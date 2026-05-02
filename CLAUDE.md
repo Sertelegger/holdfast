@@ -1,26 +1,30 @@
-# CLASP — Claude's Live Agent Shell Proxy
+# CLAUDE.md
 
-An MCP server that gives AI agents (Claude Code, etc.) full interactive shell access via persistent PTY-backed sessions.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+**CLASP** (Claude's Live Agent Shell Proxy) — An MCP server that gives AI agents a persistent, PTY-backed shell environment. Solves the problem that Claude Code's Bash tool runs non-interactive, isolated processes with no PTY, no stdin, and no session persistence.
+
+**Framing:** CLASP gives the agent a persistent shell environment, the way tmux gives a developer one.
 
 ## Project Status
 
-**Phase: Brainstorming / Design** — No code written yet. Working through the brainstorming process to produce a production-quality design spec before any implementation begins.
+**Phase: Design complete, awaiting user review of spec → implementation planning.**
 
-## Key Decision Log
+The full design specification is at `docs/superpowers/specs/2026-05-01-clasp-design.md`. Read it for any non-trivial work in this repo. The historical brainstorming notes are at `docs/brainstorming-progress.md` (kept as a record; superseded by the spec).
 
-- **Project name:** CLASP (Claude's Live Agent Shell Proxy)
-- **Approach:** MCP server (not a CLI tool like shellwright) — tighter integration with Claude Code via native MCP tools
-- **Goal:** Production quality, comprehensive testing, adversarial review
-- **Cost/effort:** Not a constraint — thoroughness is prioritized
+## Stack and Architecture (decided)
 
-## What This Project Is
+- **Language:** Rust
+- **Architecture:** Single Cargo workspace with `clasp-core` (library) + `clasp` (single binary with subcommands: `mcp`, `daemon`, `attach`, `watch`, `list`, `logs`, `ui`, ...)
+- **Transport:** Hybrid mode on Linux/macOS/WSL — stdio MCP shim + persistent Unix-socket daemon. Stdio-only mode on Windows native (sessions die with the shim).
+- **PTY:** `portable-pty` crate via a `PtyBackend` trait. v0.1.0 ships `InProcessPty`; `SubprocessPty` (process-isolated) is the priority post-v0.1.0 feature.
+- **MCP SDK:** `rmcp` (Rust)
+- **Distribution:** GitHub Releases (prebuilt per-platform binaries) + `cargo install` + Claude Code plugin marketplace (this repo doubles as marketplace; bootstrap launcher fetches binaries on demand).
 
-A standalone MCP server that:
-- Spawns interactive programs inside real PTYs
-- Exposes MCP tools for session lifecycle (start, send input, read output, wait for patterns, terminate)
-- Handles password prompts, sudo, SSH, interactive installers, REPLs, and any command that needs stdin
-- Designed to be used from Claude Code (and potentially other AI agents)
+## v0.1.0 Scope
 
-## Prior Art
+8 MCP tools (`start_session`, `send_input`, `read_output`, `wait_for_pattern`, `interrupt`, `terminate`, `list_sessions`, `status`), full hybrid mode on Unix, stdio-only on Windows, `clasp attach`/`watch`/`list`/`logs`/`ui` CLI subcommands, web UI with `xterm.js` (served over Unix socket; TCP bridge via `clasp ui` only), gitleaks-derived secret redaction with AI-provider augmentations, multi-signal prompt detection, comprehensive testing across unit / integration / cross-platform CI / adversarial tiers.
 
-- **shellwright** (https://github.com/nielsbosma/shellwright) — Rust CLI daemon that solves the same problem but as a CLI tool, not an MCP server. Good reference for prompt detection, token-efficient output reading, and security features.
+See spec §12.6 for the full ship-list and §14 for the post-v0.1.0 roadmap.
