@@ -258,7 +258,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         pty.queue_output(b"x");
         wait_for_bytes(&s, 1);
-        assert!(s.last_activity_ms() >= before);
+
+        // Strictly greater: `>=` holds even if the reader never touched
+        // the stamp, so it would pass against the very bug this guards.
+        // Poll rather than assert once -- the stamp is stored just AFTER
+        // the push, so wait_for_bytes can return in between the two.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while s.last_activity_ms() <= before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            s.last_activity_ms() > before,
+            "reader never advanced the activity stamp"
+        );
     }
 
     #[test]

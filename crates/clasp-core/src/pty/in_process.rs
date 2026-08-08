@@ -150,7 +150,11 @@ impl InProcessPty {
     #[cfg(unix)]
     fn fallback_pgids(&self) -> Vec<i32> {
         let mut v = Vec::new();
-        if let Some(p) = self.pgid() {
+        // The `> 0` guard matters: kill(-0, sig) signals CLASP's OWN
+        // process group. Unreachable today (process_id() is >= 1), but
+        // the foreground entry below guards it and asymmetry invites a
+        // regression.
+        if let Some(p) = self.pgid().filter(|p| *p > 0) {
             v.push(p);
         }
         if let Some(f) = self.master.lock().process_group_leader() {
