@@ -1,0 +1,15 @@
+[package]
+name = "clasp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "clasp"
+path = "src/main.rs"
+
+[dependencies]
+clasp-core = { path = "../clasp-core" }
+anyhow.workspace = true
+tokio.workspace = true
