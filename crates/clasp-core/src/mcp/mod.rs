@@ -5,7 +5,7 @@ pub mod tools;
 
 use crate::session::SessionRegistry;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::{tool_handler, ServerHandler, ServiceExt};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -26,10 +26,6 @@ impl Default for ClaspServer {
         Self::new()
     }
 }
-
-// Tool methods live in `tools.rs`; this attribute collects them.
-#[tool_router]
-impl ClaspServer {}
 
 #[tool_handler]
 impl ServerHandler for ClaspServer {

@@ -164,3 +164,180 @@ fn signal_after_exit_is_a_no_op() {
     pty.signal(Signal::Interrupt)
         .expect("signal after exit must be Ok");
 }
+
+use clasp_core::mcp::tools::StartSessionArgs;
+use clasp_core::mcp::ClaspServer;
+use rmcp::handler::server::wrapper::Parameters;
+use serde_json::Value;
+
+fn body(r: &rmcp::model::CallToolResult) -> Value {
+    r.structured_content.clone().expect("structured content")
+}
+
+fn bash_args() -> Vec<String> {
+    vec!["--norc".into(), "--noprofile".into()]
+}
+
+/// Poll a session's buffer until `needle` appears. Reads through the
+/// `Session` API rather than the `read_output` tool, which does not exist
+/// until Task 8.
+fn wait_for_buffer(session: &clasp_core::session::Session, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = String::from_utf8_lossy(&session.read_from(0, 1 << 20).bytes).to_string();
+        if text.contains(needle) || Instant::now() >= deadline {
+            return text;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[tokio::test]
+async fn start_session_returns_a_session_id() {
+    let server = ClaspServer::new();
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            name: Some("t1".into()),
+            cwd: None,
+            env: None,
+            cols: None,
+            rows: None,
+        }))
+        .await
+        .unwrap();
+
+    let b = body(&r);
+    assert_eq!(b["status"], "ok");
+    let id = b["data"]["session_id"].as_str().unwrap();
+    assert!(id.starts_with("sess_"));
+    assert_eq!(b["data"]["name"], "t1");
+    assert!(b["data"]["pid"].as_u64().unwrap() > 0);
+    // The default cwd is pinned to the server's own directory, not the
+    // $HOME that portable-pty would otherwise fall back to.
+    assert_eq!(
+        b["data"]["cwd"].as_str().unwrap(),
+        std::env::current_dir().unwrap().to_string_lossy()
+    );
+
+    server
+        .registry
+        .get(id)
+        .unwrap()
+        .signal(clasp_core::pty::Signal::Kill)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_name_is_rejected() {
+    let server = ClaspServer::new();
+    let mk = |name: &str| StartSessionArgs {
+        command: "bash".into(),
+        args: bash_args(),
+        name: Some(name.into()),
+        cwd: None,
+        env: None,
+        cols: None,
+        rows: None,
+    };
+    let first = server.start_session(Parameters(mk("dup"))).await.unwrap();
+    assert_eq!(body(&first)["status"], "ok");
+
+    let second = server.start_session(Parameters(mk("dup"))).await.unwrap();
+    assert_eq!(body(&second)["status"], "name_taken");
+    assert_eq!(second.is_error, Some(true));
+
+    for s in server.registry.all() {
+        let _ = s.signal(clasp_core::pty::Signal::Kill);
+    }
+}
+
+#[tokio::test]
+async fn start_session_rejects_a_nonexistent_cwd() {
+    // portable-pty silently discards a cwd that isn't a directory and
+    // runs in $HOME instead, so without this check the agent would be
+    // told `ok` while running somewhere it did not ask for.
+    let server = ClaspServer::new();
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            name: None,
+            cwd: Some("/no/such/directory/anywhere".into()),
+            env: None,
+            cols: None,
+            rows: None,
+        }))
+        .await;
+    assert!(r.is_err(), "a bad cwd must be a protocol error");
+    assert!(
+        server.registry.all().is_empty(),
+        "nothing should have been spawned"
+    );
+}
+
+#[tokio::test]
+async fn start_session_reports_spawn_failed_without_leaking_the_path() {
+    let server = ClaspServer::new();
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "clasp_definitely_not_a_real_program".into(),
+            args: vec![],
+            name: None,
+            cwd: None,
+            env: None,
+            cols: None,
+            rows: None,
+        }))
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["status"], "spawn_failed");
+    assert_eq!(r.is_error, Some(true));
+    let details = b["details"].as_str().unwrap();
+    assert!(
+        !details.contains(&std::env::var("PATH").unwrap_or_default()),
+        "the spawn error must not carry $PATH into the transcript: {details:?}"
+    );
+    assert!(details.chars().count() <= 220, "details: {details:?}");
+}
+
+#[tokio::test]
+async fn start_session_runs_in_the_requested_cwd_and_passes_env() {
+    let server = ClaspServer::new();
+    let dir = std::env::temp_dir().canonicalize().unwrap();
+    let mut env = std::collections::HashMap::new();
+    // The value never appears in the command line the test types, so the
+    // PTY's echo cannot satisfy either assertion below.
+    env.insert("CLASP_PROBE".to_string(), "env-plumbing-works".to_string());
+
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            name: None,
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            env: Some(env),
+            cols: None,
+            rows: None,
+        }))
+        .await
+        .unwrap();
+    let id = body(&r)["data"]["session_id"].as_str().unwrap().to_string();
+
+    let session = server.registry.get(&id).unwrap();
+    session.write_input(b"pwd; printenv CLASP_PROBE\n").unwrap();
+    let out = wait_for_buffer(&session, "env-plumbing-works");
+
+    assert!(
+        out.contains(&*dir.to_string_lossy()),
+        "session did not start in the requested cwd; got: {out:?}"
+    );
+    assert!(
+        out.contains("env-plumbing-works"),
+        "env was not passed to the child; got: {out:?}"
+    );
+
+    let _ = session.signal(clasp_core::pty::Signal::Kill);
+}
