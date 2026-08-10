@@ -192,7 +192,11 @@ impl ClaspServer {
         } else {
             let requested = args.tail_bytes.unwrap();
             let r = session.read_tail_bytes(requested.min(max_bytes));
-            (r, requested > max_bytes)
+            // Judge the cap by what came back, not by what was asked for:
+            // `requested > max_bytes` reports a cap even when the buffer
+            // held less than max_bytes and nothing was actually dropped.
+            let capped = r.bytes.len() >= max_bytes;
+            (r, capped)
         };
 
         // 0.0.1 returns raw bytes: no ANSI stripping, no redaction.

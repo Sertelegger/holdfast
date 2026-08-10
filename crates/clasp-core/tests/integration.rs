@@ -296,10 +296,16 @@ async fn start_session_reports_spawn_failed_without_leaking_the_path() {
     assert_eq!(b["status"], "spawn_failed");
     assert_eq!(r.is_error, Some(true));
     let details = b["details"].as_str().unwrap();
-    assert!(
-        !details.contains(&std::env::var("PATH").unwrap_or_default()),
-        "the spawn error must not carry $PATH into the transcript: {details:?}"
-    );
+    // Guard the empty case: `contains("")` is true for every string, so
+    // an unset PATH would make this assertion fail unconditionally
+    // rather than test anything.
+    let path = std::env::var("PATH").unwrap_or_default();
+    if !path.is_empty() {
+        assert!(
+            !details.contains(&path),
+            "the spawn error must not carry $PATH into the transcript: {details:?}"
+        );
+    }
     assert!(details.chars().count() <= 220, "details: {details:?}");
 }
 
@@ -527,6 +533,7 @@ async fn read_output_tail_lines_respects_max_bytes() {
     }
     assert!(session.buffer_head() >= 50_000, "child produced too little");
 
+    let head_before = session.buffer_head();
     let r = server
         .read_output(Parameters(ReadOutputArgs {
             session: id.clone(),
@@ -540,6 +547,21 @@ async fn read_output_tail_lines_respects_max_bytes() {
     let b = body(&r);
     assert_eq!(b["data"]["bytes_returned"], 1024);
     assert_eq!(b["data"]["truncated_for_size"], true);
+
+    // The cursor must still point just past the NEWEST byte, not at the
+    // start of the clipped slice. An implementation returning
+    // `head - dropped` would re-deliver these same bytes on every
+    // subsequent `since_cursor` read — an infinite loop for any agent
+    // polling with cursors. A lower bound rather than equality, because
+    // the reader thread keeps appending while this test runs.
+    let cursor = b["data"]["cursor"]
+        .as_u64()
+        .expect("cursor must be present");
+    assert!(
+        cursor >= head_before,
+        "cursor {cursor} regressed below the pre-read head {head_before}; \
+         front-clipping must not move the cursor back"
+    );
 
     let _ = session.signal(clasp_core::pty::Signal::Kill);
 }
