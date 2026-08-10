@@ -165,7 +165,7 @@ fn signal_after_exit_is_a_no_op() {
         .expect("signal after exit must be Ok");
 }
 
-use clasp_core::mcp::tools::StartSessionArgs;
+use clasp_core::mcp::tools::{ReadOutputArgs, StartSessionArgs};
 use clasp_core::mcp::ClaspServer;
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
@@ -338,6 +338,208 @@ async fn start_session_runs_in_the_requested_cwd_and_passes_env() {
         out.contains("env-plumbing-works"),
         "env was not passed to the child; got: {out:?}"
     );
+
+    let _ = session.signal(clasp_core::pty::Signal::Kill);
+}
+
+/// Poll read_output until `needle` appears or the attempt budget runs out.
+async fn read_until_contains(
+    server: &ClaspServer,
+    session: &str,
+    needle: &str,
+    attempts: usize,
+) -> String {
+    let mut cursor = 0u64;
+    let mut acc = String::new();
+    for _ in 0..attempts {
+        let r = server
+            .read_output(Parameters(ReadOutputArgs {
+                session: session.into(),
+                since_cursor: Some(cursor),
+                tail_lines: None,
+                tail_bytes: None,
+                max_bytes: None,
+            }))
+            .await
+            .unwrap();
+        let b = body(&r);
+        acc.push_str(b["data"]["output"].as_str().unwrap_or(""));
+        cursor = b["data"]["cursor"].as_u64().unwrap_or(cursor);
+        if acc.contains(needle) {
+            return acc;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    acc
+}
+
+async fn start_bash(server: &ClaspServer) -> String {
+    let started = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            name: None,
+            cwd: None,
+            env: None,
+            cols: None,
+            rows: None,
+        }))
+        .await
+        .unwrap();
+    body(&started)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn read_output_returns_shell_output_and_advances_the_cursor() {
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+    let session = server.registry.get(&id).unwrap();
+
+    // `READ''_MARKER` echoes back as `READ''_MARKER` but *prints*
+    // READ_MARKER, so the needle can only match output the shell
+    // actually produced. Searching for a marker written literally would
+    // match the PTY's echo of the command line and prove nothing.
+    session.write_input(b"echo READ''_MARKER\n").unwrap();
+    let out = read_until_contains(&server, &id, "READ_MARKER", 30).await;
+    assert!(out.contains("READ_MARKER"), "got: {out:?}");
+
+    // A capped read reports the cap and hands back a cursor to resume
+    // from; `truncated_for_size` must reflect the cap, not "more bytes
+    // exist" (§18.2).
+    let capped = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: Some(0),
+            tail_lines: None,
+            tail_bytes: None,
+            max_bytes: Some(8),
+        }))
+        .await
+        .unwrap();
+    let b = body(&capped);
+    assert_eq!(b["data"]["bytes_returned"], 8);
+    assert_eq!(b["data"]["cursor"], 8);
+    assert_eq!(b["data"]["truncated_for_size"], true);
+    assert_eq!(b["data"]["next_cursor"], 8);
+
+    let _ = session.signal(clasp_core::pty::Signal::Kill);
+}
+
+#[tokio::test]
+async fn read_output_rejects_zero_or_multiple_selectors() {
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+
+    let none = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: None,
+            tail_lines: None,
+            tail_bytes: None,
+            max_bytes: None,
+        }))
+        .await;
+    assert!(none.is_err(), "zero selectors must be a protocol error");
+
+    let both = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: Some(0),
+            tail_lines: Some(5),
+            tail_bytes: None,
+            max_bytes: None,
+        }))
+        .await;
+    assert!(both.is_err(), "two selectors must be a protocol error");
+
+    // Validation runs before resolution, so a schema violation is not
+    // masked by an unknown session (§5.1).
+    let unknown = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: "sess_nope".into(),
+            since_cursor: None,
+            tail_lines: None,
+            tail_bytes: None,
+            max_bytes: None,
+        }))
+        .await;
+    assert!(unknown.is_err(), "schema violation must win over lookup");
+
+    let _ = server
+        .registry
+        .get(&id)
+        .unwrap()
+        .signal(clasp_core::pty::Signal::Kill);
+}
+
+#[tokio::test]
+async fn read_output_on_unknown_session_is_an_error_envelope() {
+    let server = ClaspServer::new();
+    let r = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: "sess_nope".into(),
+            since_cursor: Some(0),
+            tail_lines: None,
+            tail_bytes: None,
+            max_bytes: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&r)["status"], "session_not_found");
+    assert_eq!(r.is_error, Some(true));
+}
+
+#[tokio::test]
+async fn read_output_tail_lines_respects_max_bytes() {
+    // REQ-T-006: max_bytes is a raw-byte cap on every selector. Without
+    // it a tail_lines read returns the whole ring buffer — up to 1 MiB
+    // in one tool response.
+    let server = ClaspServer::new();
+    let started = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: vec![
+                "--norc".into(),
+                "--noprofile".into(),
+                "-c".into(),
+                "for i in $(seq 1 4000); do echo padding-padding-padding-$i; done; sleep 30".into(),
+            ],
+            name: None,
+            cwd: None,
+            env: None,
+            cols: None,
+            rows: None,
+        }))
+        .await
+        .unwrap();
+    let id = body(&started)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let session = server.registry.get(&id).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while session.buffer_head() < 50_000 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(session.buffer_head() >= 50_000, "child produced too little");
+
+    let r = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: None,
+            tail_lines: Some(1_000_000),
+            tail_bytes: None,
+            max_bytes: Some(1024),
+        }))
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["data"]["bytes_returned"], 1024);
+    assert_eq!(b["data"]["truncated_for_size"], true);
 
     let _ = session.signal(clasp_core::pty::Signal::Kill);
 }
