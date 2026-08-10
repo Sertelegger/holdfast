@@ -18,7 +18,10 @@ pub struct SessionRegistry {
 
 impl SessionRegistry {
     pub fn new(max_sessions: usize) -> Self {
-        Self { sessions: RwLock::new(HashMap::new()), max_sessions }
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            max_sessions,
+        }
     }
 
     pub fn with_defaults() -> Self {
@@ -27,7 +30,11 @@ impl SessionRegistry {
 
     /// Number of sessions whose child is still running.
     pub fn live_count(&self) -> usize {
-        self.sessions.read().values().filter(|s| s.is_alive()).count()
+        self.sessions
+            .read()
+            .values()
+            .filter(|s| s.is_alive())
+            .count()
     }
 
     /// Insert a session, enforcing the limit and name rules.
@@ -85,7 +92,7 @@ impl Default for SessionRegistry {
 mod tests {
     use super::*;
     use crate::pty::MockPty;
-    use crate::session::{Session, new_session_id};
+    use crate::session::{new_session_id, Session};
 
     fn mock_session(name: Option<&str>) -> (Arc<Session>, Arc<MockPty>) {
         let pty = Arc::new(MockPty::new());
@@ -142,7 +149,8 @@ mod tests {
         reg.insert(a).unwrap();
         pa.exit(0);
         let (b, _pb) = mock_session(Some("build"));
-        reg.insert(b).expect("name should be free once the holder exits");
+        reg.insert(b)
+            .expect("name should be free once the holder exits");
     }
 
     #[test]
@@ -155,7 +163,10 @@ mod tests {
         reg.insert(a).unwrap();
         pa.exit(3);
         assert_eq!(reg.get(&id).unwrap().id, id);
-        assert!(matches!(reg.get("build"), Err(ClaspError::SessionNotFound(_))));
+        assert!(matches!(
+            reg.get("build"),
+            Err(ClaspError::SessionNotFound(_))
+        ));
     }
 
     #[test]
@@ -177,6 +188,9 @@ mod tests {
     #[test]
     fn missing_session_is_an_error() {
         let reg = SessionRegistry::with_defaults();
-        assert!(matches!(reg.get("nope"), Err(ClaspError::SessionNotFound(_))));
+        assert!(matches!(
+            reg.get("nope"),
+            Err(ClaspError::SessionNotFound(_))
+        ));
     }
 }

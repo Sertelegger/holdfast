@@ -73,7 +73,11 @@ fn terminate_kills_the_whole_process_group() {
     let child_pid: i32 = out
         .split("CHILD_PID=")
         .nth(1)
-        .map(|s| s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+        .map(|s| {
+            s.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("no child pid in: {out:?}"));
 
@@ -153,7 +157,10 @@ fn signal_after_exit_is_a_no_op() {
 
     // Must not sweep: the PID may have been recycled by now, and
     // signalling a stranger's session would be a serious bug.
-    pty.signal(Signal::Kill).expect("signal after exit must be Ok");
-    pty.signal(Signal::Terminate).expect("signal after exit must be Ok");
-    pty.signal(Signal::Interrupt).expect("signal after exit must be Ok");
+    pty.signal(Signal::Kill)
+        .expect("signal after exit must be Ok");
+    pty.signal(Signal::Terminate)
+        .expect("signal after exit must be Ok");
+    pty.signal(Signal::Interrupt)
+        .expect("signal after exit must be Ok");
 }

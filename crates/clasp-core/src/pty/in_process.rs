@@ -3,7 +3,7 @@
 use super::{PtyBackend, PtySpawnConfig, Signal};
 use crate::{ClaspError, Result};
 use parking_lot::Mutex;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 
 pub struct InProcessPty {
@@ -122,14 +122,15 @@ impl InProcessPty {
             };
             // `comm` is parenthesised and may itself contain spaces and
             // ')', so the fields after it start past the LAST ')'.
-            let Some((_, rest)) = stat.rsplit_once(')') else { continue };
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                continue;
+            };
             let fields: Vec<&str> = rest.split_whitespace().collect();
             // rest: [0]=state [1]=ppid [2]=pgrp [3]=session
             if fields.len() < 4 {
                 continue;
             }
-            let (Ok(pgrp), Ok(session)) =
-                (fields[2].parse::<i32>(), fields[3].parse::<i32>())
+            let (Ok(pgrp), Ok(session)) = (fields[2].parse::<i32>(), fields[3].parse::<i32>())
             else {
                 continue;
             };
@@ -137,7 +138,11 @@ impl InProcessPty {
                 out.push(pgrp);
             }
         }
-        if out.is_empty() { self.fallback_pgids() } else { out }
+        if out.is_empty() {
+            self.fallback_pgids()
+        } else {
+            out
+        }
     }
 
     /// Degraded sweep for Unix platforms without `/proc`. Full
@@ -232,7 +237,12 @@ impl PtyBackend for InProcessPty {
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.master
             .lock()
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| ClaspError::Pty(format!("resize: {e}")))
     }
 

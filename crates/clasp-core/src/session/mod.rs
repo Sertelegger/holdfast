@@ -7,8 +7,8 @@ use crate::buffer::{BufferRead, OutputBuffer};
 use crate::pty::{PtyBackend, Signal};
 use crate::{ClaspError, Result};
 use parking_lot::Mutex;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub type SessionId = String;
@@ -278,7 +278,10 @@ mod tests {
         let (s, pty) = mock_session();
         s.write_input(b"echo hi\n").expect("write while alive");
         pty.exit(0);
-        assert!(matches!(s.write_input(b"more\n"), Err(ClaspError::SessionDied)));
+        assert!(matches!(
+            s.write_input(b"more\n"),
+            Err(ClaspError::SessionDied)
+        ));
     }
 
     #[test]
@@ -294,6 +297,7 @@ mod tests {
     fn signal_after_exit_is_not_an_error() {
         let (s, pty) = mock_session();
         pty.exit(0);
-        s.signal(Signal::Terminate).expect("terminate must stay idempotent");
+        s.signal(Signal::Terminate)
+            .expect("terminate must stay idempotent");
     }
 }
