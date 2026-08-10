@@ -26,7 +26,11 @@ pub struct OutputBuffer {
 impl OutputBuffer {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "buffer capacity must be non-zero");
-        Self { data: Vec::new(), capacity, head: 0 }
+        Self {
+            data: Vec::new(),
+            capacity,
+            head: 0,
+        }
     }
 
     pub fn head(&self) -> u64 {
@@ -51,17 +55,29 @@ impl OutputBuffer {
         if bytes.len() >= self.capacity {
             // The new chunk alone fills or overflows the buffer.
             self.data.clear();
-            self.data.extend_from_slice(&bytes[bytes.len() - self.capacity..]);
+            self.data
+                .extend_from_slice(&bytes[bytes.len() - self.capacity..]);
             return;
         }
         self.data.extend_from_slice(bytes);
         let overflow = self.data.len().saturating_sub(self.capacity);
         if overflow > 0 {
+            // TODO(perf): Vec::drain shifts all retained bytes — O(n) per push
+            // once the buffer is full. A true ring buffer with circular index
+            // arithmetic would make eviction O(1). Acceptable at current PTY
+            // throughput; revisit if profiling shows this hot.
             self.data.drain(..overflow);
         }
     }
 
     /// Read from `since` up to at most `max_bytes`.
+    ///
+    /// If `since` is greater than `head` (e.g. a stale cursor from a previous,
+    /// larger session), `start` is clamped to `head`, the returned slice is
+    /// empty, and `cursor` is set to `head` — which is *less than* the
+    /// requested `since`. Callers must treat the returned cursor as the new
+    /// authoritative position rather than assuming it advances monotonically
+    /// relative to the input.
     pub fn read_from(&self, since: u64, max_bytes: usize) -> BufferRead {
         let tail = self.tail();
         let truncated_at_tail = since < tail;
@@ -89,7 +105,11 @@ impl OutputBuffer {
     /// Read the last `n` newline-delimited lines.
     pub fn read_tail_lines(&self, n: usize) -> BufferRead {
         if n == 0 || self.data.is_empty() {
-            return BufferRead { bytes: Vec::new(), cursor: self.head, truncated_at_tail: false };
+            return BufferRead {
+                bytes: Vec::new(),
+                cursor: self.head,
+                truncated_at_tail: false,
+            };
         }
         // Walk backwards counting newlines, ignoring a single trailing one.
         let mut seen = 0usize;
@@ -107,6 +127,14 @@ impl OutputBuffer {
                     break;
                 }
             }
+            // Unconditional update — applies to both non-newline bytes and to
+            // newlines that haven't yet reached the `n` count. This ensures
+            // that when the loop exhausts without breaking (fewer than n lines
+            // exist), the final iteration (i = 0) leaves idx = 0, causing the
+            // whole buffer to be returned. Moving this into an `else` branch
+            // would be incorrect: if the buffer starts with a '\n', the last
+            // iteration would be a newline with seen < n, and idx would stay at
+            // 1 instead of 0, silently dropping the leading content.
             idx = i;
         }
         BufferRead {
@@ -210,5 +238,45 @@ mod tests {
         let mut b = OutputBuffer::new(1024);
         b.push(b"a\nb\n");
         assert_eq!(b.read_tail_lines(10).bytes, b"a\nb\n");
+    }
+
+    /// No trailing newline, and fewer lines exist than requested. The loop
+    /// must exhaust and return everything starting at index 0.
+    #[test]
+    fn tail_lines_no_trailing_newline_fewer_than_n() {
+        let mut b = OutputBuffer::new(1024);
+        b.push(b"a\nb");
+        assert_eq!(b.read_tail_lines(3).bytes, b"a\nb");
+    }
+
+    /// When `since` exceeds `head`, `start` is clamped to `head` and the
+    /// returned cursor regresses to `head` rather than honouring `since`.
+    #[test]
+    fn read_from_since_beyond_head_clamps_cursor_to_head() {
+        let mut b = OutputBuffer::new(1024);
+        b.push(b"abc"); // head = 3
+        let r = b.read_from(99, 1024);
+        assert!(r.bytes.is_empty());
+        // cursor must be head (3), not the requested since (99)
+        assert_eq!(r.cursor, 3);
+        assert!(!r.truncated_at_tail);
+    }
+
+    #[test]
+    fn read_from_empty_buffer_returns_nothing() {
+        let b = OutputBuffer::new(1024);
+        let r = b.read_from(0, 1024);
+        assert!(r.bytes.is_empty());
+        assert_eq!(r.cursor, 0);
+        assert!(!r.truncated_at_tail);
+    }
+
+    #[test]
+    fn tail_bytes_zero_returns_empty() {
+        let mut b = OutputBuffer::new(64);
+        b.push(b"hello");
+        let r = b.read_tail_bytes(0);
+        assert!(r.bytes.is_empty());
+        assert_eq!(r.cursor, 5);
     }
 }

@@ -144,6 +144,19 @@ mod tests {
         let p = MockPty::new();
         p.signal(Signal::Interrupt).unwrap();
         assert!(p.is_alive());
+        // An impl that sets exit_code while keeping alive=true would pass
+        // the alive check above but fail here.
+        assert_eq!(p.exit_code(), None);
+    }
+
+    #[test]
+    fn kill_marks_not_alive() {
+        let p = MockPty::new();
+        assert!(p.is_alive());
+        p.signal(Signal::Kill).unwrap();
+        assert!(!p.is_alive());
+        assert_eq!(p.exit_code(), Some(0));
+        assert_eq!(p.signals(), vec![Signal::Kill]);
     }
 
     #[test]
