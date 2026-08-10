@@ -69,6 +69,20 @@ pub fn ok(data: Value, details: impl Into<String>) -> CallToolResult {
 /// `isError: true`. Folding them into `session_died` (as an earlier draft
 /// did) would tell the agent a lie it cannot detect — a failed write and
 /// an exited child are different problems.
+///
+/// **Do not use this for `SessionDied` when you hold the session.** §18.1
+/// requires `session_died` to carry `data.exit_code`, and `ClaspError::
+/// SessionDied` is a unit variant with no code to extract, so the arm
+/// below can only emit `data: {}`. A caller that has the `Session` must
+/// build the envelope directly:
+///
+/// ```ignore
+/// envelope(Status::SessionDied, json!({ "exit_code": session.exit_code() }), "…")
+/// ```
+///
+/// The arm is kept only for callers that genuinely have no session in
+/// hand. Routing a tool response through it produces a §18.1-noncompliant
+/// payload that nothing will catch at compile time.
 pub fn from_error(e: &crate::ClaspError) -> Result<CallToolResult, ErrorData> {
     use crate::ClaspError as E;
     let status = match e {
