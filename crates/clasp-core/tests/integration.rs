@@ -563,7 +563,62 @@ async fn read_output_tail_lines_respects_max_bytes() {
          front-clipping must not move the cursor back"
     );
 
+    // Stronger than the bound above: kill the child so output stops, then
+    // feed the cursor back. A correct cursor points past the newest byte,
+    // so the follow-up read returns nothing. A cursor pointing at the
+    // start of the clipped slice would re-deliver those 1024 bytes, which
+    // is the actual agent-visible failure — a cursor-polling agent would
+    // loop on the same output forever.
     let _ = session.signal(clasp_core::pty::Signal::Kill);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let settled = session.buffer_head();
+    let again = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: Some(settled),
+            tail_lines: None,
+            tail_bytes: None,
+            max_bytes: Some(4096),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        body(&again)["data"]["bytes_returned"],
+        0,
+        "reading from the settled head must return nothing; a cursor that \
+         regressed would re-deliver already-seen bytes"
+    );
+}
+
+#[tokio::test]
+async fn terminate_without_force_escalates_to_sigkill_for_a_sigterm_immune_child() {
+    // The normal production path: an interactive bash IGNORES SIGTERM, so
+    // every real terminate(force=false) must escalate to SIGKILL. The
+    // existing SIGTERM test uses a child that traps and exits, so it never
+    // reaches the escalation branch. A regression inverting that branch
+    // would leave real shells alive while terminate reported ok.
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+    let session = server.registry.get(&id).unwrap();
+    let pid = session.pid().expect("pid") as i32;
+
+    let r = server
+        .terminate(Parameters(TerminateArgs {
+            session: id.clone(),
+            force: Some(false),
+            timeout_secs: Some(1),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&r)["status"], "ok");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !pid_alive(pid),
+        "interactive bash ignores SIGTERM, so pid {pid} proves the SIGKILL \
+         escalation never ran"
+    );
+    assert!(!session.is_alive());
 }
 
 #[tokio::test]

@@ -192,10 +192,13 @@ impl ClaspServer {
         } else {
             let requested = args.tail_bytes.unwrap();
             let r = session.read_tail_bytes(requested.min(max_bytes));
-            // Judge the cap by what came back, not by what was asked for:
-            // `requested > max_bytes` reports a cap even when the buffer
-            // held less than max_bytes and nothing was actually dropped.
-            let capped = r.bytes.len() >= max_bytes;
+            // Both clauses are needed. `requested > max_bytes` alone
+            // reports a cap even when the buffer held less than max_bytes,
+            // so nothing was dropped. `r.bytes.len() >= max_bytes` alone
+            // reports a cap when the caller asked for exactly max_bytes
+            // and got exactly that -- also no truncation. Only when
+            // max_bytes was the *binding* constraint was anything lost.
+            let capped = requested > max_bytes && r.bytes.len() >= max_bytes;
             (r, capped)
         };
 
