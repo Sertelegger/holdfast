@@ -215,6 +215,100 @@ impl ClaspServer {
             format!("{} bytes", read.bytes.len()),
         ))
     }
+
+    /// Send keystrokes to a session's stdin.
+    #[tool]
+    pub async fn send_input(
+        &self,
+        Parameters(args): Parameters<SendInputArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = match self.registry.get(&args.session) {
+            Ok(s) => s,
+            Err(e) => return envelope::from_error(&e),
+        };
+        if !session.is_alive() {
+            return Ok(envelope::envelope(
+                Status::SessionDied,
+                json!({ "exit_code": session.exit_code() }),
+                "session has exited",
+            ));
+        }
+
+        let mut payload = args.data.into_bytes();
+        if args.append_newline.unwrap_or(true) {
+            payload.push(b'\n');
+        }
+        let written = match session.write_input(&payload) {
+            Ok(n) => n,
+            // The child can die between the liveness check above and the
+            // write; a real PTY reports that as EIO. That *is*
+            // `session_died` — but only here, where the context makes it
+            // true. `from_error` deliberately refuses to guess.
+            Err(e) => {
+                return Ok(envelope::envelope(
+                    Status::SessionDied,
+                    json!({ "exit_code": session.exit_code() }),
+                    format!("session exited during the write: {e}"),
+                ));
+            }
+        };
+
+        Ok(envelope::ok(
+            json!({ "bytes_written": written }),
+            format!("wrote {written} bytes"),
+        ))
+    }
+
+    /// Terminate a session, killing its whole process group. Idempotent.
+    #[tool]
+    pub async fn terminate(
+        &self,
+        Parameters(args): Parameters<TerminateArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = match self.registry.get(&args.session) {
+            Ok(s) => s,
+            Err(e) => return envelope::from_error(&e),
+        };
+
+        // Idempotent per REQ-T-010: an already-dead session reports its
+        // cached exit info rather than an error.
+        if !session.is_alive() {
+            return Ok(envelope::ok(
+                json!({ "exit_code": session.exit_code(), "already_exited": true }),
+                "session had already exited",
+            ));
+        }
+
+        let force = args.force.unwrap_or(false);
+        let grace_ms = args.timeout_secs.unwrap_or(5) as u64 * 1000;
+
+        if force {
+            let _ = session.signal(crate::pty::Signal::Kill);
+        } else {
+            let _ = session.signal(crate::pty::Signal::Terminate);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(grace_ms);
+            while session.is_alive() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if session.is_alive() {
+                let _ = session.signal(crate::pty::Signal::Kill);
+            }
+        }
+
+        // Give the child a moment to be reaped so exit_code is populated.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The session stays in the registry. Spec §4.1: an exited session
+        // keeps its id (and releases only its name), so the agent can
+        // still read the output the command produced before it was
+        // stopped. Removing it here would delete that buffer and make the
+        // second `terminate` a `session_not_found` error, which REQ-T-010
+        // forbids.
+        Ok(envelope::ok(
+            json!({ "exit_code": session.exit_code(), "already_exited": false }),
+            "terminated",
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -233,4 +327,27 @@ pub struct ReadOutputArgs {
     /// Cap on bytes returned. Defaults to 32768, hard limit 262144.
     #[serde(default)]
     pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SendInputArgs {
+    /// Session id or live session name.
+    pub session: String,
+    /// Text to write to the session's stdin.
+    pub data: String,
+    /// Append a newline. Defaults to true.
+    #[serde(default)]
+    pub append_newline: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TerminateArgs {
+    /// Session id or live session name.
+    pub session: String,
+    /// Skip the graceful SIGTERM and send SIGKILL immediately.
+    #[serde(default)]
+    pub force: Option<bool>,
+    /// Seconds to wait after SIGTERM before escalating. Defaults to 5.
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
 }

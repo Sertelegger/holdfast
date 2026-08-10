@@ -165,7 +165,7 @@ fn signal_after_exit_is_a_no_op() {
         .expect("signal after exit must be Ok");
 }
 
-use clasp_core::mcp::tools::{ReadOutputArgs, StartSessionArgs};
+use clasp_core::mcp::tools::{ReadOutputArgs, SendInputArgs, StartSessionArgs, TerminateArgs};
 use clasp_core::mcp::ClaspServer;
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
@@ -542,4 +542,179 @@ async fn read_output_tail_lines_respects_max_bytes() {
     assert_eq!(b["data"]["truncated_for_size"], true);
 
     let _ = session.signal(clasp_core::pty::Signal::Kill);
+}
+
+#[tokio::test]
+async fn send_input_reaches_the_shell() {
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+
+    // Same `''` construction as the read_output test, for the same
+    // reason: a literal marker would match the terminal's echo.
+    let r = server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "echo SEND''_MARKER; echo $((6*7))".into(),
+            append_newline: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&r)["status"], "ok");
+
+    let out = read_until_contains(&server, &id, "SEND_MARKER", 30).await;
+    assert!(out.contains("SEND_MARKER"), "got: {out:?}");
+    // `42` appears nowhere in the bytes we wrote, so only a shell that
+    // evaluated the expression can have produced it.
+    assert!(out.contains("42"), "shell did not evaluate: {out:?}");
+
+    let _ = server
+        .registry
+        .get(&id)
+        .unwrap()
+        .signal(clasp_core::pty::Signal::Kill);
+}
+
+#[tokio::test]
+async fn terminate_is_idempotent_and_preserves_the_output() {
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "echo BEFORE''_TERMINATE".into(),
+            append_newline: None,
+        }))
+        .await
+        .unwrap();
+    read_until_contains(&server, &id, "BEFORE_TERMINATE", 30).await;
+
+    let first = server
+        .terminate(Parameters(TerminateArgs {
+            session: id.clone(),
+            force: Some(true),
+            timeout_secs: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&first)["status"], "ok");
+    assert_eq!(body(&first)["data"]["already_exited"], false);
+
+    // §4.1: an exited session keeps its id, so the agent can still read
+    // what the command printed before it was stopped.
+    let after = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: Some(0),
+            tail_lines: None,
+            tail_bytes: None,
+            max_bytes: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&after)["status"], "ok");
+    assert!(
+        body(&after)["data"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("BEFORE_TERMINATE"),
+        "terminate destroyed the session's output"
+    );
+
+    // REQ-T-010: a repeat terminate is `ok` with cached exit info.
+    let second = server
+        .terminate(Parameters(TerminateArgs {
+            session: id.clone(),
+            force: Some(true),
+            timeout_secs: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&second)["status"], "ok");
+    assert_ne!(second.is_error, Some(true));
+    assert_eq!(body(&second)["data"]["already_exited"], true);
+}
+
+#[tokio::test]
+async fn terminate_without_force_delivers_sigterm_first() {
+    // REQ-P-004. The child traps SIGTERM and exits 77, an exit code it
+    // can only reach if the graceful signal arrived — a SIGKILL-first
+    // implementation reports 1 instead.
+    let server = ClaspServer::new();
+    let started = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: vec![
+                "--norc".into(),
+                "--noprofile".into(),
+                "-c".into(),
+                "trap 'exit 77' TERM; while true; do sleep 0.1; done".into(),
+            ],
+            name: None,
+            cwd: None,
+            env: None,
+            cols: None,
+            rows: None,
+        }))
+        .await
+        .unwrap();
+    let id = body(&started)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let r = server
+        .terminate(Parameters(TerminateArgs {
+            session: id.clone(),
+            force: Some(false),
+            timeout_secs: Some(5),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&r)["status"], "ok");
+    assert_eq!(
+        body(&r)["data"]["exit_code"],
+        77,
+        "child was not given a chance to handle SIGTERM"
+    );
+}
+
+#[tokio::test]
+async fn send_input_to_an_exited_session_reports_session_died() {
+    let server = ClaspServer::new();
+    let started = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: vec!["-c".into(), "exit 0".into()],
+            name: None,
+            cwd: None,
+            env: None,
+            cols: None,
+            rows: None,
+        }))
+        .await
+        .unwrap();
+    let id = body(&started)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Let the child exit.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let r = server
+        .send_input(Parameters(SendInputArgs {
+            session: id,
+            data: "echo nope".into(),
+            append_newline: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&r)["status"], "session_died");
+    assert_ne!(
+        r.is_error,
+        Some(true),
+        "session_died is an outcome, not an error"
+    );
 }
