@@ -22,6 +22,24 @@ const TAIL_LINE_MAX: usize = 512;
 const OSC_PAYLOAD_MAX: usize = 1024;
 /// Cap on the echoed command line captured between OSC 133 `B` and `C`.
 const COMMAND_CAPTURE_MAX: usize = 4096;
+/// Hard ceiling on the bytes a single control sequence may *consume*
+/// before the scanner abandons it and returns to `Ground`.
+///
+/// `OSC_PAYLOAD_MAX` bounds what a sequence stores; this bounds how long a
+/// malformed one can blind the scanner. Without it an OSC or DCS whose
+/// terminator was lost — a `cat` of a binary file, a truncated write, a
+/// background job interleaving on the same PTY — swallows the rest of the
+/// session. That is not a degraded mode: the modes hidden inside it are
+/// the availability flags §8.4 uses to *pick* a tier, so losing them
+/// silently disables deterministic detection rather than weakening it.
+///
+/// Deliberately well clear of `OSC_PAYLOAD_MAX` so that a merely oversized
+/// payload still resynchronises through the overflow path, which keeps its
+/// terminator, rather than being cut off here.
+const SEQUENCE_MAX: usize = 8 * OSC_PAYLOAD_MAX;
+/// Cap on CSI parameter bytes. Past this the sequence is consumed to its
+/// final byte but not interpreted.
+const CSI_PARAMS_MAX: usize = 64;
 
 /// An OSC 133 semantic marker (§8.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +135,10 @@ pub struct ModeScanner {
     tail: TailLine,
     /// CSI parameter and intermediate bytes, without the final byte.
     params: Vec<u8>,
+    /// True once the parameters exceeded `CSI_PARAMS_MAX`. Truncated
+    /// parameters would decode as a different, shorter sequence, so an
+    /// overflowed CSI is consumed but never applied.
+    params_overflowed: bool,
     /// OSC payload, without the introducer or terminator.
     osc: Vec<u8>,
     /// True once the payload exceeded `OSC_PAYLOAD_MAX`; the rest is
@@ -124,6 +146,8 @@ pub struct ModeScanner {
     osc_overflowed: bool,
     /// Offset of the `\x1b` that started the sequence being parsed.
     seq_start: u64,
+    /// Bytes consumed by the sequence being parsed, against `SEQUENCE_MAX`.
+    seq_len: usize,
     /// Echoed command line, accumulated between OSC 133 `B` and `C`.
     capture: Option<String>,
     /// Last OSC 133 marker letter seen (`A`/`B`/`C`/`D`), for the T1 state.
@@ -147,9 +171,11 @@ impl ModeScanner {
             title: None,
             tail: TailLine::default(),
             params: Vec::new(),
+            params_overflowed: false,
             osc: Vec::new(),
             osc_overflowed: false,
             seq_start: 0,
+            seq_len: 0,
             capture: None,
             last_marker: None,
             pending_cr: false,
@@ -182,24 +208,47 @@ impl ModeScanner {
         let mut events = Vec::new();
         for (i, &b) in bytes.iter().enumerate() {
             let offset = base + i as u64;
+            // Resynchronisation, ahead of any state-specific handling. A
+            // sequence that never terminates must not be able to blind the
+            // scanner for the rest of the session.
+            if self.state != State::Ground {
+                // `CAN` and `SUB` abandon a sequence in progress. xterm and
+                // VTE resynchronise on these precisely so that a truncated
+                // write cannot poison everything after it.
+                if b == 0x18 || b == 0x1a {
+                    self.abort();
+                    continue;
+                }
+                self.seq_len += 1;
+                if self.seq_len > SEQUENCE_MAX {
+                    // Give up and reconsider this byte as ordinary text:
+                    // the match below now sees `Ground`.
+                    self.abort();
+                }
+            }
             match self.state {
                 State::Ground => self.ground(b, offset),
-                State::Esc => self.esc(b),
+                State::Esc => self.esc(b, offset),
                 State::EscIntermediate => {
-                    if !(0x20..=0x2f).contains(&b) {
+                    if b == 0x1b {
+                        self.begin_escape(offset);
+                    } else if !(0x20..=0x2f).contains(&b) {
                         self.state = State::Ground;
                     }
                 }
-                State::Csi => self.csi(b),
+                State::Csi => self.csi(b, offset),
                 State::Osc => self.osc_byte(b, offset, &mut events),
                 State::OscEsc => {
                     if b == b'\\' {
                         self.finish_osc(offset + 1, &mut events);
                     } else {
-                        // Not ST after all: the ESC belonged to the payload.
-                        self.push_osc(0x1b);
-                        self.state = State::Osc;
-                        self.osc_byte(b, offset, &mut events);
+                        // Not ST, so the OSC's terminator was lost. The ESC
+                        // begins a new sequence rather than joining the
+                        // payload — that is what stops a title with a
+                        // dropped terminator from eating the marker behind
+                        // it. `- 1` is the ESC we are standing one byte past.
+                        self.begin_escape(offset.saturating_sub(1));
+                        self.esc(b, offset);
                     }
                 }
                 State::Str => {
@@ -207,6 +256,11 @@ impl ModeScanner {
                         self.state = State::StrEsc;
                     }
                 }
+                // Unlike OSC, a DCS/SOS/PM/APC payload stays opaque to a
+                // non-ST escape: tmux passthrough carries doubled escapes
+                // as data, and a mode set inside one is data too, not a
+                // mode change. `CAN`/`SUB` and `SEQUENCE_MAX` above are
+                // what rescue an unterminated one.
                 State::StrEsc => {
                     self.state = if b == b'\\' {
                         State::Ground
@@ -217,6 +271,28 @@ impl ModeScanner {
             }
         }
         events
+    }
+
+    /// Abandon the sequence in progress and return to `Ground`, discarding
+    /// what it accumulated. Nothing is emitted: a sequence that never
+    /// terminated is not evidence of anything.
+    fn abort(&mut self) {
+        self.state = State::Ground;
+        self.params.clear();
+        self.params_overflowed = false;
+        self.osc.clear();
+        self.osc_overflowed = false;
+        self.seq_len = 0;
+    }
+
+    /// Begin a fresh escape sequence at `offset`, discarding anything in
+    /// progress. `ESC` is the one byte that always means "a new sequence
+    /// starts here", so a truncated sequence can neither be applied nor
+    /// poison the one that follows it.
+    fn begin_escape(&mut self, offset: u64) {
+        self.abort();
+        self.seq_start = offset;
+        self.state = State::Esc;
     }
 
     fn ground(&mut self, b: u8, offset: u64) {
@@ -233,10 +309,7 @@ impl ModeScanner {
             }
         }
         match b {
-            0x1b => {
-                self.seq_start = offset;
-                self.state = State::Esc;
-            }
+            0x1b => self.begin_escape(offset),
             b'\n' => {
                 self.tail.reset();
                 self.capture_newline();
@@ -289,10 +362,16 @@ impl ModeScanner {
         }
     }
 
-    fn esc(&mut self, b: u8) {
+    fn esc(&mut self, b: u8, offset: u64) {
+        if b == 0x1b {
+            // `ESC ESC`: the first one introduced nothing.
+            self.begin_escape(offset);
+            return;
+        }
         self.state = match b {
             b'[' => {
                 self.params.clear();
+                self.params_overflowed = false;
                 State::Csi
             }
             b']' => {
@@ -307,18 +386,32 @@ impl ModeScanner {
         };
     }
 
-    fn csi(&mut self, b: u8) {
-        if (0x40..=0x7e).contains(&b) {
+    fn csi(&mut self, b: u8, offset: u64) {
+        if b == 0x1b {
+            // A truncated CSI must not be applied, and its parameter bytes
+            // must not fall through to the tail line as text — that is how
+            // a mangled sequence manufactures `$ `-shaped output for the
+            // T3 matcher to mistake for a prompt.
+            self.begin_escape(offset);
+        } else if (0x40..=0x7e).contains(&b) {
             self.apply_csi(b);
             self.state = State::Ground;
-        } else if self.params.len() < 64 {
+        } else if self.params.len() < CSI_PARAMS_MAX {
             self.params.push(b);
+        } else {
+            self.params_overflowed = true;
         }
     }
 
     /// DEC private mode set/reset. `\x1b[?2004h` and friends may carry
     /// several parameters at once (`\x1b[?1049;2004h`), so each is applied.
     fn apply_csi(&mut self, final_byte: u8) {
+        // Truncated parameters decode as a different, shorter sequence:
+        // `?9…9;20041h` cut at the cap ends in `;2004` and would forge the
+        // availability flag §8.4 gates on. Consume, do not interpret.
+        if self.params_overflowed {
+            return;
+        }
         if final_byte != b'h' && final_byte != b'l' {
             return;
         }
@@ -471,6 +564,23 @@ mod tests {
     }
 
     #[test]
+    fn an_overlong_csi_parameter_list_is_not_interpreted() {
+        // Dropping parameter bytes past the cap and parsing the remainder
+        // decodes a *different* sequence: this one truncates to `…;2004`
+        // and would set both `bracketed_paste` and the availability flag
+        // §8.4 gates on, from a sequence that says no such thing.
+        let mut input = b"\x1b[?".to_vec();
+        input.extend(std::iter::repeat_n(b'9', 58));
+        input.extend_from_slice(b";20041h");
+        let (s, _) = scan(&input);
+        assert!(!s.modes().bracketed_paste);
+        assert!(
+            !s.modes().saw_bracketed_paste,
+            "truncated parameters forged a tier-gating flag"
+        );
+    }
+
+    #[test]
     fn a_sequence_split_across_chunks_is_still_recognised() {
         // The guard: a scanner that restarted per chunk would see
         // `\x1b[?20` and `04h` and set nothing at all.
@@ -479,6 +589,99 @@ mod tests {
         assert!(!s.modes().bracketed_paste, "must not fire on a partial");
         s.feed(b"04h", 5);
         assert!(s.modes().bracketed_paste, "split sequence was missed");
+    }
+
+    #[test]
+    fn an_escape_cancels_the_sequence_it_interrupts() {
+        // Each input truncates a sequence and starts the next one with no
+        // separator, which is what a short write produces. Without a cancel
+        // rule the scanner stays in the old state, eats the next sequence's
+        // introducer, and spills the remainder into the tail line as text —
+        // and a `$ `-shaped fragment there is exactly what the T3 matcher
+        // would read as a prompt. One case per state that can be
+        // interrupted.
+        for raw in [
+            &b"\x1b[?2004\x1b[?1049h"[..], // truncated CSI
+            &b"\x1b\x1b[?1049h"[..],       // ESC that introduced nothing
+            &b"\x1b#\x1b[?1049h"[..],      // truncated ESC-intermediate
+        ] {
+            let mut s = ModeScanner::new();
+            s.feed(raw, 0);
+            assert!(
+                s.modes().alt_screen,
+                "{raw:?}: the sequence after the truncated one was lost"
+            );
+            assert!(
+                !s.modes().bracketed_paste,
+                "{raw:?}: a sequence with no final byte was applied anyway"
+            );
+            assert!(!s.modes().saw_bracketed_paste, "{raw:?}");
+            assert_eq!(
+                s.last_line(),
+                "",
+                "{raw:?}: escape payload leaked into the tail line"
+            );
+        }
+    }
+
+    #[test]
+    fn can_and_sub_abandon_a_sequence_in_progress() {
+        // The C0 abort controls. Real terminals resynchronise on them, and
+        // a scanner that does not stays blind until a final byte happens
+        // to arrive — which, inside an OSC or DCS payload, may be never.
+        //
+        // No escape follows the abort byte, deliberately. An `ESC` would
+        // cancel the stuck sequence on its own, and this test would then
+        // pass with the C0 rule deleted — which is precisely what an
+        // earlier draft of it did.
+        for abort in [0x18u8, 0x1a] {
+            for (introducer, rest) in [
+                (&b"\x1b[?2004"[..], &b"ok$ "[..]),
+                (&b"\x1b]0;ti"[..], &b"tle$ "[..]),
+                (&b"\x1bPtmux;q"[..], &b"done$ "[..]),
+            ] {
+                let mut s = ModeScanner::new();
+                s.feed(introducer, 0);
+                s.feed(&[abort], introducer.len() as u64);
+                s.feed(rest, introducer.len() as u64 + 1);
+                let want = String::from_utf8(rest.to_vec()).unwrap();
+                assert_eq!(
+                    s.last_line(),
+                    want,
+                    "{abort:#04x} {introducer:?}: never left the sequence"
+                );
+                assert!(
+                    !s.modes().bracketed_paste && !s.modes().saw_bracketed_paste,
+                    "{abort:#04x} {introducer:?}: abandoned sequence was applied"
+                );
+                assert_eq!(s.title(), None, "{abort:#04x} {introducer:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unterminated_string_gives_up_at_the_byte_ceiling() {
+        // `OSC_PAYLOAD_MAX` bounds what a sequence *stores*; nothing there
+        // bounds how long a lost terminator can blind the scanner. A `cat`
+        // of a binary file is enough to trigger it, and DCS is not even
+        // rescued by BEL. Both introducers must give up eventually.
+        for introducer in [&b"\x1b]0;"[..], &b"\x1bPtmux;"[..]] {
+            let mut s = ModeScanner::new();
+            let mut input = introducer.to_vec();
+            input.extend(std::iter::repeat_n(b'x', SEQUENCE_MAX));
+            input.extend_from_slice(b"\r\nuser@host:~$ ");
+            s.feed(&input, 0);
+            assert_eq!(
+                s.last_line(),
+                "user@host:~$ ",
+                "{introducer:?}: still trapped inside the payload"
+            );
+            assert_eq!(
+                s.title(),
+                None,
+                "{introducer:?}: a payload with no terminator is not a title"
+            );
+        }
     }
 
     #[test]
@@ -568,6 +771,20 @@ mod tests {
     }
 
     #[test]
+    fn a_second_command_start_restarts_the_capture() {
+        // `B` always begins a fresh command line; it does not resume an
+        // open one. Reusing the capture concatenates two prompts' worth of
+        // echo into a single command ("onetwo").
+        let (_, ev) = scan(b"\x1b]133;B\x07one\x1b]133;B\x07two\r\n\x1b]133;C\x07");
+        assert_eq!(
+            ev[2].marker,
+            Osc133::OutputStart {
+                command: "two".into()
+            }
+        );
+    }
+
+    #[test]
     fn text_outside_a_b_to_c_span_is_not_captured() {
         // Prompt text sits between A and B and must not become the command.
         let (_, ev) = scan(b"\x1b]133;A\x07bash-5.3$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07");
@@ -611,6 +828,21 @@ mod tests {
     }
 
     #[test]
+    fn an_osc_with_a_lost_terminator_does_not_swallow_the_next_marker() {
+        // Treating a non-ST escape as payload means one dropped `\x07`
+        // consumes every marker until some later BEL arrives — and then
+        // reports the wreckage as a window title.
+        let (s, ev) = scan(b"\x1b]0;oops\x1b]133;A\x07");
+        assert_eq!(ev.len(), 1, "the marker was eaten by the unterminated OSC");
+        assert_eq!(ev[0].marker, Osc133::PromptStart);
+        assert_eq!(
+            s.title(),
+            None,
+            "a payload with no terminator was reported as a title"
+        );
+    }
+
+    #[test]
     fn window_title_is_captured() {
         let (s, _) = scan(b"\x1b]0;user@host: ~\x07");
         assert_eq!(s.title(), Some("user@host: ~"));
@@ -651,7 +883,11 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_osc_payload_resynchronises_without_growing() {
+    fn an_oversized_osc_payload_is_discarded_and_the_machine_resynchronises() {
+        // Named for what it asserts: the payload is not trusted, and the
+        // scanner picks the stream back up. It does *not* assert anything
+        // about buffer growth — `OSC_PAYLOAD_MAX` is what bounds that, and
+        // proving it here would mean exposing buffer sizes as API.
         let mut s = ModeScanner::new();
         let mut input = b"\x1b]0;".to_vec();
         input.extend(std::iter::repeat_n(b'A', OSC_PAYLOAD_MAX * 4));
