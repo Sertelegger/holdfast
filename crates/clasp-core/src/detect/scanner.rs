@@ -547,6 +547,27 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_carriage_return_at_a_chunk_boundary_still_overwrites_the_capture() {
+        // The sibling test above splits `\r` from its `\n`, which stays
+        // green even if the lookahead is dropped at every chunk boundary:
+        // the `\n` appends either way. This one splits a *bare* `\r` from
+        // the text that overwrites it, so only a `pending_cr` that survives
+        // the boundary gets it right. That is the likeliest instance of the
+        // whole class — a PTY read ending just after a progress bar's `\r`
+        // is what `cargo`, `curl` and every spinner produce all day.
+        let mut s = ModeScanner::new();
+        s.feed(b"\x1b]133;B\x07junk\r", 0);
+        let ev = s.feed(b"real\r\n\x1b]133;C\x07", 13);
+        assert_eq!(
+            ev[0].marker,
+            Osc133::OutputStart {
+                command: "real".into()
+            },
+            "the carriage return did not carry across the chunk boundary"
+        );
+    }
+
+    #[test]
     fn text_outside_a_b_to_c_span_is_not_captured() {
         // Prompt text sits between A and B and must not become the command.
         let (_, ev) = scan(b"\x1b]133;A\x07bash-5.3$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07");
