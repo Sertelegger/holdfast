@@ -65,6 +65,7 @@ fn spawns_a_shell_and_reads_output() {
 #[test]
 fn terminate_kills_the_whole_process_group() {
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
+    assert_eq!(pty.signal_deliveries(), 0, "nothing has been signalled yet");
 
     // Background a child so shell job control puts it in its OWN process
     // group. This is the case a plain killpg(child_pid) does not reach.
@@ -89,6 +90,14 @@ fn terminate_kills_the_whole_process_group() {
     assert!(
         !pid_alive(child_pid),
         "descendant {child_pid} survived the session sweep"
+    );
+    // Positive control for `signal_after_exit_is_a_no_op`, which asserts
+    // this counter stays at zero. Without a case that drives it up, a
+    // counter that never incremented would make that assertion vacuous —
+    // exactly the failure mode the zero-assertion exists to close.
+    assert!(
+        pty.signal_deliveries() > 0,
+        "a live sweep must actually reach the OS"
     );
 }
 
@@ -163,6 +172,21 @@ fn signal_after_exit_is_a_no_op() {
         .expect("signal after exit must be Ok");
     pty.signal(Signal::Interrupt)
         .expect("signal after exit must be Ok");
+
+    // The assertion that actually tests the guard. `Ok(())` alone does
+    // not: Kill and Terminate route through `sweep`, which counts ESRCH
+    // as a success, so both return `Ok` whether or not the guard is
+    // there — deleting the guard used to leave this test passing on the
+    // two arms that matter and failing only on `Interrupt`, which is not
+    // even a 0.0.1 tool. The delivery counter is what makes "no signal
+    // left this process" observable, and it is the only thing standing
+    // between a recycled PID and a stranger's session.
+    assert_eq!(
+        pty.signal_deliveries(),
+        0,
+        "a signal was delivered to a PID that has already exited and may \
+         since have been recycled"
+    );
 }
 
 use clasp_core::mcp::tools::{ReadOutputArgs, SendInputArgs, StartSessionArgs, TerminateArgs};
@@ -396,6 +420,38 @@ async fn start_bash(server: &ClaspServer) -> String {
         .as_str()
         .unwrap()
         .to_string()
+}
+
+/// Start `bash -c <script>` and return its session id.
+async fn start_script(server: &ClaspServer, script: &str) -> String {
+    let started = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: vec![
+                "--norc".into(),
+                "--noprofile".into(),
+                "-c".into(),
+                script.into(),
+            ],
+            name: None,
+            cwd: None,
+            env: None,
+            cols: None,
+            rows: None,
+        }))
+        .await
+        .unwrap();
+    body(&started)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn kill_all(server: &ClaspServer) {
+    for s in server.registry.all() {
+        let _ = s.signal(clasp_core::pty::Signal::Kill);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
 #[tokio::test]
@@ -793,5 +849,348 @@ async fn send_input_to_an_exited_session_reports_session_died() {
         r.is_error,
         Some(true),
         "session_died is an outcome, not an error"
+    );
+}
+
+/// A child that has stopped reading its terminal must not be able to take
+/// the server down with it.
+///
+/// Written against a hand-built runtime rather than `#[tokio::test]`
+/// because both ends have to be bounded.
+///
+/// The runtime must be multi-threaded: before the fix the blocking write
+/// ran inline on the calling worker, and on the default current-thread
+/// runtime the timers below could never fire at all — the test would hang
+/// rather than fail. And the shutdown must be bounded and must happen even
+/// when an assertion fails, because a parked write is still parked when
+/// the test ends and `Runtime::drop` waits for its thread with no
+/// deadline. Hence `catch_unwind` → `shutdown_timeout` → `resume_unwind`:
+/// a regression must make this test go *red*, not make the suite hang.
+#[test]
+fn send_input_to_a_child_that_never_reads_returns_and_leaves_the_server_usable() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(wedged_send_input_body())
+    }));
+
+    // The write is *still* parked: the kernel does not wake a blocked
+    // pty-master writer when the slave closes, so killing the child does
+    // not release it. Dropping the runtime would wait for that thread
+    // without a deadline.
+    rt.shutdown_timeout(Duration::from_secs(2));
+
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+async fn wedged_send_input_body() {
+    let server = ClaspServer::new();
+
+    // `stty raw` is the whole point. In canonical mode the line
+    // discipline *discards* input it cannot buffer, so a write to a
+    // non-reading child returns immediately — which is why none of
+    // the other tests here ever saw this. In raw mode it parks the
+    // writer instead, and `exec sleep 300` guarantees nothing will
+    // ever drain it.
+    let wedged = start_script(&server, "stty raw -echo; exec sleep 300").await;
+    let healthy = start_bash(&server).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Comfortably past the few KiB the line discipline will hold, so
+    // the write cannot complete no matter how long it waits.
+    let payload = "x".repeat(64 * 1024);
+
+    let started = Instant::now();
+    let call = tokio::spawn({
+        let server = server.clone();
+        let session = wedged.clone();
+        async move {
+            server
+                .send_input(Parameters(SendInputArgs {
+                    session,
+                    data: payload,
+                    append_newline: Some(false),
+                }))
+                .await
+        }
+    });
+
+    // While that write is parked, the server must still answer for a
+    // DIFFERENT session. Before the fix each blocked write consumed a
+    // worker, and a handful of them took out every tool — including
+    // terminate, the only way to recover.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let other = tokio::time::timeout(
+        Duration::from_secs(10),
+        server.send_input(Parameters(SendInputArgs {
+            session: healthy.clone(),
+            data: "echo STILL''_SERVING".into(),
+            append_newline: None,
+        })),
+    )
+    .await
+    .expect("the server stopped answering for an unrelated session")
+    .expect("send_input must not be a protocol error");
+    assert_eq!(body(&other)["status"], "ok");
+    let out = read_until_contains(&server, &healthy, "STILL_SERVING", 30).await;
+    assert!(out.contains("STILL_SERVING"), "got: {out:?}");
+
+    // And the wedged call itself must come back rather than hang.
+    let r = tokio::time::timeout(Duration::from_secs(20), call)
+        .await
+        .expect("send_input never returned; a blocking write wedged the worker")
+        .expect("send_input task panicked")
+        .expect("send_input must not be a protocol error");
+    let elapsed = started.elapsed();
+    let b = body(&r);
+    assert_eq!(
+        b["status"], "timeout",
+        "a write the child never accepted is a timeout, not a success: {b}"
+    );
+    assert_ne!(
+        r.is_error,
+        Some(true),
+        "timeout is an outcome the agent handles, not an error (§18.1)"
+    );
+    assert!(
+        b["data"]["bytes_written"].is_null(),
+        "the write may have partially landed, so a count would be a guess: {b}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "send_input took {elapsed:?}; it must return on its own deadline"
+    );
+
+    // A second write to the SAME session must also return, instead of
+    // queueing behind the first one's lock forever.
+    let again = tokio::time::timeout(
+        Duration::from_secs(20),
+        server.send_input(Parameters(SendInputArgs {
+            session: wedged.clone(),
+            data: "y".into(),
+            append_newline: Some(false),
+        })),
+    )
+    .await
+    .expect("a second write to a wedged session never returned")
+    .expect("send_input must not be a protocol error");
+    assert_eq!(body(&again)["status"], "timeout");
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn send_input_rejects_an_oversized_payload() {
+    // `data` was unbounded, which is what made a 256 KiB write to a
+    // non-reading child possible in the first place.
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+
+    let r = server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "x".repeat(64 * 1024 + 1),
+            append_newline: Some(false),
+        }))
+        .await;
+    assert!(r.is_err(), "an oversized payload must be a protocol error");
+
+    // The cap is on size alone: the same call with a small payload works,
+    // so the rejection above cannot be blamed on the session or the args.
+    let ok = server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "echo SIZE''_OK".into(),
+            append_newline: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&ok)["status"], "ok");
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn read_output_does_not_claim_a_cap_that_returned_everything() {
+    // The `since_cursor` branch reported `truncated_for_size: true`
+    // whenever the read filled max_bytes -- including when it filled it by
+    // returning the entire buffer. The response then claimed a cap and a
+    // null `next_cursor` in the same breath: "there is more, and there is
+    // nothing more". The identical bug was fixed twice on the tail_bytes
+    // branch and never propagated here.
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+    let session = server.registry.get(&id).unwrap();
+
+    session.write_input(b"echo CAP''_MARKER\n").unwrap();
+    let out = read_until_contains(&server, &id, "CAP_MARKER", 30).await;
+    assert!(out.contains("CAP_MARKER"), "got: {out:?}");
+
+    // Kill the child so the buffer stops growing; otherwise the reader
+    // thread can append between the read and the assertion.
+    let _ = session.signal(clasp_core::pty::Signal::Kill);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let head = session.buffer_head();
+    assert!(head > 1, "the shell produced nothing to read");
+
+    let exact = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: Some(0),
+            tail_lines: None,
+            tail_bytes: None,
+            max_bytes: Some(head as usize),
+        }))
+        .await
+        .unwrap();
+    let b = body(&exact);
+    assert_eq!(b["data"]["bytes_returned"], head);
+    assert_eq!(
+        b["data"]["truncated_for_size"], false,
+        "the read returned the whole buffer, so nothing was capped: {b}"
+    );
+    assert!(
+        b["data"]["next_cursor"].is_null(),
+        "next_cursor and truncated_for_size must agree: {b}"
+    );
+
+    // The other direction, so the assertion above is not satisfied by an
+    // implementation that simply never sets the flag.
+    let short = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: Some(0),
+            tail_lines: None,
+            tail_bytes: None,
+            max_bytes: Some(head as usize - 1),
+        }))
+        .await
+        .unwrap();
+    let b = body(&short);
+    assert_eq!(b["data"]["bytes_returned"], head - 1);
+    assert_eq!(
+        b["data"]["truncated_for_size"], true,
+        "one byte was genuinely left behind: {b}"
+    );
+    assert_eq!(b["data"]["next_cursor"], head - 1);
+}
+
+#[tokio::test]
+async fn read_output_rejects_a_zero_max_bytes() {
+    // `max_bytes: 0` returned `bytes_returned: 0, truncated_for_size:
+    // true, next_cursor: <unchanged>`, so an agent following the
+    // documented "retry at next_cursor" rule spun forever making no
+    // progress. A read that cannot advance is a caller bug, and the tool
+    // already treats schema violations as protocol errors (§5.1).
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+
+    let zero = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: Some(0),
+            tail_lines: None,
+            tail_bytes: None,
+            max_bytes: Some(0),
+        }))
+        .await;
+    assert!(zero.is_err(), "max_bytes: 0 must be a protocol error");
+
+    // One byte is legal, so the rejection is about zero specifically and
+    // not about small caps in general.
+    let one = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: Some(0),
+            tail_lines: None,
+            tail_bytes: None,
+            max_bytes: Some(1),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&one)["status"], "ok");
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
+    // §5.2: the returned `cwd` is the directory the child was actually
+    // spawned in. Echoing the caller's own argument back tells it nothing,
+    // and this is on the tool surface §23.3 freezes at 0.0.1.
+    let server = ClaspServer::new();
+
+    let relative = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            name: None,
+            cwd: Some(".".into()),
+            env: None,
+            cols: None,
+            rows: None,
+        }))
+        .await
+        .unwrap();
+    let cwd = body(&relative)["data"]["cwd"]
+        .as_str()
+        .expect("cwd must be reported")
+        .to_string();
+    assert!(
+        std::path::Path::new(&cwd).is_absolute(),
+        "a relative cwd must round-trip as an absolute path; got {cwd:?}"
+    );
+    assert_eq!(
+        cwd,
+        std::env::current_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+    );
+
+    // Stronger than the `.` case, which an implementation that merely
+    // joined the argument onto the process cwd would also satisfy: only a
+    // canonicalising implementation resolves a symlink.
+    let base = std::env::temp_dir().canonicalize().unwrap();
+    let target = base.join(format!("clasp-cwd-target-{}", std::process::id()));
+    let link = base.join(format!("clasp-cwd-link-{}", std::process::id()));
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let symlinked = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            name: None,
+            cwd: Some(link.to_string_lossy().into_owned()),
+            env: None,
+            cols: None,
+            rows: None,
+        }))
+        .await
+        .unwrap();
+    let cwd = body(&symlinked)["data"]["cwd"]
+        .as_str()
+        .expect("cwd must be reported")
+        .to_string();
+
+    kill_all(&server).await;
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_dir_all(&target);
+
+    assert_eq!(
+        cwd,
+        target.to_string_lossy(),
+        "the returned cwd must be the effective directory, not the symlink \
+         the caller passed"
     );
 }

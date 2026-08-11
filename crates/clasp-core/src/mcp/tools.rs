@@ -11,6 +11,46 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Hard cap on a single `send_input` payload.
+///
+/// `data` was unbounded. The PTY master is a blocking fd whose drain rate
+/// is entirely up to the child, so a large payload to a child that is not
+/// reading is precisely the input that parks a thread. 64 KiB is far more
+/// than any keystroke or realistic paste and an order of magnitude below
+/// the 1 MiB output buffer, so no legitimate caller meets it; it also
+/// matches the 64 KiB body cap the web API applies to secret submission
+/// (spec §7.6). Oversize is a *protocol* error rather than a status: the
+/// request violates the input schema, it does not fail operationally.
+const MAX_SEND_INPUT_BYTES: usize = 64 * 1024;
+
+/// How long `send_input` waits for the write to reach the child before
+/// answering `timeout`.
+///
+/// Matches `terminate`'s default SIGTERM grace. A write to a healthy
+/// child completes in microseconds; anything near this deadline means the
+/// child has stopped draining its tty, and the agent is better served by
+/// a `timeout` it can act on than by a tool call that never returns.
+const SEND_INPUT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The `timeout` envelope for a write that never reached the child.
+fn write_timed_out(details: impl Into<String>) -> CallToolResult {
+    envelope::envelope(
+        Status::Timeout,
+        // `bytes_written` is null rather than 0 on purpose: `write_all`
+        // may have pushed part of the payload into the tty before it
+        // parked, so any number here would be a guess. Null says
+        // "unknown", which is the truth. §18.1 mandates no `data` fields
+        // for `timeout`, and `isError` stays false, so an agent that
+        // dispatches on `status` handles this without special-casing.
+        json!({
+            "bytes_written": serde_json::Value::Null,
+            "timeout_ms": SEND_INPUT_TIMEOUT.as_millis() as u64,
+        }),
+        details,
+    )
+}
 
 /// Unix seconds. Spec §5.4 requires RFC-3339 timestamp strings; that
 /// arrives in 0.0.3 along with the audit log, which needs a date crate
@@ -67,17 +107,35 @@ impl ClaspServer {
         // the agent is told `ok` while running somewhere else entirely.
         // Validate here, and pin the default explicitly rather than
         // inheriting that $HOME fallback.
+        //
+        // The path is *canonicalised* rather than echoed back: §5.2 says
+        // the returned `cwd` is the effective working directory the child
+        // was spawned in, so handing a caller its own "." or a symlinked
+        // path straight back would answer a question it did not ask.
+        // `canonicalize` also fails outright on a path that does not
+        // exist, which subsumes half the check; `is_dir` still matters
+        // because an existing *file* canonicalises perfectly well.
         cfg.cwd = match &args.cwd {
             Some(cwd) => {
-                if !std::path::Path::new(cwd).is_dir() {
-                    return Err(ErrorData::invalid_params(
-                        format!("cwd is not an existing directory: {cwd}"),
-                        None,
-                    ));
+                let resolved = std::path::Path::new(cwd)
+                    .canonicalize()
+                    .ok()
+                    .filter(|p| p.is_dir());
+                match resolved {
+                    Some(p) => Some(p.to_string_lossy().into_owned()),
+                    None => {
+                        return Err(ErrorData::invalid_params(
+                            format!("cwd is not an existing directory: {cwd}"),
+                            None,
+                        ))
+                    }
                 }
-                Some(cwd.clone())
             }
+            // `getcwd(2)` already resolves symlinks, so this is canonical
+            // by construction; canonicalise anyway so both arms are
+            // provably producing the same kind of path.
             None => std::env::current_dir()
+                .and_then(|p| p.canonicalize())
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned()),
         };
@@ -161,6 +219,22 @@ impl ClaspServer {
                 None,
             ));
         }
+        // `max_bytes: 0` is not a smaller read, it is a read that can
+        // never make progress: the response is `bytes_returned: 0,
+        // truncated_for_size: true, next_cursor: <the cursor it was
+        // given>`, so an agent following the documented "retry at
+        // next_cursor" rule live-locks. Clamping to 1 would keep the loop
+        // technically advancing at one byte per round trip, which is not a
+        // service to anyone; the request is a caller bug, so it is
+        // rejected like every other schema violation (§5.1) and for the
+        // same reason — the agent gets told what is wrong instead of
+        // silently getting something it did not ask for.
+        if args.max_bytes == Some(0) {
+            return Err(ErrorData::invalid_params(
+                "max_bytes must be at least 1",
+                None,
+            ));
+        }
 
         let session = match self.registry.get(&args.session) {
             Ok(s) => s,
@@ -169,12 +243,20 @@ impl ClaspServer {
 
         let max_bytes = args.max_bytes.unwrap_or(32 * 1024).min(256 * 1024);
         // `truncated_for_size` means "this response was capped at
-        // max_bytes" (§18.2). It is computed per branch rather than by
-        // re-reading `head` afterwards: the reader thread can append
-        // between the two calls, which would report a cap that never
-        // happened.
-        let (read, truncated_for_size) = if let Some(c) = args.since_cursor {
+        // max_bytes" (§18.2). Each branch computes the half of that
+        // question only it can answer — whether `max_bytes` was the
+        // *binding* constraint on this particular read — rather than
+        // re-deriving it from `head` afterwards, which would report a cap
+        // that never happened whenever the reader thread appended in
+        // between.
+        let is_cursor_read = args.since_cursor.is_some();
+        let (read, size_capped) = if let Some(c) = args.since_cursor {
             let r = session.read_from(c, max_bytes);
+            // Necessary but not sufficient on its own: a forward read
+            // fills exactly `max_bytes` both when it left bytes behind and
+            // when the buffer happened to hold exactly that many. The
+            // "and something was actually left behind" half is
+            // `more_forward`, applied below — it needs the post-read head.
             let capped = r.bytes.len() >= max_bytes;
             (r, capped)
         } else if let Some(n) = args.tail_lines {
@@ -198,6 +280,9 @@ impl ClaspServer {
             // reports a cap when the caller asked for exactly max_bytes
             // and got exactly that -- also no truncation. Only when
             // max_bytes was the *binding* constraint was anything lost.
+            // (A tail read always ends at `head`, so unlike the cursor
+            // branch there is never anything "further forward" to fetch;
+            // the two clauses here are the whole test.)
             let capped = requested > max_bytes && r.bytes.len() >= max_bytes;
             (r, capped)
         };
@@ -207,6 +292,13 @@ impl ClaspServer {
         let output = String::from_utf8_lossy(&read.bytes).to_string();
         let state = session.state();
         let more_forward = read.cursor < session.buffer_head();
+        // The cursor branch's missing clause. Without it, 86 buffered
+        // bytes read with `max_bytes: 86` answer `bytes_returned: 86,
+        // truncated_for_size: true, next_cursor: null` — claiming a cap
+        // while simultaneously reporting nothing left to fetch. Reusing
+        // `more_forward` keeps the flag and `next_cursor` derived from one
+        // fact instead of two that can disagree.
+        let truncated_for_size = size_capped && (!is_cursor_read || more_forward);
 
         Ok(envelope::ok(
             json!({
@@ -229,6 +321,20 @@ impl ClaspServer {
         &self,
         Parameters(args): Parameters<SendInputArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Bound the payload before anything else, for the same reason
+        // read_output validates before resolution: a schema violation is a
+        // protocol error (§5.1) and must not be masked by a
+        // `session_not_found` envelope when both are wrong at once.
+        if args.data.len() > MAX_SEND_INPUT_BYTES {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "data is {} bytes; send_input accepts at most {MAX_SEND_INPUT_BYTES}",
+                    args.data.len()
+                ),
+                None,
+            ));
+        }
+
         let session = match self.registry.get(&args.session) {
             Ok(s) => s,
             Err(e) => return envelope::from_error(&e),
@@ -245,17 +351,59 @@ impl ClaspServer {
         if args.append_newline.unwrap_or(true) {
             payload.push(b'\n');
         }
-        let written = match session.write_input(&payload) {
-            Ok(n) => n,
+
+        // The write goes to a *blocking* master fd, and the child decides
+        // when it drains. A child in raw mode that never reads fills the
+        // line discipline's input buffer and parks the writer for as long
+        // as it likes. Running that inline burned a tokio worker per call
+        // and could not be cancelled, so a handful of such calls took the
+        // whole MCP server down — including `terminate`, the only way out.
+        // `spawn_blocking` moves it to the blocking pool, and the deadline
+        // means the tool answers whether or not the child ever cooperates.
+        let writer_session = Arc::clone(&session);
+        let write = tokio::task::spawn_blocking(move || writer_session.write_input(&payload));
+        let written = match tokio::time::timeout(SEND_INPUT_TIMEOUT, write).await {
+            Ok(Ok(Ok(n))) => n,
+            // An earlier write is still parked on this session's writer
+            // lock, so this one never even reached the fd.
+            Ok(Ok(Err(crate::ClaspError::WriteTimeout))) => {
+                return Ok(write_timed_out(
+                    "a previous write to this session is still blocked; the child is not \
+                     reading its terminal",
+                ));
+            }
             // The child can die between the liveness check above and the
             // write; a real PTY reports that as EIO. That *is*
             // `session_died` — but only here, where the context makes it
             // true. `from_error` deliberately refuses to guess.
-            Err(e) => {
+            Ok(Ok(Err(e))) => {
                 return Ok(envelope::envelope(
                     Status::SessionDied,
                     json!({ "exit_code": session.exit_code() }),
                     format!("session exited during the write: {e}"),
+                ));
+            }
+            // The blocking task panicked. That is a CLASP bug, not a
+            // session outcome, so it takes the protocol channel (§5.1).
+            Ok(Err(join)) => {
+                return Err(ErrorData::internal_error(
+                    format!("write task failed: {}", envelope::brief(&join)),
+                    None,
+                ));
+            }
+            // The deadline elapsed. `spawn_blocking` tasks cannot be
+            // cancelled, so that thread is still parked on the fd — and
+            // measurably stays parked even after the child is killed,
+            // because Linux does not wake a blocked pty-master writer when
+            // the slave closes. It is detached rather than leaked into the
+            // request path: it holds only the writer lock, which is what
+            // makes the bounded-acquisition branch above fire for every
+            // later write instead of queueing behind it. `clasp mcp` bounds
+            // its runtime shutdown for the same reason.
+            Err(_elapsed) => {
+                return Ok(write_timed_out(
+                    "the child did not accept the input within the write deadline; it may be \
+                     in a mode where it is not reading its terminal",
                 ));
             }
         };
@@ -332,6 +480,7 @@ pub struct ReadOutputArgs {
     #[serde(default)]
     pub tail_bytes: Option<usize>,
     /// Cap on bytes returned. Defaults to 32768, hard limit 262144.
+    /// Must be at least 1: a zero cap can never make forward progress.
     #[serde(default)]
     pub max_bytes: Option<usize>,
 }
@@ -340,7 +489,7 @@ pub struct ReadOutputArgs {
 pub struct SendInputArgs {
     /// Session id or live session name.
     pub session: String,
-    /// Text to write to the session's stdin.
+    /// Text to write to the session's stdin. At most 65536 bytes.
     pub data: String,
     /// Append a newline. Defaults to true.
     #[serde(default)]

@@ -5,6 +5,18 @@ use crate::{ClaspError, Result};
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+/// How long `write` waits for the writer lock before giving up.
+///
+/// The master fd is blocking and the *child* decides when it drains, so a
+/// raw-mode child that never reads leaves an in-flight `write_all` parked
+/// indefinitely — holding this lock with it. Bounding acquisition means
+/// the next write reports `timeout` promptly instead of parking a second
+/// thread behind the first, which is how one wedged session used to
+/// consume every worker in the server.
+const WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct InProcessPty {
     // `MasterPty: Downcast + Send` is **not** `Sync`, and `PtyBackend`
@@ -16,6 +28,18 @@ pub struct InProcessPty {
     pid: Option<u32>,
     /// Cached exit status so `exit_code` stays cheap and idempotent.
     exit: Mutex<Option<i32>>,
+    /// How many times this PTY has actually asked the OS to deliver a
+    /// signal (one count per `kill(2)` attempt).
+    ///
+    /// This exists to make the post-exit guard in `signal` *observable*.
+    /// The guard is the only thing stopping a `/proc` sweep from
+    /// signalling whatever session has since inherited a recycled PID, but
+    /// `sweep` treats `ESRCH` as success, so removing the guard changes no
+    /// return value — a test asserting `Ok(())` passes either way. Counting
+    /// deliveries turns "no signal left this process" into something a test
+    /// can assert. Deliberately not `#[cfg(test)]`: the integration tests
+    /// link this crate externally and would not see it.
+    signal_deliveries: AtomicUsize,
 }
 
 /// Signal a whole process group. Negative pid == "the group" for kill(2).
@@ -81,7 +105,23 @@ impl InProcessPty {
             writer: Mutex::new(writer),
             pid,
             exit: Mutex::new(None),
+            signal_deliveries: AtomicUsize::new(0),
         })
+    }
+
+    /// Number of `kill(2)` calls this PTY has issued since it was spawned.
+    ///
+    /// Zero means no signal ever left this process — which is exactly the
+    /// property the post-exit guard in `signal` exists to provide.
+    pub fn signal_deliveries(&self) -> usize {
+        self.signal_deliveries.load(Ordering::Relaxed)
+    }
+
+    /// Issue one `kill(2)`, counting the attempt.
+    #[cfg(unix)]
+    fn deliver(&self, pgid: i32, signum: i32) -> std::io::Result<()> {
+        self.signal_deliveries.fetch_add(1, Ordering::Relaxed);
+        killpg(pgid, signum)
     }
 
     /// The child's own process group and session id. `setsid()` in the
@@ -181,7 +221,7 @@ impl InProcessPty {
         let mut delivered = false;
         let mut last_err = None;
         for g in groups {
-            match killpg(g, signum) {
+            match self.deliver(g, signum) {
                 Ok(()) => delivered = true,
                 // ESRCH: that group is already gone. Still a success.
                 Err(e) if e.raw_os_error() == Some(libc::ESRCH) => delivered = true,
@@ -198,7 +238,15 @@ impl InProcessPty {
 
 impl PtyBackend for InProcessPty {
     fn write(&self, data: &[u8]) -> Result<()> {
-        let mut w = self.writer.lock();
+        // `lock()` here would queue behind a parked writer forever; see
+        // WRITE_LOCK_TIMEOUT. The `write_all` below can still block for as
+        // long as the child refuses to drain — bounding *that* would need
+        // a non-blocking fd and a poll loop, and the fd is shared with the
+        // reader — so callers must additionally run this off the async
+        // runtime under their own deadline.
+        let Some(mut w) = self.writer.try_lock_for(WRITE_LOCK_TIMEOUT) else {
+            return Err(ClaspError::WriteTimeout);
+        };
         w.write_all(data)?;
         w.flush()?;
         Ok(())
@@ -222,7 +270,7 @@ impl PtyBackend for InProcessPty {
                 let Some(g) = self.foreground_pgid() else {
                     return Err(ClaspError::Pty("no process group to signal".into()));
                 };
-                killpg(g, libc::SIGINT).map_err(ClaspError::Io)
+                self.deliver(g, libc::SIGINT).map_err(ClaspError::Io)
             }
             Signal::Terminate => self.sweep(libc::SIGTERM),
             Signal::Kill => self.sweep(libc::SIGKILL),

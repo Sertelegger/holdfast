@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Ok,
+    Timeout,
     SessionDied,
     SessionNotFound,
     NameTaken,
@@ -19,6 +20,7 @@ impl Status {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            Self::Timeout => "timeout",
             Self::SessionDied => "session_died",
             Self::SessionNotFound => "session_not_found",
             Self::NameTaken => "name_taken",
@@ -28,6 +30,11 @@ impl Status {
     }
 
     /// Whether this status should surface as an MCP tool error.
+    ///
+    /// `Timeout` is deliberately absent: §18.1 lists it with
+    /// `isError: false` because a deadline elapsing is an outcome the
+    /// agent is expected to handle (retry, read output, terminate), not a
+    /// failure that should halt its plan.
     pub fn is_error(self) -> bool {
         matches!(
             self,
@@ -90,6 +97,11 @@ pub fn from_error(e: &crate::ClaspError) -> Result<CallToolResult, ErrorData> {
         E::NameTaken(_) => Status::NameTaken,
         E::LimitReached(_) => Status::LimitReached,
         E::SessionDied => Status::SessionDied,
+        // Same caveat as `SessionDied` above: a caller that holds the
+        // session should build the envelope directly so it can attach the
+        // deadline it actually applied. §18.1 mandates no `data` fields
+        // for `timeout`, so `data: {}` is at least not a lie.
+        E::WriteTimeout => Status::Timeout,
         E::Pty(_) | E::Io(_) => {
             return Err(ErrorData::internal_error(e.to_string(), None));
         }
@@ -160,6 +172,16 @@ mod tests {
     }
 
     #[test]
+    fn timeout_is_not_an_error() {
+        // §18.1 lists `timeout` with isError: false — a deadline elapsing
+        // is something the agent handles, not something that should halt
+        // its plan.
+        let r = envelope(Status::Timeout, json!({}), "deadline elapsed");
+        assert_eq!(body_of(&r)["status"], "timeout");
+        assert_ne!(r.is_error, Some(true));
+    }
+
+    #[test]
     fn error_mapping_covers_the_registry_errors() {
         let cases = [
             (
@@ -169,6 +191,7 @@ mod tests {
             (crate::ClaspError::NameTaken("b".into()), "name_taken"),
             (crate::ClaspError::LimitReached(8), "limit_reached"),
             (crate::ClaspError::SessionDied, "session_died"),
+            (crate::ClaspError::WriteTimeout, "timeout"),
         ];
         for (err, expected) in cases {
             let r = from_error(&err).expect("catalogued status must be an envelope");
