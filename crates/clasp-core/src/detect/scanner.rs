@@ -23,7 +23,7 @@ const OSC_PAYLOAD_MAX: usize = 1024;
 /// Cap on the echoed command line captured between OSC 133 `B` and `C`.
 const COMMAND_CAPTURE_MAX: usize = 4096;
 /// Hard ceiling on the bytes a single control sequence may *consume*
-/// before the scanner abandons it and returns to `Ground`.
+/// before the scanner abandons it.
 ///
 /// `OSC_PAYLOAD_MAX` bounds what a sequence stores; this bounds how long a
 /// malformed one can blind the scanner. Without it an OSC or DCS whose
@@ -33,10 +33,15 @@ const COMMAND_CAPTURE_MAX: usize = 4096;
 /// the availability flags §8.4 uses to *pick* a tier, so losing them
 /// silently disables deterministic detection rather than weakening it.
 ///
-/// Deliberately well clear of `OSC_PAYLOAD_MAX` so that a merely oversized
-/// payload still resynchronises through the overflow path, which keeps its
-/// terminator, rather than being cut off here.
-const SEQUENCE_MAX: usize = 8 * OSC_PAYLOAD_MAX;
+/// This is a *blindness budget*, not a size limit on legitimate sequences.
+/// Everything past `OSC_PAYLOAD_MAX` is already consumed without being
+/// stored or interpreted, so a well-formed sequence pays nothing for being
+/// long — but tripping this ceiling on one is not a harmless truncation
+/// (see `give_up`), so it has to sit well above what real programs emit.
+/// At `8 * OSC_PAYLOAD_MAX` it did not: tmux and vim `set-clipboard` write
+/// multi-KiB OSC 52 payloads and sixel images are larger still, and a
+/// 9 KiB *correctly terminated* OSC 52 was measured tripping it.
+const SEQUENCE_MAX: usize = 64 * OSC_PAYLOAD_MAX;
 /// Cap on CSI parameter bytes. Past this the sequence is consumed to its
 /// final byte but not interpreted.
 const CSI_PARAMS_MAX: usize = 64;
@@ -84,6 +89,9 @@ enum State {
     Str,
     /// Saw `\x1b` while inside such a string.
     StrEsc,
+    /// A sequence was abandoned at `SEQUENCE_MAX`; bytes are dropped until
+    /// the next newline rather than allowed to become terminal text.
+    Discard,
 }
 
 /// The last logical line of printable text, bounded and escape-free.
@@ -208,6 +216,17 @@ impl ModeScanner {
         let mut events = Vec::new();
         for (i, &b) in bytes.iter().enumerate() {
             let offset = base + i as u64;
+            // Ahead of everything, including the resynchronisation rules
+            // below: nothing in a discarded run is trusted — not as text,
+            // and not as a sequence either. An `ESC` here is payload the
+            // abandoned sequence chose, so honouring it would let that
+            // payload set the very availability flags §8.4 gates on.
+            if self.state == State::Discard {
+                if b == b'\n' {
+                    self.state = State::Ground;
+                }
+                continue;
+            }
             // Resynchronisation, ahead of any state-specific handling. A
             // sequence that never terminates must not be able to blind the
             // scanner for the rest of the session.
@@ -221,9 +240,8 @@ impl ModeScanner {
                 }
                 self.seq_len += 1;
                 if self.seq_len > SEQUENCE_MAX {
-                    // Give up and reconsider this byte as ordinary text:
-                    // the match below now sees `Ground`.
-                    self.abort();
+                    self.give_up();
+                    continue;
                 }
             }
             match self.state {
@@ -268,6 +286,8 @@ impl ModeScanner {
                         State::Str
                     };
                 }
+                // Handled above, before the resynchronisation rules.
+                State::Discard => unreachable!(),
             }
         }
         events
@@ -283,6 +303,31 @@ impl ModeScanner {
         self.osc.clear();
         self.osc_overflowed = false;
         self.seq_len = 0;
+    }
+
+    /// Abandon a sequence that has consumed `SEQUENCE_MAX` bytes without
+    /// terminating, and distrust the rest of the line it was sitting on.
+    ///
+    /// The byte that trips the ceiling is deliberately *not* reconsidered
+    /// as ordinary text, and neither is anything up to the next newline.
+    /// Returning straight to `Ground` re-opens the injection the
+    /// resynchronisation rules exist to close, and does it for *correctly
+    /// terminated* sequences: the remainder of the abandoned payload
+    /// becomes terminal text, and the program emitting it chose that text.
+    /// Measured — a 9 KiB BEL-terminated OSC 52 clipboard write whose
+    /// payload ended `\r\nroot@prod:/etc# ` yielded exactly that as
+    /// `last_line()`, which §8.6 scores 0.85, §8.4's act threshold. A
+    /// forged prompt is worse than no prompt: a false `AtPrompt` tells the
+    /// agent to type, where blindness only tells it to wait.
+    ///
+    /// The tail line is cleared for the same reason. Whatever preceded the
+    /// abandoned sequence is not a line the scanner can still vouch for,
+    /// and an empty tail scores 0.0 — the fail-safe direction.
+    fn give_up(&mut self) {
+        self.abort();
+        self.tail.reset();
+        self.pending_cr = false;
+        self.state = State::Discard;
     }
 
     /// Begin a fresh escape sequence at `offset`, discarding anything in
@@ -682,6 +727,142 @@ mod tests {
                 "{introducer:?}: a payload with no terminator is not a title"
             );
         }
+    }
+
+    /// A `9 KiB` control string of `kind`, correctly terminated, whose
+    /// payload ends with a newline and then `tail`.
+    fn oversized_but_well_formed(introducer: &[u8], terminator: &[u8], tail: &str) -> Vec<u8> {
+        let mut input = introducer.to_vec();
+        let filler = 9 * 1024 - introducer.len() - tail.len() - 2;
+        input.extend(std::iter::repeat_n(b'A', filler));
+        input.extend_from_slice(b"\r\n");
+        input.extend_from_slice(tail.as_bytes());
+        input.extend_from_slice(terminator);
+        input
+    }
+
+    #[test]
+    fn a_well_formed_oversized_sequence_does_not_forge_a_prompt() {
+        // The byte ceiling is a blindness budget for sequences that never
+        // terminate. Set below what real programs emit, it fired on
+        // *correctly terminated* ones and handed their payload to the tail
+        // line as text — so the emitting program chose what §8.6 matched
+        // against. Both rows below are 9 KiB, which tmux/vim
+        // `set-clipboard` writes and sixel images routinely exceed, and
+        // both payloads end in something §8.6 scores at 0.85: §8.4's act
+        // threshold. Measured at the old 8 KiB ceiling as
+        // "root@prod:/etc# " and "user@host:~$ ".
+        for (introducer, terminator, tail) in [
+            (&b"\x1b]52;c;"[..], &b"\x07"[..], "root@prod:/etc# "),
+            (&b"\x1bPq"[..], &b"\x1b\\"[..], "user@host:~$ "),
+        ] {
+            let mut s = ModeScanner::new();
+            s.feed(&oversized_but_well_formed(introducer, terminator, tail), 0);
+            assert_eq!(
+                s.last_line(),
+                "",
+                "{introducer:?}: payload was promoted to terminal text"
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_oversized_sequence_does_not_leak_into_the_command() {
+        // The same leak reaching the other consumer of scanner state: an
+        // OSC 52 write between `B` and `C` appended ~800 bytes of clipboard
+        // payload to the command that gets reported to the agent.
+        let mut s = ModeScanner::new();
+        s.feed(b"\x1b]133;B\x07ls\r\n", 0);
+        let osc = oversized_but_well_formed(b"\x1b]52;c;", b"\x07", "root@prod:/etc# ");
+        s.feed(&osc, 12);
+        let ev = s.feed(b"\x1b]133;C\x07", 12 + osc.len() as u64);
+        assert_eq!(
+            ev[0].marker,
+            Osc133::OutputStart {
+                command: "ls".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_abandoned_sequence_does_not_promote_its_payload_to_text() {
+        // The give-up path itself, past the ceiling this time. Once a
+        // sequence is abandoned, neither the byte that tripped the ceiling
+        // nor the rest of its line may become text — the payload here has
+        // no newline in it, so a scanner that simply returns to `Ground`
+        // reports a prompt the payload wrote.
+        for introducer in [&b"\x1b]0;"[..], &b"\x1bPtmux;"[..]] {
+            let mut s = ModeScanner::new();
+            let mut input = introducer.to_vec();
+            input.extend(std::iter::repeat_n(b'A', SEQUENCE_MAX + 64));
+            input.extend_from_slice(b"bash-5.3$ ");
+            s.feed(&input, 0);
+            assert_eq!(
+                s.last_line(),
+                "",
+                "{introducer:?}: abandoned payload became the tail line"
+            );
+        }
+    }
+
+    #[test]
+    fn an_abandoned_sequence_clears_the_line_it_interrupted() {
+        // The other half of the give-up. The tail line standing when a
+        // sequence is abandoned was assembled on the assumption that the
+        // scanner was tracking the stream correctly, and giving up says it
+        // was not. An empty tail scores 0.0 and reads as `Executing`; a
+        // stale one reads as a prompt that may have scrolled away long ago.
+        let mut s = ModeScanner::new();
+        s.feed(b"user@host:~$ ", 0);
+        let mut input = b"\x1b]0;".to_vec();
+        input.extend(std::iter::repeat_n(b'A', SEQUENCE_MAX + 64));
+        s.feed(&input, 13);
+        assert_eq!(
+            s.last_line(),
+            "",
+            "a line the scanner can no longer vouch for was kept"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_sequence_cannot_forge_a_mode_from_its_own_payload() {
+        // Ending the discarded run at the next `ESC` would resynchronise
+        // sooner, at the cost of letting the abandoned payload introduce
+        // sequences. That payload is chosen by the program that emitted the
+        // broken sequence, and `\x1b[?2004h` inside it would set the
+        // availability flag §8.4 gates on — the same forgery the CSI
+        // parameter cap exists to stop, arriving through another door.
+        let mut s = ModeScanner::new();
+        let mut input = b"\x1b]0;".to_vec();
+        input.extend(std::iter::repeat_n(b'A', SEQUENCE_MAX + 64));
+        input.extend_from_slice(b"\x1b[?2004hbash-5.3$ ");
+        s.feed(&input, 0);
+        assert!(
+            !s.modes().saw_bracketed_paste,
+            "discarded payload forged a tier-gating flag"
+        );
+        assert!(!s.modes().bracketed_paste);
+        assert_eq!(s.last_line(), "");
+    }
+
+    #[test]
+    fn the_byte_ceiling_is_counted_per_sequence_not_cumulatively() {
+        // `seq_len` is only ever cleared by `abort`. Leave it set and the
+        // ceiling becomes permanent rather than per-sequence: after one
+        // long sequence every later escape trips on its first few bytes,
+        // which is precisely the permanent blinding the ceiling was added
+        // to prevent. Nothing else in the suite observes the reset.
+        let mut s = ModeScanner::new();
+        let mut input = b"\x1b]0;".to_vec();
+        input.extend(std::iter::repeat_n(b'x', SEQUENCE_MAX - 8));
+        input.push(0x07);
+        input.extend_from_slice(b"\x1b]133;A\x07");
+        let ev = s.feed(&input, 0);
+        assert_eq!(
+            ev.len(),
+            1,
+            "the ceiling carried over into the next sequence"
+        );
     }
 
     #[test]
