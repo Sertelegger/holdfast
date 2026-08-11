@@ -1349,6 +1349,48 @@ async fn start_session_rejects_a_bad_prompt_pattern() {
         "a rejected start_session registered a session anyway"
     );
 
+    // The same path with a pattern the size of a small file. `regex` is
+    // caller-controlled, and the rejection is what carries it back into
+    // the MCP transcript, where it stays: unbounded this answered with a
+    // 200,044-byte `invalid_params` message.
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            prompt_patterns: Some(vec![PromptPatternArg {
+                regex: "(".repeat(200_000),
+                score: 0.9,
+            }]),
+            ..Default::default()
+        }))
+        .await;
+    let err = r.expect_err("an uncompilable regex must be rejected");
+    assert!(
+        err.message.chars().count() < 400,
+        "{} chars reached the transcript",
+        err.message.chars().count()
+    );
+
+    // And a set larger than the cap, which is rejected on count before
+    // anything is compiled at all.
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            prompt_patterns: Some(
+                (0..500)
+                    .map(|i| PromptPatternArg {
+                        regex: format!(r"p{i}>\s*$"),
+                        score: 0.5,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }))
+        .await;
+    r.expect_err("an unbounded pattern set must be rejected");
+    assert_eq!(server.registry.live_count(), 0);
+
     // The separator: the same call with a *valid* pattern must succeed,
     // or the assertion above would pass for a `start_session` that
     // rejected everything.

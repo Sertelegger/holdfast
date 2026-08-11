@@ -5,7 +5,39 @@
 //! bytes, so a linear pass over the table costs microseconds.
 
 use crate::{ClaspError, Result};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
+
+/// Hard cap on caller-supplied patterns.
+///
+/// Every pattern in the set is matched on every `score()`, and `score()`
+/// runs inside `Session::detection()` — the path that answers *every* tool
+/// call. Unbounded it accepted 5000 patterns and put each `score()` at
+/// milliseconds. The bundled table is 21 rows, so 64 is far beyond what a
+/// real caller needs and keeps the whole set comfortably under a tenth of
+/// a millisecond. Exceeding it is the caller's mistake, so it takes the
+/// same channel as an uncompilable regex (§5.1).
+const MAX_EXTRA_PATTERNS: usize = 64;
+
+/// Cap on the compiled size of one caller-supplied pattern.
+///
+/// There is no catastrophic backtracking to defend against — the regex
+/// crate is automaton-based, and `(a+)+$` was measured linear — but
+/// *compilation* is not free. `(?:(?:a{50}){50}){50}` expands to 125 000
+/// repetitions and was accepted. The crate's 10 MiB default is a sensible
+/// budget for a program compiling regexes it wrote itself and much too
+/// generous for ones an agent hands over; a real prompt pattern compiles
+/// to a few hundred bytes.
+const PATTERN_SIZE_LIMIT: usize = 64 * 1024;
+
+/// How much of a rejected pattern is echoed back in the error.
+///
+/// `start_session(prompt_patterns:)` takes these straight off the wire, so
+/// the string is whatever the agent sent. Echoed whole, a 200 KB regex
+/// produced a 200,044-byte `invalid_params` message — measured — which
+/// lands in the MCP transcript and stays there for the rest of the
+/// conversation. The *reason* is the actionable half of the message, so
+/// the pattern is clipped rather than the message.
+const ECHOED_PATTERN_MAX: usize = 120;
 
 /// A caller-supplied pattern: `start_session(prompt_patterns: [...])` and
 /// the global config both deserialise into this.
@@ -69,15 +101,28 @@ impl PatternSet {
     /// scoring takes the maximum, so an extra pattern can only raise a
     /// score, never lower one (§8.6).
     pub fn build(extra: &[PromptPattern], replace: bool) -> Result<Self> {
+        if extra.len() > MAX_EXTRA_PATTERNS {
+            return Err(ClaspError::InvalidPattern(format!(
+                "{} prompt patterns supplied; at most {MAX_EXTRA_PATTERNS} are accepted",
+                extra.len()
+            )));
+        }
         let mut compiled: Vec<(Regex, f32)> = if replace {
             Vec::new()
         } else {
             Self::defaults().compiled
         };
         for p in extra {
-            let re = Regex::new(&p.regex).map_err(|e| {
-                ClaspError::InvalidPattern(format!("{}: {}", p.regex, first_line(&e.to_string())))
-            })?;
+            let re = RegexBuilder::new(&p.regex)
+                .size_limit(PATTERN_SIZE_LIMIT)
+                .build()
+                .map_err(|e| {
+                    ClaspError::InvalidPattern(format!(
+                        "{}: {}",
+                        echoed(&p.regex),
+                        first_line(&e.to_string())
+                    ))
+                })?;
             compiled.push((re, p.score.clamp(0.0, 1.0)));
         }
         Ok(Self { compiled })
@@ -109,6 +154,19 @@ fn first_line(s: &str) -> String {
         .unwrap_or("invalid regex")
         .trim()
         .to_string()
+}
+
+/// The offending pattern, clipped to `ECHOED_PATTERN_MAX`.
+///
+/// Naming the pattern matters — a caller that sent several cannot act on
+/// "one of them is invalid" — so the identifying head is kept rather than
+/// the whole thing dropped.
+fn echoed(pattern: &str) -> String {
+    if pattern.chars().count() <= ECHOED_PATTERN_MAX {
+        return pattern.to_string();
+    }
+    let head: String = pattern.chars().take(ECHOED_PATTERN_MAX).collect();
+    format!("{head}…")
 }
 
 #[cfg(test)]
@@ -246,6 +304,94 @@ mod tests {
         assert!(matches!(e, ClaspError::InvalidPattern(_)), "got {e:?}");
         // The message must stay short enough for a tool response.
         assert!(!e.to_string().contains('\n'), "{e}");
+        // A caller that sent several patterns cannot act on "one of them
+        // is invalid", so the message has to name which. Dropping the
+        // pattern from the format string is otherwise undetectable.
+        assert!(
+            e.to_string().contains("((unclosed"),
+            "the error does not say which pattern failed: {e}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_pattern_is_not_echoed_back_whole() {
+        // These arrive over the wire from `start_session(prompt_patterns:)`
+        // and every byte of the rejection lands in the MCP transcript.
+        // Unclipped, a 200 KB regex produced a 200,044-byte
+        // `invalid_params` message — measured — which then sits in the
+        // agent's conversation history for good.
+        let huge = "(".repeat(200_000);
+        let e = PatternSet::build(
+            &[PromptPattern {
+                regex: huge,
+                score: 0.9,
+            }],
+            false,
+        )
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.chars().count() < 400, "{} chars", msg.chars().count());
+        // Clipped, not dropped: the head still identifies the pattern...
+        assert!(
+            msg.contains("((((("),
+            "the pattern is unidentifiable: {msg}"
+        );
+        // ...and the reason survives the clip, which is the whole point of
+        // clipping the pattern rather than truncating the message.
+        assert!(
+            msg.contains("unclosed") || msg.contains("regex parse error"),
+            "the reason was lost to the truncation: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_compiles_to_an_enormous_automaton_is_rejected() {
+        // Not backtracking — this crate has none — but compile cost.
+        // `{50}` nested three deep is 125 000 repetitions, accepted under
+        // the crate's 10 MiB default limit.
+        let e = PatternSet::build(
+            &[PromptPattern {
+                regex: r"(?:(?:a{50}){50}){50}".into(),
+                score: 0.9,
+            }],
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(e, ClaspError::InvalidPattern(_)), "got {e:?}");
+
+        // The separator: an ordinary prompt pattern is nowhere near the
+        // limit, so this must not be a set that rejects everything.
+        PatternSet::build(
+            &[PromptPattern {
+                regex: r"(?:myapp|myotherapp)\[\d+\]>\s*$".into(),
+                score: 0.9,
+            }],
+            true,
+        )
+        .expect("a realistic pattern must still compile");
+    }
+
+    #[test]
+    fn the_number_of_caller_patterns_is_capped() {
+        // `score()` walks the whole set, and it runs inside
+        // `Session::detection()` — on the path that answers every tool
+        // call. 5000 patterns were accepted and cost milliseconds per call.
+        let many = |n: usize| -> Vec<PromptPattern> {
+            (0..n)
+                .map(|i| PromptPattern {
+                    regex: format!(r"p{i}>\s*$"),
+                    score: 0.5,
+                })
+                .collect()
+        };
+        let e = PatternSet::build(&many(MAX_EXTRA_PATTERNS + 1), false).unwrap_err();
+        assert!(matches!(e, ClaspError::InvalidPattern(_)), "got {e:?}");
+
+        // The boundary itself, so the cap cannot quietly become off-by-one
+        // or collapse to "reject any extras at all".
+        let set = PatternSet::build(&many(MAX_EXTRA_PATTERNS), false)
+            .expect("exactly the cap must be accepted");
+        assert_eq!(set.len(), MAX_EXTRA_PATTERNS + DEFAULT_PATTERNS.len());
     }
 
     #[test]
