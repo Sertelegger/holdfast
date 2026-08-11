@@ -1,5 +1,6 @@
 //! The MCP server: tool router, handler, and stdio entry point.
 
+pub mod detection;
 pub mod envelope;
 pub mod tools;
 
