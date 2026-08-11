@@ -41,13 +41,28 @@ pub struct CommandEntry {
     /// down in the scanner's capture buffer; it is loudly wrong rather than
     /// quietly wrong, and it changes no detection decision.
     pub command: String,
+    /// **`None` does not mean "still running".** `D` may arrive with no
+    /// code at all — the shell reports the command finished and says
+    /// nothing about how — and a code outside `i32` (`D;99999999999`)
+    /// parses to `None` too. Both are indistinguishable here from a
+    /// command that has not finished. Use `output_end_cursor` to tell
+    /// them apart; it is the only field that can.
     pub exit_code: Option<i32>,
     pub started_at_unix_ms: i64,
     pub duration_ms: Option<u64>,
     /// Absolute offset of the command's first output byte.
     pub output_start_cursor: u64,
-    /// Absolute offset just past its last output byte; `None` while the
-    /// command is still running.
+    /// Absolute offset just past its last output byte.
+    ///
+    /// **This, and only this, is the "has it finished" field.** `None`
+    /// means no `D` has closed this entry — which is *usually* "still
+    /// running", but is permanent for an orphaned entry: a `D` only ever
+    /// closes the newest open command, so a `C` that arrives before its
+    /// predecessor's `D` (a nested shell, or a `D` lost to a truncated
+    /// write) leaves the older one open for the life of the session.
+    /// A consumer that renders `None` as "running" will show a
+    /// long-finished command as running indefinitely, so it should say
+    /// "not known to have finished" instead.
     pub output_end_cursor: Option<u64>,
 }
 
@@ -140,6 +155,17 @@ impl CommandHistory {
                 // wrong exit code and a truncated output span. Terminal
                 // emulators consuming OSC 133 have the same limitation;
                 // fixing it needs a signal the protocol does not carry.
+                //
+                // `back_mut` only, deliberately: a `D` closes the newest
+                // open command and never reaches past it. That leaves an
+                // entry orphaned when a `C` arrives before its
+                // predecessor's `D`, and orphaned means orphaned — no
+                // later `D` can ever close it. Walking back to find one
+                // would be worse: it would attach an exit code and an
+                // output span to whichever command happened to be open,
+                // and OSC 133 carries nothing to say which that is.
+                // Documented on `output_end_cursor`, where a consumer
+                // reads it.
                 if let Some(open) = self
                     .entries
                     .back_mut()
@@ -148,6 +174,12 @@ impl CommandHistory {
                     open.exit_code = *exit_code;
                     // The output ends where the `D` sequence begins.
                     open.output_end_cursor = Some(event.start);
+                    // `max(0)` before the cast, not after. `now_ms` comes
+                    // from the *wall* clock, which steps backwards — NTP,
+                    // a VM resuming, a container's clock being set — and
+                    // the subtraction is signed while `duration_ms` is
+                    // not, so 100 ms backwards would otherwise surface to
+                    // the agent as 18446744073709551516 ms.
                     open.duration_ms =
                         Some(now_ms.saturating_sub(open.started_at_unix_ms).max(0) as u64);
                 }
@@ -238,6 +270,86 @@ mod tests {
         );
         assert!(h.entries(0, 50).is_empty(), "bare D invented an entry");
         assert_eq!(h.total(), 0);
+    }
+
+    #[test]
+    fn a_finished_command_is_told_from_a_running_one_by_its_end_cursor_alone() {
+        // `exit_code: None` is ambiguous by construction: `D` may carry no
+        // code, and a code outside `i32` parses to `None` as well. Both
+        // shapes leave a *finished* command looking field-for-field like a
+        // running one except for `output_end_cursor`, so a consumer that
+        // keys "is it done" off the exit code is wrong in both.
+        for raw in [
+            &b"\x1b]133;C\x07out\x1b]133;D\x07"[..],
+            // Overflows parse::<i32> and degrades silently to None.
+            &b"\x1b]133;C\x07out\x1b]133;D;99999999999\x07"[..],
+        ] {
+            let h = replay(raw, 100);
+            let e = &h.entries(0, 50)[0];
+            assert_eq!(e.exit_code, None, "{raw:?}");
+            assert!(
+                e.output_end_cursor.is_some(),
+                "{raw:?}: a finished command reads as still running"
+            );
+            assert!(e.duration_ms.is_some(), "{raw:?}");
+        }
+
+        // The contrast, in the same test so the discriminator is the
+        // assertion rather than a fact stated in a comment: a genuinely
+        // running command differs in exactly that one field.
+        let h = replay(b"\x1b]133;C\x07building", 100);
+        let e = &h.entries(0, 50)[0];
+        assert_eq!(e.exit_code, None);
+        assert_eq!(e.output_end_cursor, None);
+    }
+
+    #[test]
+    fn a_completion_only_ever_closes_the_newest_open_command() {
+        // Two `C`s with no `D` between them — a nested shell, or a `D`
+        // lost to a truncated write. `D` closes `entries.back()` and never
+        // reaches past it, so entry 0 stays open for the life of the
+        // session and *no* later `D` can close it. That is the safer
+        // choice (OSC 133 carries nothing that says which command a `D`
+        // belongs to, so reaching back would attach an exit code to a
+        // guess) but it was neither documented nor asserted, and it is a
+        // different sequence from the nesting case that is.
+        let h = replay(b"\x1b]133;C\x07a\x1b]133;C\x07b\x1b]133;D;0\x07", 100);
+        let e = h.entries(0, 50);
+        assert_eq!(e.len(), 2);
+        assert_eq!(
+            e[0].output_end_cursor, None,
+            "the orphan was closed after all"
+        );
+        assert!(e[1].output_end_cursor.is_some());
+
+        // And a second `D` does not walk back to it either — it is
+        // dropped, exactly like the injection command's bare `D`.
+        let mut bytes = b"\x1b]133;C\x07a\x1b]133;C\x07b\x1b]133;D;0\x07".to_vec();
+        bytes.extend_from_slice(b"\x1b]133;D;7\x07");
+        let h = replay(&bytes, 100);
+        let e = h.entries(0, 50);
+        assert_eq!(e[0].output_end_cursor, None, "the stray D reached back");
+        assert_eq!(e[0].exit_code, None);
+        assert_eq!(
+            e[1].exit_code,
+            Some(0),
+            "the stray D reopened a closed entry"
+        );
+    }
+
+    #[test]
+    fn a_backwards_wall_clock_cannot_produce_an_absurd_duration() {
+        // `duration_ms` is unsigned and computed from a *wall* clock, so a
+        // clock that steps backwards between `C` and `D` — NTP, a VM
+        // resuming, a container's clock being set — makes the signed
+        // subtraction negative and the cast enormous. Unclamped, 100 ms
+        // backwards reports 18446744073709551516 ms to the agent.
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        let evs = sc.feed(b"\x1b]133;C\x07out\x1b]133;D;0\x07", 0);
+        h.apply(&evs[0], 1_000);
+        h.apply(&evs[1], 900);
+        assert_eq!(h.entries(0, 50)[0].duration_ms, Some(0));
     }
 
     #[test]
