@@ -189,7 +189,9 @@ fn signal_after_exit_is_a_no_op() {
     );
 }
 
-use clasp_core::mcp::tools::{ReadOutputArgs, SendInputArgs, StartSessionArgs, TerminateArgs};
+use clasp_core::mcp::tools::{
+    PromptPatternArg, ReadOutputArgs, SendInputArgs, StartSessionArgs, TerminateArgs,
+};
 use clasp_core::mcp::ClaspServer;
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
@@ -226,8 +228,7 @@ async fn start_session_returns_a_session_id() {
             name: Some("t1".into()),
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -262,8 +263,7 @@ async fn duplicate_name_is_rejected() {
         name: Some(name.into()),
         cwd: None,
         env: None,
-        cols: None,
-        rows: None,
+        ..Default::default()
     };
     let first = server.start_session(Parameters(mk("dup"))).await.unwrap();
     assert_eq!(body(&first)["status"], "ok");
@@ -290,8 +290,7 @@ async fn start_session_rejects_a_nonexistent_cwd() {
             name: None,
             cwd: Some("/no/such/directory/anywhere".into()),
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await;
     assert!(r.is_err(), "a bad cwd must be a protocol error");
@@ -311,8 +310,7 @@ async fn start_session_reports_spawn_failed_without_leaking_the_path() {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -349,8 +347,7 @@ async fn start_session_runs_in_the_requested_cwd_and_passes_env() {
             name: None,
             cwd: Some(dir.to_string_lossy().into_owned()),
             env: Some(env),
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -411,8 +408,7 @@ async fn start_bash(server: &ClaspServer) -> String {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -436,8 +432,7 @@ async fn start_script(server: &ClaspServer, script: &str) -> String {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -572,8 +567,7 @@ async fn read_output_tail_lines_respects_max_bytes() {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -786,8 +780,7 @@ async fn terminate_without_force_delivers_sigterm_first() {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -823,8 +816,7 @@ async fn send_input_to_an_exited_session_reports_session_died() {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1133,8 +1125,7 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
             name: None,
             cwd: Some(".".into()),
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1173,8 +1164,7 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
             name: None,
             cwd: Some(link.to_string_lossy().into_owned()),
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1243,4 +1233,211 @@ fn echo_enabled_is_none_once_the_child_has_exited() {
         None,
         "a dead child's line discipline says nothing about the session"
     );
+}
+
+// ------------------------------------------------------------------
+// The four `start_session` arguments 0.0.2 adds. Each one is a field
+// threaded through `StartSessionArgs` -> `SessionConfig` -> the detector,
+// and none of them changes anything the compiler can check: a
+// `settle_threshold_ms` that never reaches `DetectionConfig`, or two
+// same-typed fields swapped on the way, builds and runs exactly as
+// before. So each is asserted through the tool's own response, and each
+// positive is paired with the case that separates it from "the argument
+// was parsed and dropped".
+// ------------------------------------------------------------------
+
+/// Poll `read_output` until the session's last logical line looks like a
+/// shell prompt, then return the response's `prompt` object.
+///
+/// Waiting on the *detector's* last line rather than the raw buffer: the
+/// scores are only meaningful once the detector has consumed the prompt.
+async fn prompt_block(server: &ClaspServer, id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let r = server
+            .read_output(Parameters(ReadOutputArgs {
+                session: id.into(),
+                tail_bytes: Some(4096),
+                ..Default::default()
+            }))
+            .await
+            .expect("read_output must not be a protocol error");
+        let prompt = body(&r)["data"]["prompt"].clone();
+        let line = prompt["last_line"].as_str().unwrap_or("");
+        if line.ends_with("$ ") || line.ends_with("# ") || Instant::now() >= deadline {
+            return prompt;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn start_session_rejects_a_bad_prompt_pattern() {
+    let server = ClaspServer::new();
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            prompt_patterns: Some(vec![PromptPatternArg {
+                regex: "(unclosed".into(),
+                score: 0.9,
+            }]),
+            ..Default::default()
+        }))
+        .await;
+
+    // A bad regex is the caller's mistake, so it takes the protocol
+    // channel (§5.1) rather than becoming an envelope status.
+    let err = r.expect_err("an uncompilable regex must be rejected");
+    assert!(
+        err.message.contains("unclosed"),
+        "the error should name the offending pattern: {err:?}"
+    );
+    // The detection config is built *before* the spawn precisely so this
+    // holds: a rejected regex leaves nothing registered to clean up.
+    assert_eq!(
+        server.registry.live_count(),
+        0,
+        "a rejected start_session registered a session anyway"
+    );
+
+    // The separator: the same call with a *valid* pattern must succeed,
+    // or the assertion above would pass for a `start_session` that
+    // rejected everything.
+    let ok = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            prompt_patterns: Some(vec![PromptPatternArg {
+                regex: "(closed)".into(),
+                score: 0.9,
+            }]),
+            ..Default::default()
+        }))
+        .await
+        .expect("a valid pattern must be accepted");
+    assert_eq!(body(&ok)["status"], "ok");
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn start_session_honours_prompt_patterns_and_replace() {
+    // One extra pattern, `$`, which matches every line, scored 0.42.
+    // With `replace: true` the bundled table is gone and 0.42 is the only
+    // score available. With `replace: false` the bundled `\$\s*$` row
+    // (0.6) is still there and scoring takes the maximum, so the answer
+    // is 0.6. Neither number is reachable the other way, so this fails if
+    // `prompt_patterns` is dropped (0.6 twice), if `replace` is ignored
+    // (one value twice), or if the two are wired to each other's field.
+    for (replace, expected) in [(true, 0.42), (false, 0.6)] {
+        let server = ClaspServer::new();
+        let started = server
+            .start_session(Parameters(StartSessionArgs {
+                command: "bash".into(),
+                args: bash_args(),
+                prompt_patterns: Some(vec![PromptPatternArg {
+                    regex: "$".into(),
+                    score: 0.42,
+                }]),
+                prompt_patterns_replace: Some(replace),
+                ..Default::default()
+            }))
+            .await
+            .expect("start_session");
+        let id = body(&started)["data"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let prompt = prompt_block(&server, &id).await;
+        assert_eq!(
+            prompt["pattern_score"], expected,
+            "replace={replace} should score {expected}; got {prompt}"
+        );
+
+        kill_all(&server).await;
+    }
+}
+
+#[tokio::test]
+async fn start_session_honours_settle_threshold_ms() {
+    // Quiescence is `idle / threshold`, clamped. An hour-long threshold
+    // cannot saturate inside a test, and the 250 ms default cannot fail
+    // to. Asserting only the default would pass with the argument parsed
+    // and thrown away, since the default is what it would fall back to.
+    let server = ClaspServer::new();
+    let slow = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            settle_threshold_ms: Some(3_600_000),
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session");
+    let slow = body(&slow)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fast = start_bash(&server).await;
+
+    prompt_block(&server, &slow).await;
+    prompt_block(&server, &fast).await;
+    // Longer than the 250 ms default and a rounding error away from
+    // 3_600_000 ms.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let slow_q = prompt_block(&server, &slow).await["quiescent_score"].clone();
+    let fast_q = prompt_block(&server, &fast).await["quiescent_score"].clone();
+    assert_eq!(
+        fast_q, 1.0,
+        "the default 250 ms threshold must saturate after 600 ms of silence"
+    );
+    assert!(
+        slow_q.as_f64().is_some_and(|q| q < 0.05),
+        "an hour-long threshold must leave the session unsettled; got {slow_q}"
+    );
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn start_session_reports_and_can_disable_shell_integration() {
+    let server = ClaspServer::new();
+
+    let on = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session");
+    assert_eq!(
+        body(&on)["data"]["shell_integration"],
+        "bash",
+        "an interactive bash session is integrated by default (§8.5)"
+    );
+
+    let off = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            shell_integration: Some(false),
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session");
+    let data = body(&off)["data"].clone();
+    // Present and null, not absent: indexing a missing key also yields
+    // `Null`, so the key check is what makes the assertion mean anything
+    // — and `outputSchema` declares the field either way.
+    assert!(
+        data.as_object().unwrap().contains_key("shell_integration"),
+        "the field is reported on every start, null when nothing was injected"
+    );
+    assert_eq!(data["shell_integration"], Value::Null);
+
+    kill_all(&server).await;
 }

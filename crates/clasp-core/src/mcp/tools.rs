@@ -1,7 +1,11 @@
 //! The 0.0.1 tool set: start_session, read_output, send_input, terminate.
 
 use super::envelope::{self, Status};
-use super::ClaspServer;
+use super::{detection, schema, ClaspServer};
+use crate::detect::{
+    detect_shell, DetectionConfig, InteractionMode, PatternSet, PromptPattern,
+    DEFAULT_SETTLE_THRESHOLD_MS,
+};
 use crate::pty::{InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::session::{new_session_id, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
@@ -63,7 +67,11 @@ fn unix_secs(t: std::time::SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+/// `Default` is derived so callers (and tests) can set the fields they
+/// care about and leave the rest: every later milestone adds arguments
+/// here, and struct literals that must be updated in a dozen places
+/// each time are pure churn.
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct StartSessionArgs {
     /// Program to run, e.g. "bash".
     pub command: String,
@@ -87,6 +95,29 @@ pub struct StartSessionArgs {
     /// Terminal height in rows. Defaults to 40.
     #[serde(default)]
     pub rows: Option<u16>,
+    /// Extra tier-3 prompt patterns, each `{regex, score}` with score in
+    /// [0,1]. Added to the bundled table unless `prompt_patterns_replace`.
+    #[serde(default)]
+    pub prompt_patterns: Option<Vec<PromptPatternArg>>,
+    /// Replace the bundled tier-3 pattern table instead of extending it.
+    #[serde(default)]
+    pub prompt_patterns_replace: Option<bool>,
+    /// Milliseconds of silence that count as fully settled for the
+    /// tier-3 quiescence score. Defaults to 250.
+    #[serde(default)]
+    pub settle_threshold_ms: Option<u64>,
+    /// Inject OSC 133 shell integration when the command is bash, zsh,
+    /// or fish. Defaults to true.
+    #[serde(default)]
+    pub shell_integration: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PromptPatternArg {
+    /// Rust regex matched against the session's last logical line.
+    pub regex: String,
+    /// Score in [0,1] contributed when the regex matches.
+    pub score: f32,
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -94,7 +125,16 @@ impl ClaspServer {
     /// Start a PTY-backed shell or program and return its session id.
     /// Runs in `cwd` if given, otherwise in the directory the CLASP
     /// server was started in.
-    #[tool]
+    #[tool(
+        annotations(
+            title = "Start a PTY-backed shell session",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema::envelope_schema::<schema::StartSession>()
+    )]
     pub async fn start_session(
         &self,
         Parameters(args): Parameters<StartSessionArgs>,
@@ -155,6 +195,38 @@ impl ClaspServer {
             cfg.rows = r;
         }
 
+        // Detection config is built *before* the spawn: a bad regex is
+        // the caller's error and must not leave a live child behind.
+        let extra: Vec<PromptPattern> = args
+            .prompt_patterns
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|p| PromptPattern {
+                regex: p.regex.clone(),
+                score: p.score,
+            })
+            .collect();
+        let patterns =
+            match PatternSet::build(&extra, args.prompt_patterns_replace.unwrap_or(false)) {
+                Ok(p) => p,
+                Err(e) => return envelope::from_error(&e),
+            };
+        let config = SessionConfig {
+            detection: DetectionConfig {
+                settle_threshold_ms: args
+                    .settle_threshold_ms
+                    .unwrap_or(DEFAULT_SETTLE_THRESHOLD_MS),
+                patterns,
+            },
+            shell_integration: if args.shell_integration.unwrap_or(true) {
+                detect_shell(&args.command, &args.args)
+            } else {
+                None
+            },
+            ..SessionConfig::default()
+        };
+
         let backend = match InProcessPty::spawn(&cfg) {
             Ok(b) => Arc::new(b) as Arc<dyn PtyBackend>,
             Err(e) => {
@@ -174,7 +246,7 @@ impl ClaspServer {
             args.command.clone(),
             args.args.clone(),
             backend,
-            SessionConfig::default(),
+            config,
         );
 
         if let Err(e) = self.registry.insert(Arc::clone(&session)) {
@@ -189,6 +261,7 @@ impl ClaspServer {
                 "name": session.name,
                 "pid": session.pid(),
                 "cwd": cfg.cwd,
+                "shell_integration": session.shell_integration.map(|s| s.as_str()),
                 "started_at_unix_secs": unix_secs(session.created_at),
             }),
             format!("started `{}` as {}", args.command, session.id),
@@ -197,7 +270,14 @@ impl ClaspServer {
 
     /// Read output from a session. Supply exactly one of since_cursor,
     /// tail_lines, or tail_bytes.
-    #[tool]
+    #[tool(
+        annotations(
+            title = "Read session output",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = schema::envelope_schema::<schema::ReadOutput>()
+    )]
     pub async fn read_output(
         &self,
         Parameters(args): Parameters<ReadOutputArgs>,
@@ -301,7 +381,8 @@ impl ClaspServer {
         let truncated_for_size = size_capped && (!is_cursor_read || more_forward);
 
         Ok(envelope::ok(
-            json!({
+            detection::with_detection(
+                json!({
                 "output": output,
                 "cursor": read.cursor,
                 "bytes_returned": read.bytes.len(),
@@ -310,13 +391,24 @@ impl ClaspServer {
                 "next_cursor": if more_forward { Some(read.cursor) } else { None },
                 "state": state.as_str(),
                 "exit_code": session.exit_code(),
-            }),
+                }),
+                &session,
+            ),
             format!("{} bytes", read.bytes.len()),
         ))
     }
 
     /// Send keystrokes to a session's stdin.
-    #[tool]
+    #[tool(
+        annotations(
+            title = "Send keystrokes to a session",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema::envelope_schema::<schema::SendInput>()
+    )]
     pub async fn send_input(
         &self,
         Parameters(args): Parameters<SendInputArgs>,
@@ -346,6 +438,10 @@ impl ClaspServer {
                 "session has exited",
             ));
         }
+
+        // Sampled *before* the write, so the flag describes the state
+        // the agent acted on rather than whatever the write provoked.
+        let awaiting = session.detection().interaction_mode == InteractionMode::AwaitingSecret;
 
         let mut payload = args.data.into_bytes();
         if args.append_newline.unwrap_or(true) {
@@ -408,14 +504,30 @@ impl ClaspServer {
             }
         };
 
+        // REQ-SEC-011: the write still happens — the agent may know
+        // something CLASP does not — but the event is made visible.
+        let warning = awaiting.then_some("session_awaiting_secret");
+
         Ok(envelope::ok(
-            json!({ "bytes_written": written }),
+            detection::with_detection(
+                json!({ "bytes_written": written, "warning": warning }),
+                &session,
+            ),
             format!("wrote {written} bytes"),
         ))
     }
 
     /// Terminate a session, killing its whole process group. Idempotent.
-    #[tool]
+    #[tool(
+        annotations(
+            title = "Terminate a session",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = schema::envelope_schema::<schema::Terminate>()
+    )]
     pub async fn terminate(
         &self,
         Parameters(args): Parameters<TerminateArgs>,
@@ -466,7 +578,7 @@ impl ClaspServer {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReadOutputArgs {
     /// Session id or live session name.
     pub session: String,

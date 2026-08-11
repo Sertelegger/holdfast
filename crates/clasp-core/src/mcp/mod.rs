@@ -2,6 +2,7 @@
 
 pub mod detection;
 pub mod envelope;
+pub mod schema;
 pub mod tools;
 
 use crate::session::SessionRegistry;

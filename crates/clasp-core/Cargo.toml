@@ -20,5 +20,6 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+jsonschema.workspace = true
 libc.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
