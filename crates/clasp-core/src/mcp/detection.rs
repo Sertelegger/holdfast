@@ -59,7 +59,21 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    fn session_with_output(bytes: &[u8]) -> (Arc<Session>, Arc<MockPty>) {
+    /// A session that has already *classified* `bytes`, where `last_line`
+    /// is what the detector reports once it has caught up.
+    ///
+    /// The wait is on the detector's own state, not on `buffer_head()`.
+    /// The reader appends to the buffer before it feeds the detector, so a
+    /// byte count can be satisfied while the detector has seen nothing —
+    /// and every assertion in this module is about the detector. Measured:
+    /// the window never opened naturally here (0 failures in 600 runs,
+    /// because `queue_output` runs before `Session::new` and the reader
+    /// therefore never reaches its idle sleep), but injecting 50 ms
+    /// between the push and the feed fails
+    /// `every_documented_field_is_present` and
+    /// `scores_serialise_without_float_noise` every time. Uncorrelated is
+    /// not the same as closed.
+    fn session_with_output(bytes: &[u8], last_line: &str) -> (Arc<Session>, Arc<MockPty>) {
         let pty = Arc::new(MockPty::new());
         pty.queue_output(bytes);
         let s = Session::new(
@@ -70,15 +84,9 @@ mod tests {
             Arc::clone(&pty) as Arc<dyn PtyBackend>,
             SessionConfig::with_buffer_capacity(4096),
         );
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while s.buffer_head() < bytes.len() as u64 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(
-            s.buffer_head(),
-            bytes.len() as u64,
-            "reader never caught up"
-        );
+        wait_until("the detector to consume the queued output", || {
+            s.detection().last_line == last_line
+        });
         (s, pty)
     }
 
@@ -97,7 +105,7 @@ mod tests {
 
     #[test]
     fn every_documented_field_is_present() {
-        let (s, _pty) = session_with_output(b"\x1b[?2004h\x1b]0;build\x07bash-5.3$ ");
+        let (s, _pty) = session_with_output(b"\x1b[?2004h\x1b]0;build\x07bash-5.3$ ", "bash-5.3$ ");
         let v = with_detection(json!({ "output": "" }), &s);
 
         assert_eq!(v["output"], "");
@@ -120,7 +128,7 @@ mod tests {
 
     #[test]
     fn scores_serialise_without_float_noise() {
-        let (s, _pty) = session_with_output(b"\x1b[?2004h$ ");
+        let (s, _pty) = session_with_output(b"\x1b[?2004h$ ", "$ ");
         let v = with_detection(json!({}), &s);
         assert_eq!(v["prompt"]["confidence"], 0.95);
         assert_eq!(
@@ -131,13 +139,13 @@ mod tests {
 
     #[test]
     fn a_session_with_no_title_reports_null() {
-        let (s, _pty) = session_with_output(b"$ ");
+        let (s, _pty) = session_with_output(b"$ ", "$ ");
         assert_eq!(with_detection(json!({}), &s)["title"], Value::Null);
     }
 
     #[test]
     fn a_non_object_payload_is_returned_unchanged() {
-        let (s, _pty) = session_with_output(b"$ ");
+        let (s, _pty) = session_with_output(b"$ ", "$ ");
         assert_eq!(with_detection(json!("plain"), &s), json!("plain"));
     }
 
@@ -150,7 +158,7 @@ mod tests {
         // given type hold a *different* value: 0.95 / 1.0 / 0.9 / 0.0 for
         // the scores, six distinct strings for the rest. A session where
         // two of them happened to agree would prove nothing about either.
-        let (s, _pty) = session_with_output(b"\x1b[?2004h\x1b]0;py\x07>>> ");
+        let (s, _pty) = session_with_output(b"\x1b[?2004h\x1b]0;py\x07>>> ", ">>> ");
         // `quiescent_score` climbs with idle time, so wait for it to
         // saturate at a fixed 1.0. The `last_line` half of the predicate
         // is what proves the detector actually consumed the bytes — an
@@ -184,7 +192,7 @@ mod tests {
         // test passes just as well if the field is never inserted. §5.4
         // wants the key present and null, and 0.0.2's `outputSchema` work
         // makes the difference load-bearing.
-        let (s, _pty) = session_with_output(b"$ ");
+        let (s, _pty) = session_with_output(b"$ ", "$ ");
         let v = with_detection(json!({}), &s);
         let map = v.as_object().expect("payload stays an object");
         assert!(
