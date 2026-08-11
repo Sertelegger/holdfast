@@ -6,7 +6,12 @@ use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long a `tcgetattr` sample is reused. Matches the `is_alive`
+/// caching policy in spec §4.1: cheap enough to sample per output chunk,
+/// fresh enough that an echo drop is seen within one detector update.
+const ECHO_CACHE_TTL: Duration = Duration::from_millis(50);
 
 /// How long `write` waits for the writer lock before giving up.
 ///
@@ -40,6 +45,8 @@ pub struct InProcessPty {
     /// can assert. Deliberately not `#[cfg(test)]`: the integration tests
     /// link this crate externally and would not see it.
     signal_deliveries: AtomicUsize,
+    /// Cached `ECHO` sample and the instant it was taken.
+    echo: Mutex<Option<(Instant, Option<bool>)>>,
 }
 
 /// Signal a whole process group. Negative pid == "the group" for kill(2).
@@ -106,7 +113,28 @@ impl InProcessPty {
             pid,
             exit: Mutex::new(None),
             signal_deliveries: AtomicUsize::new(0),
+            echo: Mutex::new(None),
         })
+    }
+
+    /// One `tcgetattr` against the master fd. The master reports the
+    /// *slave's* line-discipline flags, which is exactly what §8.2 wants:
+    /// whether the program on the other end has turned echo off.
+    #[cfg(unix)]
+    fn sample_echo(&self) -> Option<bool> {
+        let master = self.master.lock();
+        let fd = master.as_raw_fd()?;
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `fd` is the live master end, owned by `self.master` and
+        // held under the lock above for the duration of the call.
+        let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+        drop(master);
+        if rc != 0 {
+            return None;
+        }
+        // SAFETY: tcgetattr returned 0, so the struct is initialised.
+        let termios = unsafe { termios.assume_init() };
+        Some(termios.c_lflag & libc::ECHO != 0)
     }
 
     /// Number of `kill(2)` calls this PTY has issued since it was spawned.
@@ -307,6 +335,24 @@ impl PtyBackend for InProcessPty {
             Ok(None) => true,
             Err(_) => false,
         }
+    }
+
+    #[cfg(unix)]
+    fn echo_enabled(&self) -> Option<bool> {
+        // A dead child's line discipline says nothing about what the
+        // session is doing, and the fd may already be closed.
+        if !self.is_alive() {
+            return None;
+        }
+        let mut cache = self.echo.lock();
+        if let Some((at, value)) = *cache {
+            if at.elapsed() < ECHO_CACHE_TTL {
+                return value;
+            }
+        }
+        let value = self.sample_echo();
+        *cache = Some((Instant::now(), value));
+        value
     }
 
     fn exit_code(&self) -> Option<i32> {

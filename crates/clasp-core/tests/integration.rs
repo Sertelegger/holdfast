@@ -1194,3 +1194,53 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
          the caller passed"
     );
 }
+
+/// Poll `echo_enabled` until it reports `want` or the deadline passes,
+/// then return whatever it last said.
+fn poll_echo(pty: &dyn PtyBackend, want: Option<bool>, timeout: Duration) -> Option<bool> {
+    let deadline = Instant::now() + timeout;
+    let mut last = pty.echo_enabled();
+    while last != want && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(60));
+        last = pty.echo_enabled();
+    }
+    last
+}
+
+#[test]
+fn echo_enabled_tracks_the_slaves_line_discipline() {
+    // Spike row 2, measured: readline turns ECHO *off* while it draws a
+    // prompt, and the line discipline is back on while a command runs.
+    // A backend returning a constant — or `None` — fails one half or the
+    // other, so both assertions are needed to pin the behaviour.
+    let pty = InProcessPty::spawn(&bash()).expect("spawn");
+
+    assert_eq!(
+        poll_echo(&pty, Some(false), Duration::from_secs(5)),
+        Some(false),
+        "ECHO should be off once readline has drawn a prompt"
+    );
+
+    pty.write(b"sleep 3\n").unwrap();
+    assert_eq!(
+        poll_echo(&pty, Some(true), Duration::from_secs(5)),
+        Some(true),
+        "ECHO should be on while a command runs"
+    );
+
+    pty.signal(Signal::Kill).unwrap();
+}
+
+#[test]
+fn echo_enabled_is_none_once_the_child_has_exited() {
+    let mut cfg = PtySpawnConfig::new("bash");
+    cfg.args = vec!["-c".into(), "exit 0".into()];
+    let pty = InProcessPty::spawn(&cfg).expect("spawn");
+    wait_for_exit(&pty, Duration::from_secs(5));
+    assert!(!pty.is_alive());
+    assert_eq!(
+        pty.echo_enabled(),
+        None,
+        "a dead child's line discipline says nothing about the session"
+    );
+}

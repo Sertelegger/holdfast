@@ -63,6 +63,21 @@ pub trait PtyBackend: Send + Sync {
     /// Non-blocking liveness check.
     fn is_alive(&self) -> bool;
 
+    /// Whether the slave's line discipline currently has `ECHO` set, read
+    /// from the master with `tcgetattr` (spec §8.2). `None` when the
+    /// backend cannot report it — the detector then treats the `ECHO`
+    /// signal as unavailable rather than assuming a value.
+    ///
+    /// Must be cheap: the detector samples it per output chunk and per
+    /// tool call, so implementations cache it the way `is_alive` does
+    /// (§4.1).
+    ///
+    /// Added in 0.0.2 *with a default*, so the seven methods 0.0.1
+    /// settled on are unchanged and existing implementors still compile.
+    fn echo_enabled(&self) -> Option<bool> {
+        None
+    }
+
     /// Exit code once the child has exited, else `None`.
     fn exit_code(&self) -> Option<i32>;
 

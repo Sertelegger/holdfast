@@ -14,6 +14,7 @@ struct MockState {
     alive: bool,
     exit_code: Option<i32>,
     size: (u16, u16),
+    echo: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -27,6 +28,8 @@ impl MockPty {
             state: Mutex::new(MockState {
                 alive: true,
                 size: (120, 40),
+                // A real PTY starts with ECHO on; tests that care set it.
+                echo: Some(true),
                 ..Default::default()
             }),
         }
@@ -56,6 +59,12 @@ impl MockPty {
 
     pub fn size(&self) -> (u16, u16) {
         self.state.lock().size
+    }
+
+    /// Set what `echo_enabled` reports. `None` models a backend that
+    /// cannot sample the line discipline at all.
+    pub fn set_echo(&self, echo: Option<bool>) {
+        self.state.lock().echo = echo;
     }
 }
 
@@ -97,6 +106,14 @@ impl PtyBackend for MockPty {
 
     fn is_alive(&self) -> bool {
         self.state.lock().alive
+    }
+
+    fn echo_enabled(&self) -> Option<bool> {
+        let s = self.state.lock();
+        if !s.alive {
+            return None;
+        }
+        s.echo
     }
 
     fn exit_code(&self) -> Option<i32> {
@@ -157,6 +174,24 @@ mod tests {
         assert!(!p.is_alive());
         assert_eq!(p.exit_code(), Some(0));
         assert_eq!(p.signals(), vec![Signal::Kill]);
+    }
+
+    #[test]
+    fn echo_is_settable_and_unreportable_once_the_child_is_gone() {
+        let p = MockPty::new();
+        assert_eq!(p.echo_enabled(), Some(true), "a fresh PTY echoes");
+        p.set_echo(Some(false));
+        assert_eq!(p.echo_enabled(), Some(false));
+        // `None` is not `Some(false)`: "echo is off" and "this backend
+        // cannot say" are different answers, and the detector treats them
+        // differently (§8.2).
+        p.set_echo(None);
+        assert_eq!(p.echo_enabled(), None);
+        // A dead child reports `None` even with echo left on, so an impl
+        // that just returned the stored field would fail here.
+        p.set_echo(Some(true));
+        p.exit(0);
+        assert_eq!(p.echo_enabled(), None);
     }
 
     #[test]
