@@ -97,7 +97,7 @@ const ZSH_INTEGRATION: &str = concat!(
     r#"CLASP_SHELL_INTEGRATION=1; "#,
     r#"__clasp_preexec() { printf '\033]133;C\007' }; "#,
     r#"__clasp_precmd() { local s=$?; printf '\033]133;D;%s\007' "$s" }; "#,
-    "PS1=$'%{\\e]133;A\\a%}'\"$PS1\"$'%{\\e]133;B\\a%}'; ",
+    "PS1=$'%{\\e]133;A\\a%}'\"${PS1-}\"$'%{\\e]133;B\\a%}'; ",
     r#"autoload -Uz add-zsh-hook; "#,
     r#"add-zsh-hook precmd __clasp_precmd; "#,
     r#"add-zsh-hook preexec __clasp_preexec; "#,
