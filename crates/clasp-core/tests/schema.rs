@@ -172,19 +172,36 @@ async fn wait_for(server: &ClaspServer, session: &str, needle: &str) {
     }
 }
 
-/// Poll until the session reports `AtPrompt`.
+/// Poll until the session is at an OSC 133 prompt — `AtPrompt` reached
+/// via the *semantic* tier, not the terminal-mode one.
 ///
-/// bash's readline turns ECHO *off* while it draws a prompt, so a session
-/// sampled mid-draw can legitimately read `AwaitingSecret` — which is a
-/// different `warning` value. Waiting for the settled state makes the
-/// no-warning assertion deterministic rather than a race.
+/// Waiting for `AtPrompt` alone is not enough, and the difference is a
+/// measured flake rather than a theoretical one. bash reaches its first
+/// prompt (bracketed paste, `terminal_mode`) *before* CLASP has finished
+/// typing the §8.5 integration snippet; the snippet then runs, and while
+/// it does, readline has ECHO off with bracketed paste momentarily
+/// disabled — which the §8.3 ladder classifies as `AwaitingSecret`. A
+/// `send_input` landing in that window gets a `session_awaiting_secret`
+/// warning, and the no-warning assertion below fails for a reason that
+/// has nothing to do with what it is testing. The mutation run caught
+/// this twice, under mutants that could not possibly affect `send_input`.
+///
+/// Once the snippet has run, `t1 && at_marker` answers first in the
+/// ladder and echo is never consulted, so `semantic` + `AtPrompt` is a
+/// state the session stays in until something is typed.
 async fn wait_for_at_prompt(server: &ClaspServer, session: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let r = read_tail(server, session).await;
-        if body(&r)["data"]["interaction_mode"] == "AtPrompt" || Instant::now() >= deadline {
+        let data = body(&read_tail(server, session).await)["data"].clone();
+        let settled =
+            data["interaction_mode"] == "AtPrompt" && data["detection_tier"] == "semantic";
+        if settled {
             return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "session never reached an OSC 133 prompt; last state: {data}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
