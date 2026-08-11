@@ -3,7 +3,7 @@
 use super::envelope::{self, Status};
 use super::ClaspServer;
 use crate::pty::{InProcessPty, PtyBackend, PtySpawnConfig};
-use crate::session::{new_session_id, registry::DEFAULT_BUFFER_BYTES, Session};
+use crate::session::{new_session_id, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router, ErrorData};
@@ -174,7 +174,7 @@ impl ClaspServer {
             args.command.clone(),
             args.args.clone(),
             backend,
-            DEFAULT_BUFFER_BYTES,
+            SessionConfig::default(),
         );
 
         if let Err(e) = self.registry.insert(Arc::clone(&session)) {

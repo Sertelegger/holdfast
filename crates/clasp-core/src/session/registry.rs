@@ -102,7 +102,7 @@ mod tests {
             "bash".into(),
             vec![],
             Arc::clone(&pty) as Arc<dyn crate::pty::PtyBackend>,
-            4096,
+            crate::session::SessionConfig::with_buffer_capacity(4096),
         );
         (s, pty)
     }
