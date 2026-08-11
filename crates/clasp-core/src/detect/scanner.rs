@@ -323,6 +323,19 @@ impl ModeScanner {
     /// The tail line is cleared for the same reason. Whatever preceded the
     /// abandoned sequence is not a line the scanner can still vouch for,
     /// and an empty tail scores 0.0 — the fail-safe direction.
+    ///
+    /// **The residual, stated rather than implied.** A *well-formed*
+    /// sequence longer than `SEQUENCE_MAX` whose payload contains a
+    /// newline followed by prompt-shaped text still leaks that last line:
+    /// the discard ends at the payload's own newline. Measured — 9 KiB
+    /// gives `""`, 68 KiB gives `"root@prod:/etc# "`. That is intrinsic,
+    /// not an oversight: at the moment the ceiling trips the scanner
+    /// cannot know whether it is inside a huge well-formed sequence or a
+    /// truncated one, so bounding how long an unterminated sequence can
+    /// blind it and never promoting a well-formed one's payload to text
+    /// are not simultaneously achievable. Raising `SEQUENCE_MAX` moves the
+    /// threshold; it does not close the case. The mitigation is to keep
+    /// the ceiling above what real programs emit, which is why it moved.
     fn give_up(&mut self) {
         self.abort();
         self.tail.reset();
