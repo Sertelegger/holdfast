@@ -179,11 +179,22 @@ mod tests {
             Regex::new(re).unwrap_or_else(|e| panic!("{re} failed to compile: {e}"));
             assert!((0.0..=1.0).contains(score), "{re} has score {score}");
         }
+        // A *literal* count, not `DEFAULT_PATTERNS.len()`. Comparing the
+        // compiled set against its own source is a tautology that stays
+        // green when a row leaves the table, which is how eleven of the
+        // twenty-one rows came to be deletable with nothing failing.
+        // `known_prompts_score_as_specified` covers each row individually;
+        // this catches a whole row going missing.
+        assert_eq!(DEFAULT_PATTERNS.len(), 21, "§8.6 has 21 rows");
         assert_eq!(PatternSet::defaults().len(), DEFAULT_PATTERNS.len());
     }
 
     #[test]
     fn known_prompts_score_as_specified() {
+        // One positive per row of §8.6, in table order. Eleven rows had
+        // none, and could be deleted — or typo'd, verified with `sqlXte>`
+        // and `nodeX>` — with the whole workspace still green. A row with
+        // no positive is a row that is not shipped, whatever the table says.
         let p = PatternSet::defaults();
         for (line, want) in [
             ("Password:", 0.95),
@@ -193,14 +204,39 @@ mod tests {
             ("Password:   ", 0.95),
             ("Password for alice:", 0.95),
             ("Enter passphrase for key '/home/a/.ssh/id_ed25519':", 0.95),
+            // The passphrase row's `\s*` half, which the row above cannot
+            // pin: it has no trailing blank, so narrowing `\s*$` to `$`
+            // would go unnoticed — and every real terminal puts a space
+            // after the colon.
+            (
+                "Enter passphrase for key '/home/a/.ssh/id_ed25519':  ",
+                0.95,
+            ),
             ("Continue? [y/N] ", 0.9),
+            ("Continue? (y/n) ", 0.9),
+            // The `\?\s*\[Yy/Nn\]\s*$` row, and the only string on earth
+            // that satisfies it: the brackets are escaped, so it is the
+            // literal text `[Yy/Nn]` rather than a character class. apt's
+            // `Do you want to continue? [Y/n] ` scores 0. That is a defect
+            // in the source table, transcribed faithfully; §8.6 rev. 26
+            // replaces the row, and this assertion changes with it.
+            ("Continue? [Yy/Nn]", 0.9),
             (">>> ", 0.9),
             ("... ", 0.85),
+            ("irb(main):001:0> ", 0.9),
+            ("node> ", 0.9),
+            ("(gdb) ", 0.95),
+            ("(lldb) ", 0.95),
             ("(Pdb) ", 0.95),
             ("mysql> ", 0.95),
+            ("postgres=# ", 0.95),
+            ("sqlite> ", 0.95),
             ("alice@build01:~/src$ ", 0.85),
             ("bash-5.3$ ", 0.6),
             ("# ", 0.6),
+            ("% ", 0.6),
+            ("> ", 0.5),
+            ("Are you sure? ", 0.55),
         ] {
             let got = p.score(line);
             assert!(
@@ -228,6 +264,11 @@ mod tests {
             // Trailing whitespace must not rescue a line that has already
             // continued past the colon: `\s*$` skips blanks, not content.
             "Password: hunter2   ",
+            // The passphrase row's near-miss, which the fix that added the
+            // password one dropped. Both rows carry the same `\s*$` anchor
+            // and the same failure if it is deleted: `ssh-add` writing this
+            // line to a log would be read as a live secret prompt.
+            "Enter passphrase for key '/home/a/.ssh/id_ed25519': supplied",
             "see mysql> in the docs",
         ] {
             assert_eq!(p.score(line), 0.0, "{line:?} should not look like a prompt");
@@ -241,9 +282,12 @@ mod tests {
         let p = PatternSet::defaults();
         assert!((p.score("alice@host:~$ ") - 0.85).abs() < 1e-6);
 
-        // The bundled table happens to be ordered by descending score, so
-        // the assertion above would also pass for a "first match wins"
-        // implementation. An appended pattern is not: this one is last in
+        // That assertion alone would also pass under "first match wins":
+        // the two rows this line matches happen to sit in descending order.
+        // (The table as a whole is *not* ordered by score — index 6 is 0.85
+        // and is followed by 0.9, 0.9 and 0.95 — but that is not what makes
+        // the assertion above weak; the local order of the matching rows is.)
+        // An appended pattern breaks the coincidence: this one is last in
         // the list and outscores the bundled `$` rule that matches first.
         let p = PatternSet::build(
             &[PromptPattern {
@@ -405,5 +449,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.score("x"), 1.0);
+
+        // The lower half. `pattern_score` is reported verbatim in every
+        // detection response (§8.4), so a negative one is agent-visible
+        // nonsense, and `confidence = quiescent * max(pattern, cursor)`
+        // consumes it directly.
+        //
+        // Stated honestly: the floor is held twice — by this clamp and by
+        // `score`'s `fold(0.0, f32::max)` identity — so removing *either*
+        // alone is invisible here and only removing both fails. That is
+        // worth an assertion anyway: the redundancy is what makes the
+        // guarantee robust, and nothing else in the tree says the floor
+        // is 0.0 at all.
+        let p = PatternSet::build(
+            &[PromptPattern {
+                regex: "^x$".into(),
+                score: -5.0,
+            }],
+            true,
+        )
+        .unwrap();
+        assert_eq!(p.score("x"), 0.0);
     }
 }
