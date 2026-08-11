@@ -6,11 +6,18 @@ use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// How long a `tcgetattr` sample is reused. Matches the `is_alive`
 /// caching policy in spec §4.1: cheap enough to sample per output chunk,
 /// fresh enough that an echo drop is seen within one detector update.
+///
+/// `cfg(unix)` along with everything else that samples `ECHO`: there is
+/// no `tcgetattr` off Unix, so on the 0.0.11 Windows build this and the
+/// cache it governs are dead code, and CI runs with `-D warnings`.
+#[cfg(unix)]
 const ECHO_CACHE_TTL: Duration = Duration::from_millis(50);
 
 /// How long `write` waits for the writer lock before giving up.
@@ -46,6 +53,7 @@ pub struct InProcessPty {
     /// link this crate externally and would not see it.
     signal_deliveries: AtomicUsize,
     /// Cached `ECHO` sample and the instant it was taken.
+    #[cfg(unix)]
     echo: Mutex<Option<(Instant, Option<bool>)>>,
 }
 
@@ -113,6 +121,7 @@ impl InProcessPty {
             pid,
             exit: Mutex::new(None),
             signal_deliveries: AtomicUsize::new(0),
+            #[cfg(unix)]
             echo: Mutex::new(None),
         })
     }

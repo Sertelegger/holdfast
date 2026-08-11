@@ -483,6 +483,16 @@ mod tests {
         // A program that turned echo off with no bracketed paste in play.
         pty.queue_output(b"Password: ");
         wait_for_bytes(&s, 10);
+        // Wait on the *detector*, not on the buffer. `Executing` is also
+        // what a detector that has seen nothing answers, so asserting it
+        // straight after the push can pass without those bytes ever having
+        // been classified — the assertion would then be about an empty
+        // detector rather than about echo. Waiting does not reintroduce
+        // the race the 60 s threshold above guards: that threshold pins
+        // *quiescence*, and consuming bytes does not move quiescence.
+        wait_until("the detector to consume the prompt line", || {
+            s.detection().last_line == "Password: "
+        });
         assert_eq!(
             s.detection().interaction_mode,
             InteractionMode::Executing,
@@ -620,7 +630,17 @@ mod tests {
         // The same bytes classify as a live prompt while the child is
         // running, so `Exited` below cannot have come from the byte
         // stream — only from liveness being sampled off the backend.
-        assert_eq!(s.detection().interaction_mode, InteractionMode::AtPrompt);
+        //
+        // `wait_until`, not a bare assertion: the reader pushes to the
+        // buffer *before* it feeds the detector, so `wait_for_bytes`
+        // returning does not mean these bytes have been classified. This
+        // test was written after that rule was established and never
+        // re-examined against it, and it is the sole killer of the mutant
+        // that hardcodes `alive` — the one that makes a dead session
+        // report AtPrompt.
+        wait_until("the detector to consume the prompt", || {
+            s.detection().interaction_mode == InteractionMode::AtPrompt
+        });
 
         pty.exit(0);
         let d = s.detection();
@@ -630,6 +650,37 @@ mod tests {
         // the exited classification of a detected session rather than one
         // that fell back to the heuristic.
         assert_eq!(d.detection_tier, DetectionTier::TerminalMode);
+    }
+
+    #[test]
+    fn history_entries_are_stamped_with_a_real_clock() {
+        // The reader computes `now_ms()` and hands it to the history, and
+        // nothing asserted that what arrives is a clock. Replacing it with
+        // a constant `0` passed the entire workspace: `history.rs`'s own
+        // duration assertion cannot see it, because its `replay` helper
+        // supplies its own clock and so constrains `CommandHistory::apply`
+        // rather than this plumbing.
+        //
+        // `started_at_unix_ms` is agent-visible on every history entry
+        // (§5.2), so a frozen clock reports every command as having
+        // started at the epoch.
+        let (s, pty) = mock_session();
+        let before = now_ms();
+        pty.queue_output(b"\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        wait_until("the command to be recorded", || s.command_count() == 1);
+
+        let entry = s.command_history(0, 10).remove(0);
+        let after = now_ms();
+        assert!(
+            entry.started_at_unix_ms >= before,
+            "started_at_unix_ms is {} — not a clock (test began at {before})",
+            entry.started_at_unix_ms
+        );
+        assert!(
+            entry.started_at_unix_ms <= after,
+            "started_at_unix_ms is {} — ahead of the clock (test ended at {after})",
+            entry.started_at_unix_ms
+        );
     }
 
     #[test]
