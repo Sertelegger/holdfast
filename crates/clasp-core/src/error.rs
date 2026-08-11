@@ -22,6 +22,9 @@ pub enum ClaspError {
     #[error("timed out waiting to write to the session")]
     WriteTimeout,
 
+    #[error("invalid prompt pattern: {0}")]
+    InvalidPattern(String),
+
     #[error("pty error: {0}")]
     Pty(String),
 

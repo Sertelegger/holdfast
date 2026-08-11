@@ -102,6 +102,12 @@ pub fn from_error(e: &crate::ClaspError) -> Result<CallToolResult, ErrorData> {
         // deadline it actually applied. §18.1 mandates no `data` fields
         // for `timeout`, so `data: {}` is at least not a lie.
         E::WriteTimeout => Status::Timeout,
+        // A bad `prompt_patterns` regex is the caller's mistake, not
+        // the server's, so it is an input-schema violation (§5.1)
+        // rather than an envelope status.
+        E::InvalidPattern(_) => {
+            return Err(ErrorData::invalid_params(e.to_string(), None));
+        }
         E::Pty(_) | E::Io(_) => {
             return Err(ErrorData::internal_error(e.to_string(), None));
         }
