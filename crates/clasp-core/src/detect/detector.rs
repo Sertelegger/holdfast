@@ -298,6 +298,10 @@ mod tests {
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
+        // §8.4's number, and the one that matters most of the four: it is
+        // what an agent thresholds on before calling request_secret_input,
+        // so a silent drop to 0.10 stops that tool from ever firing.
+        assert_eq!(s.confidence, 0.95);
     }
 
     #[test]
@@ -326,6 +330,11 @@ mod tests {
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::Fullscreen);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
+        // Zero, and deliberately so: §8.4 reports Fullscreen as a *fact*
+        // about the terminal, not as a graded belief about a prompt, and
+        // the agent has nothing to act on. Left unpinned, 0.0 could become
+        // 1.0 without a single test noticing.
+        assert_eq!(s.confidence, 0.0);
     }
 
     #[test]
@@ -408,6 +417,28 @@ mod tests {
     fn osc133_prompt_markers_give_full_confidence() {
         let (mut d, now) = detector();
         feed(&mut d, b"\x1b]133;A\x07bash-5.3$ \x1b]133;B\x07");
+        let s = d.snapshot_at(true, Some(false), now);
+        assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
+        assert_eq!(s.detection_tier, DetectionTier::Semantic);
+        assert_eq!(s.confidence, 1.0);
+    }
+
+    #[test]
+    fn an_integrated_prompt_is_at_prompt_before_the_command_line_marker() {
+        // §8.3 spells the T1 prompt state as "the last marker is A **or**
+        // B", and only the B half was exercised: every other T1 test feeds
+        // `A … B` and lands on B. Narrowing the rule to B alone therefore
+        // left the whole suite green while breaking the single most common
+        // state in the product — a shell that has drawn its prompt and is
+        // waiting for readline to signal `B`.
+        //
+        // What it degrades to is the point. With no `A` rung the classifier
+        // falls through to the echo rung, where readline's already-off ECHO
+        // reads as AwaitingSecret at 0.95: §8.7 finding 1's false positive,
+        // telling the agent to prompt a human for a password at an idle
+        // prompt.
+        let (mut d, now) = detector();
+        feed(&mut d, b"\x1b]133;A\x07bash-5.3$ ");
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert_eq!(s.detection_tier, DetectionTier::Semantic);
@@ -500,6 +531,27 @@ mod tests {
             "output did not restart the settle timer"
         );
         assert_eq!(s.confidence, 0.0);
+    }
+
+    #[test]
+    fn the_heuristic_decides_at_exactly_the_threshold_not_above_it() {
+        // §8.4's cut is `>= 0.5`, and real input lands *bit-exactly* on it:
+        // the bundled `>\s*$` rule scores 0.5, a settled session scores
+        // 1.0, and 1.0 * 0.5 is 0.5 with no rounding in f32. So `>=` vs
+        // `>` is not a boundary nicety — it silently reclassifies every
+        // generic `>` continuation prompt on every non-readline program,
+        // in the one tier that has no corroborating signal to fall back on.
+        let (mut d, now) = detector();
+        feed(&mut d, b"> ");
+        let s = d.snapshot_at(true, Some(true), now);
+        assert_eq!(s.pattern_score, 0.5);
+        assert_eq!(s.quiescent_score, 1.0);
+        assert_eq!(s.confidence, 0.5, "the product must be exact, not near");
+        assert_eq!(
+            s.interaction_mode,
+            InteractionMode::AtPrompt,
+            "a confidence exactly at the threshold must act, not wait"
+        );
     }
 
     #[test]

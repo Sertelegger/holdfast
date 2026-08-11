@@ -1222,6 +1222,54 @@ fn echo_enabled_tracks_the_slaves_line_discipline() {
 }
 
 #[test]
+fn echo_enabled_reports_echo_and_not_a_flag_that_moves_with_it() {
+    // The sibling above cannot tell `ECHO` from `ICANON`, and cannot tell
+    // `ECHO` from its own negation. Both were measured surviving the whole
+    // suite.
+    //
+    // The cause is that `bash`'s readline toggles ECHO and ICANON together
+    // across the whole raw-mode `c_lflag` group, so at every state that
+    // test visits the two are perfectly correlated — and a polarity flip
+    // just means `poll_echo` matches on its *first* sample instead of
+    // after the transition, which no assertion distinguishes.
+    //
+    // `stty -echo` breaks the correlation: it clears ECHO and leaves
+    // ICANON set. That is also the exact shape of a real password prompt
+    // (getpass, `read -s`), the one state §8.2 exists to detect and the one
+    // the ladder consumes as `echo == Some(false)`, so an ICANON reader
+    // would report `Some(true)` there — inverted for the consumer.
+    //
+    // Sampling a *window* rather than polling until a match is what makes
+    // this hold: a poll-until-`Some(false)` finds the transient at the
+    // readline prompt, before the command has run at all, and lets the
+    // ICANON reader through.
+    let pty = InProcessPty::spawn(&bash()).expect("spawn");
+
+    // The marker is printed *after* stty has taken effect, so reading it
+    // proves the window below starts inside the `stty -echo` region rather
+    // than in the canonical mode bash restores to run the line.
+    pty.write(b"stty -echo; echo STTY''_DONE; sleep 3\n")
+        .unwrap();
+    let out = read_until(&pty, "STTY_DONE", Duration::from_secs(5));
+    assert!(out.contains("STTY_DONE"), "stty never ran: {out:?}");
+
+    let mut samples = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline {
+        samples.push(pty.echo_enabled());
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    pty.signal(Signal::Kill).unwrap();
+
+    assert!(samples.len() >= 10, "too few samples: {}", samples.len());
+    assert!(
+        samples.iter().all(|s| *s == Some(false)),
+        "ECHO is off for this whole window and ICANON is on; a reading of \
+         Some(true) means the sample is inverted or is reading ICANON: {samples:?}"
+    );
+}
+
+#[test]
 fn echo_enabled_is_none_once_the_child_has_exited() {
     let mut cfg = PtySpawnConfig::new("bash");
     cfg.args = vec!["-c".into(), "exit 0".into()];
