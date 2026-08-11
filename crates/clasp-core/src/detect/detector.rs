@@ -112,6 +112,16 @@ impl PromptDetector {
     /// `feed` with an injected clock, so quiescence can be tested without
     /// sleeping.
     pub fn feed_at(&mut self, bytes: &[u8], base: u64, now: Instant) -> Vec<Osc133Event> {
+        // A zero-length chunk is not output, and must not restart the
+        // settle clock. The session reader never feeds one — it treats
+        // `Ok(0)` as "nothing yet" and loops without calling here — but
+        // the guard belongs with the rule rather than with its one caller:
+        // a backend that reported empty reads would give a session that
+        // *never settles*, so its prompt is never reported and the agent
+        // waits on a shell that is sitting idle.
+        if bytes.is_empty() {
+            return Vec::new();
+        }
         self.last_output = now;
         self.scanner.feed(bytes, base)
     }
@@ -254,16 +264,27 @@ mod tests {
     use crate::detect::patterns::PromptPattern;
     use std::time::Duration;
 
-    /// A detector whose clock reads far enough ahead that the session is
-    /// fully settled unless a test says otherwise.
-    fn detector() -> (PromptDetector, Instant) {
-        let d = PromptDetector::default();
-        let now = Instant::now() + Duration::from_secs(10);
-        (d, now)
+    /// A detector plus the two instants its tests need: `start`, which
+    /// every `feed` below is stamped with, and `settled`, far enough past
+    /// it that the session reads fully quiescent.
+    ///
+    /// Both are fixed. `feed` used to stamp with `Instant::now()` and
+    /// `settled` was ten seconds past a *separately* sampled `now`, so the
+    /// interval these tests measure was really "however long the test took
+    /// plus ten seconds" — the same live-clock dependence that let a
+    /// detector with a frozen `last_output` answer every assertion in
+    /// `quiescence_gates_the_heuristic` identically.
+    fn detector() -> (PromptDetector, Instant, Instant) {
+        let start = Instant::now();
+        (
+            PromptDetector::default(),
+            start,
+            start + Duration::from_secs(10),
+        )
     }
 
-    fn feed(d: &mut PromptDetector, bytes: &[u8]) {
-        d.feed_at(bytes, 0, Instant::now());
+    fn feed(d: &mut PromptDetector, at: Instant, bytes: &[u8]) {
+        d.feed_at(bytes, 0, at);
     }
 
     // ---- the §8.7 measurement matrix, replayed as byte streams ----
@@ -273,8 +294,8 @@ mod tests {
 
     #[test]
     fn matrix_idle_bash_prompt() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b[?2004hbash-5.3$ ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b[?2004hbash-5.3$ ");
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
@@ -283,8 +304,8 @@ mod tests {
 
     #[test]
     fn matrix_during_a_running_command() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b[?2004h\x1b[?2004lsleep 2\r\n");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lsleep 2\r\n");
         let s = d.snapshot_at(true, Some(true), now);
         assert_eq!(s.interaction_mode, InteractionMode::Executing);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
@@ -293,8 +314,8 @@ mod tests {
 
     #[test]
     fn matrix_getpass_prompt() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"Password: ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"Password: ");
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
@@ -306,18 +327,18 @@ mod tests {
 
     #[test]
     fn matrix_bash_read_s_prompt() {
-        let (mut d, now) = detector();
+        let (mut d, start, now) = detector();
         // A `read -s` runs inside a shell that has already used bracketed
         // paste; the mode is off while the command runs.
-        feed(&mut d, b"\x1b[?2004h\x1b[?2004lPassword: ");
+        feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lPassword: ");
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
     }
 
     #[test]
     fn matrix_python_repl_prompt() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b[?2004h>>> ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b[?2004h>>> ");
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
@@ -325,8 +346,8 @@ mod tests {
 
     #[test]
     fn matrix_inside_a_tui() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b[?1049h:");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b[?1049h:");
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::Fullscreen);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
@@ -342,8 +363,8 @@ mod tests {
         // `dash` drives no terminal mode and leaves ECHO on, so the T2
         // ladder would answer `Executing` at a live prompt. Availability
         // gating is what stops it (§8.6).
-        let (mut d, now) = detector();
-        feed(&mut d, b"$ ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"$ ");
         let s = d.snapshot_at(true, Some(true), now);
         assert_eq!(s.detection_tier, DetectionTier::Heuristic);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
@@ -357,8 +378,8 @@ mod tests {
         // The spike's finding: ECHO is *off* at an ordinary readline
         // prompt. A classifier keyed on ECHO alone would report
         // AwaitingSecret for every prompt in the matrix.
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b[?2004hbash-5.3$ ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b[?2004hbash-5.3$ ");
         assert_eq!(
             d.snapshot_at(true, Some(false), now).interaction_mode,
             InteractionMode::AtPrompt
@@ -370,12 +391,13 @@ mod tests {
         // Regression guard for the tier-ordering decision. `sudo` runs
         // inside one OSC 133 C..D span, so a T1-first classifier answers
         // `Executing` and the agent never calls request_secret_input.
-        let (mut d, now) = detector();
+        let (mut d, start, now) = detector();
         feed(
             &mut d,
+            start,
             b"\x1b]133;A\x07$ \x1b]133;B\x07sudo id\r\n\x1b]133;C\x07",
         );
-        feed(&mut d, b"\x1b[?2004l[sudo] password for alice: ");
+        feed(&mut d, start, b"\x1b[?2004l[sudo] password for alice: ");
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
@@ -383,12 +405,13 @@ mod tests {
 
     #[test]
     fn a_repl_inside_an_integrated_shell_reports_at_prompt() {
-        let (mut d, now) = detector();
+        let (mut d, start, now) = detector();
         feed(
             &mut d,
+            start,
             b"\x1b]133;A\x07$ \x1b]133;B\x07python3\r\n\x1b]133;C\x07",
         );
-        feed(&mut d, b"\x1b[?2004h>>> ");
+        feed(&mut d, start, b"\x1b[?2004h>>> ");
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         // The tier is what makes this AtPrompt the *right* AtPrompt: the
@@ -401,12 +424,13 @@ mod tests {
 
     #[test]
     fn a_pager_inside_an_integrated_shell_reports_fullscreen() {
-        let (mut d, now) = detector();
+        let (mut d, start, now) = detector();
         feed(
             &mut d,
+            start,
             b"\x1b]133;A\x07$ \x1b]133;B\x07less f\r\n\x1b]133;C\x07",
         );
-        feed(&mut d, b"\x1b[?1049h");
+        feed(&mut d, start, b"\x1b[?1049h");
         assert_eq!(
             d.snapshot_at(true, Some(false), now).interaction_mode,
             InteractionMode::Fullscreen
@@ -415,8 +439,8 @@ mod tests {
 
     #[test]
     fn osc133_prompt_markers_give_full_confidence() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b]133;A\x07bash-5.3$ \x1b]133;B\x07");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b]133;A\x07bash-5.3$ \x1b]133;B\x07");
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert_eq!(s.detection_tier, DetectionTier::Semantic);
@@ -437,8 +461,8 @@ mod tests {
         // reads as AwaitingSecret at 0.95: §8.7 finding 1's false positive,
         // telling the agent to prompt a human for a password at an idle
         // prompt.
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b]133;A\x07bash-5.3$ ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b]133;A\x07bash-5.3$ ");
         let s = d.snapshot_at(true, Some(false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert_eq!(s.detection_tier, DetectionTier::Semantic);
@@ -447,9 +471,10 @@ mod tests {
 
     #[test]
     fn osc133_output_markers_report_executing_at_zero_confidence() {
-        let (mut d, now) = detector();
+        let (mut d, start, now) = detector();
         feed(
             &mut d,
+            start,
             b"\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07building",
         );
         let s = d.snapshot_at(true, Some(true), now);
@@ -462,8 +487,8 @@ mod tests {
     fn a_completed_command_is_not_yet_a_prompt() {
         // Between `D` and the next `A` the shell is between commands. It
         // must not read as AtPrompt: the prompt has not been drawn.
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
         assert_eq!(
             d.snapshot_at(true, Some(true), now).interaction_mode,
             InteractionMode::Executing
@@ -541,8 +566,8 @@ mod tests {
         // `>` is not a boundary nicety — it silently reclassifies every
         // generic `>` continuation prompt on every non-readline program,
         // in the one tier that has no corroborating signal to fall back on.
-        let (mut d, now) = detector();
-        feed(&mut d, b"> ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"> ");
         let s = d.snapshot_at(true, Some(true), now);
         assert_eq!(s.pattern_score, 0.5);
         assert_eq!(s.quiescent_score, 1.0);
@@ -555,9 +580,35 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_chunk_does_not_restart_the_quiescence_clock() {
+        // The mirror of `output_restarts_the_quiescence_clock`. Output
+        // restarts the clock; the *absence* of output must not. Polled
+        // often enough by a backend that returns empty reads, a session
+        // that restarts on every poll never reaches the settle threshold,
+        // so T3 confidence stays 0 and a shell sitting at a prompt is
+        // reported `Executing` for as long as anyone keeps asking.
+        let mut d = PromptDetector::default();
+        let start = Instant::now();
+        d.feed_at(b"$ ", 0, start);
+        let settled = start + Duration::from_millis(400);
+        assert_eq!(
+            d.snapshot_at(true, Some(true), settled).quiescent_score,
+            1.0
+        );
+
+        let events = d.feed_at(b"", 2, settled);
+        assert!(events.is_empty());
+        assert_eq!(
+            d.snapshot_at(true, Some(true), settled).quiescent_score,
+            1.0,
+            "an empty read was counted as output"
+        );
+    }
+
+    #[test]
     fn a_settled_but_unrecognised_tail_scores_zero_confidence() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"linking target/debug/clasp");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"linking target/debug/clasp");
         let s = d.snapshot_at(true, Some(true), now);
         assert_eq!(s.quiescent_score, 1.0);
         assert_eq!(s.pattern_score, 0.0);
@@ -567,8 +618,8 @@ mod tests {
 
     #[test]
     fn the_cursor_sub_signal_is_reported_and_inert_until_tier_b() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"$ ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"$ ");
         let s = d.snapshot_at(true, Some(true), now);
         assert_eq!(s.cursor_score, 0.0, "Tier B is 0.0.4");
         // max(pattern, cursor) must still pick the pattern up.
@@ -617,8 +668,8 @@ mod tests {
 
     #[test]
     fn an_exited_child_forces_exited_and_zero_scores() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b[?2004hbash-5.3$ ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b[?2004hbash-5.3$ ");
         let s = d.snapshot_at(false, None, now);
         assert_eq!(s.interaction_mode, InteractionMode::Exited);
         assert_eq!(s.confidence, 0.0);
@@ -632,22 +683,54 @@ mod tests {
 
     #[test]
     fn scores_and_last_line_are_reported_at_every_tier() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b]133;A\x07alice@host:~$ \x1b]133;B\x07");
-        let s = d.snapshot_at(true, Some(false), now);
-        assert_eq!(s.detection_tier, DetectionTier::Semantic);
-        assert_eq!(s.last_line, "alice@host:~$ ");
-        assert!(
-            (s.pattern_score - 0.85).abs() < 1e-6,
-            "corroborating scores must be reported even when T1 answers"
-        );
-        assert_eq!(s.quiescent_score, 1.0);
+        // §8.4 requires the corroborating signals in *every* response, not
+        // just the one the answering tier happened to use — that is what
+        // lets an agent see a T1 `AtPrompt` disagreeing with a
+        // pattern_score of 0 and treat it as worth a second look. Named
+        // "every tier" and exercising one, the test left both suppressing
+        // pattern_score and blanking last_line alive at the other two.
+        //
+        // The same prompt line reaches each tier by a different route, so
+        // the expected scores are identical across the three rows and only
+        // `detection_tier` moves.
+        //
+        // The `echo` column is not decoration: with echo off the T2 rung
+        // answers AwaitingSecret before T3 is ever consulted, so the
+        // heuristic row has to be a session whose echo is *on* — which is
+        // exactly what a `dash` prompt looks like (§8.7).
+        for (bytes, echo, tier) in [
+            (
+                &b"\x1b]133;A\x07alice@host:~$ \x1b]133;B\x07"[..],
+                Some(false),
+                DetectionTier::Semantic,
+            ),
+            (
+                &b"\x1b[?2004halice@host:~$ "[..],
+                Some(false),
+                DetectionTier::TerminalMode,
+            ),
+            (&b"alice@host:~$ "[..], Some(true), DetectionTier::Heuristic),
+        ] {
+            let (mut d, start, now) = detector();
+            feed(&mut d, start, bytes);
+            let s = d.snapshot_at(true, echo, now);
+            assert_eq!(s.detection_tier, tier, "{bytes:?}");
+            assert_eq!(s.last_line, "alice@host:~$ ", "{bytes:?}");
+            assert!(
+                (s.pattern_score - 0.85).abs() < 1e-6,
+                "{bytes:?}: corroborating scores must be reported whichever \
+                 tier answers, got {}",
+                s.pattern_score
+            );
+            assert_eq!(s.quiescent_score, 1.0, "{bytes:?}");
+            assert_eq!(s.cursor_score, 0.0, "{bytes:?}");
+        }
     }
 
     #[test]
     fn the_window_title_is_reported() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b]0;make -j8\x07\x1b[?2004h$ ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b]0;make -j8\x07\x1b[?2004h$ ");
         assert_eq!(
             d.snapshot_at(true, Some(false), now).title.as_deref(),
             Some("make -j8")
@@ -656,8 +739,8 @@ mod tests {
 
     #[test]
     fn a_backend_that_cannot_sample_echo_never_reports_awaiting_secret() {
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b[?2004h\x1b[?2004lPassword: ");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lPassword: ");
         let s = d.snapshot_at(true, None, now);
         assert_eq!(s.interaction_mode, InteractionMode::Executing);
     }
@@ -666,8 +749,8 @@ mod tests {
     fn a_faked_bracketed_paste_fools_tier_2_as_documented() {
         // Spec §8.8: CLASP does not defend against a hostile child. This
         // asserts the limitation so it cannot change silently.
-        let (mut d, now) = detector();
-        feed(&mut d, b"\x1b[?2004h");
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"\x1b[?2004h");
         assert_eq!(
             d.snapshot_at(true, Some(true), now).interaction_mode,
             InteractionMode::AtPrompt,
