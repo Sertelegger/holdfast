@@ -1,2 +1,5 @@
 /target
 **/*.rs.bk
+
+# graphify knowledge graph (generated; rebuilt by the post-commit hook)
+graphify-out/
