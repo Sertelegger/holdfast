@@ -129,6 +129,10 @@ mod tests {
         let p = PatternSet::defaults();
         for (line, want) in [
             ("Password:", 0.95),
+            // A real prompt is usually followed by blanks; this pins the
+            // `\s*` in `\s*$`, which "Password:" alone cannot distinguish
+            // from a bare `$`.
+            ("Password:   ", 0.95),
             ("Password for alice:", 0.95),
             ("Enter passphrase for key '/home/a/.ssh/id_ed25519':", 0.95),
             ("Continue? [y/N] ", 0.9),
@@ -156,6 +160,17 @@ mod tests {
             "Compiling clasp-core v0.0.1",
             "warning: unused variable",
             "total 48",
+            // Near-misses for the anchored rules. An anchor only bites at
+            // the boundary, so a corpus of obviously-different lines pins
+            // nothing: these carry the trigger token but run past it, and
+            // a rule that fired here would be a confident wrong answer in
+            // exactly the case tier 3 exists to cover.
+            "Password: hunter2",
+            "the Password: field is required",
+            // Trailing whitespace must not rescue a line that has already
+            // continued past the colon: `\s*$` skips blanks, not content.
+            "Password: hunter2   ",
+            "see mysql> in the docs",
         ] {
             assert_eq!(p.score(line), 0.0, "{line:?} should not look like a prompt");
         }
