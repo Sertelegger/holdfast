@@ -916,6 +916,17 @@ async fn command_history_cursors_bound_exactly_one_commands_output() {
     );
     assert!(!out.contains("BEFORE_SPAN"), "span ran backwards: {out:?}");
     assert!(!out.contains("AFTER_SPAN"), "span ran forwards: {out:?}");
+    // The neighbours pin the span to within one command; this pins it to
+    // the byte. The span runs from just *past* the `C` sequence to the
+    // start of the `D` one, so neither escape may fall inside it — and
+    // both off-by-ones that put one there (`event.start` for the open,
+    // `event.end` for the close) leave the three assertions above intact,
+    // because the marker sits between the command's own output and its
+    // neighbour's.
+    assert!(
+        !out.contains("\x1b]133;"),
+        "an OSC 133 sequence is inside the output span: {out:?}"
+    );
     kill(&server, &id).await;
 }
 
