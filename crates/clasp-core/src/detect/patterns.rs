@@ -61,7 +61,7 @@ pub struct PromptPattern {
     pub score: f32,
 }
 
-/// The shipped table, verbatim from spec §8.6 (rev. 26), in table order.
+/// The shipped table, verbatim from spec §8.6 (rev. 34), in table order.
 ///
 /// Nine rows carry a head guard — a leading `^`, a `(?:^|[^…])` class, or
 /// the `\?` that qualifies a confirmation prompt. Those guards are what
@@ -74,9 +74,15 @@ pub struct PromptPattern {
 ///
 /// Changing any score or anchor here changes what CLASP reports about a
 /// live session on the tier with no corroborating signal, so each row is
-/// pinned by a positive that only it can satisfy, a near-miss that pins
-/// its anchors, and — for the guarded rows — the ordinary-output line the
-/// guard was added to reject.
+/// pinned from **both** sides of the boundary it draws (REQ-PD-017): a
+/// positive that only it can satisfy, a near-miss that pins its anchors,
+/// the ordinary-output line the guard was added to reject, *and* a real
+/// prompt on the near side of that same line — the shape the guard would
+/// zero if it were one character wider. The last of those is new at rev.
+/// 34 and is what the previous four missed: rev. 26's `%` guard scored
+/// every numbered-host `csh`/`zsh` prompt at 0 for eight revisions while
+/// the corpus, which carried `hostname% ` and no `build01% `, stayed
+/// green.
 pub const DEFAULT_PATTERNS: &[(&str, f32)] = &[
     (
         r"^(?:\S.*[^A-Za-z0-9_.\-])?[Pp]assword(?:\s+for\s+[^:]+)?:\s*$",
@@ -100,7 +106,7 @@ pub const DEFAULT_PATTERNS: &[(&str, f32)] = &[
     (r"node>\s*$", 0.9),
     (r"\$\s*$", 0.6),
     (r"(?:^|[^#])#\s*$", 0.6),
-    (r"(?:^|[^0-9])%\s*$", 0.6),
+    (r"(?:^|[^0-9]|[A-Za-z][A-Za-z0-9_.\-]*\d)%\s*$", 0.6),
     (r"^>\s*$", 0.5),
     (r"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:.*[\$#]\s*$", 0.85),
     (r"\(gdb\)\s*$", 0.95),
@@ -285,6 +291,29 @@ mod tests {
         ("# ", 0.6),
         ("hostname% ", 0.6),
         ("% ", 0.6),
+        // Row 14's *near side* (§8.6, REQ-PD-017). A head guard has two
+        // sides, and until rev. 34 this corpus carried only the far one —
+        // `Receiving objects:  47%` in `ORDINARY_CORPUS`. The rev.-26 guard
+        // required a non-digit before the `%`, which is not what separates a
+        // percentage from a prompt: a hostname ends in a digit about as
+        // readily as a percentage does, so every `csh`/`tcsh`/`zsh` prompt
+        // on a numbered host scored **0** — silently, for eight revisions,
+        // on the only tier such a session has. These are the lines that make
+        // that visible. `user@build01% ` is here because the `@` is not in
+        // the guard's identifier class, so the token the digits close starts
+        // at `build01` rather than at `user`.
+        ("build01% ", 0.6),
+        ("prod-01% ", 0.6),
+        ("web1% ", 0.6),
+        ("user@build01% ", 0.6),
+        // ...and the cost of anchoring on a letter, asserted rather than
+        // described (§8.6 rev. 34). A prompt whose host part contains no
+        // letter at all stays at 0. This is a real prompt scoring 0 — an
+        // accepted recall loss, not a near miss — and it is here so that
+        // recovering it later is a deliberate edit to §8.6 and to this line
+        // together, and so that a widening which recovers it by accident
+        // cannot pass unnoticed.
+        ("10.0.0.5% ", 0.0),
         // Row 15 — `sh`/`dash` PS2, the whole reason the `>` row exists.
         ("> ", 0.5),
         // Row 16 — full `user@host:path$`. Both also match a
@@ -305,13 +334,14 @@ mod tests {
     /// documents** rather than as a blanket zero (REQ-PD-013).
     ///
     /// A zero assertion cannot tell "this row is correctly narrow" from
-    /// "this row stopped matching anything", and two of these lines do not
-    /// score 0 by design: a `mysql>` in a README is byte-identical to the
-    /// real prompt, and the trailing-`?` row is calibrated above `AtPrompt`
-    /// and below §8.4's act threshold on purpose. Recording both as numbers
+    /// "this row stopped matching anything", and several of these lines do
+    /// not score 0 by design: a `mysql>` in a README is byte-identical to
+    /// the real prompt; the trailing-`?` row is calibrated above `AtPrompt`
+    /// and below §8.4's act threshold on purpose; and `mem2%` is the
+    /// documented price of the rev.-34 `%` guard. Recording them as numbers
     /// makes a tightening that kills recall and a loosening that re-opens a
-    /// class fail the same test, and makes changing either a deliberate
-    /// edit to §8.6 and to this corpus together.
+    /// class fail the same test, and makes changing any of them a
+    /// deliberate edit to §8.6 and to this corpus together.
     ///
     /// The four classes rev. 26 closed are here at 0 by name, because they
     /// are what the head guards were added for.
@@ -347,6 +377,27 @@ mod tests {
         ("Coverage: 92%", 0.0),
         ("  100%", 0.0),
         ("############################", 0.0),
+        // The four forms rev. 34's letter rule is what holds at 0, and the
+        // reason the guard is not simply "a non-space before the digits":
+        // that weaker form was measured re-admitting every one of them. In
+        // each case the run of identifier characters ending at the `%`
+        // opens with a `-`, a digit or a `:` rather than with a letter, so
+        // the digits open their token instead of closing one.
+        ("Coverage change: -2.1%", 0.0),
+        ("cpu -40%", 0.0),
+        ("lines......: 87.5%", 0.0),
+        ("width:100%", 0.0),
+        // ...and the class that rule re-admits, asserted **as present at
+        // 0.6** rather than as absent. This is the measured price of
+        // recovering `build01% `: a percentage written with no separator
+        // after a letter-bearing identifier is the same shape as a numbered
+        // host. No line in §8.6's 65-line corpus has it — every real
+        // percentage there is separated by a space, a colon or a bracket,
+        // all of which still score 0 — and 0.6 reads `AtPrompt` without
+        // §8.4's permission to act. An accepted cost no test asserts is a
+        // cost nobody will notice changing.
+        ("mem2%", 0.6),
+        ("x50%", 0.6),
         // Was 0.5, the exact `AtPrompt` boundary, on the broadest row in
         // the table by reach.
         ("Author: Jane Doe <jane@example.com>", 0.0),
@@ -448,6 +499,23 @@ mod tests {
     /// one. Empty means the mutation is invisible — a row or an anchor
     /// nothing asserts.
     fn divergences(mutant: &[(String, f32)]) -> Vec<&'static str> {
+        divergences_over(full_corpus(), mutant)
+    }
+
+    /// The same, restricted to one corpus.
+    ///
+    /// The restriction is not tidiness. A head-guard mutation has a
+    /// *direction*, and "some asserted line moved" does not check it:
+    /// narrowing the `%` guard back to its rev.-26 form moves `mem2%`, an
+    /// ordinary-output line, whether or not a single numbered-host prompt
+    /// exists to notice — measured, by deleting them and watching the sweep
+    /// stay green. REQ-PD-017 asks for a *real prompt on the near side*, so
+    /// the narrowing sweep ranges over `PROMPT_CORPUS` and the widening
+    /// sweep over the two corpora of things that must not score.
+    fn divergences_over<'a>(
+        corpus: impl Iterator<Item = &'a (&'static str, f32)>,
+        mutant: &[(String, f32)],
+    ) -> Vec<&'static str> {
         let shipped = PatternSet::defaults();
         let mutant = PatternSet {
             compiled: mutant
@@ -455,7 +523,7 @@ mod tests {
                 .map(|(re, s)| (Regex::new(re).expect("mutant must compile"), *s))
                 .collect(),
         };
-        full_corpus()
+        corpus
             .filter(|(line, _)| (shipped.score(line) - mutant.score(line)).abs() >= 1e-6)
             .map(|(line, _)| *line)
             .collect()
@@ -474,7 +542,7 @@ mod tests {
         // per-row positives in `PROMPT_CORPUS` catch a row being removed;
         // this literal is the only thing that catches one being *added*,
         // so both directions stay covered.
-        assert_eq!(DEFAULT_PATTERNS.len(), 22, "§8.6 rev. 26 has 22 rows");
+        assert_eq!(DEFAULT_PATTERNS.len(), 22, "§8.6 rev. 34 has 22 rows");
         assert_eq!(PatternSet::defaults().len(), DEFAULT_PATTERNS.len());
     }
 
@@ -561,61 +629,181 @@ mod tests {
         }
     }
 
+    /// A head guard and the two mutations that must *both* be visible.
+    ///
+    /// `widened` re-opens the false-positive class the guard was added to
+    /// close; `narrowed` swallows the rule the guard was drawn around. The
+    /// forms cannot be derived mechanically — each guard means something
+    /// different — so both are written out alongside what each one costs.
+    struct Guard {
+        guarded: &'static str,
+        widened: &'static str,
+        /// The ordinary output `widened` re-admits.
+        readmits: &'static str,
+        /// `None` only for a guard that is a bare `^` on a token owning its
+        /// whole line, where there is nothing between the anchor and the
+        /// token to make one character stricter. The loop below checks that
+        /// claim against the row's shape rather than taking it on trust.
+        narrowed: Option<&'static str>,
+        /// The real prompt `narrowed` zeroes — the near side of the
+        /// boundary (REQ-PD-017).
+        loses: &'static str,
+    }
+
     #[test]
-    fn every_rev26_head_guard_is_pinned_by_the_corpus() {
-        // The other half of the sweep, and the half rev. 26 is about.
-        // Widening a head guard is the mutation that re-opens a
-        // false-positive class, and unlike the two above it cannot be
-        // derived mechanically — each guard means something different — so
-        // the widened form and the line it must recover are written out.
-        let guards: &[(&str, &str, &str)] = &[
-            (
-                r"^(?:\S.*[^A-Za-z0-9_.\-])?[Pp]assword(?:\s+for\s+[^:]+)?:\s*$",
-                r"(?:\S.*[^A-Za-z0-9_.\-])?[Pp]assword(?:\s+for\s+[^:]+)?:\s*$",
-                "an indented YAML/helm key with an empty value",
-            ),
-            (
-                r"^(?:\S.*[^A-Za-z0-9_.\-])?[Pp]assphrase\s*(?:for\s+key\s+[^:]+)?:\s*$",
-                r"(?:\S.*[^A-Za-z0-9_.\-])?[Pp]assphrase\s*(?:for\s+key\s+[^:]+)?:\s*$",
-                "the same, for passphrase",
-            ),
-            (
-                r"\?\s*[\[(](?:[YyNn]/[YyNn]|yes/no)[^\])]*[\])]\s*:?\s*$",
-                r"[\[(](?:[YyNn]/[YyNn]|yes/no)[^\])]*[\])]\s*:?\s*$",
-                "`--help` prose describing a confirmation, at 0.9 not 0.6",
-            ),
-            (
-                r"^\s*[Ee]nter\s[^:]{0,60}:\s*$",
-                r"\s*[Ee]nter\s[^:]{0,60}:\s*$",
-                "any sentence containing `Enter <thing>:`",
-            ),
-            (r"^>>>\s*$", r">>>\s*$", "prose quoting the Python prompt"),
-            (
-                r"^\.\.\.\s*$",
-                r"\.\.\.\s*$",
-                "every trailing-ellipsis status line, at §8.4's act threshold",
-            ),
-            (r"(?:^|[^#])#\s*$", r"#\s*$", "a `####…` separator banner"),
-            (r"(?:^|[^0-9])%\s*$", r"%\s*$", "every progress percentage"),
-            (
-                r"^>\s*$",
-                r">\s*$",
-                "`git log` authors, traceback frames, closing tags, `<FILE>`",
-            ),
+    fn every_head_guard_is_pinned_from_both_sides() {
+        // REQ-PD-017, and the half that was missing through rev. 33.
+        //
+        // The sweep used to run one direction only: widen each guard and
+        // require the corpus to notice. That proves a guard cannot be
+        // *loosened* into a false-positive class, and it proves nothing
+        // about the opposite failure — a guard so tight that it has
+        // swallowed the rule it was drawn around. The two look identical
+        // from the reject side, which is exactly how the rev.-26 `%` guard
+        // scored every numbered-host `csh`/`zsh` prompt at 0 for eight
+        // revisions with this file green: `Receiving objects:  47%` stayed
+        // at 0 either way, and no `build01% ` existed to disagree.
+        //
+        // So each guard now carries a *narrowed* form too, and the corpus
+        // must notice that as well. For the `%` row the narrowed form is
+        // literally the rev.-26 guard, so the defect cannot be re-imposed.
+        let guards: &[Guard] = &[
+            Guard {
+                guarded: r"^(?:\S.*[^A-Za-z0-9_.\-])?[Pp]assword(?:\s+for\s+[^:]+)?:\s*$",
+                widened: r"(?:\S.*[^A-Za-z0-9_.\-])?[Pp]assword(?:\s+for\s+[^:]+)?:\s*$",
+                readmits: "an indented YAML/helm key with an empty value",
+                // One more character excluded from what may precede
+                // `password` — the space that every real one has in front
+                // of it.
+                narrowed: Some(r"^(?:\S.*[^A-Za-z0-9_.\- ])?[Pp]assword(?:\s+for\s+[^:]+)?:\s*$"),
+                loses: "`[sudo] password for <user>: ` and `<user>@<host>'s password: `",
+            },
+            Guard {
+                guarded: r"^(?:\S.*[^A-Za-z0-9_.\-])?[Pp]assphrase\s*(?:for\s+key\s+[^:]+)?:\s*$",
+                widened: r"(?:\S.*[^A-Za-z0-9_.\-])?[Pp]assphrase\s*(?:for\s+key\s+[^:]+)?:\s*$",
+                readmits: "the same, for passphrase",
+                narrowed: Some(
+                    r"^(?:\S.*[^A-Za-z0-9_.\- ])?[Pp]assphrase\s*(?:for\s+key\s+[^:]+)?:\s*$",
+                ),
+                loses: "`Enter passphrase for key '…': `, which drops to the 0.8 `Enter …:` row",
+            },
+            Guard {
+                guarded: r"\?\s*[\[(](?:[YyNn]/[YyNn]|yes/no)[^\])]*[\])]\s*:?\s*$",
+                widened: r"[\[(](?:[YyNn]/[YyNn]|yes/no)[^\])]*[\])]\s*:?\s*$",
+                readmits: "`--help` prose describing a confirmation, at 0.9 not 0.6",
+                // The `?` must still be allowed to be a space away from the
+                // choice group; apt writes `continue? [Y/n] `.
+                narrowed: Some(r"\?[\[(](?:[YyNn]/[YyNn]|yes/no)[^\])]*[\])]\s*:?\s*$"),
+                loses: "apt's `Do you want to continue? [Y/n] `, which drops to 0.6",
+            },
+            Guard {
+                guarded: r"^\s*[Ee]nter\s[^:]{0,60}:\s*$",
+                widened: r"\s*[Ee]nter\s[^:]{0,60}:\s*$",
+                readmits: "any sentence containing `Enter <thing>:`",
+                // Leading whitespace is deliberately *allowed* here where
+                // the password rows forbid it, and this is what says so.
+                narrowed: Some(r"^[Ee]nter\s[^:]{0,60}:\s*$"),
+                loses: "terraform's indented `  Enter a value: `",
+            },
+            Guard {
+                guarded: r"^>>>\s*$",
+                widened: r">>>\s*$",
+                readmits: "prose quoting the Python prompt",
+                narrowed: None,
+                loses: "nothing: `^` sits directly on a token that owns its line",
+            },
+            Guard {
+                guarded: r"^\.\.\.\s*$",
+                widened: r"\.\.\.\s*$",
+                readmits: "every trailing-ellipsis status line, at §8.4's act threshold",
+                narrowed: None,
+                loses: "nothing: `^` sits directly on a token that owns its line",
+            },
+            Guard {
+                guarded: r"(?:^|[^#])#\s*$",
+                widened: r"#\s*$",
+                readmits: "a `####…` separator banner",
+                // The `%` guard's defect, transplanted onto the `#` guard.
+                // Rev. 34 checked for it here and found none — this guard
+                // rejects a line only when its last two characters are
+                // `##`, and no shell ships a prompt ending in a literal
+                // `##` — but "found none" is a claim about a prompt that
+                // has to be in the corpus. `bash-5.3# ` is it.
+                narrowed: Some(r"(?:^|[^#0-9])#\s*$"),
+                loses: "`bash-5.3# `, the near side of the `#` guard",
+            },
+            Guard {
+                guarded: r"(?:^|[^0-9]|[A-Za-z][A-Za-z0-9_.\-]*\d)%\s*$",
+                widened: r"%\s*$",
+                readmits: "every progress percentage",
+                // The rev.-26 guard verbatim. Re-imposing it must fail a
+                // test, which through rev. 33 it did not.
+                narrowed: Some(r"(?:^|[^0-9])%\s*$"),
+                loses: "every numbered-host `csh`/`tcsh`/`zsh` prompt: `build01% `, `prod-01% `",
+            },
+            Guard {
+                guarded: r"^>\s*$",
+                widened: r">\s*$",
+                readmits: "`git log` authors, traceback frames, closing tags, `<FILE>`",
+                narrowed: None,
+                loses: "nothing: `^` sits directly on a token that owns its line",
+            },
         ];
 
-        for (guarded, widened, recovers) in guards {
+        for g in guards {
             let i = DEFAULT_PATTERNS
                 .iter()
-                .position(|(re, _)| re == guarded)
-                .unwrap_or_else(|| panic!("{guarded} is no longer in the table"));
+                .position(|(re, _)| *re == g.guarded)
+                .unwrap_or_else(|| panic!("{} is no longer in the table", g.guarded));
+            let score = DEFAULT_PATTERNS[i].1;
+
+            // A widening re-opens a class of *ordinary output*, so only
+            // the two corpora of things that must not score can witness it.
             let mut mutant = rows();
-            mutant[i] = ((*widened).to_string(), DEFAULT_PATTERNS[i].1);
+            mutant[i] = (g.widened.to_string(), score);
             assert!(
-                !divergences(&mutant).is_empty(),
-                "widening row {i} to {widened} changes nothing in the \
-                 corpus, so the guard against {recovers} is untested"
+                !divergences_over(ORDINARY_CORPUS.iter().chain(NEAR_MISS_CORPUS), &mutant)
+                    .is_empty(),
+                "widening row {i} to {} changes nothing in the corpus, so \
+                 the guard against {} is untested",
+                g.widened,
+                g.readmits
             );
+
+            match g.narrowed {
+                // ...and a narrowing costs *recall*, so only a real prompt
+                // can witness that. Ranging over the whole corpus here
+                // would accept an ordinary-output line as the witness, and
+                // measured, it does: with the four numbered-host prompts
+                // deleted, `mem2%` alone kept this assertion green while
+                // the `%` guard's near side was entirely unpinned.
+                Some(narrowed) => {
+                    let mut mutant = rows();
+                    mutant[i] = (narrowed.to_string(), score);
+                    assert!(
+                        !divergences_over(PROMPT_CORPUS.iter(), &mutant).is_empty(),
+                        "narrowing row {i} to {narrowed} moves no *prompt* in \
+                         the corpus, so nothing holds the guard off {} — \
+                         which is the direction the rev.-26 `%` guard failed \
+                         in, undetected, for eight revisions (REQ-PD-017)",
+                        g.loses
+                    );
+                }
+                // A bare `^` immediately on the row's token: no optional
+                // prefix group (`^(`) and no leading-whitespace tolerance
+                // (`^\s`), so there is no character between the anchor and
+                // the token to make stricter. Any other shape has a near
+                // side and must name it.
+                None => assert!(
+                    g.guarded.starts_with('^')
+                        && !g.guarded.starts_with("^(")
+                        && !g.guarded.starts_with(r"^\s"),
+                    "row {i} ({}) claims no narrower form exists, but its \
+                     guard admits characters before the token — name the \
+                     prompt on its near side (REQ-PD-017)",
+                    g.guarded
+                ),
+            }
         }
 
         // ...and the guards table must cover every guarded row, or a row
@@ -636,6 +824,72 @@ mod tests {
              mutation-tested",
             guards.len()
         );
+    }
+
+    #[test]
+    fn the_percent_guard_admits_a_hosts_digits_and_not_a_percentages() {
+        // The rule rev. 34 replaced "a non-digit before the `%`" with, and
+        // the one mutation neither direction of the sweep above reaches.
+        //
+        // What separates a percentage from a numbered-host prompt is *where
+        // the digit run starts*: a percentage's digits open their token
+        // (`47%`, ` 40%`, `: 92%`, `-2.1%`), while a numbered host's digits
+        // close a token that began with a letter. Both mutants below sit
+        // between the shipped guard and the two the sweep tries, and each
+        // gets exactly one of the two sides right.
+        let i = DEFAULT_PATTERNS
+            .iter()
+            .position(|(re, _)| *re == r"(?:^|[^0-9]|[A-Za-z][A-Za-z0-9_.\-]*\d)%\s*$")
+            .expect("the rev.-34 `%` row is no longer in the table");
+
+        // "A non-space before the digits" — the weaker form that was
+        // measured re-admitting all four of these. It recovers `build01% `,
+        // so the recall half of the corpus cannot tell it from the real
+        // guard; only the false-positive half can.
+        let mut mutant = rows();
+        mutant[i] = (
+            r"(?:^|[^0-9]|\S[A-Za-z0-9_.\-]*\d)%\s*$".to_string(),
+            DEFAULT_PATTERNS[i].1,
+        );
+        let moved = divergences(&mutant);
+        for line in [
+            "Coverage change: -2.1%",
+            "cpu -40%",
+            "lines......: 87.5%",
+            "width:100%",
+        ] {
+            assert!(
+                moved.contains(&line),
+                "{line:?} scores the same under `\\S` as under `[A-Za-z]`, \
+                 so the corpus does not hold the guard to the letter rule"
+            );
+        }
+
+        // ...and the same table read from the recall side: dropping the
+        // third alternative is the rev.-26 guard, which the four lines
+        // above cannot see at all.
+        let mut mutant = rows();
+        mutant[i] = (r"(?:^|[^0-9])%\s*$".to_string(), DEFAULT_PATTERNS[i].1);
+        let moved = divergences(&mutant);
+        for line in ["build01% ", "prod-01% ", "web1% ", "user@build01% "] {
+            assert!(
+                moved.contains(&line),
+                "{line:?} scores the same with and without the letter rule, \
+                 so nothing stops the rev.-26 guard being re-imposed"
+            );
+        }
+        for line in [
+            "Coverage change: -2.1%",
+            "cpu -40%",
+            "lines......: 87.5%",
+            "width:100%",
+        ] {
+            assert!(
+                !moved.contains(&line),
+                "{line:?} moved when the letter rule was dropped, so it is \
+                 not a line the letter rule is what holds at 0"
+            );
+        }
     }
 
     #[test]
