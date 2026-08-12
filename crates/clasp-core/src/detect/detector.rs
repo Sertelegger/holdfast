@@ -157,11 +157,43 @@ impl PromptDetector {
         // Availability, not current value: a program that has never driven
         // a terminal mode (`dash`) cannot be classified by one, and must
         // fall through to T3 rather than be read as "not at a prompt".
+        //
+        // Availability is stated **per signal**, not per tier (§8.3), and
+        // it is *sticky* — observed once, never un-observed. So whatever a
+        // signal's availability licenses has to hold for the rest of the
+        // session, and only bracketed paste supports a claim that strong:
+        //
+        // - **bracketed paste** licenses the T2 executing rung below, and
+        //   only that rung. That rung infers *prompt mode is off, therefore
+        //   not at a prompt*, which is valid exactly for a program known to
+        //   signal its prompts with bracketed paste — off means
+        //   not-at-a-prompt precisely because on is what it does at a
+        //   prompt.
+        // - **alternate screen** licenses nothing. Observing it says a
+        //   child took the whole screen and later gave it back; it supports
+        //   no inference about whether the shell now holding the tty
+        //   signals its prompts at all. The `Fullscreen` rung reads
+        //   alt-screen's *current* value and so needs no availability
+        //   notion — which is why this narrows the executing rung rather
+        //   than dropping the signal from the classifier.
+        // - **termios `ECHO`** likewise: readable is not observed. `dash`
+        //   has a perfectly readable `ECHO` and it is *on* at a `dash`
+        //   prompt, so a T2 answer there would be actively wrong.
+        //
+        // Through rev. 27 this read `saw_bracketed_paste || saw_alt_screen`.
+        // Because availability is sticky, one alt-screen toggle marked a
+        // session T2-available for life and the executing rung then
+        // answered `Executing` at every later live prompt of a shell that
+        // drives no terminal modes at all — with `pattern_score: 0.60`
+        // contradicting it in the same payload, and §8.4 telling the agent
+        // to wait. Nothing in the session could ever clear it. See the
+        // `availability` test module for the five §8.7 rows that pin this
+        // in both directions.
         let t1 = modes.saw_osc133;
-        let t2 = modes.saw_bracketed_paste || modes.saw_alt_screen;
+        let t2_prompt_mode = modes.saw_bracketed_paste;
         let session_tier = if t1 {
             DetectionTier::Semantic
-        } else if t2 {
+        } else if t2_prompt_mode {
             DetectionTier::TerminalMode
         } else {
             DetectionTier::Heuristic
@@ -210,12 +242,14 @@ impl PromptDetector {
                 0.0,
                 "osc 133 output marker with no completion since".to_string(),
             )
-        } else if t2 {
+        } else if t2_prompt_mode {
             (
                 InteractionMode::Executing,
                 DetectionTier::TerminalMode,
                 0.0,
-                "bracketed paste is disabled".to_string(),
+                "this program signals its prompts with bracketed paste, \
+                 and it is disabled"
+                    .to_string(),
             )
         } else {
             let evidence = pattern_score.max(cursor_score);
@@ -340,10 +374,9 @@ mod tests {
         // §8.7's fifth row, and the one the spike called out specially:
         // `ssh` is not readline and prints its own prompt, so this row is
         // the evidence that the `AwaitingSecret` rung generalises past
-        // `getpass()` and bash's `read -s` — the matrix had six of its
-        // seven rows under test and this was the gap. It ran under a shell
-        // that had already driven bracketed paste (§8.7's `Seen BrktPst`
-        // column), which the stream below reproduces.
+        // `getpass()` and bash's `read -s`. It ran under a shell that had
+        // already driven bracketed paste (`Seen BrktPst: yes`), which the
+        // stream below reproduces.
         let (mut d, start, now) = detector();
         feed(
             &mut d,
@@ -777,5 +810,231 @@ mod tests {
             InteractionMode::AtPrompt,
             "documented limitation: a program printing \\x1b[?2004h is believed"
         );
+    }
+
+    /// §11.1 `detector::availability` — the §8.3 availability rule, pinned
+    /// in **both** directions (REQ-PD-011, REQ-PD-015).
+    ///
+    /// Availability is a *sticky per-signal* fact: observed once, never
+    /// un-observed. So whatever a signal's availability licenses has to
+    /// hold for the rest of the session, and exactly one of the three T2
+    /// signals supports such a claim. Bracketed paste licenses the T2
+    /// executing rung — *prompt mode is off, therefore not at a prompt* is
+    /// valid only for a program known to signal its prompts that way.
+    /// Observing the alternate screen says a child took the screen and
+    /// gave it back; it licenses nothing about whether the shell now
+    /// holding the tty signals its prompts at all.
+    ///
+    /// **Why this module exists as a module.** The rule was previously
+    /// unpinned in *both* directions: the entire 0.0.2 suite passed with
+    /// and without the `|| saw_alt_screen` disjunct, so two implementations
+    /// that classify a live `dash` prompt differently both satisfied the
+    /// text. A rule that only fails one way is half-pinned. The two
+    /// mutations these rows exist to kill are:
+    ///
+    /// - **drop bracketed paste** from the rule — row 4 breaks, and note
+    ///   that its `interaction_mode` (`Executing`) and its `confidence`
+    ///   (`0.00`) are *unchanged* by that mutation. Only the tier moves.
+    ///   A row asserted at its mode alone would not notice.
+    /// - **add alt-screen back** to the rule — rows 2 and 3 break, on all
+    ///   three fields.
+    ///
+    /// Rows 1 and 5 must not move under either mutation. Row 1 is the
+    /// baseline `dash` prompt the availability gate was introduced (rev.
+    /// 23) to protect; row 5 reads alt-screen's *current* value at the
+    /// `Fullscreen` rung, which sits earlier in the ladder and is untouched
+    /// by any change to availability.
+    mod availability {
+        use super::*;
+
+        /// Assert the session *history* a row's byte stream is supposed to
+        /// establish, before asking what the classifier makes of it.
+        ///
+        /// These five rows differ from one another only in that history —
+        /// rows 1 and 2 end on byte-identical prompts — so a stream that
+        /// silently stops establishing it degrades into another row that
+        /// is already covered and keeps passing. A mistyped `\x1b[?1049h`
+        /// turns row 2 back into row 1, which satisfies every assertion
+        /// row 2 makes about the *answer*. This is the guard that makes
+        /// the row name mean something.
+        fn assert_history(d: &PromptDetector, saw_bp: bool, saw_alt: bool, alt_now: bool) {
+            let m = d.scanner.modes();
+            assert_eq!(
+                m.saw_bracketed_paste, saw_bp,
+                "observed-bracketed-paste history"
+            );
+            assert_eq!(m.saw_alt_screen, saw_alt, "observed-alt-screen history");
+            assert_eq!(m.alt_screen, alt_now, "alternate screen right now");
+        }
+
+        /// Row 1 — `dash`, no terminal mode ever seen, sitting at `$ `.
+        /// The case that always worked, asserted so the fix cannot buy
+        /// rows 2 and 3 at its expense.
+        #[test]
+        fn row_1_dash_that_never_saw_a_mode_answers_at_prompt_via_t3() {
+            let (mut d, start, now) = detector();
+            feed(&mut d, start, b"$ ");
+            assert_history(&d, false, false, false);
+
+            let s = d.snapshot_at(true, Some(true), now);
+            assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
+            assert_eq!(s.detection_tier, DetectionTier::Heuristic);
+            assert!((s.confidence - 0.60).abs() < 1e-6, "{}", s.confidence);
+        }
+
+        /// Row 2 — the *same* `dash` prompt as row 1, after `less` entered
+        /// and left the alternate screen. This is the rev.-27 defect: one
+        /// alt-screen toggle marked the session T2-available for life, and
+        /// the T2 executing rung then answered `Executing` / `terminal_mode`
+        /// / `0.00` at a live prompt — while `pattern_score: 0.60` sat in
+        /// the same payload contradicting it. §8.4 tells the agent that
+        /// `Executing` at `terminal_mode` is deterministic and to wait, so
+        /// the agent waited at a prompt nothing in the session could ever
+        /// clear.
+        #[test]
+        fn row_2_dash_after_less_entered_and_left_the_alt_screen_still_answers_via_t3() {
+            let (mut d, start, now) = detector();
+            feed(&mut d, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n$ ");
+            assert_history(&d, false, true, false);
+
+            let s = d.snapshot_at(true, Some(true), now);
+            assert_eq!(
+                s.interaction_mode,
+                InteractionMode::AtPrompt,
+                "a live `dash` prompt, reported as a running command"
+            );
+            assert_eq!(s.detection_tier, DetectionTier::Heuristic);
+            assert!((s.confidence - 0.60).abs() < 1e-6, "{}", s.confidence);
+            // The self-contradiction the old answer shipped with. Pinned
+            // because it is the cheapest signal that the disjunct is back:
+            // a `terminal_mode` `Executing` beside a 0.60 pattern score.
+            assert!((s.pattern_score - 0.60).abs() < 1e-6, "{}", s.pattern_score);
+        }
+
+        /// Row 3 — a bespoke CLI that alt-screened once and now prompts.
+        /// Same defect as row 2, but with no shell involved at all and a
+        /// different pattern row carrying the answer, so the two rows fail
+        /// the add-alt-screen mutation independently rather than as one
+        /// duplicated assertion.
+        #[test]
+        fn row_3_a_bespoke_cli_that_alt_screened_once_and_now_prompts_answers_via_t3() {
+            let (mut d, start, now) = detector();
+            feed(
+                &mut d,
+                start,
+                b"\x1b[?1049h drawing \x1b[?1049l\r\nEnter a value: ",
+            );
+            assert_history(&d, false, true, false);
+
+            let s = d.snapshot_at(true, Some(true), now);
+            assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
+            assert_eq!(s.detection_tier, DetectionTier::Heuristic);
+            assert!((s.confidence - 0.80).abs() < 1e-6, "{}", s.confidence);
+        }
+
+        /// Row 4 — bash, bracketed paste seen and now disabled, a command
+        /// running. The one inference bracketed-paste availability
+        /// legitimately licenses, and the row that breaks if the signal is
+        /// *removed* from the rule.
+        #[test]
+        fn row_4_bash_with_bracketed_paste_seen_then_disabled_answers_executing_via_t2() {
+            let (mut d, start, now) = detector();
+            feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lsleep 2\r\n");
+            assert_history(&d, true, false, false);
+
+            let s = d.snapshot_at(true, Some(true), now);
+            assert_eq!(s.interaction_mode, InteractionMode::Executing);
+            assert_eq!(
+                s.detection_tier,
+                DetectionTier::TerminalMode,
+                "removing bracketed paste from the availability rule drops \
+                 this row to the heuristic tier while leaving its mode \
+                 (`Executing`) and its confidence (0.00) untouched — the \
+                 tier is the only field that catches that direction"
+            );
+            assert_eq!(s.confidence, 0.0);
+        }
+
+        /// Row 5 — the alternate screen currently **on**. Unaffected in
+        /// both directions: the `Fullscreen` rung reads alt-screen's
+        /// current value and sits above every availability question, which
+        /// is why the fix narrows the executing rung rather than dropping
+        /// alt-screen from the classifier. Note the session has never
+        /// driven bracketed paste, so this holds with no T2 availability
+        /// at all.
+        #[test]
+        fn row_5_a_live_alt_screen_reports_fullscreen_with_no_availability_at_all() {
+            let (mut d, start, now) = detector();
+            feed(&mut d, start, b"\x1b[?1049h:");
+            assert_history(&d, false, true, true);
+
+            let s = d.snapshot_at(true, Some(true), now);
+            assert_eq!(s.interaction_mode, InteractionMode::Fullscreen);
+            assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
+            assert_eq!(s.confidence, 0.0);
+        }
+
+        /// The rule stated as a rule, rather than as five of its
+        /// consequences: observing the alternate screen must not change any
+        /// answer the classifier gives once the screen is handed back.
+        ///
+        /// Rows 1 and 2 are that claim for one prompt; this walks the
+        /// prompt-bearing tails the T3 table actually distinguishes and
+        /// requires the *whole* `Detection` to match with and without the
+        /// alt-screen episode. It fails on the add-alt-screen mutation and
+        /// would also catch a narrower reintroduction — one that gated some
+        /// other rung on `saw_alt_screen` — which the five rows above,
+        /// being fixed points, could miss.
+        #[test]
+        fn an_alt_screen_episode_changes_no_later_answer() {
+            for tail in [
+                &b"$ "[..],
+                &b"Enter a value: "[..],
+                &b">>> "[..],
+                &b"linking target/debug/clasp"[..],
+            ] {
+                let (mut clean, start, now) = detector();
+                feed(&mut clean, start, tail);
+                let without = clean.snapshot_at(true, Some(true), now);
+
+                let (mut toggled, start, now) = detector();
+                feed(&mut toggled, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n");
+                feed(&mut toggled, start, tail);
+                assert_history(&toggled, false, true, false);
+                let with = toggled.snapshot_at(true, Some(true), now);
+
+                assert_eq!(
+                    with,
+                    without,
+                    "an alt-screen episode changed the answer for {:?}",
+                    String::from_utf8_lossy(tail)
+                );
+            }
+        }
+
+        /// `session_tier` — the tier reported once the child is gone — is
+        /// derived from the *same* availability notion the live ladder
+        /// uses, so "T2 available" has exactly one meaning in this
+        /// function.
+        ///
+        /// §8.3 does not speak to this directly: its first rung answers
+        /// `Exited` before any tier question is asked, and §8.4's table
+        /// describes the tier of the branch that *answered*. Resolved
+        /// deliberately in favour of one definition, because a second and
+        /// wider spelling of T2-availability sitting beside the narrowed
+        /// one is precisely the shape the alt-screen disjunct survived in
+        /// from rev. 23 to rev. 27.
+        #[test]
+        fn an_exited_alt_screen_only_session_reports_the_tier_that_could_have_answered() {
+            let (mut d, start, now) = detector();
+            feed(&mut d, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n$ ");
+            assert_history(&d, false, true, false);
+            assert_eq!(
+                d.snapshot_at(false, None, now).detection_tier,
+                DetectionTier::Heuristic,
+                "a session that only ever drove the alternate screen was \
+                 never classifiable by terminal mode"
+            );
+        }
     }
 }
