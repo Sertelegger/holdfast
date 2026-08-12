@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "clasp"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "clasp-core",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "clasp-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "jsonschema",
