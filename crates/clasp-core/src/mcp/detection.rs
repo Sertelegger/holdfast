@@ -56,6 +56,7 @@ mod tests {
     use super::*;
     use crate::pty::{MockPty, PtyBackend};
     use crate::session::{new_session_id, Session, SessionConfig};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -88,6 +89,19 @@ mod tests {
             s.detection().last_line == last_line
         });
         (s, pty)
+    }
+
+    /// The exact set of keys an object carries.
+    fn key_set(v: &Value) -> BTreeSet<&str> {
+        v.as_object()
+            .unwrap_or_else(|| panic!("expected an object, got {v}"))
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn set<'a>(names: &[&'a str]) -> BTreeSet<&'a str> {
+        names.iter().copied().collect()
     }
 
     /// Poll the *detector's* state, not the buffer's.
@@ -200,6 +214,55 @@ mod tests {
             "title must be emitted, not omitted"
         );
         assert_eq!(map["title"], Value::Null);
+    }
+
+    #[test]
+    fn the_block_inserts_exactly_the_keys_5_4_names_and_no_others() {
+        // Every other test in this module asserts *presence* and values:
+        // `every_documented_field_is_present` walks a list of keys it
+        // expects and `each_field_carries_the_value_it_names` indexes them
+        // by name. Neither can see an *extra* key. Adding
+        // `map.insert("debug".into(), json!(1))` next to the real inserts
+        // survives all seven of them.
+        //
+        // That is not cosmetic. §23.3 freezes this surface, and every
+        // schema declaring it is `deny_unknown_fields`, so a stray key here
+        // is `additionalProperties` rejection on a live response — a
+        // failure the agent sees and no test in this crate does. Pinning
+        // the exact key set is what turns that into a local failure.
+        //
+        // The payload starts non-empty so the assertion also proves the
+        // block is *added to* the caller's data rather than replacing it.
+        let (s, _pty) = session_with_output(b"\x1b[?2004h\x1b]0;t\x07$ ", "$ ");
+        let v = with_detection(json!({ "output": "", "cursor": 0 }), &s);
+
+        assert_eq!(
+            key_set(&v),
+            set(&[
+                // The caller's own fields, which the block must not eat…
+                "output",
+                "cursor",
+                // …and the five §5.4 siblings.
+                "interaction_mode",
+                "detection_tier",
+                "screen_tracking",
+                "title",
+                "prompt",
+            ]),
+            "the §5.4 block gained or lost a field"
+        );
+        assert_eq!(
+            key_set(&v["prompt"]),
+            set(&[
+                "confidence",
+                "quiescent_score",
+                "pattern_score",
+                "cursor_score",
+                "reason",
+                "last_line",
+            ]),
+            "the §5.4 prompt object gained or lost a field"
+        );
     }
 
     #[test]
