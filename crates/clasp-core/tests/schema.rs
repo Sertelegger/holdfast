@@ -21,9 +21,12 @@
 //! unfalsifiable: `an_undeclared_field_is_rejected` and
 //! `read_output_emits_every_field_5_4_promises` are the two halves.
 
+use clasp_core::detect::Shell;
 use clasp_core::mcp::envelope;
-use clasp_core::mcp::schema;
-use clasp_core::mcp::tools::{ReadOutputArgs, SendInputArgs, StartSessionArgs, TerminateArgs};
+use clasp_core::mcp::tools::{
+    GetCommandHistoryArgs, ReadOutputArgs, SendInputArgs, StartSessionArgs, StatusArgs,
+    TerminateArgs,
+};
 use clasp_core::mcp::ClaspServer;
 use clasp_core::pty::{MockPty, PtyBackend};
 use clasp_core::session::{new_session_id, Session, SessionConfig};
@@ -45,11 +48,25 @@ fn advertised(name: &str) -> Tool {
         "read_output" => ClaspServer::read_output_tool_attr(),
         "send_input" => ClaspServer::send_input_tool_attr(),
         "terminate" => ClaspServer::terminate_tool_attr(),
+        "status" => ClaspServer::status_tool_attr(),
+        "list_sessions" => ClaspServer::list_sessions_tool_attr(),
+        "get_command_history" => ClaspServer::get_command_history_tool_attr(),
         other => panic!("no such tool: {other}"),
     }
 }
 
-const TOOLS: [&str; 4] = ["start_session", "read_output", "send_input", "terminate"];
+/// Every tool 0.0.2 ships. REQ-T-013 says "every tool", so this is
+/// enumerated rather than spot-checked: a tool added later without a
+/// schema, or without annotations, fails the loops below.
+const TOOLS: [&str; 7] = [
+    "start_session",
+    "read_output",
+    "send_input",
+    "terminate",
+    "status",
+    "list_sessions",
+    "get_command_history",
+];
 
 fn output_schema(name: &str) -> Value {
     let tool = advertised(name);
@@ -221,18 +238,81 @@ async fn kill(server: &ClaspServer, session: &str) {
 fn mock_session(server: &ClaspServer, echo: Option<bool>) -> (String, Arc<MockPty>) {
     let pty = Arc::new(MockPty::new());
     pty.set_echo(echo);
+    let id = register(server, None, "mock", &[], SessionConfig::default(), &pty);
+    (id, pty)
+}
+
+/// Register a mock-backed session with a chosen identity and config.
+///
+/// `status` and `list_sessions` report a dozen fields off the `Session`,
+/// most of them same-typed; a real `bash` session cannot give them
+/// distinguishable values (`command` and `shell_integration` are both
+/// `"bash"`), so the value assertions drive a mock whose every field is
+/// different from every other.
+fn register(
+    server: &ClaspServer,
+    name: Option<&str>,
+    command: &str,
+    args: &[&str],
+    config: SessionConfig,
+    pty: &Arc<MockPty>,
+) -> String {
     let session = Session::new(
         new_session_id(),
-        None,
-        "mock".into(),
-        vec![],
-        Arc::clone(&pty) as Arc<dyn PtyBackend>,
-        SessionConfig::default(),
+        name.map(str::to_string),
+        command.to_string(),
+        args.iter().map(|a| (*a).to_string()).collect(),
+        Arc::clone(pty) as Arc<dyn PtyBackend>,
+        config,
     );
     let id = session.id.clone();
     server.registry.insert(session).expect("registry insert");
-    (id, pty)
+    id
 }
+
+/// Poll until `pred` holds, or fail with `what`.
+async fn until(what: &str, mut pred: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pred() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(pred(), "timed out waiting for {what}");
+}
+
+/// The §5.4 session-state block, which `status` and every `list_sessions`
+/// entry carry as siblings of the record's own fields.
+const DETECTION_FIELDS: [&str; 5] = [
+    "interaction_mode",
+    "detection_tier",
+    "screen_tracking",
+    "title",
+    "prompt",
+];
+
+/// Every key a `SessionRecord` carries: §5.2's own fields plus §5.4's.
+fn session_record_keys() -> BTreeSet<String> {
+    let mut all = set(&[
+        "id",
+        "name",
+        "command",
+        "args",
+        "state",
+        "pid",
+        "exit_code",
+        "shell_integration",
+        "command_count",
+        "started_at_unix_secs",
+        "last_activity_unix_ms",
+        "buffer",
+    ]);
+    all.extend(set(&DETECTION_FIELDS));
+    all
+}
+
+/// Two OSC 133 commands with distinct texts and distinct non-zero exit
+/// codes, so no entry's field can be confused with another's.
+const TWO_COMMANDS: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07echo one\r\n\x1b]133;C\x07one\r\n\
+\x1b]133;D;3\x07\x1b]133;A\x07$ \x1b]133;B\x07echo two\r\n\x1b]133;C\x07two\r\n\x1b]133;D;4\x07";
 
 // ------------------------------------------------- the advertised surface
 
@@ -254,67 +334,65 @@ fn every_tool_advertises_a_compiling_output_schema() {
     }
 }
 
-#[test]
-fn every_declared_shape_forbids_undeclared_fields() {
-    // The load-bearing detail. JSON Schema permits unknown properties by
-    // default, so without `additionalProperties: false` a schema that
-    // merely *omitted* a field would validate every response and every
-    // positive test in this file would pass unconditionally. This asserts
-    // the strictness itself, on the envelope and on each tool's `data`.
-    for name in TOOLS {
-        let schema = output_schema(name);
-        assert_eq!(
-            schema["additionalProperties"],
-            json!(false),
-            "{name}: the envelope must reject undeclared fields"
-        );
-        for (def, body) in schema["$defs"]
-            .as_object()
-            .unwrap_or_else(|| panic!("{name}: schema has no $defs"))
-        {
-            // Enums are `type: string`; only object shapes carry the flag.
-            if body.get("type").is_some_and(|t| t == "object") {
-                assert_eq!(
-                    body["additionalProperties"],
-                    json!(false),
-                    "{name}: $defs/{def} must reject undeclared fields"
-                );
+/// Every object subschema reachable from `schema`, as `(path, subschema)`.
+///
+/// A recursive walk rather than a look at `$defs`: whether schemars hoists
+/// a nested shape into `$defs` or inlines it under `properties` is its
+/// choice, not the contract, and a shape that got inlined would silently
+/// drop out of a `$defs`-only sweep.
+fn object_subschemas<'a>(path: &str, schema: &'a Value, out: &mut Vec<(String, &'a Value)>) {
+    let Some(map) = schema.as_object() else {
+        return;
+    };
+    if map.get("type").is_some_and(|t| t == "object") {
+        out.push((path.to_string(), schema));
+    }
+    for key in ["properties", "$defs", "definitions"] {
+        if let Some(children) = map.get(key).and_then(Value::as_object) {
+            for (name, child) in children {
+                object_subschemas(&format!("{path}/{key}/{name}"), child, out);
+            }
+        }
+    }
+    for key in ["items", "additionalProperties", "not"] {
+        if let Some(child) = map.get(key) {
+            object_subschemas(&format!("{path}/{key}"), child, out);
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(children) = map.get(key).and_then(Value::as_array) {
+            for (i, child) in children.iter().enumerate() {
+                object_subschemas(&format!("{path}/{key}/{i}"), child, out);
             }
         }
     }
 }
 
 #[test]
-fn the_shapes_task_10_will_use_are_declared_and_strict() {
-    // `status`, `list_sessions` and `get_command_history` are Task 10's
-    // tools, but their schemas are declared here so the surface freezes in
-    // one place. Assert the same strictness now — a `deny_unknown_fields`
-    // missing from one of these would otherwise only be noticed once the
-    // tool that uses it shipped.
-    for (label, schema) in [
-        (
-            "ListSessions",
-            schema::envelope_schema::<schema::ListSessions>(),
-        ),
-        (
-            "CommandHistory",
-            schema::envelope_schema::<schema::CommandHistory>(),
-        ),
-        (
-            "SessionRecord",
-            schema::envelope_schema::<schema::SessionRecord>(),
-        ),
-    ] {
-        let schema = Value::Object(schema.as_ref().clone());
-        assert_eq!(schema["additionalProperties"], json!(false), "{label}");
-        for (def, body) in schema["$defs"].as_object().expect("$defs") {
-            if body.get("type").is_some_and(|t| t == "object") {
-                assert_eq!(
-                    body["additionalProperties"],
-                    json!(false),
-                    "{label}: $defs/{def}"
-                );
-            }
+fn every_declared_shape_forbids_undeclared_fields() {
+    // The load-bearing detail. JSON Schema permits unknown properties by
+    // default, so without `additionalProperties: false` a schema that
+    // merely *omitted* a field would validate every response and every
+    // positive test in this file would pass unconditionally. This asserts
+    // the strictness itself, on the envelope and on every object shape
+    // underneath it — `SessionRecord`, `Buffer`, `Prompt`, `CommandEntry`.
+    for name in TOOLS {
+        let schema = output_schema(name);
+        let mut found = Vec::new();
+        object_subschemas("#", &schema, &mut found);
+        // The envelope, `data`, and at minimum one shape below it. A walk
+        // that silently found nothing would make the loop vacuous.
+        assert!(
+            found.len() >= 2,
+            "{name}: only {} object shape(s) reachable; the walk found nothing to check",
+            found.len()
+        );
+        for (path, body) in found {
+            assert_eq!(
+                body["additionalProperties"],
+                json!(false),
+                "{name}: {path} must reject undeclared fields"
+            );
         }
     }
 }
@@ -362,7 +440,40 @@ fn every_tool_declares_the_annotations_5_3_assigns_it() {
             Some(true),
             Some(false),
         ),
+        // The three read-only tools share one hint combination, so the
+        // *title* is what distinguishes them: a `status` that advertised
+        // `list_sessions`'s annotations would pass the boolean columns and
+        // fail here.
+        (
+            "status",
+            "Get detailed session status",
+            Some(true),
+            None,
+            None,
+            Some(false),
+        ),
+        (
+            "list_sessions",
+            "List active sessions",
+            Some(true),
+            None,
+            None,
+            Some(false),
+        ),
+        (
+            "get_command_history",
+            "List commands run, with exit codes",
+            Some(true),
+            None,
+            None,
+            Some(false),
+        ),
     ];
+    assert_eq!(
+        expected.len(),
+        TOOLS.len(),
+        "every tool must have a row here, or REQ-T-014 is only spot-checked"
+    );
     for (name, title, read_only, destructive, idempotent, open_world) in expected {
         let a = advertised(name)
             .annotations
@@ -397,23 +508,27 @@ fn the_status_enum_declares_every_status_the_envelope_can_emit() {
         envelope::Status::NameTaken,
         envelope::Status::LimitReached,
         envelope::Status::SpawnFailed,
+        envelope::Status::Unavailable,
     ]
     .iter()
     .map(|s| s.as_str().to_string())
     .collect();
 
-    let undeclared: Vec<_> = emitted.difference(&declared).collect();
-    assert!(
-        undeclared.is_empty(),
-        "these statuses are emitted but not declared: {undeclared:?}"
+    // Both directions, and both matter. A status emitted but not declared
+    // is a response that fails its own schema the first time that path
+    // runs. A status declared but not emitted is vocabulary the agent is
+    // told to branch on and never sees — which is what `unavailable` was
+    // until `get_command_history` shipped, and the reason this assertion
+    // used to allow exactly that one exception. It no longer does.
+    assert_eq!(
+        emitted.difference(&declared).collect::<Vec<_>>(),
+        Vec::<&String>::new(),
+        "these statuses are emitted but not declared"
     );
-    // The reverse is allowed and intentional: `unavailable` is declared
-    // for Task 10's `get_command_history` before the tool exists. Pin it,
-    // so "declared but unemitted" cannot grow silently.
     assert_eq!(
         declared.difference(&emitted).collect::<Vec<_>>(),
-        vec![&"unavailable".to_string()],
-        "only `unavailable` may be declared ahead of its tool"
+        Vec::<&String>::new(),
+        "these statuses are declared but no tool can emit them"
     );
 }
 
@@ -663,6 +778,396 @@ async fn terminate_responses_match_their_schema() {
         .expect("terminate must not be a protocol error");
     let payload = assert_matches_schema("terminate", &second);
     assert_eq!(payload["data"]["already_exited"], true);
+}
+
+// ------------------------------------- status / list_sessions / history
+
+#[tokio::test]
+async fn status_response_matches_its_schema() {
+    // Against a *real* bash, so `pid` is a live process id and
+    // `shell_integration` is the value `detect_shell` produced rather than
+    // one the test handed in. The field *values* are pinned separately, on
+    // a mock that can make every same-typed field differ.
+    let server = ClaspServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    let r = server
+        .status(Parameters(StatusArgs {
+            session: id.clone(),
+        }))
+        .await
+        .expect("status must not be a protocol error");
+
+    let payload = assert_matches_schema("status", &r);
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(
+        keys(&payload["data"]),
+        session_record_keys(),
+        "status's record changed shape"
+    );
+    assert_eq!(
+        keys(&payload["data"]["buffer"]),
+        set(&["head", "tail"]),
+        "the buffer extent changed shape"
+    );
+    assert_eq!(
+        keys(&payload["data"]["prompt"]),
+        set(&[
+            "confidence",
+            "quiescent_score",
+            "pattern_score",
+            "cursor_score",
+            "reason",
+            "last_line",
+        ]),
+    );
+    assert!(
+        payload["data"]["pid"].as_u64().is_some_and(|p| p > 0),
+        "a live session reports its child's pid: {payload}"
+    );
+    assert_eq!(
+        payload["data"]["shell_integration"], "bash",
+        "an interactive bash session is integrated (§8.5)"
+    );
+
+    kill(&server, &id).await;
+}
+
+#[tokio::test]
+async fn status_reports_each_field_from_the_session_it_names() {
+    // Twelve fields, most of them same-typed: five strings (`id`, `name`,
+    // `command`, `state`, `shell_integration`) and five numbers. Any two
+    // transposed still compiles, still serialises, and still passes the
+    // key-set assertion above. So this session is built so that no two
+    // fields of a type can hold the same value — which a real `bash`
+    // session cannot do, since its `command` and `shell_integration` are
+    // both "bash".
+    let server = ClaspServer::new();
+    let pty = Arc::new(MockPty::new());
+    pty.queue_output(TWO_COMMANDS);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let id = register(
+        &server,
+        Some("beta"),
+        "mycmd",
+        &["a1", "a2"],
+        SessionConfig {
+            shell_integration: Some(Shell::Fish),
+            ..SessionConfig::with_buffer_capacity(4096)
+        },
+        &pty,
+    );
+    let session = server.registry.get(&id).expect("session");
+    until("both commands to be recorded", || {
+        session.command_count() == 2
+    })
+    .await;
+
+    let payload = assert_matches_schema(
+        "status",
+        &server
+            .status(Parameters(StatusArgs {
+                session: id.clone(),
+            }))
+            .await
+            .expect("status must not be a protocol error"),
+    );
+    let data = &payload["data"];
+
+    assert_eq!(data["id"], id.as_str());
+    assert_eq!(data["name"], "beta");
+    assert_eq!(data["command"], "mycmd");
+    assert_eq!(data["args"], json!(["a1", "a2"]));
+    assert_eq!(data["state"], "Running");
+    assert_eq!(data["shell_integration"], "fish");
+    assert_eq!(data["pid"], 4242, "MockPty's pid, not some other number");
+    assert_eq!(data["exit_code"], Value::Null, "the child is still running");
+    assert_eq!(data["command_count"], 2);
+    // `head` is the byte count the reader accumulated and `tail` is 0
+    // because nothing was evicted from a 4 KiB buffer — two numbers that a
+    // transposition would swap and neither of which equals `command_count`.
+    assert_eq!(data["buffer"]["head"], TWO_COMMANDS.len() as u64);
+    assert_eq!(data["buffer"]["tail"], 0);
+    // Seconds and milliseconds differ by three orders of magnitude, so
+    // each bound also proves the other field was not used.
+    let started = data["started_at_unix_secs"].as_u64().expect("secs");
+    assert!(
+        started >= before && started <= before + 60,
+        "started_at_unix_secs is {started}, not a clock reading in seconds"
+    );
+    let activity = data["last_activity_unix_ms"].as_i64().expect("ms");
+    assert!(
+        activity >= (before as i64) * 1000,
+        "last_activity_unix_ms is {activity}, not a clock reading in milliseconds"
+    );
+
+    // A resolvable session that is nonetheless *not* this one must not
+    // answer: without this, `status` returning the first session in the
+    // registry would pass everything above.
+    let other = mock_session(&server, None).0;
+    let others = body(
+        &server
+            .status(Parameters(StatusArgs { session: other }))
+            .await
+            .expect("status"),
+    );
+    assert_eq!(others["data"]["command"], "mock");
+    assert_ne!(others["data"]["id"], id.as_str());
+}
+
+#[tokio::test]
+async fn status_session_not_found_response_matches_its_schema() {
+    let server = ClaspServer::new();
+    let r = server
+        .status(Parameters(StatusArgs {
+            session: "sess_does_not_exist".into(),
+        }))
+        .await
+        .expect("a missing session is a status, not a protocol error");
+
+    let payload = assert_matches_schema("status", &r);
+    assert_eq!(payload["status"], "session_not_found");
+    assert_eq!(payload["data"], json!({}));
+}
+
+#[tokio::test]
+async fn list_sessions_returns_every_registered_session_and_only_those() {
+    // Arity is not identity. A `list_sessions` that returned the *same*
+    // session three times, or three sessions from somewhere else, passes
+    // both "the session appears" and "there are three of them". So the
+    // assertion is set equality on ids, plus the id→name mapping, which is
+    // what separates "returned the right sessions" from "returned the
+    // right ids attached to the wrong records".
+    let server = ClaspServer::new();
+    let mut expected: BTreeSet<String> = BTreeSet::new();
+    let mut names: Vec<(String, String)> = Vec::new();
+    let mut ptys = Vec::new();
+    for name in ["alpha", "beta", "gamma"] {
+        let pty = Arc::new(MockPty::new());
+        let id = register(
+            &server,
+            Some(name),
+            name,
+            &[],
+            SessionConfig::default(),
+            &pty,
+        );
+        expected.insert(id.clone());
+        names.push((id, name.to_string()));
+        ptys.push(pty);
+    }
+    // §4.1 keeps an exited session in the registry with its id, and
+    // `state` is what tells the agent it has gone. Killing one here is the
+    // separator that stops this passing against a `list_sessions` that
+    // filtered to live sessions and happened to be handed only live ones.
+    ptys[1].exit(9);
+    let dead = names[1].0.clone();
+    until("the exited session to be observed", || {
+        !server.registry.get(&dead).expect("session").is_alive()
+    })
+    .await;
+
+    let r = server
+        .list_sessions()
+        .await
+        .expect("list_sessions must not be a protocol error");
+    let payload = assert_matches_schema("list_sessions", &r);
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(keys(&payload["data"]), set(&["sessions"]));
+
+    let entries = payload["data"]["sessions"]
+        .as_array()
+        .expect("sessions is an array");
+    let got: BTreeSet<String> = entries
+        .iter()
+        .map(|e| e["id"].as_str().expect("each entry has an id").to_string())
+        .collect();
+    assert_eq!(got, expected, "list_sessions returned the wrong sessions");
+    assert_eq!(
+        entries.len(),
+        expected.len(),
+        "an id appeared more than once"
+    );
+
+    for (id, name) in &names {
+        let entry = entries
+            .iter()
+            .find(|e| e["id"] == id.as_str())
+            .unwrap_or_else(|| panic!("{id} missing from {payload}"));
+        assert_eq!(
+            entry["name"],
+            name.as_str(),
+            "{id} was reported under another session's name"
+        );
+        // Each entry is a full §5.4-bearing record — 0.0.5's own notes say
+        // its version of this tool deliberately does *not* run entries
+        // through `with_detection`, so this is the assertion that keeps
+        // 0.0.2's behaviour when that milestone adapts.
+        assert_eq!(
+            keys(entry),
+            session_record_keys(),
+            "{id}'s entry is not a full session record"
+        );
+    }
+
+    let dead_entry = entries
+        .iter()
+        .find(|e| e["id"] == dead.as_str())
+        .expect("the exited session is still listed");
+    assert_eq!(dead_entry["state"], "Exited");
+    assert_eq!(dead_entry["exit_code"], 9);
+}
+
+#[tokio::test]
+async fn get_command_history_ok_response_matches_its_schema() {
+    let server = ClaspServer::new();
+    let pty = Arc::new(MockPty::new());
+    pty.queue_output(TWO_COMMANDS);
+    let id = register(
+        &server,
+        None,
+        "mock",
+        &[],
+        SessionConfig::with_buffer_capacity(4096),
+        &pty,
+    );
+    let session = server.registry.get(&id).expect("session");
+    until("both commands to be recorded", || {
+        session.command_count() == 2
+    })
+    .await;
+
+    let r = server
+        .get_command_history(Parameters(GetCommandHistoryArgs {
+            session: id.clone(),
+            limit: None,
+            since_index: None,
+        }))
+        .await
+        .expect("get_command_history must not be a protocol error");
+
+    let payload = assert_matches_schema("get_command_history", &r);
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(
+        keys(&payload["data"]),
+        set(&["entries", "truncated_at_tail", "total"]),
+    );
+    // The negative half of the truncation pair: two commands into a ring
+    // of a thousand drops nothing, and a flag that is always true tells
+    // the agent every history has holes.
+    assert_eq!(payload["data"]["truncated_at_tail"], false);
+    assert_eq!(payload["data"]["total"], 2);
+
+    let entries = payload["data"]["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 2);
+    for e in entries {
+        assert_eq!(
+            keys(e),
+            set(&[
+                "index",
+                "command",
+                "exit_code",
+                "started_at_unix_ms",
+                "duration_ms",
+                "output_start_cursor",
+                "output_end_cursor",
+            ]),
+        );
+    }
+    // Distinct texts and distinct non-zero exit codes, so a transposition
+    // between the two entries — or between `index` and `exit_code` — is
+    // visible. `\r\n` before `C` is part of the echo, hence the trim.
+    assert_eq!(entries[0]["index"], 0);
+    assert_eq!(entries[0]["command"], "echo one");
+    assert_eq!(entries[0]["exit_code"], 3);
+    assert_eq!(entries[1]["index"], 1);
+    assert_eq!(entries[1]["command"], "echo two");
+    assert_eq!(entries[1]["exit_code"], 4);
+    // The span must address the session's own buffer: reading it back
+    // returns exactly that command's output and not its neighbour's.
+    let start = entries[0]["output_start_cursor"].as_u64().expect("start");
+    let end = entries[0]["output_end_cursor"].as_u64().expect("end");
+    let read = session.read_from(start, (end - start) as usize);
+    assert_eq!(String::from_utf8_lossy(&read.bytes), "one\r\n");
+}
+
+#[tokio::test]
+async fn get_command_history_unavailable_response_matches_its_schema() {
+    // Two ways to have no history, with *different* reasons, because the
+    // reason is the only thing the agent can act on: an un-integrated
+    // command is a `start_session` argument away from working, while a
+    // recognised shell that emits nothing is not. A single case would pass
+    // against an implementation that hardcoded either string.
+    let server = ClaspServer::new();
+    let cases = [
+        (
+            SessionConfig::default(),
+            "shell integration was not injected for this command",
+        ),
+        (
+            SessionConfig {
+                shell_integration: Some(Shell::Bash),
+                ..SessionConfig::default()
+            },
+            "this shell has emitted no OSC 133 markers",
+        ),
+    ];
+    for (config, reason) in cases {
+        let pty = Arc::new(MockPty::new());
+        // Output with no OSC 133 markers in it: "nothing arrived" must be
+        // decided by the marker stream, not by the session being idle.
+        pty.queue_output(b"$ ls\r\nfile\r\n$ ");
+        let id = register(&server, None, "mock", &[], config, &pty);
+        let session = server.registry.get(&id).expect("session");
+        until("the output to be consumed", || session.buffer_head() >= 14).await;
+
+        let r = server
+            .get_command_history(Parameters(GetCommandHistoryArgs {
+                session: id.clone(),
+                limit: None,
+                since_index: None,
+            }))
+            .await
+            .expect("no history is a status, not a protocol error");
+
+        // §18.1 lists `unavailable` with isError: false — "this session has
+        // no shell integration" is an ordinary outcome, not a failure.
+        assert_ne!(r.is_error, Some(true), "{reason}");
+        let payload = assert_matches_schema("get_command_history", &r);
+        assert_eq!(payload["status"], "unavailable");
+        assert_eq!(
+            keys(&payload["data"]),
+            set(&["reason", "entries", "truncated_at_tail"]),
+        );
+        assert_eq!(payload["data"]["reason"], reason);
+        assert_eq!(payload["data"]["entries"], json!([]));
+        assert_eq!(payload["data"]["truncated_at_tail"], false);
+    }
+}
+
+#[tokio::test]
+async fn get_command_history_session_not_found_response_matches_its_schema() {
+    // The one error envelope whose `data: {}` is a different shape again.
+    // `CommandHistory` declares `entries`, and a schema that required it
+    // would reject CLASP's own `session_not_found` response — in
+    // production, on a path no positive test above reaches.
+    let server = ClaspServer::new();
+    let r = server
+        .get_command_history(Parameters(GetCommandHistoryArgs {
+            session: "sess_does_not_exist".into(),
+            limit: None,
+            since_index: None,
+        }))
+        .await
+        .expect("a missing session is a status, not a protocol error");
+
+    let payload = assert_matches_schema("get_command_history", &r);
+    assert_eq!(payload["status"], "session_not_found");
+    assert_eq!(payload["data"], json!({}));
 }
 
 /// A backend whose `write` parks until it is released.

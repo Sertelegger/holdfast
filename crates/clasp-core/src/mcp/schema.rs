@@ -233,7 +233,18 @@ pub struct CommandEntry {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommandHistory {
-    pub entries: Vec<CommandEntry>,
+    /// Optional for the reason the module header gives, and this is the
+    /// field that proved it: `get_command_history` answers a missing
+    /// session through `envelope::from_error`, whose `data` is `{}`.
+    /// Declared as a bare `Vec` this was `required`, so CLASP's own
+    /// `session_not_found` response failed its own advertised schema —
+    /// caught by `get_command_history_session_not_found_response_matches_
+    /// its_schema`, which is the only path that reaches it.
+    ///
+    /// `ListSessions::sessions` is deliberately *not* optional: that tool
+    /// takes no arguments, emits only `ok`, and therefore has no second
+    /// `data` shape.
+    pub entries: Option<Vec<CommandEntry>>,
     pub truncated_at_tail: Option<bool>,
     pub total: Option<u64>,
     /// Present on `unavailable`: why no history is available.
