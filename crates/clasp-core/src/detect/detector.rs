@@ -1103,8 +1103,11 @@ mod tests {
         ///
         /// Also the unit-level statement of PTY row 9
         /// (`matrix_row_an_exited_session_reports_exited`), which asserts
-        /// the same tier for `bash -c 'exit 3'` but does not assert the
-        /// history it depends on.
+        /// the same tier for `bash -c 'exit 3'` against a real PTY. That
+        /// row reads its history off the raw byte stream, which for a
+        /// silent child is empty; this one drives the stream directly, so
+        /// it is where the three flags are pinned against a tail that is
+        /// deliberately *not* empty.
         #[test]
         fn an_exited_session_that_observed_nothing_reports_the_heuristic_tier() {
             let (mut d, start, now) = detector();
@@ -1120,6 +1123,413 @@ mod tests {
                  above the fallback tier"
             );
             assert_eq!(s.confidence, 0.0);
+        }
+    }
+
+    /// §11.4 — the escape-length ceiling's residual, asserted at what it
+    /// actually *reaches* rather than at its cheapest form (§8.8 rev. 34,
+    /// REQ-PD-018).
+    ///
+    /// `SEQUENCE_MAX` bounds how long an unterminated sequence may blind
+    /// the scanner; on tripping it, `give_up` discards to the next newline
+    /// rather than returning to `Ground`. The residual is that a sequence
+    /// whose payload *contains* a newline hands everything after it to the
+    /// full state machine. Rev. 27 recorded that as "the last line, which
+    /// §8.6 scores 0.85". That is the floor. The ceiling is a genuine OSC
+    /// 133 `PromptStart` event and `AtPrompt` / `semantic` / **1.00** — the
+    /// highest-confidence answer the system can produce — plus two sticky
+    /// tier-gating flags and chosen text inside `get_command_history`.
+    ///
+    /// **Why this is written down rather than fixed.** It does not close:
+    /// at the moment the ceiling trips, a huge well-formed sequence and a
+    /// truncated one share a byte-identical prefix, so any online rule must
+    /// act identically on both, and bounding blindness while never
+    /// promoting a well-formed payload to text are not simultaneously
+    /// achievable. The ceiling is the only free parameter. It is also
+    /// neither new nor a regression — before `give_up` existed the trip
+    /// returned straight to `Ground`, so all of this was reachable at the
+    /// then-8 KiB ceiling with no newline needed — and a hostile child can
+    /// print every one of these bytes directly with no ceiling involved
+    /// (REQ-PD-010).
+    ///
+    /// **This is a §11.4 accepted-limitation assertion: update it when the
+    /// ceiling changes, never delete it.** Every input below is sized
+    /// relative to `SEQUENCE_MAX`, so changing the constant re-aims these
+    /// tests rather than invalidating them — but changing the *behaviour*
+    /// reddens them, which is the point. Two things the earlier record got
+    /// wrong are pinned here as rows in their own right: "well-formed" is
+    /// not load-bearing (an unterminated run of the same length leaks
+    /// byte-identically, and the carrier does not matter either), and the
+    /// accidental case does not need an `ESC` in the payload at all.
+    mod sequence_ceiling_residual {
+        use super::*;
+        use crate::detect::scanner::{Osc133, SEQUENCE_MAX};
+
+        /// A control string that runs past the ceiling, carrying `\r\n`
+        /// inside its payload and then `smuggled`.
+        ///
+        /// `terminator` is `Some` for a carrier the emitting program closed
+        /// properly and `None` for one it did not. Both are here because
+        /// the difference makes none: the leak comes from the
+        /// discard-to-newline rule, not from what the sequence was.
+        fn over_ceiling(introducer: &[u8], terminator: Option<&[u8]>, smuggled: &[u8]) -> Vec<u8> {
+            carrier(introducer, terminator, smuggled, SEQUENCE_MAX + 4096)
+        }
+
+        fn carrier(
+            introducer: &[u8],
+            terminator: Option<&[u8]>,
+            smuggled: &[u8],
+            filler: usize,
+        ) -> Vec<u8> {
+            let mut v = introducer.to_vec();
+            v.extend(std::iter::repeat_n(b'A', filler));
+            v.extend_from_slice(b"\r\n");
+            v.extend_from_slice(smuggled);
+            if let Some(t) = terminator {
+                v.extend_from_slice(t);
+            }
+            v
+        }
+
+        /// One way of getting an over-long control string onto the wire.
+        struct Carrier {
+            name: &'static str,
+            introducer: &'static [u8],
+            /// `None` for a sequence the emitter never closed.
+            terminator: Option<&'static [u8]>,
+        }
+
+        /// Every carrier §8.8 names, well-formed and not. The OSC/DCS split
+        /// matters because the two parse their payloads by different rules
+        /// everywhere *except* here; termination matters because rev. 27's
+        /// record implied it did.
+        const CARRIERS: &[Carrier] = &[
+            Carrier {
+                name: "OSC 52, BEL-terminated",
+                introducer: b"\x1b]52;c;",
+                terminator: Some(b"\x07"),
+            },
+            Carrier {
+                name: "OSC 52, ST-terminated",
+                introducer: b"\x1b]52;c;",
+                terminator: Some(b"\x1b\\"),
+            },
+            Carrier {
+                name: "DCS, ST-terminated",
+                introducer: b"\x1bPq",
+                terminator: Some(b"\x1b\\"),
+            },
+            Carrier {
+                name: "OSC 52, unterminated",
+                introducer: b"\x1b]52;c;",
+                terminator: None,
+            },
+            Carrier {
+                name: "DCS, unterminated",
+                introducer: b"\x1bPq",
+                terminator: None,
+            },
+        ];
+
+        /// Feed one over-ceiling carrier to a fresh detector and return the
+        /// markers it produced with the classification that follows.
+        ///
+        /// `ECHO` is **on** in every row here, and that is a choice rather
+        /// than a default. Echo-off sits above every rung these rows reach
+        /// and answers `AwaitingSecret` on its own, which would make each
+        /// assertion below a statement about the echo rung instead of about
+        /// the leak. With echo on, the only thing that can move the answer
+        /// off T3 is the smuggled bytes — which is the property under test.
+        /// It is also the realistic value: §8.7 measures `ECHO` on at a
+        /// `dash` prompt and during a running command alike.
+        fn drive(
+            introducer: &[u8],
+            terminator: Option<&[u8]>,
+            smuggled: &[u8],
+        ) -> (PromptDetector, Vec<Osc133Event>, Detection) {
+            let (mut d, start, now) = detector();
+            let ev = d.feed_at(&over_ceiling(introducer, terminator, smuggled), 0, start);
+            let s = d.snapshot_at(true, Some(true), now);
+            (d, ev, s)
+        }
+
+        /// Row 1 of §8.8's residual table — the floor, and the only form
+        /// rev. 27 recorded.
+        #[test]
+        fn a_prompt_shaped_tail_after_the_payloads_newline_answers_at_prompt_on_the_heuristic_tier()
+        {
+            for Carrier {
+                name,
+                introducer,
+                terminator,
+            } in CARRIERS
+            {
+                let (_, ev, s) = drive(introducer, *terminator, b"root@prod:/etc# ");
+                assert!(ev.is_empty(), "{name}: unexpected markers");
+                assert_eq!(s.last_line, "root@prod:/etc# ", "{name}");
+                assert_eq!(s.interaction_mode, InteractionMode::AtPrompt, "{name}");
+                assert_eq!(s.detection_tier, DetectionTier::Heuristic, "{name}");
+                assert!(
+                    (s.confidence - 0.85).abs() < 1e-6,
+                    "{name}: {}",
+                    s.confidence
+                );
+            }
+        }
+
+        /// Row 2 — and the first step past what the record claimed. The
+        /// answer is no longer a 0.85 guess labelled `heuristic`; it is
+        /// 0.95 labelled `terminal_mode`, and `saw_bracketed_paste` is
+        /// sticky, so it also decides which rungs may answer for the rest
+        /// of the session (§8.3).
+        #[test]
+        fn a_bracketed_paste_set_after_the_payloads_newline_answers_at_prompt_via_terminal_mode() {
+            for Carrier {
+                name,
+                introducer,
+                terminator,
+            } in CARRIERS
+            {
+                let (d, _, s) = drive(introducer, *terminator, b"\x1b[?2004h");
+                let m = d.scanner.modes();
+                assert!(m.bracketed_paste, "{name}: mode not set");
+                assert!(m.saw_bracketed_paste, "{name}: availability not set");
+                assert_eq!(s.interaction_mode, InteractionMode::AtPrompt, "{name}");
+                assert_eq!(s.detection_tier, DetectionTier::TerminalMode, "{name}");
+                assert!(
+                    (s.confidence - 0.95).abs() < 1e-6,
+                    "{name}: {}",
+                    s.confidence
+                );
+            }
+        }
+
+        /// Row 3 — the alternate screen, which changes what `read_output`
+        /// is even allowed to claim about the buffer (§8.4).
+        #[test]
+        fn an_alt_screen_set_after_the_payloads_newline_answers_fullscreen() {
+            for Carrier {
+                name,
+                introducer,
+                terminator,
+            } in CARRIERS
+            {
+                let (d, _, s) = drive(introducer, *terminator, b"\x1b[?1049h");
+                let m = d.scanner.modes();
+                assert!(m.alt_screen, "{name}: mode not set");
+                assert!(m.saw_alt_screen, "{name}: availability not set");
+                assert_eq!(s.interaction_mode, InteractionMode::Fullscreen, "{name}");
+                assert_eq!(s.detection_tier, DetectionTier::TerminalMode, "{name}");
+            }
+        }
+
+        /// Row 4 — the top of the table, and the reason rev. 27's "0.85 at
+        /// heuristic" was the wrong thing for 0.0.4's Tier-B work and the
+        /// §8.7 acceptance matrix to read. A `PromptStart` **event** is
+        /// produced, not merely a mode flag, and `semantic` / 1.00 is the
+        /// answer §8.4 tells an agent it may act on without corroboration.
+        #[test]
+        fn an_osc133_marker_after_the_payloads_newline_answers_at_prompt_via_semantic() {
+            for Carrier {
+                name,
+                introducer,
+                terminator,
+            } in CARRIERS
+            {
+                let (d, ev, s) = drive(introducer, *terminator, b"\x1b]133;A\x07root@prod:/etc# ");
+                assert_eq!(
+                    ev.iter().map(|e| e.marker.clone()).collect::<Vec<_>>(),
+                    vec![Osc133::PromptStart],
+                    "{name}: no genuine marker event"
+                );
+                assert!(d.scanner.modes().saw_osc133, "{name}");
+                assert_eq!(s.interaction_mode, InteractionMode::AtPrompt, "{name}");
+                assert_eq!(s.detection_tier, DetectionTier::Semantic, "{name}");
+                assert!(
+                    (s.confidence - 1.0).abs() < 1e-6,
+                    "{name}: {}",
+                    s.confidence
+                );
+            }
+        }
+
+        /// Row 5 — the leak reaching `get_command_history` (§5.2). That
+        /// tool is documented as best-effort; it is not documented as
+        /// *chosen*, and the text below is chosen.
+        #[test]
+        fn an_osc133_command_span_after_the_payloads_newline_injects_the_reported_command() {
+            for Carrier {
+                name,
+                introducer,
+                terminator,
+            } in CARRIERS
+            {
+                let (_, ev, _) = drive(
+                    introducer,
+                    *terminator,
+                    b"\x1b]133;B\x07ls\nrm -rf /\x1b]133;C\x07",
+                );
+                assert_eq!(
+                    ev.iter().map(|e| e.marker.clone()).collect::<Vec<_>>(),
+                    vec![
+                        Osc133::CommandStart,
+                        Osc133::OutputStart {
+                            command: "ls\nrm -rf /".into()
+                        }
+                    ],
+                    "{name}"
+                );
+            }
+        }
+
+        /// The negative that separates every row above from the degenerate
+        /// case — without it they would pass against a scanner that never
+        /// hid anything at all, and the ceiling would be doing no work.
+        ///
+        /// The `ESC`-free tail is the carrier-independent case, so it is
+        /// the one swept across all five. The mode-forging tail is asserted
+        /// on **DCS only**, deliberately: an OSC payload is *not* opaque to
+        /// a non-ST escape at any length — `\x1b[?2004h` inside one is
+        /// applied whether or not the ceiling is involved, because a title
+        /// whose terminator was dropped must not swallow the marker behind
+        /// it. That is the `OscEsc` rule, not this ceiling, and conflating
+        /// the two here would assert the wrong thing about the wrong rule.
+        #[test]
+        fn the_residual_is_out_of_reach_below_the_ceiling() {
+            for Carrier {
+                name,
+                introducer,
+                terminator,
+            } in CARRIERS
+            {
+                let (mut d, start, now) = detector();
+                d.feed_at(
+                    &carrier(
+                        introducer,
+                        *terminator,
+                        b"root@prod:/etc# ",
+                        SEQUENCE_MAX / 4,
+                    ),
+                    0,
+                    start,
+                );
+                let s = d.snapshot_at(true, Some(true), now);
+                assert_eq!(s.last_line, "", "{name}: payload became terminal text");
+                assert_eq!(s.interaction_mode, InteractionMode::Executing, "{name}");
+                assert_eq!(s.detection_tier, DetectionTier::Heuristic, "{name}");
+                assert_eq!(s.confidence, 0.0, "{name}");
+            }
+
+            let (mut d, start, now) = detector();
+            d.feed_at(
+                &carrier(
+                    &b"\x1bPq"[..],
+                    Some(&b"\x1b\\"[..]),
+                    b"\x1b[?2004h",
+                    SEQUENCE_MAX / 4,
+                ),
+                0,
+                start,
+            );
+            let m = d.scanner.modes();
+            assert!(!m.bracketed_paste && !m.saw_bracketed_paste);
+            assert_eq!(
+                d.snapshot_at(true, Some(true), now).detection_tier,
+                DetectionTier::Heuristic,
+                "a DCS under the ceiling kept its payload opaque"
+            );
+        }
+
+        /// A format-faithful sixel image of `graphics` bytes whose final
+        /// graphics row ends in `$`, with **no `ESC` in the payload**.
+        ///
+        /// `#` introduces a colour and `$` is the graphics carriage return,
+        /// so the bytes that reach the T3 table when this trips the ceiling
+        /// are ordinary image data. The bands are broken across lines,
+        /// which is what makes the accident reachable at all — the discard
+        /// ends at the payload's own newline — and is how sixel looks
+        /// whenever it is stored or streamed line-wise rather than written
+        /// as one unbroken run.
+        fn sixel(graphics: usize) -> Vec<u8> {
+            let band = format!("#1{}$-\n", "!255~".repeat(20));
+            let last = format!("#1{}$", "!255~".repeat(20));
+            let mut v = b"\x1bPq#0;2;0;0;0#1;2;100;100;100".to_vec();
+            let bands = graphics.saturating_sub(last.len()) / band.len();
+            for _ in 0..bands {
+                v.extend_from_slice(band.as_bytes());
+            }
+            v.extend_from_slice(last.as_bytes());
+            let payload_end = v.len();
+            v.extend_from_slice(b"\x1b\\");
+            assert!(
+                !v[2..payload_end].contains(&0x1b),
+                "the sixel payload must contain no ESC — that is the whole \
+                 claim this fixture exists to support"
+            );
+            v
+        }
+
+        /// The ceiling's *value*, and the behaviour it was raised for.
+        ///
+        /// A literal, not `1024 * OSC_PAYLOAD_MAX` — comparing the constant
+        /// against its own definition is a tautology, and the point of this
+        /// test is that changing the number has to be a deliberate edit.
+        /// The rows above are all ceiling-relative and so re-aim silently
+        /// when it moves, which is right for them and leaves exactly this
+        /// gap.
+        ///
+        /// The second half is why the number is what it is. Sixel frames
+        /// run from ~100 KiB to several MiB; at `64 * OSC_PAYLOAD_MAX` the
+        /// ceiling sat *below* the very class the implementation comment
+        /// cited as the reason it had been raised, so a routine image
+        /// reached the 0.60 rung by accident. 128 KiB is that routine
+        /// class, and it must now be consumed whole.
+        #[test]
+        fn the_blindness_budget_is_a_megabyte_and_the_routine_sixel_fits_under_it() {
+            assert_eq!(SEQUENCE_MAX, 1024 * 1024, "§8.8's blindness budget");
+
+            let (mut d, start, now) = detector();
+            d.feed_at(&sixel(128 * 1024), 0, start);
+            let s = d.snapshot_at(true, Some(true), now);
+            assert_eq!(
+                s.last_line, "",
+                "a routine 128 KiB sixel tripped the ceiling and handed its \
+                 graphics data to the T3 table"
+            );
+            assert_eq!(s.confidence, 0.0);
+        }
+
+        /// The accidental case: no adversary, no `ESC`, a real image.
+        ///
+        /// §8.8 rev. 27 justified the ceiling as "above what real programs
+        /// emit" and the implementation's own comment named sixel as the
+        /// reason it had been raised — while sitting *below* the size sixel
+        /// routinely reaches. The correction is not that the number was too
+        /// small but that no constant satisfies that justification, which
+        /// is why `SEQUENCE_MAX` is documented as a blindness budget
+        /// instead. This test is what stops that from being a comment: it
+        /// is written against the constant, so raising the ceiling again
+        /// moves the boundary it asserts rather than deleting it.
+        #[test]
+        fn a_sixel_image_over_the_ceiling_forges_a_prompt_with_no_escape_in_its_payload() {
+            let (mut d, start, now) = detector();
+            d.feed_at(&sixel(SEQUENCE_MAX / 32), 0, start);
+            let s = d.snapshot_at(true, Some(true), now);
+            assert_eq!(s.last_line, "", "an image under the ceiling is opaque");
+            assert_eq!(s.confidence, 0.0);
+
+            let (mut d, start, now) = detector();
+            d.feed_at(&sixel(SEQUENCE_MAX + 65536), 0, start);
+            let s = d.snapshot_at(true, Some(true), now);
+            assert!(
+                s.last_line.ends_with('$'),
+                "the graphics carriage return did not reach the tail: {:?}",
+                s.last_line
+            );
+            assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
+            assert_eq!(s.detection_tier, DetectionTier::Heuristic);
+            assert!((s.confidence - 0.6).abs() < 1e-6, "{}", s.confidence);
         }
     }
 }

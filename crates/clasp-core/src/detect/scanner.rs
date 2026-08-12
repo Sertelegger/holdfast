@@ -23,25 +23,45 @@ const OSC_PAYLOAD_MAX: usize = 1024;
 /// Cap on the echoed command line captured between OSC 133 `B` and `C`.
 const COMMAND_CAPTURE_MAX: usize = 4096;
 /// Hard ceiling on the bytes a single control sequence may *consume*
-/// before the scanner abandons it.
+/// before the scanner abandons it — a **blindness budget** (§8.8).
 ///
-/// `OSC_PAYLOAD_MAX` bounds what a sequence stores; this bounds how long a
-/// malformed one can blind the scanner. Without it an OSC or DCS whose
-/// terminator was lost — a `cat` of a binary file, a truncated write, a
-/// background job interleaving on the same PTY — swallows the rest of the
-/// session. That is not a degraded mode: the modes hidden inside it are
-/// the availability flags §8.4 uses to *pick* a tier, so losing them
-/// silently disables deterministic detection rather than weakening it.
+/// `OSC_PAYLOAD_MAX` bounds what a sequence stores; this bounds how long
+/// the scanner may be unable to see mode changes. Without it an OSC or DCS
+/// whose terminator was lost — a `cat` of a binary file, a truncated
+/// write, a background job interleaving on the same PTY — swallows the
+/// rest of the session. That is not a degraded mode: the modes hidden
+/// inside it are the availability flags §8.4 uses to *pick* a tier, so
+/// losing them silently disables deterministic detection rather than
+/// weakening it. The bound is not exact — `give_up` then discards to the
+/// next newline, so the blind window runs to the end of the line the trip
+/// landed on, which a bare-`\r` progress display can extend indefinitely.
+/// Strictly better than the unbounded case it replaced, and stated here
+/// rather than left implied by the word "bounds".
 ///
-/// This is a *blindness budget*, not a size limit on legitimate sequences.
-/// Everything past `OSC_PAYLOAD_MAX` is already consumed without being
-/// stored or interpreted, so a well-formed sequence pays nothing for being
-/// long — but tripping this ceiling on one is not a harmless truncation
-/// (see `give_up`), so it has to sit well above what real programs emit.
-/// At `8 * OSC_PAYLOAD_MAX` it did not: tmux and vim `set-clipboard` write
-/// multi-KiB OSC 52 payloads and sixel images are larger still, and a
-/// 9 KiB *correctly terminated* OSC 52 was measured tripping it.
-const SEQUENCE_MAX: usize = 64 * OSC_PAYLOAD_MAX;
+/// **What this value is chosen against, corrected at spec rev. 34.** It is
+/// *not* "above what real programs emit", because no constant is: sixel
+/// frames run from ~100 KiB to several MiB, so the previous
+/// `64 * OSC_PAYLOAD_MAX` sat *below* the very class this comment cited as
+/// the reason it had been raised from `8 *`. Worse, sixel needs no `ESC`
+/// to reach the residual — `#` is its colour introducer and `$` its
+/// graphics carriage return — so a legitimate image tripping the ceiling
+/// leaves a `$`-terminated line the T3 table scores 0.60, with no
+/// adversary anywhere. The honest framing is the one above: the ceiling is
+/// chosen against how long an unterminated sequence may hide mode changes,
+/// not against how large a legitimate payload can be.
+///
+/// So `1024 * OSC_PAYLOAD_MAX` (1 MiB), and the cost of the raise is
+/// bounded on both sides. A well-formed sequence pays nothing for being
+/// long — everything past `OSC_PAYLOAD_MAX` is already consumed without
+/// being stored or interpreted — so the raise costs nothing at all in the
+/// ordinary case; what it buys is that the routine sixel no longer trips
+/// it. What it costs is the width of the blind window when a sequence
+/// really is truncated, which is the one thing this constant exists to
+/// bound. Raising it moves the threshold at which the `give_up` residual
+/// becomes reachable; it does not close it, and cannot (see `give_up`).
+/// REQ-PD-018 pins that residual at its real reach, expressed relative to
+/// this constant so the assertions move with it.
+pub(crate) const SEQUENCE_MAX: usize = 1024 * OSC_PAYLOAD_MAX;
 /// Cap on CSI parameter bytes. Past this the sequence is consumed to its
 /// final byte but not interpreted.
 const CSI_PARAMS_MAX: usize = 64;
@@ -324,18 +344,48 @@ impl ModeScanner {
     /// abandoned sequence is not a line the scanner can still vouch for,
     /// and an empty tail scores 0.0 — the fail-safe direction.
     ///
-    /// **The residual, stated rather than implied.** A *well-formed*
-    /// sequence longer than `SEQUENCE_MAX` whose payload contains a
-    /// newline followed by prompt-shaped text still leaks that last line:
-    /// the discard ends at the payload's own newline. Measured — 9 KiB
-    /// gives `""`, 68 KiB gives `"root@prod:/etc# "`. That is intrinsic,
-    /// not an oversight: at the moment the ceiling trips the scanner
+    /// **The residual, at its real reach (§8.8 rev. 34, REQ-PD-018).** A
+    /// sequence longer than `SEQUENCE_MAX` whose payload contains a newline
+    /// hands *everything after that newline* to the full state machine,
+    /// because the discard ends at the payload's own newline and the
+    /// scanner resumes at `Ground` there. A prompt-shaped tail line is only
+    /// the cheapest form of that. Measured, on a payload carrying `\r\n`
+    /// before the smuggled bytes:
+    ///
+    /// - `root@prod:/etc# ` → `AtPrompt` / `heuristic` / 0.85 — the floor,
+    ///   and the only case rev. 27 recorded
+    /// - `\x1b[?2004h` → `AtPrompt` / `terminal_mode` / **0.95**, with
+    ///   `saw_bracketed_paste` set, which is sticky and gates which rungs
+    ///   may answer for the rest of the session
+    /// - `\x1b[?1049h` → `Fullscreen` / `terminal_mode`, `saw_alt_screen`
+    ///   set
+    /// - `\x1b]133;A\x07root@prod:/etc# ` → a genuine `PromptStart`
+    ///   **event**, `saw_osc133` set, and `AtPrompt` / **`semantic`** /
+    ///   **1.00** — the highest-confidence answer the system can produce
+    /// - `\x1b]133;B\x07ls\nrm -rf /\x1b]133;C\x07` → `OutputStart {
+    ///   command: "ls\nrm -rf /" }`, text injected into the history §5.2
+    ///   reports
+    ///
+    /// **"Well-formed" is not load-bearing**, and neither is the carrier:
+    /// an *unterminated* run of the same length leaks byte-identically, and
+    /// a DCS opener behaves exactly as an OSC one does. The leak comes from
+    /// the discard-to-newline rule, not from what the sequence was.
+    ///
+    /// **It is not new and not a regression.** Before this path existed the
+    /// trip returned straight to `Ground`, so all of the above was
+    /// reachable at the then-8 KiB ceiling with no newline needed, and
+    /// §8.8/REQ-PD-010 already accepts that a hostile child can print these
+    /// bytes directly at any length with no ceiling involved. Nor does it
+    /// need an adversary: an ESC-free sixel over the ceiling reaches the
+    /// 0.60 rung by accident (see `SEQUENCE_MAX`).
+    ///
+    /// **It does not close.** At the moment the ceiling trips the scanner
     /// cannot know whether it is inside a huge well-formed sequence or a
     /// truncated one, so bounding how long an unterminated sequence can
-    /// blind it and never promoting a well-formed one's payload to text
-    /// are not simultaneously achievable. Raising `SEQUENCE_MAX` moves the
-    /// threshold; it does not close the case. The mitigation is to keep
-    /// the ceiling above what real programs emit, which is why it moved.
+    /// blind it and never promoting a well-formed one's payload to text are
+    /// not simultaneously achievable. The ceiling is the only free
+    /// parameter: raising it moves the threshold at which the residual
+    /// becomes reachable.
     fn give_up(&mut self) {
         self.abort();
         self.tail.reset();
@@ -768,21 +818,19 @@ mod tests {
         //
         // **What this establishes, and what it does not.** "Under the
         // blindness ceiling" is load-bearing and used to be missing from
-        // the name. These rows are 9 KiB against a `SEQUENCE_MAX` of 64
-        // KiB, so they never trip it at all — the property they pin is that
-        // a correctly terminated sequence *below* the ceiling pays nothing
+        // the name. These rows are 9 KiB against a `SEQUENCE_MAX` of 1 MiB,
+        // so they never trip it at all — the property they pin is that a
+        // correctly terminated sequence *below* the ceiling pays nothing
         // for being long, however far past `OSC_PAYLOAD_MAX` it runs.
         //
-        // Past the ceiling the claim is false, and measurably so. A 70 KiB
-        // well-formed OSC 52 or DCS whose payload carries `\r\n` before the
-        // tail yields `last_line == "root@prod:/etc# "`, plus
-        // `saw_bracketed_paste`, `saw_alt_screen` and `saw_osc133` all set
-        // from payload bytes — the detector answers `AtPrompt` / `Semantic`
-        // / 1.0, not the 0.85 heuristic answer §8.8 records. See
+        // Past the ceiling the claim is false, and measurably so: the
+        // payload's `\r\n` ends the discard and everything after it reaches
+        // the full state machine. That residual is pinned at its real reach
+        // — up to `AtPrompt` / `semantic` / 1.00 and injected command text
+        // — by `detector::tests::sequence_ceiling_residual` (REQ-PD-018),
+        // and the boundary itself by
         // `an_abandoned_sequence_cannot_forge_a_mode_from_the_payload_
-        // before_the_next_newline` for the same boundary stated directly.
-        // Raising the ceiling and pinning that residual are spec rev. 34's;
-        // this comment exists so the gap is not read as covered here.
+        // before_the_next_newline` below.
         for (introducer, terminator, tail) in [
             (&b"\x1b]52;c;"[..], &b"\x07"[..], "root@prod:/etc# "),
             (&b"\x1bPq"[..], &b"\x1b\\"[..], "user@host:~$ "),
@@ -805,10 +853,11 @@ mod tests {
         // payload to the command that gets reported to the agent.
         //
         // Same qualification as the test above, for the same measured
-        // reason: the OSC 52 here is 9 KiB against a 64 KiB ceiling. Past
+        // reason: the OSC 52 here is 9 KiB against a 1 MiB ceiling. Past
         // the ceiling the payload's own `\x1b]133;` bytes are parsed as
         // real markers, so command capture takes payload — the residual is
-        // `OutputStart { command: "ls\nrm -rf /" }`, not a clean "ls".
+        // `OutputStart { command: "ls\nrm -rf /" }`, not a clean "ls", and
+        // it is pinned in `detector::tests::sequence_ceiling_residual`.
         let mut s = ModeScanner::new();
         s.feed(b"\x1b]133;B\x07ls\r\n", 0);
         let osc = oversized_but_well_formed(b"\x1b]52;c;", b"\x07", "root@prod:/etc# ");
@@ -879,21 +928,21 @@ mod tests {
         // ceiling. The input below has no newline after the filler, which
         // is why nothing is forged.
         //
-        // Measured, with `\r\n` inserted before the smuggled bytes instead:
-        // `saw_bracketed_paste` **and** `bracketed_paste` both true,
-        // `saw_alt_screen`/`alt_screen` both true from a `\x1b[?1049h`, a
-        // genuine `PromptStart` event with `saw_osc133` set, and
-        // `last_line == "root@prod:/etc# "`. All three are sticky and
-        // tier-gating, so the classifier answers `AtPrompt` / `Semantic` /
-        // 1.0.
+        // With `\r\n` inserted before the smuggled bytes instead, all of it
+        // gets through — up to a genuine `PromptStart` and `AtPrompt` /
+        // `semantic` / 1.00. That is asserted, row by row, in
+        // `detector::tests::sequence_ceiling_residual` (REQ-PD-018) rather
+        // than described here.
         //
         // Not a regression and not a new exposure: before the give-up path
         // existed the trip returned straight to `Ground`, so the same
         // forgeries were reachable at 8 KiB, and §8.8/REQ-PD-010 already
         // accepts that a hostile child can print `\x1b[?2004h` directly.
-        // Accidental forgery needs an ESC inside a payload that by
-        // construction has none (base64, sixel). What was wrong was this
-        // test's name, which read as the unqualified claim.
+        // Nor does it take an adversary — the "accidental forgery needs an
+        // ESC in a payload that by construction has none" reading was
+        // wrong, since sixel reaches the 0.60 rung with no `ESC` at all
+        // (§8.8 rev. 34). What was wrong about *this* test was its name,
+        // which read as the unqualified claim.
         let mut s = ModeScanner::new();
         let mut input = b"\x1b]0;".to_vec();
         input.extend(std::iter::repeat_n(b'A', SEQUENCE_MAX + 64));
