@@ -57,10 +57,133 @@ fn body(r: &rmcp::model::CallToolResult) -> Value {
     r.structured_content.clone().expect("structured content")
 }
 
-fn have(program: &str) -> bool {
+/// Every row in this file that needs a program beyond `bash`, and the
+/// programs it needs.
+///
+/// The table exists so the *number of rows that actually ran* is a
+/// quantity the suite can assert on. Eight of these eighteen tests
+/// early-`return` when their program is missing; libtest reports each as
+/// `ok` and swallows the `eprintln!` without `--nocapture`. Measured: with
+/// `fish` absent this file prints `18 passed` and nothing anywhere says a
+/// row never ran.
+///
+/// The exposure is not `fish`. `an_alt_screen_episode_leaves_a_dash_prompt_
+/// on_the_heuristic_tier` needs **both** `dash` and `less`, and it is the
+/// only PTY-level test of the add-alt-screen direction. On a slim container
+/// it vanishes silently along with the `dash` degradation row, the PS2
+/// threshold row, the pager row and both `python3` rows — and the task
+/// report's claim that "REQ-PD-015 is pinned at the PTY level in both
+/// directions" quietly becomes conditional on the host.
+///
+/// `have()` refuses a program that appears in no row here, so a new gated
+/// row cannot introduce a new dependency without this table learning about
+/// it. Residual, stated rather than papered over: a new row reusing a
+/// program already listed adds no entry, so the floor below does not rise
+/// with it.
+const HOST_DEPENDENT_ROWS: &[(&str, &[&str])] = &[
+    (
+        "matrix_row_getpass_is_awaiting_secret_with_no_bracketed_paste_history",
+        &["python3"],
+    ),
+    (
+        "matrix_row_the_python_repl_is_at_prompt_with_no_repl_specific_config",
+        &["python3"],
+    ),
+    ("matrix_row_a_pager_is_fullscreen", &["less"]),
+    (
+        "matrix_row_dash_degrades_silently_to_the_heuristic_tier",
+        &["dash"],
+    ),
+    (
+        "an_alt_screen_episode_leaves_a_dash_prompt_on_the_heuristic_tier",
+        &["dash", "less"],
+    ),
+    (
+        "the_heuristic_decides_at_exactly_the_threshold_on_a_real_ps2_prompt",
+        &["dash"],
+    ),
+    (
+        "zsh_integration_emits_the_measured_marker_stream_and_exact_exit_codes",
+        &["zsh"],
+    ),
+    (
+        "fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes",
+        &["fish"],
+    ),
+];
+
+/// How many rows may skip before this file's green stops meaning anything.
+///
+/// One: `fish`, which is not installable on the development host (no sudo,
+/// no network, no binary anywhere on the filesystem) and whose snippet
+/// therefore remains UNVERIFIED at runtime. Every other program this file
+/// needs is present on any ordinary POSIX host. A second skip is the slim
+/// container case, and it goes red.
+const MAX_SKIPPED_ROWS: usize = 1;
+
+/// The environment variable that turns every skip into a failure.
+///
+/// CI's Linux job sets it, so a runner missing `fish` — or `dash`, or
+/// `less` — fails loudly instead of reporting a green eighteen.
+const REQUIRE_ALL: &str = "CLASP_REQUIRE_ALL_SHELLS";
+
+fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
         .unwrap_or(false)
+}
+
+fn have(program: &str) -> bool {
+    assert!(
+        HOST_DEPENDENT_ROWS
+            .iter()
+            .any(|(_, progs)| progs.contains(&program)),
+        "{program:?} gates a row but appears in no entry of \
+         HOST_DEPENDENT_ROWS, so the skip census cannot see it"
+    );
+    if on_path(program) {
+        return true;
+    }
+    assert!(
+        std::env::var(REQUIRE_ALL).as_deref() != Ok("1"),
+        "{REQUIRE_ALL}=1 is set and {program:?} is not on PATH. This row \
+         would otherwise be skipped and reported as `ok`. Install it, or \
+         unset {REQUIRE_ALL} and accept that this file's green covers \
+         fewer rows than its name suggests."
+    );
+    false
+}
+
+/// The census that stops the row count dropping silently.
+///
+/// Independent of whether any other test in this file has run: it asks the
+/// host the same question `have()` asks, for every row that asks one. That
+/// is what makes it a floor rather than a report.
+#[test]
+fn the_pty_matrix_runs_all_but_one_of_its_host_dependent_rows() {
+    let skipped: Vec<&str> = HOST_DEPENDENT_ROWS
+        .iter()
+        .filter(|(_, progs)| !progs.iter().all(|p| on_path(p)))
+        .map(|(row, _)| *row)
+        .collect();
+
+    if std::env::var(REQUIRE_ALL).as_deref() == Ok("1") {
+        assert!(
+            skipped.is_empty(),
+            "{REQUIRE_ALL}=1 but {} row(s) would skip: {skipped:?}",
+            skipped.len()
+        );
+    }
+    assert!(
+        skipped.len() <= MAX_SKIPPED_ROWS,
+        "{} of this file's {} host-dependent rows would skip and be \
+         reported as `ok`: {skipped:?}. At most {MAX_SKIPPED_ROWS} may \
+         (`fish`). Every other program here is present on an ordinary \
+         POSIX host, so this is the slim-container case the suite's green \
+         used to hide.",
+        skipped.len(),
+        HOST_DEPENDENT_ROWS.len()
+    );
 }
 
 /// Every session here runs with `TERM` pinned.
