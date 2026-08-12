@@ -214,13 +214,35 @@ impl Session {
         session
     }
 
-    /// The current classification (spec §8.3). Samples `ECHO` from the
-    /// backend, which caches it, so this is cheap enough to call on every
-    /// tool response.
+    /// The current classification (spec §8.3). One `tcgetattr` and a
+    /// bounded scan of state the reader already maintains, so it is cheap
+    /// enough to call on every tool response.
+    ///
+    /// **The `ECHO` sample is taken with the detector held**, and the order
+    /// is the whole point rather than a style choice. §8.3's echo rung
+    /// combines `echo == false` with the *current* bracketed-paste mode,
+    /// and the two come from different places: the mode from bytes the
+    /// reader has fed, the flag from `tcgetattr`. Sampled first and
+    /// classified afterwards, the reader can feed the `\x1b[?2004l` that a
+    /// submitted command emits *in between* — and the ladder then pairs a
+    /// readline prompt's echo-off with that command's bracketed-paste-off
+    /// and answers `AwaitingSecret` at 0.95, telling the agent (§8.4) to
+    /// interrupt a human for a password no program asked for. The window is
+    /// exactly one contended `detector.lock()`, and the reader holds that
+    /// lock while it feeds, so the contention is the common case rather
+    /// than an exotic one.
+    ///
+    /// Holding the detector across the sample removes the window instead of
+    /// narrowing it: no chunk can be classified between the sample and the
+    /// classification, so the value handed to the ladder is never older
+    /// than the newest byte the ladder has seen. Nothing here can block —
+    /// `is_alive` is a `WNOHANG` wait and `echo_enabled` is one ioctl — so
+    /// §4.3's "no lock across blocking work" invariant is intact.
     pub fn detection(&self) -> Detection {
         let alive = self.backend.is_alive();
+        let mut detector = self.detector.lock();
         let echo = self.backend.echo_enabled();
-        self.detector.lock().snapshot(alive, echo)
+        detector.snapshot(alive, echo)
     }
 
     /// True once any OSC 133 marker has arrived, i.e. shell integration is
@@ -681,6 +703,90 @@ mod tests {
             "started_at_unix_ms is {} — ahead of the clock (test ended at {after})",
             entry.started_at_unix_ms
         );
+    }
+
+    #[test]
+    fn no_output_is_classified_between_the_echo_sample_and_the_answer() {
+        // §8.3's echo rung reads two signals from two places — the
+        // bracketed-paste mode from bytes the reader has fed, `ECHO` from
+        // the backend — and is only sound if they describe the same
+        // instant. `detection()` sampled `ECHO` *before* it took the
+        // detector, so a chunk could be classified in between, and the one
+        // chunk that matters is the `\x1b[?2004l` readline writes when a
+        // command is submitted: paired with the echo-off readline had at
+        // the prompt it just left, the ladder answers `AwaitingSecret` at
+        // 0.95 and §8.4 tells the agent to interrupt a human for a
+        // password. For `sleep 5`.
+        //
+        // The window is one contended `detector.lock()` — and the reader
+        // holds that lock while it feeds, so contention is the ordinary
+        // case, not an exotic one. This test does not wait for it: the
+        // backend's `on_echo_sample` hook makes the interleaving happen on
+        // purpose, at the one instant it has to happen at.
+        //
+        // The chunk carries an OSC 133 `C` as well, for observability: the
+        // reader applies it to the history strictly *after* `feed` returns,
+        // so `command_count() == 1` is proof that the detector consumed
+        // those bytes — which the buffer's own head is not, since the
+        // reader pushes before it feeds.
+        let pty = Arc::new(MockPty::new());
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(4096),
+        );
+        // A readline prompt: bracketed paste on, and ECHO off because
+        // readline echoes characters itself (§8.2).
+        pty.set_echo(Some(false));
+        pty.queue_output(b"\x1b[?2004hbash-5.3$ ");
+        wait_until("the prompt to be classified", || {
+            s.detection().interaction_mode == InteractionMode::AtPrompt
+        });
+
+        let weak = Arc::downgrade(&s);
+        let queue = Arc::clone(&pty);
+        pty.on_echo_sample(move || {
+            let Some(s) = weak.upgrade() else { return };
+            if s.command_count() > 0 {
+                return; // already delivered; this is a later sample
+            }
+            queue.queue_output(b"\x1b[?2004l\x1b]133;C\x07");
+            // Give the reader every chance to classify it. Correctly
+            // ordered it cannot: it is blocked on the detector this call
+            // is running underneath, so this waits out the deadline and
+            // that is the pass. Incorrectly ordered it takes milliseconds.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while s.command_count() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let d = s.detection();
+        assert_ne!(
+            d.interaction_mode,
+            InteractionMode::AwaitingSecret,
+            "the classifier was handed an ECHO reading older than the \
+             terminal modes it was combined with: {d:?}"
+        );
+        // And the answer is the *right* one rather than merely not that
+        // one: this sample was taken while the session was still at the
+        // prompt, so it is the prompt's answer.
+        assert_eq!(d.interaction_mode, InteractionMode::AtPrompt);
+        assert_eq!(d.detection_tier, DetectionTier::TerminalMode);
+
+        // The chunk is not discarded — it is only deferred. Once the
+        // reader gets the detector, the session moves on to `Executing`
+        // with a *fresh* echo sample, which is the answer §8.7 row 2
+        // requires. Without this half the test would also pass against a
+        // backend that dropped the bytes on the floor.
+        pty.set_echo(Some(true));
+        wait_until("the submitted command to be classified", || {
+            s.detection().interaction_mode == InteractionMode::Executing
+        });
+        assert_eq!(s.command_count(), 1, "the chunk never reached the history");
     }
 
     #[test]

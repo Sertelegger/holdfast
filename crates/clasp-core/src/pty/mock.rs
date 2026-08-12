@@ -17,9 +17,24 @@ struct MockState {
     echo: Option<bool>,
 }
 
-#[derive(Debug)]
+/// Something to run when `echo_enabled` is sampled — see
+/// `MockPty::on_echo_sample`.
+type EchoSampleHook = Box<dyn Fn() + Send + Sync>;
+
 pub struct MockPty {
     state: Mutex<MockState>,
+    /// Run on every `echo_enabled` call, with `state` **not** held.
+    on_echo_sample: Mutex<Option<EchoSampleHook>>,
+}
+
+// Manual, because a boxed `Fn` is not `Debug`. Deliberately does not lock:
+// a `Debug` impl that blocks is a debugging hazard, and this type is a
+// test double whose interesting state is asserted through its own
+// accessors rather than through formatting.
+impl std::fmt::Debug for MockPty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MockPty").finish_non_exhaustive()
+    }
 }
 
 impl MockPty {
@@ -32,6 +47,7 @@ impl MockPty {
                 echo: Some(true),
                 ..Default::default()
             }),
+            on_echo_sample: Mutex::new(None),
         }
     }
 
@@ -65,6 +81,18 @@ impl MockPty {
     /// cannot sample the line discipline at all.
     pub fn set_echo(&self, echo: Option<bool>) {
         self.state.lock().echo = echo;
+    }
+
+    /// Run `f` at the instant `echo_enabled` is sampled.
+    ///
+    /// The one thing a caller of `detection()` cannot otherwise steer is
+    /// *what else happens between the `ECHO` sample and the classification
+    /// that consumes it* — and that interval is where §8.3's echo rung can
+    /// be handed a reading older than the terminal modes it is combined
+    /// with. This hook turns that interleaving into something a test
+    /// drives rather than races for.
+    pub fn on_echo_sample(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_echo_sample.lock() = Some(Box::new(f));
     }
 }
 
@@ -109,6 +137,12 @@ impl PtyBackend for MockPty {
     }
 
     fn echo_enabled(&self) -> Option<bool> {
+        // Before `state` is taken, and while no lock of this backend's is
+        // held: the hook exists to let output arrive mid-sample, and
+        // `queue_output` needs `state`.
+        if let Some(hook) = self.on_echo_sample.lock().as_ref() {
+            hook();
+        }
         let s = self.state.lock();
         if !s.alive {
             return None;
