@@ -93,6 +93,40 @@ pub enum ScreenTracking {
     Off,
 }
 
+/// Lifecycle state of a session (§5.2).
+///
+/// Mirrors `session::SessionState::as_str`, which is a closed vocabulary of
+/// four words. Declared as an enum rather than a `String` for the same
+/// reason `InteractionMode` and `DetectionTier` are: `state: "banana"`
+/// validated against the old declaration, and `a_wrongly_typed_field_is_
+/// rejected` substitutes `json!(3)` — a *type* violation — so the looseness
+/// was invisible to it. The agent branches on this field; a schema that
+/// admits any string tells it nothing about what to branch on.
+///
+/// PascalCase with no `rename_all`, because that is what `as_str` emits:
+/// the point of the enum is to match the wire, not to tidy it.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub enum SessionState {
+    Starting,
+    Running,
+    Exited,
+    Dead,
+}
+
+/// Which shell integration was injected (§8.5).
+///
+/// Mirrors `detect::Shell::as_str`. Same reasoning as `SessionState`:
+/// `shell_integration: "not-a-shell"` validated against the old `String`
+/// declaration. Null when no integration was injected, which is why the
+/// fields that carry it stay `Option`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellIntegration {
+    Bash,
+    Zsh,
+    Fish,
+}
+
 /// The `prompt` object carried by every prompt-bearing response (§18.2a).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -121,7 +155,7 @@ pub struct StartSession {
     /// The *effective* working directory the child was spawned in (§5.2).
     pub cwd: Option<String>,
     /// Which shell integration was injected, if any (§8.5).
-    pub shell_integration: Option<String>,
+    pub shell_integration: Option<ShellIntegration>,
     pub started_at_unix_secs: Option<u64>,
     /// Present on `spawn_failed`: the command that could not be spawned.
     pub command: Option<String>,
@@ -138,7 +172,7 @@ pub struct ReadOutput {
     pub truncated_at_tail: Option<bool>,
     pub truncated_for_size: Option<bool>,
     pub next_cursor: Option<u64>,
-    pub state: Option<String>,
+    pub state: Option<SessionState>,
     pub exit_code: Option<i32>,
     pub interaction_mode: Option<InteractionMode>,
     pub detection_tier: Option<DetectionTier>,
@@ -190,10 +224,10 @@ pub struct SessionRecord {
     pub name: Option<String>,
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
-    pub state: Option<String>,
+    pub state: Option<SessionState>,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
-    pub shell_integration: Option<String>,
+    pub shell_integration: Option<ShellIntegration>,
     pub command_count: Option<u64>,
     pub started_at_unix_secs: Option<u64>,
     pub last_activity_unix_ms: Option<i64>,

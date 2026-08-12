@@ -602,10 +602,14 @@ impl ClaspServer {
         ))
     }
 
-    /// List live sessions with what each one is doing.
+    /// Every session this server knows about, live or exited, with what
+    /// each one is doing. Exited sessions stay listed and keep their output
+    /// buffer, so a command's final output can still be read after the
+    /// shell is gone; read `state` to tell the two apart rather than
+    /// assuming everything returned here is running.
     #[tool(
         annotations(
-            title = "List active sessions",
+            title = "List all sessions",
             read_only_hint = true,
             open_world_hint = false
         ),
@@ -832,12 +836,52 @@ mod tests {
     fn get_command_history_description_carries_its_caveats() {
         let tool = ClaspServer::get_command_history_tool_attr();
         let description = tool.description.as_deref().unwrap_or("");
-        for needle in ["nested integrated shell", "truncated to its tail"] {
+        // `80 columns` and `Latin-1` are here because the needle set was
+        // narrower than the caveat it guards: deleting the quantification
+        // ("125 characters at 80 columns yields 47") *and* the Latin-1
+        // clause while keeping the phrase `truncated to its tail` survived
+        // the whole suite. Those two are what tell the agent *how* wrong
+        // `command` gets and on which inputs, and they are the first
+        // casualties of a reword — the bare phrase would still be there.
+        for needle in [
+            "nested integrated shell",
+            "truncated to its tail",
+            "80 columns",
+            "Latin-1",
+        ] {
             assert!(
                 description.contains(needle),
                 "get_command_history's advertised description dropped \
                  {needle:?}:\n{description}"
             );
         }
+    }
+
+    /// `list_sessions` returns every entry in the registry, including
+    /// exited ones — `SessionRegistry::all()` does no filtering. Its
+    /// description said "live sessions", which is an agent-visible string
+    /// describing something the code does not do: an agent told the list is
+    /// live has no reason to look for a session it started and cannot find,
+    /// and `state` is the field that actually answers the question.
+    ///
+    /// Pinned in both directions, because "mentions exited" alone would
+    /// pass against a description that also still promised the list was
+    /// live-only.
+    #[test]
+    fn list_sessions_description_does_not_promise_a_live_only_list() {
+        let tool = ClaspServer::list_sessions_tool_attr();
+        let description = tool.description.as_deref().unwrap_or("");
+        for needle in ["live or exited", "state"] {
+            assert!(
+                description.contains(needle),
+                "list_sessions' advertised description dropped {needle:?}, \
+                 which is what tells the agent the list is not live-only:\n{description}"
+            );
+        }
+        assert!(
+            !description.contains("live sessions"),
+            "list_sessions' advertised description still promises a \
+             live-only list, which `registry.all()` does not produce:\n{description}"
+        );
     }
 }

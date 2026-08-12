@@ -174,6 +174,12 @@ async fn read_tail(server: &ClaspServer, session: &str) -> CallToolResult {
 
 /// Poll until the session's buffer holds `needle`, so the detector has
 /// seen a real prompt before the response is sampled.
+///
+/// Asserts on the deadline rather than returning quietly. A silent return
+/// is the shape that produced the flake `b04e4f2` fixed: every downstream
+/// assertion still fails, but it fails describing a *response*, several
+/// screens away from the fact that the session never got where the test
+/// needed it. `wait_for_at_prompt` was hardened out of the same shape.
 async fn wait_for(server: &ClaspServer, session: &str, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -182,9 +188,13 @@ async fn wait_for(server: &ClaspServer, session: &str, needle: &str) {
             .as_str()
             .unwrap_or("")
             .to_string();
-        if text.contains(needle) || Instant::now() >= deadline {
+        if text.contains(needle) {
             return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "session never produced {needle:?}; last output: {text:?}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -268,6 +278,15 @@ fn register(
     let id = session.id.clone();
     server.registry.insert(session).expect("registry insert");
     id
+}
+
+/// Milliseconds since the Unix epoch, for bounding a reported timestamp
+/// from a reading taken in the test rather than from a constant.
+fn unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64
 }
 
 /// Poll until `pred` holds, or fail with `what`.
@@ -394,6 +413,52 @@ fn every_declared_shape_forbids_undeclared_fields() {
                 "{name}: {path} must reject undeclared fields"
             );
         }
+
+        // The generalisation of the `CommandHistory::entries` bug, asserted
+        // at *declaration* time instead of two tasks later.
+        //
+        // `entries` was declared as a bare `Vec`, so schemars marked it
+        // `required`, and `get_command_history` answers a missing session
+        // through `envelope::from_error` — whose `data` is always `{}`. The
+        // tool therefore produced a response its own advertised schema
+        // rejected, in production, on a path no test reached. The loop above
+        // checks `additionalProperties` and never `required`, so it could
+        // not see it.
+        //
+        // This is the one payload every tool that takes a `session`
+        // argument can emit, byte for byte, and it is the cheapest possible
+        // statement of the module header's rule that every `data` field is
+        // optional.
+        let error_envelope = json!({
+            "status": "session_not_found",
+            "data": {},
+            "details": "",
+        });
+        let accepted = validator(name).is_valid(&error_envelope);
+        if name == "list_sessions" {
+            // The one deliberate exception, and it is asserted as the
+            // *negative* rather than skipped. `ListSessions::sessions` stays
+            // required because this tool takes no arguments and emits only
+            // `ok`, so it has no second `data` shape. That premise lives in
+            // a comment in `schema.rs`; 0.0.5 puts the tool behind the
+            // daemon control protocol, where an error envelope becomes
+            // plausible. Pinning the rejection here makes the premise go red
+            // the moment it stops holding, instead of shipping the bug above
+            // a second time.
+            assert!(
+                !accepted,
+                "list_sessions declares `sessions` required on the premise \
+                 that it emits only `ok`; it now accepts an error envelope, \
+                 so either the premise or the declaration has changed"
+            );
+        } else {
+            assert!(
+                accepted,
+                "{name} advertises a schema that rejects the \
+                 `session_not_found` envelope `envelope::from_error` builds \
+                 for it — a `data` field is declared required"
+            );
+        }
     }
 }
 
@@ -452,9 +517,13 @@ fn every_tool_declares_the_annotations_5_3_assigns_it() {
             None,
             Some(false),
         ),
+        // "List all sessions", not "List active sessions": the tool returns
+        // every registry entry, exited ones included. The title is the
+        // second agent-visible string that said otherwise — this row going
+        // red when the description was corrected is the guard working.
         (
             "list_sessions",
-            "List active sessions",
+            "List all sessions",
             Some(true),
             None,
             None,
@@ -486,6 +555,63 @@ fn every_tool_declares_the_annotations_5_3_assigns_it() {
     }
 }
 
+/// Every variant of `envelope::Status`, enumerated so that **the compiler**
+/// refuses to build until a newly added one is accounted for.
+///
+/// This used to be a hand-written array, and that is the whole reason this
+/// function exists. A reviewer added a `Cancelled` variant with an `as_str`
+/// arm returning a status `schema::Status` does not declare, and the entire
+/// 252-test suite passed — the array simply did not mention it, so the
+/// "emitted" set stayed at eight and both differences below stayed empty.
+/// The test's own comment says it exists to catch exactly that drift.
+///
+/// The array was self-healing in one direction only: `declared − emitted`
+/// forces a manual update when a variant is added to *`schema::Status`*, so
+/// `unavailable` did make this go red. A variant added to the *emitting*
+/// side was invisible.
+///
+/// `successor` is a walk over every variant rather than a `match` beside a
+/// list, because a `match` beside a list can be satisfied by adding an arm
+/// and forgetting the list — which is the same hole one level in. Here the
+/// walk **is** the list: adding a variant to `envelope::Status` makes this
+/// `match` non-exhaustive and this file stops compiling, and the arm the
+/// compiler then demands can only be written by linking the new variant
+/// into the chain.
+///
+/// Residual, stated so it is not mistaken for airtightness: a *deliberate*
+/// dead-end arm (`Cancelled => None` while `Unavailable => None` stays) is
+/// unreachable and would not be walked. Nothing short of reflection closes
+/// that, and the `assert!(!seen.contains(..))` below at least makes a
+/// mis-linked chain fail loudly rather than loop.
+fn every_envelope_status() -> Vec<envelope::Status> {
+    use envelope::Status as S;
+
+    fn successor(s: S) -> Option<S> {
+        match s {
+            S::Ok => Some(S::Timeout),
+            S::Timeout => Some(S::SessionDied),
+            S::SessionDied => Some(S::SessionNotFound),
+            S::SessionNotFound => Some(S::NameTaken),
+            S::NameTaken => Some(S::LimitReached),
+            S::LimitReached => Some(S::SpawnFailed),
+            S::SpawnFailed => Some(S::Unavailable),
+            S::Unavailable => None,
+        }
+    }
+
+    let mut walk = vec![S::Ok];
+    while let Some(next) = successor(*walk.last().expect("the walk starts non-empty")) {
+        assert!(
+            !walk.contains(&next),
+            "the status walk revisits {:?}; the chain in `successor` is \
+             mis-linked and is not enumerating every variant",
+            next.as_str()
+        );
+        walk.push(next);
+    }
+    walk
+}
+
 #[test]
 fn the_status_enum_declares_every_status_the_envelope_can_emit() {
     // `envelope::Status` is what the tools actually serialise;
@@ -500,19 +626,18 @@ fn the_status_enum_declares_every_status_the_envelope_can_emit() {
         .map(|v| v.as_str().expect("string variant").to_string())
         .collect();
 
-    let emitted: BTreeSet<String> = [
-        envelope::Status::Ok,
-        envelope::Status::Timeout,
-        envelope::Status::SessionDied,
-        envelope::Status::SessionNotFound,
-        envelope::Status::NameTaken,
-        envelope::Status::LimitReached,
-        envelope::Status::SpawnFailed,
-        envelope::Status::Unavailable,
-    ]
-    .iter()
-    .map(|s| s.as_str().to_string())
-    .collect();
+    let emitted: BTreeSet<String> = every_envelope_status()
+        .iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+    // The walk is the enumeration, so it cannot be short. Asserted anyway,
+    // because a `successor` chain that somehow returned `None` on its first
+    // step would make both differences below empty against an empty set.
+    assert!(
+        emitted.len() >= 8,
+        "the status walk found only {} variant(s); it is not enumerating",
+        emitted.len()
+    );
 
     // Both directions, and both matter. A status emitted but not declared
     // is a response that fails its own schema the first time that path
@@ -530,6 +655,93 @@ fn the_status_enum_declares_every_status_the_envelope_can_emit() {
         Vec::<&String>::new(),
         "these statuses are declared but no tool can emit them"
     );
+}
+
+#[test]
+fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
+    // `state` and `shell_integration` were declared `Option<String>`, so
+    // `state: "banana"` and `shell_integration: "not-a-shell"` validated
+    // against the schema the agent is handed. Both mirror a closed
+    // vocabulary that already exists in production — `SessionState::as_str`
+    // and `Shell::as_str` — and both are fields the agent branches on, so
+    // "any string" is the wrong declaration for the same reason it would be
+    // for `interaction_mode`.
+    //
+    // Declaring them as enums creates the drift this whole file exists to
+    // stop, one level down: a fifth `SessionState` is a value the agent is
+    // told cannot occur. So both sides are enumerated by exhaustive `match`
+    // — the same construction `every_envelope_status` uses, for the same
+    // reason.
+    let declared = |tool: &str, def: &str| -> BTreeSet<String> {
+        output_schema(tool)["$defs"][def]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool}: $defs/{def} is not an enum"))
+            .iter()
+            .map(|v| v.as_str().expect("string variant").to_string())
+            .collect()
+    };
+
+    // `SessionState` carries data in two of its four variants, so the walk
+    // constructs them; the payload is irrelevant to `as_str` and the values
+    // below are chosen only to be constructible.
+    use clasp_core::session::SessionState as St;
+    fn next_state(s: &St) -> Option<St> {
+        match s {
+            St::Starting => Some(St::Running),
+            St::Running => Some(St::Exited(0)),
+            St::Exited(_) => Some(St::Dead(String::new())),
+            St::Dead(_) => None,
+        }
+    }
+    let mut states = vec![St::Starting];
+    while let Some(next) = next_state(states.last().expect("non-empty")) {
+        assert!(
+            !states.iter().any(|s| s.as_str() == next.as_str()),
+            "the SessionState walk revisits {:?}",
+            next.as_str()
+        );
+        states.push(next);
+    }
+    let emitted_states: BTreeSet<String> = states.iter().map(|s| s.as_str().to_string()).collect();
+
+    fn next_shell(s: Shell) -> Option<Shell> {
+        match s {
+            Shell::Bash => Some(Shell::Zsh),
+            Shell::Zsh => Some(Shell::Fish),
+            Shell::Fish => None,
+        }
+    }
+    let mut shells = vec![Shell::Bash];
+    while let Some(next) = next_shell(*shells.last().expect("non-empty")) {
+        assert!(
+            !shells.contains(&next),
+            "the Shell walk revisits {:?}",
+            next.as_str()
+        );
+        shells.push(next);
+    }
+    let emitted_shells: BTreeSet<String> = shells.iter().map(|s| s.as_str().to_string()).collect();
+
+    // Both directions. A value emitted but not declared is a response that
+    // fails its own schema; a value declared but not emitted is vocabulary
+    // the agent is told to branch on and never sees.
+    assert_eq!(
+        declared("status", "SessionState"),
+        emitted_states,
+        "schema::SessionState and session::SessionState::as_str disagree"
+    );
+    assert_eq!(
+        declared("read_output", "SessionState"),
+        emitted_states,
+        "read_output declares a different `state` vocabulary than `status`"
+    );
+    assert_eq!(
+        declared("status", "ShellIntegration"),
+        emitted_shells,
+        "schema::ShellIntegration and detect::Shell::as_str disagree"
+    );
+    assert_eq!(emitted_states.len(), 4);
+    assert_eq!(emitted_shells.len(), 3);
 }
 
 // --------------------------------------------------- real tool responses
@@ -904,6 +1116,16 @@ async fn status_reports_each_field_from_the_session_it_names() {
         activity >= (before as i64) * 1000,
         "last_activity_unix_ms is {activity}, not a clock reading in milliseconds"
     );
+    // `details` is §5.1 agent-visible text and is the `content[0]` block
+    // that clients ignoring `structuredContent` read. Replacing this
+    // `format!` with a constant survived the whole suite. It carries the
+    // session id, so pinning it is also a second, independent statement
+    // that `status` answered about the session it was asked about.
+    assert_eq!(
+        payload["details"],
+        format!("status of {id}"),
+        "status' details line is what a client that ignores structuredContent sees"
+    );
 
     // A resolvable session that is nonetheless *not* this one must not
     // answer: without this, `status` returning the first session in the
@@ -992,6 +1214,15 @@ async fn list_sessions_returns_every_registered_session_and_only_those() {
         expected.len(),
         "an id appeared more than once"
     );
+    // `details` is §5.1 agent-visible text and the `content[0]` block a
+    // client ignoring `structuredContent` reads. `{n} session(s)` with
+    // `n + 1` substituted survived the whole suite, so the count a client
+    // reads could disagree with the array beside it and nothing noticed.
+    assert_eq!(
+        payload["details"],
+        format!("{} session(s)", expected.len()),
+        "the details line must report the same count as `sessions`"
+    );
 
     for (id, name) in &names {
         let entry = entries
@@ -1025,6 +1256,9 @@ async fn list_sessions_returns_every_registered_session_and_only_those() {
 #[tokio::test]
 async fn get_command_history_ok_response_matches_its_schema() {
     let server = ClaspServer::new();
+    // Read the clock *before* anything runs, so `started_at_unix_ms` can be
+    // bounded below by a real epoch reading rather than by a constant.
+    let before = unix_ms_now();
     let pty = Arc::new(MockPty::new());
     pty.queue_output(TWO_COMMANDS);
     let id = register(
@@ -1087,6 +1321,37 @@ async fn get_command_history_ok_response_matches_its_schema() {
     assert_eq!(entries[1]["index"], 1);
     assert_eq!(entries[1]["command"], "echo two");
     assert_eq!(entries[1]["exit_code"], 4);
+    // `started_at_unix_ms` and `duration_ms` are adjacent, same-typed and
+    // numeric, and were pinned by nothing but their key names: transposing
+    // the two in `get_command_history`'s `json!` map survived the whole
+    // workspace suite (measured). Nothing else in the file reaches them.
+    //
+    // The separation is three orders of magnitude, which is what makes it
+    // an assertion rather than a formality: an epoch reading is ~1.7e12 and
+    // these commands are replayed from a `MockPty` in well under a second,
+    // so the transposed pair fails both bounds at once. This is the same
+    // shape `status_reports_each_field_from_the_session_it_names` uses for
+    // `started_at_unix_secs` versus `last_activity_unix_ms`.
+    let after = unix_ms_now();
+    for (i, e) in entries.iter().enumerate() {
+        let started = e["started_at_unix_ms"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("entry {i}: started_at_unix_ms must be an integer"));
+        assert!(
+            (before..=after).contains(&started),
+            "entry {i}: started_at_unix_ms {started} is not an epoch-ms \
+             reading taken during this test ({before}..={after}) — a \
+             duration is what lands here when the two fields transpose"
+        );
+        let duration = e["duration_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("entry {i}: duration_ms must be an integer"));
+        assert!(
+            duration < 60_000,
+            "entry {i}: duration_ms {duration} is an epoch reading, not an \
+             elapsed time; these commands are replayed from a mock"
+        );
+    }
     // The span must address the session's own buffer: reading it back
     // returns exactly that command's output and not its neighbour's.
     let start = entries[0]["output_start_cursor"].as_u64().expect("start");
@@ -1344,6 +1609,13 @@ async fn a_wrongly_typed_field_is_rejected() {
     for (field, bad) in [
         ("cursor", json!("not a number")),
         ("state", json!(3)),
+        // The *vocabulary* violation, not just the type violation. `state`
+        // and `shell_integration` were `Option<String>`, so `"banana"` and
+        // `"not-a-shell"` both validated; the `json!(3)` row above is a type
+        // violation and could not see that. Both fields mirror a closed
+        // four- and three-word vocabulary the agent is expected to branch
+        // on, exactly like `interaction_mode` below.
+        ("state", json!("banana")),
         ("truncated_at_tail", json!("yes")),
         ("interaction_mode", json!("NotAMode")),
         ("detection_tier", json!("terminal-mode")),
