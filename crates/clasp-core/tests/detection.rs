@@ -726,6 +726,23 @@ async fn matrix_row_an_exited_session_reports_exited() {
     assert_classified(&s, "Exited", "heuristic", 0.0);
     assert_eq!(s["prompt"]["quiescent_score"], 0.0);
     assert_eq!(s["prompt"]["pattern_score"], 0.0);
+
+    // The premise the tier rests on, asserted directly rather than read
+    // back out of the answer — the guard every other row in this file
+    // carries and the one row that was missing it. `heuristic` here is a
+    // claim about what the session *observed*, and all three tier-gating
+    // flags have to be off for it to be the honest answer rather than a
+    // coincidence. `assert_history` covers two of them; the third is
+    // checked on the escape, since `bash -c` still has shell integration
+    // enabled by default and a snippet reaching this child would take the
+    // row to `semantic`.
+    let raw = raw(&server, &id).await;
+    assert_history(&raw, false, false);
+    assert!(
+        !raw.contains("\x1b]133;"),
+        "an OSC 133 marker arrived, so `heuristic` is not what this \
+         session could have answered at: {raw:?}"
+    );
 }
 
 #[tokio::test]

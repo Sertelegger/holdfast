@@ -791,6 +791,103 @@ async fn start_session_spawn_failed_response_matches_its_schema() {
     assert_eq!(keys(&payload["data"]), set(&["command"]));
 }
 
+/// §18.1 `name_taken`, driven through the real tool.
+///
+/// Every §18.1 status any 0.0.2 tool can emit is driven for real
+/// somewhere in this file, and these two `start_session` rows plus the two
+/// `session_not_found` rows below are what makes that true rather than
+/// nearly true. Nothing about them was broken — all four shapes accept
+/// `data: {}`, which is what `envelope::from_error` always produces — but
+/// an unexercised branch is a branch whose payload shape is asserted by
+/// inspection, and inspection is what `CommandHistory`'s `required:
+/// ["entries"]` survived for two tasks.
+///
+/// The occupying session is a **mock**: the name has to belong to a *live*
+/// session (§4.1 releases a name when its session exits), and a mock is
+/// alive on construction without a second PTY having to stay up for it.
+#[tokio::test]
+async fn start_session_name_taken_response_matches_its_schema() {
+    let server = ClaspServer::new();
+    let pty = Arc::new(MockPty::new());
+    let _occupant = register(
+        &server,
+        Some("taken"),
+        "mock",
+        &[],
+        SessionConfig::default(),
+        &pty,
+    );
+
+    let before = server.registry.all().len();
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            name: Some("taken".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect("a taken name is a status, not a protocol error");
+
+    let payload = assert_matches_schema("start_session", &r);
+    assert_eq!(payload["status"], "name_taken");
+    assert_eq!(payload["data"], json!({}));
+    // The child is spawned before the registry is consulted, so the
+    // rejection path has to kill it. A rejected `start_session` that left
+    // a running shell behind would still pass every schema assertion
+    // above, and the registry is the only place the leak would show.
+    assert_eq!(
+        server.registry.all().len(),
+        before,
+        "the rejected session was registered anyway"
+    );
+}
+
+/// §18.1 `limit_reached`.
+///
+/// The limit counts *live* sessions, so the fill has to be live and the
+/// separator has to be a session that would otherwise have been accepted:
+/// `DEFAULT_MAX_SESSIONS` mocks in, one real `start_session` rejected.
+#[tokio::test]
+async fn start_session_limit_reached_response_matches_its_schema() {
+    let server = ClaspServer::new();
+    let mut ptys = Vec::new();
+    for _ in 0..clasp_core::session::registry::DEFAULT_MAX_SESSIONS {
+        let pty = Arc::new(MockPty::new());
+        register(&server, None, "mock", &[], SessionConfig::default(), &pty);
+        ptys.push(pty);
+    }
+
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            ..Default::default()
+        }))
+        .await
+        .expect("a full registry is a status, not a protocol error");
+
+    let payload = assert_matches_schema("start_session", &r);
+    assert_eq!(payload["status"], "limit_reached");
+    assert_eq!(payload["data"], json!({}));
+    assert_eq!(
+        server.registry.all().len(),
+        clasp_core::session::registry::DEFAULT_MAX_SESSIONS,
+        "the rejected session was registered anyway"
+    );
+
+    // The separator: with one slot freed the identical call succeeds, so
+    // this pins the *limit* rather than "start_session rejects everything".
+    ptys[0].exit(0);
+    until("the freed slot to be observed", || {
+        server.registry.live_count() < clasp_core::session::registry::DEFAULT_MAX_SESSIONS
+    })
+    .await;
+    let (id, r) = start_bash(&server).await;
+    assert_eq!(body(&r)["status"], "ok");
+    kill(&server, &id).await;
+}
+
 #[tokio::test]
 async fn read_output_response_matches_its_schema() {
     let server = ClaspServer::new();
@@ -865,6 +962,52 @@ async fn read_output_session_not_found_response_matches_its_schema() {
     let payload = assert_matches_schema("read_output", &r);
     assert_eq!(payload["status"], "session_not_found");
     assert_eq!(payload["data"], json!({}));
+}
+
+/// §18.1 `session_not_found` on the two tools that resolve a session and
+/// then *write* to it.
+///
+/// `read_output`, `status` and `get_command_history` each drive this
+/// already; `send_input` and `terminate` did not, and they are the two
+/// where the status has to arrive without the side effect. The assertions
+/// are therefore the same envelope plus the absence of any registry
+/// change: a resolver that inserted, resurrected or otherwise materialised
+/// the missing session would still return `session_not_found`.
+#[tokio::test]
+async fn send_input_and_terminate_session_not_found_responses_match_their_schema() {
+    let server = ClaspServer::new();
+
+    let r = server
+        .send_input(Parameters(SendInputArgs {
+            session: "sess_does_not_exist".into(),
+            data: "echo nope".into(),
+            append_newline: None,
+        }))
+        .await
+        .expect("a missing session is a status, not a protocol error");
+    let payload = assert_matches_schema("send_input", &r);
+    assert_eq!(payload["status"], "session_not_found");
+    // Not `keys(...)` against a set: the point here is that the write path
+    // emits the *empty* payload `envelope::from_error` builds, with none
+    // of the §5.4 detection block a resolved `send_input` carries.
+    assert_eq!(payload["data"], json!({}));
+
+    let r = server
+        .terminate(Parameters(TerminateArgs {
+            session: "sess_does_not_exist".into(),
+            force: Some(true),
+            timeout_secs: None,
+        }))
+        .await
+        .expect("a missing session is a status, not a protocol error");
+    let payload = assert_matches_schema("terminate", &r);
+    assert_eq!(payload["status"], "session_not_found");
+    assert_eq!(payload["data"], json!({}));
+
+    assert!(
+        server.registry.all().is_empty(),
+        "resolving a missing session created one"
+    );
 }
 
 #[tokio::test]
