@@ -857,7 +857,23 @@ mod tests {
         /// turns row 2 back into row 1, which satisfies every assertion
         /// row 2 makes about the *answer*. This is the guard that makes
         /// the row name mean something.
-        fn assert_history(d: &PromptDetector, saw_bp: bool, saw_alt: bool, alt_now: bool) {
+        ///
+        /// Argument order is `(bracketed paste seen, alt screen seen, alt
+        /// screen now, osc 133 seen)`. All four are `bool`, so a
+        /// transposition compiles; what stops it is that no two rows below
+        /// carry the same four values, and the failure names the field.
+        ///
+        /// `saw_osc133` is the *third* tier-gating flag and the one
+        /// REQ-PD-016's exited matrix keys on. Without it here, that
+        /// matrix's OSC-133 row and its never-observed row are, as far as
+        /// this guard can tell, the same stream.
+        fn assert_history(
+            d: &PromptDetector,
+            saw_bp: bool,
+            saw_alt: bool,
+            alt_now: bool,
+            saw_osc133: bool,
+        ) {
             let m = d.scanner.modes();
             assert_eq!(
                 m.saw_bracketed_paste, saw_bp,
@@ -865,6 +881,7 @@ mod tests {
             );
             assert_eq!(m.saw_alt_screen, saw_alt, "observed-alt-screen history");
             assert_eq!(m.alt_screen, alt_now, "alternate screen right now");
+            assert_eq!(m.saw_osc133, saw_osc133, "observed-osc-133 history");
         }
 
         /// Row 1 — `dash`, no terminal mode ever seen, sitting at `$ `.
@@ -874,7 +891,7 @@ mod tests {
         fn row_1_dash_that_never_saw_a_mode_answers_at_prompt_via_t3() {
             let (mut d, start, now) = detector();
             feed(&mut d, start, b"$ ");
-            assert_history(&d, false, false, false);
+            assert_history(&d, false, false, false, false);
 
             let s = d.snapshot_at(true, Some(true), now);
             assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
@@ -895,7 +912,7 @@ mod tests {
         fn row_2_dash_after_less_entered_and_left_the_alt_screen_still_answers_via_t3() {
             let (mut d, start, now) = detector();
             feed(&mut d, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n$ ");
-            assert_history(&d, false, true, false);
+            assert_history(&d, false, true, false, false);
 
             let s = d.snapshot_at(true, Some(true), now);
             assert_eq!(
@@ -924,7 +941,7 @@ mod tests {
                 start,
                 b"\x1b[?1049h drawing \x1b[?1049l\r\nEnter a value: ",
             );
-            assert_history(&d, false, true, false);
+            assert_history(&d, false, true, false, false);
 
             let s = d.snapshot_at(true, Some(true), now);
             assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
@@ -940,7 +957,7 @@ mod tests {
         fn row_4_bash_with_bracketed_paste_seen_then_disabled_answers_executing_via_t2() {
             let (mut d, start, now) = detector();
             feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lsleep 2\r\n");
-            assert_history(&d, true, false, false);
+            assert_history(&d, true, false, false, false);
 
             let s = d.snapshot_at(true, Some(true), now);
             assert_eq!(s.interaction_mode, InteractionMode::Executing);
@@ -966,7 +983,7 @@ mod tests {
         fn row_5_a_live_alt_screen_reports_fullscreen_with_no_availability_at_all() {
             let (mut d, start, now) = detector();
             feed(&mut d, start, b"\x1b[?1049h:");
-            assert_history(&d, false, true, true);
+            assert_history(&d, false, true, true, false);
 
             let s = d.snapshot_at(true, Some(true), now);
             assert_eq!(s.interaction_mode, InteractionMode::Fullscreen);
@@ -1000,7 +1017,7 @@ mod tests {
                 let (mut toggled, start, now) = detector();
                 feed(&mut toggled, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n");
                 feed(&mut toggled, start, tail);
-                assert_history(&toggled, false, true, false);
+                assert_history(&toggled, false, true, false, false);
                 let with = toggled.snapshot_at(true, Some(true), now);
 
                 assert_eq!(
@@ -1028,13 +1045,81 @@ mod tests {
         fn an_exited_alt_screen_only_session_reports_the_tier_that_could_have_answered() {
             let (mut d, start, now) = detector();
             feed(&mut d, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n$ ");
-            assert_history(&d, false, true, false);
+            assert_history(&d, false, true, false, false);
             assert_eq!(
                 d.snapshot_at(false, None, now).detection_tier,
                 DetectionTier::Heuristic,
                 "a session that only ever drove the alternate screen was \
                  never classifiable by terminal mode"
             );
+        }
+
+        /// REQ-PD-016 row 4 — an integrated shell that has exited reports
+        /// `semantic`.
+        ///
+        /// The row that closes the requirement's four-history matrix, and
+        /// the one that makes the other three mean something. With it
+        /// absent, a mutation collapsing the `!alive` arm to a literal
+        /// `DetectionTier::Heuristic` was killed only by the
+        /// bracketed-paste row, and a mutation collapsing it to
+        /// "`session_tier` but never `Semantic`" was killed by **nothing in
+        /// the workspace** — the T1 branch of `session_tier` had no exited
+        /// witness at all.
+        ///
+        /// The history assertion is not decoration here. This row's answer
+        /// (`Exited`, all scores 0.0) is byte-identical to every other
+        /// exited row; the *only* thing that distinguishes it is that
+        /// `saw_osc133` is true and the other two flags are false. A
+        /// mistyped marker turns it into the never-observed row below,
+        /// which asserts a different tier and would fail — but a mistyped
+        /// marker plus a copied expectation would not, which is what the
+        /// guard is for.
+        #[test]
+        fn an_exited_integrated_shell_reports_the_semantic_tier_it_reached() {
+            let (mut d, start, now) = detector();
+            feed(&mut d, start, b"\x1b]133;A\x07bash-5.3$ ");
+            assert_history(&d, false, false, false, true);
+
+            let s = d.snapshot_at(false, None, now);
+            assert_eq!(s.interaction_mode, InteractionMode::Exited);
+            assert_eq!(
+                s.detection_tier,
+                DetectionTier::Semantic,
+                "a shell that emitted OSC 133 was classifiable semantically, \
+                 and exiting does not retract that"
+            );
+            assert_eq!(s.confidence, 0.0);
+        }
+
+        /// REQ-PD-016 row 1 — nothing ever observed reports `heuristic`.
+        ///
+        /// The negative that separates the row above from the degenerate
+        /// case: the same exited call, the same empty prompt line, the same
+        /// zeroed scores, and the *only* difference in the input is the
+        /// absence of the OSC 133 marker. Without this row, an
+        /// implementation that answered `Semantic` unconditionally on the
+        /// `!alive` path would satisfy every other assertion in this
+        /// module.
+        ///
+        /// Also the unit-level statement of PTY row 9
+        /// (`matrix_row_an_exited_session_reports_exited`), which asserts
+        /// the same tier for `bash -c 'exit 3'` but does not assert the
+        /// history it depends on.
+        #[test]
+        fn an_exited_session_that_observed_nothing_reports_the_heuristic_tier() {
+            let (mut d, start, now) = detector();
+            feed(&mut d, start, b"bash-5.3$ ");
+            assert_history(&d, false, false, false, false);
+
+            let s = d.snapshot_at(false, None, now);
+            assert_eq!(s.interaction_mode, InteractionMode::Exited);
+            assert_eq!(
+                s.detection_tier,
+                DetectionTier::Heuristic,
+                "a session with no observed signal was never classifiable \
+                 above the fallback tier"
+            );
+            assert_eq!(s.confidence, 0.0);
         }
     }
 }

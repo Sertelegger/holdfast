@@ -755,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn a_well_formed_oversized_sequence_does_not_forge_a_prompt() {
+    fn a_well_formed_sequence_under_the_blindness_ceiling_does_not_forge_a_prompt() {
         // The byte ceiling is a blindness budget for sequences that never
         // terminate. Set below what real programs emit, it fired on
         // *correctly terminated* ones and handed their payload to the tail
@@ -765,6 +765,24 @@ mod tests {
         // both payloads end in something §8.6 scores at 0.85: §8.4's act
         // threshold. Measured at the old 8 KiB ceiling as
         // "root@prod:/etc# " and "user@host:~$ ".
+        //
+        // **What this establishes, and what it does not.** "Under the
+        // blindness ceiling" is load-bearing and used to be missing from
+        // the name. These rows are 9 KiB against a `SEQUENCE_MAX` of 64
+        // KiB, so they never trip it at all — the property they pin is that
+        // a correctly terminated sequence *below* the ceiling pays nothing
+        // for being long, however far past `OSC_PAYLOAD_MAX` it runs.
+        //
+        // Past the ceiling the claim is false, and measurably so. A 70 KiB
+        // well-formed OSC 52 or DCS whose payload carries `\r\n` before the
+        // tail yields `last_line == "root@prod:/etc# "`, plus
+        // `saw_bracketed_paste`, `saw_alt_screen` and `saw_osc133` all set
+        // from payload bytes — the detector answers `AtPrompt` / `Semantic`
+        // / 1.0, not the 0.85 heuristic answer §8.8 records. See
+        // `an_abandoned_sequence_cannot_forge_a_mode_from_the_payload_
+        // before_the_next_newline` for the same boundary stated directly.
+        // Raising the ceiling and pinning that residual are spec rev. 34's;
+        // this comment exists so the gap is not read as covered here.
         for (introducer, terminator, tail) in [
             (&b"\x1b]52;c;"[..], &b"\x07"[..], "root@prod:/etc# "),
             (&b"\x1bPq"[..], &b"\x1b\\"[..], "user@host:~$ "),
@@ -774,16 +792,23 @@ mod tests {
             assert_eq!(
                 s.last_line(),
                 "",
-                "{introducer:?}: payload was promoted to terminal text"
+                "{introducer:?}: a well-formed sequence under SEQUENCE_MAX \
+                 promoted its payload to terminal text"
             );
         }
     }
 
     #[test]
-    fn a_well_formed_oversized_sequence_does_not_leak_into_the_command() {
+    fn a_well_formed_sequence_under_the_blindness_ceiling_does_not_leak_into_the_command() {
         // The same leak reaching the other consumer of scanner state: an
         // OSC 52 write between `B` and `C` appended ~800 bytes of clipboard
         // payload to the command that gets reported to the agent.
+        //
+        // Same qualification as the test above, for the same measured
+        // reason: the OSC 52 here is 9 KiB against a 64 KiB ceiling. Past
+        // the ceiling the payload's own `\x1b]133;` bytes are parsed as
+        // real markers, so command capture takes payload — the residual is
+        // `OutputStart { command: "ls\nrm -rf /" }`, not a clean "ls".
         let mut s = ModeScanner::new();
         s.feed(b"\x1b]133;B\x07ls\r\n", 0);
         let osc = oversized_but_well_formed(b"\x1b]52;c;", b"\x07", "root@prod:/etc# ");
@@ -793,7 +818,9 @@ mod tests {
             ev[0].marker,
             Osc133::OutputStart {
                 command: "ls".into()
-            }
+            },
+            "a well-formed sequence under SEQUENCE_MAX leaked into the \
+             captured command"
         );
     }
 
@@ -838,13 +865,35 @@ mod tests {
     }
 
     #[test]
-    fn an_abandoned_sequence_cannot_forge_a_mode_from_its_own_payload() {
+    fn an_abandoned_sequence_cannot_forge_a_mode_from_the_payload_before_the_next_newline() {
         // Ending the discarded run at the next `ESC` would resynchronise
         // sooner, at the cost of letting the abandoned payload introduce
         // sequences. That payload is chosen by the program that emitted the
         // broken sequence, and `\x1b[?2004h` inside it would set the
         // availability flag §8.4 gates on — the same forgery the CSI
         // parameter cap exists to stop, arriving through another door.
+        //
+        // **The name carries "before the next newline" because that is the
+        // whole of what this establishes.** `Discard` exits on `\n`, so the
+        // protection lasts exactly to the end of the line that tripped the
+        // ceiling. The input below has no newline after the filler, which
+        // is why nothing is forged.
+        //
+        // Measured, with `\r\n` inserted before the smuggled bytes instead:
+        // `saw_bracketed_paste` **and** `bracketed_paste` both true,
+        // `saw_alt_screen`/`alt_screen` both true from a `\x1b[?1049h`, a
+        // genuine `PromptStart` event with `saw_osc133` set, and
+        // `last_line == "root@prod:/etc# "`. All three are sticky and
+        // tier-gating, so the classifier answers `AtPrompt` / `Semantic` /
+        // 1.0.
+        //
+        // Not a regression and not a new exposure: before the give-up path
+        // existed the trip returned straight to `Ground`, so the same
+        // forgeries were reachable at 8 KiB, and §8.8/REQ-PD-010 already
+        // accepts that a hostile child can print `\x1b[?2004h` directly.
+        // Accidental forgery needs an ESC inside a payload that by
+        // construction has none (base64, sixel). What was wrong was this
+        // test's name, which read as the unqualified claim.
         let mut s = ModeScanner::new();
         let mut input = b"\x1b]0;".to_vec();
         input.extend(std::iter::repeat_n(b'A', SEQUENCE_MAX + 64));
@@ -852,7 +901,7 @@ mod tests {
         s.feed(&input, 0);
         assert!(
             !s.modes().saw_bracketed_paste,
-            "discarded payload forged a tier-gating flag"
+            "payload before the next newline forged a tier-gating flag"
         );
         assert!(!s.modes().bracketed_paste);
         assert_eq!(s.last_line(), "");
