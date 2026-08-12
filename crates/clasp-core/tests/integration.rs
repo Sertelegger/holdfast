@@ -40,6 +40,16 @@ fn wait_for_exit(pty: &dyn PtyBackend, timeout: Duration) {
     }
 }
 
+/// Whether a pid still exists, via `kill(pid, 0)`.
+///
+/// Unix-only, and every test that calls it now carries the *same*
+/// `#[cfg(unix)]` — which is the fix, not decoration. This helper was
+/// already gated while its three call sites were not, so `cargo check
+/// --all-targets --target x86_64-pc-windows-gnu` failed with four errors,
+/// and had done for some time: the cross-check run by hand throughout 0.0.1
+/// and 0.0.2, and reported in task reports as "clippy clean on
+/// x86_64-pc-windows-gnu", was lib + bin only. A gated helper with unguarded
+/// callers is what made a guard whose name is broader than its reach.
 #[cfg(unix)]
 fn pid_alive(pid: i32) -> bool {
     // kill(pid, 0) probes existence without signalling.
@@ -62,6 +72,11 @@ fn spawns_a_shell_and_reads_output() {
     pty.signal(Signal::Kill).unwrap();
 }
 
+// Unix-only: the assertion is about a *descendant* pid outliving the sweep,
+// probed with `kill(pid, 0)`. Windows job objects are 0.0.7's, and get
+// their own test rather than a contorted version of this one. Gated at the
+// test rather than at `pid_alive`, so the Linux run still carries it.
+#[cfg(unix)]
 #[test]
 fn terminate_kills_the_whole_process_group() {
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
@@ -644,6 +659,10 @@ async fn read_output_tail_lines_respects_max_bytes() {
     );
 }
 
+// Unix-only for the same reason as `terminate_kills_the_whole_process_group`:
+// the proof that SIGKILL escalation ran is that the pid is gone, and SIGTERM
+// immunity is a Unix signal behaviour with no Windows counterpart.
+#[cfg(unix)]
 #[tokio::test]
 async fn terminate_without_force_escalates_to_sigkill_for_a_sigterm_immune_child() {
     // The normal production path: an interactive bash IGNORES SIGTERM, so
@@ -1115,6 +1134,13 @@ async fn read_output_rejects_a_zero_max_bytes() {
     kill_all(&server).await;
 }
 
+// Unix-only: the second half resolves a *symlinked* cwd, which is what
+// separates a canonicalising implementation from one that merely joins the
+// argument onto the process cwd. `std::os::unix::fs::symlink` has no
+// portable spelling — Windows needs a privileged, directory-vs-file-typed
+// call — so the whole test is gated rather than split, which would change
+// the Linux count without adding Windows coverage of anything that runs.
+#[cfg(unix)]
 #[tokio::test]
 async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
     // §5.2: the returned `cwd` is the directory the child was actually
@@ -1316,9 +1342,18 @@ async fn prompt_block(server: &ClaspServer, id: &str) -> Value {
             .expect("read_output must not be a protocol error");
         let prompt = body(&r)["data"]["prompt"].clone();
         let line = prompt["last_line"].as_str().unwrap_or("");
-        if line.ends_with("$ ") || line.ends_with("# ") || Instant::now() >= deadline {
+        if line.ends_with("$ ") || line.ends_with("# ") {
             return prompt;
         }
+        // Assert rather than return the last block seen. Returning quietly
+        // is the shape `wait_for_at_prompt` was hardened out of: every
+        // caller's assertion still fails, but it fails describing a
+        // confidence or a tier, with nothing saying the session never
+        // reached a prompt at all.
+        assert!(
+            Instant::now() < deadline,
+            "session never reached a shell prompt; last block: {prompt}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
