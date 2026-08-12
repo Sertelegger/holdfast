@@ -336,6 +336,27 @@ mod tests {
     }
 
     #[test]
+    fn matrix_real_ssh_password_prompt() {
+        // §8.7's fifth row, and the one the spike called out specially:
+        // `ssh` is not readline and prints its own prompt, so this row is
+        // the evidence that the `AwaitingSecret` rung generalises past
+        // `getpass()` and bash's `read -s` — the matrix had six of its
+        // seven rows under test and this was the gap. It ran under a shell
+        // that had already driven bracketed paste (§8.7's `Seen BrktPst`
+        // column), which the stream below reproduces.
+        let (mut d, start, now) = detector();
+        feed(
+            &mut d,
+            start,
+            b"\x1b[?2004h\x1b[?2004lssh prod-01\r\njane@prod-01's password: ",
+        );
+        let s = d.snapshot_at(true, Some(false), now);
+        assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
+        assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
+        assert_eq!(s.confidence, 0.95);
+    }
+
+    #[test]
     fn matrix_python_repl_prompt() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b[?2004h>>> ");
