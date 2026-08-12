@@ -172,16 +172,25 @@ async fn await_mode(server: &ClaspServer, id: &str, want: &str) -> Value {
 /// window has saturated.
 ///
 /// And a *mode* wait is not enough for any row that also asserts the line
-/// the mode was reached on, because the shell passes through transient
-/// states on its way there. The sharpest is a spurious `AwaitingSecret`
-/// between a command being submitted and its first byte of output:
-/// readline disables bracketed paste the instant the line is accepted,
-/// while `ECHO` is sampled through a 50 ms cache (§4.1) that can still be
-/// holding readline's echo-off reading — so the ladder's echo rung fires
-/// with an empty tail line. Reproduced under a parallel workspace run in
-/// roughly one run in ten, on `read -s`. Waiting for the line as well
-/// makes the wait an assertion about *these* bytes rather than about
-/// however long the test took to get here.
+/// the mode was reached on, because a program reaches a mode and prints
+/// the line that explains it as two separate events, in that order.
+/// PyREPL enables bracketed paste *before* it draws `>>> `, so a mode-only
+/// wait there returns with an empty last line and the row's own assertion
+/// fails for a reason that has nothing to do with the row. Waiting for the
+/// line as well makes the wait an assertion about *these* bytes rather
+/// than about however long the test took to get here.
+///
+/// It was also, until this milestone closed it, the workaround for a
+/// product defect. Between a command being submitted and its first byte of
+/// output, `ECHO` was sampled through a 50 ms cache that could still be
+/// holding readline's echo-off reading while bracketed paste had already
+/// gone off — so §8.3's echo rung answered `AwaitingSecret` at 0.95, with
+/// an empty tail line, for an ordinary command. Roughly one workspace run
+/// in ten failed `matrix_row_bash_read_s_..._flags_a_write` on it. The
+/// cache is gone (`pty::echo_freshness`) and the sample is now taken with
+/// the detector held (`session::no_output_is_classified_between_...`), so
+/// the wait below is no longer load-bearing for that; it is kept for the
+/// PyREPL reason above, which is not going anywhere.
 async fn await_settled(server: &ClaspServer, id: &str, last_line: &str) -> Value {
     await_status(server, id, &format!("a settled {last_line:?}"), |s| {
         s["prompt"]["last_line"] == last_line && s["prompt"]["quiescent_score"] == 1.0
@@ -442,10 +451,10 @@ async fn matrix_row_bash_read_s_is_awaiting_secret_and_flags_a_write() {
 
     send(&server, &id, "read -s -p 'Password: ' pw").await;
     // Settled on the prompt `read -s` printed — not the echo of the
-    // command line, which ends in ` pw`. See `await_settled`: a mode-only
-    // wait here catches the transient `AwaitingSecret` that a 50 ms-stale
-    // `ECHO` sample produces the moment bracketed paste goes off, before
-    // `read` has printed anything at all.
+    // command line, which ends in ` pw`. This is the row that caught the
+    // stale-`ECHO` transient described in `await_settled`, and asserting
+    // the line keeps it an assertion about `read -s`'s own prompt rather
+    // than about whatever state the shell was passing through.
     let s = await_settled(&server, &id, "Password: ").await;
     // 0.95 is what an agent thresholds on before calling
     // `request_secret_input` (§5.2, §9.5); a silent drop stops that tool
