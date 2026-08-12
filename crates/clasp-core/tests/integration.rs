@@ -190,11 +190,15 @@ fn signal_after_exit_is_a_no_op() {
 }
 
 use clasp_core::mcp::tools::{
-    PromptPatternArg, ReadOutputArgs, SendInputArgs, StartSessionArgs, TerminateArgs,
+    GetCommandHistoryArgs, PromptPatternArg, ReadOutputArgs, SendInputArgs, StartSessionArgs,
+    TerminateArgs,
 };
 use clasp_core::mcp::ClaspServer;
+use clasp_core::pty::MockPty;
+use clasp_core::session::{new_session_id, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
+use std::sync::Arc;
 
 fn body(r: &rmcp::model::CallToolResult) -> Value {
     r.structured_content.clone().expect("structured content")
@@ -1530,4 +1534,168 @@ async fn start_session_reports_and_can_disable_shell_integration() {
     assert_eq!(data["shell_integration"], Value::Null);
 
     kill_all(&server).await;
+}
+
+// ------------------------------------------------------------------
+// 0.0.2: get_command_history's window arguments.
+//
+// `since_index` and `limit` are both numeric options handed to
+// `command_history(since_index, limit)` positionally, which is the
+// transposition hazard in its purest form: swapped, the tool still
+// compiles, still returns entries, and still answers `ok`. The schema
+// tests validate the *shape* of the response and cannot see it. So each
+// window below is chosen so that no two of them — and no transposition of
+// them — produce the same answer.
+// ------------------------------------------------------------------
+
+/// A registry-resident mock session that has already recorded `n` OSC 133
+/// commands, `cmd0`..`cmd{n-1}`, in a ring of `max_entries`.
+async fn history_session(server: &ClaspServer, n: usize, max_entries: usize) -> String {
+    let mut bytes = Vec::new();
+    for i in 0..n {
+        bytes.extend_from_slice(b"\x1b]133;B\x07cmd");
+        bytes.extend_from_slice(i.to_string().as_bytes());
+        bytes.extend_from_slice(b"\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+    }
+    let pty = Arc::new(MockPty::new());
+    pty.queue_output(&bytes);
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "mock".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn clasp_core::pty::PtyBackend>,
+        SessionConfig {
+            history_max_entries: max_entries,
+            ..SessionConfig::default()
+        },
+    );
+    let id = session.id.clone();
+    server
+        .registry
+        .insert(Arc::clone(&session))
+        .expect("registry insert");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session.command_count() < n as u64 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        session.command_count(),
+        n as u64,
+        "the reader never folded all {n} commands into the history"
+    );
+    id
+}
+
+/// `get_command_history`'s entry indices for one window.
+async fn history_indices(
+    server: &ClaspServer,
+    id: &str,
+    since_index: Option<u64>,
+    limit: Option<usize>,
+) -> (Vec<u64>, Value) {
+    let r = server
+        .get_command_history(Parameters(GetCommandHistoryArgs {
+            session: id.into(),
+            limit,
+            since_index,
+        }))
+        .await
+        .expect("get_command_history must not be a protocol error");
+    let payload = body(&r);
+    assert_eq!(payload["status"], "ok", "{payload}");
+    let indices = payload["data"]["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| e["index"].as_u64().expect("index"))
+        .collect();
+    (indices, payload)
+}
+
+#[tokio::test]
+async fn get_command_history_limit_and_since_index_select_different_windows() {
+    let server = ClaspServer::new();
+    let id = history_session(&server, 5, 100).await;
+
+    // Neither argument: every entry, and `total` agrees with the count.
+    let (all, payload) = history_indices(&server, &id, None, None).await;
+    assert_eq!(all, vec![0, 1, 2, 3, 4]);
+    assert_eq!(payload["data"]["total"], 5);
+    // Nothing was evicted from a ring of a hundred. The positive half is
+    // `get_command_history_reports_a_truncated_ring` below; a flag stuck
+    // on tells the agent every history it will ever read has holes.
+    assert_eq!(payload["data"]["truncated_at_tail"], false);
+
+    // `since_index` alone keeps the *oldest* boundary; `limit` alone keeps
+    // the *newest* entries. The two windows differ, so a tool that wired
+    // one argument to the other's slot answers one of them wrongly.
+    let (since_only, _) = history_indices(&server, &id, Some(1), None).await;
+    assert_eq!(since_only, vec![1, 2, 3, 4], "since_index was ignored");
+    let (limit_only, _) = history_indices(&server, &id, None, Some(2)).await;
+    assert_eq!(
+        limit_only,
+        vec![3, 4],
+        "limit kept the oldest, not the newest"
+    );
+
+    // Both at once, chosen so a transposition is visible: `(since=1,
+    // limit=2)` is [3, 4]; the swapped call `(since=2, limit=1)` is [4].
+    let (window, payload) = history_indices(&server, &id, Some(1), Some(2)).await;
+    assert_eq!(window, vec![3, 4], "since_index and limit are transposed");
+    // `total` is every command ever recorded, not the size of the window.
+    // Deriving it from `entries.len()` would report 2 here.
+    assert_eq!(payload["data"]["total"], 5);
+
+    // A window past the end is empty rather than an error: the agent polls
+    // `since_index: total` to ask "anything new?".
+    let (empty, payload) = history_indices(&server, &id, Some(5), None).await;
+    assert!(empty.is_empty(), "{payload}");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["total"], 5);
+}
+
+#[tokio::test]
+async fn get_command_history_reports_a_truncated_ring() {
+    // Five commands into a ring of three. Three survive, not one: at a cap
+    // of two an implementation that *cleared* the ring on overflow would
+    // land on the same answer as one that evicts a single entry, and
+    // nothing here could tell them apart.
+    let server = ClaspServer::new();
+    let id = history_session(&server, 5, 3).await;
+
+    let (indices, payload) = history_indices(&server, &id, None, None).await;
+    assert_eq!(indices, vec![2, 3, 4], "the ring dropped the wrong entries");
+    assert_eq!(payload["data"]["truncated_at_tail"], true);
+    // `total` counts evicted commands too, which is how the agent knows
+    // its `since_index` cursor skipped some.
+    assert_eq!(payload["data"]["total"], 5);
+}
+
+#[tokio::test]
+async fn get_command_history_bounds_its_response_at_the_ring_default() {
+    // `limit` is clamped to `DEFAULT_MAX_ENTRIES`, so no caller can ask
+    // for an unbounded response. That clamp is invisible with a stock
+    // session — the ring holds at most `DEFAULT_MAX_ENTRIES` anyway, so
+    // the cap is never the binding constraint — which is exactly why it
+    // has to be exercised against a ring that is deliberately larger.
+    // Delete the `.min(...)` and this returns 1002 entries.
+    let server = ClaspServer::new();
+    let n = clasp_core::detect::DEFAULT_MAX_ENTRIES + 2;
+    let id = history_session(&server, n, n).await;
+
+    let (indices, payload) = history_indices(&server, &id, None, Some(usize::MAX)).await;
+    assert_eq!(
+        indices.len(),
+        clasp_core::detect::DEFAULT_MAX_ENTRIES,
+        "an unbounded `limit` was honoured literally"
+    );
+    // The newest are kept, so the clamp is a cap and not a truncation of
+    // the head of the window.
+    assert_eq!(*indices.last().expect("entries"), n as u64 - 1);
+    assert_eq!(payload["data"]["total"], n as u64);
+    // Nothing was evicted: the ring was sized to hold everything, so the
+    // shortfall above is the response cap and not the ring's.
+    assert_eq!(payload["data"]["truncated_at_tail"], false);
 }
