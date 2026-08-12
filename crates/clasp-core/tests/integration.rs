@@ -1685,6 +1685,19 @@ async fn get_command_history_bounds_its_response_at_the_ring_default() {
     let n = clasp_core::detect::DEFAULT_MAX_ENTRIES + 2;
     let id = history_session(&server, n, n).await;
 
+    // The documented default, which is only observable here for the same
+    // reason: with five commands in the ring, "50" and "no limit at all"
+    // are the same answer. `limit: 50` is what the tool's input schema
+    // promises, so an implementation that defaulted to the ring size would
+    // return 1000 entries to a caller that asked for nothing.
+    let (defaulted, _) = history_indices(&server, &id, None, None).await;
+    assert_eq!(defaulted.len(), 50, "`limit` does not default to 50");
+    assert_eq!(
+        *defaulted.last().expect("entries"),
+        n as u64 - 1,
+        "the default window kept the oldest 50 rather than the newest"
+    );
+
     let (indices, payload) = history_indices(&server, &id, None, Some(usize::MAX)).await;
     assert_eq!(
         indices.len(),
