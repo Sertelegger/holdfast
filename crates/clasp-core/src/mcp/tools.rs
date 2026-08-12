@@ -1,4 +1,5 @@
-//! The 0.0.1 tool set: start_session, read_output, send_input, terminate.
+//! The 0.0.2 tool set: start_session, read_output, send_input, terminate,
+//! status, list_sessions, get_command_history.
 
 use super::envelope::{self, Status};
 use super::{detection, schema, ClaspServer};
@@ -576,6 +577,151 @@ impl ClaspServer {
             "terminated",
         ))
     }
+
+    /// Detailed status of one session, including what it is doing right
+    /// now and how that was determined.
+    #[tool(
+        annotations(
+            title = "Get detailed session status",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = schema::envelope_schema::<schema::SessionRecord>()
+    )]
+    pub async fn status(
+        &self,
+        Parameters(args): Parameters<StatusArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = match self.registry.get(&args.session) {
+            Ok(s) => s,
+            Err(e) => return envelope::from_error(&e),
+        };
+        Ok(envelope::ok(
+            detection::with_detection(session_record(&session), &session),
+            format!("status of {}", session.id),
+        ))
+    }
+
+    /// List live sessions with what each one is doing.
+    #[tool(
+        annotations(
+            title = "List active sessions",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = schema::envelope_schema::<schema::ListSessions>()
+    )]
+    pub async fn list_sessions(&self) -> Result<CallToolResult, ErrorData> {
+        let sessions: Vec<serde_json::Value> = self
+            .registry
+            .all()
+            .iter()
+            .map(|s| detection::with_detection(session_record(s), s))
+            .collect();
+        let n = sessions.len();
+        Ok(envelope::ok(
+            json!({ "sessions": sessions }),
+            format!("{n} session(s)"),
+        ))
+    }
+
+    /// Commands run in the session, with exit codes and output spans,
+    /// derived from OSC 133 shell-integration markers. If the session ran
+    /// a nested integrated shell, the entry for the command that launched
+    /// it can be closed early with that shell's first exit code, so a
+    /// reported exit for a command that may still be running should be
+    /// corroborated with `status` before acting on it.
+    ///
+    /// `command` is best-effort: it is reconstructed from the terminal's
+    /// echo of what was typed, so a command longer than the terminal width
+    /// is captured truncated to its tail (125 characters at 80 columns
+    /// yields 47), and non-ASCII bytes are recorded as Latin-1. A truncated
+    /// tail looks exactly like a complete shorter command, with no ellipsis
+    /// and no error, so do not read `command` as a transcript of what ran.
+    #[tool(
+        annotations(
+            title = "List commands run, with exit codes",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = schema::envelope_schema::<schema::CommandHistory>()
+    )]
+    pub async fn get_command_history(
+        &self,
+        Parameters(args): Parameters<GetCommandHistoryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = match self.registry.get(&args.session) {
+            Ok(s) => s,
+            Err(e) => return envelope::from_error(&e),
+        };
+
+        // "No marker has arrived" is the only honest test: a shell can be
+        // recognised and still emit nothing (a `sh` symlinked to dash).
+        if !session.history_active() {
+            let reason = match session.shell_integration {
+                None => "shell integration was not injected for this command",
+                Some(_) => "this shell has emitted no OSC 133 markers",
+            };
+            return Ok(envelope::envelope(
+                Status::Unavailable,
+                json!({ "reason": reason, "entries": [], "truncated_at_tail": false }),
+                "command history needs an integrated shell",
+            ));
+        }
+
+        let limit = args
+            .limit
+            .unwrap_or(50)
+            .min(crate::detect::DEFAULT_MAX_ENTRIES);
+        let entries: Vec<serde_json::Value> = session
+            .command_history(args.since_index.unwrap_or(0), limit)
+            .iter()
+            .map(|e| {
+                json!({
+                    "index": e.index,
+                    "command": e.command,
+                    "exit_code": e.exit_code,
+                    "started_at_unix_ms": e.started_at_unix_ms,
+                    "duration_ms": e.duration_ms,
+                    "output_start_cursor": e.output_start_cursor,
+                    "output_end_cursor": e.output_end_cursor,
+                })
+            })
+            .collect();
+
+        let n = entries.len();
+        Ok(envelope::ok(
+            json!({
+                "entries": entries,
+                "truncated_at_tail": session.history_truncated(),
+                "total": session.command_count(),
+            }),
+            format!("{n} command(s)"),
+        ))
+    }
+}
+
+/// The fields `status` and `list_sessions` share. Both are prompt-bearing
+/// responses (§5.4), so both pass the result through `with_detection`.
+fn session_record(session: &Session) -> serde_json::Value {
+    let state = session.state();
+    json!({
+        "id": session.id,
+        "name": session.name,
+        "command": session.command,
+        "args": session.args,
+        "state": state.as_str(),
+        "pid": session.pid(),
+        "exit_code": session.exit_code(),
+        "shell_integration": session.shell_integration.map(|s| s.as_str()),
+        "command_count": session.command_count(),
+        "started_at_unix_secs": unix_secs(session.created_at),
+        "last_activity_unix_ms": session.last_activity_ms(),
+        "buffer": {
+            "head": session.buffer_head(),
+            "tail": session.buffer_tail(),
+        },
+    })
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
@@ -618,4 +764,46 @@ pub struct TerminateArgs {
     /// Seconds to wait after SIGTERM before escalating. Defaults to 5.
     #[serde(default)]
     pub timeout_secs: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct StatusArgs {
+    /// Session id or live session name.
+    pub session: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GetCommandHistoryArgs {
+    /// Session id or live session name.
+    pub session: String,
+    /// Most recent N entries. Defaults to 50.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Only entries with `index >= since_index`.
+    #[serde(default)]
+    pub since_index: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `get_command_history`'s caveats are part of the tool contract, not
+    /// commentary: a truncated `command` looks exactly like a complete
+    /// shorter one, and a nested shell's exit code looks exactly like the
+    /// launching command's. Both are silent plausible wrongness, and the
+    /// only place the misled consumer can read the warning is the
+    /// description the router advertises.
+    #[test]
+    fn get_command_history_description_carries_its_caveats() {
+        let tool = ClaspServer::get_command_history_tool_attr();
+        let description = tool.description.as_deref().unwrap_or("");
+        for needle in ["nested integrated shell", "truncated to its tail"] {
+            assert!(
+                description.contains(needle),
+                "get_command_history's advertised description dropped \
+                 {needle:?}:\n{description}"
+            );
+        }
+    }
 }

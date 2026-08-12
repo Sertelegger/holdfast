@@ -14,6 +14,7 @@ pub enum Status {
     NameTaken,
     LimitReached,
     SpawnFailed,
+    Unavailable,
 }
 
 impl Status {
@@ -26,6 +27,7 @@ impl Status {
             Self::NameTaken => "name_taken",
             Self::LimitReached => "limit_reached",
             Self::SpawnFailed => "spawn_failed",
+            Self::Unavailable => "unavailable",
         }
     }
 
@@ -191,6 +193,19 @@ mod tests {
         // its plan.
         let r = envelope(Status::Timeout, json!({}), "deadline elapsed");
         assert_eq!(body_of(&r)["status"], "timeout");
+        assert_ne!(r.is_error, Some(true));
+    }
+
+    #[test]
+    fn unavailable_is_not_an_error() {
+        // §18.1 lists `unavailable` with isError: false. It is the answer
+        // `get_command_history` gives a session with no OSC 133 markers,
+        // and "this session has no shell integration" is an ordinary
+        // outcome the agent handles, not a failure that should halt it.
+        // Both halves are asserted: the wire spelling (nothing else pins
+        // the `as_str` arm) and the error classification.
+        let r = envelope(Status::Unavailable, json!({}), "no shell integration");
+        assert_eq!(body_of(&r)["status"], "unavailable");
         assert_ne!(r.is_error, Some(true));
     }
 
