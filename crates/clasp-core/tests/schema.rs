@@ -1123,7 +1123,17 @@ async fn get_command_history_unavailable_response_matches_its_schema() {
         pty.queue_output(b"$ ls\r\nfile\r\n$ ");
         let id = register(&server, None, "mock", &[], config, &pty);
         let session = server.registry.get(&id).expect("session");
-        until("the output to be consumed", || session.buffer_head() >= 14).await;
+        // Wait on the *detector*, not on `buffer_head()`. The reader
+        // appends to the buffer before it feeds the detector, so a byte
+        // count is satisfied while the detector — and therefore the
+        // history — has seen nothing, and "no markers have arrived" is
+        // trivially true of a stream nobody has looked at yet. Waiting for
+        // the classified last line is what makes this "these bytes were
+        // scanned and contained no markers".
+        until("the detector to consume the output", || {
+            session.detection().last_line == "$ "
+        })
+        .await;
 
         let r = server
             .get_command_history(Parameters(GetCommandHistoryArgs {

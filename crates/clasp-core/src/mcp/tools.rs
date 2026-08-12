@@ -788,6 +788,40 @@ pub struct GetCommandHistoryArgs {
 mod tests {
     use super::*;
 
+    /// The set of tools the router actually advertises.
+    ///
+    /// `tests/schema.rs` checks REQ-T-013 and REQ-T-014 — an
+    /// `outputSchema` and the §5.3 annotations on *every* tool — against a
+    /// hand-written list, because `tool_router()` is `pub(crate)` and an
+    /// integration test cannot reach it. A tool added to this `impl` and
+    /// not to that list would simply not be checked, and "every tool"
+    /// would quietly mean "the four we remembered". This is the link that
+    /// makes the enumeration complete: add a tool without listing it there
+    /// and this goes red first.
+    #[test]
+    fn the_router_advertises_exactly_the_0_0_2_tool_set() {
+        let mut names: Vec<String> = ClaspServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "get_command_history",
+                "list_sessions",
+                "read_output",
+                "send_input",
+                "start_session",
+                "status",
+                "terminate",
+            ],
+            "the advertised tool set changed; update tests/schema.rs::TOOLS \
+             and its annotation table to match"
+        );
+    }
+
     /// `get_command_history`'s caveats are part of the tool contract, not
     /// commentary: a truncated `command` looks exactly like a complete
     /// shorter one, and a nested shell's exit code looks exactly like the
