@@ -145,13 +145,32 @@ impl TailLine {
 
 /// Terminal modes observed so far, plus whether each was ever observed at
 /// all — availability, not just current value, decides which detection
-/// tier can answer (§8.4).
+/// tier can answer (§8.4). Two of the three `saw_*` flags do that;
+/// `saw_alt_screen` is the exception, and says so on the field.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Modes {
     pub bracketed_paste: bool,
     pub alt_screen: bool,
+    /// Availability of the bracketed-paste signal. Licenses the T2
+    /// executing rung, and only that rung (`detector::snapshot_at`).
     pub saw_bracketed_paste: bool,
+    /// **Not** a tier-gating signal, despite the `saw_` prefix and the
+    /// struct doc above: it is written by `apply_csi` and read by nothing
+    /// in the classifier. It is recorded for the §11.1 assertions and for
+    /// 0.0.4's Tier B, which needs to know the alternate screen was
+    /// entered in order to model the grid.
+    ///
+    /// It licenses nothing because availability is *sticky* and this
+    /// signal supports no lasting inference: that a child took the whole
+    /// screen and later gave it back says nothing about whether the shell
+    /// now holding the tty signals its prompts at all. Through rev. 27 it
+    /// gated the executing rung, and one `vim` then marked the session
+    /// `Executing` at every later live prompt for the rest of its life.
+    /// The reasoning is in full at `detector::snapshot_at`.
     pub saw_alt_screen: bool,
+    /// Availability of the OSC 133 signal. Decides `session_tier` and
+    /// gates both T1 rungs on its own, so an OSC 133 subcommand the
+    /// scanner does not model must leave it alone.
     pub saw_osc133: bool,
 }
 
@@ -1106,7 +1125,35 @@ mod tests {
     }
 
     #[test]
-    fn osc133_accepts_the_st_terminator() {
+    fn osc133_accepts_the_st_terminator_with_the_same_span_as_bel() {
+        // The offsets, not just the marker. Every other span assertion in
+        // this module uses the BEL terminator, which is what CLASP's own
+        // rc snippets emit — but §8.5 nesting and every user-installed
+        // integration (Kitty, WezTerm, starship) use ST, and ST is two
+        // bytes. `end` becomes `output_start_cursor`, so an `end` one byte
+        // short opens the span an agent reads back with a stray `\`.
+        let input = b"\x1b]133;C\x1b\\hi\r\n";
+        let (_, ev) = scan(input);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            ev[0].marker,
+            Osc133::OutputStart {
+                command: String::new()
+            }
+        );
+        assert_eq!(ev[0].start, 0);
+        assert_eq!(
+            ev[0].end, 9,
+            "the ST terminator's second byte is inside the sequence"
+        );
+        assert_eq!(
+            &input[ev[0].end as usize..],
+            b"hi\r\n",
+            "the output span an agent reads back must not open with the \
+             tail of the terminator"
+        );
+
+        // The `A` case the older, marker-only assertion covered.
         let (_, ev) = scan(b"\x1b]133;A\x1b\\");
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].marker, Osc133::PromptStart);
@@ -1181,6 +1228,23 @@ mod tests {
     }
 
     #[test]
+    fn a_backspace_erases_the_character_it_overwrote_in_the_tail_line() {
+        // `0x08` does two things — it rewinds the tail line and it rewinds
+        // the command capture — and only the capture half was asserted
+        // anywhere. Deleting `tail.backspace()` survived the whole suite.
+        //
+        // The tail line is what the §8.6 table matches against, so an
+        // un-rewound backspace leaves the editing history of the line in
+        // the string being scored. `readline` uses `\b` to erase on every
+        // correction, tab-completion redraw and history recall, so the
+        // prompt line an agent is classified against would routinely carry
+        // characters the user already removed.
+        let mut s = ModeScanner::new();
+        s.feed(b"user@host:~$ ec\x08\x08ls", 0);
+        assert_eq!(s.last_line(), "user@host:~$ ls");
+    }
+
+    #[test]
     fn carriage_return_restarts_the_tail_line() {
         let mut s = ModeScanner::new();
         s.feed(b"downloading 45%\rdownloading 90%", 0);
@@ -1196,6 +1260,16 @@ mod tests {
 
     #[test]
     fn tail_line_keeps_the_newest_bytes_when_it_overflows() {
+        // A *literal*, for the reason `SEQUENCE_MAX`'s is one: the
+        // overflow assertions below are written against the constant and
+        // so re-aim silently when it moves, which is right for them and
+        // leaves exactly this gap. §4.1's bound decides what
+        // `prompt.last_line` reports to the agent and what the whole §8.6
+        // table matches against, so shrinking it to 64 truncates a
+        // perfectly ordinary `\w@\h:\w$ ` prompt out of both — and every
+        // assertion here still passes.
+        assert_eq!(TAIL_LINE_MAX, 512, "§4.1's last-line bound");
+
         let mut s = ModeScanner::new();
         let long = vec![b'x'; TAIL_LINE_MAX + 50];
         s.feed(&long, 0);
@@ -1221,14 +1295,40 @@ mod tests {
     }
 
     #[test]
-    fn a_dcs_string_is_consumed_whole() {
-        let mut s = ModeScanner::new();
-        s.feed(b"\x1bPtmux;\x1b[?2004h\x1b\\clean$ ", 0);
-        assert!(
-            !s.modes().bracketed_paste,
-            "a mode set inside a DCS payload is data, not a mode change"
-        );
-        assert_eq!(s.last_line(), "clean$ ");
+    fn every_string_introducer_is_consumed_whole() {
+        // All four of `ESC P` / `ESC X` / `ESC ^` / `ESC _` open an
+        // ST-terminated string, and only DCS was ever exercised — so
+        // narrowing the arm to `b'P'` alone survived the whole suite.
+        //
+        // APC is the one that makes that expensive rather than academic:
+        // `ESC _ G` is Kitty's graphics protocol, which every Kitty-family
+        // terminal, `timg`, `chafa` and the Jupyter console emit. Drop the
+        // arm and an inline image's base64 lands in the tail line the §8.6
+        // table scores, and the `ESC [` sequences inside any of the four
+        // payloads become real mode changes — which is how a payload
+        // forges the availability flags §8.4 gates on.
+        for (name, introducer) in [
+            ("DCS", &b"\x1bPtmux;"[..]),
+            ("SOS", &b"\x1bX"[..]),
+            ("PM", &b"\x1b^"[..]),
+            ("APC", &b"\x1b_Ga=T,f=100;"[..]),
+        ] {
+            let mut s = ModeScanner::new();
+            let mut input = introducer.to_vec();
+            input.extend_from_slice(b"\x1b[?2004hiVBORw0KGgoAAAANSUhEUg");
+            input.extend_from_slice(b"\x1b\\clean$ ");
+            s.feed(&input, 0);
+            assert!(
+                !s.modes().bracketed_paste && !s.modes().saw_bracketed_paste,
+                "{name}: a mode set inside the payload is data, not a mode \
+                 change"
+            );
+            assert_eq!(
+                s.last_line(),
+                "clean$ ",
+                "{name}: the payload leaked into the tail line"
+            );
+        }
     }
 
     #[test]
