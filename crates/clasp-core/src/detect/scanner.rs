@@ -1114,8 +1114,39 @@ mod tests {
 
     #[test]
     fn unknown_osc133_subcommands_do_not_move_the_t1_state() {
+        // The T1 state is *two* things, and `saw_osc133` is the half that
+        // decides everything: `detector::snapshot_at` reads it alone for
+        // `session_tier` and for both T1 rungs. So the first rows here run
+        // on a fresh scanner. The row at the bottom has a real `B` in front
+        // of the unmodelled marker and so leaves the flag true in either
+        // build — which is exactly how this half came to be unasserted
+        // under a name that claims to cover it.
+        //
+        // Kitty and WezTerm shell integrations emit `133;P;k=i` and
+        // `133;L`, and an rc file can emit them with no `A`/`B`/`C`/`D`
+        // anywhere. Setting availability from one of those gives `t1 ==
+        // true` with `at_marker` never true, which falls straight to the
+        // T1 executing rung and reports `Executing` / `semantic` / 0.00 at
+        // a live prompt for the rest of the session, with nothing able to
+        // clear it — the rev.-27 `saw_alt_screen` defect in the T1
+        // dimension. Pinned end-to-end in
+        // `detector::tests::availability::an_unmodelled_osc_133_subcommand_
+        // does_not_make_the_session_semantic`.
+        for raw in [&b"\x1b]133;P;k=i\x07"[..], &b"\x1b]133;L\x07"[..]] {
+            let (s, ev) = scan(raw);
+            assert!(ev.is_empty(), "{raw:?}: an unmodelled marker was emitted");
+            assert!(
+                !s.modes().saw_osc133,
+                "{raw:?}: an unmodelled marker forged T1 availability"
+            );
+            assert_eq!(s.last_marker(), None, "{raw:?}");
+        }
+
+        // Nor does it disturb a T1 state that a modelled marker really did
+        // establish: availability stays set, `last_marker` stays on `B`.
         let (s, ev) = scan(b"\x1b]133;B\x07\x1b]133;P;k=i\x07");
         assert_eq!(ev.len(), 1, "only B is modelled");
+        assert!(s.modes().saw_osc133, "a real B must still set availability");
         assert_eq!(s.last_marker(), Some(b'B'));
     }
 

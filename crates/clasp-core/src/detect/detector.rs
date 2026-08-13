@@ -1091,6 +1091,65 @@ mod tests {
             assert_eq!(s.confidence, 0.0);
         }
 
+        /// Rows 2 and 3, in the T1 dimension: an OSC 133 subcommand the
+        /// scanner does not model must not confer T1 availability.
+        ///
+        /// `saw_osc133` alone decides `session_tier` and gates *both* T1
+        /// rungs, and like every availability flag it is sticky. Set it
+        /// from an unmodelled subcommand and `t1` is true while
+        /// `at_marker` never can be — `last_marker` stays `None` — so the
+        /// ladder falls past the T1 prompt rung to the T1 *executing* rung
+        /// and answers `Executing` / `semantic` / 0.00 at a live prompt,
+        /// with `pattern_score: 0.60` contradicting it in the same
+        /// payload, §8.4 telling the agent `semantic` is deterministic and
+        /// to wait, and nothing in the session able to clear it. That is
+        /// the rev.-27 alt-screen defect exactly, one dimension over.
+        ///
+        /// The inputs are not hypothetical: Kitty and WezTerm emit
+        /// `133;P;k=i`, and `133;L` is in circulation too, both from rc
+        /// files that may never send an `A`/`B`/`C`/`D` at all. The
+        /// scanner-level half is
+        /// `scanner::tests::unknown_osc133_subcommands_do_not_move_the_t1_state`;
+        /// this is the half that says what the agent would have been told.
+        #[test]
+        fn an_unmodelled_osc_133_subcommand_does_not_make_the_session_semantic() {
+            for raw in [&b"\x1b]133;P;k=i\x07$ "[..], &b"\x1b]133;L\x07$ "[..]] {
+                let shown = String::from_utf8_lossy(raw).into_owned();
+                let (mut d, start, now) = detector();
+                feed(&mut d, start, raw);
+                assert_history(&d, false, false, false, false);
+
+                let s = d.snapshot_at(true, Some(true), now);
+                assert_eq!(
+                    s.interaction_mode,
+                    InteractionMode::AtPrompt,
+                    "{shown:?}: a live prompt reported as a running command"
+                );
+                assert_eq!(s.detection_tier, DetectionTier::Heuristic, "{shown:?}");
+                assert!(
+                    (s.confidence - 0.60).abs() < 1e-6,
+                    "{shown:?}: {}",
+                    s.confidence
+                );
+                // The self-contradiction the forged flag would ship with,
+                // pinned for the same reason row 2 pins it.
+                assert!(
+                    (s.pattern_score - 0.60).abs() < 1e-6,
+                    "{shown:?}: {}",
+                    s.pattern_score
+                );
+
+                // And `session_tier`, which is the half that outlives the
+                // child: an unmodelled subcommand never made the session
+                // classifiable semantically.
+                assert_eq!(
+                    d.snapshot_at(false, None, now).detection_tier,
+                    DetectionTier::Heuristic,
+                    "{shown:?}: an unmodelled marker forged the session tier"
+                );
+            }
+        }
+
         /// REQ-PD-016 row 1 — nothing ever observed reports `heuristic`.
         ///
         /// The negative that separates the row above from the degenerate
