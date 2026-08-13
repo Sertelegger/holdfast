@@ -6,15 +6,19 @@
 #
 #   1. the pinned toolchain is the one running,
 #   2. the kernel will hand us a pseudoterminal,
-#   3. every shell the suite spawns by name is installed.
+#   3. every shell the suite spawns by name is installed, and the one
+#      requirement that is not a presence claim — a CPython >= 3.13, whose
+#      REPL drives bracketed paste — is met by something on PATH.
 #
-# (3) overlaps with CLASP_REQUIRE_ALL_SHELLS=1, which the test job also
-# sets and which panics from inside the suite when a gated program is
-# missing. The overlap is deliberate and neither is redundant: this probe
-# fails in ~20 seconds with a one-line diagnosis and also covers the
-# toolchain and the pty, which the variable cannot see; the variable
-# covers a `have()` guard added tomorrow that this hardcoded list has
-# never heard of.
+# (3) is what CLASP_REQUIRE_ALL_SHELLS=1 would cover from inside the suite,
+# by turning every `have()` skip into a panic. **That variable is not set**
+# — ci.yml says why, above the `test` job, and it is a measurement about
+# fish rather than an oversight. Until it can be, this probe is the
+# fail-fast half of the gate and scripts/ci-skip-census.sh is the other
+# half: this one fails in ~20 seconds with a one-line diagnosis and also
+# covers the toolchain and the pty, which the variable cannot see; the
+# census reads the suite's own skip notices and so catches a `have()`
+# guard added tomorrow that this hardcoded list has never heard of.
 #
 # Run it locally exactly as CI does:  ./scripts/ci-probe.sh
 set -uo pipefail
@@ -57,8 +61,8 @@ echo "--- shells and helpers the test suite spawns by name ---"
 #                       ubuntu-24.04 image manifest, so this one is load-bearing
 #   python3          -> both getpass()/REPL rows of §8.7, and the pty probe below
 #   jq               -> scripts/mcp-smoke.sh, a hard requirement not a soft skip
-# Add `fish` to this list in the same change that adds it to the apt line —
-# see plan Task 1 Step 4. It is deliberately absent until then.
+# `fish` is deliberately NOT in this list; see the note printed after the
+# loop, which is a measurement rather than an omission.
 for prog in bash zsh dash sh python3 less jq; do
   path="$(command -v "$prog" 2>/dev/null)"
   if [ -n "$path" ]; then
@@ -68,6 +72,69 @@ for prog in bash zsh dash sh python3 less jq; do
     bad "$prog is not installed — its tests will SKIP and still report as passing"
   fi
 done
+
+# fish is the one gated program this pipeline does not require, and the
+# shortfall is printed on every run rather than left to a comment nobody
+# opens. Measured 2026-08-13 on the ubuntu-24.04 base image, at both fish
+# versions obtainable there: 3.7.0 (noble's archive) fails the row on
+# `(exit 42)`, which is a subshell in bash and zsh and a rejected command
+# substitution in fish; 4.8.1 (the maintainers' PPA) fails it because
+# CLASP's own snippet guard declines to inject. Installing either would
+# turn a silent skip into a red row that says nothing about CI. See
+# ci.yml above the `test` job.
+if command -v fish >/dev/null 2>&1; then
+  printf '  note  %-8s %-24s %s\n' "fish" "$(command -v fish)" "$(fish --version 2>&1 | head -1)"
+  printf '  note  fish is PRESENT, so its row will RUN — and is expected to FAIL until\n'
+  printf '  note  the row and the snippet guard are fixed. That failure is a finding, not CI.\n'
+else
+  printf '  note  %-8s %s\n' "fish" "not installed — fish_integration_… will SKIP and the fish snippet stays UNVERIFIED at runtime"
+fi
+
+echo
+echo "--- a CPython >= 3.13 (PyREPL) for the §8.7 REPL row ---"
+# `Need::PyreplPython` in tests/detection.rs. The row
+# matrix_row_the_python_repl_is_at_prompt_with_no_repl_specific_config
+# needs an interpreter whose REPL drives bracketed paste with NO
+# configuration, which is a VERSION claim and not a presence one: PyREPL
+# landed in 3.13 and enables bracketed paste itself, while a pre-3.13
+# readline REPL leaves it to the readline build and to inputrc, and
+# ubuntu-24.04's own 3.12.3 emits none — measured on three runner VMs.
+# Without the paste the row reaches §8.3's echo rung instead and answers
+# `AwaitingSecret` at 0.95 for an ordinary `>>> ` prompt.
+#
+# Asked of each interpreter rather than parsed out of its file name, and
+# scanned the same way the row scans: a `python3.13` on PATH may be a
+# wrapper, a symlink to something else, or not executable at all.
+if [ -n "${PYTHON_BASIC_REPL:-}" ]; then
+  bad "PYTHON_BASIC_REPL is set in the environment — it turns PyREPL off on EVERY interpreter here, so even a 3.14 stops satisfying the row"
+fi
+names="$(
+  IFS=:
+  for dir in $PATH; do
+    for cand in "$dir"/python3 "$dir"/python3.[0-9] "$dir"/python3.[0-9][0-9]; do
+      [ -f "$cand" ] && basename "$cand"
+    done
+  done | sort -u
+)"
+best=""; best_major=0; best_minor=0
+for name in $names; do
+  read -r impl major minor <<<"$("$name" -c 'import sys; print(sys.implementation.name, sys.version_info[0], sys.version_info[1])' 2>/dev/null)"
+  if [ "${impl:-}" != "cpython" ]; then
+    printf '  scan  %-12s reported no CPython version\n' "$name"
+    continue
+  fi
+  printf '  scan  %-12s CPython %s.%s\n' "$name" "$major" "$minor"
+  if [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 13 ]; }; then
+    if [ "$major" -gt "$best_major" ] || { [ "$major" -eq "$best_major" ] && [ "$minor" -gt "$best_minor" ]; }; then
+      best="$name"; best_major="$major"; best_minor="$minor"
+    fi
+  fi
+done
+if [ -n "$best" ]; then
+  ok "$best is CPython $best_major.$best_minor — the REPL row can run"
+else
+  bad "no CPython >= 3.13 on PATH — matrix_row_the_python_repl_… will SKIP and still report as passing (CI installs one with actions/setup-python, python-version 3.13)"
+fi
 
 echo
 echo "--- pseudoterminal allocation ---"

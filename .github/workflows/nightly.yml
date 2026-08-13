@@ -13,6 +13,8 @@
 #   rust toolchain  channel "1.97" — from rust-toolchain.toml, the ONLY pin
 #   actions/checkout            v7.0.1  3d3c42e5aac5ba805825da76410c181273ba90b1
 #   Swatinem/rust-cache         v2.9.2  6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+#   actions/setup-python        v7.0.0  5fda3b95a4ea91299a34e894583c3862153e4b97
+#   python                      3.13    (minor series; see ci.yml's probe job)
 
 name: Nightly
 
@@ -54,20 +56,24 @@ jobs:
   flake-hunt:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    # CLASP_REQUIRE_ALL_SHELLS: "1" is deliberately NOT set, for the same
-    # reason and by the same rule as in ci.yml's `test` job: plan Task 1
-    # Step 4 requires that the variable, `fish` in the apt line below, and
-    # `fish` in ci-probe.sh's required list all flip in ONE change. The apt
-    # line here does not install `fish` — so setting the variable now would
-    # make this job fail on iteration 1, every night, on the fish row and
-    # the row census, and never once reach the race it exists to hunt. A
-    # nightly that is red for an unrelated reason is a nightly nobody reads.
+    # CLASP_REQUIRE_ALL_SHELLS: "1" is STILL not set, and ci.yml's `test`
+    # job carries the measurement that says why: the fish row cannot pass
+    # on either fish version obtainable on this image, so the variable
+    # would make this job fail on iteration 1, every night, on a defect
+    # that has nothing to do with the race it exists to hunt. A nightly
+    # that is red for a known reason is a nightly nobody reads.
     #
-    # WHOEVER PERFORMS THE FISH FLIP MUST FLIP IT HERE TOO — this file and
+    # WHOEVER MAKES THE FISH ROW PASS MUST FLIP IT HERE TOO — this file and
     # ci.yml both, or the coverage gate is half-applied.
     #
     # env:
     #   CLASP_REQUIRE_ALL_SHELLS: "1"
+    #
+    # ci.yml's skip census is deliberately NOT repeated here: it reads one
+    # suite log and the hunt produces twenty, and every push already runs
+    # it. What this job needs is that the same ROWS run — which is a
+    # property of the host, and ci-probe.sh below asserts it (including the
+    # CPython >= 3.13 the PyREPL row needs) before the first iteration.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,6 +82,13 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends zsh dash less python3
+      # Without this the flake hunt repeats a configuration in which the
+      # §8.7 PyREPL row never runs: ubuntu-24.04's own python3 is 3.12.3,
+      # whose readline REPL drives no bracketed paste. See ci.yml's probe
+      # job for the full reason and for why the pin is a minor series.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup show active-toolchain && rustc --version
       # save-if: false because a nightly run should read whatever cache
