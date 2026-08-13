@@ -398,6 +398,85 @@ mod tests {
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
     }
 
+    /// The §8.7 row the matrix does not carry — and the one CI found by
+    /// running the acceptance suite on a host the author's box does not
+    /// resemble.
+    ///
+    /// Every §8.7 row is a *readline* session, so every one of them has
+    /// bracketed paste on at its prompt and the echo rung is never reached
+    /// there. This is the same readline prompt with bracketed paste
+    /// **absent**: the classic readline REPL (`PYTHON_BASIC_REPL=1`, and
+    /// every CPython before 3.13), a `psql` built against a readline whose
+    /// `enable-bracketed-paste` is off, anything using `editline`. §8.3's
+    /// rung then reads `echo == Some(false) && !bracketed_paste` and
+    /// answers `AwaitingSecret` — at an ordinary REPL prompt, at the 0.95
+    /// §8.4 tells the agent to answer by calling `request_secret_input`.
+    ///
+    /// **The termios state is what separates the two, and the detector is
+    /// not handed it.** Measured on this host (`tcgetattr` on the master
+    /// fd, one sample per scenario):
+    ///
+    /// ```text
+    /// bash idle prompt                ECHO off / ICANON off
+    /// python3 -q (PyREPL, 3.13/3.14)  ECHO off / ICANON off
+    /// python3 -q PYTHON_BASIC_REPL=1  ECHO off / ICANON off
+    /// getpass()                       ECHO off / ICANON ON
+    /// bash read -s                    ECHO off / ICANON ON
+    /// bash read -s -n 1               ECHO off / ICANON off   (§14.1's false negative)
+    /// ```
+    ///
+    /// A line editor turns echo off and *leaves* canonical mode because it
+    /// is drawing the characters itself; a shell that wants a whole secret
+    /// line turns echo off and *stays* canonical. `snapshot_at` receives
+    /// `echo` alone, so both collapse onto one answer.
+    ///
+    /// **This test is written to be flipped, not deleted.** When the rung
+    /// consults `ICANON` (§14.1, REQ-PDS-001), the first row's expectation
+    /// becomes `AtPrompt` / `heuristic` / 0.9 — the T3 answer the tail
+    /// already scores, sitting inertly in `pattern_score` below — and the
+    /// second row does not move. The third row moves *with* the first, and
+    /// that is REQ-PDS-003's point rather than a regression: `read -s -n 1`
+    /// measures `off/off` while being a genuine secret prompt.
+    #[test]
+    fn matrix_echo_off_at_a_prompt_shaped_tail_with_no_bracketed_paste() {
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b">>> ");
+        let s = d.snapshot_at(true, Some(false), now);
+        assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
+        assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
+        assert_eq!(s.confidence, 0.95);
+        // The corroborating signal disagrees inside the same payload — the
+        // shape §8.3 records for the rev.-27 alt-screen defect, one rung
+        // over. It is also the value the answer becomes when the rung
+        // learns to tell the two states apart.
+        assert!((s.pattern_score - 0.9).abs() < 1e-6, "{}", s.pattern_score);
+
+        // The genuine secret prompt, on the same rung, answered
+        // identically. This is the pair: the two rows differ in `ICANON`
+        // (off vs ON, measured above) and in nothing the classifier is
+        // given, so no implementation of this signature can separate them.
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b"Password: ");
+        let secret = d.snapshot_at(true, Some(false), now);
+        assert_eq!(secret.interaction_mode, InteractionMode::AwaitingSecret);
+        assert_eq!(secret.detection_tier, DetectionTier::TerminalMode);
+        assert_eq!(secret.confidence, 0.95);
+
+        // The negative that separates both from the degenerate case: with
+        // echo *on* the same tail is a T3 answer, so the rung above is
+        // genuinely deciding these rows rather than the tail carrying them.
+        let (mut d, start, now) = detector();
+        feed(&mut d, start, b">>> ");
+        let echoing = d.snapshot_at(true, Some(true), now);
+        assert_eq!(echoing.interaction_mode, InteractionMode::AtPrompt);
+        assert_eq!(echoing.detection_tier, DetectionTier::Heuristic);
+        assert!(
+            (echoing.confidence - 0.9).abs() < 1e-6,
+            "{}",
+            echoing.confidence
+        );
+    }
+
     #[test]
     fn matrix_inside_a_tui() {
         let (mut d, start, now) = detector();
