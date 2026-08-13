@@ -657,6 +657,61 @@ async fn read_output_tail_lines_respects_max_bytes() {
         "reading from the settled head must return nothing; a cursor that \
          regressed would re-deliver already-seen bytes"
     );
+
+    // The negative that separates the cap above from the degenerate case:
+    // a tail that *fits* must not claim one. `tail_lines` was the last
+    // selector where "claims a cap that never happened" went unguarded —
+    // `capped = len > max_bytes` mutated to `>=` left the whole suite
+    // green and produced `truncated_for_size: true` beside
+    // `next_cursor: null`, the "there is more, and there is nothing more"
+    // contradiction already fixed twice on `tail_bytes` and once on the
+    // cursor branch. The other two selectors are pinned in both
+    // directions; this one only had its positive.
+    //
+    // `max_bytes` is set to exactly what the read returns, which is the
+    // only value that tells `>` and `>=` apart. It is measured with a
+    // probe rather than assumed, because the line width is the child's to
+    // choose — and it is measured *after* the child is dead and the
+    // buffer settled, so the two reads see the same bytes.
+    let probe = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: None,
+            tail_lines: Some(3),
+            tail_bytes: None,
+            max_bytes: Some(65536),
+        }))
+        .await
+        .unwrap();
+    let exact = body(&probe)["data"]["bytes_returned"]
+        .as_u64()
+        .expect("bytes_returned must be present") as usize;
+    assert!(exact > 0 && exact < 65536, "probe read {exact} bytes");
+
+    let fits = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: None,
+            tail_lines: Some(3),
+            tail_bytes: None,
+            max_bytes: Some(exact),
+        }))
+        .await
+        .unwrap();
+    let b = body(&fits);
+    assert_eq!(
+        b["data"]["bytes_returned"], exact,
+        "a tail that fits must come back whole"
+    );
+    assert_eq!(
+        b["data"]["truncated_for_size"], false,
+        "a read that dropped nothing reported a cap: {b}"
+    );
+    assert!(
+        b["data"]["next_cursor"].is_null(),
+        "`truncated_for_size` beside a null `next_cursor` tells the agent \
+         there is more and that there is nothing more: {b}"
+    );
 }
 
 // Unix-only for the same reason as `terminate_kills_the_whole_process_group`:
