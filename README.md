@@ -4,8 +4,7 @@ An MCP server that gives AI agents persistent, PTY-backed shell sessions.
 
 > **Status: milestone 0.0.2 — early development.** Seven tools, stdio
 > only, Unix only. Sessions die with the MCP process. Output is returned
-> **raw and unredacted**. Not yet suitable for real use; see the milestone
-> plan in `docs/superpowers/specs/2026-05-01-clasp-design.md` §23.
+> **raw and unredacted**. Not yet suitable for real use.
 
 ## What works today (0.0.2)
 
@@ -72,5 +71,7 @@ to it.
 
 ## Documentation
 
-- Design specification: `docs/superpowers/specs/2026-05-01-clasp-design.md`
-- Implementation plans: `docs/superpowers/plans/`
+The design specification and the per-milestone implementation plans are kept
+as the author's working documents and are not part of this repository. The
+code is meant to stand on its own: every module carries a doc comment
+explaining what it does and why, and the tests name the behaviour they pin.

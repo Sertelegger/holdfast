@@ -9,3 +9,10 @@ graphify-out/
 # covers what lands under `sdd/`; this covers the directory itself so a new
 # artifact elsewhere in it cannot become tracked by an `git add -A`.
 .superpowers/
+
+# Design specification and implementation plans. Deliberately local-only:
+# working documents rather than published artifacts, and not part of what a
+# consumer of this repository needs. Kept on the author's machine and
+# stripped from history rather than merely untracked, so they are absent from
+# the remote entirely.
+docs/
