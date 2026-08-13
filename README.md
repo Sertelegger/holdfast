@@ -71,7 +71,21 @@ to it.
 
 ## Documentation
 
+- [CHANGELOG.md](./CHANGELOG.md) — what has landed, and the known limitations
+  that are easy to mistake for bugs
+- [ROADMAP.md](./ROADMAP.md) — where this is going, as ordered scope groupings
+  rather than a schedule
+- [CONTRIBUTING.md](./CONTRIBUTING.md) — the checks, and the two testing
+  standards this project actually enforces
+- [SECURITY.md](./SECURITY.md) — what is in scope. CLASP runs commands on your
+  machine by design, so the interesting surface is the machinery around that:
+  detection, signals, and the redaction that has not shipped yet.
+
 The design specification and the per-milestone implementation plans are kept
 as the author's working documents and are not part of this repository. The
 code is meant to stand on its own: every module carries a doc comment
 explaining what it does and why, and the tests name the behaviour they pin.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).

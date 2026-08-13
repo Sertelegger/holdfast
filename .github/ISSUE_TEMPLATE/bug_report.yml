@@ -1,0 +1,118 @@
+name: Bug report
+description: A session, a tool call, or CLASP's view of what a session is doing went wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report.
+
+        Most CLASP bugs are **detection** bugs — CLASP telling the agent a
+        session is at a prompt when it is running, or awaiting a secret when it
+        is not. Those are only diagnosable with the shell, the program, and the
+        `interaction_mode`/`detection_tier` CLASP reported, so please fill in the
+        fields below even when they feel irrelevant.
+
+        Before filing, note what is **already known** and does not need a report:
+        output is returned raw and unredacted, transport is stdio only, sessions
+        die with the MCP process, and only Unix is supported. See
+        [CHANGELOG.md](https://github.com/Sertelegger/clasp/blob/main/CHANGELOG.md#known-limitations).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: tool-calls
+    attributes:
+      label: Tool calls and responses
+      description: |
+        The MCP tool calls you made and the JSON that came back — `start_session`'s
+        arguments especially, plus whatever `status` or `read_output` returned.
+
+        **Redact anything sensitive.** CLASP does not: output is returned raw, so
+        a session's bytes can contain tokens, keys, paths, and hostnames.
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: session-command
+    attributes:
+      label: Session command
+      description: The `command` and `args` you passed to `start_session`, and the program that was actually running when it went wrong.
+      placeholder: 'bash --norc, running: ssh build01'
+    validations:
+      required: true
+  - type: dropdown
+    id: interaction-mode
+    attributes:
+      label: Reported interaction_mode
+      description: What CLASP said the session was doing. Pick "not applicable" if the bug is not about detection.
+      options:
+        - AtPrompt
+        - Executing
+        - AwaitingSecret
+        - Fullscreen
+        - Exited
+        - not applicable
+    validations:
+      required: true
+  - type: dropdown
+    id: detection-tier
+    attributes:
+      label: Reported detection_tier
+      description: How CLASP said it knew. This is the single most useful field — a wrong answer at `semantic` is a different bug from a wrong answer at `heuristic`.
+      options:
+        - semantic (OSC 133)
+        - terminal_mode (bracketed paste / alt screen / termios ECHO)
+        - heuristic (quiescence x prompt patterns)
+        - not applicable
+    validations:
+      required: true
+  - type: input
+    id: expected-mode
+    attributes:
+      label: What the session was actually doing
+      description: If the reported mode was wrong, what should it have been?
+      placeholder: "Executing — the ssh was still connecting, nothing was waiting for input"
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      description: The shell in the session, its version, and whether shell integration was on. `dash`, a REPL, or a plain program is useful to know — those only ever reach the terminal_mode or heuristic tier.
+      placeholder: "zsh 5.9, shell_integration left at the default (on)"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: Distribution/version, and whether this is WSL. `uname -sr` is enough.
+      placeholder: "Ubuntu 24.04 on WSL2, Linux 6.6.87"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: CLASP version
+      description: Output of `clasp version` (note — the subcommand, not `--version`), plus the commit if you built from source.
+      placeholder: "clasp 0.0.2 (protocol 1.0), built at f942683"
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      description: What was driving CLASP — Claude Code and its version, another client, or `scripts/mcp-smoke.sh`.
+      placeholder: "Claude Code 2.1.3"
+  - type: textarea
+    id: checks
+    attributes:
+      label: Do the local checks pass?
+      description: |
+        If you built from source, the output of whichever of these you ran.
+        `./scripts/mcp-smoke.sh` is the useful one for anything on the tool
+        surface — it drives the real JSON-RPC wire.
+      render: shell

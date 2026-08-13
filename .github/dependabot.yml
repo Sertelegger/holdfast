@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # One PR per week for routine bumps instead of one PR per crate.
+      # The workspace pins its dependencies in the root Cargo.toml's
+      # [workspace.dependencies], so a single PR covers both crates.
+      minor-and-patch:
+        update-types: [minor, patch]
+  # Nothing to update until `.github/workflows/` exists; the CI setup is
+  # tracked separately. Declared now so a workflow's actions are covered
+  # from the day it lands rather than whenever someone remembers this file.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -1,0 +1,41 @@
+name: Feature request
+description: Suggest an improvement or new capability
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, check
+        [ROADMAP.md](https://github.com/Sertelegger/clasp/blob/main/ROADMAP.md) —
+        redaction, a persistent daemon, attach and a CLI, out-of-band secret
+        input, command preflight, a web UI, and Windows are all already planned
+        and ordered. If your idea is one of those, a 👍 or a comment on the
+        direction is more useful than a new issue, and saying **why you need it
+        sooner** is the most useful thing of all.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to get an agent to do that doesn't work (or is awkward) today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How would you like it to work? A new tool, an argument on an existing one, a CLI subcommand — whatever fits.
+    validations:
+      required: true
+  - type: textarea
+    id: agent-impact
+    attributes:
+      label: What would the agent see?
+      description: |
+        Optional, but it is the question that decides most of these. If this adds
+        or changes something an agent reads, say what it should say — and how the
+        agent would tell a measurement from a guess.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you're using now, or other designs you thought about.
