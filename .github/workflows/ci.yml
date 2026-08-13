@@ -133,23 +133,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # TEMPORARY, deleted after one run (plan Task 1 Step 2). It asserts
-      # nothing; it converts the image manifest into a measurement of the
-      # runner. Its answer does not change between runs of the same image.
-      - name: TEMPORARY — inventory what the image shipped, before we install anything
-        run: |
-          echo "runner: $RUNNER_OS $RUNNER_ARCH | nproc=$(nproc) | mem=$(free -m | awk '/^Mem:/{print $2}') MiB"
-          echo "disk: $(df -h / | awk 'NR==2{print $4}') free on /"
-          for p in bash sh dash zsh less fish python3 jq tmux; do
-            printf '%-8s %s\n' "$p" "$(command -v "$p" 2>/dev/null || echo 'NOT PREINSTALLED')"
-          done
-          rustc --version || echo "no rustc on PATH"
-          rustup toolchain list || echo "no rustup"
-      # Shells the test suite spawns BY NAME. `less` is NOT in the
-      # ubuntu-24.04 image manifest, and it gates the only PTY-level test of
-      # REQ-PD-011/015. `jq` IS on the image (1.7.1) and is asserted by the
-      # probe rather than installed. `fish` is added by a separate change —
-      # see plan Task 1 Step 4.
+      # Shells the test suite spawns BY NAME.
+      #
+      # MEASURED on image ubuntu24 20260720.247.2, run 31737949604, before
+      # anything was installed: zsh NOT PREINSTALLED, fish NOT PREINSTALLED;
+      # bash, sh, dash, python3 (3.12.3), jq (1.7), tmux and — contrary to
+      # the image manifest, which does not list it — less (590) all present.
+      # `less` stays in this line anyway: it gates the only PTY-level test of
+      # REQ-PD-011/015, and a program the manifest does not promise is a
+      # program that can leave without notice. `jq` is asserted by the probe
+      # rather than installed. `fish` is added by a separate change — see
+      # plan Task 1 Step 4.
       - name: Install the shells and helpers the test suite spawns by name
         run: |
           sudo apt-get update -qq
