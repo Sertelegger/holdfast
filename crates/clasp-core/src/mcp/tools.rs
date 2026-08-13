@@ -30,6 +30,16 @@ use std::time::Duration;
 /// request violates the input schema, it does not fail operationally.
 const MAX_SEND_INPUT_BYTES: usize = 64 * 1024;
 
+/// `read_output`'s `max_bytes` when the caller does not supply one, and the
+/// ceiling it is clamped to. Both are advertised to the agent in
+/// `ReadOutputArgs::max_bytes`' description, so both are pinned as literals
+/// against that description in `tests::the_advertised_byte_caps_are_the_ones_
+/// the_code_applies` — a default that drifts from its documentation is a
+/// silent short read, which looks to the agent exactly like a child that
+/// stopped talking.
+const DEFAULT_READ_MAX_BYTES: usize = 32 * 1024;
+const MAX_READ_MAX_BYTES: usize = 256 * 1024;
+
 /// How long `send_input` waits for the write to reach the child before
 /// answering `timeout`.
 ///
@@ -322,7 +332,10 @@ impl ClaspServer {
             Err(e) => return envelope::from_error(&e),
         };
 
-        let max_bytes = args.max_bytes.unwrap_or(32 * 1024).min(256 * 1024);
+        let max_bytes = args
+            .max_bytes
+            .unwrap_or(DEFAULT_READ_MAX_BYTES)
+            .min(MAX_READ_MAX_BYTES);
         // `truncated_for_size` means "this response was capped at
         // max_bytes" (§18.2). Each branch computes the half of that
         // question only it can answer — whether `max_bytes` was the
@@ -823,6 +836,63 @@ mod tests {
             ],
             "the advertised tool set changed; update tests/schema.rs::TOOLS \
              and its annotation table to match"
+        );
+    }
+
+    /// The advertised description of one tool argument, as the agent
+    /// receives it.
+    fn arg_description(schema: &serde_json::Map<String, serde_json::Value>, field: &str) -> String {
+        schema
+            .get("properties")
+            .and_then(|p| p.get(field))
+            .and_then(|f| f.get("description"))
+            .and_then(|d| d.as_str())
+            .unwrap_or_else(|| panic!("{field} has no advertised description"))
+            .to_string()
+    }
+
+    /// The three advertised byte caps, as literals, each cross-checked
+    /// against the description the agent actually reads.
+    ///
+    /// Literals for the reason `SEQUENCE_MAX`'s is one: comparing a
+    /// constant against its own definition is a tautology, and nothing
+    /// else in the workspace observed these three numbers. Dropping
+    /// `read_output`'s default from 32768 to 1024 left the whole suite
+    /// green while the schema went on promising 32768 — a silently short
+    /// read, which is indistinguishable from a child that stopped talking
+    /// for any agent sizing its reads against the documented default.
+    /// `MAX_SEND_INPUT_BYTES` is bounded from above by
+    /// `send_input_rejects_an_oversized_payload` and from below, as it
+    /// happens, by the exactly-64-KiB payload in the wedged-write test —
+    /// but that payload's size is incidental to what that test is about,
+    /// so the coupling is stated here rather than left to it.
+    ///
+    /// The second clause of each row is what keeps this from being a
+    /// second place to write the same number down. The description is
+    /// what the agent sizes its requests against, so the constant and the
+    /// text have to move together or one of them is a lie.
+    #[test]
+    fn the_advertised_byte_caps_are_the_ones_the_code_applies() {
+        assert_eq!(DEFAULT_READ_MAX_BYTES, 32768, "read_output's default cap");
+        assert_eq!(MAX_READ_MAX_BYTES, 262144, "read_output's hard limit");
+        assert_eq!(MAX_SEND_INPUT_BYTES, 65536, "send_input's payload cap");
+
+        let read_output = ClaspServer::read_output_tool_attr();
+        let max_bytes = arg_description(&read_output.input_schema, "max_bytes");
+        for needle in ["32768", "262144"] {
+            assert!(
+                max_bytes.contains(needle),
+                "read_output's advertised `max_bytes` no longer names \
+                 {needle}:\n{max_bytes}"
+            );
+        }
+
+        let send_input = ClaspServer::send_input_tool_attr();
+        let data = arg_description(&send_input.input_schema, "data");
+        assert!(
+            data.contains("65536"),
+            "send_input's advertised `data` no longer names the cap it \
+             rejects on:\n{data}"
         );
     }
 
