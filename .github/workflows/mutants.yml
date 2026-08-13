@@ -10,6 +10,8 @@
 #   actions/checkout            v7.0.1  3d3c42e5aac5ba805825da76410c181273ba90b1
 #   Swatinem/rust-cache         v2.9.2  6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 #   actions/upload-artifact     v7.0.1  043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+#   actions/setup-python        v7.0.0  5fda3b95a4ea91299a34e894583c3862153e4b97
+#   python                      3.13    (minor series; see ci.yml's probe job)
 #   cargo-mutants               27.1.0  resolved and measured by run 31747269472
 
 name: Mutants
@@ -59,6 +61,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends zsh dash less python3
+      # The same interpreter ci.yml installs, for the same reason: without
+      # it the §8.7 PyREPL row does not run, and a sweep whose baseline
+      # skips a row reports every mutant only that row could kill as
+      # MISSED. A calibration measured against a different suite than CI
+      # runs is a calibration of something else.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
       - name: Install the toolchain rust-toolchain.toml pins
         run: rustup show active-toolchain && rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
