@@ -10,6 +10,25 @@
 # run misses and twenty contended runs catch.
 #
 # Usage: ./scripts/ci-flake-hunt.sh [iterations]   (default 20)
+#
+# TO REPRODUCE A NIGHTLY FAILURE LOCALLY, CONSTRAIN THE CORES:
+#
+#   taskset -c 0,1 env TEST_THREADS=4 ./scripts/ci-flake-hunt.sh 20
+#
+# --test-threads is not the whole story, and running this script bare on a
+# workstation is much weaker than running it on the runner. Measured
+# 2026-08-13 against the read-too-early race in
+# `a_prompt_that_already_emits_osc_133_meets_the_injected_snippet`:
+#
+#   2-vCPU runner,  8 threads  -> RED on iteration 17 of 20
+#   48-core box,  192 threads  -> 5/5 GREEN
+#   48-core box under taskset -c 0,1, 8 threads -> RED on iteration 1
+#
+# What manufactures the contention is the ratio of RUNNABLE THREADS TO
+# AVAILABLE CORES, not the thread count. Much of this suite is wait-
+# dominated, so 192 nominal threads on 48 idle cores are rarely 192
+# runnable ones and everything still gets scheduled promptly. The hunt is
+# effective on the CI runner precisely because that runner is small.
 set -uo pipefail
 
 iterations="${1:-20}"
