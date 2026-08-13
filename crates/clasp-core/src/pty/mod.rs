@@ -63,6 +63,33 @@ pub trait PtyBackend: Send + Sync {
     /// Non-blocking liveness check.
     fn is_alive(&self) -> bool;
 
+    /// Whether the slave's line discipline currently has `ECHO` set, read
+    /// from the master with `tcgetattr` (spec §8.2). `None` when the
+    /// backend cannot report it — the detector then treats the `ECHO`
+    /// signal as unavailable rather than assuming a value.
+    ///
+    /// **The answer must describe the line discipline at the moment of the
+    /// call.** An implementation may cache only if the cached value cannot
+    /// outlive the state it describes, which in practice means it may not
+    /// cache at all: §8.3 combines this reading with the *current*
+    /// bracketed-paste mode, and a reading from even a few milliseconds ago
+    /// pairs a readline prompt's echo-off with a submitted command's
+    /// bracketed-paste-off — the signature of `AwaitingSecret` at 0.95, for
+    /// a command that wants no input. §4.5 previously asked for a 50 ms
+    /// cache here "per §4.1 `is_alive` policy"; that produced exactly this
+    /// reading and is withdrawn. See `InProcessPty::sample_echo` for the
+    /// measurement.
+    ///
+    /// Cheap, though: it is sampled on every prompt-bearing response. One
+    /// `tcgetattr` (524 ns measured) is within budget; anything that blocks
+    /// is not.
+    ///
+    /// Added in 0.0.2 *with a default*, so the seven methods 0.0.1
+    /// settled on are unchanged and existing implementors still compile.
+    fn echo_enabled(&self) -> Option<bool> {
+        None
+    }
+
     /// Exit code once the child has exited, else `None`.
     fn exit_code(&self) -> Option<i32>;
 

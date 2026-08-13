@@ -14,6 +14,7 @@ pub enum Status {
     NameTaken,
     LimitReached,
     SpawnFailed,
+    Unavailable,
 }
 
 impl Status {
@@ -26,6 +27,7 @@ impl Status {
             Self::NameTaken => "name_taken",
             Self::LimitReached => "limit_reached",
             Self::SpawnFailed => "spawn_failed",
+            Self::Unavailable => "unavailable",
         }
     }
 
@@ -102,6 +104,19 @@ pub fn from_error(e: &crate::ClaspError) -> Result<CallToolResult, ErrorData> {
         // deadline it actually applied. §18.1 mandates no `data` fields
         // for `timeout`, so `data: {}` is at least not a lie.
         E::WriteTimeout => Status::Timeout,
+        // A bad `prompt_patterns` regex is the caller's mistake, not
+        // the server's, so it is an input-schema violation (§5.1)
+        // rather than an envelope status.
+        //
+        // `brief` rather than `to_string`: this message is built from a
+        // string the *caller* supplied, which is the one case where the
+        // hazard `brief` documents is not hypothetical. The pattern is
+        // already clipped where the error is constructed; this is the
+        // guarantee at the boundary, so no future producer of this variant
+        // can put an unbounded string into the transcript.
+        E::InvalidPattern(_) => {
+            return Err(ErrorData::invalid_params(brief(e), None));
+        }
         E::Pty(_) | E::Io(_) => {
             return Err(ErrorData::internal_error(e.to_string(), None));
         }
@@ -182,6 +197,19 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_is_not_an_error() {
+        // §18.1 lists `unavailable` with isError: false. It is the answer
+        // `get_command_history` gives a session with no OSC 133 markers,
+        // and "this session has no shell integration" is an ordinary
+        // outcome the agent handles, not a failure that should halt it.
+        // Both halves are asserted: the wire spelling (nothing else pins
+        // the `as_str` arm) and the error classification.
+        let r = envelope(Status::Unavailable, json!({}), "no shell integration");
+        assert_eq!(body_of(&r)["status"], "unavailable");
+        assert_ne!(r.is_error, Some(true));
+    }
+
+    #[test]
     fn error_mapping_covers_the_registry_errors() {
         let cases = [
             (
@@ -210,6 +238,27 @@ mod tests {
                 "{err:?} must not be reported as a tool status"
             );
         }
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_a_bounded_invalid_params_error() {
+        // Three separate things, none of which any other test pins.
+        //
+        // It must be a *protocol* error, not an envelope status: an agent
+        // reads a status as a normal outcome and a protocol error as "I
+        // sent something malformed", and a bad regex is the latter (§5.1).
+        // It must be `invalid_params` rather than `internal_error`, which
+        // would blame the server for the caller's mistake. And it must be
+        // bounded — this message is built from a string the caller supplied,
+        // and it lands in the MCP transcript for the rest of the session.
+        let e = crate::ClaspError::InvalidPattern("x".repeat(5000));
+        let err = from_error(&e).expect_err("a caller's bad regex is a protocol error");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.chars().count() <= 201,
+            "{} chars reached the transcript",
+            err.message.chars().count()
+        );
     }
 
     #[test]

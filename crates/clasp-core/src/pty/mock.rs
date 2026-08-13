@@ -14,11 +14,27 @@ struct MockState {
     alive: bool,
     exit_code: Option<i32>,
     size: (u16, u16),
+    echo: Option<bool>,
 }
 
-#[derive(Debug)]
+/// Something to run when `echo_enabled` is sampled — see
+/// `MockPty::on_echo_sample`.
+type EchoSampleHook = Box<dyn Fn() + Send + Sync>;
+
 pub struct MockPty {
     state: Mutex<MockState>,
+    /// Run on every `echo_enabled` call, with `state` **not** held.
+    on_echo_sample: Mutex<Option<EchoSampleHook>>,
+}
+
+// Manual, because a boxed `Fn` is not `Debug`. Deliberately does not lock:
+// a `Debug` impl that blocks is a debugging hazard, and this type is a
+// test double whose interesting state is asserted through its own
+// accessors rather than through formatting.
+impl std::fmt::Debug for MockPty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MockPty").finish_non_exhaustive()
+    }
 }
 
 impl MockPty {
@@ -27,8 +43,11 @@ impl MockPty {
             state: Mutex::new(MockState {
                 alive: true,
                 size: (120, 40),
+                // A real PTY starts with ECHO on; tests that care set it.
+                echo: Some(true),
                 ..Default::default()
             }),
+            on_echo_sample: Mutex::new(None),
         }
     }
 
@@ -56,6 +75,24 @@ impl MockPty {
 
     pub fn size(&self) -> (u16, u16) {
         self.state.lock().size
+    }
+
+    /// Set what `echo_enabled` reports. `None` models a backend that
+    /// cannot sample the line discipline at all.
+    pub fn set_echo(&self, echo: Option<bool>) {
+        self.state.lock().echo = echo;
+    }
+
+    /// Run `f` at the instant `echo_enabled` is sampled.
+    ///
+    /// The one thing a caller of `detection()` cannot otherwise steer is
+    /// *what else happens between the `ECHO` sample and the classification
+    /// that consumes it* — and that interval is where §8.3's echo rung can
+    /// be handed a reading older than the terminal modes it is combined
+    /// with. This hook turns that interleaving into something a test
+    /// drives rather than races for.
+    pub fn on_echo_sample(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_echo_sample.lock() = Some(Box::new(f));
     }
 }
 
@@ -97,6 +134,20 @@ impl PtyBackend for MockPty {
 
     fn is_alive(&self) -> bool {
         self.state.lock().alive
+    }
+
+    fn echo_enabled(&self) -> Option<bool> {
+        // Before `state` is taken, and while no lock of this backend's is
+        // held: the hook exists to let output arrive mid-sample, and
+        // `queue_output` needs `state`.
+        if let Some(hook) = self.on_echo_sample.lock().as_ref() {
+            hook();
+        }
+        let s = self.state.lock();
+        if !s.alive {
+            return None;
+        }
+        s.echo
     }
 
     fn exit_code(&self) -> Option<i32> {
@@ -157,6 +208,24 @@ mod tests {
         assert!(!p.is_alive());
         assert_eq!(p.exit_code(), Some(0));
         assert_eq!(p.signals(), vec![Signal::Kill]);
+    }
+
+    #[test]
+    fn echo_is_settable_and_unreportable_once_the_child_is_gone() {
+        let p = MockPty::new();
+        assert_eq!(p.echo_enabled(), Some(true), "a fresh PTY echoes");
+        p.set_echo(Some(false));
+        assert_eq!(p.echo_enabled(), Some(false));
+        // `None` is not `Some(false)`: "echo is off" and "this backend
+        // cannot say" are different answers, and the detector treats them
+        // differently (§8.2).
+        p.set_echo(None);
+        assert_eq!(p.echo_enabled(), None);
+        // A dead child reports `None` even with echo left on, so an impl
+        // that just returned the stored field would fail here.
+        p.set_echo(Some(true));
+        p.exit(0);
+        assert_eq!(p.echo_enabled(), None);
     }
 
     #[test]

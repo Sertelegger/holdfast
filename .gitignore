@@ -1,2 +1,11 @@
 /target
 **/*.rs.bk
+
+# graphify knowledge graph (generated; rebuilt by the post-commit hook)
+graphify-out/
+
+# SDD working artifacts — ledgers, task briefs, reports, review packages.
+# `.superpowers/sdd/.gitignore` already self-ignores with `*`, but that only
+# covers what lands under `sdd/`; this covers the directory itself so a new
+# artifact elsewhere in it cannot become tracked by an `git add -A`.
+.superpowers/

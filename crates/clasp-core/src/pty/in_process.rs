@@ -109,6 +109,72 @@ impl InProcessPty {
         })
     }
 
+    /// One `tcgetattr` against the master fd. The master reports the
+    /// *slave's* line-discipline flags, which is exactly what §8.2 wants:
+    /// whether the program on the other end has turned echo off.
+    ///
+    /// **This is deliberately not cached, and that is a fix rather than an
+    /// omission.** Through 0.0.2 the sample was reused for 50 ms, on §4.5's
+    /// instruction to cache it "per §4.1 `is_alive` policy". The 50 ms was
+    /// agent-visible and wrong:
+    ///
+    /// - `ECHO` is *off* at a readline prompt (§8.2). When a command is
+    ///   submitted, readline writes `\x1b[?2004l` and restores the line
+    ///   discipline — so for up to 50 ms the classifier saw a **stale**
+    ///   echo-off beside a current bracketed-paste-off and answered §8.3's
+    ///   echo rung: `AwaitingSecret` / `terminal_mode` / **0.95**, which
+    ///   §8.4 tells the agent to answer by interrupting a human for a
+    ///   password. For `sleep 5`. Measured as a 1-in-10 flake in the
+    ///   0.0.2 acceptance matrix.
+    /// - §8.8's echo-off caveat does not cover it. That caveat is about a
+    ///   program that genuinely disabled echo; here nothing did, and the
+    ///   session was never in the state being reported.
+    ///
+    /// The caching instruction did not survive its own premise. §4.1 caches
+    /// `is_alive` because "the PromptDetector calls `is_alive()` per output
+    /// chunk"; **nothing calls `echo_enabled` per chunk** — the read path
+    /// never samples it, `Session::detection` does, once per tool call. And
+    /// `is_alive` itself is not cached in this backend while the child
+    /// lives (see below): `waitpid(WNOHANG)` runs on every call. So the
+    /// cache was the only one of its kind, and it was buying a call
+    /// frequency that does not exist.
+    ///
+    /// Measured cost of what it saved: **524 ns** per sample (200k samples,
+    /// debug build, including the master mutex) — against an MCP tool call
+    /// that serialises a JSON response.
+    ///
+    /// **What an uncached sample buys, exactly.** `Session::detection`
+    /// samples under the detector lock, so no chunk can be classified
+    /// between the sample and the classification: the value handed to
+    /// §8.3's ladder is never older than the newest byte the ladder has
+    /// seen. The residual is the child's own non-atomicity — readline
+    /// writes `\x1b[?2004l` and *then* calls `tcsetattr` — and measurement
+    /// says that window runs the safe way round: over 12 runs the restored
+    /// `ECHO` was observable 8–29 µs **before** the `\x1b[?2004l` bytes
+    /// were readable from the master, because seeing the bytes costs a
+    /// `read` wakeup and seeing the flag costs one ioctl. To read echo-off
+    /// there now, the child would have to be descheduled between its own
+    /// `fflush` and its `tcsetattr` for longer than CLASP takes to read and
+    /// classify the bytes it just wrote — and throughout such a window the
+    /// terminal genuinely *does* have echo off, which is the case §8.8
+    /// already documents.
+    #[cfg(unix)]
+    fn sample_echo(&self) -> Option<bool> {
+        let master = self.master.lock();
+        let fd = master.as_raw_fd()?;
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `fd` is the live master end, owned by `self.master` and
+        // held under the lock above for the duration of the call.
+        let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
+        drop(master);
+        if rc != 0 {
+            return None;
+        }
+        // SAFETY: tcgetattr returned 0, so the struct is initialised.
+        let termios = unsafe { termios.assume_init() };
+        Some(termios.c_lflag & libc::ECHO != 0)
+    }
+
     /// Number of `kill(2)` calls this PTY has issued since it was spawned.
     ///
     /// Zero means no signal ever left this process — which is exactly the
@@ -309,6 +375,17 @@ impl PtyBackend for InProcessPty {
         }
     }
 
+    /// Sampled on every call, with **no cache**. See `sample_echo`.
+    #[cfg(unix)]
+    fn echo_enabled(&self) -> Option<bool> {
+        // A dead child's line discipline says nothing about what the
+        // session is doing, and the fd may already be closed.
+        if !self.is_alive() {
+            return None;
+        }
+        self.sample_echo()
+    }
+
     fn exit_code(&self) -> Option<i32> {
         if let Some(c) = *self.exit.lock() {
             return Some(c);
@@ -319,5 +396,136 @@ impl PtyBackend for InProcessPty {
 
     fn pid(&self) -> Option<u32> {
         self.pid
+    }
+}
+
+/// §11.1 `pty::echo_freshness` — the `ECHO` sample must describe the line
+/// discipline the session has *now*.
+///
+/// These live beside the implementation rather than in `tests/` because
+/// the property is about the master fd, and driving it needs the fd. Every
+/// other `echo_enabled` test in the tree drives the line discipline
+/// through a *child* (`stty -echo`, readline), which means it can only
+/// observe transitions the child chooses to make, when the child gets
+/// round to making them. Setting termios from the master end makes the
+/// transition an instruction rather than an event, which is what turns the
+/// 0.0.2 flake into an assertion.
+#[cfg(all(test, unix))]
+mod echo_freshness {
+    use super::*;
+    use crate::pty::PtySpawnConfig;
+    use std::time::Instant;
+
+    /// A child that never touches the line discipline, so every change
+    /// below is one this test made.
+    fn inert() -> PtySpawnConfig {
+        let mut cfg = PtySpawnConfig::new("sleep");
+        cfg.args = vec!["300".into()];
+        cfg
+    }
+
+    /// Set `ECHO` on the slave's line discipline, from the master end.
+    ///
+    /// The master and the slave share one termios — which is the whole
+    /// reason `sample_echo` can read the slave's flags off the master — so
+    /// this is the same state change `stty -echo` makes, minus the child.
+    fn set_echo(pty: &InProcessPty, on: bool) {
+        let master = pty.master.lock();
+        let fd = master.as_raw_fd().expect("master fd");
+        let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `fd` is the live master end, held under the lock above.
+        assert_eq!(unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) }, 0);
+        // SAFETY: tcgetattr returned 0, so the struct is initialised.
+        let mut t = unsafe { t.assume_init() };
+        if on {
+            t.c_lflag |= libc::ECHO;
+        } else {
+            t.c_lflag &= !libc::ECHO;
+        }
+        // SAFETY: as above; `t` is a fully initialised termios.
+        assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) }, 0);
+    }
+
+    #[test]
+    fn echo_enabled_reports_the_line_discipline_it_has_now_not_the_one_it_had() {
+        // The 0.0.2 defect, driven rather than raced.
+        //
+        // Through 0.0.2 the sample was cached for 50 ms. Nothing in the
+        // suite could see that, because every other test polls until the
+        // answer it wants shows up — a stale answer just costs one more
+        // poll. What made it agent-visible is §8.3 combining this reading
+        // with a bracketed-paste mode read from the byte stream: a
+        // 50 ms-old echo-off from a readline prompt beside the
+        // bracketed-paste-off of the command that was just submitted is
+        // the exact signature of `AwaitingSecret`, and §8.4 answers that
+        // by interrupting a human for a password. Measured at 1-in-10 in
+        // the acceptance matrix.
+        //
+        // Asserting *both* directions on every flip is what stops this
+        // being answerable by a constant: `Some(true)` fails the first
+        // half, `Some(false)` the second.
+        let pty = InProcessPty::spawn(&inert()).expect("spawn");
+
+        let mut fastest = Duration::from_secs(3600);
+        for flip in 0..20 {
+            let started = Instant::now();
+            set_echo(&pty, false);
+            assert_eq!(
+                pty.echo_enabled(),
+                Some(false),
+                "flip {flip}: echo was just turned off"
+            );
+            set_echo(&pty, true);
+            assert_eq!(
+                pty.echo_enabled(),
+                Some(true),
+                "flip {flip}: a cached sample outlived the line discipline \
+                 it described — the session is reported as having echo off \
+                 while the terminal has it on"
+            );
+            fastest = fastest.min(started.elapsed());
+        }
+
+        // The test says something only if at least one flip pair fits
+        // inside the window the old cache held its answer for. Four
+        // `tcsetattr`-class syscalls take microseconds, so this is a
+        // check that the machine is sane rather than a timing assumption:
+        // without it, a run slow enough for every pair to straddle 50 ms
+        // would pass against the very bug it exists to catch, and pass
+        // silently.
+        assert!(
+            fastest < Duration::from_millis(50),
+            "no flip completed inside the 50 ms window the withdrawn cache \
+             reused its answer for (fastest was {fastest:?}), so this run \
+             proves nothing"
+        );
+
+        pty.signal(Signal::Kill).expect("kill");
+    }
+
+    #[test]
+    fn a_dead_childs_line_discipline_is_not_reported_from_an_earlier_sample() {
+        // The pair to the above, for the one answer that is *not* a fresh
+        // sample. `echo_enabled` short-circuits on liveness, and with the
+        // cache gone the only thing standing between a reaped child and a
+        // `tcgetattr` on its fd is that guard. Removing the guard reports
+        // `Some(_)` here.
+        let mut cfg = PtySpawnConfig::new("sleep");
+        cfg.args = vec!["300".into()];
+        let pty = InProcessPty::spawn(&cfg).expect("spawn");
+        set_echo(&pty, false);
+        assert_eq!(pty.echo_enabled(), Some(false));
+
+        pty.signal(Signal::Kill).expect("kill");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pty.is_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pty.is_alive(), "the child never died");
+        assert_eq!(
+            pty.echo_enabled(),
+            None,
+            "a dead child's line discipline says nothing about the session"
+        );
     }
 }

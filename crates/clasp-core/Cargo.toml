@@ -10,6 +10,7 @@ anyhow.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
 portable-pty.workspace = true
+regex.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true
@@ -19,5 +20,6 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+jsonschema.workspace = true
 libc.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

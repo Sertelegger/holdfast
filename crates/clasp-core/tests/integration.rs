@@ -40,6 +40,16 @@ fn wait_for_exit(pty: &dyn PtyBackend, timeout: Duration) {
     }
 }
 
+/// Whether a pid still exists, via `kill(pid, 0)`.
+///
+/// Unix-only, and every test that calls it now carries the *same*
+/// `#[cfg(unix)]` — which is the fix, not decoration. This helper was
+/// already gated while its three call sites were not, so `cargo check
+/// --all-targets --target x86_64-pc-windows-gnu` failed with four errors,
+/// and had done for some time: the cross-check run by hand throughout 0.0.1
+/// and 0.0.2, and reported in task reports as "clippy clean on
+/// x86_64-pc-windows-gnu", was lib + bin only. A gated helper with unguarded
+/// callers is what made a guard whose name is broader than its reach.
 #[cfg(unix)]
 fn pid_alive(pid: i32) -> bool {
     // kill(pid, 0) probes existence without signalling.
@@ -62,6 +72,11 @@ fn spawns_a_shell_and_reads_output() {
     pty.signal(Signal::Kill).unwrap();
 }
 
+// Unix-only: the assertion is about a *descendant* pid outliving the sweep,
+// probed with `kill(pid, 0)`. Windows job objects are 0.0.7's, and get
+// their own test rather than a contorted version of this one. Gated at the
+// test rather than at `pid_alive`, so the Linux run still carries it.
+#[cfg(unix)]
 #[test]
 fn terminate_kills_the_whole_process_group() {
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
@@ -189,10 +204,16 @@ fn signal_after_exit_is_a_no_op() {
     );
 }
 
-use clasp_core::mcp::tools::{ReadOutputArgs, SendInputArgs, StartSessionArgs, TerminateArgs};
+use clasp_core::mcp::tools::{
+    GetCommandHistoryArgs, PromptPatternArg, ReadOutputArgs, SendInputArgs, StartSessionArgs,
+    TerminateArgs,
+};
 use clasp_core::mcp::ClaspServer;
+use clasp_core::pty::MockPty;
+use clasp_core::session::{new_session_id, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
+use std::sync::Arc;
 
 fn body(r: &rmcp::model::CallToolResult) -> Value {
     r.structured_content.clone().expect("structured content")
@@ -226,8 +247,7 @@ async fn start_session_returns_a_session_id() {
             name: Some("t1".into()),
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -262,8 +282,7 @@ async fn duplicate_name_is_rejected() {
         name: Some(name.into()),
         cwd: None,
         env: None,
-        cols: None,
-        rows: None,
+        ..Default::default()
     };
     let first = server.start_session(Parameters(mk("dup"))).await.unwrap();
     assert_eq!(body(&first)["status"], "ok");
@@ -290,8 +309,7 @@ async fn start_session_rejects_a_nonexistent_cwd() {
             name: None,
             cwd: Some("/no/such/directory/anywhere".into()),
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await;
     assert!(r.is_err(), "a bad cwd must be a protocol error");
@@ -311,8 +329,7 @@ async fn start_session_reports_spawn_failed_without_leaking_the_path() {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -349,8 +366,7 @@ async fn start_session_runs_in_the_requested_cwd_and_passes_env() {
             name: None,
             cwd: Some(dir.to_string_lossy().into_owned()),
             env: Some(env),
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -411,8 +427,7 @@ async fn start_bash(server: &ClaspServer) -> String {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -436,8 +451,7 @@ async fn start_script(server: &ClaspServer, script: &str) -> String {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -572,8 +586,7 @@ async fn read_output_tail_lines_respects_max_bytes() {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -644,8 +657,67 @@ async fn read_output_tail_lines_respects_max_bytes() {
         "reading from the settled head must return nothing; a cursor that \
          regressed would re-deliver already-seen bytes"
     );
+
+    // The negative that separates the cap above from the degenerate case:
+    // a tail that *fits* must not claim one. `tail_lines` was the last
+    // selector where "claims a cap that never happened" went unguarded —
+    // `capped = len > max_bytes` mutated to `>=` left the whole suite
+    // green and produced `truncated_for_size: true` beside
+    // `next_cursor: null`, the "there is more, and there is nothing more"
+    // contradiction already fixed twice on `tail_bytes` and once on the
+    // cursor branch. The other two selectors are pinned in both
+    // directions; this one only had its positive.
+    //
+    // `max_bytes` is set to exactly what the read returns, which is the
+    // only value that tells `>` and `>=` apart. It is measured with a
+    // probe rather than assumed, because the line width is the child's to
+    // choose — and it is measured *after* the child is dead and the
+    // buffer settled, so the two reads see the same bytes.
+    let probe = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: None,
+            tail_lines: Some(3),
+            tail_bytes: None,
+            max_bytes: Some(65536),
+        }))
+        .await
+        .unwrap();
+    let exact = body(&probe)["data"]["bytes_returned"]
+        .as_u64()
+        .expect("bytes_returned must be present") as usize;
+    assert!(exact > 0 && exact < 65536, "probe read {exact} bytes");
+
+    let fits = server
+        .read_output(Parameters(ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: None,
+            tail_lines: Some(3),
+            tail_bytes: None,
+            max_bytes: Some(exact),
+        }))
+        .await
+        .unwrap();
+    let b = body(&fits);
+    assert_eq!(
+        b["data"]["bytes_returned"], exact,
+        "a tail that fits must come back whole"
+    );
+    assert_eq!(
+        b["data"]["truncated_for_size"], false,
+        "a read that dropped nothing reported a cap: {b}"
+    );
+    assert!(
+        b["data"]["next_cursor"].is_null(),
+        "`truncated_for_size` beside a null `next_cursor` tells the agent \
+         there is more and that there is nothing more: {b}"
+    );
 }
 
+// Unix-only for the same reason as `terminate_kills_the_whole_process_group`:
+// the proof that SIGKILL escalation ran is that the pid is gone, and SIGTERM
+// immunity is a Unix signal behaviour with no Windows counterpart.
+#[cfg(unix)]
 #[tokio::test]
 async fn terminate_without_force_escalates_to_sigkill_for_a_sigterm_immune_child() {
     // The normal production path: an interactive bash IGNORES SIGTERM, so
@@ -786,8 +858,7 @@ async fn terminate_without_force_delivers_sigterm_first() {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -823,8 +894,7 @@ async fn send_input_to_an_exited_session_reports_session_died() {
             name: None,
             cwd: None,
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1119,6 +1189,13 @@ async fn read_output_rejects_a_zero_max_bytes() {
     kill_all(&server).await;
 }
 
+// Unix-only: the second half resolves a *symlinked* cwd, which is what
+// separates a canonicalising implementation from one that merely joins the
+// argument onto the process cwd. `std::os::unix::fs::symlink` has no
+// portable spelling — Windows needs a privileged, directory-vs-file-typed
+// call — so the whole test is gated rather than split, which would change
+// the Linux count without adding Windows coverage of anything that runs.
+#[cfg(unix)]
 #[tokio::test]
 async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
     // §5.2: the returned `cwd` is the directory the child was actually
@@ -1133,8 +1210,7 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
             name: None,
             cwd: Some(".".into()),
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1173,8 +1249,7 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
             name: None,
             cwd: Some(link.to_string_lossy().into_owned()),
             env: None,
-            cols: None,
-            rows: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1193,4 +1268,537 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
         "the returned cwd must be the effective directory, not the symlink \
          the caller passed"
     );
+}
+
+/// Poll `echo_enabled` until it reports `want` or the deadline passes,
+/// then return whatever it last said.
+fn poll_echo(pty: &dyn PtyBackend, want: Option<bool>, timeout: Duration) -> Option<bool> {
+    let deadline = Instant::now() + timeout;
+    let mut last = pty.echo_enabled();
+    while last != want && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(60));
+        last = pty.echo_enabled();
+    }
+    last
+}
+
+#[test]
+fn echo_enabled_tracks_the_slaves_line_discipline() {
+    // Spike row 2, measured: readline turns ECHO *off* while it draws a
+    // prompt, and the line discipline is back on while a command runs.
+    // A backend returning a constant — or `None` — fails one half or the
+    // other, so both assertions are needed to pin the behaviour.
+    let pty = InProcessPty::spawn(&bash()).expect("spawn");
+
+    assert_eq!(
+        poll_echo(&pty, Some(false), Duration::from_secs(5)),
+        Some(false),
+        "ECHO should be off once readline has drawn a prompt"
+    );
+
+    pty.write(b"sleep 3\n").unwrap();
+    assert_eq!(
+        poll_echo(&pty, Some(true), Duration::from_secs(5)),
+        Some(true),
+        "ECHO should be on while a command runs"
+    );
+
+    pty.signal(Signal::Kill).unwrap();
+}
+
+#[test]
+fn echo_enabled_reports_echo_and_not_a_flag_that_moves_with_it() {
+    // The sibling above cannot tell `ECHO` from `ICANON`, and cannot tell
+    // `ECHO` from its own negation. Both were measured surviving the whole
+    // suite.
+    //
+    // The cause is that `bash`'s readline toggles ECHO and ICANON together
+    // across the whole raw-mode `c_lflag` group, so at every state that
+    // test visits the two are perfectly correlated — and a polarity flip
+    // just means `poll_echo` matches on its *first* sample instead of
+    // after the transition, which no assertion distinguishes.
+    //
+    // `stty -echo` breaks the correlation: it clears ECHO and leaves
+    // ICANON set. That is also the exact shape of a real password prompt
+    // (getpass, `read -s`), the one state §8.2 exists to detect and the one
+    // the ladder consumes as `echo == Some(false)`, so an ICANON reader
+    // would report `Some(true)` there — inverted for the consumer.
+    //
+    // Sampling a *window* rather than polling until a match is what makes
+    // this hold: a poll-until-`Some(false)` finds the transient at the
+    // readline prompt, before the command has run at all, and lets the
+    // ICANON reader through.
+    let pty = InProcessPty::spawn(&bash()).expect("spawn");
+
+    // The marker is printed *after* stty has taken effect, so reading it
+    // proves the window below starts inside the `stty -echo` region rather
+    // than in the canonical mode bash restores to run the line.
+    pty.write(b"stty -echo; echo STTY''_DONE; sleep 3\n")
+        .unwrap();
+    let out = read_until(&pty, "STTY_DONE", Duration::from_secs(5));
+    assert!(out.contains("STTY_DONE"), "stty never ran: {out:?}");
+
+    let mut samples = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline {
+        samples.push(pty.echo_enabled());
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    pty.signal(Signal::Kill).unwrap();
+
+    assert!(samples.len() >= 10, "too few samples: {}", samples.len());
+    assert!(
+        samples.iter().all(|s| *s == Some(false)),
+        "ECHO is off for this whole window and ICANON is on; a reading of \
+         Some(true) means the sample is inverted or is reading ICANON: {samples:?}"
+    );
+}
+
+#[test]
+fn echo_enabled_is_none_once_the_child_has_exited() {
+    let mut cfg = PtySpawnConfig::new("bash");
+    cfg.args = vec!["-c".into(), "exit 0".into()];
+    let pty = InProcessPty::spawn(&cfg).expect("spawn");
+    wait_for_exit(&pty, Duration::from_secs(5));
+    assert!(!pty.is_alive());
+    assert_eq!(
+        pty.echo_enabled(),
+        None,
+        "a dead child's line discipline says nothing about the session"
+    );
+}
+
+// ------------------------------------------------------------------
+// The four `start_session` arguments 0.0.2 adds. Each one is a field
+// threaded through `StartSessionArgs` -> `SessionConfig` -> the detector,
+// and none of them changes anything the compiler can check: a
+// `settle_threshold_ms` that never reaches `DetectionConfig`, or two
+// same-typed fields swapped on the way, builds and runs exactly as
+// before. So each is asserted through the tool's own response, and each
+// positive is paired with the case that separates it from "the argument
+// was parsed and dropped".
+// ------------------------------------------------------------------
+
+/// Poll `read_output` until the session's last logical line looks like a
+/// shell prompt, then return the response's `prompt` object.
+///
+/// Waiting on the *detector's* last line rather than the raw buffer: the
+/// scores are only meaningful once the detector has consumed the prompt.
+async fn prompt_block(server: &ClaspServer, id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let r = server
+            .read_output(Parameters(ReadOutputArgs {
+                session: id.into(),
+                tail_bytes: Some(4096),
+                ..Default::default()
+            }))
+            .await
+            .expect("read_output must not be a protocol error");
+        let prompt = body(&r)["data"]["prompt"].clone();
+        let line = prompt["last_line"].as_str().unwrap_or("");
+        if line.ends_with("$ ") || line.ends_with("# ") {
+            return prompt;
+        }
+        // Assert rather than return the last block seen. Returning quietly
+        // is the shape `wait_for_at_prompt` was hardened out of: every
+        // caller's assertion still fails, but it fails describing a
+        // confidence or a tier, with nothing saying the session never
+        // reached a prompt at all.
+        assert!(
+            Instant::now() < deadline,
+            "session never reached a shell prompt; last block: {prompt}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn start_session_rejects_a_bad_prompt_pattern() {
+    let server = ClaspServer::new();
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            prompt_patterns: Some(vec![PromptPatternArg {
+                regex: "(unclosed".into(),
+                score: 0.9,
+            }]),
+            ..Default::default()
+        }))
+        .await;
+
+    // A bad regex is the caller's mistake, so it takes the protocol
+    // channel (§5.1) rather than becoming an envelope status.
+    let err = r.expect_err("an uncompilable regex must be rejected");
+    assert!(
+        err.message.contains("unclosed"),
+        "the error should name the offending pattern: {err:?}"
+    );
+    // The detection config is built *before* the spawn precisely so this
+    // holds: a rejected regex leaves nothing registered to clean up.
+    assert_eq!(
+        server.registry.live_count(),
+        0,
+        "a rejected start_session registered a session anyway"
+    );
+
+    // The same path with a pattern the size of a small file. `regex` is
+    // caller-controlled, and the rejection is what carries it back into
+    // the MCP transcript, where it stays: unbounded this answered with a
+    // 200,044-byte `invalid_params` message.
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            prompt_patterns: Some(vec![PromptPatternArg {
+                regex: "(".repeat(200_000),
+                score: 0.9,
+            }]),
+            ..Default::default()
+        }))
+        .await;
+    let err = r.expect_err("an uncompilable regex must be rejected");
+    assert!(
+        err.message.chars().count() < 400,
+        "{} chars reached the transcript",
+        err.message.chars().count()
+    );
+
+    // And a set larger than the cap, which is rejected on count before
+    // anything is compiled at all.
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            prompt_patterns: Some(
+                (0..500)
+                    .map(|i| PromptPatternArg {
+                        regex: format!(r"p{i}>\s*$"),
+                        score: 0.5,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }))
+        .await;
+    r.expect_err("an unbounded pattern set must be rejected");
+    assert_eq!(server.registry.live_count(), 0);
+
+    // The separator: the same call with a *valid* pattern must succeed,
+    // or the assertion above would pass for a `start_session` that
+    // rejected everything.
+    let ok = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            prompt_patterns: Some(vec![PromptPatternArg {
+                regex: "(closed)".into(),
+                score: 0.9,
+            }]),
+            ..Default::default()
+        }))
+        .await
+        .expect("a valid pattern must be accepted");
+    assert_eq!(body(&ok)["status"], "ok");
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn start_session_honours_prompt_patterns_and_replace() {
+    // One extra pattern, `$`, which matches every line, scored 0.42.
+    // With `replace: true` the bundled table is gone and 0.42 is the only
+    // score available. With `replace: false` the bundled `\$\s*$` row
+    // (0.6) is still there and scoring takes the maximum, so the answer
+    // is 0.6. Neither number is reachable the other way, so this fails if
+    // `prompt_patterns` is dropped (0.6 twice), if `replace` is ignored
+    // (one value twice), or if the two are wired to each other's field.
+    for (replace, expected) in [(true, 0.42), (false, 0.6)] {
+        let server = ClaspServer::new();
+        let started = server
+            .start_session(Parameters(StartSessionArgs {
+                command: "bash".into(),
+                args: bash_args(),
+                prompt_patterns: Some(vec![PromptPatternArg {
+                    regex: "$".into(),
+                    score: 0.42,
+                }]),
+                prompt_patterns_replace: Some(replace),
+                ..Default::default()
+            }))
+            .await
+            .expect("start_session");
+        let id = body(&started)["data"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let prompt = prompt_block(&server, &id).await;
+        assert_eq!(
+            prompt["pattern_score"], expected,
+            "replace={replace} should score {expected}; got {prompt}"
+        );
+
+        kill_all(&server).await;
+    }
+}
+
+#[tokio::test]
+async fn start_session_honours_settle_threshold_ms() {
+    // Quiescence is `idle / threshold`, clamped. An hour-long threshold
+    // cannot saturate inside a test, and the 250 ms default cannot fail
+    // to. Asserting only the default would pass with the argument parsed
+    // and thrown away, since the default is what it would fall back to.
+    let server = ClaspServer::new();
+    let slow = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            settle_threshold_ms: Some(3_600_000),
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session");
+    let slow = body(&slow)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fast = start_bash(&server).await;
+
+    prompt_block(&server, &slow).await;
+    prompt_block(&server, &fast).await;
+    // Longer than the 250 ms default and a rounding error away from
+    // 3_600_000 ms.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let slow_q = prompt_block(&server, &slow).await["quiescent_score"].clone();
+    let fast_q = prompt_block(&server, &fast).await["quiescent_score"].clone();
+    assert_eq!(
+        fast_q, 1.0,
+        "the default 250 ms threshold must saturate after 600 ms of silence"
+    );
+    assert!(
+        slow_q.as_f64().is_some_and(|q| q < 0.05),
+        "an hour-long threshold must leave the session unsettled; got {slow_q}"
+    );
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn start_session_reports_and_can_disable_shell_integration() {
+    let server = ClaspServer::new();
+
+    let on = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session");
+    assert_eq!(
+        body(&on)["data"]["shell_integration"],
+        "bash",
+        "an interactive bash session is integrated by default (§8.5)"
+    );
+
+    let off = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            shell_integration: Some(false),
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session");
+    let data = body(&off)["data"].clone();
+    // Present and null, not absent: indexing a missing key also yields
+    // `Null`, so the key check is what makes the assertion mean anything
+    // — and `outputSchema` declares the field either way.
+    assert!(
+        data.as_object().unwrap().contains_key("shell_integration"),
+        "the field is reported on every start, null when nothing was injected"
+    );
+    assert_eq!(data["shell_integration"], Value::Null);
+
+    kill_all(&server).await;
+}
+
+// ------------------------------------------------------------------
+// 0.0.2: get_command_history's window arguments.
+//
+// `since_index` and `limit` are both numeric options handed to
+// `command_history(since_index, limit)` positionally, which is the
+// transposition hazard in its purest form: swapped, the tool still
+// compiles, still returns entries, and still answers `ok`. The schema
+// tests validate the *shape* of the response and cannot see it. So each
+// window below is chosen so that no two of them — and no transposition of
+// them — produce the same answer.
+// ------------------------------------------------------------------
+
+/// A registry-resident mock session that has already recorded `n` OSC 133
+/// commands, `cmd0`..`cmd{n-1}`, in a ring of `max_entries`.
+async fn history_session(server: &ClaspServer, n: usize, max_entries: usize) -> String {
+    let mut bytes = Vec::new();
+    for i in 0..n {
+        bytes.extend_from_slice(b"\x1b]133;B\x07cmd");
+        bytes.extend_from_slice(i.to_string().as_bytes());
+        bytes.extend_from_slice(b"\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+    }
+    let pty = Arc::new(MockPty::new());
+    pty.queue_output(&bytes);
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "mock".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn clasp_core::pty::PtyBackend>,
+        SessionConfig {
+            history_max_entries: max_entries,
+            ..SessionConfig::default()
+        },
+    );
+    let id = session.id.clone();
+    server
+        .registry
+        .insert(Arc::clone(&session))
+        .expect("registry insert");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session.command_count() < n as u64 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        session.command_count(),
+        n as u64,
+        "the reader never folded all {n} commands into the history"
+    );
+    id
+}
+
+/// `get_command_history`'s entry indices for one window.
+async fn history_indices(
+    server: &ClaspServer,
+    id: &str,
+    since_index: Option<u64>,
+    limit: Option<usize>,
+) -> (Vec<u64>, Value) {
+    let r = server
+        .get_command_history(Parameters(GetCommandHistoryArgs {
+            session: id.into(),
+            limit,
+            since_index,
+        }))
+        .await
+        .expect("get_command_history must not be a protocol error");
+    let payload = body(&r);
+    assert_eq!(payload["status"], "ok", "{payload}");
+    let indices = payload["data"]["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| e["index"].as_u64().expect("index"))
+        .collect();
+    (indices, payload)
+}
+
+#[tokio::test]
+async fn get_command_history_limit_and_since_index_select_different_windows() {
+    let server = ClaspServer::new();
+    let id = history_session(&server, 5, 100).await;
+
+    // Neither argument: every entry, and `total` agrees with the count.
+    let (all, payload) = history_indices(&server, &id, None, None).await;
+    assert_eq!(all, vec![0, 1, 2, 3, 4]);
+    assert_eq!(payload["data"]["total"], 5);
+    // Nothing was evicted from a ring of a hundred. The positive half is
+    // `get_command_history_reports_a_truncated_ring` below; a flag stuck
+    // on tells the agent every history it will ever read has holes.
+    assert_eq!(payload["data"]["truncated_at_tail"], false);
+
+    // `since_index` alone keeps the *oldest* boundary; `limit` alone keeps
+    // the *newest* entries. The two windows differ, so a tool that wired
+    // one argument to the other's slot answers one of them wrongly.
+    let (since_only, _) = history_indices(&server, &id, Some(1), None).await;
+    assert_eq!(since_only, vec![1, 2, 3, 4], "since_index was ignored");
+    let (limit_only, _) = history_indices(&server, &id, None, Some(2)).await;
+    assert_eq!(
+        limit_only,
+        vec![3, 4],
+        "limit kept the oldest, not the newest"
+    );
+
+    // Both at once, chosen so a transposition is visible: `(since=1,
+    // limit=2)` is [3, 4]; the swapped call `(since=2, limit=1)` is [4].
+    let (window, payload) = history_indices(&server, &id, Some(1), Some(2)).await;
+    assert_eq!(window, vec![3, 4], "since_index and limit are transposed");
+    // `total` is every command ever recorded, not the size of the window.
+    // Deriving it from `entries.len()` would report 2 here.
+    assert_eq!(payload["data"]["total"], 5);
+
+    // A window past the end is empty rather than an error: the agent polls
+    // `since_index: total` to ask "anything new?".
+    let (empty, payload) = history_indices(&server, &id, Some(5), None).await;
+    assert!(empty.is_empty(), "{payload}");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["total"], 5);
+}
+
+#[tokio::test]
+async fn get_command_history_reports_a_truncated_ring() {
+    // Five commands into a ring of three. Three survive, not one: at a cap
+    // of two an implementation that *cleared* the ring on overflow would
+    // land on the same answer as one that evicts a single entry, and
+    // nothing here could tell them apart.
+    let server = ClaspServer::new();
+    let id = history_session(&server, 5, 3).await;
+
+    let (indices, payload) = history_indices(&server, &id, None, None).await;
+    assert_eq!(indices, vec![2, 3, 4], "the ring dropped the wrong entries");
+    assert_eq!(payload["data"]["truncated_at_tail"], true);
+    // `total` counts evicted commands too, which is how the agent knows
+    // its `since_index` cursor skipped some.
+    assert_eq!(payload["data"]["total"], 5);
+}
+
+#[tokio::test]
+async fn get_command_history_bounds_its_response_at_the_ring_default() {
+    // `limit` is clamped to `DEFAULT_MAX_ENTRIES`, so no caller can ask
+    // for an unbounded response. That clamp is invisible with a stock
+    // session — the ring holds at most `DEFAULT_MAX_ENTRIES` anyway, so
+    // the cap is never the binding constraint — which is exactly why it
+    // has to be exercised against a ring that is deliberately larger.
+    // Delete the `.min(...)` and this returns 1002 entries.
+    let server = ClaspServer::new();
+    let n = clasp_core::detect::DEFAULT_MAX_ENTRIES + 2;
+    let id = history_session(&server, n, n).await;
+
+    // The documented default, which is only observable here for the same
+    // reason: with five commands in the ring, "50" and "no limit at all"
+    // are the same answer. `limit: 50` is what the tool's input schema
+    // promises, so an implementation that defaulted to the ring size would
+    // return 1000 entries to a caller that asked for nothing.
+    let (defaulted, _) = history_indices(&server, &id, None, None).await;
+    assert_eq!(defaulted.len(), 50, "`limit` does not default to 50");
+    assert_eq!(
+        *defaulted.last().expect("entries"),
+        n as u64 - 1,
+        "the default window kept the oldest 50 rather than the newest"
+    );
+
+    let (indices, payload) = history_indices(&server, &id, None, Some(usize::MAX)).await;
+    assert_eq!(
+        indices.len(),
+        clasp_core::detect::DEFAULT_MAX_ENTRIES,
+        "an unbounded `limit` was honoured literally"
+    );
+    // The newest are kept, so the clamp is a cap and not a truncation of
+    // the head of the window.
+    assert_eq!(*indices.last().expect("entries"), n as u64 - 1);
+    assert_eq!(payload["data"]["total"], n as u64);
+    // Nothing was evicted: the ring was sized to hold everything, so the
+    // shortfall above is the response cap and not the ring's.
+    assert_eq!(payload["data"]["truncated_at_tail"], false);
 }
