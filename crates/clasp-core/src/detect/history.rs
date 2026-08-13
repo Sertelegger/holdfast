@@ -236,6 +236,37 @@ mod tests {
         assert_eq!(span, b"hi\r\n");
     }
 
+    /// One full fish prompt-command-done cycle, byte for byte off a real
+    /// PTY (fish 3.7.0, Ubuntu 24.04), because the defect it pins was
+    /// invisible to every hand-written stream in this file.
+    ///
+    /// `get_command_history` reported `command: ""` for **every** entry of
+    /// **every** fish session while the exit code, span and duration beside
+    /// it were all correct — so the shape of the entry looked healthy and
+    /// only the one best-effort field was empty. `command` being
+    /// best-effort licenses a *truncated* or mis-decoded value, not an
+    /// absent one on a supported shell.
+    ///
+    /// The cause is in the scanner (`capture_return`): fish's editor
+    /// repaints with `\r` plus a cursor-forward and submits with one final
+    /// `\r` that nothing is written over.
+    #[test]
+    fn a_measured_fish_session_records_the_command_that_was_typed() {
+        let h = replay(
+            b"\x1b]133;A\x07root@host /# \x1b]133;B\x07\x1b[K\r\x1b[21Cecho \
+              \r\x1b[26Chello\r\x1b[31C\x1b[10Decho hello\r\x1b[31C\r\n\
+              \x1b[30m\x1b(B\x1b[m\x1b]133;C\x07hello\r\n\x1b]133;D;0\x07",
+            100,
+        );
+        let e = h.entries(0, 50);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].command, "echo hello", "fish entry lost its command");
+        // The rest of the entry, so a fix that filled `command` in by
+        // breaking the span would not read as a pass.
+        assert_eq!(e[0].exit_code, Some(0));
+        assert!(e[0].output_end_cursor.is_some());
+    }
+
     #[test]
     fn nonzero_exit_codes_are_kept() {
         let h = replay(

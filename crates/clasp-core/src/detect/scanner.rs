@@ -197,6 +197,9 @@ pub struct ModeScanner {
     seq_len: usize,
     /// Echoed command line, accumulated between OSC 133 `B` and `C`.
     capture: Option<String>,
+    /// A bare `\r` was seen inside the capture and the overwrite it
+    /// promises has not been observed yet. See `capture_return`.
+    capture_return_pending: bool,
     /// Last OSC 133 marker letter seen (`A`/`B`/`C`/`D`), for the T1 state.
     last_marker: Option<u8>,
     /// A `\r` was seen and we do not yet know whether it is the first half
@@ -224,6 +227,7 @@ impl ModeScanner {
             seq_start: 0,
             seq_len: 0,
             capture: None,
+            capture_return_pending: false,
             last_marker: None,
             pending_cr: false,
         }
@@ -457,6 +461,7 @@ impl ModeScanner {
 
     fn text(&mut self, b: u8) {
         self.tail.push(b);
+        self.resolve_capture_return();
         if let Some(cap) = self.capture.as_mut() {
             if cap.len() < COMMAND_CAPTURE_MAX {
                 cap.push(b as char);
@@ -464,11 +469,50 @@ impl ModeScanner {
         }
     }
 
-    /// The capture obeys the same overwrite rules as the tail line. It has
-    /// to: `zsh`'s line editor echoes the first keystroke, backspaces over
-    /// it, and redraws. Appending blindly captures `eecho hello` instead
-    /// of `echo hello` — measured, not hypothetical.
+    /// A bare `\r` inside the capture *promises* an overwrite; it does not
+    /// perform one. The reset is therefore armed here and applied by
+    /// `resolve_capture_return` when a byte is actually written over the
+    /// line — never before.
+    ///
+    /// **The eager form was measured wrong on fish, in both directions of
+    /// the same rule.** `zsh`'s line editor echoes the first keystroke,
+    /// backspaces over it and redraws, so a capture that ignores `\r`
+    /// entirely reports `eecho hello`; that is why the reset exists at all.
+    /// fish's editor repaints the line a word at a time as `\r` followed by
+    /// a cursor-forward — `\r\x1b[21Cecho \r\x1b[26Chello\r\x1b[31C\x1b[10D`
+    /// `echo hello` — and then, having painted the finished line, submits
+    /// with one more `\r\x1b[31C` before the `\r\n`. That last `\r` is the
+    /// only one that matters: it is followed by a CSI and then the line
+    /// ending, so *nothing is ever written over the text it discarded*.
+    /// Applied eagerly it took `echo hello` down to the `\n` that followed,
+    /// and `get_command_history` reported `command: ""` for **every** entry
+    /// of **every** fish session — exit codes, spans and durations all
+    /// correct beside it. Measured on fish 3.7.0 (Ubuntu 24.04) and 4.8.1
+    /// (upstream PPA), which repaint identically.
+    ///
+    /// Deferring costs nothing on the shells that were already right: bash
+    /// and zsh submit with `\r\r\n`, and a `\r` run ending in `\n` never
+    /// arms this at all (see `ground`). It is also not cursor arithmetic —
+    /// no column is tracked and no CSI is interpreted — so it stays inside
+    /// tier A. What it does not model is an *erase*: a `\r` followed by
+    /// `\x1b[K` and no text really did blank the line, and the capture will
+    /// keep what was there. That is the same class of best-effort the
+    /// `command` field already documents, and it fails toward reporting
+    /// text the agent typed rather than toward reporting nothing.
     fn capture_return(&mut self) {
+        if self.capture.is_some() {
+            self.capture_return_pending = true;
+        }
+    }
+
+    /// Apply an armed `\r`: the line is being written over, so everything
+    /// after the last newline goes. Called from the two places that put
+    /// bytes on the line, and deliberately *not* from `capture_newline`.
+    fn resolve_capture_return(&mut self) {
+        if !self.capture_return_pending {
+            return;
+        }
+        self.capture_return_pending = false;
         if let Some(cap) = self.capture.as_mut() {
             let keep = cap.rfind('\n').map(|i| i + 1).unwrap_or(0);
             cap.truncate(keep);
@@ -484,6 +528,12 @@ impl ModeScanner {
     }
 
     fn capture_backspace(&mut self) {
+        // Resolving first keeps a `\r` immediately followed by a backspace
+        // byte-identical to the eager rule: the truncate leaves the line
+        // empty and the `pop` then takes the newline that ended the one
+        // before it, exactly as it did when the truncate happened on the
+        // `\r` itself.
+        self.resolve_capture_return();
         if let Some(cap) = self.capture.as_mut() {
             cap.pop();
         }
@@ -611,6 +661,11 @@ impl ModeScanner {
 
     fn osc133(&mut self, rest: &str) -> Option<Osc133> {
         let kind = rest.as_bytes().first().copied()?;
+        // Every modelled marker begins or ends a capture, so none of them
+        // may inherit an armed `\r` from the span before it.
+        if matches!(kind, b'A' | b'B' | b'C' | b'D') {
+            self.capture_return_pending = false;
+        }
         let marker = match kind {
             b'A' => {
                 self.capture = None;
@@ -1044,6 +1099,98 @@ mod tests {
             Osc133::OutputStart {
                 command: "real command".into()
             }
+        );
+    }
+
+    /// The measured fish line editor, and the pair that separates the rule
+    /// it needs from the rule that would delete `\r` handling outright.
+    ///
+    /// fish repaints a word at a time as `\r` plus a cursor-forward, and
+    /// submits with one final `\r` + CSI before the `\r\n` — so the last
+    /// `\r` of the span discards the finished command line and *nothing is
+    /// written over it*. Eagerly applied, that left `get_command_history`
+    /// reporting `command: ""` for every entry of every fish session while
+    /// the exit codes beside it were correct.
+    ///
+    /// Both rows are verbatim `B`-to-`C` spans lifted out of real PTY
+    /// captures, escapes and all, not hand-written approximations.
+    #[test]
+    fn the_measured_fish_line_editor_repaint_yields_the_command_it_typed() {
+        // fish 3.7.0 (Ubuntu 24.04), `echo hello` and `sh -c 'exit 42'`.
+        for (raw, want) in [
+            (
+                &b"\x1b]133;B\x07\x1b[K\r\x1b[21Cecho \r\x1b[26Chello\r\x1b[31C\
+                   \x1b[10Decho hello\r\x1b[31C\r\n\x1b[30m\x1b(B\x1b[m\x1b]133;C\x07"[..],
+                "echo hello",
+            ),
+            (
+                &b"\x1b]133;B\x07\x1b[K\r\x1b[21Csh \r\x1b[24C-c \r\x1b[27C'exit \
+                   \r\x1b[33C42'\r\x1b[36C\x1b[15Dsh -c 'exit 42'\r\x1b[36C\r\n\
+                   \x1b[30m\x1b(B\x1b[m\x1b]133;C\x07"[..],
+                "sh -c 'exit 42'",
+            ),
+            // fish 4.8.1 (upstream PPA) with its own marking off. Same
+            // repaint, with the bracketed-paste teardown mixed in.
+            (
+                &b"\x1b]133;B\x07\x1b[K\r\x1b[21C\x1b[?2004l\x1b[?2031l\x1b[>4;0m\x1b>\
+                   false\r\x1b[26C\r\n\x1b[m\x1b]133;C\x07"[..],
+                "false",
+            ),
+        ] {
+            let (_, ev) = scan(raw);
+            assert_eq!(
+                ev[1].marker,
+                Osc133::OutputStart {
+                    command: want.into()
+                },
+                "fish repaint lost the command"
+            );
+        }
+
+        // The negative, and it is the whole reason the reset is deferred
+        // rather than deleted. Here the `\r` *is* followed by text, so the
+        // overwrite really happened and the discarded half must stay
+        // discarded — a scanner that simply stopped honouring `\r` reports
+        // "junkreal command" for this and passes every row above.
+        let (_, ev) = scan(b"\x1b]133;B\x07junk\r\x1b[3Creal command\r\x1b[13C\r\n\x1b]133;C\x07");
+        assert_eq!(
+            ev[1].marker,
+            Osc133::OutputStart {
+                command: "real command".into()
+            },
+            "a carriage return that was written over must still discard"
+        );
+    }
+
+    #[test]
+    fn a_span_ending_on_an_unwritten_carriage_return_does_not_disturb_the_next() {
+        // fish's spans end armed — the last `\r` before `C` is never
+        // written over — so the arm outlives the span that set it.
+        //
+        // **This row cannot fail against the `osc133` reset being deleted,
+        // and the name says only what it checks.** A stale arm can only
+        // ever truncate to the last newline of a buffer that `B` created
+        // empty, and every path that puts a character into that buffer
+        // resolves the arm first, so the truncate is a no-op in every
+        // reachable stream. The reset is kept as lifecycle hygiene rather
+        // than as behaviour, and this asserts the behaviour it protects
+        // instead of pretending to assert the reset.
+        let (_, ev) = scan(
+            b"\x1b]133;B\x07first\r\x1b[5C\x1b]133;C\x07\x1b]133;D;0\x07\
+              \x1b]133;A\x07$ \x1b]133;B\x07echo hello\r\n\x1b]133;C\x07",
+        );
+        assert_eq!(
+            ev[1].marker,
+            Osc133::OutputStart {
+                command: "first".into()
+            }
+        );
+        assert_eq!(
+            ev.last().unwrap().marker,
+            Osc133::OutputStart {
+                command: "echo hello".into()
+            },
+            "a carriage return armed in one span fired inside the next"
         );
     }
 
