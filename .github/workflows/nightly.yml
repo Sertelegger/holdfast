@@ -1,0 +1,90 @@
+# CLASP nightly tier.
+# Plan: docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md
+#
+# Named for the TIER, not for the flake hunt. REQ-TST-004 (tier-4
+# adversarial/property/stress) belongs here when the milestones that write
+# it land; the flake hunt is the first tenant, not the purpose.
+#
+# Same constraints as ci.yml: nothing publishes, nothing authenticates,
+# no continue-on-error, every `uses:` SHA-pinned, persist-credentials false.
+#
+# Pinned inputs:
+#   runner image    ubuntu-24.04
+#   rust toolchain  channel "1.97" — from rust-toolchain.toml, the ONLY pin
+#   actions/checkout            v7.0.1  3d3c42e5aac5ba805825da76410c181273ba90b1
+#   Swatinem/rust-cache         v2.9.2  6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+
+name: Nightly
+
+on:
+  schedule:
+    # 10:17 UTC daily.
+    #
+    # GitHub Actions cron is UTC ONLY -- there is no timezone field and no
+    # DST adjustment. This is 03:17 US/Pacific in summer and 02:17 in
+    # winter; for a nightly job that drift is irrelevant, and it is written
+    # down here so nobody "fixes" an hour that looks wrong.
+    #
+    # :17 rather than :00 on purpose: GitHub documents that scheduled runs
+    # can be delayed under load and recommends avoiding the top of the hour.
+    #
+    # A scheduled workflow only fires from the DEFAULT BRANCH. This file
+    # does nothing until it is merged there.
+    - cron: "17 10 * * *"
+  # So the job can be exercised on demand during Task 7 without waiting a
+  # day. This is NOT a substitute for the schedule -- a workflow_dispatch-
+  # only job nobody dispatches is a job that cannot fail.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Read by ci-flake-hunt.sh, which asserts its own parallelism exceeds it.
+  TEST_THREADS: "4"
+
+jobs:
+  flake-hunt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    # CLASP_REQUIRE_ALL_SHELLS: "1" is deliberately NOT set, for the same
+    # reason and by the same rule as in ci.yml's `test` job: plan Task 1
+    # Step 4 requires that the variable, `fish` in the apt line below, and
+    # `fish` in ci-probe.sh's required list all flip in ONE change. The apt
+    # line here does not install `fish` — so setting the variable now would
+    # make this job fail on iteration 1, every night, on the fish row and
+    # the row census, and never once reach the race it exists to hunt. A
+    # nightly that is red for an unrelated reason is a nightly nobody reads.
+    #
+    # WHOEVER PERFORMS THE FISH FLIP MUST FLIP IT HERE TOO — this file and
+    # ci.yml both, or the coverage gate is half-applied.
+    #
+    # env:
+    #   CLASP_REQUIRE_ALL_SHELLS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the shells and helpers the test suite spawns by name
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      # save-if: false because a nightly run should read whatever cache
+      # exists and never write over it — a scheduled job that writes the
+      # shared cache is a scheduled job that can slow every push, and cache
+      # space is a 10 GB shared budget.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: nightly
+          save-if: false
+      - run: ./scripts/ci-probe.sh
+      - run: ./scripts/ci-flake-hunt.sh 20

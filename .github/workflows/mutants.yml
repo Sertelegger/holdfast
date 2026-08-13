@@ -1,0 +1,84 @@
+# CLASP weekly mutation sweep.
+# Plan: docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md Task 6.
+#
+# clasp-core only. NEVER on the push path -- a sweep is hours, and a
+# per-push sweep is the first thing anyone disables.
+#
+# Pinned inputs:
+#   runner image    ubuntu-24.04
+#   rust toolchain  channel "1.97" — from rust-toolchain.toml, the ONLY pin
+#   actions/checkout            v7.0.1  3d3c42e5aac5ba805825da76410c181273ba90b1
+#   Swatinem/rust-cache         v2.9.2  6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+#   actions/upload-artifact     v7.0.1  043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+#   cargo-mutants              UNPINNED on the first run only — see below
+
+name: Mutants
+
+on:
+  schedule:
+    # 11:41 UTC on Saturdays. UTC only; see nightly.yml for the note.
+    - cron: "41 11 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  mutants:
+    runs-on: ubuntu-24.04
+    # 350 rather than 360: GitHub's own hard cap for a hosted job is 6
+    # hours, so a job asking for exactly 360 is a job that will be killed by
+    # the platform rather than by its own timeout, with a less legible
+    # message. Ten minutes of headroom makes the timeout ours.
+    timeout-minutes: 350
+    # CALIBRATION ONLY -- REMOVE THIS KEY OR DELETE THE FILE BY 2026-09-09.
+    #
+    # ci-hygiene.sh bans continue-on-error everywhere, and this is the one
+    # exemption. It is narrow and SELF-EXPIRING rather than a hole in the
+    # rule: hygiene skips this file only while the dated marker below is in
+    # the future. After 2026-09-09 the file is checked like every other, so
+    # a forgotten continue-on-error turns the hygiene job red without
+    # anyone having to remember. "Leave it as-is" is not on the list.
+    #
+    # CALIBRATION-EXEMPT-UNTIL: 2026-09-09
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the shells and helpers the test suite spawns by name
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: mutants
+          save-if: false
+      # Unpinned on the first run by necessity: no version of cargo-mutants
+      # is installed anywhere, so there is nothing to pin to yet. Step 5
+      # records the resolved version and pins it here -- the same discipline
+      # as an action SHA.
+      - run: cargo install --locked cargo-mutants
+      - run: cargo mutants --version
+      - run: cargo mutants --package clasp-core --no-shuffle --jobs 2 -- --locked
+      # mutants.out/ is the only durable evidence this job produced anything.
+      # `if-no-files-found: error` is what stops a sweep that produced
+      # nothing from uploading nothing and looking identical to a clean one.
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-out-${{ github.run_id }}
+          path: mutants.out/
+          retention-days: 30
+          if-no-files-found: error

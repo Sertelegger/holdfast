@@ -1,0 +1,12 @@
+# cargo-mutants configuration for the weekly sweep.
+# See docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md Task 6.
+
+# Test files are the oracle; mutating them proves nothing.
+exclude_globs = ["crates/clasp-core/tests/**"]
+
+# The suite spawns real shells and has deliberate multi-second waits, so a
+# mutant that hangs must be bounded generously rather than tightly. These
+# were calibrated for a 48-core box; the first scheduled run on a 2-vCPU
+# runner is where they get their real value (Task 6 Step 5).
+timeout_multiplier = 5.0
+minimum_test_timeout = 120.0
