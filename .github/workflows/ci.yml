@@ -1,0 +1,230 @@
+# CLASP CI — push and pull-request pipeline.
+# Plan: docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md
+#
+# Constraints this file is held to (enforced by scripts/ci-hygiene.sh):
+#   * no secrets, no publishing, no deploy — no release action, no
+#     `secrets.` reference, no cargo publish, no docker push, no git push
+#   * no `continue-on-error` and no retry action anywhere — a retried PTY
+#     test hides the race it exists to catch, and this project has shipped
+#     two such races
+#   * every `uses:` pinned to a 40-hex commit SHA, version in the comment
+#   * `persist-credentials: false` on every checkout — the default is true
+#     and writes a pushable token into .git/config
+#   * `runs-on: ubuntu-24.04`, never ubuntu-latest
+#   * explicit timeout-minutes on every job — the default is 360
+#   * every job body is a command a developer can run locally
+#
+# Pinned inputs:
+#   runner image    ubuntu-24.04
+#   rust toolchain  channel "1.97" — from rust-toolchain.toml, the ONLY pin.
+#                   Do not add RUSTUP_TOOLCHAIN and do not add a toolchain
+#                   action; either creates a second pin that can drift.
+#   cross target    x86_64-pc-windows-gnu
+#   actions/checkout            v7.0.1  3d3c42e5aac5ba805825da76410c181273ba90b1
+#   Swatinem/rust-cache         v2.9.2  6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+#   actions/upload-artifact     v7.0.1  043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Supersede an in-flight run for the same ref. Scheduled workflows live in
+# their own files and therefore their own concurrency groups, so a push can
+# never cancel a nightly flake hunt.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are useless across jobs and bloat the cache.
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Pinned rather than tracking nproc. The standard runner is 2 vCPU while
+  # this repo is private and 4 vCPU after it goes public; a fixed value
+  # means that flip does not silently change the timing profile the suite
+  # was calibrated under. See plan Task 4 Step 1.
+  TEST_THREADS: "4"
+
+jobs:
+  # --- checks that need no capability gate ---------------------------------
+  # hygiene/fmt/clippy/windows-cross deliberately do NOT `needs: probe`.
+  # None of them spawns a shell or allocates a pty, so the probe's
+  # assertions are irrelevant to them, and gating them would add minutes to
+  # the feedback a developer actually reads first. Only `test` is gated,
+  # because only `test` is the job whose green the probe makes meaningful.
+
+  hygiene:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ./scripts/ci-hygiene.sh
+
+  fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # -D warnings is what makes clippy::await_holding_lock a hard error
+      # (REQ-C-004). That lint is warn-by-default in clippy 0.1.97 —
+      # verified 2026-08-12 against a probe crate — so no extra
+      # configuration is needed and none should be added.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  windows-cross:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      - run: rustup target add x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-cross
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # --all-targets, and clippy rather than check: measured clean at
+      # 866e10c on 2026-08-12 with a forced rebuild. An earlier revision of
+      # the plan scoped this to lib+bin because four errors lived in
+      # tests/integration.rs; those are fixed, and the narrower form must
+      # not be restored without re-measuring.
+      #
+      # This proves CLASP still COMPILES for Windows. It is not evidence
+      # that it WORKS on Windows — that needs a Windows runner, which is
+      # milestone 0.0.11.
+      - run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+
+  # --- the capability gate -------------------------------------------------
+
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # TEMPORARY, deleted after one run (plan Task 1 Step 2). It asserts
+      # nothing; it converts the image manifest into a measurement of the
+      # runner. Its answer does not change between runs of the same image.
+      - name: TEMPORARY — inventory what the image shipped, before we install anything
+        run: |
+          echo "runner: $RUNNER_OS $RUNNER_ARCH | nproc=$(nproc) | mem=$(free -m | awk '/^Mem:/{print $2}') MiB"
+          echo "disk: $(df -h / | awk 'NR==2{print $4}') free on /"
+          for p in bash sh dash zsh less fish python3 jq tmux; do
+            printf '%-8s %s\n' "$p" "$(command -v "$p" 2>/dev/null || echo 'NOT PREINSTALLED')"
+          done
+          rustc --version || echo "no rustc on PATH"
+          rustup toolchain list || echo "no rustup"
+      # Shells the test suite spawns BY NAME. `less` is NOT in the
+      # ubuntu-24.04 image manifest, and it gates the only PTY-level test of
+      # REQ-PD-011/015. `jq` IS on the image (1.7.1) and is asserted by the
+      # probe rather than installed. `fish` is added by a separate change —
+      # see plan Task 1 Step 4.
+      - name: Install the shells and helpers the test suite spawns by name
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      - run: ./scripts/ci-probe.sh
+
+  # --- the suite -----------------------------------------------------------
+
+  test:
+    needs: probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    # CLASP_REQUIRE_ALL_SHELLS: "1" is deliberately NOT set yet. It makes
+    # tests/detection.rs's `have()` guard PANIC instead of skip and tightens
+    # the row census from "at most one skip" to zero, so it must land in the
+    # SAME change that adds `fish` to the apt line below — plan Task 1
+    # Step 4. Until then it would fail on fish alone, and a red pipeline
+    # would be ambiguous between "CI is broken" and "the fish snippet is".
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the shells and helpers the test suite spawns by name
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # --no-fail-fast is not optional. Measured on this project: without it
+      # a lib-test failure hides whether the integration suite catches the
+      # same defect, which is the only way to tell a narrow defect from a
+      # broad one.
+      #
+      # --show-output prints the captured stdout/stderr of *passing* tests,
+      # so a `skipping: …` notice that slips past the guards above is at
+      # least visible in the log instead of swallowed by libtest.
+      - run: cargo test --workspace --locked --no-fail-fast -- --test-threads=${{ env.TEST_THREADS }} --show-output
+
+  # --- the artifact --------------------------------------------------------
+
+  package:
+    # `needs: test` is the whole point: no artifact exists for a tree that
+    # did not pass. The build that gets installed is the build that was
+    # tested.
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --release --locked --workspace
+      # The same smoke script, against the binary that will actually be
+      # installed. `jq` is preinstalled on ubuntu-24.04 (1.7.1).
+      - run: ./scripts/mcp-smoke.sh ./target/release/clasp
+      - run: sha256sum target/release/clasp | tee clasp-linux-x86_64.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clasp-linux-x86_64-${{ github.sha }}
+          path: |
+            target/release/clasp
+            clasp-linux-x86_64.sha256
+          retention-days: 30
+          # The default is `warn`, which produces a GREEN job with a warning
+          # nobody reads when the binary is missing. That is a job that
+          # cannot fail. `error` is mandatory here.
+          if-no-files-found: error
