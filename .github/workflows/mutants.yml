@@ -10,7 +10,7 @@
 #   actions/checkout            v7.0.1  3d3c42e5aac5ba805825da76410c181273ba90b1
 #   Swatinem/rust-cache         v2.9.2  6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 #   actions/upload-artifact     v7.0.1  043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-#   cargo-mutants              UNPINNED on the first run only — see below
+#   cargo-mutants               27.1.0  resolved and measured by run 31747269472
 
 name: Mutants
 
@@ -65,12 +65,19 @@ jobs:
         with:
           key: mutants
           save-if: false
-      # Unpinned on the first run by necessity: no version of cargo-mutants
-      # is installed anywhere, so there is nothing to pin to yet. Step 5
-      # records the resolved version and pins it here -- the same discipline
-      # as an action SHA.
-      - run: cargo install --locked cargo-mutants
+      # Pinned. The first run (31747269472, 2026-08-13) resolved 27.1.0 and
+      # that is what every measurement in .cargo/mutants.toml was taken
+      # against; an unpinned tool is a second mutable pointer alongside the
+      # action SHAs. `cargo mutants --version` below is the receipt.
+      - run: cargo install --locked cargo-mutants@27.1.0
       - run: cargo mutants --version
+      # cargo-mutants reads .cargo/mutants.toml. A file named mutants.toml
+      # at the repository root -- which is what the plan's file table asked
+      # for -- is IGNORED COMPLETELY: measured 464 mutants with it, without
+      # it, and with a deliberately different exclude_globs. So assert both
+      # halves: the real config is where the tool looks, and no inert decoy
+      # has reappeared at the root for someone to edit in good faith.
+      - run: test -f .cargo/mutants.toml && test ! -e mutants.toml
       - run: cargo mutants --package clasp-core --no-shuffle --jobs 2 -- --locked
       # mutants.out/ is the only durable evidence this job produced anything.
       # `if-no-files-found: error` is what stops a sweep that produced

@@ -1,0 +1,37 @@
+# cargo-mutants configuration for the weekly sweep.
+# See docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md Task 6.
+#
+# THE PATH IS LOAD-BEARING. cargo-mutants reads `.cargo/mutants.toml`, not
+# `mutants.toml` at the repository root; the root path is what the plan's
+# file table named, and it is inert. Measured with cargo-mutants 27.1.0 on
+# 2026-08-13, `cargo mutants -p clasp-core --list`:
+#
+#   root mutants.toml, as written by the plan .................. 464 mutants
+#   root mutants.toml, exclude_globs widened to drop src/detect/ 464 mutants
+#   root mutants.toml deleted entirely ......................... 464 mutants
+#   .cargo/mutants.toml, same widened exclude_globs ............ 296 mutants
+#
+# The first three being identical is the proof: at the root the file is not
+# read at all, and an unknown key there raises nothing. At this path the
+# same keys are parsed AND type-checked -- `timeout_multiplier = "banana"`
+# fails with `invalid type: string "banana", expected f64`. mutants.yml
+# asserts this file exists and that no root-level decoy has reappeared,
+# because a setting that looks applied and is not is worse than no setting.
+
+# Test files are the oracle; mutating them proves nothing.
+#
+# HONEST NOTE: measured inert at 27.1.0 -- the mutant count is 464 with and
+# without this line, because cargo-mutants does not mutate the integration
+# test targets under tests/ in the first place. It is kept as a statement of
+# intent that survives a future version which does, not because it is doing
+# work today. `crates/clasp-core/src/pty/mock.rs` (32 mutants) is the test
+# double that IS being mutated; whether to exclude it is a calibration
+# decision for the survivor review, not a guess to make in advance.
+exclude_globs = ["crates/clasp-core/tests/**"]
+
+# The suite spawns real shells and has deliberate multi-second waits, so a
+# mutant that hangs must be bounded generously rather than tightly. These
+# were calibrated for a 48-core box; the first scheduled run on a 2-vCPU
+# runner is where they get their real value (Task 6 Step 5).
+timeout_multiplier = 5.0
+minimum_test_timeout = 120.0
