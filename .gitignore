@@ -1,6 +1,11 @@
 /target
 **/*.rs.bk
 
+# The test log scripts/ci-skip-census.sh reads. CI writes it in the `test`
+# job, and the script's own header tells a developer to write it here too,
+# so it is exactly the kind of file an `git add -A` sweeps up.
+/test-output.log
+
 # graphify knowledge graph (generated; rebuilt by the post-commit hook)
 graphify-out/
 
