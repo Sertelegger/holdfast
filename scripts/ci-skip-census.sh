@@ -134,16 +134,28 @@ fi
 # Green here means "the shortfall is exactly the one we know about", which
 # is not the same as "nothing was skipped" and must not read like it. Say
 # so on the run summary page, every run, so the exemption is visible to
-# someone who never opens the log.
-note="skip census: ${#observed[@]} tolerated skip(s), 0 unexpected — the fish row is UNVERIFIED at runtime"
+# someone who never opens the log — and say the OTHER thing on the day
+# EXPECTED is empty, rather than carrying a sentence about fish into a run
+# where fish ran.
+if [ "${#observed[@]}" -gt 0 ]; then
+  note="skip census: ${#observed[@]} tolerated skip(s), 0 unexpected — the row(s) above did NOT run"
+else
+  note="skip census: nothing skipped — every host-dependent row ran"
+fi
 echo "SKIP CENSUS OK: $note"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
     printf '### Skip census\n\n'
     printf '%s\n\n' "$note"
-    printf -- '- `%s`\n' "${observed[@]:-}"
+    # Guarded, because the state this file exists to reach is EXPECTED
+    # empty and nothing skipping, and `printf` with an empty array would
+    # still emit one empty bullet — a summary that reports a skip that
+    # does not exist.
+    [ "${#observed[@]}" -gt 0 ] && printf -- '- `%s`\n' "${observed[@]}"
   } >> "$GITHUB_STEP_SUMMARY"
 fi
+# No annotation when nothing skipped: a warning on a run with full
+# coverage trains people to ignore the warning that means something.
 if [ "${#observed[@]}" -gt 0 ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
   printf '::warning::%s\n' "$note"
 fi
