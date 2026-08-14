@@ -608,8 +608,19 @@ async fn write(server: &ClaspServer, id: &str, data: &str, newline: bool) -> Val
     b
 }
 
-/// The session's whole raw buffer, escape sequences intact (0.0.2 does no
-/// stripping on the read path).
+/// The session's whole raw buffer, escape sequences intact.
+///
+/// **`ansi: "raw"` is load-bearing here, and it is new in 0.0.3.** Until
+/// this milestone `read_output` did no stripping, so the default answered
+/// this helper's name by accident; from 0.0.3 the default is `strip` and
+/// every assertion below about OSC 133 markers, bracketed paste and the
+/// alternate screen is an assertion about bytes the default read removes.
+/// Fourteen tests in this file went red the moment stripping landed, all
+/// of them through this one helper, and every one of them was asking the
+/// right question of the wrong read.
+///
+/// Redaction stays **on**: nothing in this file emits a secret, and
+/// `redact: false` is the audited escape hatch rather than a convenience.
 async fn raw(server: &ClaspServer, id: &str) -> String {
     let r = body(
         &server
@@ -617,6 +628,7 @@ async fn raw(server: &ClaspServer, id: &str) -> String {
                 session: id.into(),
                 since_cursor: Some(0),
                 max_bytes: Some(256 * 1024),
+                ansi: Some("raw".into()),
                 ..Default::default()
             }))
             .await

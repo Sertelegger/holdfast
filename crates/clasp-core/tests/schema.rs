@@ -324,6 +324,11 @@ fn session_record_keys() -> BTreeSet<String> {
         "started_at_unix_secs",
         "last_activity_unix_ms",
         "buffer",
+        // The session's cumulative redaction tally (§9.2, REQ-O-012).
+        // Emitted by both tools through the one shared `session_record`,
+        // which is why it belongs in this shared literal rather than in
+        // `status`'s alone.
+        "redaction_stats",
     ]);
     all.extend(set(&DETECTION_FIELDS));
     all
@@ -1007,6 +1012,15 @@ async fn read_output_emits_every_field_5_4_promises() {
             "bytes_returned",
             "truncated_at_tail",
             "truncated_for_size",
+            // 0.0.3's two: the read stopped at the holdback boundary
+            // (§4.1), and what it replaced on the way out (§5.2,
+            // REQ-O-012). Both are declared on `schema::ReadOutput`, so
+            // this literal is what catches either half being skipped —
+            // an undeclared emitted field fails `assert_matches_schema`
+            // with `Additional properties are not allowed`, and a
+            // declared unemitted one fails only here.
+            "held_back",
+            "redactions",
             "next_cursor",
             "state",
             "exit_code",

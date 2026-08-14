@@ -7,6 +7,7 @@ pub mod tools;
 
 use crate::audit::AuditLog;
 use crate::output::rules::builtin_shared;
+use crate::output::{OutputProcessor, ProcessingLimits};
 use crate::session::SessionRegistry;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool_handler, ServerHandler, ServiceExt};
@@ -16,9 +17,16 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ClaspServer {
     pub registry: Arc<SessionRegistry>,
-    /// The §9.4 trail. Every string handed to it is redacted before it is
-    /// written, so no call site can leak a secret into it.
-    pub audit: Arc<AuditLog>,
+    /// Redaction, ANSI stripping, holdback, encoding — shared by every
+    /// read path so there is exactly one place secrets are removed.
+    ///
+    /// It owns the §9.4 trail as well (`processor.audit`): every string
+    /// handed to that log is redacted before it is written, so no call
+    /// site can leak a secret into it. The log lives *here*, on the one
+    /// object every read already has to reach, rather than as a second
+    /// field beside it — two handles to one log is two things that can
+    /// be initialised differently.
+    pub processor: Arc<OutputProcessor>,
 }
 
 impl ClaspServer {
@@ -49,7 +57,11 @@ impl ClaspServer {
         };
         Self {
             registry: Arc::new(SessionRegistry::with_defaults()),
-            audit,
+            processor: Arc::new(OutputProcessor::new(
+                rules,
+                audit,
+                ProcessingLimits::default(),
+            )),
         }
     }
 }
@@ -86,8 +98,9 @@ impl ServerHandler for ClaspServer {
              (terminal_mode), or guessed from output quiescence and prompt \
              patterns (heuristic). For bash, zsh and fish, CLASP injects OSC 133 \
              markers at start-up, and get_command_history then reports each \
-             command's exit code and output span. Output in this build is \
-             returned raw and unredacted."
+             command's exit code and output span. Output is ANSI-stripped \
+             and secret-redacted by default; secrets are replaced with \
+             [REDACTED:<kind>] markers."
                 .into(),
         );
         info

@@ -206,7 +206,7 @@ fn signal_after_exit_is_a_no_op() {
 
 use clasp_core::mcp::tools::{
     GetCommandHistoryArgs, PromptPatternArg, ReadOutputArgs, SendInputArgs, StartSessionArgs,
-    TerminateArgs,
+    StatusArgs, TerminateArgs,
 };
 use clasp_core::mcp::ClaspServer;
 use clasp_core::pty::MockPty;
@@ -405,6 +405,7 @@ async fn read_until_contains(
                 tail_lines: None,
                 tail_bytes: None,
                 max_bytes: None,
+                ..Default::default()
             }))
             .await
             .unwrap();
@@ -492,6 +493,7 @@ async fn read_output_returns_shell_output_and_advances_the_cursor() {
             tail_lines: None,
             tail_bytes: None,
             max_bytes: Some(8),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -516,6 +518,7 @@ async fn read_output_rejects_zero_or_multiple_selectors() {
             tail_lines: None,
             tail_bytes: None,
             max_bytes: None,
+            ..Default::default()
         }))
         .await;
     assert!(none.is_err(), "zero selectors must be a protocol error");
@@ -527,6 +530,7 @@ async fn read_output_rejects_zero_or_multiple_selectors() {
             tail_lines: Some(5),
             tail_bytes: None,
             max_bytes: None,
+            ..Default::default()
         }))
         .await;
     assert!(both.is_err(), "two selectors must be a protocol error");
@@ -540,6 +544,7 @@ async fn read_output_rejects_zero_or_multiple_selectors() {
             tail_lines: None,
             tail_bytes: None,
             max_bytes: None,
+            ..Default::default()
         }))
         .await;
     assert!(unknown.is_err(), "schema violation must win over lookup");
@@ -561,6 +566,7 @@ async fn read_output_on_unknown_session_is_an_error_envelope() {
             tail_lines: None,
             tail_bytes: None,
             max_bytes: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -610,6 +616,7 @@ async fn read_output_tail_lines_respects_max_bytes() {
             tail_lines: Some(1_000_000),
             tail_bytes: None,
             max_bytes: Some(1024),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -648,6 +655,7 @@ async fn read_output_tail_lines_respects_max_bytes() {
             tail_lines: None,
             tail_bytes: None,
             max_bytes: Some(4096),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -680,6 +688,7 @@ async fn read_output_tail_lines_respects_max_bytes() {
             tail_lines: Some(3),
             tail_bytes: None,
             max_bytes: Some(65536),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -695,6 +704,7 @@ async fn read_output_tail_lines_respects_max_bytes() {
             tail_lines: Some(3),
             tail_bytes: None,
             max_bytes: Some(exact),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -814,6 +824,7 @@ async fn terminate_is_idempotent_and_preserves_the_output() {
             tail_lines: None,
             tail_bytes: None,
             max_bytes: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1116,6 +1127,7 @@ async fn read_output_does_not_claim_a_cap_that_returned_everything() {
             tail_lines: None,
             tail_bytes: None,
             max_bytes: Some(head as usize),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1139,6 +1151,7 @@ async fn read_output_does_not_claim_a_cap_that_returned_everything() {
             tail_lines: None,
             tail_bytes: None,
             max_bytes: Some(head as usize - 1),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1168,6 +1181,7 @@ async fn read_output_rejects_a_zero_max_bytes() {
             tail_lines: None,
             tail_bytes: None,
             max_bytes: Some(0),
+            ..Default::default()
         }))
         .await;
     assert!(zero.is_err(), "max_bytes: 0 must be a protocol error");
@@ -1181,6 +1195,7 @@ async fn read_output_rejects_a_zero_max_bytes() {
             tail_lines: None,
             tail_bytes: None,
             max_bytes: Some(1),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -2135,6 +2150,580 @@ async fn session_start_records_the_field_set_9_4_names() {
         entries[0]["pid"],
         json!(server.registry.get(&id).unwrap().pid()),
         "the entry names the child that was actually spawned"
+    );
+
+    kill_all(&server).await;
+}
+
+// --------------------------------------------------------------- 0.0.3
+// Output processing against a real PTY: redaction, ANSI stripping, and
+// the text_encoding matrix.
+
+// These four `use` lines are the WHOLE import addition. `new_session_id`,
+// `Session`, `SessionConfig`, `Arc`, `InProcessPty`, `PtyBackend`,
+// `Signal`, `Duration`, `Instant`, `bash()` and `body()` are all already
+// in scope at the top of this file (0.0.1 and 0.0.2 imported them);
+// re-importing any of them is `error[E0252]`.
+use clasp_core::audit::AuditLog;
+use clasp_core::output::rules::RuleSet;
+use clasp_core::output::{
+    ansi::AnsiMode, encoding::TextEncoding, OutputProcessor, ProcessedRead, ProcessingLimits,
+    ReadOptions, ReadRequest, ReadStart,
+};
+
+/// A 40-character GitHub token, assembled at runtime. It is never typed
+/// into the shell as one string, so the PTY's echo of the command line
+/// cannot satisfy any assertion below — only the child's own output can.
+const TOKEN_TAIL: &str = "0123456789abcdefghijABCDEFGHIJ012345";
+
+fn shell_session() -> Arc<Session> {
+    let pty = InProcessPty::spawn(&bash()).expect("spawn bash");
+    Session::new(
+        new_session_id(),
+        None,
+        "bash".into(),
+        vec![],
+        Arc::new(pty) as Arc<dyn PtyBackend>,
+        SessionConfig::with_buffer_capacity(1024 * 1024),
+    )
+}
+
+/// Poll the processed read path until `needle` shows up.
+///
+/// `needle` must be something the echoed command line cannot contain.
+fn read_until_processed(
+    session: &Session,
+    processor: &OutputProcessor,
+    needle: &str,
+    timeout: Duration,
+) -> ProcessedRead {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let read = session.read_processed(&ReadRequest::since(0, 64 * 1024), processor);
+        if read.output.contains(needle) {
+            return read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never saw {needle:?} in the processed output; got: {:?}",
+            read.output
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn a_secret_a_real_shell_printed_is_redacted_in_place() {
+    let session = shell_session();
+    let processor = OutputProcessor::builtin().unwrap();
+    // The `''` splits the marker so the echo reads `CLASP''_TOKEN=`, and
+    // the two printf arguments keep `ghp_` and its 36 characters apart on
+    // the command line. Only executing this can produce either needle.
+    session
+        .write_input(format!("printf 'CLASP''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
+        .unwrap();
+
+    let read = read_until_processed(
+        &session,
+        &processor,
+        "CLASP_TOKEN=",
+        Duration::from_secs(10),
+    );
+
+    let full_token = format!("ghp_{TOKEN_TAIL}");
+    assert!(
+        !read.output.contains(&full_token),
+        "the token reached the agent: {:?}",
+        read.output
+    );
+    // The absence check above would also pass against a read that
+    // returned nothing, so require the redacted line itself.
+    assert!(
+        read.output.contains("CLASP_TOKEN=[REDACTED:github]"),
+        "expected the line to survive with a marker; got: {:?}",
+        read.output
+    );
+    assert_eq!(read.redactions.get("github"), Some(&1));
+    assert!(!read.held_back, "the token completed before the newline");
+
+    let _ = session.signal(Signal::Kill);
+}
+
+#[test]
+fn ansi_from_a_real_shell_is_stripped_but_the_text_survives() {
+    let session = shell_session();
+    let processor = OutputProcessor::builtin().unwrap();
+    session
+        .write_input(b"printf '\\033[32mCLASP''_GREEN\\033[0m\\n'\n")
+        .unwrap();
+
+    let read = read_until_processed(&session, &processor, "CLASP_GREEN", Duration::from_secs(10));
+    assert!(
+        !read.output.contains('\u{1b}'),
+        "an escape byte reached the agent: {:?}",
+        read.output
+    );
+    // `CLASP_GREEN` is only producible by running the command — the echo
+    // shows `CLASP''_GREEN` — so this pair means stripping ran over real
+    // escape bytes rather than over an empty buffer.
+    assert!(read.output.contains("CLASP_GREEN"));
+
+    let _ = session.signal(Signal::Kill);
+}
+
+#[test]
+fn base64_without_redaction_returns_the_exact_pty_bytes() {
+    use base64::Engine as _;
+
+    let session = shell_session();
+    let processor = OutputProcessor::builtin().unwrap();
+    session
+        .write_input(b"printf '\\033[32mCLASP''_GREEN\\033[0m\\n'\n")
+        .unwrap();
+    read_until_processed(&session, &processor, "CLASP_GREEN", Duration::from_secs(10));
+
+    let read = session.read_processed(
+        &ReadRequest {
+            start: ReadStart::Cursor(0),
+            max_bytes: 64 * 1024,
+            options: ReadOptions {
+                ansi: AnsiMode::Raw,
+                text_encoding: TextEncoding::Base64,
+                redact: false,
+            },
+            tool: "read_output",
+            client_kind: "in_process",
+        },
+        &processor,
+    );
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(read.output.as_bytes())
+        .expect("valid base64");
+    assert_eq!(
+        decoded.len(),
+        read.bytes_returned,
+        "base64 of raw bytes decodes back to exactly the bytes counted"
+    );
+    assert!(
+        decoded.contains(&0x1b),
+        "raw mode must preserve the escape bytes the shell emitted"
+    );
+    assert!(
+        String::from_utf8_lossy(&decoded).contains("CLASP_GREEN"),
+        "and the text the child printed"
+    );
+
+    let _ = session.signal(Signal::Kill);
+}
+
+#[test]
+fn a_raw_read_of_a_real_session_is_recorded_in_the_audit_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = Arc::new(RuleSet::builtin().unwrap());
+    let audit =
+        Arc::new(AuditLog::to_path(dir.path().join("audit.log"), Arc::clone(&rules)).unwrap());
+    let processor = OutputProcessor::new(rules, Arc::clone(&audit), ProcessingLimits::default());
+
+    let session = shell_session();
+    session
+        .write_input(format!("printf 'CLASP''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
+        .unwrap();
+    read_until_processed(
+        &session,
+        &processor,
+        "CLASP_TOKEN=",
+        Duration::from_secs(10),
+    );
+
+    let raw = session.read_processed(
+        &ReadRequest {
+            start: ReadStart::Cursor(0),
+            max_bytes: 64 * 1024,
+            options: ReadOptions {
+                redact: false,
+                ..Default::default()
+            },
+            tool: "read_output",
+            client_kind: "in_process",
+        },
+        &processor,
+    );
+    let full_token = format!("ghp_{TOKEN_TAIL}");
+    assert!(
+        raw.output.contains(&full_token),
+        "the escape hatch must actually return the secret"
+    );
+
+    let log = std::fs::read_to_string(audit.path().unwrap()).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    assert_eq!(entry["kind"], "redaction_disabled");
+    assert_eq!(entry["tool"], "read_output");
+    // No control connection exists in this milestone, so the caller
+    // really is in-process. 0.0.5 derives this from the handshake and
+    // the same read through the shim records `shim` (§9.4's spelling,
+    // verbatim from the handshake).
+    assert_eq!(entry["client_kind"], "in_process");
+    assert_eq!(entry["session_id"], session.id.as_str());
+    assert!(
+        !log.contains(&full_token),
+        "the audit log must not carry the secret it is recording the disclosure of"
+    );
+
+    let _ = session.signal(Signal::Kill);
+}
+
+// The same guarantees through the MCP tool surface.
+
+fn read_args(session: &str) -> ReadOutputArgs {
+    // Deliberately exhaustive. It names every field, so adding
+    // `..Default::default()` here is `clippy::needless_update` and fails
+    // `-D warnings`. Step 4b's repair does not apply to this literal.
+    ReadOutputArgs {
+        session: session.to_string(),
+        since_cursor: Some(0),
+        tail_lines: None,
+        tail_bytes: None,
+        max_bytes: None,
+        ansi: None,
+        text_encoding: None,
+        redact: None,
+    }
+}
+
+async fn started_session(server: &ClaspServer) -> String {
+    // `..Default::default()`, not an exhaustive literal. 0.0.2 gave
+    // `StartSessionArgs` four more fields and derived `Default` for
+    // exactly this reason; 0.0.4 adds `screen_tracking` and 0.0.8 adds
+    // more. Naming every field here is `error[E0063]: missing fields`
+    // today and a re-break every milestone after.
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: vec!["--norc".into(), "--noprofile".into()],
+            // Explicitly OFF, and not a style choice. `start_session`
+            // defaults `shell_integration` to true and injects the OSC 133
+            // snippet, so every prompt writes `\x1b]133;…` into the
+            // buffer. A read that lands while one of those escapes is
+            // half-arrived and bash is still alive is held back by
+            // REQ-O-008 — correctly — and `assert_eq!(data["held_back"],
+            // false)` below then fails at random. The needle these tests
+            // poll for is satisfied by the command's own output, so the
+            // loop can break on exactly that read. Nothing here is
+            // testing shell integration.
+            shell_integration: Some(false),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    body(&r)["data"]["session_id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn read_output_redacts_by_default_and_reports_the_new_flags() {
+    let server = ClaspServer::new();
+    let id = started_session(&server).await;
+    let session = server.registry.get(&id).unwrap();
+    session
+        .write_input(format!("printf 'CLASP''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let full_token = format!("ghp_{TOKEN_TAIL}");
+    loop {
+        let r = server
+            .read_output(Parameters(read_args(&id)))
+            .await
+            .unwrap();
+        let data = body(&r)["data"].clone();
+        let out = data["output"].as_str().unwrap().to_string();
+        if out.contains("CLASP_TOKEN=") {
+            assert!(
+                !out.contains(&full_token),
+                "the tool leaked the token: {out}"
+            );
+            assert!(
+                out.contains("CLASP_TOKEN=[REDACTED:github]"),
+                "expected the surrounding line intact: {out}"
+            );
+            assert_eq!(data["held_back"], false);
+            assert_eq!(data["truncated_at_tail"], false);
+            assert_eq!(data["redactions"]["github"], 1);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never saw the printed line: {out}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let _ = session.signal(Signal::Kill);
+}
+
+/// `status.redaction_stats` as the agent sees it.
+async fn redaction_stats(server: &ClaspServer, id: &str) -> Value {
+    let r = server
+        .status(Parameters(StatusArgs {
+            session: id.to_string(),
+        }))
+        .await
+        .expect("status must not be a protocol error");
+    body(&r)["data"]["redaction_stats"].clone()
+}
+
+/// REQ-O-012, at the two surfaces an agent actually sees.
+///
+/// **The point of this test is that it must FAIL against an
+/// implementation that merges the two counters or aliases one to the
+/// other.** Both such implementations return a plausible map from a
+/// single read, so no single-read test tells them apart: serve
+/// `read_output.redactions` from the session tally and the second read
+/// reports 2 == 2; alias `status.redaction_stats` to the last response
+/// and it reports 1 == 1. Only two *overlapping* reads of one secret
+/// separate 1 from 2, which is why `assert_ne!` is the assertion and
+/// "both fields are present" is not.
+///
+/// The clean-session assertion in front is the paired negative: an
+/// implementation that counts nothing anywhere reports `{}` and `{}` —
+/// equal, so `assert_ne!` catches it — and it separately pins
+/// REQ-O-012's other guard, that a session which has redacted nothing
+/// reports an empty map rather than omitting the key.
+#[tokio::test]
+async fn the_per_response_and_per_session_redaction_counts_are_different_numbers() {
+    let server = ClaspServer::new();
+    let id = started_session(&server).await;
+    let session = server.registry.get(&id).unwrap();
+
+    assert_eq!(
+        redaction_stats(&server, &id).await,
+        serde_json::json!({}),
+        "a session that has redacted nothing reports an empty map, not a \
+         missing key (REQ-O-012)"
+    );
+
+    session
+        .write_input(format!("printf 'CLASP''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
+        .unwrap();
+
+    // Poll on the REDACTED form, so the read that breaks the loop is
+    // provably the first read that redacted the token — the tally is 1
+    // at that instant, not "1 or more depending on timing".
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = server
+            .read_output(Parameters(read_args(&id)))
+            .await
+            .unwrap();
+        let out = body(&r)["data"]["output"].as_str().unwrap().to_string();
+        if out.contains("CLASP_TOKEN=[REDACTED:github]") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never saw the redacted line: {out}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // The second read OVERLAPS the first: `read_args` always reads from
+    // cursor 0, so it returns the same secret and redacts it again.
+    let r = server
+        .read_output(Parameters(read_args(&id)))
+        .await
+        .unwrap();
+    let per_response = body(&r)["data"]["redactions"]["github"].clone();
+    let per_session = redaction_stats(&server, &id).await["github"].clone();
+
+    assert_eq!(
+        per_response, 1,
+        "`redactions` counts substitutions in the bytes THIS response \
+         returned: {per_response}"
+    );
+    assert_eq!(
+        per_session, 2,
+        "`redaction_stats` is cumulative for the session and double-counts \
+         the overlap on purpose: {per_session}"
+    );
+    assert_ne!(
+        per_response, per_session,
+        "the two surfaces must report different numbers after two \
+         overlapping reads; equal means one is being served from the other"
+    );
+
+    let _ = session.signal(Signal::Kill);
+}
+
+#[tokio::test]
+async fn read_output_rejects_an_unknown_text_encoding_as_a_protocol_error() {
+    let server = ClaspServer::new();
+    let id = started_session(&server).await;
+
+    let mut args = read_args(&id);
+    args.text_encoding = Some("rot13".into());
+    let err = server
+        .read_output(Parameters(args))
+        .await
+        .expect_err("an unknown encoding is an input-schema violation (§5.1)");
+    assert!(
+        err.message.contains("text_encoding"),
+        "the message must name the offending argument: {}",
+        err.message
+    );
+
+    let mut args = read_args(&id);
+    args.ansi = Some("sideways".into());
+    let err = server
+        .read_output(Parameters(args))
+        .await
+        .expect_err("ditto");
+    assert!(err.message.contains("ansi"), "{}", err.message);
+
+    let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+}
+
+/// The paired negative for the row above: the three *legal* enum values
+/// are accepted and each does what it says. Without it, a `read_output`
+/// that rejected every `ansi`/`text_encoding` value it was given would
+/// pass the rejection test completely.
+#[tokio::test]
+async fn the_advertised_enum_values_are_all_accepted() {
+    use base64::Engine as _;
+
+    let server = ClaspServer::new();
+    let id = started_session(&server).await;
+    let session = server.registry.get(&id).unwrap();
+    session
+        .write_input(b"printf '\\033[32mCLASP''_GREEN\\033[0m\\n'\n")
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = server
+            .read_output(Parameters(read_args(&id)))
+            .await
+            .unwrap();
+        if body(&r)["data"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("CLASP_GREEN")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the shell never printed");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let mut raw = read_args(&id);
+    raw.ansi = Some("raw".into());
+    let out = body(&server.read_output(Parameters(raw)).await.unwrap())["data"]["output"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(out.contains('\u{1b}'), "ansi=raw must keep the escapes");
+
+    let mut stripped = read_args(&id);
+    stripped.ansi = Some("strip".into());
+    let out = body(&server.read_output(Parameters(stripped)).await.unwrap())["data"]["output"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!out.contains('\u{1b}'), "ansi=strip must remove them");
+
+    let mut b64 = read_args(&id);
+    b64.text_encoding = Some("base64".into());
+    let out = body(&server.read_output(Parameters(b64)).await.unwrap())["data"]["output"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(out.as_bytes())
+        .expect("text_encoding=base64 must produce base64");
+    assert!(String::from_utf8_lossy(&decoded).contains("CLASP_GREEN"));
+
+    let mut lossy = read_args(&id);
+    lossy.text_encoding = Some("lossy_printable".into());
+    let out = body(&server.read_output(Parameters(lossy)).await.unwrap())["data"]["output"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(out.contains("CLASP_GREEN"));
+
+    let _ = session.signal(Signal::Kill);
+}
+
+// ---------------------------------------------- REQ-P-007, Step 6b
+//
+// **These two tests assert a LIMITATION, not a feature.** §20 records it
+// as "documented, not fixed in v0.1.0": `portable-pty` maps signal death
+// to `code: 1`, so a child CLASP killed and a child that ran `exit 1`
+// are indistinguishable in `terminate`'s response. REQ-P-007's
+// Verification column asks for exactly this — assert the documented
+// behaviour so it cannot drift silently — and the REQ was written after
+// 0.0.1 closed, so no milestone had picked it up. The limitation was
+// prose, and prose cannot fail.
+//
+// Whoever widens `PtyBackend` to carry an exit *status* will find these
+// red. That is the intended outcome: fix them together with §20 and
+// §4.4, do not "repair" them back to green.
+
+#[tokio::test]
+async fn terminate_cannot_distinguish_a_signalled_child_from_exit_1() {
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+
+    let r = server
+        .terminate(Parameters(TerminateArgs {
+            session: id.clone(),
+            force: Some(true),
+            timeout_secs: None,
+        }))
+        .await
+        .unwrap();
+    let data = body(&r)["data"].clone();
+    assert_eq!(
+        data["exit_code"],
+        json!(1),
+        "the documented wrong answer: a SIGKILLed shell reports 1, not a \
+         signal (REQ-P-007, §20)"
+    );
+    assert_eq!(data["already_exited"], json!(false));
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn a_child_that_really_exits_1_is_reported_the_same_way() {
+    // The pairing that gives the test above its meaning. Read alone, that
+    // one says "signals report 1"; the defect is that these two cases are
+    // *indistinguishable*, and without this half the first test passes
+    // against an implementation that reports signals correctly and
+    // ordinary exits wrongly.
+    let server = ClaspServer::new();
+    let id = start_script(&server, "exit 1").await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server.registry.get(&id).unwrap().is_alive() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let r = server
+        .terminate(Parameters(TerminateArgs {
+            session: id.clone(),
+            force: Some(false),
+            timeout_secs: None,
+        }))
+        .await
+        .unwrap();
+    let data = body(&r)["data"].clone();
+    assert_eq!(
+        data["exit_code"],
+        json!(1),
+        "a genuine `exit 1` reports the same 1 the signalled child did"
+    );
+    assert_eq!(
+        data["already_exited"],
+        json!(true),
+        "and it really had exited on its own"
     );
 
     kill_all(&server).await;

@@ -7,6 +7,9 @@ use crate::detect::{
     detect_shell, DetectionConfig, InteractionMode, PatternSet, PromptPattern,
     DEFAULT_SETTLE_THRESHOLD_MS,
 };
+use crate::output::ansi::AnsiMode;
+use crate::output::encoding::TextEncoding;
+use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::session::{new_session_id, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
@@ -291,7 +294,7 @@ impl ClaspServer {
             keys.sort_unstable();
             keys
         };
-        self.audit.record(
+        self.processor.audit.record(
             "session_start",
             Some(&session.id),
             json!({
@@ -327,7 +330,8 @@ impl ClaspServer {
     }
 
     /// Read output from a session. Supply exactly one of since_cursor,
-    /// tail_lines, or tail_bytes.
+    /// tail_lines, or tail_bytes. Output is ANSI-stripped and
+    /// secret-redacted by default.
     #[tool(
         annotations(
             title = "Read session output",
@@ -374,6 +378,34 @@ impl ClaspServer {
             ));
         }
 
+        // Unknown enum values are input-schema violations, which §5.1
+        // routes to the protocol channel rather than `isError: true`.
+        let ansi = match args.ansi.as_deref().unwrap_or("strip") {
+            "strip" => AnsiMode::Strip,
+            "raw" => AnsiMode::Raw,
+            other => {
+                return Err(ErrorData::invalid_params(
+                    format!("ansi must be \"strip\" or \"raw\", got {other:?}"),
+                    None,
+                ))
+            }
+        };
+        let text_encoding = match args.text_encoding.as_deref() {
+            None => TextEncoding::Utf8,
+            Some(name) => match TextEncoding::parse(name) {
+                Some(e) => e,
+                None => {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "text_encoding must be \"utf8\", \"base64\", or \
+                             \"lossy_printable\", got {name:?}"
+                        ),
+                        None,
+                    ))
+                }
+            },
+        };
+
         let session = match self.registry.get(&args.session) {
             Ok(s) => s,
             Err(e) => return envelope::from_error(&e),
@@ -383,79 +415,53 @@ impl ClaspServer {
             .max_bytes
             .unwrap_or(DEFAULT_READ_MAX_BYTES)
             .min(MAX_READ_MAX_BYTES);
-        // `truncated_for_size` means "this response was capped at
-        // max_bytes" (§18.2). Each branch computes the half of that
-        // question only it can answer — whether `max_bytes` was the
-        // *binding* constraint on this particular read — rather than
-        // re-deriving it from `head` afterwards, which would report a cap
-        // that never happened whenever the reader thread appended in
-        // between.
-        let is_cursor_read = args.since_cursor.is_some();
-        let (read, size_capped) = if let Some(c) = args.since_cursor {
-            let r = session.read_from(c, max_bytes);
-            // Necessary but not sufficient on its own: a forward read
-            // fills exactly `max_bytes` both when it left bytes behind and
-            // when the buffer happened to hold exactly that many. The
-            // "and something was actually left behind" half is
-            // `more_forward`, applied below — it needs the post-read head.
-            let capped = r.bytes.len() >= max_bytes;
-            (r, capped)
+        let start = if let Some(c) = args.since_cursor {
+            ReadStart::Cursor(c)
         } else if let Some(n) = args.tail_lines {
-            // max_bytes is a raw-byte cap on *every* selector
-            // (REQ-T-006), not just the cursor path. A tail read is
-            // clipped from the front, so the newest bytes survive and the
-            // returned cursor still points just past them.
-            let mut r = session.read_tail_lines(n);
-            let capped = r.bytes.len() > max_bytes;
-            if capped {
-                let drop = r.bytes.len() - max_bytes;
-                r.bytes.drain(..drop);
-            }
-            (r, capped)
+            ReadStart::TailLines(n)
         } else {
-            let requested = args.tail_bytes.unwrap();
-            let r = session.read_tail_bytes(requested.min(max_bytes));
-            // Both clauses are needed. `requested > max_bytes` alone
-            // reports a cap even when the buffer held less than max_bytes,
-            // so nothing was dropped. `r.bytes.len() >= max_bytes` alone
-            // reports a cap when the caller asked for exactly max_bytes
-            // and got exactly that -- also no truncation. Only when
-            // max_bytes was the *binding* constraint was anything lost.
-            // (A tail read always ends at `head`, so unlike the cursor
-            // branch there is never anything "further forward" to fetch;
-            // the two clauses here are the whole test.)
-            let capped = requested > max_bytes && r.bytes.len() >= max_bytes;
-            (r, capped)
+            ReadStart::TailBytes(args.tail_bytes.unwrap().min(max_bytes))
         };
 
-        // 0.0.1 returns raw bytes: no ANSI stripping, no redaction.
-        // Both arrive in 0.0.3.
-        let output = String::from_utf8_lossy(&read.bytes).to_string();
+        let read = session.read_processed(
+            &ReadRequest {
+                start,
+                max_bytes,
+                options: ReadOptions {
+                    ansi,
+                    text_encoding,
+                    redact: args.redact.unwrap_or(true),
+                },
+                // The §9.4 caller seam. 0.0.5 replaces these two literals
+                // with `caller::audit_surface("read_output")`, derived
+                // server-side from the authenticated connection; there is
+                // deliberately no path from a tool argument to either,
+                // because a caller that can name itself can lie about it
+                // (REQ-SEC-018).
+                tool: "read_output",
+                client_kind: "in_process",
+            },
+            &self.processor,
+        );
         let state = session.state();
-        let more_forward = read.cursor < session.buffer_head();
-        // The cursor branch's missing clause. Without it, 86 buffered
-        // bytes read with `max_bytes: 86` answer `bytes_returned: 86,
-        // truncated_for_size: true, next_cursor: null` — claiming a cap
-        // while simultaneously reporting nothing left to fetch. Reusing
-        // `more_forward` keeps the flag and `next_cursor` derived from one
-        // fact instead of two that can disagree.
-        let truncated_for_size = size_capped && (!is_cursor_read || more_forward);
 
         Ok(envelope::ok(
             detection::with_detection(
                 json!({
-                "output": output,
-                "cursor": read.cursor,
-                "bytes_returned": read.bytes.len(),
-                "truncated_at_tail": read.truncated_at_tail,
-                "truncated_for_size": truncated_for_size,
-                "next_cursor": if more_forward { Some(read.cursor) } else { None },
-                "state": state.as_str(),
-                "exit_code": session.exit_code(),
+                    "output": read.output,
+                    "cursor": read.cursor,
+                    "bytes_returned": read.bytes_returned,
+                    "truncated_at_tail": read.truncated_at_tail,
+                    "truncated_for_size": read.truncated_for_size,
+                    "held_back": read.held_back,
+                    "next_cursor": read.next_cursor,
+                    "redactions": read.redactions,
+                    "state": state.as_str(),
+                    "exit_code": session.exit_code(),
                 }),
                 &session,
             ),
-            format!("{} bytes", read.bytes.len()),
+            format!("{} bytes", read.bytes_returned),
         ))
     }
 
@@ -792,6 +798,12 @@ fn session_record(session: &Session) -> serde_json::Value {
             "head": session.buffer_head(),
             "tail": session.buffer_tail(),
         },
+        // The session's cumulative tally (§9.2, REQ-O-012), and a
+        // *different* number from `read_output.redactions`: that one
+        // describes the bytes one response returned, this one describes
+        // the session. An empty `BTreeMap` serialises to `{}`, which is
+        // what REQ-O-012 requires — present and empty, never absent.
+        "redaction_stats": session.redaction_stats(),
     })
 }
 
@@ -808,10 +820,23 @@ pub struct ReadOutputArgs {
     /// Read the last N bytes instead.
     #[serde(default)]
     pub tail_bytes: Option<usize>,
-    /// Cap on bytes returned. Defaults to 32768, hard limit 262144.
-    /// Must be at least 1: a zero cap can never make forward progress.
+    /// Cap on RAW bytes read from the buffer. Defaults to 32768, hard
+    /// limit 262144. Must be at least 1: a zero cap can never make
+    /// forward progress. The encoded payload may be larger or smaller.
     #[serde(default)]
     pub max_bytes: Option<usize>,
+    /// "strip" (default) removes ANSI/VT100 escape sequences; "raw"
+    /// preserves them. Independent of `redact`.
+    #[serde(default)]
+    pub ansi: Option<String>,
+    /// "utf8" (default), "base64", or "lossy_printable". Byte-exact
+    /// capture is "base64" together with `redact: false`.
+    #[serde(default)]
+    pub text_encoding: Option<String>,
+    /// Redact secrets (default true). Setting false returns raw secret
+    /// bytes and is recorded in the audit log.
+    #[serde(default)]
+    pub redact: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]

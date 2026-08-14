@@ -194,6 +194,12 @@ pub struct ReadOutput {
     pub bytes_returned: Option<u64>,
     pub truncated_at_tail: Option<bool>,
     pub truncated_for_size: Option<bool>,
+    /// The read stopped short of `buffer.head` at the holdback boundary
+    /// (§4.1), or an unfinished escape was pulled back (REQ-O-008).
+    pub held_back: Option<bool>,
+    /// `rule kind -> count` for the redactions inside the returned range.
+    /// Empty on an unredacted read; absent only on an error envelope.
+    pub redactions: Option<std::collections::BTreeMap<String, u64>>,
     pub next_cursor: Option<u64>,
     pub state: Option<SessionState>,
     pub exit_code: Option<i32>,
@@ -258,6 +264,9 @@ pub struct SessionRecord {
     pub started_at_unix_secs: Option<u64>,
     pub last_activity_unix_ms: Option<i64>,
     pub buffer: Option<Buffer>,
+    /// Cumulative `rule kind -> count` for the session (§9.2). Distinct
+    /// from `read_output.redactions`, which is per response (REQ-O-012).
+    pub redaction_stats: Option<std::collections::BTreeMap<String, u64>>,
     pub interaction_mode: Option<InteractionMode>,
     pub detection_tier: Option<DetectionTier>,
     pub screen_tracking: Option<ScreenTracking>,
