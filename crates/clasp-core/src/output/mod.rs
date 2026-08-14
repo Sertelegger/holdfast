@@ -3,4 +3,5 @@
 pub mod ansi;
 pub mod encoding;
 pub mod prefix_index;
+pub mod redact;
 pub mod rules;
