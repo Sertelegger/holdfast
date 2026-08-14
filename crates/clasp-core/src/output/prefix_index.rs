@@ -419,6 +419,32 @@ mod tests {
         // With no space, the earlier one qualifies and wins.
         let region = b"ghp_abcsk-ant-xy";
         assert_eq!(index.earliest_partial(&rules, region, 100), Some(100));
+
+        // …and now the ordering itself, which neither case above pins.
+        // Measured: reversing the candidate loop (`.enumerate().rev()`)
+        // leaves the **whole workspace** green against the two fixtures
+        // above, because each of them has exactly one candidate that
+        // qualifies — in the first the space kills `ghp_`, and in the
+        // second `sk-ant-` sits mid-word behind a `c` and its rule's `\b`
+        // forbids it. A scan that walks backwards answers both
+        // identically, so "earliest" was a claim in the name only.
+        //
+        // This fixture separates the two directions: `/` is a word
+        // boundary *and* a legal value byte, so `ghp_` and `sk-ant-` both
+        // qualify at the same time and only a left-to-right scan reports
+        // the first one.
+        let region = b"ghp_abc/sk-ant-xy";
+        assert_eq!(
+            index.earliest_partial(&rules, &region[7..], 107),
+            Some(108),
+            "the later candidate must qualify on its own, or the assertion \
+             below separates earliest-from-nothing rather than earliest-from-latest"
+        );
+        assert_eq!(
+            index.earliest_partial(&rules, region, 100),
+            Some(100),
+            "both candidates qualify, so the earlier one is the boundary"
+        );
     }
 
     #[test]
