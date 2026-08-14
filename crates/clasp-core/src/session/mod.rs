@@ -236,13 +236,13 @@ impl Session {
     /// narrowing it: no chunk can be classified between the sample and the
     /// classification, so the value handed to the ladder is never older
     /// than the newest byte the ladder has seen. Nothing here can block —
-    /// `is_alive` is a `WNOHANG` wait and `echo_enabled` is one ioctl — so
+    /// `is_alive` is a `WNOHANG` wait and `line_discipline` is one ioctl — so
     /// §4.3's "no lock across blocking work" invariant is intact.
     pub fn detection(&self) -> Detection {
         let alive = self.backend.is_alive();
         let mut detector = self.detector.lock();
-        let echo = self.backend.echo_enabled();
-        detector.snapshot(alive, echo)
+        let line = self.backend.line_discipline();
+        detector.snapshot(alive, line)
     }
 
     /// True once any OSC 133 marker has arrived, i.e. shell integration is
@@ -721,7 +721,7 @@ mod tests {
         // The window is one contended `detector.lock()` — and the reader
         // holds that lock while it feeds, so contention is the ordinary
         // case, not an exotic one. This test does not wait for it: the
-        // backend's `on_echo_sample` hook makes the interleaving happen on
+        // backend's `on_line_discipline_sample` hook makes the interleaving happen on
         // purpose, at the one instant it has to happen at.
         //
         // The chunk carries an OSC 133 `C` as well, for observability: the
@@ -748,7 +748,7 @@ mod tests {
 
         let weak = Arc::downgrade(&s);
         let queue = Arc::clone(&pty);
-        pty.on_echo_sample(move || {
+        pty.on_line_discipline_sample(move || {
             let Some(s) = weak.upgrade() else { return };
             if s.command_count() > 0 {
                 return; // already delivered; this is a later sample

@@ -42,6 +42,41 @@ impl PtySpawnConfig {
     }
 }
 
+/// The slave's line-discipline flags, read from **one** `tcgetattr` on the
+/// master (spec §8.2). The master reports the slave's `c_lflag`, which is
+/// what §8.3's echo rung consults.
+///
+/// **Both fields are tri-state and independent.** `Some(true)`,
+/// `Some(false)`, or `None` — a backend that cannot sample the line
+/// discipline reports `None` rather than guessing a value, and §8.3
+/// requires the two flags to degrade separately: the rung fires when
+/// `echo` is *known* off and is suppressed only when `canonical` is
+/// *known* off, so an unreadable `ICANON` reproduces the pre-rev.-36
+/// answer exactly instead of taking a third path (REQ-PD-021).
+///
+/// No platform in this tree produces `echo: Some(_), canonical: None`.
+/// It is representable anyway because REQ-PD-021's degradation rule is
+/// only falsifiable if it is, and `MockPty` is what produces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LineDiscipline {
+    /// `c_lflag & ECHO`. Off at every readline prompt — §8.7 finding 1 —
+    /// so it means nothing alone and everything in combination.
+    pub echo: Option<bool>,
+    /// `c_lflag & ICANON`. A program wanting a secret *line* stays
+    /// canonical because it wants the kernel to assemble the line; a line
+    /// editor leaves canonical mode because it draws the characters
+    /// itself (§8.2).
+    pub canonical: Option<bool>,
+}
+
+impl LineDiscipline {
+    /// What a backend that cannot sample the line discipline reports.
+    pub const UNKNOWN: Self = Self {
+        echo: None,
+        canonical: None,
+    };
+}
+
 /// A spawned PTY and its child process.
 ///
 /// Implementations must be `Send + Sync`: the reader task, the writer
@@ -63,10 +98,10 @@ pub trait PtyBackend: Send + Sync {
     /// Non-blocking liveness check.
     fn is_alive(&self) -> bool;
 
-    /// Whether the slave's line discipline currently has `ECHO` set, read
-    /// from the master with `tcgetattr` (spec §8.2). `None` when the
-    /// backend cannot report it — the detector then treats the `ECHO`
-    /// signal as unavailable rather than assuming a value.
+    /// The slave's line-discipline flags, from **one** `tcgetattr` on the
+    /// master (spec §8.2, §8.3). `LineDiscipline::UNKNOWN` when the
+    /// backend cannot report them — the detector then treats the flags as
+    /// unavailable rather than assuming values.
     ///
     /// **The answer must describe the line discipline at the moment of the
     /// call.** An implementation may cache only if the cached value cannot
@@ -77,17 +112,24 @@ pub trait PtyBackend: Send + Sync {
     /// bracketed-paste-off — the signature of `AwaitingSecret` at 0.95, for
     /// a command that wants no input. §4.5 previously asked for a 50 ms
     /// cache here "per §4.1 `is_alive` policy"; that produced exactly this
-    /// reading and is withdrawn. See `InProcessPty::sample_echo` for the
-    /// measurement.
+    /// reading, measured at 267 spurious samples under load, and is
+    /// withdrawn (REQ-PD-019). See `InProcessPty::sample_line_discipline`.
     ///
-    /// Cheap, though: it is sampled on every prompt-bearing response. One
-    /// `tcgetattr` (524 ns measured) is within budget; anything that blocks
-    /// is not.
+    /// **One method, not two, and that is a correctness property rather
+    /// than an ergonomic one.** `ECHO` and `ICANON` come out of the same
+    /// `termios`. Two accessor methods mean two `tcgetattr`s that can
+    /// straddle the child's own `tcsetattr`, so the pair the ladder sees
+    /// would describe two different instants — reopening the freshness gap
+    /// above by a narrower window, which is the same defect and not a
+    /// smaller one.
+    ///
+    /// Cheap: one `tcgetattr` (524 ns measured) is within budget on every
+    /// prompt-bearing response; anything that blocks is not.
     ///
     /// Added in 0.0.2 *with a default*, so the seven methods 0.0.1
     /// settled on are unchanged and existing implementors still compile.
-    fn echo_enabled(&self) -> Option<bool> {
-        None
+    fn line_discipline(&self) -> LineDiscipline {
+        LineDiscipline::UNKNOWN
     }
 
     /// Exit code once the child has exited, else `None`.

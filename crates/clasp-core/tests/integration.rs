@@ -1,4 +1,4 @@
-use clasp_core::pty::{InProcessPty, PtyBackend, PtySpawnConfig, Signal};
+use clasp_core::pty::{InProcessPty, LineDiscipline, PtyBackend, PtySpawnConfig, Signal};
 use std::time::{Duration, Instant};
 
 fn bash() -> PtySpawnConfig {
@@ -1270,64 +1270,81 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
     );
 }
 
-/// Poll `echo_enabled` until it reports `want` or the deadline passes,
-/// then return whatever it last said.
-fn poll_echo(pty: &dyn PtyBackend, want: Option<bool>, timeout: Duration) -> Option<bool> {
+/// Poll `line_discipline` until its `echo` field reports `want` or the
+/// deadline passes, then return whatever the whole pair last said.
+///
+/// The poll is on `.echo` alone and the answer is the pair, deliberately:
+/// `ECHO` is the flag whose transitions the shell drives on a schedule
+/// this test can wait for, and `ICANON` is what the caller then asserts
+/// *at* that moment. Polling on the pair would let a caller wait for the
+/// answer it wanted rather than read what was there.
+fn poll_line_discipline(
+    pty: &dyn PtyBackend,
+    want: Option<bool>,
+    timeout: Duration,
+) -> LineDiscipline {
     let deadline = Instant::now() + timeout;
-    let mut last = pty.echo_enabled();
-    while last != want && Instant::now() < deadline {
+    let mut last = pty.line_discipline();
+    while last.echo != want && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(60));
-        last = pty.echo_enabled();
+        last = pty.line_discipline();
     }
     last
 }
 
 #[test]
-fn echo_enabled_tracks_the_slaves_line_discipline() {
+fn line_discipline_tracks_the_slaves_line_discipline() {
     // Spike row 2, measured: readline turns ECHO *off* while it draws a
     // prompt, and the line discipline is back on while a command runs.
-    // A backend returning a constant — or `None` — fails one half or the
-    // other, so both assertions are needed to pin the behaviour.
+    // A backend returning a constant — or `UNKNOWN` — fails one half or
+    // the other, so both assertions are needed to pin the behaviour.
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
 
     assert_eq!(
-        poll_echo(&pty, Some(false), Duration::from_secs(5)),
-        Some(false),
-        "ECHO should be off once readline has drawn a prompt"
+        poll_line_discipline(&pty, Some(false), Duration::from_secs(5)),
+        LineDiscipline {
+            echo: Some(false),
+            canonical: Some(false),
+        },
+        "at a readline prompt both flags are off — §8.2 row 1, which is \
+         exactly why `ECHO` alone cannot mean `AwaitingSecret`"
     );
 
     pty.write(b"sleep 3\n").unwrap();
     assert_eq!(
-        poll_echo(&pty, Some(true), Duration::from_secs(5)),
-        Some(true),
-        "ECHO should be on while a command runs"
+        poll_line_discipline(&pty, Some(true), Duration::from_secs(5)),
+        LineDiscipline {
+            echo: Some(true),
+            canonical: Some(true),
+        },
+        "while a command runs the shell restores both flags"
     );
 
     pty.signal(Signal::Kill).unwrap();
 }
 
 #[test]
-fn echo_enabled_reports_echo_and_not_a_flag_that_moves_with_it() {
-    // The sibling above cannot tell `ECHO` from `ICANON`, and cannot tell
+fn line_discipline_reports_echo_and_canonical_as_separate_flags() {
+    // The sibling above visits only states in which the two flags move
+    // together, so on its own it cannot tell `ECHO` from `ICANON`, nor
     // `ECHO` from its own negation. Both were measured surviving the whole
     // suite.
     //
     // The cause is that `bash`'s readline toggles ECHO and ICANON together
     // across the whole raw-mode `c_lflag` group, so at every state that
     // test visits the two are perfectly correlated — and a polarity flip
-    // just means `poll_echo` matches on its *first* sample instead of
-    // after the transition, which no assertion distinguishes.
+    // just means `poll_line_discipline` matches on its *first* sample
+    // instead of after the transition, which no assertion distinguishes.
     //
     // `stty -echo` breaks the correlation: it clears ECHO and leaves
     // ICANON set. That is also the exact shape of a real password prompt
     // (getpass, `read -s`), the one state §8.2 exists to detect and the one
-    // the ladder consumes as `echo == Some(false)`, so an ICANON reader
-    // would report `Some(true)` there — inverted for the consumer.
+    // the ladder consumes as `echo == Some(false) && canonical != Some(false)`.
     //
     // Sampling a *window* rather than polling until a match is what makes
     // this hold: a poll-until-`Some(false)` finds the transient at the
-    // readline prompt, before the command has run at all, and lets the
-    // ICANON reader through.
+    // readline prompt, before the command has run at all, and lets a
+    // reader that returns `ICANON` in the `echo` field through.
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
 
     // The marker is printed *after* stty has taken effect, so reading it
@@ -1341,29 +1358,74 @@ fn echo_enabled_reports_echo_and_not_a_flag_that_moves_with_it() {
     let mut samples = Vec::new();
     let deadline = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < deadline {
-        samples.push(pty.echo_enabled());
+        samples.push(pty.line_discipline());
         std::thread::sleep(Duration::from_millis(60));
     }
     pty.signal(Signal::Kill).unwrap();
 
     assert!(samples.len() >= 10, "too few samples: {}", samples.len());
     assert!(
-        samples.iter().all(|s| *s == Some(false)),
-        "ECHO is off for this whole window and ICANON is on; a reading of \
-         Some(true) means the sample is inverted or is reading ICANON: {samples:?}"
+        samples.iter().all(|s| *s
+            == LineDiscipline {
+                echo: Some(false),
+                canonical: Some(true),
+            }),
+        "ECHO is off for this whole window and ICANON is on; anything else \
+         means the sample is inverted, or the two flags are one bit read \
+         twice: {samples:?}"
     );
 }
 
 #[test]
-fn echo_enabled_is_none_once_the_child_has_exited() {
+fn line_discipline_separates_a_line_editor_from_a_secret_prompt() {
+    // §8.2's table, the two rows that matter, on one PTY. `stty -echo
+    // -icanon` is a line editor's shape and `stty -echo` is a secret
+    // prompt's; they differ in exactly one bit and §8.3's rung is about to
+    // start reading it. A backend that reads only ECHO answers
+    // `Some(false)` for both, and both halves are needed to see that: the
+    // first alone passes for a reader returning a constant `Some(false)`,
+    // the second alone for one returning `Some(true)`.
+    let pty = InProcessPty::spawn(&bash()).expect("spawn");
+    pty.write(b"stty -echo -icanon; echo EDITOR''_SET; sleep 3\n")
+        .unwrap();
+    let out = read_until(&pty, "EDITOR_SET", Duration::from_secs(5));
+    assert!(out.contains("EDITOR_SET"), "stty never ran: {out:?}");
+    assert_eq!(
+        pty.line_discipline(),
+        LineDiscipline {
+            echo: Some(false),
+            canonical: Some(false),
+        },
+        "a line editor: echo off, canonical off"
+    );
+    pty.signal(Signal::Kill).unwrap();
+
+    let pty = InProcessPty::spawn(&bash()).expect("spawn");
+    pty.write(b"stty -echo; echo SECRET''_SET; sleep 3\n")
+        .unwrap();
+    let out = read_until(&pty, "SECRET_SET", Duration::from_secs(5));
+    assert!(out.contains("SECRET_SET"), "stty never ran: {out:?}");
+    assert_eq!(
+        pty.line_discipline(),
+        LineDiscipline {
+            echo: Some(false),
+            canonical: Some(true),
+        },
+        "a secret prompt: echo off, canonical ON"
+    );
+    pty.signal(Signal::Kill).unwrap();
+}
+
+#[test]
+fn line_discipline_is_unknown_once_the_child_has_exited() {
     let mut cfg = PtySpawnConfig::new("bash");
     cfg.args = vec!["-c".into(), "exit 0".into()];
     let pty = InProcessPty::spawn(&cfg).expect("spawn");
     wait_for_exit(&pty, Duration::from_secs(5));
     assert!(!pty.is_alive());
     assert_eq!(
-        pty.echo_enabled(),
-        None,
+        pty.line_discipline(),
+        LineDiscipline::UNKNOWN,
         "a dead child's line discipline says nothing about the session"
     );
 }

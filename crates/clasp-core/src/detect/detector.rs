@@ -2,6 +2,7 @@
 
 use super::patterns::PatternSet;
 use super::scanner::{ModeScanner, Osc133Event};
+use crate::pty::LineDiscipline;
 use std::time::Instant;
 
 /// Default `settle_threshold_ms` (spec §4.2).
@@ -126,8 +127,8 @@ impl PromptDetector {
         self.scanner.feed(bytes, base)
     }
 
-    pub fn snapshot(&mut self, alive: bool, echo: Option<bool>) -> Detection {
-        self.snapshot_at(alive, echo, Instant::now())
+    pub fn snapshot(&mut self, alive: bool, line: LineDiscipline) -> Detection {
+        self.snapshot_at(alive, line, Instant::now())
     }
 
     /// Classify, per spec §8.3/§8.4.
@@ -143,7 +144,7 @@ impl PromptDetector {
     /// is: liveness, then alt-screen, then T1's prompt state, then
     /// echo-off, then bracketed paste, then T1/T2 "executing", then T3.
     /// Verified against every row of the §8.7 matrix.
-    pub fn snapshot_at(&mut self, alive: bool, echo: Option<bool>, now: Instant) -> Detection {
+    pub fn snapshot_at(&mut self, alive: bool, line: LineDiscipline, now: Instant) -> Detection {
         let modes = self.scanner.modes();
         let last_line = self.scanner.last_line();
         let title = self.scanner.title().map(str::to_owned);
@@ -221,7 +222,7 @@ impl PromptDetector {
                 1.0,
                 "osc 133 prompt marker with no command started since".to_string(),
             )
-        } else if echo == Some(false) && !modes.bracketed_paste {
+        } else if line.echo == Some(false) && !modes.bracketed_paste {
             (
                 InteractionMode::AwaitingSecret,
                 DetectionTier::TerminalMode,
@@ -321,6 +322,16 @@ mod tests {
         d.feed_at(bytes, 0, at);
     }
 
+    /// A readable line discipline. `ld(false, false)` is readline's shape
+    /// — echo off, canonical off — and `ld(false, true)` is a secret
+    /// prompt's.
+    fn ld(echo: bool, canonical: bool) -> LineDiscipline {
+        LineDiscipline {
+            echo: Some(echo),
+            canonical: Some(canonical),
+        }
+    }
+
     // ---- the §8.7 measurement matrix, replayed as byte streams ----
     //
     // The mode/echo values in each row are the ones measured against real
@@ -330,7 +341,11 @@ mod tests {
     fn matrix_idle_bash_prompt() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b[?2004hbash-5.3$ ");
-        let s = d.snapshot_at(true, Some(false), now);
+        // §8.2's table row 1: an idle bash prompt is `ECHO off / ICANON
+        // off` — readline's shape. It answers at the bracketed-paste rung
+        // either way, which is what makes the row insensitive to the
+        // conjunct rather than lucky.
+        let s = d.snapshot_at(true, ld(false, false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
         assert_eq!(s.confidence, 0.95);
@@ -340,7 +355,7 @@ mod tests {
     fn matrix_during_a_running_command() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lsleep 2\r\n");
-        let s = d.snapshot_at(true, Some(true), now);
+        let s = d.snapshot_at(true, ld(true, true), now);
         assert_eq!(s.interaction_mode, InteractionMode::Executing);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
         assert_eq!(s.confidence, 0.0);
@@ -350,7 +365,7 @@ mod tests {
     fn matrix_getpass_prompt() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"Password: ");
-        let s = d.snapshot_at(true, Some(false), now);
+        let s = d.snapshot_at(true, ld(false, true), now);
         assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
         // §8.4's number, and the one that matters most of the four: it is
@@ -365,7 +380,7 @@ mod tests {
         // A `read -s` runs inside a shell that has already used bracketed
         // paste; the mode is off while the command runs.
         feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lPassword: ");
-        let s = d.snapshot_at(true, Some(false), now);
+        let s = d.snapshot_at(true, ld(false, true), now);
         assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
     }
 
@@ -383,7 +398,7 @@ mod tests {
             start,
             b"\x1b[?2004h\x1b[?2004lssh prod-01\r\njane@prod-01's password: ",
         );
-        let s = d.snapshot_at(true, Some(false), now);
+        let s = d.snapshot_at(true, ld(false, true), now);
         assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
         assert_eq!(s.confidence, 0.95);
@@ -393,7 +408,9 @@ mod tests {
     fn matrix_python_repl_prompt() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b[?2004h>>> ");
-        let s = d.snapshot_at(true, Some(false), now);
+        // §8.7 row 6, PyREPL: `ECHO off / ICANON off` with bracketed paste
+        // **on**. Answers at the bracketed-paste rung either way.
+        let s = d.snapshot_at(true, ld(false, false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
     }
@@ -441,7 +458,7 @@ mod tests {
     fn matrix_echo_off_at_a_prompt_shaped_tail_with_no_bracketed_paste() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b">>> ");
-        let s = d.snapshot_at(true, Some(false), now);
+        let s = d.snapshot_at(true, ld(false, false), now);
         assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
         assert_eq!(s.confidence, 0.95);
@@ -457,7 +474,7 @@ mod tests {
         // given, so no implementation of this signature can separate them.
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"Password: ");
-        let secret = d.snapshot_at(true, Some(false), now);
+        let secret = d.snapshot_at(true, ld(false, true), now);
         assert_eq!(secret.interaction_mode, InteractionMode::AwaitingSecret);
         assert_eq!(secret.detection_tier, DetectionTier::TerminalMode);
         assert_eq!(secret.confidence, 0.95);
@@ -467,7 +484,7 @@ mod tests {
         // genuinely deciding these rows rather than the tail carrying them.
         let (mut d, start, now) = detector();
         feed(&mut d, start, b">>> ");
-        let echoing = d.snapshot_at(true, Some(true), now);
+        let echoing = d.snapshot_at(true, ld(true, true), now);
         assert_eq!(echoing.interaction_mode, InteractionMode::AtPrompt);
         assert_eq!(echoing.detection_tier, DetectionTier::Heuristic);
         assert!(
@@ -481,7 +498,7 @@ mod tests {
     fn matrix_inside_a_tui() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b[?1049h:");
-        let s = d.snapshot_at(true, Some(false), now);
+        let s = d.snapshot_at(true, ld(false, true), now);
         assert_eq!(s.interaction_mode, InteractionMode::Fullscreen);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
         // Zero, and deliberately so: §8.4 reports Fullscreen as a *fact*
@@ -498,7 +515,7 @@ mod tests {
         // gating is what stops it (§8.6).
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"$ ");
-        let s = d.snapshot_at(true, Some(true), now);
+        let s = d.snapshot_at(true, ld(true, true), now);
         assert_eq!(s.detection_tier, DetectionTier::Heuristic);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert!((s.confidence - 0.6).abs() < 1e-6, "{}", s.confidence);
@@ -514,7 +531,7 @@ mod tests {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b[?2004hbash-5.3$ ");
         assert_eq!(
-            d.snapshot_at(true, Some(false), now).interaction_mode,
+            d.snapshot_at(true, ld(false, true), now).interaction_mode,
             InteractionMode::AtPrompt
         );
     }
@@ -531,7 +548,7 @@ mod tests {
             b"\x1b]133;A\x07$ \x1b]133;B\x07sudo id\r\n\x1b]133;C\x07",
         );
         feed(&mut d, start, b"\x1b[?2004l[sudo] password for alice: ");
-        let s = d.snapshot_at(true, Some(false), now);
+        let s = d.snapshot_at(true, ld(false, true), now);
         assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
         assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
     }
@@ -545,7 +562,7 @@ mod tests {
             b"\x1b]133;A\x07$ \x1b]133;B\x07python3\r\n\x1b]133;C\x07",
         );
         feed(&mut d, start, b"\x1b[?2004h>>> ");
-        let s = d.snapshot_at(true, Some(false), now);
+        let s = d.snapshot_at(true, ld(false, true), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         // The tier is what makes this AtPrompt the *right* AtPrompt: the
         // REPL is recognised by its own bracketed paste, not by the shell's
@@ -565,7 +582,7 @@ mod tests {
         );
         feed(&mut d, start, b"\x1b[?1049h");
         assert_eq!(
-            d.snapshot_at(true, Some(false), now).interaction_mode,
+            d.snapshot_at(true, ld(false, true), now).interaction_mode,
             InteractionMode::Fullscreen
         );
     }
@@ -574,7 +591,7 @@ mod tests {
     fn osc133_prompt_markers_give_full_confidence() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b]133;A\x07bash-5.3$ \x1b]133;B\x07");
-        let s = d.snapshot_at(true, Some(false), now);
+        let s = d.snapshot_at(true, ld(false, true), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert_eq!(s.detection_tier, DetectionTier::Semantic);
         assert_eq!(s.confidence, 1.0);
@@ -596,7 +613,7 @@ mod tests {
         // prompt.
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b]133;A\x07bash-5.3$ ");
-        let s = d.snapshot_at(true, Some(false), now);
+        let s = d.snapshot_at(true, ld(false, true), now);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert_eq!(s.detection_tier, DetectionTier::Semantic);
         assert_eq!(s.confidence, 1.0);
@@ -610,7 +627,7 @@ mod tests {
             start,
             b"\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07building",
         );
-        let s = d.snapshot_at(true, Some(true), now);
+        let s = d.snapshot_at(true, ld(true, true), now);
         assert_eq!(s.interaction_mode, InteractionMode::Executing);
         assert_eq!(s.detection_tier, DetectionTier::Semantic);
         assert_eq!(s.confidence, 0.0);
@@ -623,7 +640,7 @@ mod tests {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
         assert_eq!(
-            d.snapshot_at(true, Some(true), now).interaction_mode,
+            d.snapshot_at(true, ld(true, true), now).interaction_mode,
             InteractionMode::Executing
         );
     }
@@ -638,13 +655,13 @@ mod tests {
 
         // Immediately after output: not settled, so no confidence at all
         // however prompt-shaped the tail is.
-        let s = d.snapshot_at(true, Some(true), start);
+        let s = d.snapshot_at(true, ld(true, true), start);
         assert_eq!(s.quiescent_score, 0.0);
         assert!((s.pattern_score - 0.9).abs() < 1e-6);
         assert_eq!(s.confidence, 0.0);
 
         // Half the settle threshold: half the score.
-        let s = d.snapshot_at(true, Some(true), start + Duration::from_millis(125));
+        let s = d.snapshot_at(true, ld(true, true), start + Duration::from_millis(125));
         assert!(
             (s.quiescent_score - 0.5).abs() < 0.01,
             "{}",
@@ -653,7 +670,7 @@ mod tests {
         assert!((s.confidence - 0.45).abs() < 0.01, "{}", s.confidence);
 
         // Past the threshold: saturated.
-        let s = d.snapshot_at(true, Some(true), start + Duration::from_millis(400));
+        let s = d.snapshot_at(true, ld(true, true), start + Duration::from_millis(400));
         assert_eq!(s.quiescent_score, 1.0);
         assert!((s.confidence - 0.9).abs() < 1e-6);
     }
@@ -677,13 +694,13 @@ mod tests {
         d.feed_at(b"building\r\n>>> ", 0, start);
         let settled = start + Duration::from_millis(400);
         assert_eq!(
-            d.snapshot_at(true, Some(true), settled).quiescent_score,
+            d.snapshot_at(true, ld(true, true), settled).quiescent_score,
             1.0
         );
 
         // More output lands at the instant we were about to call it settled.
         d.feed_at(b"linking\r\n>>> ", 13, settled);
-        let s = d.snapshot_at(true, Some(true), settled);
+        let s = d.snapshot_at(true, ld(true, true), settled);
         assert_eq!(
             s.quiescent_score, 0.0,
             "output did not restart the settle timer"
@@ -701,7 +718,7 @@ mod tests {
         // in the one tier that has no corroborating signal to fall back on.
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"> ");
-        let s = d.snapshot_at(true, Some(true), now);
+        let s = d.snapshot_at(true, ld(true, true), now);
         assert_eq!(s.pattern_score, 0.5);
         assert_eq!(s.quiescent_score, 1.0);
         assert_eq!(s.confidence, 0.5, "the product must be exact, not near");
@@ -725,14 +742,14 @@ mod tests {
         d.feed_at(b"$ ", 0, start);
         let settled = start + Duration::from_millis(400);
         assert_eq!(
-            d.snapshot_at(true, Some(true), settled).quiescent_score,
+            d.snapshot_at(true, ld(true, true), settled).quiescent_score,
             1.0
         );
 
         let events = d.feed_at(b"", 2, settled);
         assert!(events.is_empty());
         assert_eq!(
-            d.snapshot_at(true, Some(true), settled).quiescent_score,
+            d.snapshot_at(true, ld(true, true), settled).quiescent_score,
             1.0,
             "an empty read was counted as output"
         );
@@ -742,7 +759,7 @@ mod tests {
     fn a_settled_but_unrecognised_tail_scores_zero_confidence() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"linking target/debug/clasp");
-        let s = d.snapshot_at(true, Some(true), now);
+        let s = d.snapshot_at(true, ld(true, true), now);
         assert_eq!(s.quiescent_score, 1.0);
         assert_eq!(s.pattern_score, 0.0);
         assert_eq!(s.confidence, 0.0);
@@ -753,7 +770,7 @@ mod tests {
     fn the_cursor_sub_signal_is_reported_and_inert_until_tier_b() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"$ ");
-        let s = d.snapshot_at(true, Some(true), now);
+        let s = d.snapshot_at(true, ld(true, true), now);
         assert_eq!(s.cursor_score, 0.0, "Tier B is 0.0.4");
         // max(pattern, cursor) must still pick the pattern up.
         assert!((s.confidence - s.pattern_score).abs() < 1e-6);
@@ -775,7 +792,7 @@ mod tests {
         let mut d = PromptDetector::new(cfg);
         let now = Instant::now() + Duration::from_secs(10);
         d.feed_at(b"ready> ", 0, Instant::now());
-        let s = d.snapshot_at(true, Some(true), now);
+        let s = d.snapshot_at(true, ld(true, true), now);
         assert!((s.pattern_score - 0.95).abs() < 1e-6);
         assert_eq!(s.detection_tier, DetectionTier::Heuristic);
     }
@@ -789,7 +806,7 @@ mod tests {
         let mut d = PromptDetector::new(cfg);
         let start = Instant::now();
         d.feed_at(b">>> ", 0, start);
-        let s = d.snapshot_at(true, Some(true), start + Duration::from_millis(250));
+        let s = d.snapshot_at(true, ld(true, true), start + Duration::from_millis(250));
         assert!(
             (s.quiescent_score - 0.25).abs() < 0.01,
             "a 1000 ms threshold must not settle in 250 ms: {}",
@@ -803,7 +820,7 @@ mod tests {
     fn an_exited_child_forces_exited_and_zero_scores() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b[?2004hbash-5.3$ ");
-        let s = d.snapshot_at(false, None, now);
+        let s = d.snapshot_at(false, LineDiscipline::UNKNOWN, now);
         assert_eq!(s.interaction_mode, InteractionMode::Exited);
         assert_eq!(s.confidence, 0.0);
         assert_eq!(s.quiescent_score, 0.0);
@@ -827,26 +844,30 @@ mod tests {
         // the expected scores are identical across the three rows and only
         // `detection_tier` moves.
         //
-        // The `echo` column is not decoration: with echo off the T2 rung
-        // answers AwaitingSecret before T3 is ever consulted, so the
-        // heuristic row has to be a session whose echo is *on* — which is
-        // exactly what a `dash` prompt looks like (§8.7).
-        for (bytes, echo, tier) in [
+        // The line-discipline column is not decoration: with echo off the
+        // T2 rung answers AwaitingSecret before T3 is ever consulted, so
+        // the heuristic row has to be a session whose echo is *on* — which
+        // is exactly what a `dash` prompt looks like (§8.7).
+        for (bytes, line, tier) in [
             (
                 &b"\x1b]133;A\x07alice@host:~$ \x1b]133;B\x07"[..],
-                Some(false),
+                ld(false, true),
                 DetectionTier::Semantic,
             ),
             (
                 &b"\x1b[?2004halice@host:~$ "[..],
-                Some(false),
+                ld(false, true),
                 DetectionTier::TerminalMode,
             ),
-            (&b"alice@host:~$ "[..], Some(true), DetectionTier::Heuristic),
+            (
+                &b"alice@host:~$ "[..],
+                ld(true, true),
+                DetectionTier::Heuristic,
+            ),
         ] {
             let (mut d, start, now) = detector();
             feed(&mut d, start, bytes);
-            let s = d.snapshot_at(true, echo, now);
+            let s = d.snapshot_at(true, line, now);
             assert_eq!(s.detection_tier, tier, "{bytes:?}");
             assert_eq!(s.last_line, "alice@host:~$ ", "{bytes:?}");
             assert!(
@@ -865,7 +886,7 @@ mod tests {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b]0;make -j8\x07\x1b[?2004h$ ");
         assert_eq!(
-            d.snapshot_at(true, Some(false), now).title.as_deref(),
+            d.snapshot_at(true, ld(false, true), now).title.as_deref(),
             Some("make -j8")
         );
     }
@@ -874,7 +895,7 @@ mod tests {
     fn a_backend_that_cannot_sample_echo_never_reports_awaiting_secret() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lPassword: ");
-        let s = d.snapshot_at(true, None, now);
+        let s = d.snapshot_at(true, LineDiscipline::UNKNOWN, now);
         assert_eq!(s.interaction_mode, InteractionMode::Executing);
     }
 
@@ -885,7 +906,7 @@ mod tests {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b[?2004h");
         assert_eq!(
-            d.snapshot_at(true, Some(true), now).interaction_mode,
+            d.snapshot_at(true, ld(true, true), now).interaction_mode,
             InteractionMode::AtPrompt,
             "documented limitation: a program printing \\x1b[?2004h is believed"
         );
@@ -972,7 +993,7 @@ mod tests {
             feed(&mut d, start, b"$ ");
             assert_history(&d, false, false, false, false);
 
-            let s = d.snapshot_at(true, Some(true), now);
+            let s = d.snapshot_at(true, ld(true, true), now);
             assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
             assert_eq!(s.detection_tier, DetectionTier::Heuristic);
             assert!((s.confidence - 0.60).abs() < 1e-6, "{}", s.confidence);
@@ -993,7 +1014,7 @@ mod tests {
             feed(&mut d, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n$ ");
             assert_history(&d, false, true, false, false);
 
-            let s = d.snapshot_at(true, Some(true), now);
+            let s = d.snapshot_at(true, ld(true, true), now);
             assert_eq!(
                 s.interaction_mode,
                 InteractionMode::AtPrompt,
@@ -1022,7 +1043,7 @@ mod tests {
             );
             assert_history(&d, false, true, false, false);
 
-            let s = d.snapshot_at(true, Some(true), now);
+            let s = d.snapshot_at(true, ld(true, true), now);
             assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
             assert_eq!(s.detection_tier, DetectionTier::Heuristic);
             assert!((s.confidence - 0.80).abs() < 1e-6, "{}", s.confidence);
@@ -1038,7 +1059,7 @@ mod tests {
             feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lsleep 2\r\n");
             assert_history(&d, true, false, false, false);
 
-            let s = d.snapshot_at(true, Some(true), now);
+            let s = d.snapshot_at(true, ld(true, true), now);
             assert_eq!(s.interaction_mode, InteractionMode::Executing);
             assert_eq!(
                 s.detection_tier,
@@ -1064,7 +1085,7 @@ mod tests {
             feed(&mut d, start, b"\x1b[?1049h:");
             assert_history(&d, false, true, true, false);
 
-            let s = d.snapshot_at(true, Some(true), now);
+            let s = d.snapshot_at(true, ld(true, true), now);
             assert_eq!(s.interaction_mode, InteractionMode::Fullscreen);
             assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
             assert_eq!(s.confidence, 0.0);
@@ -1091,13 +1112,13 @@ mod tests {
             ] {
                 let (mut clean, start, now) = detector();
                 feed(&mut clean, start, tail);
-                let without = clean.snapshot_at(true, Some(true), now);
+                let without = clean.snapshot_at(true, ld(true, true), now);
 
                 let (mut toggled, start, now) = detector();
                 feed(&mut toggled, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n");
                 feed(&mut toggled, start, tail);
                 assert_history(&toggled, false, true, false, false);
-                let with = toggled.snapshot_at(true, Some(true), now);
+                let with = toggled.snapshot_at(true, ld(true, true), now);
 
                 assert_eq!(
                     with,
@@ -1126,7 +1147,8 @@ mod tests {
             feed(&mut d, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n$ ");
             assert_history(&d, false, true, false, false);
             assert_eq!(
-                d.snapshot_at(false, None, now).detection_tier,
+                d.snapshot_at(false, LineDiscipline::UNKNOWN, now)
+                    .detection_tier,
                 DetectionTier::Heuristic,
                 "a session that only ever drove the alternate screen was \
                  never classifiable by terminal mode"
@@ -1159,7 +1181,7 @@ mod tests {
             feed(&mut d, start, b"\x1b]133;A\x07bash-5.3$ ");
             assert_history(&d, false, false, false, true);
 
-            let s = d.snapshot_at(false, None, now);
+            let s = d.snapshot_at(false, LineDiscipline::UNKNOWN, now);
             assert_eq!(s.interaction_mode, InteractionMode::Exited);
             assert_eq!(
                 s.detection_tier,
@@ -1198,7 +1220,7 @@ mod tests {
                 feed(&mut d, start, raw);
                 assert_history(&d, false, false, false, false);
 
-                let s = d.snapshot_at(true, Some(true), now);
+                let s = d.snapshot_at(true, ld(true, true), now);
                 assert_eq!(
                     s.interaction_mode,
                     InteractionMode::AtPrompt,
@@ -1222,7 +1244,8 @@ mod tests {
                 // child: an unmodelled subcommand never made the session
                 // classifiable semantically.
                 assert_eq!(
-                    d.snapshot_at(false, None, now).detection_tier,
+                    d.snapshot_at(false, LineDiscipline::UNKNOWN, now)
+                        .detection_tier,
                     DetectionTier::Heuristic,
                     "{shown:?}: an unmodelled marker forged the session tier"
                 );
@@ -1252,7 +1275,7 @@ mod tests {
             feed(&mut d, start, b"bash-5.3$ ");
             assert_history(&d, false, false, false, false);
 
-            let s = d.snapshot_at(false, None, now);
+            let s = d.snapshot_at(false, LineDiscipline::UNKNOWN, now);
             assert_eq!(s.interaction_mode, InteractionMode::Exited);
             assert_eq!(
                 s.detection_tier,
@@ -1388,7 +1411,7 @@ mod tests {
         ) -> (PromptDetector, Vec<Osc133Event>, Detection) {
             let (mut d, start, now) = detector();
             let ev = d.feed_at(&over_ceiling(introducer, terminator, smuggled), 0, start);
-            let s = d.snapshot_at(true, Some(true), now);
+            let s = d.snapshot_at(true, ld(true, true), now);
             (d, ev, s)
         }
 
@@ -1552,7 +1575,7 @@ mod tests {
                     0,
                     start,
                 );
-                let s = d.snapshot_at(true, Some(true), now);
+                let s = d.snapshot_at(true, ld(true, true), now);
                 assert_eq!(s.last_line, "", "{name}: payload became terminal text");
                 assert_eq!(s.interaction_mode, InteractionMode::Executing, "{name}");
                 assert_eq!(s.detection_tier, DetectionTier::Heuristic, "{name}");
@@ -1573,7 +1596,7 @@ mod tests {
             let m = d.scanner.modes();
             assert!(!m.bracketed_paste && !m.saw_bracketed_paste);
             assert_eq!(
-                d.snapshot_at(true, Some(true), now).detection_tier,
+                d.snapshot_at(true, ld(true, true), now).detection_tier,
                 DetectionTier::Heuristic,
                 "a DCS under the ceiling kept its payload opaque"
             );
@@ -1629,7 +1652,7 @@ mod tests {
 
             let (mut d, start, now) = detector();
             d.feed_at(&sixel(128 * 1024), 0, start);
-            let s = d.snapshot_at(true, Some(true), now);
+            let s = d.snapshot_at(true, ld(true, true), now);
             assert_eq!(
                 s.last_line, "",
                 "a routine 128 KiB sixel tripped the ceiling and handed its \
@@ -1653,13 +1676,13 @@ mod tests {
         fn a_sixel_image_over_the_ceiling_forges_a_prompt_with_no_escape_in_its_payload() {
             let (mut d, start, now) = detector();
             d.feed_at(&sixel(SEQUENCE_MAX / 32), 0, start);
-            let s = d.snapshot_at(true, Some(true), now);
+            let s = d.snapshot_at(true, ld(true, true), now);
             assert_eq!(s.last_line, "", "an image under the ceiling is opaque");
             assert_eq!(s.confidence, 0.0);
 
             let (mut d, start, now) = detector();
             d.feed_at(&sixel(SEQUENCE_MAX + 65536), 0, start);
-            let s = d.snapshot_at(true, Some(true), now);
+            let s = d.snapshot_at(true, ld(true, true), now);
             assert!(
                 s.last_line.ends_with('$'),
                 "the graphics carriage return did not reach the tail: {:?}",

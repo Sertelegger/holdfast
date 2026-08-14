@@ -1,6 +1,11 @@
 //! `portable-pty`-backed PTY. Unix only in 0.0.1; Windows lands in 0.0.11.
 
 use super::{PtyBackend, PtySpawnConfig, Signal};
+// Only the Unix `line_discipline` names this type; on other platforms the
+// trait default answers and importing it unconditionally is a warning the
+// Windows-cross clippy gate turns into an error.
+#[cfg(unix)]
+use super::LineDiscipline;
 use crate::{ClaspError, Result};
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -132,7 +137,7 @@ impl InProcessPty {
     ///
     /// The caching instruction did not survive its own premise. §4.1 caches
     /// `is_alive` because "the PromptDetector calls `is_alive()` per output
-    /// chunk"; **nothing calls `echo_enabled` per chunk** — the read path
+    /// chunk"; **nothing calls `line_discipline` per chunk** — the read path
     /// never samples it, `Session::detection` does, once per tool call. And
     /// `is_alive` itself is not cached in this backend while the child
     /// lives (see below): `waitpid(WNOHANG)` runs on every call. So the
@@ -159,20 +164,28 @@ impl InProcessPty {
     /// terminal genuinely *does* have echo off, which is the case §8.8
     /// already documents.
     #[cfg(unix)]
-    fn sample_echo(&self) -> Option<bool> {
+    fn sample_line_discipline(&self) -> LineDiscipline {
         let master = self.master.lock();
-        let fd = master.as_raw_fd()?;
+        let Some(fd) = master.as_raw_fd() else {
+            return LineDiscipline::UNKNOWN;
+        };
         let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
         // SAFETY: `fd` is the live master end, owned by `self.master` and
         // held under the lock above for the duration of the call.
         let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
         drop(master);
         if rc != 0 {
-            return None;
+            return LineDiscipline::UNKNOWN;
         }
         // SAFETY: tcgetattr returned 0, so the struct is initialised.
         let termios = unsafe { termios.assume_init() };
-        Some(termios.c_lflag & libc::ECHO != 0)
+        // Both flags out of the one struct. Reading `ICANON` here costs
+        // nothing the `ECHO` read did not already pay for, and taking them
+        // together is what makes them describe the same instant.
+        LineDiscipline {
+            echo: Some(termios.c_lflag & libc::ECHO != 0),
+            canonical: Some(termios.c_lflag & libc::ICANON != 0),
+        }
     }
 
     /// Number of `kill(2)` calls this PTY has issued since it was spawned.
@@ -375,15 +388,16 @@ impl PtyBackend for InProcessPty {
         }
     }
 
-    /// Sampled on every call, with **no cache**. See `sample_echo`.
+    /// Sampled on every call, with **no cache**, and both flags out of one
+    /// `tcgetattr`. See `sample_line_discipline`.
     #[cfg(unix)]
-    fn echo_enabled(&self) -> Option<bool> {
+    fn line_discipline(&self) -> LineDiscipline {
         // A dead child's line discipline says nothing about what the
         // session is doing, and the fd may already be closed.
         if !self.is_alive() {
-            return None;
+            return LineDiscipline::UNKNOWN;
         }
-        self.sample_echo()
+        self.sample_line_discipline()
     }
 
     fn exit_code(&self) -> Option<i32> {
@@ -404,7 +418,7 @@ impl PtyBackend for InProcessPty {
 ///
 /// These live beside the implementation rather than in `tests/` because
 /// the property is about the master fd, and driving it needs the fd. Every
-/// other `echo_enabled` test in the tree drives the line discipline
+/// other `line_discipline` test in the tree drives it
 /// through a *child* (`stty -echo`, readline), which means it can only
 /// observe transitions the child chooses to make, when the child gets
 /// round to making them. Setting termios from the master end makes the
@@ -427,8 +441,9 @@ mod echo_freshness {
     /// Set `ECHO` on the slave's line discipline, from the master end.
     ///
     /// The master and the slave share one termios — which is the whole
-    /// reason `sample_echo` can read the slave's flags off the master — so
-    /// this is the same state change `stty -echo` makes, minus the child.
+    /// reason `sample_line_discipline` can read the slave's flags off the
+    /// master — so this is the same state change `stty -echo` makes, minus
+    /// the child.
     fn set_echo(pty: &InProcessPty, on: bool) {
         let master = pty.master.lock();
         let fd = master.as_raw_fd().expect("master fd");
@@ -447,7 +462,7 @@ mod echo_freshness {
     }
 
     #[test]
-    fn echo_enabled_reports_the_line_discipline_it_has_now_not_the_one_it_had() {
+    fn line_discipline_reports_the_line_discipline_it_has_now_not_the_one_it_had() {
         // The 0.0.2 defect, driven rather than raced.
         //
         // Through 0.0.2 the sample was cached for 50 ms. Nothing in the
@@ -471,13 +486,13 @@ mod echo_freshness {
             let started = Instant::now();
             set_echo(&pty, false);
             assert_eq!(
-                pty.echo_enabled(),
+                pty.line_discipline().echo,
                 Some(false),
                 "flip {flip}: echo was just turned off"
             );
             set_echo(&pty, true);
             assert_eq!(
-                pty.echo_enabled(),
+                pty.line_discipline().echo,
                 Some(true),
                 "flip {flip}: a cached sample outlived the line discipline \
                  it described — the session is reported as having echo off \
@@ -506,7 +521,7 @@ mod echo_freshness {
     #[test]
     fn a_dead_childs_line_discipline_is_not_reported_from_an_earlier_sample() {
         // The pair to the above, for the one answer that is *not* a fresh
-        // sample. `echo_enabled` short-circuits on liveness, and with the
+        // sample. `line_discipline` short-circuits on liveness, and with the
         // cache gone the only thing standing between a reaped child and a
         // `tcgetattr` on its fd is that guard. Removing the guard reports
         // `Some(_)` here.
@@ -514,7 +529,7 @@ mod echo_freshness {
         cfg.args = vec!["300".into()];
         let pty = InProcessPty::spawn(&cfg).expect("spawn");
         set_echo(&pty, false);
-        assert_eq!(pty.echo_enabled(), Some(false));
+        assert_eq!(pty.line_discipline().echo, Some(false));
 
         pty.signal(Signal::Kill).expect("kill");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -523,8 +538,8 @@ mod echo_freshness {
         }
         assert!(!pty.is_alive(), "the child never died");
         assert_eq!(
-            pty.echo_enabled(),
-            None,
+            pty.line_discipline(),
+            LineDiscipline::UNKNOWN,
             "a dead child's line discipline says nothing about the session"
         );
     }

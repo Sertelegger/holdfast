@@ -1,7 +1,7 @@
 //! Deterministic in-memory PTY for tests. Output is queued up front;
 //! writes are recorded for assertions.
 
-use super::{PtyBackend, Signal};
+use super::{LineDiscipline, PtyBackend, Signal};
 use crate::Result;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -15,16 +15,17 @@ struct MockState {
     exit_code: Option<i32>,
     size: (u16, u16),
     echo: Option<bool>,
+    canonical: Option<bool>,
 }
 
-/// Something to run when `echo_enabled` is sampled — see
-/// `MockPty::on_echo_sample`.
-type EchoSampleHook = Box<dyn Fn() + Send + Sync>;
+/// Something to run when `line_discipline` is sampled — see
+/// `MockPty::on_line_discipline_sample`.
+type LineDisciplineSampleHook = Box<dyn Fn() + Send + Sync>;
 
 pub struct MockPty {
     state: Mutex<MockState>,
-    /// Run on every `echo_enabled` call, with `state` **not** held.
-    on_echo_sample: Mutex<Option<EchoSampleHook>>,
+    /// Run on every `line_discipline` call, with `state` **not** held.
+    on_line_discipline_sample: Mutex<Option<LineDisciplineSampleHook>>,
 }
 
 // Manual, because a boxed `Fn` is not `Debug`. Deliberately does not lock:
@@ -45,9 +46,13 @@ impl MockPty {
                 size: (120, 40),
                 // A real PTY starts with ECHO on; tests that care set it.
                 echo: Some(true),
+                // A real PTY starts canonical, and stays canonical for
+                // every secret prompt in §8.7. A line editor is what
+                // clears it.
+                canonical: Some(true),
                 ..Default::default()
             }),
-            on_echo_sample: Mutex::new(None),
+            on_line_discipline_sample: Mutex::new(None),
         }
     }
 
@@ -77,22 +82,30 @@ impl MockPty {
         self.state.lock().size
     }
 
-    /// Set what `echo_enabled` reports. `None` models a backend that
-    /// cannot sample the line discipline at all.
+    /// Set what `line_discipline` reports for `ECHO`. `None` models a
+    /// backend that cannot sample the line discipline at all.
     pub fn set_echo(&self, echo: Option<bool>) {
         self.state.lock().echo = echo;
     }
 
-    /// Run `f` at the instant `echo_enabled` is sampled.
+    /// Set what `line_discipline` reports for `ICANON`. `None` models a
+    /// backend that can read `ECHO` and not the canonical bit — a state no
+    /// real platform in this tree produces, and the only way REQ-PD-021's
+    /// degradation rule can be made to fail.
+    pub fn set_canonical(&self, canonical: Option<bool>) {
+        self.state.lock().canonical = canonical;
+    }
+
+    /// Run `f` at the instant `line_discipline` is sampled.
     ///
     /// The one thing a caller of `detection()` cannot otherwise steer is
-    /// *what else happens between the `ECHO` sample and the classification
-    /// that consumes it* — and that interval is where §8.3's echo rung can
-    /// be handed a reading older than the terminal modes it is combined
-    /// with. This hook turns that interleaving into something a test
-    /// drives rather than races for.
-    pub fn on_echo_sample(&self, f: impl Fn() + Send + Sync + 'static) {
-        *self.on_echo_sample.lock() = Some(Box::new(f));
+    /// *what else happens between the line-discipline sample and the
+    /// classification that consumes it* — and that interval is where §8.3's
+    /// echo rung can be handed a reading older than the terminal modes it
+    /// is combined with. This hook turns that interleaving into something a
+    /// test drives rather than races for.
+    pub fn on_line_discipline_sample(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_line_discipline_sample.lock() = Some(Box::new(f));
     }
 }
 
@@ -136,18 +149,22 @@ impl PtyBackend for MockPty {
         self.state.lock().alive
     }
 
-    fn echo_enabled(&self) -> Option<bool> {
+    fn line_discipline(&self) -> LineDiscipline {
         // Before `state` is taken, and while no lock of this backend's is
         // held: the hook exists to let output arrive mid-sample, and
         // `queue_output` needs `state`.
-        if let Some(hook) = self.on_echo_sample.lock().as_ref() {
+        if let Some(hook) = self.on_line_discipline_sample.lock().as_ref() {
             hook();
         }
         let s = self.state.lock();
         if !s.alive {
-            return None;
+            // Both flags, so a dead mock matches a dead `InProcessPty`.
+            return LineDiscipline::UNKNOWN;
         }
-        s.echo
+        LineDiscipline {
+            echo: s.echo,
+            canonical: s.canonical,
+        }
     }
 
     fn exit_code(&self) -> Option<i32> {
@@ -211,21 +228,64 @@ mod tests {
     }
 
     #[test]
-    fn echo_is_settable_and_unreportable_once_the_child_is_gone() {
+    fn both_line_discipline_flags_are_settable_and_unreportable_once_the_child_is_gone() {
         let p = MockPty::new();
-        assert_eq!(p.echo_enabled(), Some(true), "a fresh PTY echoes");
+        assert_eq!(
+            p.line_discipline(),
+            LineDiscipline {
+                echo: Some(true),
+                canonical: Some(true)
+            },
+            "a fresh PTY echoes and is canonical"
+        );
         p.set_echo(Some(false));
-        assert_eq!(p.echo_enabled(), Some(false));
+        assert_eq!(
+            p.line_discipline(),
+            LineDiscipline {
+                echo: Some(false),
+                canonical: Some(true)
+            },
+            "a secret prompt's shape: setting one flag must not move the other"
+        );
+        p.set_canonical(Some(false));
+        assert_eq!(
+            p.line_discipline(),
+            LineDiscipline {
+                echo: Some(false),
+                canonical: Some(false)
+            },
+            "a line editor's shape"
+        );
         // `None` is not `Some(false)`: "echo is off" and "this backend
         // cannot say" are different answers, and the detector treats them
         // differently (§8.2).
         p.set_echo(None);
-        assert_eq!(p.echo_enabled(), None);
-        // A dead child reports `None` even with echo left on, so an impl
-        // that just returned the stored field would fail here.
+        assert_eq!(
+            p.line_discipline(),
+            LineDiscipline {
+                echo: None,
+                canonical: Some(false)
+            }
+        );
+        // The mixed state no real platform in this tree produces, and the
+        // only shape that can falsify REQ-PD-021's degradation rule: `ECHO`
+        // readable, `ICANON` not. A backend modelling the pair as one
+        // `Option` cannot express it, which is why they are two fields.
+        p.set_echo(Some(false));
+        p.set_canonical(None);
+        assert_eq!(
+            p.line_discipline(),
+            LineDiscipline {
+                echo: Some(false),
+                canonical: None
+            }
+        );
+        // A dead child reports UNKNOWN even with both flags set, so an
+        // impl that just returned the stored fields would fail here.
         p.set_echo(Some(true));
+        p.set_canonical(Some(true));
         p.exit(0);
-        assert_eq!(p.echo_enabled(), None);
+        assert_eq!(p.line_discipline(), LineDiscipline::UNKNOWN);
     }
 
     #[test]
