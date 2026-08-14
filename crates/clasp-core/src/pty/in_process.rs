@@ -619,20 +619,54 @@ mod foreground_scope {
     /// are needed — the first alone passes for an accessor that always
     /// returns `None`, and it also catches the narrower mistake of
     /// accepting `Some(0)` as a group.
+    ///
+    /// The child is `sleep 300`, killed here, rather than the
+    /// `bash -c "exit 0"` this test used through 0.0.2. That child was
+    /// designed to exit as fast as it could, so the live-state
+    /// precondition below was a *race against it* rather than an
+    /// observation: on a 48-core box confined to `taskset -c 0,1` at
+    /// `--test-threads=8`, 7 of 20 lib-suite runs panicked on "a live
+    /// child holds the terminal" with the child already reaped
+    /// (`is_alive()` false at the assertion). Deleting that precondition
+    /// would have been the cheap repair and the wrong one — it is the
+    /// only assertion excluding an accessor that always answers `None` —
+    /// so instead the reaping became something this test *performs*,
+    /// between the two observations, at a point of its choosing.
     #[test]
     fn the_detection_accessor_does_not_fall_back_to_the_childs_own_group() {
-        let mut cfg = PtySpawnConfig::new("bash");
-        cfg.args = vec!["-c".into(), "exit 0".into()];
+        let mut cfg = PtySpawnConfig::new("sleep");
+        cfg.args = vec!["300".into()];
         let pty = InProcessPty::spawn(&cfg).expect("spawn");
 
-        // While it lives the two agree, which is what makes the
-        // divergence below a property of the reaped state rather than of
-        // one accessor being broken outright.
-        assert!(
-            pty.foreground_group().is_some(),
-            "a live child holds the terminal"
+        // No wait loop guarding this, deliberately: the terminal already
+        // has a foreground group when `spawn` returns. `portable-pty`
+        // does its `setsid`/`TIOCSCTTY` in a `pre_exec` closure, and
+        // std's Unix `Command::spawn` blocks the parent on the CLOEXEC
+        // sync pipe until the child either reports a `pre_exec` failure
+        // or reaches `execvp` — so the child has taken the terminal
+        // before the parent holds a `Child` at all. Measured at 0 misses
+        // in 1000 spawns under the contention above; a wait loop here
+        // would weaken this to "eventually holds" for nothing.
+        //
+        // While it lives the two accessors agree, which is what makes the
+        // divergence below a property of the *reaped* state rather than
+        // of one accessor being broken outright.
+        let live = pty.foreground_group();
+        assert!(live.is_some(), "a live child holds the terminal");
+        assert_eq!(
+            live,
+            pty.foreground_pgid(),
+            "a live child's terminal needs no fallback, so both accessors \
+             answer with its own group"
         );
 
+        // Now take the child away, on this test's schedule rather than
+        // the child's. The kernel clears the terminal's foreground group
+        // in `disassociate_ctty` during `do_exit`, before the parent can
+        // reap, so once `is_alive` reports false the reaped state below
+        // has already settled — no polling for it, and nothing to hope
+        // about.
+        pty.signal(Signal::Kill).expect("kill");
         let deadline = Instant::now() + Duration::from_secs(5);
         while pty.is_alive() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
