@@ -1274,8 +1274,16 @@ mod tests {
         );
     }
 
-    /// The measured fish line editor, and the pair that separates the rule
-    /// it needs from the rule that would delete `\r` handling outright.
+    /// REQ-DM-010's unit half: the measured fish line editor, and the pair
+    /// that separates the rule it needs from the rule that would delete
+    /// `\r` handling outright. The rule is *arm the reset on a bare `\r`,
+    /// apply it when a byte is actually written over the line*, and it is
+    /// pinned from both sides here because both degenerate spellings are
+    /// measured wrong and in opposite directions. The **history**-level
+    /// half — `command`, exit code and span asserted together over real
+    /// bash, zsh and fish cycles — is in `detect::history`, because in the
+    /// broken direction the codes and spans stay correct and a test that
+    /// checks one column at a time passes against it.
     ///
     /// fish repaints a word at a time as `\r` plus a cursor-forward, and
     /// submits with one final `\r` + CSI before the `\r\n` — so the last

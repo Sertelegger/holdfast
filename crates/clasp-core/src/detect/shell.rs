@@ -90,7 +90,7 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 /// it is invisible to a test that greps for `clasp=1` alone.
 ///
 /// **`return "${1:-0}"` is not decoration — it is the repair of a measured
-/// data-corruption defect (§8.5, spec rev. 42).** CLASP *prepends* itself
+/// data-corruption defect (§8.5, REQ-PD-027).** CLASP *prepends* itself
 /// to `PROMPT_COMMAND`, which bash evaluates as a command list, so `$?` as
 /// seen by the next element was `__clasp_d`'s `printf` — 0, always.
 /// Measured on bash 5.3.9: for a command that exited 42, a starship-shaped

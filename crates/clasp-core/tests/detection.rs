@@ -1966,7 +1966,8 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         both, expected,
         "a shell that was already marking was marked again"
     );
-    // **The `$?` repair, asserted as the property rather than as a count.**
+    // **REQ-PD-027's `$?` repair, asserted as the property rather than as
+    // a count.**
     // `PROMPT_COMMAND` becomes `__clasp_d "$?"; <the user's emitter>`, and
     // bash evaluates that as a command list — so before the fix `$?` had
     // already been overwritten by CLASP's own `printf` (exit 0) by the time

@@ -2127,14 +2127,38 @@ mod tests {
             terminator: Option<&[u8]>,
             smuggled: &[u8],
         ) -> (PromptDetector, Vec<Osc133Event>, Detection) {
+            drive_as(introducer, terminator, smuggled, Some(100), Some(100))
+        }
+
+        /// `drive` with the availability *scope* made an argument: `owner`
+        /// is who held the terminal when the forgery was scanned, `holder`
+        /// who holds it at classification (§8.3, REQ-PD-025).
+        ///
+        /// **The default is a known group that does not change, and that is
+        /// deliberate.** Through rev. 42 this module passed `None` on both
+        /// sides, which is the degenerate fixture REQ-PD-018 names by hand:
+        /// under `licensed = observed ∧ ¬(owner ∧ holder known ∧
+        /// different)`, unknown-on-both-sides can never withhold, so every
+        /// row passed identically against a scoped implementation and
+        /// against rev. 36's unscoped one and the widen mutation could not
+        /// redden any of them. `Some(100)`/`Some(100)` leaves every row's
+        /// answer unchanged while making the rows below a *variation* of
+        /// them rather than a different test.
+        fn drive_as(
+            introducer: &[u8],
+            terminator: Option<&[u8]>,
+            smuggled: &[u8],
+            owner: Option<i32>,
+            holder: Option<i32>,
+        ) -> (PromptDetector, Vec<Osc133Event>, Detection) {
             let (mut d, start, now) = detector();
             let ev = d.feed_at(
                 &over_ceiling(introducer, terminator, smuggled),
                 0,
-                None,
+                owner,
                 start,
             );
-            let s = d.snapshot_at(true, ld(true, true), None, now);
+            let s = d.snapshot_at(true, ld(true, true), holder, now);
             (d, ev, s)
         }
 
@@ -2188,7 +2212,21 @@ mod tests {
                 let (d, _, s) = drive(introducer, *terminator, b"\x1b[?2004h");
                 let m = d.scanner.modes();
                 assert!(m.bracketed_paste, "{name}: mode not set");
-                assert!(m.saw_bracketed_paste, "{name}: availability not set");
+                assert!(m.saw_bracketed_paste, "{name}: the record is not armed");
+                // **The record's owner, asserted separately from the
+                // answer** (REQ-PD-018, REQ-PD-025). The forged record
+                // belongs to the program that forged it — the group the
+                // scanner sampled when it observed the sequence, not the
+                // group at classification. Asserting only the flag, under
+                // the label *availability*, is the pre-rev.-37 spelling
+                // rev. 42 withdrew: it leaves an implementer believing the
+                // scoped rule is pinned here when it is pinned only at
+                // REQ-PD-025.
+                assert_eq!(
+                    m.bracketed_paste_owner,
+                    Some(100),
+                    "{name}: the forged record is owned by the forging program"
+                );
                 assert_eq!(s.interaction_mode, InteractionMode::AtPrompt, "{name}");
                 assert_eq!(s.detection_tier, DetectionTier::TerminalMode, "{name}");
                 assert!(
@@ -2196,6 +2234,95 @@ mod tests {
                     "{name}: {}",
                     s.confidence
                 );
+            }
+        }
+
+        /// Row 2's **scope** half (REQ-PD-018, §8.8 rev. 42): the forged
+        /// record licenses the T2 executing rung for the **forging
+        /// program** and for nothing else.
+        ///
+        /// **The bytes are not row 2's, and the difference is the whole
+        /// test.** Row 2 smuggles `\x1b[?2004h` and is answered by the
+        /// bracketed-paste rung, which reads the mode's *current value* and
+        /// is gated on no availability at all — so scoping cannot move it
+        /// and a row written on those bytes asserts nothing about the
+        /// licence. §8.8 says exactly this: "the two forged current-value
+        /// answers are unaffected by scoping entirely". Turning the mode
+        /// back **off** leaves the record armed with the mode down, which
+        /// is the only state in which the licensed rung is the one that
+        /// answers.
+        ///
+        /// Three arms, and each is required:
+        ///
+        /// - owner == holder — the forging program is still at the
+        ///   terminal, so its own record licenses its own rung. This is the
+        ///   positive, and without it the row below would pass against an
+        ///   implementation that never licenses anything.
+        /// - owner ≠ holder — something else took the terminal, the licence
+        ///   lapses, and the answer drops to the fallback tier. This is the
+        ///   arm rev. 36's unscoped licence fails, and the reason the
+        ///   widen mutation now reddens this module.
+        /// - unknown on both sides — reproduces the owner == holder answer,
+        ///   which is **not a bug**: §8.8 rev. 42 says unknown reproduces
+        ///   rev. 36, and **on ConPTY that is every session**, so the
+        ///   escape-sequence forgery residual is undiminished on Windows.
+        ///   Keeping it is what stops the middle arm being read as
+        ///   "scoping fixes this".
+        #[test]
+        fn the_forged_record_licenses_only_the_program_that_forged_it() {
+            for Carrier {
+                name,
+                introducer,
+                terminator,
+            } in CARRIERS
+            {
+                // The mode is armed and then turned off, so the record is
+                // set and the ungated current-value rung is silent.
+                let armed_then_off = b"\x1b[?2004h\x1b[?2004l";
+                for (arm, owner, holder, tier) in [
+                    (
+                        "the forging program still holds the terminal",
+                        Some(100),
+                        Some(100),
+                        DetectionTier::TerminalMode,
+                    ),
+                    (
+                        "another program holds the terminal",
+                        Some(100),
+                        Some(200),
+                        DetectionTier::Heuristic,
+                    ),
+                    (
+                        "neither side is known — rev. 36, and every ConPTY session",
+                        None,
+                        None,
+                        DetectionTier::TerminalMode,
+                    ),
+                ] {
+                    let (d, _, s) =
+                        drive_as(introducer, *terminator, armed_then_off, owner, holder);
+                    let m = d.scanner.modes();
+                    assert!(!m.bracketed_paste, "{name}/{arm}: the mode is still on");
+                    // The record is sticky and stays armed in every arm —
+                    // asserted, because scoping the *flag* as well would
+                    // break REQ-PD-016's exited tier and REQ-PD-025's
+                    // ConPTY degradation in one move (§11.4, rev. 42).
+                    assert!(
+                        m.saw_bracketed_paste,
+                        "{name}/{arm}: the record must stay armed"
+                    );
+                    assert_eq!(m.bracketed_paste_owner, owner, "{name}/{arm}");
+                    // What moves is the tier, not the mode: a program the
+                    // shell launched is still `Executing` either way, and
+                    // §8.4 still says wait. What changes is whether the
+                    // answer is labelled deterministic or a guess.
+                    assert_eq!(
+                        s.interaction_mode,
+                        InteractionMode::Executing,
+                        "{name}/{arm}"
+                    );
+                    assert_eq!(s.detection_tier, tier, "{name}/{arm}");
+                }
             }
         }
 
