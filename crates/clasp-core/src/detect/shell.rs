@@ -175,58 +175,59 @@ const ZSH_INTEGRATION: &str = concat!(
 /// equivalence — §24). The 0.0.2 integration suite measures it where fish
 /// is installed and skips otherwise.
 ///
-/// **The guard is fish's half of §8.5's "no-op if markers are already
-/// present", and it is not optional on fish 4.** fish 4.0 emits OSC 133
-/// itself — "fish now also marks the prompt and command output with the
-/// OSC 133 sequences" — so the snippet above it marks a shell that is
-/// already marking. Measured out-of-band on fish 4.0.2 (not on this host,
-/// which has no fish): every marker duplicated, the snippet echoed as a
-/// command, and `D;42` never arriving. bash and zsh get the same
-/// protection from a `PS1` string test, which fish cannot use because its
-/// marking lives in the shell binary rather than in a prompt variable.
+/// **It injects unconditionally, and the native-marking guard that used to
+/// stand here was deleted rather than repaired (REQ-PD-028, §8.5.1).**
+/// What shipped through rev. 39 was `$version` ≥ 4 **and** `status
+/// test-feature no-mark-prompt`, declining when it believed fish marked
+/// prompts natively. That is *observe and decline* — the design rev. 36
+/// rejected for bash and zsh in favour of tag-and-yield — moved to the
+/// only moment at which declining is possible and therefore evaluated
+/// against a version number instead of against a marker. Three
+/// measurements across fish 3.7.0, 4.0.2 and 4.8.1 say to remove it, and
+/// the first matters most because it is what anyone correcting the feature
+/// name would reach for:
 ///
-/// The condition is *decline when fish marks prompts natively*, spelled as
-/// two probes rather than a version check alone:
+/// - `no-mark-prompt` is never a feature *name*, only the disabling
+///   spelling, so `status test-feature no-mark-prompt` answers `2`
+///   (unknown) on **every** fish. The probe distinguished nothing.
+/// - The obvious repair — decline iff `status test-feature mark-prompt`
+///   answers `0` — **injects on 4.0.2**, which marks natively and has no
+///   such feature. It is strictly worse than the bug.
+/// - Declining on fish 4.0–4.2 leaves the session with **no `B` marker at
+///   all** (fish emits `A`, `C` and `D` there and never `B`), so the echo
+///   capture has no span and `get_command_history` reports `command: ""`
+///   for every entry — permanently, and not disableable by the user
+///   because the flag is not there. That is precisely the partial-foreign
+///   -integration case §8.5.1's per-letter yielding exists for, reached
+///   through the decline path instead: unguarded, CLASP's tagged `B` is
+///   never yielded because fish supplies none to yield to.
 ///
-/// - `$version` 4 or above — the release the marking landed in. Below it,
-///   inject; fish 3 emits nothing of its own.
-/// - `status test-feature no-mark-prompt` — 0 when the user has turned the
-///   marking off (`set -Ua fish_features no-mark-prompt`), 1 when it is
-///   on, 2 on a fish that has never heard of the flag. Only exit 0 means
-///   *fish is not marking*, so a future fish that drops the flag (it is
-///   documented as temporary) still declines rather than double-marking.
+/// The hazard that blocked removal is discharged by measurement, not
+/// argument: `functions -c fish_prompt` works on 3.7.0, 4.0.2 and 4.8.1
+/// alike, **including when `fish_prompt` is the built-in default** — the
+/// copy exits 0, the copy exists, and the wrapped prompt renders the real
+/// prompt between the markers.
 ///
-/// **Every failure path injects**, which is 0.0.2's behaviour: an errored
-/// probe leaves the `and` chain false, `not` makes it true, and the body
-/// runs. The one behaviour change beyond fish 4 is fish 2.x — no
-/// `$version`, no `status test-feature` — which injects as before.
+/// The separate `set -q CLASP_SHELL_INTEGRATION` self-guard against a
+/// **second CLASP injection** is a different guard against a different
+/// thing (REQ-PD-005) and is untouched.
 ///
-/// **Unverified at runtime, like the rest of this snippet.** fish is not
-/// installed on the machine this was written on, so the guard has never
-/// been parsed by a fish. `fish_integration_emits_the_measured_marker_
-/// stream_and_exact_exit_codes` starts fish with `--features=no-mark-
-/// prompt` on fish 4+ precisely so it keeps measuring *this* snippet
-/// rather than fish's own markers; what a declined fish 4 session looks
-/// like — fish 4.0–4.2 mark prompt start but not prompt end — is measured
-/// by nobody and asserted nowhere.
-/// **The `clasp=1` tag is applied here too, and nothing in this snippet
-/// has been run.** fish is not installed on this host, so every claim
-/// below is a string-level one. Two questions in the same class as the
-/// bash and zsh `$?` measurements above are, for fish, **unmeasured**:
-/// whether `$status` inside `--on-event fish_postexec` is the command's
-/// (fish calls every handler for an event in turn, as zsh does, and zsh
-/// was clean — but "as zsh does" is an inference, not a measurement), and
-/// what the `fish_prompt` wrapper does to `$status` inside the copied
-/// prompt function, which §8.5 records as a *measured* defect on fish
-/// 4.8.1 and which is **not repaired here**. The guard above is also the
-/// rejected observe-and-decline design and is deleted, not fixed, when
-/// §8.5.1's tag-and-yield lands (REQ-PD-028) — not before, since removing
-/// it while the collision rule is absent restores the collision on every
-/// fish ≥ 4.0.
+/// **What remains unverified, stated rather than implied.** fish is not
+/// installed on the host this was written on, so nothing here has been run
+/// *by this workspace's suite*; `fish_integration_emits_the_measured_
+/// marker_stream_and_exact_exit_codes` is the row that measures it and it
+/// skips. The snippet body itself has been driven on live PTYs in
+/// containers for the three versions above, so the claims in this comment
+/// are measurements — but they were taken out of band, and the one
+/// question in the same class as the bash and zsh `$?` measurements is
+/// still open here: **the `fish_prompt` wrapper's `printf` runs before the
+/// copied prompt, so `$status` inside the user's own prompt function is
+/// that `printf`'s 0.** §8.5 records that as measured on 4.8.1 and it is
+/// **not repaired here** — it is REQ-PD-027's fish instance and the
+/// measured repair (capture `$status` first, re-assert it immediately
+/// before the call) is not applied by this milestone.
 const FISH_INTEGRATION: &str = concat!(
     r#"if not set -q CLASP_SHELL_INTEGRATION; "#,
-    r#"and not begin; string match -qr '^([4-9]|[1-9][0-9]+)[.]' -- $version; "#,
-    r#"and not status test-feature no-mark-prompt; end; "#,
     r#"set -g CLASP_SHELL_INTEGRATION 1; "#,
     r#"functions -q __clasp_orig_fish_prompt; "#,
     r#"or functions -c fish_prompt __clasp_orig_fish_prompt; "#,
@@ -393,46 +394,34 @@ mod tests {
         assert!(printf < ret, "the return precedes the emitter: {s}");
     }
 
-    /// fish's half of §8.5's "no-op if markers are already present".
+    /// REQ-PD-028: the fish snippet injects unconditionally.
     ///
-    /// The two POSIX snippets carry a `PS1` string test for this; fish
-    /// cannot, because fish 4.0 emits OSC 133 from the shell binary rather
-    /// than from a prompt variable. Measured out-of-band on fish 4.0.2:
-    /// without a guard every marker is duplicated and `D;42` never
-    /// arrives, so the session's `get_command_history` — the only thing T1
-    /// buys over T2 — is wrong rather than absent.
+    /// Asserted as an **absence**, because the failure this forbids is a
+    /// *respelled* probe — `mark-prompt` instead of `no-mark-prompt`, a
+    /// `$version` comparison written a different way — and a test naming
+    /// one spelling passes against the next one. The presence-asserting
+    /// test that stood here (`the_fish_snippet_declines_when_fish_marks_
+    /// prompts_itself`) is deleted with the guard rather than re-pointed:
+    /// a test re-aimed at the new shape keeps the rejected design's
+    /// vocabulary alive in the suite, and the next reader repairs the
+    /// probe rather than reading the requirement.
     ///
-    /// **What this test can and cannot establish.** It is a string test,
-    /// and this file's own doctrine says string tests cannot tell a
-    /// snippet that *emits* from one that merely *mentions*: seven
-    /// mutations of the shipped snippets pass every structural test here
-    /// while producing nothing at runtime. It kills exactly one class —
-    /// the guard being dropped, or demoted from the `if` condition into
-    /// the body where it would gate nothing — and fish is not installed on
-    /// this host, so nothing anywhere has parsed the clause it asserts.
+    /// `CLASP_SHELL_INTEGRATION` is asserted **present** in the same test.
+    /// That is REQ-PD-005's double-injection self-guard and it is not what
+    /// this removes — without that arm a snippet gutted of both guards
+    /// passes.
     #[test]
-    fn the_fish_snippet_declines_when_fish_marks_prompts_itself() {
+    fn the_fish_snippet_carries_no_version_or_feature_probe() {
         let s = Shell::Fish.integration_snippet();
-        // Both probes, because either alone is wrong: a version test alone
-        // keeps declining for a user who turned fish's marking off, and a
-        // feature test alone declines on a fish 3 that has never heard of
-        // the flag (`status test-feature` answers 2 there, not 0).
-        assert!(s.contains("$version"), "no version probe: {s}");
+        assert!(!s.contains("$version"), "REQ-PD-028: version probe: {s}");
         assert!(
-            s.contains("status test-feature no-mark-prompt"),
-            "no feature probe: {s}"
+            !s.contains("test-feature"),
+            "REQ-PD-028: feature probe: {s}"
         );
-
-        // In the condition, not the body. A guard sitting after `set -g
-        // CLASP_SHELL_INTEGRATION 1` would run unconditionally and gate
-        // nothing, while satisfying both `contains` above.
-        let guard = s.find("no-mark-prompt").expect("probe");
-        let body = s
-            .find("set -g CLASP_SHELL_INTEGRATION")
-            .expect("guard variable");
-        assert!(guard < body, "the guard is in the body, not the condition");
-        let first_marker = s.find(r"\033]133;").expect("an emitter");
-        assert!(guard < first_marker, "an emitter precedes the guard");
+        assert!(
+            s.contains("CLASP_SHELL_INTEGRATION"),
+            "REQ-PD-005's self-guard was removed too: {s}"
+        );
     }
 
     #[test]
