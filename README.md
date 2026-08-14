@@ -2,15 +2,21 @@
 
 An MCP server that gives AI agents persistent, PTY-backed shell sessions.
 
-> **Status: milestone 0.0.2 — early development.** Seven tools, stdio
-> only, Unix only. Sessions die with the MCP process. Output is returned
-> **raw and unredacted**. Not yet suitable for real use.
+> **Status: milestone 0.0.3 — early development.** Eight tools, stdio
+> only, Unix only. Sessions die with the MCP process. Output is
+> ANSI-stripped and secret-redacted by default. Not yet suitable for
+> real use.
 
-## What works today (0.0.2)
+## What works today (0.0.3)
 
 - `start_session` — spawn a shell or program on a real PTY
 - `send_input` — type into it
-- `read_output` — read what it printed, using a cursor you carry between calls
+- `read_output` — read what it printed, using a cursor you carry between
+  calls; escape sequences stripped and secrets replaced with
+  `[REDACTED:<kind>]` markers by default
+- `wait_for_pattern` — block until a regex matches new output, so an
+  agent can wait for a command to finish or a prompt to appear instead of
+  polling; `send_input(wait_for:)` does the same after a write
 - `terminate` — stop it, killing the whole process group
 - `status` — what one session is doing right now
 - `list_sessions` — every session this server knows about, live or exited
@@ -45,8 +51,13 @@ copy of each snippet. Anything else — `dash`, `sh`, a REPL, a plain
 program — degrades silently to `terminal_mode` or `heuristic`, with no
 configuration and no error.
 
-Output is still returned **raw and unredacted**; redaction and ANSI
-stripping arrive in 0.0.3.
+Output is ANSI-stripped and secret-redacted by default: secrets are
+replaced with `[REDACTED:<kind>]` markers, and `read_output` with
+`redact: false` returns the raw bytes and is recorded in the audit log.
+`status` and `list_sessions` redact `command`, `args` and
+`prompt.last_line` on the way out, and every string written to the audit
+log goes through the redactor first — so a session's own trail cannot
+carry the secret whose disclosure it is recording.
 
 ## Build and try it
 

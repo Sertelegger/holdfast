@@ -45,7 +45,7 @@ product, not a flaw in it. So:
 
 What *is* in scope is everything CLASP claims to do about that execution:
 whether the agent is told the truth about what a session is doing, whether a
-`terminate` really terminates, and — once it ships — whether the redactor holds.
+`terminate` really terminates, and whether the redactor holds.
 
 ## In scope
 
@@ -55,20 +55,29 @@ The design routes secret input **client → daemon → PTY**, so a secret never
 appears in a tool argument or a tool result, and a redactor runs at every
 output boundary including the audit log.
 
-**None of that exists in 0.0.2, and the current behaviour is the opposite.**
-Stated plainly, because a security policy that implies shipped protection is
-worse than none:
+**Half of that exists as of 0.0.3. Which half, stated plainly, because a
+security policy that implies shipped protection is worse than none:**
 
-- **`read_output` returns the session's bytes raw.** No redaction, no ANSI
-  stripping. If a command prints a token, an API key, or a password, the agent
-  reads it and it lands in the conversation transcript. This is said in
-  `README.md`, in the MCP server `instructions` string
-  (`crates/clasp-core/src/mcp/mod.rs`), and in `read_output` itself
-  (`crates/clasp-core/src/mcp/tools.rs`). It is a known gap on the roadmap, not
-  a vulnerability report.
-- **There is no secret input channel.** `send_input` writes whatever the agent
-  sends, over the MCP wire. The out-of-band `request_secret_input` path is a
-  later milestone.
+- **The redactor ships and runs on every read.** `read_output`,
+  `wait_for_pattern`, `send_input(wait_for:)`, `status` and `list_sessions`
+  are redacted by default: a match against the vendored rule set is replaced
+  with a `[REDACTED:<kind>]` marker before the bytes leave the process, over
+  an expanded window so a secret straddling a cursor boundary is caught from
+  both sides, and a secret still *arriving* holds the read at its first byte
+  rather than being returned in halves. Every string written to the audit log
+  goes through the same redactor unconditionally.
+- **`read_output(redact: false)` is a real escape hatch and returns raw
+  bytes.** It exists because a withheld partial has to be reachable somehow.
+  Each such read writes a `redaction_disabled` entry to the audit log naming
+  the tool and the calling surface. That is by design, not a bypass.
+- **The redactor is a pattern matcher, and patterns miss.** It catches
+  secret-*shaped* values — the vendored rules cover the common token formats
+  — and it cannot catch a password like `correct horse battery staple`, which
+  matches no rule. Treat it as defence in depth, not as a guarantee that no
+  credential reaches the transcript.
+- **There is still no secret input channel.** `send_input` writes whatever the
+  agent sends, over the MCP wire. The out-of-band `request_secret_input` path
+  is a later milestone.
 - **`start_session(env:)` values cross the MCP boundary** and the argument
   documents that ("Do not pass secrets"). Putting a credential there puts it in
   the transcript.
@@ -79,10 +88,12 @@ caller did not ask for. One fix of exactly this shape has already shipped:
 reports a clipped `envelope::brief(&e)` rather than the raw error, which would
 otherwise have landed in the transcript on every failed spawn.
 
-Once redaction lands, **a bypass of the redactor at any output boundary is
-squarely in scope** — including the paths that are easy to forget, such as
-error strings, the audit log, and bulk output delivered as a resource rather
-than inline.
+**A bypass of the redactor at any output boundary is squarely in scope** —
+including the paths that are easy to forget, such as error strings, the audit
+log, and (when it lands) bulk output delivered as a resource rather than
+inline. A secret reaching an MCP response through a surface that did not run
+the redactor is a report worth making; a secret the rule set simply does not
+match is the documented limit above.
 
 ### Prompt and interaction-state detection
 
@@ -138,9 +149,11 @@ recorded in the code, and accepted:
   differently on them. The discard-to-newline rule leaves a residual: a payload
   carrying a newline hands everything after it to the state machine. This is
   documented at its real reach in `give_up`'s doc comment.
-- **0.0.2 has no ANSI stripper**, so the tier-3 table matches raw bytes:
-  coloured prompts score 0 and the table's false-positive surface is wider than
-  it is designed to be. `patterns.rs` says so and pins it.
+- **The tier-3 pattern table matches raw bytes**, so coloured prompts score 0
+  and the table's false-positive surface is wider than it is designed to be.
+  0.0.3's ANSI stripper did *not* close this: it runs on the read path
+  (`read_output`, `wait_for_pattern`), not ahead of this table. `patterns.rs`
+  says so and pins it.
 
 A report that demonstrates one of these residuals is already known. A report
 showing a **new** path to a forged state, or one that materially lowers the
@@ -198,14 +211,18 @@ scope.
 ## Out of scope
 
 - **Command safety.** There is no preflight, no dangerous-command classifier,
-  and no confirmation flow in 0.0.2. They are on the roadmap; their absence is
+  and no confirmation flow in 0.0.3. They are on the roadmap; their absence is
   not a vulnerability.
-- **Secrets in output.** No redactor has shipped. See above.
+- **A secret the rule set does not match.** The redactor recognises
+  secret-shaped values; a passphrase in prose matches nothing and is returned.
+  A *new pattern* is a welcome contribution rather than a vulnerability
+  report. A secret reaching the agent through a path that skipped the redactor
+  entirely is in scope — see above.
 - **A program inside a session forging its own detection signals.** It is
   inside the trust boundary.
 - **Anything that requires an attacker who already runs as the user running
   `clasp mcp`.** At that point they can start the shell themselves.
-- **Windows.** 0.0.2 is Unix-only. The workspace is kept compiling and
+- **Windows.** 0.0.3 is Unix-only. The workspace is kept compiling and
   clippy-clean for `x86_64-pc-windows-gnu`, but signalling returns an error
   there, there is no process-group handling, and `ECHO` is not sampled. Windows
   is unimplemented, not broken.

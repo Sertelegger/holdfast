@@ -13,10 +13,18 @@
 //! twenty-two rows depend on that `^` to separate a prompt that owns its
 //! line from ordinary output that merely ends the same way. Second, ANSI
 //! stripping happens first: `"\x1b[1;32m$\x1b[0m "` scores 0 while the
-//! stripped `"$ "` scores 0.6. The stripper lands at 0.0.3, so 0.0.2 runs
-//! T3 with its full false-positive surface and no recall on coloured
-//! prompts; both facts are asserted below as the documented behaviour they
-//! are, to be updated rather than deleted when the stripper arrives.
+//! stripped `"$ "` scores 0.6.
+//!
+//! **0.0.3 shipped a stripper and this gap did not close, which is worth
+//! stating because the note here previously said it would.** The stripper
+//! (`output::ansi`) runs on the **read path** — `read_output`,
+//! `wait_for_pattern`, the resource fetches — and the detector still
+//! scores the raw last line the scanner assembled. So T3 keeps its full
+//! false-positive surface *and* has no recall on coloured prompts, which
+//! is the wrong way round and is still owed to a detection milestone
+//! (§8.6, REQ-PD-012). Both facts are asserted below as the documented
+//! behaviour they are, to be updated rather than deleted when the
+//! stripper is wired in *ahead of this table*.
 
 use crate::{ClaspError, Result};
 use regex::{Regex, RegexBuilder};
@@ -917,13 +925,17 @@ mod tests {
     }
 
     #[test]
-    fn an_ansi_decorated_prompt_scores_zero_until_the_stripper_lands() {
-        // The 0.0.2-only gap (§8.6, REQ-PD-012), asserted as the
-        // documented behaviour it is. Most real prompts are SGR-coloured,
-        // so until the 0.0.3 stripper runs ahead of this table T3 carries
-        // its full false-positive surface *and* no recall on them — the
-        // wrong way round, which is why 0.0.3 is not optional. Update this
-        // test when the stripper lands; do not delete it.
+    fn an_ansi_decorated_prompt_scores_zero_because_this_table_sees_raw_bytes() {
+        // §8.6, REQ-PD-012, asserted as the documented behaviour it is.
+        // Most real prompts are SGR-coloured, so while this table scores
+        // raw bytes T3 carries its full false-positive surface *and* no
+        // recall on them — the wrong way round.
+        //
+        // **Renamed at 0.0.3, not deleted.** The old name said "until the
+        // stripper lands"; the stripper landed in 0.0.3 and this score is
+        // still 0, because `output::ansi` runs on the read path and
+        // nothing strips the line this table is handed. Update this test
+        // when the stripper is wired in ahead of it.
         let p = PatternSet::defaults();
         assert_eq!(p.score("\x1b[1;32m$\x1b[0m "), 0.0);
         assert!((p.score("$ ") - 0.6).abs() < 1e-6);
