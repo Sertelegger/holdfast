@@ -629,6 +629,51 @@ async fn history(server: &ClaspServer, id: &str) -> Value {
     )
 }
 
+/// Poll until the history holds at least `n` entries and **every one of
+/// them is closed**, and return that payload.
+///
+/// **A marker being visible is not the history having recorded it**, and
+/// the gap between the two is a real window rather than a nicety. The
+/// reader appends each chunk to the output buffer and feeds the detector —
+/// which is what applies history events — *afterwards* (`session::spawn`),
+/// so a `D` is readable through `read_output` strictly before it has
+/// closed an entry. A row that waits on `await_markers` and then asserts
+/// on `get_command_history` is licensing a claim about one observable with
+/// a wait on another.
+///
+/// Measured with `mcp::detection`'s own probe, a 50 ms sleep injected
+/// between the buffer push and the detector feed: with the probe applied
+/// and this wait absent, all four history rows in this file fail every
+/// run — two, three or four entries short, or missing the nested shell's
+/// command entirely. With the wait they pass. Without the probe the window
+/// is microseconds wide and closes on its own on an idle box, which is the
+/// definition of the flake this file has already shipped once.
+///
+/// A floor, never the assertion: every caller still asserts the *exact*
+/// entry count, commands and exit codes it expects.
+async fn await_closed_history(server: &ClaspServer, id: &str, n: usize) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let h = history(server, id).await;
+        let entries = h["data"]["entries"].as_array().cloned().unwrap_or_default();
+        // `output_end_cursor` and `duration_ms` are what an open entry
+        // lacks. `exit_code` is not the test: a `D` with no payload closes
+        // an entry and still parses to `None`.
+        if entries.len() >= n
+            && entries
+                .iter()
+                .all(|e| e["output_end_cursor"].is_u64() && e["duration_ms"].is_u64())
+        {
+            return h;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the history never reached {n} closed entries; last was {h}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Every OSC 133 marker in `raw`, in order, as its payload — `"A"`, `"B"`,
 /// `"C"`, `"D;42"`.
 ///
@@ -1355,7 +1400,10 @@ async fn assert_marker_stream_and_exit_codes(server: &ClaspServer, id: &str, she
     let m = markers(&raw(server, id).await);
     assert_eq!(m, MEASURED_MARKER_STREAM, "{shell} marker stream");
 
-    let h = history(server, id).await;
+    // Waited for, not sampled: `await_markers` above is satisfied by the
+    // *buffer*, and the history is applied one step later (see
+    // `await_closed_history`).
+    let h = await_closed_history(server, id, 3).await;
     assert_eq!(h["status"], "ok", "history unavailable: {h}");
     let entries = h["data"]["entries"].as_array().expect("entries");
     // Exactly three: the line that installed the integration ran before
@@ -1471,12 +1519,31 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     // integration learns to *observe* whether markers already arrive
     // rather than test a string, the injected half moves to one marker per
     // event and this test's expectation changes with it.
+    //
+    // **Every wait below is the length of what it is about to assert**,
+    // and that is not a stylistic preference. Written as a bare `12` next
+    // to an eighteen-marker expectation, the positive half returned at the
+    // `C`, `C` pair `(exit 42)` opens with and compared a twelve-marker
+    // *prefix* to the full stream. On an idle box bash's remaining six
+    // markers land in the same PTY read and it passes; under core scarcity
+    // the reader drains between the shell's writes and it does not. The
+    // nightly flake hunt caught it on iteration 17 of 20 on a 2-vCPU
+    // runner; here it was 15 red runs of 30 under `taskset -c 0`, and
+    // iteration 9 of 20 under the hunt's own documented `taskset -c 0,1`
+    // invocation. A count derived from the expectation cannot drift away
+    // from it again.
     let server = ClaspServer::new();
+
+    // The fixture's own first prompt: `D;0` from its `PROMPT_COMMAND`, `A`
+    // and `B` from its `PS1`. Both halves start here, and in the declined
+    // half it is the whole of the session's history so far.
+    const FIRST_PROMPT: usize = 3;
 
     // The negative first, and it is what makes the positive mean anything:
     // the same shell with integration declined marks each event exactly
     // once. Without it, a fixture that had silently stopped emitting would
     // make the doubling below unreachable rather than visible.
+    const ALONE: [&str; 7] = ["D;0", "A", "B", "C", "D;42", "A", "B"];
     let declined = start(
         &server,
         StartSessionArgs {
@@ -1485,12 +1552,11 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         },
     )
     .await;
-    await_markers(&server, &declined, 3).await;
+    await_markers(&server, &declined, FIRST_PROMPT).await;
     send(&server, &declined, "(exit 42)").await;
-    let alone = await_markers(&server, &declined, 7).await;
+    let alone = await_markers(&server, &declined, ALONE.len()).await;
     assert_eq!(
-        alone,
-        vec!["D;0", "A", "B", "C", "D;42", "A", "B"],
+        alone, ALONE,
         "the fixture's own prompt is not emitting the stream this test \
          rests on"
     );
@@ -1502,21 +1568,38 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
 
     // The same shell, integration left on. CLASP types its snippet at a
     // prompt that is already marking, and both emitters run from then on.
+    const BOTH: [&str; 18] = [
+        "D;0", "A", "B", // the shell's own first prompt
+        "C", // the snippet's command, marked by the user's PS0
+        "D;0", "D;0", // ... and completed by both PROMPT_COMMANDs
+        "A", "A", "B", "B", // ... and prompted by both PS1s
+        "C", "C", // `(exit 42)` starts, marked twice
+        "D;42", "D;0", // and **the user's exit code is destroyed**
+        "A", "A", "B", "B",
+    ];
+    // The prefix of `BOTH` that the collision itself consists of, before
+    // any command is typed into it.
+    const COLLIDING_PROMPT: usize = 10;
+
     let id = start(&server, already_marking_bash()).await;
-    await_markers(&server, &id, 3).await;
-    send(&server, &id, "(exit 42)").await;
-    let both = await_markers(&server, &id, 12).await;
+    // Ten, not `FIRST_PROMPT`. Three is the fixture's prompt *before* the
+    // snippet has run, so a wait for three types `(exit 42)` into a
+    // session whose collision has not happened yet — the premise this row
+    // is named for, assumed rather than observed. Ten is the first prompt
+    // drawn by two emitters at once, and it exists only once the snippet
+    // is installed. Asserted, not merely counted: the doubling at the
+    // prompt is a separate finding from the doubling at the command, and
+    // this is the half that a `PS1`-text guard was supposed to prevent.
+    let colliding = await_markers(&server, &id, COLLIDING_PROMPT).await;
     assert_eq!(
-        both,
-        vec![
-            "D;0", "A", "B", // the shell's own first prompt
-            "C", // the snippet's command, marked by the user's PS0
-            "D;0", "D;0", // ... and completed by both PROMPT_COMMANDs
-            "A", "A", "B", "B", // ... and prompted by both PS1s
-            "C", "C", // `(exit 42)` starts, marked twice
-            "D;42", "D;0", // and **the user's exit code is destroyed**
-            "A", "A", "B", "B",
-        ],
+        colliding.as_slice(),
+        &BOTH[..COLLIDING_PROMPT],
+        "the snippet did not land on a prompt that was already marking"
+    );
+    send(&server, &id, "(exit 42)").await;
+    let both = await_markers(&server, &id, BOTH.len()).await;
+    assert_eq!(
+        both, BOTH,
         "a shell that was already marking was marked again"
     );
     // The last pair is the finding, and it is worse than duplication.
@@ -1557,7 +1640,7 @@ async fn command_history_cursors_bound_exactly_one_commands_output() {
         await_markers(&server, &id, total).await;
     }
 
-    let h = history(&server, &id).await;
+    let h = await_closed_history(&server, &id, 3).await;
     let entries = h["data"]["entries"].as_array().expect("entries");
     assert_eq!(entries.len(), 3, "{h}");
     let target = &entries[1];
@@ -1646,6 +1729,11 @@ async fn osc133_markers_survive_shell_nesting() {
          outer shell and prove nothing"
     );
 
+    // Three entries so far — `echo CLASP_PID_A`, the nested `bash`, `echo
+    // CLASP_PID_B` — and the count is read *after* they are all recorded
+    // rather than while the last one is still on its way, because it is
+    // the `since_index` the read below is scoped by.
+    await_closed_history(&server, &id, 3).await;
     let before = status(&server, &id).await["command_count"]
         .as_u64()
         .expect("command_count");
@@ -1668,6 +1756,10 @@ async fn osc133_markers_survive_shell_nesting() {
         "the nested shell's markers did not reach the detector intact"
     );
 
+    // Four now, the fourth being `(exit 7)`. `await_markers` above proves
+    // the shell *emitted* `D;7`; this proves the detector has applied it,
+    // which is a later event and the one every assertion below is about.
+    await_closed_history(&server, &id, 4).await;
     let h = body(
         &server
             .get_command_history(Parameters(GetCommandHistoryArgs {
