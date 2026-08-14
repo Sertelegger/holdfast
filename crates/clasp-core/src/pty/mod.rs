@@ -132,6 +132,34 @@ pub trait PtyBackend: Send + Sync {
         LineDiscipline::UNKNOWN
     }
 
+    /// The PTY's **foreground process group** — the terminal's own notion
+    /// of which program holds it, and the same one the kernel uses for
+    /// signal delivery and `SIGTTOU`/`SIGTTIN` (spec §8.3, §4.4).
+    ///
+    /// `None` is **unknown**, and unknown is not a change: the platform
+    /// has no such call, the ioctl failed, or no valid group came back
+    /// (measured: `tcgetpgrp` returns 0 once the child is reaped). §8.3
+    /// withholds a licence only when the owner and the current holder are
+    /// **both known and differ**, so unknown reproduces the pre-rev.-37
+    /// session-scoped classification exactly rather than taking a third
+    /// path — the same guardrail REQ-PD-021 applies to an unreadable
+    /// `ICANON`, and what covers ConPTY (§3.6, §24: Windows has no
+    /// `tcgetpgrp`).
+    ///
+    /// **This is not `interrupt`'s accessor and must not become it.**
+    /// `InProcessPty::foreground_pgid` reads
+    /// `process_group_leader().or(pgid())`, which is correct for signal
+    /// targeting and wrong here: the fallback re-asserts session scope
+    /// while looking like a known answer. One accessor cannot serve both
+    /// (REQ-PD-025).
+    ///
+    /// Cheap: one `tcgetpgrp`. Sampled at classification **and** at the
+    /// moment the scanner observes an availability-conferring signal —
+    /// a handful of times per prompt cycle, not per chunk.
+    fn foreground_group(&self) -> Option<i32> {
+        None
+    }
+
     /// Exit code once the child has exited, else `None`.
     fn exit_code(&self) -> Option<i32>;
 

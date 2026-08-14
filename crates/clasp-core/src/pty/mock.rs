@@ -16,6 +16,7 @@ struct MockState {
     size: (u16, u16),
     echo: Option<bool>,
     canonical: Option<bool>,
+    foreground: Option<i32>,
 }
 
 /// Something to run when `line_discipline` is sampled — see
@@ -50,6 +51,10 @@ impl MockPty {
                 // every secret prompt in §8.7. A line editor is what
                 // clears it.
                 canonical: Some(true),
+                // One program holds the terminal, and it does not change
+                // unless a test says so. Any positive value will do; the
+                // scoping rule only ever compares two of these.
+                foreground: Some(1),
                 ..Default::default()
             }),
             on_line_discipline_sample: Mutex::new(None),
@@ -94,6 +99,14 @@ impl MockPty {
     /// degradation rule can be made to fail.
     pub fn set_canonical(&self, canonical: Option<bool>) {
         self.state.lock().canonical = canonical;
+    }
+
+    /// Set which process group `foreground_group` reports holds the
+    /// terminal. `None` models a platform with no `tcgetpgrp` — ConPTY —
+    /// or an ioctl that failed, which §8.3 treats as *unknown* and not as
+    /// a change (REQ-PD-025).
+    pub fn set_foreground_group(&self, g: Option<i32>) {
+        self.state.lock().foreground = g;
     }
 
     /// Run `f` at the instant `line_discipline` is sampled.
@@ -165,6 +178,17 @@ impl PtyBackend for MockPty {
             echo: s.echo,
             canonical: s.canonical,
         }
+    }
+
+    fn foreground_group(&self) -> Option<i32> {
+        let s = self.state.lock();
+        // A reaped child leaves `tcgetpgrp` answering 0, which
+        // `InProcessPty` reports as unknown. Matching that here keeps the
+        // two backends telling the exited path the same story.
+        if !s.alive {
+            return None;
+        }
+        s.foreground
     }
 
     fn exit_code(&self) -> Option<i32> {

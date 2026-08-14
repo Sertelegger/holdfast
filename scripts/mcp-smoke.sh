@@ -299,6 +299,13 @@ check "read_output shows shell-evaluated output" 'SMOKE_42'
 # not the classifier. Three separate settled instants are sampled here and
 # all three would have to miss for this to pass wrongly -- which is
 # exactly what happens when the §8.5 snippet never runs.
+#
+# Rev. 37's scoped availability does *not* move this, and the reason is
+# worth recording so the next reader need not re-derive it:
+# `AtPrompt`/`semantic` comes from the T1 prompt-marker rung, and `A`/`B`
+# being the last marker means no `C` has arrived, means no command is
+# running, means the emitting shell is itself the foreground program. The
+# owner and the holder are the same group there by construction.
 jcheck "responses carry interaction_mode" \
   '[.[] | .result.structuredContent.data
         | select(.interaction_mode? != null)
@@ -308,11 +315,18 @@ jcheck "responses carry interaction_mode" \
 
 # `semantic` is only reachable if the injected OSC 133 snippet was typed
 # into a real shell and that shell ran it -- it cannot be faked by the
-# PTY echo, which carries the snippet's *text* and no markers. The tier is
-# reported by both the at-prompt and the executing rung once OSC 133 has
-# been seen, so unlike the mode it does not depend on catching the session
-# between commands.
-jcheck "shell integration reached tier 1" 'data(5).detection_tier' '"semantic"'
+# PTY echo, which carries the snippet's *text* and no markers.
+#
+# Written over the transcript rather than over `data(5)` since rev. 37:
+# availability is scoped to the foreground program, so a read landing
+# while an external command runs correctly reports `heuristic`, and
+# pinning one response id makes this a race. At least one prompt-bearing
+# response must have caught the shell itself at the terminal, which is
+# what `semantic` means and what an empty list would not satisfy.
+jcheck "shell integration reached tier 1" \
+  '[.[] | .result.structuredContent.data
+        | select(.detection_tier? == "semantic")] | length > 0' \
+  'true'
 
 # The separator for the two above: a hardcoded `AtPrompt`/`semantic`
 # passes both. §8.7 row 4 is a different mode reached through a different

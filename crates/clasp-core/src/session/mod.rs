@@ -188,7 +188,17 @@ impl Session {
                 // Detection runs outside the buffer lock: §4.3's invariant
                 // is that no lock is held across work that can block, and
                 // each of these has its own short critical section.
-                let events = detector.lock().feed(&buf[..n], base);
+                //
+                // The owner sample belongs with the scan, not with the
+                // classification (§8.3): a shell's `D`/`A` markers arrive
+                // in the same write in which it regains the terminal, so
+                // recording the owner only at classification would
+                // discard the markers that had just re-armed the licence,
+                // at every prompt.
+                let mut detector_guard = detector.lock();
+                let foreground = reader_backend.foreground_group();
+                let events = detector_guard.feed(&buf[..n], base, foreground);
+                drop(detector_guard);
                 if !events.is_empty() {
                     let at = now_ms();
                     let mut h = history.lock();
@@ -236,13 +246,21 @@ impl Session {
     /// narrowing it: no chunk can be classified between the sample and the
     /// classification, so the value handed to the ladder is never older
     /// than the newest byte the ladder has seen. Nothing here can block —
-    /// `is_alive` is a `WNOHANG` wait and `line_discipline` is one ioctl — so
-    /// §4.3's "no lock across blocking work" invariant is intact.
+    /// `is_alive` is a `WNOHANG` wait, `line_discipline` is one ioctl and
+    /// `foreground_group` is one more — so §4.3's "no lock across blocking
+    /// work" invariant is intact.
+    ///
+    /// The foreground sample is taken under the same lock and for the same
+    /// reason (§8.3, REQ-PD-025): it decides whether the availability
+    /// records the ladder is about to read still license anything, so a
+    /// chunk classified between the sample and the answer would let the
+    /// two describe different instants.
     pub fn detection(&self) -> Detection {
         let alive = self.backend.is_alive();
         let mut detector = self.detector.lock();
         let line = self.backend.line_discipline();
-        detector.snapshot(alive, line)
+        let foreground = self.backend.foreground_group();
+        detector.snapshot(alive, line, foreground)
     }
 
     /// True once any OSC 133 marker has arrived, i.e. shell integration is
@@ -787,6 +805,76 @@ mod tests {
             s.detection().interaction_mode == InteractionMode::Executing
         });
         assert_eq!(s.command_count(), 1, "the chunk never reached the history");
+    }
+
+    #[test]
+    fn the_reader_records_who_owned_each_availability_conferring_signal() {
+        // §8.3 requires the foreground group to be sampled at **two**
+        // points: at classification, and at the moment the scanner
+        // observes an availability-conferring signal, to record that
+        // signal's owner. This is the second one, and it is the half no
+        // detector unit test can reach — those hand `feed_at` an owner
+        // directly, so deleting the reader thread's sample leaves every
+        // one of them green while the licence silently reverts to session
+        // scope for every real session (REQ-PD-025).
+        //
+        // The reader is the only place that can take this sample, because
+        // it is the only place that knows *when* the bytes arrived.
+        // Sampling only at classification would break T1 outright: a
+        // shell's `D`/`A` markers arrive in the same write in which it
+        // regains the terminal.
+        let pty = Arc::new(MockPty::new());
+        pty.set_foreground_group(Some(100));
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(4096),
+        );
+
+        // bash drives bracketed paste at its prompt and turns it off to
+        // run something, all while it still holds the terminal. The
+        // trailing `working` is what the wait below keys on: `Executing`
+        // is also what a detector that has seen *nothing* answers, so
+        // waiting on the mode would return before these bytes were fed and
+        // both assertions below would be about an empty detector.
+        pty.queue_output(b"\x1b[?2004h\x1b[?2004lsleep 2\r\nworking");
+        wait_until("the submitted command to be classified", || {
+            s.detection().last_line == "working"
+        });
+
+        // The positive: owner and holder are the same group, so the T2
+        // executing rung is licensed and answers deterministically. Half
+        // of the pair — without it a reader that recorded a *wrong* owner,
+        // or a rule that never licenses anything, would satisfy the
+        // negative below.
+        assert_eq!(
+            s.detection().detection_tier,
+            DetectionTier::TerminalMode,
+            "the program that drove the paste still holds the terminal"
+        );
+
+        // The negative, and the whole point: an external command takes the
+        // terminal. Nothing new is fed, so the only thing that can move
+        // the answer is the owner the reader recorded earlier being
+        // compared against the holder sampled now. A reader that passed
+        // `None` records an unknown owner, unknown never withholds, and
+        // this stays `TerminalMode` — the rev.-36 behaviour, restored in
+        // silence.
+        pty.set_foreground_group(Some(200));
+        let d = s.detection();
+        assert_eq!(
+            d.detection_tier,
+            DetectionTier::Heuristic,
+            "bash's bracketed paste licenses nothing about the command it \
+             launched: {d:?}"
+        );
+        // The mode is unchanged by the narrowing, which is why the tier is
+        // the field asserted: an assertion on the mode alone cannot see
+        // this direction at all.
+        assert_eq!(d.interaction_mode, InteractionMode::Executing);
     }
 
     #[test]

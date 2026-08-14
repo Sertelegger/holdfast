@@ -1416,6 +1416,58 @@ fn line_discipline_separates_a_line_editor_from_a_secret_prompt() {
     pty.signal(Signal::Kill).unwrap();
 }
 
+/// Poll `foreground_group` until `pred` holds, then return the last value.
+fn poll_foreground(
+    pty: &dyn PtyBackend,
+    mut pred: impl FnMut(Option<i32>) -> bool,
+    timeout: Duration,
+) -> Option<i32> {
+    let deadline = Instant::now() + timeout;
+    let mut last = pty.foreground_group();
+    while !pred(last) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(30));
+        last = pty.foreground_group();
+    }
+    last
+}
+
+#[test]
+fn the_foreground_group_changes_for_an_external_command_and_not_for_a_builtin() {
+    // §8.3's discriminator, measured rather than assumed. Both halves are
+    // needed: the first alone passes for an accessor returning the child's
+    // pid plus one, and the second alone for one returning a constant.
+    let pty = InProcessPty::spawn(&bash()).expect("spawn");
+    let at_prompt = poll_foreground(&pty, |g| g.is_some(), Duration::from_secs(5));
+    assert!(at_prompt.is_some(), "the shell never took the terminal");
+    pty.write(b"sleep 3\n").unwrap();
+    let running = poll_foreground(&pty, |g| g != at_prompt, Duration::from_secs(5));
+    assert_ne!(
+        running, at_prompt,
+        "an external command must get its own group"
+    );
+    assert!(
+        running.is_some_and(|g| g > 0),
+        "and a real one: {running:?}"
+    );
+    pty.signal(Signal::Kill).unwrap();
+
+    // A builtin keeps the shell's group, which is why §8.7 row 8's known
+    // false negative is untouched by scoping: the shell really is the
+    // program at the terminal, and the rung's premise really does hold.
+    let pty = InProcessPty::spawn(&bash()).expect("spawn");
+    let at_prompt = poll_foreground(&pty, |g| g.is_some(), Duration::from_secs(5));
+    assert!(at_prompt.is_some(), "the shell never took the terminal");
+    pty.write(b"read -s -n 1 -p 'Key: ' k\n").unwrap();
+    let out = read_until(&pty, "Key: ", Duration::from_secs(5));
+    assert!(out.contains("Key: "), "read never prompted: {out:?}");
+    assert_eq!(
+        pty.foreground_group(),
+        at_prompt,
+        "a builtin keeps the shell's group"
+    );
+    pty.signal(Signal::Kill).unwrap();
+}
+
 #[test]
 fn line_discipline_is_unknown_once_the_child_has_exited() {
     let mut cfg = PtySpawnConfig::new("bash");

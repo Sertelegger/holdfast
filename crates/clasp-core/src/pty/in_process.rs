@@ -47,6 +47,26 @@ pub struct InProcessPty {
     signal_deliveries: AtomicUsize,
 }
 
+/// `tcgetpgrp`'s answer as §8.3's tri-state: a group, or **unknown**.
+///
+/// A process group id is positive. `tcgetpgrp` answers `0` once the child
+/// has been reaped and `-1` on error, and both are *unknown* rather than a
+/// group — reading either as one would make §8.3's owner/holder comparison
+/// fail against a value that names nothing (REQ-PD-025).
+///
+/// **Separated out because it is otherwise untestable, and that is a
+/// measured fact rather than a stylistic one.** `portable-pty` 0.9.0's own
+/// `process_group_leader` already maps non-positive to `None`
+/// (`unix.rs:374`), so no value reaching `foreground_group` through that
+/// backend can exercise the rule and a mutation widening it to `g >= 0`
+/// passes the whole workspace. The rule still belongs here — the trait is
+/// `MasterPty`, not that one implementation — so it is written where it can
+/// be pinned instead of where it cannot.
+#[cfg(unix)]
+fn valid_group(g: Option<i32>) -> Option<i32> {
+    g.filter(|g| *g > 0)
+}
+
 /// Signal a whole process group. Negative pid == "the group" for kill(2).
 #[cfg(unix)]
 fn killpg(pgid: i32, signum: i32) -> std::io::Result<()> {
@@ -400,6 +420,16 @@ impl PtyBackend for InProcessPty {
         self.sample_line_discipline()
     }
 
+    /// The raw `tcgetpgrp`, with **no fallback** — deliberately not
+    /// `foreground_pgid`. See the trait's doc and REQ-PD-025: the
+    /// fallback that makes `interrupt` correct makes detection wrong,
+    /// because it re-asserts session scope while presenting as a known
+    /// answer.
+    #[cfg(unix)]
+    fn foreground_group(&self) -> Option<i32> {
+        valid_group(self.master.lock().process_group_leader())
+    }
+
     fn exit_code(&self) -> Option<i32> {
         if let Some(c) = *self.exit.lock() {
             return Some(c);
@@ -541,6 +571,83 @@ mod echo_freshness {
             pty.line_discipline(),
             LineDiscipline::UNKNOWN,
             "a dead child's line discipline says nothing about the session"
+        );
+    }
+}
+
+/// §11.1 — the *detection* foreground accessor, which is not `interrupt`'s
+/// and must not become it (REQ-PD-025).
+///
+/// Beside the implementation for the same reason as `echo_freshness`: both
+/// accessors under test are private inherent methods, and the distinction
+/// between them is invisible from outside the module.
+#[cfg(all(test, unix))]
+mod foreground_scope {
+    use super::*;
+    use crate::pty::PtySpawnConfig;
+    use std::time::Instant;
+
+    /// `tcgetpgrp`'s non-positive answers are **unknown**, not groups.
+    ///
+    /// The reaped-child test below cannot reach this rule: `portable-pty`
+    /// filters `pid > 0` before CLASP sees the value, so `Some(0)` never
+    /// arrives through that backend and a widened guard passes the whole
+    /// workspace. Asserting the rule directly is what makes it a rule
+    /// rather than a comment — and `Some(-1)` is here too, because
+    /// `tcgetpgrp`'s error return is the other non-group it can produce
+    /// and a guard spelled `!= 0` would let it through into an
+    /// owner/holder comparison.
+    #[test]
+    fn a_non_positive_foreground_group_is_unknown_rather_than_a_group() {
+        assert_eq!(valid_group(Some(0)), None, "a reaped child's tcgetpgrp");
+        assert_eq!(valid_group(Some(-1)), None, "tcgetpgrp's error return");
+        assert_eq!(valid_group(None), None);
+        assert_eq!(valid_group(Some(4242)), Some(4242), "a real group survives");
+    }
+
+    /// REQ-PD-025: the detection accessor must not be `interrupt`'s.
+    ///
+    /// `foreground_pgid` falls back to the child's own group because a
+    /// best-effort signal target beats none. `foreground_group` must not,
+    /// because that fallback re-asserts session scope while presenting as
+    /// a known answer — the fix wearing the defect's clothes, and the
+    /// obvious line to write.
+    ///
+    /// A reaped child is the discriminator and it is measured:
+    /// `tcgetpgrp` answers 0, so the raw accessor reports **unknown**
+    /// while the fallback still reports the child's pgid. Both assertions
+    /// are needed — the first alone passes for an accessor that always
+    /// returns `None`, and it also catches the narrower mistake of
+    /// accepting `Some(0)` as a group.
+    #[test]
+    fn the_detection_accessor_does_not_fall_back_to_the_childs_own_group() {
+        let mut cfg = PtySpawnConfig::new("bash");
+        cfg.args = vec!["-c".into(), "exit 0".into()];
+        let pty = InProcessPty::spawn(&cfg).expect("spawn");
+
+        // While it lives the two agree, which is what makes the
+        // divergence below a property of the reaped state rather than of
+        // one accessor being broken outright.
+        assert!(
+            pty.foreground_group().is_some(),
+            "a live child holds the terminal"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pty.is_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pty.is_alive(), "the child never exited");
+
+        assert_eq!(
+            pty.foreground_group(),
+            None,
+            "detection must report unknown: `tcgetpgrp` answers 0 for a \
+             reaped child, and 0 is not a process group"
+        );
+        assert!(
+            pty.foreground_pgid().is_some(),
+            "signalling still has a target"
         );
     }
 }

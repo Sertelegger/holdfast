@@ -208,7 +208,7 @@ mod tests {
         let mut sc = ModeScanner::new();
         let mut h = CommandHistory::new(max_entries);
         let mut t = 1_000i64;
-        for ev in sc.feed(bytes, 0) {
+        for ev in sc.feed(bytes, 0, None) {
             h.apply(&ev, t);
             t += 10;
         }
@@ -377,7 +377,7 @@ mod tests {
         // backwards reports 18446744073709551516 ms to the agent.
         let mut sc = ModeScanner::new();
         let mut h = CommandHistory::new(100);
-        let evs = sc.feed(b"\x1b]133;C\x07out\x1b]133;D;0\x07", 0);
+        let evs = sc.feed(b"\x1b]133;C\x07out\x1b]133;D;0\x07", 0, None);
         h.apply(&evs[0], 1_000);
         h.apply(&evs[1], 900);
         assert_eq!(h.entries(0, 50)[0].duration_ms, Some(0));

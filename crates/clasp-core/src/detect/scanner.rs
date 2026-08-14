@@ -172,6 +172,18 @@ pub struct Modes {
     /// gates both T1 rungs on its own, so an OSC 133 subcommand the
     /// scanner does not model must leave it alone.
     pub saw_osc133: bool,
+    /// The foreground process group that held the terminal when the most
+    /// recent bracketed-paste transition was seen. `None` means the owner
+    /// could not be sampled — which is *not* a change (§8.3).
+    ///
+    /// Re-recorded on **every** transition, not only the first: a new
+    /// program that drives bracketed paste at its own prompt re-arms the
+    /// licence for itself, which is §8.7 availability row 4c and is the
+    /// case the rung's premise is literally true of.
+    pub bracketed_paste_owner: Option<i32>,
+    /// Likewise for OSC 133, re-recorded on every marker that reaches the
+    /// detector — which is what makes T1 available at every prompt.
+    pub osc133_owner: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -205,6 +217,14 @@ pub struct ModeScanner {
     /// A `\r` was seen and we do not yet know whether it is the first half
     /// of a `\r\n` line terminator or a bare column-0 return.
     pending_cr: bool,
+    /// The foreground process group the caller sampled for the chunk being
+    /// scanned, held for the duration of one `feed`.
+    ///
+    /// The scanner has no backend and must not acquire one: the sample is
+    /// an argument so that "who held the terminal when this byte arrived"
+    /// is decided by the reader thread, which is the only place that knows
+    /// (§8.3, REQ-PD-025).
+    foreground: Option<i32>,
 }
 
 impl Default for ModeScanner {
@@ -230,6 +250,7 @@ impl ModeScanner {
             capture_return_pending: false,
             last_marker: None,
             pending_cr: false,
+            foreground: None,
         }
     }
 
@@ -255,7 +276,16 @@ impl ModeScanner {
     ///
     /// The machine is persistent across calls, so an escape sequence split
     /// across two chunks is still recognised.
-    pub fn feed(&mut self, bytes: &[u8], base: u64) -> Vec<Osc133Event> {
+    ///
+    /// `foreground` is who held the terminal when this chunk was read, and
+    /// it is recorded as the **owner** of any availability-conferring
+    /// signal the chunk carries (§8.3). Sampling only at classification
+    /// would break T1 outright: a shell's `D`/`A` markers arrive in the
+    /// same burst in which it regains the terminal, so a rule that cleared
+    /// the record on noticing the change would discard the markers that had
+    /// just re-armed it, at every prompt.
+    pub fn feed(&mut self, bytes: &[u8], base: u64, foreground: Option<i32>) -> Vec<Osc133Event> {
+        self.foreground = foreground;
         let mut events = Vec::new();
         for (i, &b) in bytes.iter().enumerate() {
             let offset = base + i as u64;
@@ -604,6 +634,12 @@ impl ModeScanner {
                 "2004" => {
                     self.modes.bracketed_paste = on;
                     self.modes.saw_bracketed_paste = true;
+                    // Re-recorded on every transition, not only the first:
+                    // a REPL that drives the paste at its own prompt
+                    // re-arms the licence for itself (§8.7 availability
+                    // row 4c), which is the case the T2 executing rung's
+                    // premise is literally true of.
+                    self.modes.bracketed_paste_owner = self.foreground;
                 }
                 "1049" => {
                     self.modes.alt_screen = on;
@@ -695,6 +731,10 @@ impl ModeScanner {
             _ => return None,
         };
         self.modes.saw_osc133 = true;
+        // Same rule as bracketed paste, and re-recorded on every marker,
+        // which is what keeps T1 available at every prompt: the shell's
+        // `D`/`A` arrive in the burst in which it regains the terminal.
+        self.modes.osc133_owner = self.foreground;
         self.last_marker = Some(kind);
         Some(marker)
     }
@@ -706,7 +746,7 @@ mod tests {
 
     fn scan(input: &[u8]) -> (ModeScanner, Vec<Osc133Event>) {
         let mut s = ModeScanner::new();
-        let ev = s.feed(input, 0);
+        let ev = s.feed(input, 0, None);
         (s, ev)
     }
 
@@ -767,9 +807,9 @@ mod tests {
         // The guard: a scanner that restarted per chunk would see
         // `\x1b[?20` and `04h` and set nothing at all.
         let mut s = ModeScanner::new();
-        s.feed(b"\x1b[?20", 0);
+        s.feed(b"\x1b[?20", 0, None);
         assert!(!s.modes().bracketed_paste, "must not fire on a partial");
-        s.feed(b"04h", 5);
+        s.feed(b"04h", 5, None);
         assert!(s.modes().bracketed_paste, "split sequence was missed");
     }
 
@@ -788,7 +828,7 @@ mod tests {
             &b"\x1b#\x1b[?1049h"[..],      // truncated ESC-intermediate
         ] {
             let mut s = ModeScanner::new();
-            s.feed(raw, 0);
+            s.feed(raw, 0, None);
             assert!(
                 s.modes().alt_screen,
                 "{raw:?}: the sequence after the truncated one was lost"
@@ -823,9 +863,9 @@ mod tests {
                 (&b"\x1bPtmux;q"[..], &b"done$ "[..]),
             ] {
                 let mut s = ModeScanner::new();
-                s.feed(introducer, 0);
-                s.feed(&[abort], introducer.len() as u64);
-                s.feed(rest, introducer.len() as u64 + 1);
+                s.feed(introducer, 0, None);
+                s.feed(&[abort], introducer.len() as u64, None);
+                s.feed(rest, introducer.len() as u64 + 1, None);
                 let want = String::from_utf8(rest.to_vec()).unwrap();
                 assert_eq!(
                     s.last_line(),
@@ -852,7 +892,7 @@ mod tests {
             let mut input = introducer.to_vec();
             input.extend(std::iter::repeat_n(b'x', SEQUENCE_MAX));
             input.extend_from_slice(b"\r\nuser@host:~$ ");
-            s.feed(&input, 0);
+            s.feed(&input, 0, None);
             assert_eq!(
                 s.last_line(),
                 "user@host:~$ ",
@@ -910,7 +950,11 @@ mod tests {
             (&b"\x1bPq"[..], &b"\x1b\\"[..], "user@host:~$ "),
         ] {
             let mut s = ModeScanner::new();
-            s.feed(&oversized_but_well_formed(introducer, terminator, tail), 0);
+            s.feed(
+                &oversized_but_well_formed(introducer, terminator, tail),
+                0,
+                None,
+            );
             assert_eq!(
                 s.last_line(),
                 "",
@@ -933,10 +977,10 @@ mod tests {
         // `OutputStart { command: "ls\nrm -rf /" }`, not a clean "ls", and
         // it is pinned in `detector::tests::sequence_ceiling_residual`.
         let mut s = ModeScanner::new();
-        s.feed(b"\x1b]133;B\x07ls\r\n", 0);
+        s.feed(b"\x1b]133;B\x07ls\r\n", 0, None);
         let osc = oversized_but_well_formed(b"\x1b]52;c;", b"\x07", "root@prod:/etc# ");
-        s.feed(&osc, 12);
-        let ev = s.feed(b"\x1b]133;C\x07", 12 + osc.len() as u64);
+        s.feed(&osc, 12, None);
+        let ev = s.feed(b"\x1b]133;C\x07", 12 + osc.len() as u64, None);
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
@@ -959,7 +1003,7 @@ mod tests {
             let mut input = introducer.to_vec();
             input.extend(std::iter::repeat_n(b'A', SEQUENCE_MAX + 64));
             input.extend_from_slice(b"bash-5.3$ ");
-            s.feed(&input, 0);
+            s.feed(&input, 0, None);
             assert_eq!(
                 s.last_line(),
                 "",
@@ -976,10 +1020,10 @@ mod tests {
         // was not. An empty tail scores 0.0 and reads as `Executing`; a
         // stale one reads as a prompt that may have scrolled away long ago.
         let mut s = ModeScanner::new();
-        s.feed(b"user@host:~$ ", 0);
+        s.feed(b"user@host:~$ ", 0, None);
         let mut input = b"\x1b]0;".to_vec();
         input.extend(std::iter::repeat_n(b'A', SEQUENCE_MAX + 64));
-        s.feed(&input, 13);
+        s.feed(&input, 13, None);
         assert_eq!(
             s.last_line(),
             "",
@@ -1021,7 +1065,7 @@ mod tests {
         let mut input = b"\x1b]0;".to_vec();
         input.extend(std::iter::repeat_n(b'A', SEQUENCE_MAX + 64));
         input.extend_from_slice(b"\x1b[?2004hbash-5.3$ ");
-        s.feed(&input, 0);
+        s.feed(&input, 0, None);
         assert!(
             !s.modes().saw_bracketed_paste,
             "payload before the next newline forged a tier-gating flag"
@@ -1042,7 +1086,7 @@ mod tests {
         input.extend(std::iter::repeat_n(b'x', SEQUENCE_MAX - 8));
         input.push(0x07);
         input.extend_from_slice(b"\x1b]133;A\x07");
-        let ev = s.feed(&input, 0);
+        let ev = s.feed(&input, 0, None);
         assert_eq!(
             ev.len(),
             1,
@@ -1197,8 +1241,8 @@ mod tests {
     #[test]
     fn a_carriage_return_split_across_chunks_still_pairs_with_its_newline() {
         let mut s = ModeScanner::new();
-        s.feed(b"\x1b]133;B\x07echo hi\r", 0);
-        let ev = s.feed(b"\n\x1b]133;C\x07", 16);
+        s.feed(b"\x1b]133;B\x07echo hi\r", 0, None);
+        let ev = s.feed(b"\n\x1b]133;C\x07", 16, None);
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
@@ -1217,8 +1261,8 @@ mod tests {
         // whole class — a PTY read ending just after a progress bar's `\r`
         // is what `cargo`, `curl` and every spinner produce all day.
         let mut s = ModeScanner::new();
-        s.feed(b"\x1b]133;B\x07junk\r", 0);
-        let ev = s.feed(b"real\r\n\x1b]133;C\x07", 13);
+        s.feed(b"\x1b]133;B\x07junk\r", 0, None);
+        let ev = s.feed(b"real\r\n\x1b]133;C\x07", 13, None);
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
@@ -1370,7 +1414,7 @@ mod tests {
     #[test]
     fn escape_sequences_never_reach_the_tail_line() {
         let mut s = ModeScanner::new();
-        s.feed(b"\x1b[1;32muser@host\x1b[0m:\x1b[34m~\x1b[0m$ ", 0);
+        s.feed(b"\x1b[1;32muser@host\x1b[0m:\x1b[34m~\x1b[0m$ ", 0, None);
         assert_eq!(s.last_line(), "user@host:~$ ");
     }
 
@@ -1387,21 +1431,21 @@ mod tests {
         // prompt line an agent is classified against would routinely carry
         // characters the user already removed.
         let mut s = ModeScanner::new();
-        s.feed(b"user@host:~$ ec\x08\x08ls", 0);
+        s.feed(b"user@host:~$ ec\x08\x08ls", 0, None);
         assert_eq!(s.last_line(), "user@host:~$ ls");
     }
 
     #[test]
     fn carriage_return_restarts_the_tail_line() {
         let mut s = ModeScanner::new();
-        s.feed(b"downloading 45%\rdownloading 90%", 0);
+        s.feed(b"downloading 45%\rdownloading 90%", 0, None);
         assert_eq!(s.last_line(), "downloading 90%");
     }
 
     #[test]
     fn newline_restarts_the_tail_line() {
         let mut s = ModeScanner::new();
-        s.feed(b"one\ntwo\nthree$ ", 0);
+        s.feed(b"one\ntwo\nthree$ ", 0, None);
         assert_eq!(s.last_line(), "three$ ");
     }
 
@@ -1419,8 +1463,8 @@ mod tests {
 
         let mut s = ModeScanner::new();
         let long = vec![b'x'; TAIL_LINE_MAX + 50];
-        s.feed(&long, 0);
-        s.feed(b"$ ", long.len() as u64);
+        s.feed(&long, 0, None);
+        s.feed(b"$ ", long.len() as u64, None);
         let line = s.last_line();
         assert_eq!(line.len(), TAIL_LINE_MAX);
         assert!(line.ends_with("$ "), "kept the head instead of the tail");
@@ -1436,7 +1480,7 @@ mod tests {
         let mut input = b"\x1b]0;".to_vec();
         input.extend(std::iter::repeat_n(b'A', OSC_PAYLOAD_MAX * 4));
         input.extend_from_slice(b"\x07after$ ");
-        s.feed(&input, 0);
+        s.feed(&input, 0, None);
         assert_eq!(s.title(), None, "overflowed payload must not be trusted");
         assert_eq!(s.last_line(), "after$ ", "machine failed to resynchronise");
     }
@@ -1464,7 +1508,7 @@ mod tests {
             let mut input = introducer.to_vec();
             input.extend_from_slice(b"\x1b[?2004hiVBORw0KGgoAAAANSUhEUg");
             input.extend_from_slice(b"\x1b\\clean$ ");
-            s.feed(&input, 0);
+            s.feed(&input, 0, None);
             assert!(
                 !s.modes().bracketed_paste && !s.modes().saw_bracketed_paste,
                 "{name}: a mode set inside the payload is data, not a mode \
@@ -1481,8 +1525,8 @@ mod tests {
     #[test]
     fn offsets_are_absolute_across_feeds() {
         let mut s = ModeScanner::new();
-        s.feed(b"hello", 1000);
-        let ev = s.feed(b"\x1b]133;A\x07", 1005);
+        s.feed(b"hello", 1000, None);
+        let ev = s.feed(b"\x1b]133;A\x07", 1005, None);
         assert_eq!(ev[0].start, 1005);
         assert_eq!(ev[0].end, 1013);
     }
