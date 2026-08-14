@@ -1742,6 +1742,16 @@ async fn assert_marker_stream_and_exit_codes(server: &ClaspServer, id: &str, she
         assert!(e["output_end_cursor"].is_u64(), "unfinished entry: {e}");
         assert!(e["duration_ms"].is_u64(), "unfinished entry: {e}");
     }
+
+    // **The negative half of `osc133_source`, at a real shell.** No foreign
+    // emitter is present here, so every marker above is CLASP's own and was
+    // used — `external` is what
+    // `a_prompt_that_already_emits_osc_133_meets_the_injected_snippet`
+    // asserts for the same field on the same kind of shell, and having only
+    // that one would not separate "yielded correctly" from "discards
+    // everything".
+    let s = status(server, id).await;
+    assert_eq!(s["osc133_source"], "clasp", "{shell} status: {s}");
 }
 
 #[tokio::test]
@@ -2032,7 +2042,14 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         "the install line became a history entry: {h}"
     );
 
-    assert_eq!(status(&server, &id).await["shell_integration"], "bash");
+    // Every letter has a foreign writer here, so none of CLASP's markers
+    // reach the detector: `mixed` would mean a letter was still CLASP's and
+    // `clasp` would mean the fixture had stopped emitting. The pair with
+    // `shell_integration` is the point of having two fields — CLASP
+    // injected for bash, and none of what it injected is being used.
+    let s = status(&server, &id).await;
+    assert_eq!(s["osc133_source"], "external", "status: {s}");
+    assert_eq!(s["shell_integration"], "bash", "status: {s}");
     kill(&server, &id).await;
 }
 

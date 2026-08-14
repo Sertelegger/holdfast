@@ -731,6 +731,13 @@ fn session_record(session: &Session) -> serde_json::Value {
         "pid": session.pid(),
         "exit_code": session.exit_code(),
         "shell_integration": session.shell_integration.map(|s| s.as_str()),
+        // What CLASP *injected* is the line above; this is what has since
+        // been observed on the wire (§18.2a, §8.5.1). The two answer
+        // different questions and a session can carry `"fish"` here with
+        // `"external"` below. `start_session`'s response deliberately gets
+        // neither this nor a null for it: §5.2 does not list it there, and
+        // it would be null at every call by construction.
+        "osc133_source": session.osc133_source().map(|s| s.as_str()),
         "command_count": session.command_count(),
         "started_at_unix_secs": unix_secs(session.created_at),
         "last_activity_unix_ms": session.last_activity_ms(),

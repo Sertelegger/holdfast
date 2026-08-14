@@ -319,6 +319,7 @@ fn session_record_keys() -> BTreeSet<String> {
         "pid",
         "exit_code",
         "shell_integration",
+        "osc133_source",
         "command_count",
         "started_at_unix_secs",
         "last_activity_unix_ms",
@@ -722,6 +723,31 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
     }
     let emitted_shells: BTreeSet<String> = shells.iter().map(|s| s.as_str().to_string()).collect();
 
+    // §8.5.1's `osc133_source`, walked the same way. It is a *third*
+    // vocabulary rather than a fourth `ShellIntegration` value because
+    // §12.3's append-only rule is written over fields, not over enum value
+    // sets — and because `mixed` is a state no answer to "which shell did
+    // CLASP inject for" could carry.
+    use clasp_core::detect::Osc133Source as Src;
+    fn next_source(s: Src) -> Option<Src> {
+        match s {
+            Src::Clasp => Some(Src::External),
+            Src::External => Some(Src::Mixed),
+            Src::Mixed => None,
+        }
+    }
+    let mut sources = vec![Src::Clasp];
+    while let Some(next) = next_source(*sources.last().expect("non-empty")) {
+        assert!(
+            !sources.contains(&next),
+            "the Osc133Source walk revisits {:?}",
+            next.as_str()
+        );
+        sources.push(next);
+    }
+    let emitted_sources: BTreeSet<String> =
+        sources.iter().map(|s| s.as_str().to_string()).collect();
+
     // Both directions. A value emitted but not declared is a response that
     // fails its own schema; a value declared but not emitted is vocabulary
     // the agent is told to branch on and never sees.
@@ -740,8 +766,14 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
         emitted_shells,
         "schema::ShellIntegration and detect::Shell::as_str disagree"
     );
+    assert_eq!(
+        declared("status", "Osc133Source"),
+        emitted_sources,
+        "schema::Osc133Source and detect::Osc133Source::as_str disagree"
+    );
     assert_eq!(emitted_states.len(), 4);
     assert_eq!(emitted_shells.len(), 3);
+    assert_eq!(emitted_sources.len(), 3);
 }
 
 // --------------------------------------------------- real tool responses
@@ -1268,6 +1300,59 @@ async fn status_reports_each_field_from_the_session_it_names() {
         payload["details"],
         format!("status of {id}"),
         "status' details line is what a client that ignores structuredContent sees"
+    );
+
+    // `osc133_source` is what the session *observed*, and it answers a
+    // different question from `shell_integration` two assertions up — which
+    // reads `"fish"` here while no fish is involved at all. `TWO_COMMANDS`
+    // carries **untagged** markers, so under §8.5.1 every letter is foreign
+    // and every one of CLASP's would be discarded.
+    assert_eq!(
+        data["osc133_source"], "external",
+        "untagged markers are a foreign emitter's"
+    );
+
+    // The other value, on a second mock fed a `clasp=1`-tagged copy of the
+    // same stream — cheaper than a real shell and enough to keep both
+    // values exercised, so a `session_record` that hardcoded either one
+    // fails here. (`mixed` is measured on a verbatim fish 4.0.2 capture in
+    // `detect::history`, where a real partial emitter produces it.)
+    let tagged: Vec<u8> = String::from_utf8_lossy(TWO_COMMANDS)
+        .replace("\u{1b}]133;A\u{7}", "\u{1b}]133;A;clasp=1\u{7}")
+        .replace("\u{1b}]133;B\u{7}", "\u{1b}]133;B;clasp=1\u{7}")
+        .replace("\u{1b}]133;C\u{7}", "\u{1b}]133;C;clasp=1\u{7}")
+        .replace("\u{1b}]133;D;3\u{7}", "\u{1b}]133;D;3;clasp=1\u{7}")
+        .replace("\u{1b}]133;D;4\u{7}", "\u{1b}]133;D;4;clasp=1\u{7}")
+        .into_bytes();
+    let pty2 = Arc::new(MockPty::new());
+    pty2.queue_output(&tagged);
+    let id2 = register(
+        &server,
+        Some("gamma"),
+        "mycmd",
+        &[],
+        SessionConfig {
+            shell_integration: Some(Shell::Bash),
+            ..SessionConfig::with_buffer_capacity(4096)
+        },
+        &pty2,
+    );
+    let s2 = server.registry.get(&id2).expect("session");
+    until("the tagged stream to be recorded", || {
+        s2.command_count() == 2
+    })
+    .await;
+    let d2 = body(
+        &server
+            .status(Parameters(StatusArgs {
+                session: id2.clone(),
+            }))
+            .await
+            .expect("status"),
+    );
+    assert_eq!(
+        d2["data"]["osc133_source"], "clasp",
+        "tagged markers are CLASP's own"
     );
 
     // A resolvable session that is nonetheless *not* this one must not

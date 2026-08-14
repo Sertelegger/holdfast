@@ -127,6 +127,29 @@ pub enum ShellIntegration {
     Fish,
 }
 
+/// Whose OSC 133 markers the session is **using** (§18.2a, §8.5.1).
+///
+/// Distinct from `shell_integration`, which records only what CLASP
+/// *injected* and is fixed at spawn. `external` and `mixed` do **not** mean
+/// CLASP declined to inject: the snippet is installed and firing, and its
+/// markers are being dropped on arrival. Null until the first marker
+/// arrives, which is genuinely all CLASP knows before the first prompt
+/// cycle.
+///
+/// A new **field** rather than a fourth value on `ShellIntegration`, and
+/// §12.3 is the reason: the append-only rule is written over fields —
+/// "existing fields stay; new optional fields can be added" — and says
+/// nothing that makes widening a closed enum's value set free. It is also
+/// the more honest shape, since `mixed` is a state no value of "which shell
+/// CLASP injected for" could express.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Osc133Source {
+    Clasp,
+    External,
+    Mixed,
+}
+
 /// The `prompt` object carried by every prompt-bearing response (§18.2a).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -228,6 +251,9 @@ pub struct SessionRecord {
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub shell_integration: Option<ShellIntegration>,
+    /// Whose markers the session is using (§8.5.1). Null until the first
+    /// marker arrives.
+    pub osc133_source: Option<Osc133Source>,
     pub command_count: Option<u64>,
     pub started_at_unix_secs: Option<u64>,
     pub last_activity_unix_ms: Option<i64>,
