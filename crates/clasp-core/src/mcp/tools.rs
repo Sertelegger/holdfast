@@ -13,7 +13,7 @@ use crate::output::redact::redact_str;
 use crate::output::rules::RuleSet;
 use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{InProcessPty, PtyBackend, PtySpawnConfig};
-use crate::session::{new_session_id, Session, SessionConfig};
+use crate::session::{new_session_id, wait, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router, ErrorData};
@@ -53,6 +53,47 @@ const MAX_READ_MAX_BYTES: usize = 256 * 1024;
 /// child has stopped draining its tty, and the agent is better served by
 /// a `timeout` it can act on than by a tool call that never returns.
 const SEND_INPUT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `wait_for_pattern`'s default deadline and the ceiling the daemon
+/// enforces whatever the caller asks for (§4.2, REQ-T-008).
+///
+/// `0` does not mean "return immediately" and does not mean "wait for
+/// ever": §5.2 defines it as "no explicit *caller* deadline", which the
+/// daemon still bounds at the cap so a pending wait cannot be retained
+/// indefinitely.
+const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 30;
+pub const WAIT_FOR_PATTERN_MAX_TIMEOUT_SECS: u64 = 3600;
+
+/// How often a withheld match re-checks the holdback boundary while it
+/// waits for the in-flight secret to finish arriving.
+const HOLDBACK_RELEASE_POLL: Duration = Duration::from_millis(50);
+
+/// REQ-T-008. Returns the deadline to wait for, and the cap to report in
+/// `clamped_timeout_secs` — **only** when a clamp actually happened, so an
+/// agent that asked for 30 s never sees the field and one that asked for
+/// `0` or 24 h learns the deadline it will really get.
+fn resolve_wait_timeout(requested: Option<u64>) -> (Duration, Option<u64>) {
+    let cap = WAIT_FOR_PATTERN_MAX_TIMEOUT_SECS;
+    match requested {
+        None => (Duration::from_secs(DEFAULT_WAIT_TIMEOUT_SECS), None),
+        // "No caller deadline", still bounded here.
+        Some(0) => (Duration::from_secs(cap), Some(cap)),
+        Some(n) if n > cap => (Duration::from_secs(cap), Some(cap)),
+        Some(n) => (Duration::from_secs(n), None),
+    }
+}
+
+/// Compile a caller-supplied pattern. A bad regex is an input-schema
+/// violation (§5.1), not an operational failure, so it takes the protocol
+/// channel. The size limit bounds compilation of a pathological pattern;
+/// without it a caller can make the server allocate for as long as it
+/// likes before the first byte is ever scanned.
+fn compile_pattern(pattern: &str) -> Result<regex::bytes::Regex, ErrorData> {
+    regex::bytes::RegexBuilder::new(pattern)
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| ErrorData::invalid_params(format!("pattern is not a valid regex: {e}"), None))
+}
 
 /// The `timeout` envelope for a write that never reached the child.
 fn write_timed_out(details: impl Into<String>) -> CallToolResult {
@@ -468,6 +509,71 @@ impl ClaspServer {
         ))
     }
 
+    /// Wait until a regex matches the session's output, or the deadline
+    /// passes. Scans history from since_cursor (default: live output
+    /// only) and then live output, so a pattern that arrives while the
+    /// call is in flight is not missed. match.text and
+    /// output_since_start are secret-redacted; match.offset is the raw
+    /// byte offset.
+    #[tool(
+        annotations(
+            title = "Wait for a regex to match output",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = schema::envelope_schema::<schema::WaitForPattern>()
+    )]
+    pub async fn wait_for_pattern(
+        &self,
+        Parameters(args): Parameters<WaitForPatternArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Argument validation before resolution, as everywhere (§5.1).
+        let pattern = compile_pattern(&args.pattern)?;
+        if args.max_bytes == Some(0) {
+            return Err(ErrorData::invalid_params(
+                "max_bytes must be at least 1",
+                None,
+            ));
+        }
+        let session = match self.registry.get(&args.session) {
+            Ok(s) => s,
+            Err(e) => return envelope::from_error(&e),
+        };
+        let max_bytes = args
+            .max_bytes
+            .unwrap_or(DEFAULT_READ_MAX_BYTES)
+            .min(MAX_READ_MAX_BYTES);
+        let (timeout, clamped) = resolve_wait_timeout(args.timeout_secs);
+
+        let (status, fields) = self
+            .run_wait(
+                &session,
+                &pattern,
+                args.since_cursor,
+                max_bytes,
+                timeout,
+                clamped,
+            )
+            .await;
+        let matched = fields
+            .get("matched")
+            .and_then(|m| m.as_bool())
+            .unwrap_or(false);
+        Ok(envelope::envelope(
+            status,
+            detection::with_detection(
+                serde_json::Value::Object(fields),
+                &session,
+                &self.processor.rules,
+            ),
+            if matched {
+                "pattern matched".to_string()
+            } else {
+                format!("pattern did not match within {}s", timeout.as_secs())
+            },
+        ))
+    }
+
     /// Send keystrokes to a session's stdin.
     #[tool(
         annotations(
@@ -496,6 +602,12 @@ impl ClaspServer {
                 None,
             ));
         }
+        // Compiled before the session is resolved, and before the write:
+        // a bad regex must not leave input typed into a shell (§5.1).
+        let wait_pattern = match &args.wait_for {
+            Some(p) => Some(compile_pattern(p)?),
+            None => None,
+        };
 
         let session = match self.registry.get(&args.session) {
             Ok(s) => s,
@@ -527,9 +639,15 @@ impl ClaspServer {
         // `spawn_blocking` moves it to the blocking pool, and the deadline
         // means the tool answers whether or not the child ever cooperates.
         let writer_session = Arc::clone(&session);
-        let write = tokio::task::spawn_blocking(move || writer_session.write_input(&payload));
-        let written = match tokio::time::timeout(SEND_INPUT_TIMEOUT, write).await {
-            Ok(Ok(Ok(n))) => n,
+        // `write_input_acked`, not `write_input`: the ack carries the
+        // `buffer.head` sampled inside this task immediately before the
+        // write. That is `wait_for`'s scan start (§5.2), and sampling it
+        // in the handler instead races the child's echo — a fast command's
+        // first bytes land between the handler's snapshot and the write
+        // and then vanish from `output_since_start`.
+        let write = tokio::task::spawn_blocking(move || writer_session.write_input_acked(&payload));
+        let ack = match tokio::time::timeout(SEND_INPUT_TIMEOUT, write).await {
+            Ok(Ok(Ok(ack))) => ack,
             // An earlier write is still parked on this session's writer
             // lock, so this one never even reached the fd.
             Ok(Ok(Err(crate::ClaspError::WriteTimeout))) => {
@@ -577,14 +695,52 @@ impl ClaspServer {
         // REQ-SEC-011: the write still happens — the agent may know
         // something CLASP does not — but the event is made visible.
         let warning = awaiting.then_some("session_awaiting_secret");
+        let written = ack.bytes_written;
 
-        Ok(envelope::ok(
+        let Some(pattern) = wait_pattern else {
+            return Ok(envelope::ok(
+                detection::with_detection(
+                    json!({ "bytes_written": written, "warning": warning }),
+                    &session,
+                    &self.processor.rules,
+                ),
+                format!("wrote {written} bytes"),
+            ));
+        };
+
+        // `wait_for` shares `wait_for_pattern`'s semantics verbatim,
+        // through the same function (§5.2). The one difference is where
+        // "start" is: `send_input` has no `since_cursor`, so it scans from
+        // the writer task's `pre_write_head`.
+        let (timeout, clamped) = resolve_wait_timeout(args.timeout_secs);
+        let (status, mut fields) = self
+            .run_wait(
+                &session,
+                &pattern,
+                Some(ack.pre_write_head),
+                DEFAULT_READ_MAX_BYTES,
+                timeout,
+                clamped,
+            )
+            .await;
+        fields.insert("bytes_written".into(), json!(written));
+        fields.insert("warning".into(), json!(warning));
+        let matched = fields
+            .get("matched")
+            .and_then(|m| m.as_bool())
+            .unwrap_or(false);
+        Ok(envelope::envelope(
+            status,
             detection::with_detection(
-                json!({ "bytes_written": written, "warning": warning }),
+                serde_json::Value::Object(fields),
                 &session,
                 &self.processor.rules,
             ),
-            format!("wrote {written} bytes"),
+            if matched {
+                format!("wrote {written} bytes; pattern matched")
+            } else {
+                format!("wrote {written} bytes; pattern did not match")
+            },
         ))
     }
 
@@ -796,6 +952,129 @@ impl ClaspServer {
     }
 }
 
+impl ClaspServer {
+    /// Run one wait and render §5.2's eight shared fields.
+    ///
+    /// **`wait_for_pattern` and `send_input(wait_for=)` both come through
+    /// here, and that is the requirement rather than tidiness**: §5.2 says
+    /// the two share holdback semantics *verbatim*, and a second
+    /// implementation is what makes "verbatim" drift.
+    async fn run_wait(
+        &self,
+        session: &Arc<Session>,
+        pattern: &regex::bytes::Regex,
+        since_cursor: Option<u64>,
+        max_bytes: usize,
+        timeout: Duration,
+        clamped: Option<u64>,
+    ) -> (Status, serde_json::Map<String, serde_json::Value>) {
+        let deadline = std::time::Instant::now() + timeout;
+        let outcome = wait::for_pattern(
+            session,
+            pattern,
+            wait::WaitSpec {
+                since_cursor,
+                timeout,
+            },
+        )
+        .await;
+
+        // A match that intersects `[holdback_boundary, buffer.head)` is
+        // withheld — the identical predicate `read_output` applies
+        // (REQ-O-004, §4.1). There is no separate match contract and no
+        // pending-match lifecycle; if one appears here, re-read §4.1.
+        let mut boundary = session.holdback_boundary(&self.processor);
+        let mut withheld = outcome.found.is_some_and(|m| m.end > boundary);
+        // The boundary advances as the in-flight secret finishes
+        // arriving, so a partial that completes before the deadline
+        // releases the text (§18.2's second worked example). Only a
+        // deadline that elapses with the match still withheld answers
+        // `timeout`.
+        while withheld && std::time::Instant::now() < deadline && session.is_alive() {
+            tokio::time::sleep(HOLDBACK_RELEASE_POLL).await;
+            boundary = session.holdback_boundary(&self.processor);
+            withheld = outcome.found.is_some_and(|m| m.end > boundary);
+        }
+
+        // `output_since_start` runs through the same pipeline as
+        // `read_output`, and is clipped **before** `match.offset` when the
+        // match is withheld — otherwise the withheld bytes come back
+        // through the surrounding context (§5.2).
+        let context_cap = match outcome.found {
+            Some(m) if withheld => {
+                (m.start.saturating_sub(outcome.scan_start) as usize).min(max_bytes)
+            }
+            _ => max_bytes,
+        };
+        let context = session.read_processed(
+            &ReadRequest {
+                start: ReadStart::Cursor(outcome.scan_start),
+                max_bytes: context_cap,
+                options: ReadOptions::default(),
+                tool: "wait_for_pattern",
+                client_kind: "in_process",
+            },
+            &self.processor,
+        );
+
+        let mut fields = serde_json::Map::new();
+        fields.insert("matched".into(), json!(outcome.found.is_some()));
+        fields.insert(
+            "match".into(),
+            match outcome.found {
+                None => serde_json::Value::Null,
+                Some(m) => {
+                    // `offset` is always the raw byte offset, redacted or
+                    // not, truncated or not. `text` is omitted — not
+                    // nulled — when the match is withheld.
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("offset".into(), json!(m.start));
+                    if !withheld {
+                        let raw = session.buffer_slice(m.start, m.end);
+                        let text =
+                            String::from_utf8_lossy(&crate::output::ansi::strip(&raw)).into_owned();
+                        obj.insert(
+                            "text".into(),
+                            json!(redact_str(&self.processor.rules, &text)),
+                        );
+                    }
+                    serde_json::Value::Object(obj)
+                }
+            },
+        );
+        fields.insert("output_since_start".into(), json!(context.output));
+        fields.insert(
+            "truncated_at_tail".into(),
+            json!(outcome.truncated_at_tail || context.truncated_at_tail),
+        );
+        fields.insert(
+            "truncated_for_size".into(),
+            json!(context.truncated_for_size),
+        );
+        fields.insert("held_back".into(), json!(withheld || context.held_back));
+        fields.insert(
+            "next_cursor".into(),
+            match (withheld, context.next_cursor) {
+                (true, _) => json!(boundary),
+                (false, c) => json!(c),
+            },
+        );
+        if let Some(cap) = clamped {
+            fields.insert("clamped_timeout_secs".into(), json!(cap));
+        }
+
+        let alive = session.is_alive();
+        let status = match (outcome.found.is_some(), withheld, alive) {
+            (true, false, _) => Status::Ok,
+            // Matched but still withheld at the deadline: the operation
+            // did not deliver a complete result, so it is not `ok`.
+            (_, _, false) => Status::SessionDied,
+            _ => Status::Timeout,
+        };
+        (status, fields)
+    }
+}
+
 /// The fields `status` and `list_sessions` share. Both are prompt-bearing
 /// responses (§5.4), so both pass the result through `with_detection`.
 ///
@@ -884,7 +1163,7 @@ pub struct ReadOutputArgs {
     pub redact: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SendInputArgs {
     /// Session id or live session name.
     pub session: String,
@@ -893,6 +1172,35 @@ pub struct SendInputArgs {
     /// Append a newline. Defaults to true.
     #[serde(default)]
     pub append_newline: Option<bool>,
+    /// Regex to wait for after the write, with the same semantics and
+    /// response fields as wait_for_pattern. Output is scanned from
+    /// immediately before the write, so the child's echo is included.
+    #[serde(default)]
+    pub wait_for: Option<String>,
+    /// Deadline for wait_for, in seconds. Defaults to 30; 0 means no
+    /// caller deadline, capped at 3600.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct WaitForPatternArgs {
+    /// Session id or live session name.
+    pub session: String,
+    /// Rust regex matched against the session's raw output bytes.
+    pub pattern: String,
+    /// Deadline in seconds. Defaults to 30. 0 means "no caller deadline"
+    /// and is capped at 3600, reported back as clamped_timeout_secs.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Start scanning from this absolute offset. Defaults to the current
+    /// buffer head, i.e. live output only.
+    #[serde(default)]
+    pub since_cursor: Option<u64>,
+    /// Cap on RAW bytes of output_since_start. Defaults to 32768, hard
+    /// limit 262144. Must be at least 1.
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -940,7 +1248,7 @@ mod tests {
     /// makes the enumeration complete: add a tool without listing it there
     /// and this goes red first.
     #[test]
-    fn the_router_advertises_exactly_the_0_0_2_tool_set() {
+    fn the_router_advertises_exactly_the_0_0_3_tool_set() {
         let mut names: Vec<String> = ClaspServer::tool_router()
             .list_all()
             .into_iter()
@@ -957,9 +1265,11 @@ mod tests {
                 "start_session",
                 "status",
                 "terminate",
+                "wait_for_pattern",
             ],
-            "the advertised tool set changed; update tests/schema.rs::TOOLS \
-             and its annotation table to match"
+            "the advertised tool set changed; update tests/schema.rs::TOOLS, \
+             its annotation table, and scripts/mcp-smoke.sh (which only CI \
+             runs) to match"
         );
     }
 

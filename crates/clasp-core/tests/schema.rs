@@ -25,7 +25,7 @@ use clasp_core::detect::Shell;
 use clasp_core::mcp::envelope;
 use clasp_core::mcp::tools::{
     GetCommandHistoryArgs, ReadOutputArgs, SendInputArgs, StartSessionArgs, StatusArgs,
-    TerminateArgs,
+    TerminateArgs, WaitForPatternArgs,
 };
 use clasp_core::mcp::ClaspServer;
 use clasp_core::pty::{MockPty, PtyBackend};
@@ -51,14 +51,15 @@ fn advertised(name: &str) -> Tool {
         "status" => ClaspServer::status_tool_attr(),
         "list_sessions" => ClaspServer::list_sessions_tool_attr(),
         "get_command_history" => ClaspServer::get_command_history_tool_attr(),
+        "wait_for_pattern" => ClaspServer::wait_for_pattern_tool_attr(),
         other => panic!("no such tool: {other}"),
     }
 }
 
-/// Every tool 0.0.2 ships. REQ-T-013 says "every tool", so this is
+/// Every tool 0.0.3 ships. REQ-T-013 says "every tool", so this is
 /// enumerated rather than spot-checked: a tool added later without a
 /// schema, or without annotations, fails the loops below.
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 8] = [
     "start_session",
     "read_output",
     "send_input",
@@ -66,6 +67,7 @@ const TOOLS: [&str; 7] = [
     "status",
     "list_sessions",
     "get_command_history",
+    "wait_for_pattern",
 ];
 
 fn output_schema(name: &str) -> Value {
@@ -135,6 +137,18 @@ fn keys(v: &Value) -> BTreeSet<String> {
         .keys()
         .cloned()
         .collect()
+}
+
+/// The §5.4 `prompt` block's key set, enumerated once (REQ-T-019).
+fn prompt_keys() -> BTreeSet<String> {
+    set(&[
+        "confidence",
+        "quiescent_score",
+        "pattern_score",
+        "cursor_score",
+        "reason",
+        "last_line",
+    ])
 }
 
 fn set(names: &[&str]) -> BTreeSet<String> {
@@ -567,7 +581,15 @@ fn every_tool_declares_the_annotations_5_3_assigns_it() {
             Some(true),
             Some(false),
         ),
-        // The three read-only tools share one hint combination, so the
+        (
+            "wait_for_pattern",
+            "Wait for a regex to match output",
+            Some(true),
+            None,
+            None,
+            Some(false),
+        ),
+        // The read-only tools share one hint combination, so the
         // *title* is what distinguishes them: a `status` that advertised
         // `list_sessions`'s annotations would pass the boolean columns and
         // fail here.
@@ -1084,6 +1106,7 @@ async fn send_input_and_terminate_session_not_found_responses_match_their_schema
             session: "sess_does_not_exist".into(),
             data: "echo nope".into(),
             append_newline: None,
+            ..Default::default()
         }))
         .await
         .expect("a missing session is a status, not a protocol error");
@@ -1123,6 +1146,7 @@ async fn send_input_response_matches_its_schema() {
             session: id.clone(),
             data: "echo SCHEMA''_OK".into(),
             append_newline: None,
+            ..Default::default()
         }))
         .await
         .expect("send_input must not be a protocol error");
@@ -1168,6 +1192,7 @@ async fn send_input_to_an_echo_off_session_warns_and_still_matches_its_schema() 
             session: id.clone(),
             data: "hunter2".into(),
             append_newline: None,
+            ..Default::default()
         }))
         .await
         .expect("send_input must not be a protocol error");
@@ -1193,6 +1218,7 @@ async fn send_input_session_died_response_matches_its_schema() {
             session: id.clone(),
             data: "x".into(),
             append_newline: None,
+            ..Default::default()
         }))
         .await
         .expect("a dead session is a status, not a protocol error");
@@ -1822,6 +1848,7 @@ async fn send_input_timeout_response_matches_its_schema() {
             session: id,
             data: "x".into(),
             append_newline: Some(false),
+            ..Default::default()
         }))
         .await
         .expect("a write deadline is a status, not a protocol error");
@@ -1943,4 +1970,102 @@ async fn the_status_field_is_constrained_to_the_declared_enum() {
         "`everything_is_fine` is not one of the §18.1 statuses",
         |k| matches!(k, ValidationErrorKind::Enum { .. }),
     );
+}
+
+// ----------------------------------------------------- wait_for_pattern
+
+/// Driven for real, like every other tool: the response the router
+/// produces is validated against the schema the router advertises.
+#[tokio::test]
+async fn wait_for_pattern_response_matches_its_schema() {
+    let server = ClaspServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    // `SCHEMA''_READY` echoes with the quotes and prints without them, so
+    // the needle is producible only by running the command.
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "echo SCHEMA''_READY".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("send_input");
+
+    let matched = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: "SCHEMA_READY".into(),
+            timeout_secs: Some(10),
+            since_cursor: Some(0),
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let payload = assert_matches_schema("wait_for_pattern", &matched);
+    assert_eq!(payload["status"], "ok", "{payload}");
+    assert_eq!(
+        keys(&payload["data"]),
+        set(&[
+            "matched",
+            "match",
+            "output_since_start",
+            "truncated_at_tail",
+            "truncated_for_size",
+            "held_back",
+            "next_cursor",
+            "interaction_mode",
+            "detection_tier",
+            "screen_tracking",
+            "title",
+            "prompt",
+        ]),
+        "wait_for_pattern's data key set drifted from §5.2's Returns list"
+    );
+    // REQ-T-016: the nested objects are pinned too, not just `data`.
+    assert_eq!(keys(&payload["data"]["match"]), set(&["offset", "text"]));
+    assert_eq!(keys(&payload["data"]["prompt"]), prompt_keys());
+
+    // The `timeout` population is a different `data` shape, so it is
+    // validated too. One second, not zero: `timeout_secs: 0` means "no
+    // *caller* deadline" and clamps to the hour cap, so a zero here
+    // against a pattern that never matches is an hour-long test. (It was
+    // written that way first, and that is exactly what it did.)
+    let timed_out = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: "NEVER_EVER_MATCHES".into(),
+            timeout_secs: Some(1),
+            since_cursor: Some(0),
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let payload = assert_matches_schema("wait_for_pattern", &timed_out);
+    assert_eq!(payload["status"], "timeout");
+    assert_eq!(payload["data"]["matched"], false);
+    assert_eq!(payload["data"]["match"], Value::Null);
+    assert!(
+        payload["data"].get("clamped_timeout_secs").is_none(),
+        "one second is inside the cap; nothing was clamped: {payload}"
+    );
+
+    // The third population: the clamp field, which appears only when a
+    // clamp happened. Driven against a pattern that is already in the
+    // buffer, so the hour-long deadline is never waited on.
+    let clamped = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: "SCHEMA_READY".into(),
+            timeout_secs: Some(0),
+            since_cursor: Some(0),
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let payload = assert_matches_schema("wait_for_pattern", &clamped);
+    assert_eq!(payload["data"]["clamped_timeout_secs"], 3600);
+
+    kill(&server, &id).await;
 }

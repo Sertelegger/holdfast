@@ -197,24 +197,24 @@ check "initialize advertises tool capability" '"capabilities":{"tools":'
 # server, and it described a four-tool 0.0.1 surface for the whole of
 # 0.0.2. Asserting the names rather than the prose keeps it honest
 # without pinning wording.
-jcheck "initialize's instructions name every 0.0.2 tool" \
+jcheck "initialize's instructions name every 0.0.3 tool" \
   'resp(1).result.instructions as $i
-   | ["start_session","send_input","read_output","terminate","status",
-      "list_sessions","get_command_history"]
+   | ["start_session","send_input","read_output","wait_for_pattern","terminate",
+      "status","list_sessions","get_command_history"]
    | map(. as $n | select(($i | contains($n)) | not))' \
   '[]'
 
 # ------------------------------------------------- the advertised surface
 
 for tool in start_session read_output send_input terminate status list_sessions \
-            get_command_history; do
+            get_command_history wait_for_pattern; do
   check "tools/list contains $tool" "\"name\":\"$tool\""
 done
 # The loop above cannot see an *extra* tool, and "every tool has X" is
-# only a claim about the seven if seven is all there is.
-jcheck "tools/list advertises exactly the seven 0.0.2 tools" \
+# only a claim about the eight if eight is all there is.
+jcheck "tools/list advertises exactly the eight 0.0.3 tools" \
   'tools | map(.name) | sort' \
-  '["get_command_history","list_sessions","read_output","send_input","start_session","status","terminate"]'
+  '["get_command_history","list_sessions","read_output","send_input","start_session","status","terminate","wait_for_pattern"]'
 
 # REQ-T-014. Four same-typed booleans per tool: a transposition
 # serialises perfectly and passes any check that greps for the word
@@ -228,18 +228,18 @@ jcheck "tools carry MCP annotations" \
    | map([.name, .annotations.title, .annotations.readOnlyHint,
           .annotations.destructiveHint, .annotations.idempotentHint,
           .annotations.openWorldHint])' \
-  '[["get_command_history","List commands run, with exit codes",true,null,null,false],["list_sessions","List all sessions",true,null,null,false],["read_output","Read session output",true,null,null,false],["send_input","Send keystrokes to a session",false,true,false,true],["start_session","Start a PTY-backed shell session",false,true,false,true],["status","Get detailed session status",true,null,null,false],["terminate","Terminate a session",false,true,true,false]]'
+  '[["get_command_history","List commands run, with exit codes",true,null,null,false],["list_sessions","List all sessions",true,null,null,false],["read_output","Read session output",true,null,null,false],["send_input","Send keystrokes to a session",false,true,false,true],["start_session","Start a PTY-backed shell session",false,true,false,true],["status","Get detailed session status",true,null,null,false],["terminate","Terminate a session",false,true,true,false],["wait_for_pattern","Wait for a regex to match output",true,null,null,false]]'
 
 # REQ-T-013, on the wire rather than in Rust. The `$ref` column is the
-# load-bearing one: it is what distinguishes seven tools that each
-# advertise an `outputSchema` from seven tools that advertise the *same*
+# load-bearing one: it is what distinguishes eight tools that each
+# advertise an `outputSchema` from eight tools that advertise the *same*
 # `outputSchema`, which is the shape a copy-paste error takes here and
 # which a presence check cannot see.
 jcheck "tools declare an outputSchema" \
   'tools | sort_by(.name)
    | map([.name, .outputSchema.type, .outputSchema.required,
           .outputSchema.properties.data["$ref"]])' \
-  '[["get_command_history","object",["status","data","details"],"#/$defs/CommandHistory"],["list_sessions","object",["status","data","details"],"#/$defs/ListSessions"],["read_output","object",["status","data","details"],"#/$defs/ReadOutput"],["send_input","object",["status","data","details"],"#/$defs/SendInput"],["start_session","object",["status","data","details"],"#/$defs/StartSession"],["status","object",["status","data","details"],"#/$defs/SessionRecord"],["terminate","object",["status","data","details"],"#/$defs/Terminate"]]'
+  '[["get_command_history","object",["status","data","details"],"#/$defs/CommandHistory"],["list_sessions","object",["status","data","details"],"#/$defs/ListSessions"],["read_output","object",["status","data","details"],"#/$defs/ReadOutput"],["send_input","object",["status","data","details"],"#/$defs/SendInput"],["start_session","object",["status","data","details"],"#/$defs/StartSession"],["status","object",["status","data","details"],"#/$defs/SessionRecord"],["terminate","object",["status","data","details"],"#/$defs/Terminate"],["wait_for_pattern","object",["status","data","details"],"#/$defs/WaitForPattern"]]'
 
 # A `$ref` that resolves to nothing describes nothing. `additionalProperties:
 # false` is separately load-bearing: without it a schema that merely omitted
@@ -250,7 +250,7 @@ jcheck "each tool's data schema resolves to a closed object" \
    | map(.outputSchema
          | (.properties.data["$ref"] | ltrimstr("#/$defs/")) as $d
          | [.["$defs"][$d].type, .["$defs"][$d].additionalProperties])' \
-  '[["object",false],["object",false],["object",false],["object",false],["object",false],["object",false],["object",false]]'
+  '[["object",false],["object",false],["object",false],["object",false],["object",false],["object",false],["object",false],["object",false]]'
 
 # `$defs` only appears in a schemars-generated schema, so this cannot be
 # satisfied by a hand-written stub that says `{"type":"object"}`.

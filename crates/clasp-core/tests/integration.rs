@@ -206,7 +206,7 @@ fn signal_after_exit_is_a_no_op() {
 
 use clasp_core::mcp::tools::{
     GetCommandHistoryArgs, PromptPatternArg, ReadOutputArgs, SendInputArgs, StartSessionArgs,
-    StatusArgs, TerminateArgs,
+    StatusArgs, TerminateArgs, WaitForPatternArgs,
 };
 use clasp_core::mcp::ClaspServer;
 use clasp_core::pty::MockPty;
@@ -771,6 +771,7 @@ async fn send_input_reaches_the_shell() {
             session: id.clone(),
             data: "echo SEND''_MARKER; echo $((6*7))".into(),
             append_newline: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -799,6 +800,7 @@ async fn terminate_is_idempotent_and_preserves_the_output() {
             session: id.clone(),
             data: "echo BEFORE''_TERMINATE".into(),
             append_newline: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -922,6 +924,7 @@ async fn send_input_to_an_exited_session_reports_session_died() {
             session: id,
             data: "echo nope".into(),
             append_newline: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -997,6 +1000,7 @@ async fn wedged_send_input_body() {
                     session,
                     data: payload,
                     append_newline: Some(false),
+                    ..Default::default()
                 }))
                 .await
         }
@@ -1013,6 +1017,7 @@ async fn wedged_send_input_body() {
             session: healthy.clone(),
             data: "echo STILL''_SERVING".into(),
             append_newline: None,
+            ..Default::default()
         })),
     )
     .await
@@ -1056,6 +1061,7 @@ async fn wedged_send_input_body() {
             session: wedged.clone(),
             data: "y".into(),
             append_newline: Some(false),
+            ..Default::default()
         })),
     )
     .await
@@ -1078,6 +1084,7 @@ async fn send_input_rejects_an_oversized_payload() {
             session: id.clone(),
             data: "x".repeat(64 * 1024 + 1),
             append_newline: Some(false),
+            ..Default::default()
         }))
         .await;
     assert!(r.is_err(), "an oversized payload must be a protocol error");
@@ -1089,6 +1096,7 @@ async fn send_input_rejects_an_oversized_payload() {
             session: id.clone(),
             data: "echo SIZE''_OK".into(),
             append_newline: None,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -2902,6 +2910,7 @@ async fn prompt_last_line_is_redacted_on_every_prompt_bearing_tool() {
                 session: id.clone(),
                 data: String::new(),
                 append_newline: Some(false),
+                ..Default::default()
             }))
             .await
             .unwrap(),
@@ -2978,4 +2987,363 @@ async fn exited_at_is_absent_while_the_child_lives_and_set_once_after_it_dies() 
     );
 
     kill_all(&server).await;
+}
+
+// ------------------------------------------- wait_for_pattern, Step 5d
+//
+// A `MockPty` session inserted into the server's own registry, so the
+// arrival of an in-flight secret is deterministic. A real shell cannot be
+// made to stop mid-token on demand, and a test that waits for the race to
+// happen by luck is a test that fails by luck.
+
+fn mock_session_in(server: &ClaspServer, name: &str) -> (String, Arc<MockPty>) {
+    let pty = Arc::new(MockPty::new());
+    let session = Session::new(
+        new_session_id(),
+        Some(name.to_string()),
+        "bash".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn PtyBackend>,
+        SessionConfig::with_buffer_capacity(64 * 1024),
+    );
+    let id = session.id.clone();
+    server.registry.insert(session).expect("registry insert");
+    (id, pty)
+}
+
+fn wait_args(session: &str, pattern: &str) -> WaitForPatternArgs {
+    WaitForPatternArgs {
+        session: session.to_string(),
+        pattern: pattern.to_string(),
+        timeout_secs: Some(2),
+        since_cursor: Some(0),
+        max_bytes: None,
+    }
+}
+
+async fn wait_data(server: &ClaspServer, args: WaitForPatternArgs) -> Value {
+    let r = server
+        .wait_for_pattern(Parameters(args))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    body(&r)
+}
+
+fn wait_until_head(session: &Session, n: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.buffer_head() < n && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(session.buffer_head() >= n, "the reader never caught up");
+}
+
+/// REQ-O-004 and §4.1's worked example: a match that intersects the
+/// withheld region comes back as `timeout` with its offset and **no
+/// text**, and the surrounding context is clipped before the match so the
+/// withheld bytes cannot return through it.
+#[tokio::test]
+async fn a_pattern_matching_an_in_flight_secret_is_withheld_with_its_offset() {
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "withheld");
+    // A partial token: nine bytes of line, then `ghp_` and too few
+    // characters for the rule to complete. The boundary sits at 9.
+    pty.queue_output(b"line one\nghp_abcdef");
+    wait_until_head(&server.registry.get(&id).unwrap(), 18);
+
+    let payload = wait_data(&server, wait_args(&id, r"ghp_\w+")).await;
+    let data = &payload["data"];
+    assert_eq!(
+        payload["status"], "timeout",
+        "a withheld match is not a delivered result: {payload}"
+    );
+    assert_eq!(data["matched"], json!(true));
+    assert_eq!(
+        data["match"]["offset"],
+        json!(9),
+        "the raw offset is always reported"
+    );
+    assert!(
+        data["match"].get("text").is_none(),
+        "the text is omitted, not nulled: {}",
+        data["match"]
+    );
+    assert_eq!(data["held_back"], json!(true));
+    assert_eq!(
+        data["next_cursor"],
+        json!(9),
+        "the agent retries from the boundary"
+    );
+    assert_eq!(
+        data["output_since_start"], "line one\n",
+        "the context is clipped before the match, so the withheld bytes \
+         cannot come back through it"
+    );
+
+    let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+}
+
+/// The paired negative, and the common case: no secret in flight, so
+/// nothing is withheld and the text comes back. Without this, a
+/// withhold-everything implementation passes the row above completely.
+#[tokio::test]
+async fn an_ordinary_match_is_not_withheld() {
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "ordinary");
+    pty.queue_output(b"building\nREADY\n");
+    wait_until_head(&server.registry.get(&id).unwrap(), 14);
+
+    let payload = wait_data(&server, wait_args(&id, "READY")).await;
+    let data = &payload["data"];
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(data["matched"], json!(true));
+    assert_eq!(data["match"]["offset"], json!(9));
+    assert_eq!(data["match"]["text"], json!("READY"));
+    assert_eq!(data["held_back"], json!(false));
+    assert_eq!(data["output_since_start"], "building\nREADY\n");
+
+    let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+}
+
+/// A match whose *text* is a secret is redacted rather than withheld:
+/// the token is complete, so the holdback has nothing to hold, and §5.2's
+/// "match.text is routed through the OutputProcessor" is what applies.
+#[tokio::test]
+async fn a_completed_secret_match_returns_the_redacted_text() {
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "complete");
+    let token = format!("ghp_{TOKEN_TAIL}");
+    pty.queue_output(format!("t={token}\ndone\n").as_bytes());
+    wait_until_head(&server.registry.get(&id).unwrap(), 48);
+
+    let payload = wait_data(&server, wait_args(&id, r"ghp_\w+")).await;
+    let data = &payload["data"];
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(data["match"]["text"], json!("[REDACTED:github]"));
+    assert!(
+        !payload.to_string().contains(&token),
+        "the token reached the agent: {payload}"
+    );
+    assert_eq!(
+        data["match"]["offset"],
+        json!(2),
+        "the offset is the raw one, redacted or not"
+    );
+
+    let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+}
+
+#[tokio::test]
+async fn a_pattern_that_never_matches_reports_timeout_without_a_match() {
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "notimeout");
+    pty.queue_output(b"nothing here\n");
+    wait_until_head(&server.registry.get(&id).unwrap(), 13);
+
+    let mut args = wait_args(&id, "NEVER");
+    args.timeout_secs = Some(1);
+    let payload = wait_data(&server, args).await;
+    assert_eq!(payload["status"], "timeout");
+    assert_eq!(payload["data"]["matched"], json!(false));
+    assert_eq!(payload["data"]["match"], Value::Null);
+    assert_eq!(payload["data"]["held_back"], json!(false));
+
+    let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+}
+
+/// REQ-T-008. `0` is "no caller deadline", which the daemon still bounds;
+/// the agent is told the deadline it will really get.
+#[tokio::test]
+async fn a_zero_timeout_is_clamped_to_the_hour_cap_and_says_so() {
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "clamped");
+    pty.queue_output(b"READY\n");
+    wait_until_head(&server.registry.get(&id).unwrap(), 6);
+
+    let mut args = wait_args(&id, "READY");
+    // The pattern is already in the buffer, so this returns at once — the
+    // clamp is observable without waiting an hour for it.
+    args.timeout_secs = Some(0);
+    let payload = wait_data(&server, args).await;
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(
+        payload["data"]["clamped_timeout_secs"],
+        json!(3600),
+        "0 means no *caller* deadline, not no deadline"
+    );
+
+    let mut args = wait_args(&id, "READY");
+    args.timeout_secs = Some(99_999);
+    let payload = wait_data(&server, args).await;
+    assert_eq!(payload["data"]["clamped_timeout_secs"], json!(3600));
+
+    let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+}
+
+/// The paired negative: a deadline inside the cap is not clamped, and the
+/// field is **absent**. A field that is always present carries no
+/// information, which is what emitting it unconditionally would produce.
+#[tokio::test]
+async fn an_ordinary_timeout_reports_no_clamp_field() {
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "unclamped");
+    pty.queue_output(b"READY\n");
+    wait_until_head(&server.registry.get(&id).unwrap(), 6);
+
+    let mut args = wait_args(&id, "READY");
+    args.timeout_secs = Some(30);
+    let payload = wait_data(&server, args).await;
+    assert_eq!(payload["status"], "ok");
+    assert!(
+        payload["data"].get("clamped_timeout_secs").is_none(),
+        "an agent that asked for 30s must never see this field: {payload}"
+    );
+
+    let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+}
+
+#[tokio::test]
+async fn an_invalid_pattern_is_a_protocol_error_and_never_reaches_the_shell() {
+    let server = ClaspServer::new();
+    let (id, _pty) = mock_session_in(&server, "badregex");
+    let mut args = wait_args(&id, "((((");
+    args.timeout_secs = Some(1);
+    let err = server
+        .wait_for_pattern(Parameters(args))
+        .await
+        .expect_err("a bad regex is an input-schema violation (§5.1)");
+    assert!(err.message.contains("regex"), "{}", err.message);
+
+    // And through `send_input`, where it matters more: a pattern
+    // rejected *after* the write would have typed into a live shell.
+    let session = server.registry.get(&id).unwrap();
+    let err = server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "echo hi".into(),
+            wait_for: Some("((((".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("ditto");
+    assert!(err.message.contains("regex"), "{}", err.message);
+    assert!(
+        session.read_from(0, 4096).bytes.is_empty(),
+        "the rejected call still wrote to the session"
+    );
+
+    let _ = session.signal(Signal::Kill);
+}
+
+/// `send_input(wait_for=)` and `wait_for_pattern` are the same code path,
+/// not a parallel one (§5.2). Driven against the identical arrangement —
+/// a partial token arriving *after* the call starts — the eight shared
+/// fields must agree.
+#[tokio::test]
+async fn send_input_wait_for_returns_the_identical_shape() {
+    let server = ClaspServer::new();
+    let (wid, wpty) = mock_session_in(&server, "shape-wait");
+    let (sid, spty) = mock_session_in(&server, "shape-send");
+
+    for pty in [Arc::clone(&wpty), Arc::clone(&spty)] {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            pty.queue_output(b"line one\nghp_abcdef");
+        });
+    }
+
+    let mut args = wait_args(&wid, r"ghp_\w+");
+    args.since_cursor = None; // live-only, like send_input's
+    args.timeout_secs = Some(2);
+
+    // Concurrently, because both waits must be *running* when the bytes
+    // land: each one's scan starts at the head it saw when it began, and
+    // running them in sequence leaves the second starting after its
+    // session's output had already arrived.
+    let (waited, sent) = tokio::join!(async { wait_data(&server, args).await }, async {
+        body(
+            &server
+                .send_input(Parameters(SendInputArgs {
+                    session: sid.clone(),
+                    // Empty and no newline: nothing is typed, so the
+                    // two sessions see the same bytes.
+                    data: String::new(),
+                    append_newline: Some(false),
+                    wait_for: Some(r"ghp_\w+".into()),
+                    timeout_secs: Some(2),
+                }))
+                .await
+                .expect("send_input must not be a protocol error"),
+        )
+    });
+
+    assert_eq!(waited["status"], sent["status"], "{waited} vs {sent}");
+    for key in [
+        "matched",
+        "match",
+        "output_since_start",
+        "truncated_at_tail",
+        "truncated_for_size",
+        "held_back",
+        "next_cursor",
+    ] {
+        assert_eq!(
+            waited["data"][key], sent["data"][key],
+            "{key} differs between wait_for_pattern and send_input(wait_for=)"
+        );
+    }
+    // And the shape really is the withheld one, so the agreement above is
+    // agreement about something.
+    assert_eq!(waited["data"]["held_back"], json!(true));
+    assert!(waited["data"]["match"].get("text").is_none());
+
+    for id in [wid, sid] {
+        let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+    }
+}
+
+#[test]
+fn send_input_wait_for_sees_the_echo_of_its_own_write() {
+    // A real PTY, because the echo is the point. `output_since_start`
+    // starts at the `pre_write_head` the *writer task* sampled, so the
+    // terminal's echo of the submitted line is inside it. Sampling that
+    // cursor in the handler instead races the echo, and the echo then
+    // disappears from the context the agent is shown.
+    //
+    // `CLASP''_ECHOED` can only be produced by the echo — running the
+    // command prints `CLASP_ECHOED` — so the two forms tell the echo and
+    // the output apart.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let server = ClaspServer::new();
+        let id = started_session(&server).await;
+
+        let sent = body(
+            &server
+                .send_input(Parameters(SendInputArgs {
+                    session: id.clone(),
+                    data: "echo CLASP''_ECHOED".into(),
+                    wait_for: Some("CLASP_ECHOED".into()),
+                    timeout_secs: Some(10),
+                    ..Default::default()
+                }))
+                .await
+                .expect("send_input must not be a protocol error"),
+        );
+        assert_eq!(sent["status"], "ok", "{sent}");
+        let context = sent["data"]["output_since_start"].as_str().unwrap();
+        assert!(
+            context.contains("CLASP''_ECHOED"),
+            "the echo of the write is missing from output_since_start: {context:?}"
+        );
+        assert!(
+            context.contains("CLASP_ECHOED"),
+            "and the command's own output: {context:?}"
+        );
+        assert_eq!(sent["data"]["bytes_written"], json!(20));
+
+        kill_all(&server).await;
+    });
 }

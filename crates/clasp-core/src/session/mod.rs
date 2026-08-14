@@ -1,12 +1,15 @@
 //! A single PTY-backed session.
 
 pub mod registry;
+pub mod wait;
 pub use registry::SessionRegistry;
 
 use crate::buffer::{BufferRead, OutputBuffer};
 use crate::detect::history::{CommandEntry, CommandHistory, DEFAULT_MAX_ENTRIES};
 use crate::detect::{Detection, DetectionConfig, Osc133Source, PromptDetector, Shell};
-use crate::output::{OutputProcessor, ProcessedRead, ReadRequest, ReadStart, WindowSnapshot};
+use crate::output::{
+    OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
+};
 use crate::pty::{PtyBackend, Signal};
 use crate::{ClaspError, Result};
 use parking_lot::Mutex;
@@ -14,8 +17,32 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 pub type SessionId = String;
+
+/// How many frames the per-session output broadcast holds before a slow
+/// consumer starts losing them (§4.3's default). A consumer that lags gets
+/// `RecvError::Lagged` and resyncs from the ring buffer rather than from
+/// the frame it happened to be holding (REQ-C-006); the reader is never
+/// blocked, which is the property the bound exists to guarantee.
+pub const OUTPUT_BROADCAST_FRAMES: usize = 256;
+
+/// One chunk the reader appended, with the absolute span it occupies.
+///
+/// The span is what makes the two-phase scan in `wait::for_pattern`
+/// possible: a waiter that has already scanned history up to
+/// `snapshot_head` can skip the part of a queued frame that lies below it
+/// and feed only the suffix, so no byte is scanned twice and none is
+/// missed (§5.2).
+#[derive(Debug, Clone)]
+pub struct OutputFrame {
+    pub start: u64,
+    pub end: u64,
+    /// `Arc` rather than `Vec`: the broadcast hands a clone to every
+    /// subscriber, and 0.0.5 adds attach clients to that set.
+    pub bytes: Arc<[u8]>,
+}
 
 /// How long the reader waits before retrying a backend that reported no
 /// bytes but is still alive. Only reached by non-blocking backends; a
@@ -101,6 +128,10 @@ pub struct Session {
     /// each response reporting 1 while this reaches 2, and that
     /// difference is the contract.
     redaction_stats: Mutex<BTreeMap<String, u64>>,
+    /// Live output fan-out. `wait_for_pattern` subscribes to this *before*
+    /// it snapshots the buffer, which is the ordering that stops a fast
+    /// command's output from landing in the gap between the two.
+    output_tx: broadcast::Sender<OutputFrame>,
     last_activity_ms: Arc<AtomicI64>,
     /// Unix seconds at which the exit was *first observed*, 0 while alive.
     /// Observation time, not the child's true death instant: nothing in
@@ -108,6 +139,15 @@ pub struct Session {
     /// a more precise lie than no field at all.
     exited_at_secs: Arc<AtomicI64>,
     pub created_at: std::time::SystemTime,
+}
+
+/// What a write reports back: how much went, and where the buffer stood
+/// the instant before it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteAck {
+    pub bytes_written: usize,
+    /// `buffer.head` sampled immediately before `backend.write`.
+    pub pre_write_head: u64,
 }
 
 fn now_secs() -> i64 {
@@ -139,6 +179,7 @@ impl Session {
         let detector = Arc::new(Mutex::new(PromptDetector::new(config.detection)));
         let history = Arc::new(Mutex::new(CommandHistory::new(config.history_max_entries)));
         let last_activity_ms = Arc::new(AtomicI64::new(now_ms()));
+        let (output_tx, _) = broadcast::channel(OUTPUT_BROADCAST_FRAMES);
 
         let session = Arc::new(Self {
             id,
@@ -152,6 +193,7 @@ impl Session {
             shell_integration: config.shell_integration,
             state: Mutex::new(SessionState::Running),
             redaction_stats: Mutex::new(BTreeMap::new()),
+            output_tx: output_tx.clone(),
             last_activity_ms: Arc::clone(&last_activity_ms),
             exited_at_secs: Arc::new(AtomicI64::new(0)),
             created_at: std::time::SystemTime::now(),
@@ -209,6 +251,15 @@ impl Session {
                     base
                 };
                 drop(buffer);
+
+                // Published outside the buffer lock, and the error is
+                // dropped on purpose: `send` fails only when nobody is
+                // subscribed, which is the ordinary case.
+                let _ = output_tx.send(OutputFrame {
+                    start: base,
+                    end: base + n as u64,
+                    bytes: Arc::from(&buf[..n]),
+                });
 
                 // Detection runs outside the buffer lock: §4.3's invariant
                 // is that no lock is held across work that can block, and
@@ -393,6 +444,20 @@ impl Session {
         self.buffer.lock().tail()
     }
 
+    /// `(tail, head)` from **one** lock acquisition, so the pair describes
+    /// a single instant. Two separate accessor calls can straddle a push
+    /// and produce an extent that never existed.
+    pub fn buffer_extent(&self) -> (u64, u64) {
+        let buffer = self.buffer.lock();
+        (buffer.tail(), buffer.head())
+    }
+
+    /// Copy the absolute range `[start, end)`, clamped to what the buffer
+    /// still holds.
+    pub fn buffer_slice(&self, start: u64, end: u64) -> Vec<u8> {
+        self.buffer.lock().slice(start, end)
+    }
+
     pub fn read_from(&self, since: u64, max_bytes: usize) -> BufferRead {
         self.buffer.lock().read_from(since, max_bytes)
     }
@@ -403,6 +468,53 @@ impl Session {
 
     pub fn read_tail_lines(&self, n: usize) -> BufferRead {
         self.buffer.lock().read_tail_lines(n)
+    }
+
+    /// Subscribe to this session's live output frames.
+    ///
+    /// Subscribing is lock-free and takes effect immediately, so a caller
+    /// that subscribes *before* snapshotting the buffer sees every byte
+    /// written after the snapshot — the ordering §5.2's two-phase scan
+    /// requires.
+    pub fn subscribe(&self) -> broadcast::Receiver<OutputFrame> {
+        self.output_tx.subscribe()
+    }
+
+    /// Where a read of this session must stop right now (§4.1):
+    /// `buffer.head` unless a secret is still arriving in the trailing
+    /// region.
+    ///
+    /// **The identical predicate `read_processed` applies** (REQ-O-004) —
+    /// it is the same `OutputProcessor::holdback_boundary` call, over a
+    /// snapshot of the same trailing region. `wait_for_pattern` needs the
+    /// boundary as a *value* rather than as a flag, to decide whether a
+    /// match intersects the withheld region; that is the only reason this
+    /// is exposed separately, and it must never become a second rule.
+    pub fn holdback_boundary(&self, processor: &OutputProcessor) -> u64 {
+        let limits = processor.limits;
+        let (tail_region, scan_start, head) = {
+            let buffer = self.buffer.lock();
+            let head = buffer.head();
+            let tail = buffer.tail();
+            let scan_start = head
+                .saturating_sub(limits.partial_secret_scan_bytes as u64)
+                .max(tail);
+            (buffer.slice(scan_start, head), scan_start, head)
+        };
+        let snapshot = WindowSnapshot {
+            window: &[],
+            window_start: head,
+            tail_region: &tail_region,
+            tail_region_start: scan_start,
+            req_start: head,
+            head,
+            cap_end: head,
+            child_alive: self.backend.is_alive(),
+            bypass_holdback: false,
+            front_clipped: false,
+            truncated_at_tail: false,
+        };
+        processor.holdback_boundary(&snapshot, &ReadOptions::default())
     }
 
     /// A snapshot of the cumulative per-session redaction tally.
@@ -535,15 +647,32 @@ impl Session {
     }
 
     pub fn write_input(&self, data: &[u8]) -> Result<usize> {
+        self.write_input_acked(data).map(|ack| ack.bytes_written)
+    }
+
+    /// `write_input`, plus the `buffer.head` sampled **immediately before**
+    /// the write reached the backend.
+    ///
+    /// That cursor is what `send_input(wait_for=)` uses as the start of
+    /// `output_since_start` (§5.2). Sampling it in the handler instead
+    /// races the child's echo: a fast command's first bytes land between
+    /// the handler's snapshot and the write, and then disappear from the
+    /// context the agent is shown. Taking it here means it is sampled on
+    /// the same thread as the write, one statement before it.
+    pub fn write_input_acked(&self, data: &[u8]) -> Result<WriteAck> {
         // A real PTY fails a write to a dead child with EIO, but a
         // non-blocking test backend does not. Checking here means the
         // behaviour is the same on both.
         if !self.backend.is_alive() {
             return Err(ClaspError::SessionDied);
         }
+        let pre_write_head = self.buffer.lock().head();
         self.backend.write(data)?;
         self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
-        Ok(data.len())
+        Ok(WriteAck {
+            bytes_written: data.len(),
+            pre_write_head,
+        })
     }
 
     /// Signals are *not* liveness-guarded: terminating an
@@ -673,7 +802,7 @@ mod tests {
     // Re-importing any of them is `error[E0252]`.
     use crate::audit::AuditLog;
     use crate::output::rules::RuleSet;
-    use crate::output::{ProcessingLimits, ReadOptions, ReadRequest, ReadStart};
+    use crate::output::{ProcessingLimits, ReadRequest, ReadStart};
 
     const GITHUB: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
 

@@ -600,6 +600,7 @@ async fn write(server: &ClaspServer, id: &str, data: &str, newline: bool) -> Val
             session: id.into(),
             data: data.into(),
             append_newline: Some(newline),
+            ..Default::default()
         }))
         .await
         .expect("send_input must not be a protocol error");

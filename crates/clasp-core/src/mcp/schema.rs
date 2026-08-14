@@ -212,6 +212,45 @@ pub struct ReadOutput {
     pub prompt: Option<Prompt>,
 }
 
+/// One regex match (§5.2 `wait_for_pattern`).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Match {
+    /// Raw byte offset of the match start. **Always** present on a match,
+    /// redacted or not, truncated or not.
+    pub offset: u64,
+    /// The matched text, routed through the OutputProcessor. **Omitted**
+    /// when the match intersects the withheld region (§4.1): an in-flight
+    /// secret prefix sits at or before it.
+    pub text: Option<String>,
+}
+
+/// `wait_for_pattern`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WaitForPattern {
+    pub matched: Option<bool>,
+    pub r#match: Option<Match>,
+    /// Output from the scan start through the match, redacted through the
+    /// same pipeline as `read_output`, and clipped before `match.offset`
+    /// when the match is withheld — so withheld bytes cannot reach the
+    /// agent through the surrounding context.
+    pub output_since_start: Option<String>,
+    pub truncated_at_tail: Option<bool>,
+    pub truncated_for_size: Option<bool>,
+    pub held_back: Option<bool>,
+    pub next_cursor: Option<u64>,
+    /// Set **only** when the daemon clamped the requested deadline
+    /// (REQ-T-008). A field that is always present carries no information.
+    pub clamped_timeout_secs: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub interaction_mode: Option<InteractionMode>,
+    pub detection_tier: Option<DetectionTier>,
+    pub screen_tracking: Option<ScreenTracking>,
+    pub title: Option<String>,
+    pub prompt: Option<Prompt>,
+}
+
 /// `send_input`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -224,6 +263,17 @@ pub struct SendInput {
     pub warning: Option<String>,
     pub timeout_ms: Option<u64>,
     pub exit_code: Option<i32>,
+    // The `wait_for` fields (§5.2). Present only when `wait_for` was set,
+    // and identical to `wait_for_pattern`'s — the same code path, not a
+    // parallel one.
+    pub matched: Option<bool>,
+    pub r#match: Option<Match>,
+    pub output_since_start: Option<String>,
+    pub truncated_at_tail: Option<bool>,
+    pub truncated_for_size: Option<bool>,
+    pub held_back: Option<bool>,
+    pub next_cursor: Option<u64>,
+    pub clamped_timeout_secs: Option<u64>,
     pub interaction_mode: Option<InteractionMode>,
     pub detection_tier: Option<DetectionTier>,
     pub screen_tracking: Option<ScreenTracking>,

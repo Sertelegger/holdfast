@@ -89,8 +89,10 @@ impl ServerHandler for ClaspServer {
         info.instructions = Some(
             "CLASP gives you PTY-backed shell sessions. start_session spawns a \
              shell or program; send_input types into it; read_output reads what \
-             it printed using a cursor you carry between calls; terminate stops \
-             it and its process group. status and list_sessions report what each \
+             it printed using a cursor you carry between calls; \
+             wait_for_pattern blocks until a regex matches new output, which \
+             is how you wait for a command to finish or for a prompt to \
+             appear; terminate stops it and its process group. status and list_sessions report what each \
              session is doing: interaction_mode is one of AtPrompt, Executing, \
              AwaitingSecret, Fullscreen, Exited, and detection_tier says whether \
              that was measured from OSC 133 shell integration (semantic), from a \
