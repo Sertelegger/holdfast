@@ -388,17 +388,7 @@ impl Session {
         // if nothing has read since.
         if !self.backend.is_alive() {
             let code = self.backend.exit_code().unwrap_or(-1);
-            // Latched with `compare_exchange`, not stored: `state()` runs
-            // on every response and several of them run concurrently, so a
-            // plain store would move the reported instant forward on every
-            // call — a timestamp that drifts is worse than none, and a
-            // single-read test cannot see it.
-            let _ = self.exited_at_secs.compare_exchange(
-                0,
-                now_secs(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+            self.latch_exit_time();
             let mut s = self.state.lock();
             if matches!(*s, SessionState::Starting | SessionState::Running) {
                 *s = SessionState::Exited(code);
@@ -420,12 +410,35 @@ impl Session {
         self.backend.pid()
     }
 
+    /// Stamp the exit time, once, the first time anything observes the
+    /// child gone.
+    ///
+    /// `compare_exchange`, not a store: this runs on every response and
+    /// several responses run concurrently, so a plain store would move
+    /// the reported instant forward on every call. A timestamp that
+    /// drifts is worse than none, and a single-read test cannot see it.
+    fn latch_exit_time(&self) {
+        let _ = self.exited_at_secs.compare_exchange(
+            0,
+            now_secs(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
     /// Unix seconds at which this session's exit was first observed
     /// (§5.2's `exited_at_unix_secs`), or `None` while it is alive.
     ///
-    /// Observed, not latched by the reaper: the value is written by the
-    /// first `state()` call that finds the child gone.
+    /// **Observation time, and every observer counts** — not just
+    /// `state()`. `terminate`'s idempotent path reports the exit without
+    /// ever calling `state()`, so a latch armed only there answered
+    /// `null` on the one response whose whole subject is that the session
+    /// has exited. Caught by `every_emitted_unix_field_is_a_number`,
+    /// which requires the field to be seen as a real number somewhere.
     pub fn exited_at_secs(&self) -> Option<u64> {
+        if self.exited_at_secs.load(Ordering::Relaxed) == 0 && !self.backend.is_alive() {
+            self.latch_exit_time();
+        }
         match self.exited_at_secs.load(Ordering::Relaxed) {
             0 => None,
             secs => Some(secs as u64),

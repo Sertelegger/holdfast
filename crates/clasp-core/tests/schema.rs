@@ -2069,3 +2069,543 @@ async fn wait_for_pattern_response_matches_its_schema() {
 
     kill(&server, &id).await;
 }
+
+// ------------------------------------ the four §5.4 rules, asserted generally
+//
+// Steps 5a-5c pinned key sets tool by tool, by hand. These four assert
+// the *rules* those literals are instances of, so the next three tools do
+// not each get their own chance to copy one wrong.
+
+/// §5.4, REQ-T-016: **one record, one key set.** `status` and
+/// `list_sessions` render the same record from one builder, so the two
+/// are asserted against **each other**, not each against its own literal.
+/// The literal comparisons elsewhere in this file catch a field added to
+/// one; this catches the edit that makes those stop working — forking
+/// `session_record_keys()` into two helpers, which is one refactor away
+/// and leaves both of them green.
+#[tokio::test]
+async fn status_and_a_list_sessions_entry_are_the_same_record() {
+    let server = ClaspServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    let status_payload = body(
+        &server
+            .status(Parameters(StatusArgs {
+                session: id.clone(),
+            }))
+            .await
+            .expect("status"),
+    );
+    let listed = body(&server.list_sessions().await.expect("list_sessions"));
+    let entry = listed["data"]["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|s| s["id"] == json!(id))
+        .expect("the session we started")
+        .clone();
+
+    assert_eq!(
+        keys(&status_payload["data"]),
+        keys(&entry),
+        "status and list_sessions have diverged as key sets"
+    );
+    // Recursively, on the same terms — a nested divergence is the one
+    // that has actually happened (§5.4: `list_sessions[].prompt` carried
+    // a field its Returns list excluded for every revision on record,
+    // with the entry's top-level key set pinned green throughout).
+    for nested in ["prompt", "buffer", "redaction_stats"] {
+        assert_eq!(
+            keys(&status_payload["data"][nested]),
+            keys(&entry[nested]),
+            "{nested} differs between status and list_sessions"
+        );
+    }
+
+    kill(&server, &id).await;
+}
+
+/// §5.4, REQ-T-016, the recursive half: every nested object §5.2 declares
+/// carries its own exact key set. A per-tool assertion on `data` reaches
+/// the top level only.
+#[tokio::test]
+async fn every_nested_object_a_tool_returns_has_its_key_set_pinned() {
+    let server = ClaspServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+    // A command, so `get_command_history` has an entry to enumerate.
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "echo NESTED''_OK".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("send_input");
+    wait_for(&server, &id, "NESTED_OK").await;
+
+    // `send_input.prompt` — the call above returned one, but a fresh one
+    // keeps this test's own arrangement explicit.
+    let sent = body(
+        &server
+            .send_input(Parameters(SendInputArgs {
+                session: id.clone(),
+                data: String::new(),
+                append_newline: Some(false),
+                ..Default::default()
+            }))
+            .await
+            .expect("send_input"),
+    );
+    assert_eq!(keys(&sent["data"]["prompt"]), prompt_keys());
+
+    // `list_sessions[].prompt` and `[].buffer` — the pair §5.4 names as
+    // the drift that actually happened.
+    let listed = body(&server.list_sessions().await.expect("list_sessions"));
+    let entry = listed["data"]["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|s| s["id"] == json!(id))
+        .expect("the session")
+        .clone();
+    assert_eq!(keys(&entry["prompt"]), prompt_keys());
+    assert_eq!(keys(&entry["buffer"]), set(&["head", "tail"]));
+
+    // `get_command_history.entries[]`.
+    let history = body(
+        &server
+            .get_command_history(Parameters(GetCommandHistoryArgs {
+                session: id.clone(),
+                limit: None,
+                since_index: None,
+            }))
+            .await
+            .expect("get_command_history"),
+    );
+    let entries = history["data"]["entries"].as_array().expect("entries");
+    assert!(!entries.is_empty(), "no command was recorded: {history}");
+    for e in entries {
+        assert_eq!(
+            keys(e),
+            set(&[
+                "index",
+                "command",
+                "exit_code",
+                "started_at_unix_ms",
+                "duration_ms",
+                "output_start_cursor",
+                "output_end_cursor",
+            ]),
+            "a history entry's key set drifted from §5.2"
+        );
+    }
+
+    kill(&server, &id).await;
+}
+
+/// §18.1, REQ-T-017: every status the agent is told to branch on is one
+/// some tool actually returns.
+///
+/// `the_status_enum_declares_every_status_the_envelope_can_emit` compares
+/// two *enumerations* — both can agree on a variant no response ever
+/// carries, which is a permanently unreachable branch no reviewer can
+/// tell from an unimplemented one. This drives a real `CallToolResult`
+/// per declared variant.
+#[tokio::test]
+async fn every_declared_status_is_returned_by_a_real_response() {
+    let declared: BTreeSet<String> = output_schema("read_output")["$defs"]["Status"]["enum"]
+        .as_array()
+        .expect("Status is an enum")
+        .iter()
+        .map(|v| v.as_str().expect("string variant").to_string())
+        .collect();
+
+    let mut produced: BTreeSet<String> = BTreeSet::new();
+    let mut note = |payload: &Value| {
+        produced.insert(payload["status"].as_str().expect("a status").to_string());
+    };
+
+    let server = ClaspServer::new();
+    let (id, started) = start_bash(&server).await;
+    note(&body(&started)); // ok
+
+    note(&body(
+        &server
+            .status(Parameters(StatusArgs {
+                session: "sess_nope".into(),
+            }))
+            .await
+            .expect("status"),
+    )); // session_not_found
+
+    // name_taken: two starts with one name.
+    for _ in 0..2 {
+        let r = server
+            .start_session(Parameters(StartSessionArgs {
+                command: "bash".into(),
+                args: bash_args(),
+                name: Some("taken".into()),
+                ..Default::default()
+            }))
+            .await
+            .expect("start_session");
+        note(&body(&r));
+    }
+
+    // spawn_failed: a command that does not exist.
+    note(&body(
+        &server
+            .start_session(Parameters(StartSessionArgs {
+                command: "clasp-no-such-binary-anywhere".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("start_session"),
+    ));
+
+    // limit_reached: a registry of one, already full.
+    {
+        let small = ClaspServer::new();
+        // `with_capacity` is the registry's own knob; the server's
+        // default registry is replaced rather than reconfigured.
+        let one = clasp_core::session::SessionRegistry::new(1);
+        let server_one = ClaspServer {
+            registry: std::sync::Arc::new(one),
+            processor: std::sync::Arc::clone(&small.processor),
+        };
+        let (_first, _) = start_bash(&server_one).await;
+        note(&body(
+            &server_one
+                .start_session(Parameters(StartSessionArgs {
+                    command: "bash".into(),
+                    args: bash_args(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("start_session"),
+        ));
+        for s in server_one.registry.all() {
+            let _ = s.signal(clasp_core::pty::Signal::Kill);
+        }
+    }
+
+    // unavailable: a session with no shell integration.
+    {
+        let r = server
+            .start_session(Parameters(StartSessionArgs {
+                command: "bash".into(),
+                args: bash_args(),
+                shell_integration: Some(false),
+                ..Default::default()
+            }))
+            .await
+            .expect("start_session");
+        let plain = body(&r)["data"]["session_id"].as_str().unwrap().to_string();
+        note(&body(
+            &server
+                .get_command_history(Parameters(GetCommandHistoryArgs {
+                    session: plain.clone(),
+                    limit: None,
+                    since_index: None,
+                }))
+                .await
+                .expect("get_command_history"),
+        ));
+        kill(&server, &plain).await;
+    }
+
+    // timeout: a one-second wait for something that never arrives. Before
+    // `wait_for_pattern` the only producer was `send_input`'s write
+    // deadline, which costs a parked PTY write and five seconds.
+    note(&body(
+        &server
+            .wait_for_pattern(Parameters(WaitForPatternArgs {
+                session: id.clone(),
+                pattern: "NEVER_MATCHES_ANYTHING".into(),
+                timeout_secs: Some(1),
+                since_cursor: Some(0),
+                max_bytes: None,
+            }))
+            .await
+            .expect("wait_for_pattern"),
+    ));
+
+    // session_died: read after the child has gone.
+    {
+        let dead = start_bash(&server).await.0;
+        let session = server.registry.get(&dead).unwrap();
+        let _ = session.signal(clasp_core::pty::Signal::Kill);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.is_alive() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        note(&body(
+            &server
+                .send_input(Parameters(SendInputArgs {
+                    session: dead.clone(),
+                    data: "x".into(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("send_input"),
+        ));
+    }
+
+    assert_eq!(
+        declared.difference(&produced).collect::<Vec<_>>(),
+        Vec::<&String>::new(),
+        "these statuses are declared and no real response produced one"
+    );
+    assert!(
+        !declared.contains("awaiting_secret"),
+        "§18.1 catalogues awaiting_secret as notification-only: no tool \
+         returns it, and an agent meets it as interaction_mode instead"
+    );
+
+    for s in server.registry.all() {
+        let _ = s.signal(clasp_core::pty::Signal::Kill);
+    }
+}
+
+/// §5.4, REQ-T-018. Non-circular on purpose: the rule is not "fields
+/// named `_unix_*` are named `_unix_*`". It is that a **bare** temporal
+/// name is a claim the value does not support, so the bare spellings are
+/// banned outright and everything temporal must carry its unit.
+const BARE_TEMPORAL_NAMES: [&str; 6] = [
+    "started_at",
+    "last_activity",
+    "idle_deadline",
+    "exited_at",
+    "created_at",
+    "timestamp",
+];
+
+#[test]
+fn no_declared_timestamp_carries_a_bare_name() {
+    for tool in TOOLS {
+        let schema = output_schema(tool);
+        let mut found = Vec::new();
+        object_subschemas("#", &schema, &mut found);
+        assert!(!found.is_empty(), "{tool}: the walk found no objects");
+        for (path, object) in found {
+            let Some(props) = object.get("properties").and_then(Value::as_object) else {
+                continue;
+            };
+            for name in props.keys() {
+                assert!(
+                    !BARE_TEMPORAL_NAMES.contains(&name.as_str()),
+                    "{tool} at {path} declares `{name}`: a bare temporal name is \
+                     a claim the value does not support (REQ-T-018)"
+                );
+                // Temporal by *stem*, not by "contains `_at`": the plan's
+                // wider rule flags `truncated_at_tail`, which is a
+                // boolean and carries no unit because it names no
+                // instant. A stem test says what the rule means — a
+                // field describing one of these moments must carry the
+                // unit of the number it holds.
+                for stem in BARE_TEMPORAL_NAMES {
+                    if name.starts_with(stem) {
+                        assert!(
+                            name.ends_with("_unix_secs") || name.ends_with("_unix_ms"),
+                            "{tool} at {path} declares `{name}`, which is temporal \
+                             and does not carry its unit (REQ-T-018)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The emission half. The schema alone cannot catch an RFC-3339 string
+/// under a correct name, which is why the value is asserted as well.
+#[tokio::test]
+async fn every_emitted_unix_field_is_a_number() {
+    let server = ClaspServer::new();
+    let (id, started) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "echo UNIX''_OK".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("send_input");
+    wait_for(&server, &id, "UNIX_OK").await;
+
+    let mut payloads = vec![body(&started)];
+    payloads.push(body(
+        &server
+            .status(Parameters(StatusArgs {
+                session: id.clone(),
+            }))
+            .await
+            .expect("status"),
+    ));
+    payloads.push(body(&server.list_sessions().await.expect("list_sessions")));
+    payloads.push(body(
+        &server
+            .get_command_history(Parameters(GetCommandHistoryArgs {
+                session: id.clone(),
+                limit: None,
+                since_index: None,
+            }))
+            .await
+            .expect("get_command_history"),
+    ));
+    // An exited session, so `exited_at_unix_secs` is populated rather
+    // than null — a null passes any "is not a string" check.
+    let session = server.registry.get(&id).unwrap();
+    let _ = session.signal(clasp_core::pty::Signal::Kill);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.is_alive() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    payloads.push(body(
+        &server
+            .terminate(Parameters(TerminateArgs {
+                session: id.clone(),
+                force: Some(true),
+                timeout_secs: None,
+            }))
+            .await
+            .expect("terminate"),
+    ));
+
+    fn walk(path: &str, v: &Value, seen: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map {
+                    if k.ends_with("_unix_secs") || k.ends_with("_unix_ms") {
+                        // Null is legitimate — `exited_at_unix_secs` is
+                        // absent while the session is alive — but a
+                        // *string* never is, which is the RFC-3339
+                        // regression this half exists to catch. Only
+                        // numbers count as "seen", so the expectation
+                        // list below cannot be satisfied by a field that
+                        // is null everywhere.
+                        assert!(
+                            child.is_number() || child.is_null(),
+                            "{path}/{k} is {child}, not a number — every epoch \
+                             field on the MCP surface is an integer (REQ-T-018)"
+                        );
+                        if child.is_number() {
+                            seen.push(k.clone());
+                        }
+                    }
+                    walk(&format!("{path}/{k}"), child, seen);
+                }
+            }
+            Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    walk(&format!("{path}/{i}"), child, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut seen = Vec::new();
+    for p in &payloads {
+        walk("#", p, &mut seen);
+    }
+    for expected in [
+        "started_at_unix_secs",
+        "last_activity_unix_ms",
+        "exited_at_unix_secs",
+        "started_at_unix_ms",
+    ] {
+        assert!(
+            seen.iter().any(|s| s == expected),
+            "{expected} was never emitted, so the walk proves nothing about \
+             it; seen: {seen:?}"
+        );
+    }
+
+    for s in server.registry.all() {
+        let _ = s.signal(clasp_core::pty::Signal::Kill);
+    }
+}
+
+/// §5.4, REQ-T-019: one shape, one builder, referenced. The tools are
+/// **discovered**, not listed — every tool whose `outputSchema` declares
+/// `prompt` is in scope, so 0.0.4's `interrupt` and 0.0.7's
+/// `request_secret_input` are covered the day they are added rather than
+/// the day someone remembers this test.
+#[test]
+fn every_tool_that_declares_prompt_declares_the_same_block() {
+    // The block's own shape, pinned once as a literal on the first tool
+    // found, so agreement is agreement about the right thing.
+    let block = [
+        "confidence",
+        "quiescent_score",
+        "pattern_score",
+        "cursor_score",
+        "reason",
+        "last_line",
+    ];
+    let siblings = [
+        "interaction_mode",
+        "detection_tier",
+        "screen_tracking",
+        "title",
+    ];
+
+    let mut found_in: Vec<String> = Vec::new();
+    let mut first: Option<BTreeSet<String>> = None;
+
+    for tool in TOOLS {
+        let schema = output_schema(tool);
+        let mut objects = Vec::new();
+        object_subschemas("#", &schema, &mut objects);
+        for (path, object) in objects {
+            let Some(props) = object.get("properties").and_then(Value::as_object) else {
+                continue;
+            };
+            if !props.contains_key("prompt") {
+                continue;
+            }
+            // The `prompt` property is a `$ref` or an inline object; the
+            // walk already visited whatever it resolves to, so the shape
+            // is read from the `Prompt` definition the schema carries.
+            let prompt_props = schema["$defs"]["Prompt"]["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{tool} declares prompt but no Prompt definition"));
+            let names: BTreeSet<String> = prompt_props.keys().cloned().collect();
+            match &first {
+                None => {
+                    assert_eq!(
+                        names,
+                        block.iter().map(|s| (*s).to_string()).collect(),
+                        "{tool} at {path}: the §5.4 prompt block's shape changed"
+                    );
+                    first = Some(names);
+                }
+                Some(expected) => assert_eq!(
+                    &names, expected,
+                    "{tool} at {path} declares a different prompt block; the \
+                     block comes from one builder, so a narrower variant means \
+                     a second builder (REQ-T-019)"
+                ),
+            }
+            // A tool that wants `prompt` is asking for the whole block.
+            for sibling in siblings {
+                assert!(
+                    props.contains_key(sibling),
+                    "{tool} at {path} declares `prompt` without `{sibling}`"
+                );
+            }
+            found_in.push(format!("{tool}{path}"));
+        }
+    }
+
+    assert!(
+        found_in.len() >= 4,
+        "only {} declaration(s) of the session-state block were found; the \
+         walk is not walking: {found_in:?}",
+        found_in.len()
+    );
+}
