@@ -6,9 +6,11 @@ pub use registry::SessionRegistry;
 use crate::buffer::{BufferRead, OutputBuffer};
 use crate::detect::history::{CommandEntry, CommandHistory, DEFAULT_MAX_ENTRIES};
 use crate::detect::{Detection, DetectionConfig, Osc133Source, PromptDetector, Shell};
+use crate::output::{OutputProcessor, ProcessedRead, ReadRequest, ReadStart, WindowSnapshot};
 use crate::pty::{PtyBackend, Signal};
 use crate::{ClaspError, Result};
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,6 +92,15 @@ pub struct Session {
     /// Which shell integration was injected, if any.
     pub shell_integration: Option<Shell>,
     state: Mutex<SessionState>,
+    /// Cumulative `{rule kind: count}` for this session — §5.2's
+    /// `status.redaction_stats` (§9.2, REQ-O-012).
+    ///
+    /// **Not the same number `read_output.redactions` reports, and never
+    /// derived from it.** That one describes a single response; this one
+    /// describes the session. Two overlapping reads of one secret leave
+    /// each response reporting 1 while this reaches 2, and that
+    /// difference is the contract.
+    redaction_stats: Mutex<BTreeMap<String, u64>>,
     last_activity_ms: Arc<AtomicI64>,
     pub created_at: std::time::SystemTime,
 }
@@ -128,6 +139,7 @@ impl Session {
             history: Arc::clone(&history),
             shell_integration: config.shell_integration,
             state: Mutex::new(SessionState::Running),
+            redaction_stats: Mutex::new(BTreeMap::new()),
             last_activity_ms: Arc::clone(&last_activity_ms),
             created_at: std::time::SystemTime::now(),
         });
@@ -357,6 +369,135 @@ impl Session {
         self.buffer.lock().read_tail_lines(n)
     }
 
+    /// A snapshot of the cumulative per-session redaction tally.
+    ///
+    /// Empty (`{}`), never absent, when nothing has been redacted — the
+    /// caller serialises it as an empty map so `status` reports a
+    /// truthful zero rather than omitting the key (REQ-O-012).
+    pub fn redaction_stats(&self) -> BTreeMap<String, u64> {
+        self.redaction_stats.lock().clone()
+    }
+
+    /// Fold one processed read's per-response counts into the session
+    /// tally. Called from `read_processed` and nowhere else.
+    fn note_redactions(&self, counts: &BTreeMap<String, usize>) {
+        if counts.is_empty() {
+            return;
+        }
+        let mut stats = self.redaction_stats.lock();
+        for (kind, n) in counts {
+            *stats.entry(kind.clone()).or_insert(0) += *n as u64;
+        }
+    }
+
+    /// Read through the output processor: ANSI strip, redaction, the
+    /// targeted holdback, and text encoding (spec §4.1).
+    ///
+    /// The buffer lock is held only to copy the expanded window and the
+    /// partial-secret scan region; every regex runs outside it, honouring
+    /// the §4.3 "no work under the buffer lock" invariant.
+    pub fn read_processed(&self, req: &ReadRequest, processor: &OutputProcessor) -> ProcessedRead {
+        // Liveness decides whether an unfinished escape can still be
+        // completed; read it before taking the lock (§4.1).
+        let child_alive = self.backend.is_alive();
+        let limits = processor.limits;
+
+        let (
+            window,
+            window_start,
+            tail_region,
+            scan_start,
+            req_start,
+            head,
+            tail,
+            cap_end,
+            front_clipped,
+        ) = {
+            let buffer = self.buffer.lock();
+            let head = buffer.head();
+            let tail = buffer.tail();
+            let requested_start = match req.start {
+                ReadStart::Cursor(c) => c.clamp(tail, head),
+                ReadStart::TailBytes(n) => buffer.tail_bytes_start(n),
+                ReadStart::TailLines(n) => buffer.tail_lines_start(n),
+            };
+            // A `tail_*` read asks for the *newest* bytes, so when its
+            // extent exceeds `max_bytes` the OLDEST bytes are dropped and
+            // the cursor still lands past `buffer.head`. Capping forward
+            // instead would return the oldest slice and hand back a cursor
+            // far behind `head`, which re-delivers the same bytes on every
+            // subsequent cursor read (0.0.1's documented contract, REQ-T-006).
+            let (req_start, front_clipped) = if req.start.bypasses_holdback() {
+                let clipped = head
+                    .saturating_sub(req.max_bytes as u64)
+                    .max(requested_start);
+                (clipped, clipped > requested_start)
+            } else {
+                (requested_start, false)
+            };
+            let cap_end = req_start.saturating_add(req.max_bytes as u64).min(head);
+            let window_start = req_start
+                .saturating_sub(limits.lookbehind_bytes as u64)
+                .max(tail);
+            let window_end = cap_end
+                .saturating_add(limits.lookahead_bytes as u64)
+                .min(head);
+            let scan_start = head
+                .saturating_sub(limits.partial_secret_scan_bytes as u64)
+                .max(tail);
+            (
+                buffer.slice(window_start, window_end),
+                window_start,
+                buffer.slice(scan_start, head),
+                scan_start,
+                req_start,
+                head,
+                tail,
+                cap_end,
+                front_clipped,
+            )
+        };
+
+        let truncated_at_tail = matches!(req.start, ReadStart::Cursor(c) if c < tail);
+        let snapshot = WindowSnapshot {
+            window: &window,
+            window_start,
+            tail_region: &tail_region,
+            tail_region_start: scan_start,
+            req_start,
+            head,
+            cap_end,
+            child_alive,
+            bypass_holdback: req.start.bypasses_holdback(),
+            front_clipped,
+            truncated_at_tail,
+        };
+        let read = processor.process(&snapshot, &req.options);
+
+        // Fold this response's counts into the session tally that
+        // `status.redaction_stats` reports (§5.2, REQ-O-012). It is fed
+        // from `read.redactions` but is a *different* quantity: two
+        // overlapping reads of one secret leave each response reporting 1
+        // while this reaches 2. Never serve one of the two from the other.
+        self.note_redactions(&read.redactions);
+
+        // Both of these are audit obligations of the *read*, so they live
+        // here rather than in each transport that calls it (§9.2, §9.4).
+        if !req.options.redact {
+            processor
+                .audit
+                .record_redaction_disabled(Some(&self.id), req.tool, req.client_kind);
+        }
+        if truncated_at_tail {
+            if let ReadStart::Cursor(c) = req.start {
+                processor
+                    .audit
+                    .record_truncated_at_tail(&self.id, req.tool, c, tail);
+            }
+        }
+        read
+    }
+
     pub fn write_input(&self, data: &[u8]) -> Result<usize> {
         // A real PTY fails a write to a dead child with EIO, but a
         // non-blocking test backend does not. Checking here means the
@@ -486,6 +627,372 @@ mod tests {
         pty.exit(7);
         assert_eq!(s.state(), SessionState::Exited(7));
         assert_eq!(s.state().as_str(), "Exited");
+    }
+
+    // ------------------------------------------------ 0.0.3 read path
+
+    // `Session`, `SessionConfig`, `new_session_id`, `PtyBackend`, `Arc`
+    // and `OutputProcessor` all arrive through the block's existing
+    // `use super::*;` (they live in this module or are imported by it).
+    // Re-importing any of them is `error[E0252]`.
+    use crate::audit::AuditLog;
+    use crate::output::rules::RuleSet;
+    use crate::output::{ProcessingLimits, ReadOptions, ReadRequest, ReadStart};
+
+    const GITHUB: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+
+    /// A processor writing to a real audit file, so the audit assertions
+    /// exercise the same path production uses.
+    fn processor_with_audit(dir: &std::path::Path) -> OutputProcessor {
+        let rules = Arc::new(RuleSet::builtin().unwrap());
+        let audit = Arc::new(AuditLog::to_path(dir.join("audit.log"), Arc::clone(&rules)).unwrap());
+        OutputProcessor::new(rules, audit, ProcessingLimits::default())
+    }
+
+    fn audit_kinds(p: &OutputProcessor) -> Vec<String> {
+        let text = std::fs::read_to_string(p.audit.path().unwrap()).unwrap();
+        text.lines()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn read_processed_redacts_and_keeps_the_surrounding_output() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        let line = format!("export TOKEN={GITHUB}\nnext\n");
+        pty.queue_output(line.as_bytes());
+        wait_for_bytes(&s, line.len() as u64);
+
+        let r = s.read_processed(&ReadRequest::since(0, 32 * 1024), &p);
+        assert!(!r.output.contains(GITHUB), "secret leaked: {}", r.output);
+        // Asserting absence alone would pass against a read that returned
+        // nothing, so pin the surviving text as well.
+        assert_eq!(r.output, "export TOKEN=[REDACTED:github]\nnext\n");
+        assert_eq!(r.cursor, line.len() as u64);
+        assert!(!r.held_back);
+    }
+
+    #[test]
+    fn read_processed_holds_an_in_flight_token_and_releases_it_on_completion() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        pty.queue_output(b"line one\nghp_abcdef");
+        wait_for_bytes(&s, 18);
+
+        let first = s.read_processed(&ReadRequest::since(0, 32 * 1024), &p);
+        assert!(first.held_back, "an in-flight token must stop the read");
+        assert_eq!(first.output, "line one\n");
+        assert_eq!(first.cursor, 9);
+        assert_eq!(first.next_cursor, Some(9));
+
+        pty.queue_output(b"ghijABCDEFGHIJ0123450123456789abcd\n");
+        wait_for_bytes(&s, 53);
+        let second = s.read_processed(&ReadRequest::since(first.cursor, 32 * 1024), &p);
+        assert!(!second.held_back, "the token completed");
+        assert!(!second.output.contains("ghp_abcdef"), "{}", second.output);
+        assert_eq!(second.output, "[REDACTED:github]\n");
+    }
+
+    #[test]
+    fn tail_reads_bypass_the_holdback_through_the_session() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        pty.queue_output(b"line one\nghp_abcdef");
+        wait_for_bytes(&s, 18);
+
+        let r = s.read_processed(
+            &ReadRequest {
+                start: ReadStart::TailBytes(10),
+                max_bytes: 32 * 1024,
+                options: ReadOptions::default(),
+                tool: "read_output",
+                client_kind: "in_process",
+            },
+            &p,
+        );
+        assert!(!r.held_back);
+        assert_eq!(r.output, "ghp_abcdef", "recency was explicitly requested");
+    }
+
+    #[test]
+    fn disabling_redaction_returns_raw_bytes_and_is_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = processor_with_audit(dir.path());
+        let (s, pty) = mock_session();
+        let line = format!("t={GITHUB}\n");
+        pty.queue_output(line.as_bytes());
+        wait_for_bytes(&s, line.len() as u64);
+
+        let r = s.read_processed(
+            &ReadRequest {
+                start: ReadStart::Cursor(0),
+                max_bytes: 32 * 1024,
+                options: ReadOptions {
+                    redact: false,
+                    ..Default::default()
+                },
+                tool: "read_output",
+                client_kind: "in_process",
+            },
+            &p,
+        );
+        assert_eq!(r.output, line, "the escape hatch returns the raw bytes");
+        assert_eq!(
+            audit_kinds(&p),
+            vec!["redaction_disabled"],
+            "the escape hatch is audited, exactly once"
+        );
+
+        // …and the default read is *not* audited, so the trail stays a
+        // record of exceptions rather than of every read.
+        let _ = s.read_processed(&ReadRequest::since(0, 32 * 1024), &p);
+        assert_eq!(audit_kinds(&p).len(), 1);
+    }
+
+    #[test]
+    fn a_stale_cursor_sets_the_flag_and_is_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = processor_with_audit(dir.path());
+        let pty = Arc::new(MockPty::new());
+        // A 16-byte buffer so a second chunk evicts the first.
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(16),
+        );
+        pty.queue_output(b"0123456789abcdef");
+        wait_for_bytes(&s, 16);
+        pty.queue_output(b"GHIJKLMNOPQRSTUV");
+        wait_for_bytes(&s, 32);
+
+        let r = s.read_processed(&ReadRequest::since(0, 32 * 1024), &p);
+        assert!(r.truncated_at_tail, "cursor 0 is below the live tail");
+        assert_eq!(r.output, "GHIJKLMNOPQRSTUV");
+        assert_eq!(audit_kinds(&p), vec!["truncated_at_tail"]);
+    }
+
+    /// The negative half of the row above: a cursor that is still inside
+    /// the buffer sets no flag and writes nothing. Without it, a
+    /// `truncated_at_tail` hardcoded to `true` — or an audit write with no
+    /// condition on it — passes the test above and is caught by nothing.
+    #[test]
+    fn a_live_cursor_sets_no_truncation_flag_and_is_not_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = processor_with_audit(dir.path());
+        let (s, pty) = mock_session();
+        pty.queue_output(b"0123456789abcdef");
+        wait_for_bytes(&s, 16);
+
+        let r = s.read_processed(&ReadRequest::since(0, 32 * 1024), &p);
+        assert!(!r.truncated_at_tail, "cursor 0 is still in the buffer");
+        assert_eq!(r.output, "0123456789abcdef");
+        assert!(
+            audit_kinds(&p).is_empty(),
+            "an ordinary read is not an audit event: {:?}",
+            audit_kinds(&p)
+        );
+    }
+
+    /// 0.0.1's `read_output` clipped an oversized `tail_lines` read from
+    /// the FRONT so the newest bytes survive and the cursor still points
+    /// past `buffer.head`. Capping forward from the tail-lines start
+    /// instead would return the oldest slice and hand back a cursor far
+    /// behind `head` — which re-delivers those same bytes on every
+    /// follow-up cursor read, an infinite loop for a polling agent.
+    #[test]
+    fn an_oversized_tail_read_drops_the_oldest_bytes_not_the_newest() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        pty.queue_output(b"one\ntwo\nthree\nfour\n");
+        wait_for_bytes(&s, 19);
+
+        let r = s.read_processed(
+            &ReadRequest {
+                start: ReadStart::TailLines(100),
+                max_bytes: 5,
+                options: ReadOptions::default(),
+                tool: "read_output",
+                client_kind: "in_process",
+            },
+            &p,
+        );
+        assert_eq!(r.output, "four\n", "the newest bytes are the ones kept");
+        assert_eq!(r.cursor, 19, "the cursor still points past the newest byte");
+        assert!(r.truncated_for_size, "bytes were lost to the size budget");
+        assert!(!r.held_back);
+    }
+
+    /// The negative half: a `tail_*` read that *fits* was not clipped, so
+    /// it must not claim it was. `front_clipped` is the one input the
+    /// processor cannot compute itself, and a version that sets it
+    /// unconditionally satisfies the row above.
+    #[test]
+    fn a_tail_read_that_fits_reports_no_truncation() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        pty.queue_output(b"one\ntwo\nthree\nfour\n");
+        wait_for_bytes(&s, 19);
+
+        let r = s.read_processed(
+            &ReadRequest {
+                start: ReadStart::TailLines(2),
+                max_bytes: 32 * 1024,
+                options: ReadOptions::default(),
+                tool: "read_output",
+                client_kind: "in_process",
+            },
+            &p,
+        );
+        assert_eq!(r.output, "three\nfour\n");
+        assert!(!r.truncated_for_size, "every requested byte was returned");
+        assert_eq!(r.next_cursor, None);
+    }
+
+    #[test]
+    fn a_size_cap_is_reported_as_truncation_not_holdback() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        pty.queue_output(b"0123456789abcdefghij");
+        wait_for_bytes(&s, 20);
+
+        let r = s.read_processed(&ReadRequest::since(0, 8), &p);
+        assert_eq!(r.output, "01234567");
+        assert!(r.truncated_for_size);
+        assert!(!r.held_back, "more bytes are available now, not withheld");
+        assert_eq!(r.next_cursor, Some(8));
+    }
+
+    /// REQ-O-008's liveness input comes from the backend, and
+    /// `read_processed` is the only place that samples it. Every
+    /// processor unit test builds its own snapshot and passes
+    /// `child_alive` by hand, so hardcoding it here leaves all of them
+    /// green while a real exited session withholds its last bytes for
+    /// ever.
+    #[test]
+    fn the_liveness_the_escape_rule_needs_comes_from_the_backend() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        pty.queue_output(b"done\x1b[3");
+        wait_for_bytes(&s, 7);
+
+        // Alive: the child may still finish the sequence, so the tail
+        // waits at the introducer.
+        let live = s.read_processed(&ReadRequest::since(0, 4096), &p);
+        assert!(live.held_back);
+        assert_eq!(live.output, "done");
+        assert_eq!(live.cursor, 4);
+        assert!(!live.dropped_incomplete_escape);
+
+        // Exited: it never will, so the read completes and reports it.
+        pty.exit(0);
+        let dead = s.read_processed(&ReadRequest::since(0, 4096), &p);
+        assert!(!dead.held_back, "a dead child will never finish it");
+        assert_eq!(dead.output, "done");
+        assert_eq!(dead.cursor, 7);
+        assert!(dead.dropped_incomplete_escape);
+    }
+
+    /// A cursor *past* `buffer.head` — a stale handle from a previous,
+    /// longer session — clamps down to `head` and returns nothing.
+    /// Unclamped, `read_end - req_start` underflows and the read panics;
+    /// the below-tail half of the same clamp is pinned by
+    /// `a_stale_cursor_sets_the_flag_and_is_audited` and cannot see this.
+    #[test]
+    fn a_cursor_past_the_head_returns_nothing_rather_than_underflowing() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        pty.queue_output(b"abc");
+        wait_for_bytes(&s, 3);
+
+        let r = s.read_processed(&ReadRequest::since(99, 4096), &p);
+        assert_eq!(r.output, "");
+        assert_eq!(r.bytes_returned, 0);
+        assert_eq!(
+            r.cursor, 3,
+            "the cursor regresses to head, per 0.0.1's documented contract"
+        );
+        assert!(!r.truncated_at_tail);
+    }
+
+    /// REQ-O-012, session half: the tally is cumulative and is a
+    /// different number from the per-response map.
+    ///
+    /// Kills both collapses at once — "alias `redaction_stats` to the
+    /// last response's `redactions`" and "serve `redactions` from the
+    /// session tally". Either makes the two numbers equal, and after two
+    /// *overlapping* reads of one secret they must differ (1 and 2).
+    /// A single-read test cannot tell any of these apart.
+    ///
+    /// The empty-tally assertion is the paired negative: an
+    /// implementation that never counts anything reports 0 and 0 — equal,
+    /// so `assert_ne!` catches it — and it also pins that a session which
+    /// has redacted nothing reports an empty map rather than never
+    /// having a map at all.
+    #[test]
+    fn the_session_tally_is_cumulative_and_is_not_the_per_response_map() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+
+        assert!(
+            s.redaction_stats().is_empty(),
+            "a session that has redacted nothing reports an empty tally, \
+             not an absent one"
+        );
+
+        let line = format!("t={GITHUB}\n");
+        pty.queue_output(line.as_bytes());
+        wait_for_bytes(&s, line.len() as u64);
+
+        // Two OVERLAPPING reads: both start at cursor 0, so both return
+        // the same secret and each redacts it exactly once.
+        let first = s.read_processed(&ReadRequest::since(0, 32 * 1024), &p);
+        let second = s.read_processed(&ReadRequest::since(0, 32 * 1024), &p);
+        assert_eq!(first.redactions.get("github"), Some(&1));
+        assert_eq!(
+            second.redactions.get("github"),
+            Some(&1),
+            "the per-response map describes only this response"
+        );
+        assert_eq!(
+            s.redaction_stats().get("github"),
+            Some(&2),
+            "the session tally accumulates across reads, double-counting \
+             the overlap on purpose"
+        );
+        let per_response = second.redactions["github"] as u64;
+        assert_ne!(
+            per_response,
+            s.redaction_stats()["github"],
+            "the two surfaces must report different numbers here; equal \
+             means one is being served from the other"
+        );
+
+        // A `redact: false` read redacts nothing, so it must not move the
+        // tally — otherwise the escape hatch would inflate the one
+        // statistic that says whether secrets were withheld.
+        let _ = s.read_processed(
+            &ReadRequest {
+                start: ReadStart::Cursor(0),
+                max_bytes: 32 * 1024,
+                options: ReadOptions {
+                    redact: false,
+                    ..Default::default()
+                },
+                tool: "read_output",
+                client_kind: "in_process",
+            },
+            &p,
+        );
+        assert_eq!(s.redaction_stats()["github"], 2, "no redaction, no count");
     }
 
     #[test]

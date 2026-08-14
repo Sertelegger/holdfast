@@ -104,12 +104,27 @@ impl OutputBuffer {
 
     /// Read the last `n` newline-delimited lines.
     pub fn read_tail_lines(&self, n: usize) -> BufferRead {
+        let start = self.tail_lines_start(n);
+        let off = (start - self.tail()) as usize;
+        BufferRead {
+            bytes: self.data[off..].to_vec(),
+            cursor: self.head,
+            truncated_at_tail: false,
+        }
+    }
+
+    /// Absolute offset of the first of the last `n` bytes. The read path
+    /// needs the *offset* as well as the bytes, so it can build the
+    /// expanded redaction window around it.
+    pub fn tail_bytes_start(&self, n: usize) -> u64 {
+        self.head - n.min(self.data.len()) as u64
+    }
+
+    /// Absolute offset of the first of the last `n` newline-delimited
+    /// lines. `read_tail_lines` is defined in terms of this.
+    pub fn tail_lines_start(&self, n: usize) -> u64 {
         if n == 0 || self.data.is_empty() {
-            return BufferRead {
-                bytes: Vec::new(),
-                cursor: self.head,
-                truncated_at_tail: false,
-            };
+            return self.head;
         }
         // Walk backwards counting newlines, ignoring a single trailing one.
         let mut seen = 0usize;
@@ -137,17 +152,70 @@ impl OutputBuffer {
             // 1 instead of 0, silently dropping the leading content.
             idx = i;
         }
-        BufferRead {
-            bytes: self.data[idx..].to_vec(),
-            cursor: self.head,
-            truncated_at_tail: false,
-        }
+        self.tail() + idx as u64
+    }
+
+    /// Copy the absolute range `[start, end)`, clamped to what the buffer
+    /// still holds. Used to snapshot the expanded redaction window and the
+    /// partial-secret scan region under a single lock acquisition.
+    pub fn slice(&self, start: u64, end: u64) -> Vec<u8> {
+        let tail = self.tail();
+        let s = start.clamp(tail, self.head);
+        let e = end.clamp(s, self.head);
+        let off = (s - tail) as usize;
+        self.data[off..off + (e - s) as usize].to_vec()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_starts_are_absolute_offsets() {
+        let mut b = OutputBuffer::new(64);
+        b.push(b"one\ntwo\nthree\n");
+        assert_eq!(b.tail_bytes_start(5), 14 - 5);
+        assert_eq!(b.tail_bytes_start(1000), 0, "clamped to what is held");
+        // "two\nthree\n" starts 4 bytes in.
+        assert_eq!(b.tail_lines_start(2), 4);
+        assert_eq!(b.tail_lines_start(0), b.head());
+    }
+
+    #[test]
+    fn tail_starts_survive_eviction() {
+        let mut b = OutputBuffer::new(8);
+        b.push(b"0123456789ab"); // tail 4, head 12
+        assert_eq!(b.tail(), 4);
+        assert_eq!(
+            b.tail_bytes_start(4),
+            8,
+            "offsets stay absolute after the ring wraps"
+        );
+        assert_eq!(b.tail_bytes_start(100), 4, "clamped to the live tail");
+    }
+
+    #[test]
+    fn slice_returns_the_absolute_range_and_clamps() {
+        let mut b = OutputBuffer::new(64);
+        b.push(b"0123456789");
+        assert_eq!(b.slice(2, 5), b"234");
+        assert_eq!(b.slice(0, 100), b"0123456789", "clamped to head");
+        assert_eq!(
+            b.slice(7, 3),
+            b"",
+            "an inverted range is empty, not a panic"
+        );
+    }
+
+    #[test]
+    fn slice_is_relative_to_the_live_tail_after_eviction() {
+        let mut b = OutputBuffer::new(4);
+        b.push(b"abcdef"); // holds "cdef", tail 2, head 6
+        assert_eq!(b.slice(2, 6), b"cdef");
+        assert_eq!(b.slice(0, 6), b"cdef", "below the tail clamps up");
+        assert_eq!(b.slice(4, 6), b"ef");
+    }
 
     #[test]
     fn push_and_read_from_zero() {
