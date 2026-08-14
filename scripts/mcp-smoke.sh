@@ -33,6 +33,27 @@
 # attempt is a smoke check that cannot go red.
 set -uo pipefail
 
+# Called with no argument, this script builds what it is about to test.
+#
+# It used not to, and against a stale `target/debug/clasp` it fails two
+# checks with `osc133_source: null` -- which reads exactly like a 0.0.2
+# regression and cost one milestone's implementer a bisect against a
+# baseline worktree to disprove. A check that fails misleadingly costs
+# almost as much as one that cannot fail, and "remember to build first"
+# is not a property of the artifact.
+#
+# Only on the default path. An explicit argument names a binary the
+# caller has already produced -- CI passes `./target/release/clasp` after
+# its own `cargo build --release`, and `./scripts/mcp-smoke.sh /bin/true`
+# is the negative control that must fail all 30 checks -- so building in
+# that case would either be wrong or a no-op.
+if [ "$#" -eq 0 ]; then
+  if ! cargo build --workspace >&2; then
+    echo "mcp-smoke: cargo build --workspace failed; nothing to smoke" >&2
+    exit 1
+  fi
+fi
+
 BIN="${1:-./target/debug/clasp}"
 if [ ! -x "$BIN" ]; then
   echo "build first: cargo build --workspace" >&2
