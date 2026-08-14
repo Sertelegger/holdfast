@@ -1,1 +1,471 @@
-//! Audit log. Implemented in Task 6.
+//! Append-only JSON-lines audit log (spec §9.4).
+//!
+//! **Every string that reaches this log goes through the redactor first.**
+//! That is not a convention the callers have to remember: `record` walks
+//! the payload and redacts it, so an audit line cannot carry a secret even
+//! when the session it describes has redaction disabled (§9.4, REQ-O-010).
+
+use crate::output::redact::redact_str;
+use crate::output::rules::RuleSet;
+use parking_lot::Mutex;
+use serde_json::{Map, Value};
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+#[derive(Debug)]
+enum Sink {
+    /// No audit file configured; `record` is a no-op. Used by tests and
+    /// by callers that have not opened a log yet.
+    Disabled,
+    File(File),
+}
+
+#[derive(Debug)]
+pub struct AuditLog {
+    rules: Arc<RuleSet>,
+    sink: Mutex<Sink>,
+    path: Option<PathBuf>,
+    /// Running count of `redact: false` reads, reported in the
+    /// `redaction_disabled` entry as `redact_false_count_so_far`.
+    redact_false_count: AtomicU64,
+    /// Writes that failed. The daemon must not die because a log file
+    /// filled up, but the failure must be countable.
+    write_errors: AtomicU64,
+}
+
+impl AuditLog {
+    pub fn disabled(rules: Arc<RuleSet>) -> Self {
+        Self {
+            rules,
+            sink: Mutex::new(Sink::Disabled),
+            path: None,
+            redact_false_count: AtomicU64::new(0),
+            write_errors: AtomicU64::new(0),
+        }
+    }
+
+    /// Open (or create) an audit log at `path`, appending.
+    pub fn to_path(path: impl AsRef<Path>, rules: Arc<RuleSet>) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Self {
+            rules,
+            sink: Mutex::new(Sink::File(file)),
+            path: Some(path),
+            redact_false_count: AtomicU64::new(0),
+            write_errors: AtomicU64::new(0),
+        })
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn write_errors(&self) -> u64 {
+        self.write_errors.load(Ordering::Relaxed)
+    }
+
+    /// Redact every string in a JSON payload, however deeply nested.
+    pub fn redact_value(&self, value: &Value) -> Value {
+        match value {
+            Value::String(s) => Value::String(redact_str(&self.rules, s)),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|v| self.redact_value(v)).collect())
+            }
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), self.redact_value(v)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    /// Append one entry. `fields` supplies the per-`kind` extras from the
+    /// §9.4 table; `ts` and `kind` are added here.
+    pub fn record(&self, kind: &str, session_id: Option<&str>, fields: Value) {
+        let mut line: Map<String, Value> = match self.redact_value(&fields) {
+            Value::Object(map) => map,
+            other => {
+                let mut m = Map::new();
+                m.insert("fields".into(), other);
+                m
+            }
+        };
+        line.insert("ts".into(), Value::String(now_rfc3339()));
+        line.insert("kind".into(), Value::String(kind.to_string()));
+        if let Some(id) = session_id {
+            line.insert("session_id".into(), Value::String(id.to_string()));
+        }
+        let mut text = match serde_json::to_string(&Value::Object(line)) {
+            Ok(t) => t,
+            Err(_) => {
+                self.write_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        text.push('\n');
+
+        let mut sink = self.sink.lock();
+        if let Sink::File(file) = &mut *sink {
+            if file.write_all(text.as_bytes()).is_err() {
+                self.write_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// `redaction_disabled` (§9.4): someone asked for raw bytes.
+    ///
+    /// **Two facts, not one.** `tool` is the mechanism that read
+    /// (`read_output`, `resource_read`, `get_screen_state`);
+    /// `client_kind` is the accountable party (`shim`, `cli`,
+    /// `ui-bridge`, `in_process` — the three handshake values verbatim,
+    /// hyphen included, so the log joins across event kinds).
+    /// A human running `clasp logs --raw` and an agent calling
+    /// `read_output(redact: false)` both go through `read_output`, so
+    /// one string cannot tell them apart — and the whole value of this
+    /// entry is telling them apart.
+    ///
+    /// Both are `&'static str` on purpose: they name things compiled
+    /// into this binary, so they can only come from literals at the
+    /// call site, never from a request body. 0.0.5 derives
+    /// `client_kind` from the authenticated control connection
+    /// (`crate::mcp::caller::audit_surface`); until then every caller
+    /// really is in-process.
+    ///
+    /// `client_kind` is audit attribution and nothing else. Nothing in
+    /// the read path may branch on it to decide whether to redact
+    /// (§9.4, REQ-SEC-018); §7.5's `Attach.role` is the only field that
+    /// selects raw versus redacted output.
+    pub fn record_redaction_disabled(
+        &self,
+        session_id: Option<&str>,
+        tool: &'static str,
+        client_kind: &'static str,
+    ) {
+        let count = self.redact_false_count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.record(
+            "redaction_disabled",
+            session_id,
+            serde_json::json!({
+                "tool": tool,
+                "client_kind": client_kind,
+                "redact_false_count_so_far": count,
+            }),
+        );
+    }
+
+    /// `truncated_at_tail` (§9.4): a forensic record of the context-rule
+    /// blind spot documented in §4.1 — a secret's context prefix may have
+    /// rolled out of the ring buffer before the value was read.
+    pub fn record_truncated_at_tail(
+        &self,
+        session_id: &str,
+        tool: &str,
+        since_cursor: u64,
+        buffer_tail: u64,
+    ) {
+        self.record(
+            "truncated_at_tail",
+            Some(session_id),
+            serde_json::json!({
+                "tool": tool,
+                "since_cursor": since_cursor,
+                "buffer_tail": buffer_tail,
+            }),
+        );
+    }
+
+    pub fn redact_false_count(&self) -> u64 {
+        self.redact_false_count.load(Ordering::Relaxed)
+    }
+}
+
+/// `~/.clasp/logs/audit.log` — the one path §9.4 names. There is no
+/// environment override: §10.1 reserves env vars for operational logging
+/// knobs, not configuration, and the config-file path arrives with the
+/// daemon in 0.0.5.
+///
+/// Returns `None` when `$HOME` is unset, in which case the caller runs
+/// with a disabled log rather than guessing a path.
+pub fn default_path() -> Option<PathBuf> {
+    audit_path_under_home(std::env::var_os("HOME"))
+}
+
+/// The pure half of `default_path`, so both of its arms are reachable
+/// from a test without mutating the process environment — which is racy
+/// under a parallel test runner and, from Rust 2024 on, unsafe.
+///
+/// An **empty** `$HOME` is treated as unset. `PathBuf::from("")` joins to
+/// a *relative* `.clasp/logs/audit.log`, so the one thing worse than no
+/// audit trail — an audit trail written into whatever directory the
+/// daemon happened to start in, where nothing will look for it — is what
+/// the obvious spelling produces.
+fn audit_path_under_home(home: Option<OsString>) -> Option<PathBuf> {
+    home.filter(|h| !h.is_empty()).map(|h| {
+        PathBuf::from(h)
+            .join(".clasp")
+            .join("logs")
+            .join("audit.log")
+    })
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const SECRET: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+
+    fn log_in(dir: &Path) -> AuditLog {
+        let rules = Arc::new(RuleSet::builtin().unwrap());
+        AuditLog::to_path(dir.join("audit.log"), rules).unwrap()
+    }
+
+    fn lines(log: &AuditLog) -> Vec<Value> {
+        let text = std::fs::read_to_string(log.path().unwrap()).unwrap();
+        text.lines()
+            .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
+            .collect()
+    }
+
+    #[test]
+    fn an_entry_carries_ts_kind_and_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record("session_start", Some("sess_abc"), json!({"pid": 4242}));
+        let entries = lines(&log);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["kind"], "session_start");
+        assert_eq!(entries[0]["session_id"], "sess_abc");
+        assert_eq!(entries[0]["pid"], 4242);
+        let ts = entries[0]["ts"].as_str().unwrap();
+        assert!(
+            ts.len() >= 20 && ts.ends_with('Z') && ts.contains('T'),
+            "ts must be RFC 3339 UTC, got {ts:?}"
+        );
+    }
+
+    #[test]
+    fn entries_append_rather_than_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record("daemon_start", None, json!({"pid": 1}));
+        log.record("daemon_stop", None, json!({"reason": "explicit"}));
+        let entries = lines(&log);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["kind"], "daemon_start");
+        assert_eq!(entries[1]["kind"], "daemon_stop");
+        assert!(
+            entries[0].get("session_id").is_none(),
+            "daemon-wide entries carry no session id"
+        );
+    }
+
+    /// REQ-O-010 / §9.4: audit lines never carry an unredacted secret.
+    #[test]
+    fn a_secret_in_a_field_is_redacted_and_its_context_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record(
+            "session_start",
+            Some("sess_abc"),
+            json!({ "command": "curl", "args": ["-H", format!("Authorization: token {SECRET}")] }),
+        );
+        let raw = std::fs::read_to_string(log.path().unwrap()).unwrap();
+        assert!(!raw.contains(SECRET), "the secret reached the audit log");
+        // The absence check alone would pass against a log that wrote
+        // nothing at all, so assert the rest of the entry survived.
+        let entries = lines(&log);
+        assert_eq!(entries[0]["command"], "curl");
+        assert_eq!(entries[0]["args"][0], "-H");
+        assert_eq!(
+            entries[0]["args"][1],
+            "Authorization: token [REDACTED:github]"
+        );
+    }
+
+    #[test]
+    fn redaction_reaches_arbitrarily_nested_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record(
+            "panic",
+            None,
+            json!({ "context": { "excerpt": [{"line": format!("export TOKEN={SECRET}")}] } }),
+        );
+        let raw = std::fs::read_to_string(log.path().unwrap()).unwrap();
+        assert!(!raw.contains(SECRET));
+        let entries = lines(&log);
+        assert_eq!(
+            entries[0]["context"]["excerpt"][0]["line"],
+            "export TOKEN=[REDACTED:github]"
+        );
+    }
+
+    /// `record`'s other arm. A `fields` value that is not an object is
+    /// wrapped under `fields` rather than dropped — and it is redacted on
+    /// the way, because the redaction runs *before* the shape test. Only
+    /// the object arm was exercised, so a wrapper that skipped the
+    /// redactor, or dropped the payload entirely, was invisible.
+    #[test]
+    fn a_non_object_payload_is_wrapped_and_still_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record("panic", None, json!(format!("died holding {SECRET}")));
+        let raw = std::fs::read_to_string(log.path().unwrap()).unwrap();
+        assert!(!raw.contains(SECRET), "the secret reached the audit log");
+        let entries = lines(&log);
+        assert_eq!(entries[0]["kind"], "panic");
+        assert_eq!(entries[0]["fields"], "died holding [REDACTED:github]");
+    }
+
+    /// §9.4 records the mechanism and the accountable party separately.
+    /// `clasp logs --raw` is not a third mechanism: it is `read_output`
+    /// performed on behalf of a `cli` client, which is exactly the
+    /// distinction a single `surface` string could not make.
+    ///
+    /// Kills "collapse the two back into one field": the two entries
+    /// share a `tool` and differ only in `client_kind`, so an
+    /// implementation that writes either one alone cannot tell them
+    /// apart. The `shim` / `cli` literals are §9.4's spelling verbatim
+    /// (rev. 35 rejected `agent`), so this also kills a re-spelling.
+    #[test]
+    fn redaction_disabled_entries_name_the_tool_and_the_caller_and_count_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record_redaction_disabled(Some("sess_a"), "read_output", "shim");
+        log.record_redaction_disabled(Some("sess_a"), "read_output", "cli");
+        let entries = lines(&log);
+        assert_eq!(entries[0]["kind"], "redaction_disabled");
+        assert_eq!(entries[0]["session_id"], "sess_a");
+        assert_eq!(entries[0]["tool"], "read_output");
+        assert_eq!(entries[0]["client_kind"], "shim");
+        assert_eq!(entries[0]["redact_false_count_so_far"], 1);
+        // Same mechanism, different accountable party — the distinction
+        // a single `surface` string could not make.
+        assert_eq!(entries[1]["tool"], "read_output");
+        assert_eq!(entries[1]["client_kind"], "cli");
+        assert_eq!(entries[1]["redact_false_count_so_far"], 2);
+        assert_eq!(log.redact_false_count(), 2);
+    }
+
+    #[test]
+    fn truncated_at_tail_entries_record_the_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record_truncated_at_tail("sess_a", "read_output", 10, 4096);
+        let entries = lines(&log);
+        assert_eq!(entries[0]["kind"], "truncated_at_tail");
+        // §9.4 gives this kind three extra fields, not two. `tool` is what
+        // says *which* read path hit the gap, and the session id is what
+        // says whose buffer it was — neither is inferable from the
+        // offsets, and neither was asserted.
+        assert_eq!(entries[0]["session_id"], "sess_a");
+        assert_eq!(entries[0]["tool"], "read_output");
+        // Two numbers a transposition would swap, so they are different.
+        assert_eq!(entries[0]["since_cursor"], 10);
+        assert_eq!(entries[0]["buffer_tail"], 4096);
+    }
+
+    #[test]
+    fn a_disabled_log_writes_nothing_and_does_not_fail() {
+        let rules = Arc::new(RuleSet::builtin().unwrap());
+        let log = AuditLog::disabled(rules);
+        log.record("session_start", Some("sess_a"), json!({"pid": 1}));
+        assert!(log.path().is_none());
+        assert_eq!(log.write_errors(), 0);
+    }
+
+    /// A full disk must not take the daemon down, and a silent failure is
+    /// worse than a loud one — so the write error is swallowed and
+    /// *counted*, and `clasp doctor` (0.0.12) reads the count.
+    ///
+    /// `/dev/full` is the only portable way to make `write_all` fail on
+    /// demand; it is Linux-only, and this is the one arm of `record` that
+    /// nothing else can reach. Paired with the ordinary path, so a
+    /// counter stuck at 1 fails as loudly as one stuck at 0.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_that_fails_is_counted_and_does_not_panic() {
+        let rules = Arc::new(RuleSet::builtin().unwrap());
+        let full = match AuditLog::to_path("/dev/full", Arc::clone(&rules)) {
+            Ok(log) => log,
+            // A container without /dev/full: the arm is unreachable here,
+            // and skipping is honest where inventing a pass is not.
+            Err(_) => return,
+        };
+        assert_eq!(full.write_errors(), 0, "nothing has been written yet");
+        full.record("daemon_start", None, json!({"pid": 1}));
+        assert_eq!(full.write_errors(), 1, "ENOSPC must be counted");
+        full.record("daemon_stop", None, json!({"reason": "explicit"}));
+        assert_eq!(full.write_errors(), 2, "and counted per write");
+
+        // The separator: the same two calls against a real file count
+        // nothing, so this pins the *failure* rather than "record always
+        // increments".
+        let dir = tempfile::tempdir().unwrap();
+        let ok = log_in(dir.path());
+        ok.record("daemon_start", None, json!({"pid": 1}));
+        ok.record("daemon_stop", None, json!({"reason": "explicit"}));
+        assert_eq!(ok.write_errors(), 0);
+    }
+
+    #[test]
+    fn reopening_the_same_path_appends_to_the_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let log = log_in(dir.path());
+            log.record("daemon_start", None, json!({"pid": 1}));
+        }
+        let log = log_in(dir.path());
+        log.record("daemon_start", None, json!({"pid": 2}));
+        let entries = lines(&log);
+        assert_eq!(entries.len(), 2, "a restart must not truncate the trail");
+        assert_eq!(entries[0]["pid"], 1);
+        assert_eq!(entries[1]["pid"], 2);
+    }
+
+    /// §9.4 names exactly one path, and both of `default_path`'s answers
+    /// matter: the components decide where the trail lands, and the
+    /// `None` decides that a caller with no `$HOME` runs with a disabled
+    /// log instead of guessing.
+    #[test]
+    fn the_default_path_is_the_one_9_4_names_and_is_absent_without_a_home() {
+        assert_eq!(
+            audit_path_under_home(Some(OsString::from("/home/u"))),
+            Some(PathBuf::from("/home/u/.clasp/logs/audit.log")),
+        );
+        assert_eq!(audit_path_under_home(None), None, "no $HOME, no guess");
+        assert_eq!(
+            audit_path_under_home(Some(OsString::new())),
+            None,
+            "an empty $HOME would join to a *relative* path, which writes \
+             the audit trail into the daemon's working directory"
+        );
+        // …and the env-reading wrapper really is that function. Under
+        // `cargo test` $HOME is set, so this arm is the reachable one.
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            assert_eq!(
+                default_path(),
+                Some(
+                    PathBuf::from(home)
+                        .join(".clasp")
+                        .join("logs")
+                        .join("audit.log")
+                ),
+            );
+        }
+    }
+}

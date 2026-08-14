@@ -463,6 +463,61 @@ fn every_declared_shape_forbids_undeclared_fields() {
     }
 }
 
+/// REQ-SEC-006's echo half, and the reason it is testable at all.
+///
+/// §9.2 requires `env` values to be redacted "in any echo back via
+/// `status` etc.". v0.1.0 satisfies that the stronger way: **no tool
+/// returns `env` on any Returns list**, so there is no echo to redact.
+/// That is a decision, not an accident — the audit log is keys-only
+/// (`session_start`, REQ-SEC-006) and a response field carrying the map
+/// would reintroduce, on the MCP wire, exactly the exposure the log
+/// avoids. Whoever adds an `env` field to `SessionRecord` for the
+/// convenience of it gets this test, and the decision, in front of them.
+///
+/// The `start_session` assertion at the end is the pair. `env` is an
+/// *input* — the whole point of the argument — and asserting its presence
+/// there is what stops this test from passing because the walk found
+/// nothing, or because `env` was spelled differently everywhere.
+#[test]
+fn no_tool_advertises_an_env_field_to_echo() {
+    let mut shapes = 0usize;
+    for name in TOOLS {
+        let schema = output_schema(name);
+        let mut found = Vec::new();
+        object_subschemas("#", &schema, &mut found);
+        assert!(found.len() >= 2, "{name}: the walk found nothing to check");
+        for (path, body) in found {
+            shapes += 1;
+            if let Some(props) = body.get("properties").and_then(Value::as_object) {
+                assert!(
+                    !props.contains_key("env"),
+                    "{name}: {path} declares an `env` field. v0.1.0's \
+                     protection for env values is that no response carries \
+                     them (REQ-SEC-006); adding one turns that structural \
+                     guarantee into a redaction outcome, and the redactor \
+                     only catches secret-*shaped* values"
+                );
+            }
+        }
+    }
+    assert!(
+        shapes >= 2 * TOOLS.len(),
+        "only {shapes} object shape(s) across {} tools; the sweep is not \
+         reaching the record shapes",
+        TOOLS.len()
+    );
+
+    let input = advertised("start_session").input_schema;
+    assert!(
+        input
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|p| p.contains_key("env")),
+        "`env` is not spelled `env` on the way *in* either, so the sweep \
+         above is looking for a name nothing uses"
+    );
+}
+
 #[test]
 fn every_tool_declares_the_annotations_5_3_assigns_it() {
     // Four same-typed booleans per tool: transposing two of them compiles,

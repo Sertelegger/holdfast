@@ -212,7 +212,7 @@ use clasp_core::mcp::ClaspServer;
 use clasp_core::pty::MockPty;
 use clasp_core::session::{new_session_id, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 fn body(r: &rmcp::model::CallToolResult) -> Value {
@@ -1915,4 +1915,227 @@ async fn get_command_history_bounds_its_response_at_the_ring_default() {
     // Nothing was evicted: the ring was sized to hold everything, so the
     // shortfall above is the response cap and not the ring's.
     assert_eq!(payload["data"]["truncated_at_tail"], false);
+}
+
+// ------------------------------------------------- §9.4 `session_start`
+//
+// REQ-SEC-006's Tier-2 row (§11.2 "`start_session.env` audit log"). The
+// three tests below are one requirement in three parts: the entry exists
+// and names the keys, the *values* are absent for a value no rule could
+// have masked, and the field list is §9.4's.
+
+/// A server writing its audit trail into a temporary directory, plus the
+/// path to read it back from. Never the real `~/.clasp/logs/audit.log`.
+fn server_with_audit(dir: &std::path::Path) -> (ClaspServer, std::path::PathBuf) {
+    let path = dir.join("audit.log");
+    (
+        ClaspServer::with_audit_path(Some(path.clone())),
+        path.clone(),
+    )
+}
+
+/// Every `session_start` line in the trail, parsed.
+fn audit_entries(path: &std::path::Path, kind: &str) -> Vec<Value> {
+    let text = std::fs::read_to_string(path).expect("the audit log must exist");
+    text.lines()
+        .map(|l| serde_json::from_str::<Value>(l).expect("each line is one JSON object"))
+        .filter(|e| e["kind"] == kind)
+        .collect()
+}
+
+/// Start a session carrying `env`, run `printenv` over its keys, then
+/// terminate it — so the value has been through the child, the buffer and
+/// a tool response before the log is inspected.
+async fn env_session_lifecycle(
+    server: &ClaspServer,
+    env: &[(&str, &str)],
+) -> (String, std::string::String) {
+    let map: std::collections::HashMap<String, String> = env
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    let started = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            env: Some(map),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let id = body(&started)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let session = server.registry.get(&id).unwrap();
+    let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+    session
+        .write_input(format!("printenv {}\n", names.join(" ")).as_bytes())
+        .unwrap();
+    // Wait for the *last* value to appear, so every one of them has been
+    // through the PTY before the log is read.
+    let seen = wait_for_buffer(&session, env.last().expect("at least one var").1);
+
+    let _ = server
+        .terminate(Parameters(TerminateArgs {
+            session: id.clone(),
+            force: Some(true),
+            timeout_secs: None,
+        }))
+        .await;
+    (id, seen)
+}
+
+/// REQ-SEC-006, the secret-shaped half. `env_keys` names the key; the
+/// value is nowhere in the trail.
+#[tokio::test]
+async fn session_start_logs_env_keys_and_never_env_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, log_path) = server_with_audit(dir.path());
+    const API_KEY: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
+    const OTHER: &str = "sk-ant-api03-ZZZZYYYYXXXXWWWWVVVVUUUUTTTT";
+
+    // Two keys, handed in reverse alphabetical order, so the assertion
+    // below is about the key *set and order* rather than about one name.
+    let (id, seen) =
+        env_session_lifecycle(&server, &[("ZZ_OTHER", OTHER), ("API_KEY", API_KEY)]).await;
+
+    // The check is only worth anything if the values really existed: a
+    // spawn that silently dropped `env` would make the absence assertions
+    // below pass for the wrong reason.
+    assert!(
+        seen.contains(API_KEY) && seen.contains(OTHER),
+        "env never reached the child, so the absence checks prove nothing: {seen:?}"
+    );
+
+    let entries = audit_entries(&log_path, "session_start");
+    assert_eq!(entries.len(), 1, "one spawn, one entry");
+    assert_eq!(entries[0]["session_id"], id.as_str());
+    assert_eq!(
+        entries[0]["env_keys"],
+        json!(["API_KEY", "ZZ_OTHER"]),
+        "env_keys is the sorted key set"
+    );
+
+    let raw = std::fs::read_to_string(&log_path).unwrap();
+    for value in [API_KEY, OTHER] {
+        assert!(
+            !raw.contains(value),
+            "an env value reached the audit log: {raw}"
+        );
+    }
+}
+
+/// The pairing, and the one that matters. `correct horse battery staple`
+/// matches **no** redaction rule, so a `session_start` that serialised the
+/// whole `env` map and leaned on the redactor passes the test above and
+/// fails this one. §9.2's row is keys-only, which is a structural
+/// guarantee rather than a redaction outcome.
+#[tokio::test]
+async fn an_env_value_that_matches_no_rule_is_still_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, log_path) = server_with_audit(dir.path());
+    const PASSPHRASE: &str = "correct horse battery staple";
+
+    // The premise, asserted rather than assumed: if some rule *did* match
+    // this value, the test would be a second copy of the one above.
+    let rules = clasp_core::output::rules::builtin_shared();
+    assert_eq!(
+        clasp_core::output::redact::redact_str(&rules, PASSPHRASE),
+        PASSPHRASE,
+        "the separator only separates while no rule matches this value"
+    );
+
+    let (id, seen) = env_session_lifecycle(&server, &[("DB_PASSWORD", PASSPHRASE)]).await;
+    assert!(
+        seen.contains(PASSPHRASE),
+        "env never reached the child: {seen:?}"
+    );
+
+    let entries = audit_entries(&log_path, "session_start");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["session_id"], id.as_str());
+    assert_eq!(entries[0]["env_keys"], json!(["DB_PASSWORD"]));
+
+    let raw = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        !raw.contains(PASSPHRASE),
+        "the env map was logged and merely redacted: {raw}"
+    );
+}
+
+/// §9.4's field list for `session_start`, pinned as an exact key set so a
+/// field quietly added or dropped later reads red — plus the three common
+/// fields every entry carries.
+#[tokio::test]
+async fn session_start_records_the_field_set_9_4_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, log_path) = server_with_audit(dir.path());
+    let cwd = std::env::temp_dir().canonicalize().unwrap();
+
+    let started = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: bash_args(),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let id = body(&started)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let entries = audit_entries(&log_path, "session_start");
+    assert_eq!(entries.len(), 1);
+    let mut got: Vec<&str> = entries[0]
+        .as_object()
+        .expect("each entry is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![
+            "args",
+            "command",
+            "cwd",
+            "env_keys",
+            "idle_timeout_secs",
+            "kind",
+            "pid",
+            "redaction_enabled",
+            "session_id",
+            "ts",
+        ],
+        "§9.4's `session_start` row plus the three fields every entry carries"
+    );
+
+    // Values, not just names: a record that reported another session's
+    // command, or a constant, would pass the key-set assertion alone.
+    assert_eq!(entries[0]["command"], "bash");
+    assert_eq!(entries[0]["args"], json!(["--norc", "--noprofile"]));
+    assert_eq!(
+        entries[0]["cwd"],
+        cwd.to_string_lossy().as_ref(),
+        "the *canonical* cwd the child was spawned in"
+    );
+    assert_eq!(entries[0]["env_keys"], json!([]));
+    assert_eq!(entries[0]["redaction_enabled"], true);
+    assert_eq!(
+        entries[0]["idle_timeout_secs"],
+        Value::Null,
+        "no milestone has built idle reaping yet; a number here would be a \
+         promise nothing keeps"
+    );
+    assert_eq!(
+        entries[0]["pid"],
+        json!(server.registry.get(&id).unwrap().pid()),
+        "the entry names the child that was actually spawned"
+    );
+
+    kill_all(&server).await;
 }

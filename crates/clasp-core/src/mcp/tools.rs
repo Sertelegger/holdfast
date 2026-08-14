@@ -266,6 +266,53 @@ impl ClaspServer {
             return envelope::from_error(&e);
         }
 
+        // §9.4's `session_start`, with its field list verbatim.
+        //
+        // `command` and `args` are *not* pre-redacted here: `record`
+        // redacts every string it is handed, unconditionally, which is
+        // the property that makes an audit leak impossible rather than
+        // merely unlikely. A second redaction at the call site would be
+        // one more place that can be forgotten.
+        //
+        // `env_keys` is built from the key set, so the values are
+        // **structurally absent** rather than redacted (REQ-SEC-006). The
+        // redactor catches secret-*shaped* values; a password like
+        // `correct horse battery staple` matches no rule and would be
+        // logged in full. Sorted, so the field compares between runs.
+        //
+        // **No response carries `env`, and none should.** §9.2 requires
+        // `env` values to be redacted "in any echo back via `status`
+        // etc."; the cheapest way to satisfy that is to have no echo, so
+        // `session_record` must not grow an `env` field —
+        // `no_tool_advertises_an_env_field_to_echo` in `tests/schema.rs`
+        // is what keeps that decision from being undone by convenience.
+        let env_keys: Vec<&str> = {
+            let mut keys: Vec<&str> = cfg.env.iter().map(|(k, _)| k.as_str()).collect();
+            keys.sort_unstable();
+            keys
+        };
+        self.audit.record(
+            "session_start",
+            Some(&session.id),
+            json!({
+                "command": cfg.command,
+                "args": cfg.args,
+                "cwd": cfg.cwd,
+                "env_keys": env_keys,
+                // Null, not §5.2's 1800 default: `idle_timeout_secs` is a
+                // `start_session` argument no milestone has built yet
+                // (REQ-S-004 is 0.0.5's, with the reaper), so nothing in
+                // this build would reap at any value written here. §9.4
+                // names the field, so the key is present; a number would
+                // be a promise nothing keeps.
+                "idle_timeout_secs": serde_json::Value::Null,
+                // Unconditionally true until `redaction_enabled` becomes a
+                // per-session argument, which is 0.0.5's too.
+                "redaction_enabled": true,
+                "pid": session.pid(),
+            }),
+        );
+
         Ok(envelope::ok(
             json!({
                 "session_id": session.id,

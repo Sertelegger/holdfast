@@ -5,20 +5,51 @@ pub mod envelope;
 pub mod schema;
 pub mod tools;
 
+use crate::audit::AuditLog;
+use crate::output::rules::builtin_shared;
 use crate::session::SessionRegistry;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool_handler, ServerHandler, ServiceExt};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct ClaspServer {
     pub registry: Arc<SessionRegistry>,
+    /// The §9.4 trail. Every string handed to it is redacted before it is
+    /// written, so no call site can leak a secret into it.
+    pub audit: Arc<AuditLog>,
 }
 
 impl ClaspServer {
+    /// A server with the audit trail disabled. This is the constructor
+    /// tests use: no test should write into the invoking user's home.
     pub fn new() -> Self {
+        Self::with_audit_path(None)
+    }
+
+    /// A server whose audit trail is written to `path`, when given.
+    ///
+    /// A log that cannot be opened degrades to a disabled one with a
+    /// message on stderr rather than refusing to start: a daemon that
+    /// will not run because `~/.clasp/logs` is unwritable is a worse
+    /// outcome than one that runs and says so. (`AuditLog::record`
+    /// redacts either way, so the degraded mode cannot leak.)
+    pub fn with_audit_path(path: Option<PathBuf>) -> Self {
+        let rules = builtin_shared();
+        let audit = match path {
+            Some(p) => match AuditLog::to_path(&p, Arc::clone(&rules)) {
+                Ok(log) => Arc::new(log),
+                Err(e) => {
+                    eprintln!("clasp: cannot open audit log {}: {e}", p.display());
+                    Arc::new(AuditLog::disabled(Arc::clone(&rules)))
+                }
+            },
+            None => Arc::new(AuditLog::disabled(Arc::clone(&rules))),
+        };
         Self {
             registry: Arc::new(SessionRegistry::with_defaults()),
+            audit,
         }
     }
 }
@@ -65,7 +96,10 @@ impl ServerHandler for ClaspServer {
 
 /// Serve MCP over stdio until the client disconnects.
 pub async fn serve_stdio() -> anyhow::Result<()> {
-    let service = ClaspServer::new().serve(rmcp::transport::stdio()).await?;
+    // The audit path is resolved here rather than in `new()` so that only
+    // the real server process ever writes to it.
+    let server = ClaspServer::with_audit_path(crate::audit::default_path());
+    let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
