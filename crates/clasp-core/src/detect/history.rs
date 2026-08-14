@@ -633,6 +633,51 @@ mod tests {
         );
     }
 
+    /// The suffix half of §8.5.1 rule 5, which nothing else separates from
+    /// an equality test.
+    ///
+    /// The rule is written over a *suffix* because §5.2 documents the echo
+    /// capture truncating to its tail at the terminal width: 125 characters
+    /// typed at 80 columns are captured as the last 47. CLASP's snippets
+    /// are 300-500 characters, so at any real width the capture is **always**
+    /// a tail and never the whole line — which means an implementation
+    /// spelled `line.trim_end() == command` suppresses the injection line
+    /// at no terminal width anybody uses, while passing every fixture whose
+    /// snippet happens to be short enough to fit.
+    #[test]
+    fn the_injection_line_is_matched_as_a_suffix_and_not_as_an_equality() {
+        let snippet = "if [ -z \"${CLASP_SHELL_INTEGRATION-}\" ]; then \
+                       CLASP_SHELL_INTEGRATION=1; PS0='mark'; PS1='mark'; fi";
+        // What an 80-column terminal leaves of it: the tail, with the front
+        // of the line overwritten by the line editor's wrap redraw.
+        let captured = "PS0='mark'; PS1='mark'; fi";
+        assert!(
+            snippet.ends_with(captured) && snippet != captured,
+            "the fixture must be a proper suffix, or it proves nothing"
+        );
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        h.set_injection_line(snippet.to_string());
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        raw.extend_from_slice(captured.as_bytes());
+        raw.extend_from_slice(b"\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        raw.extend_from_slice(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi\r\n");
+        raw.extend_from_slice(b"\x1b]133;D;0\x07");
+        let mut t = 1_000i64;
+        for ev in sc.feed(&raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        let e = h.entries(0, 50);
+        assert_eq!(
+            e.len(),
+            1,
+            "a truncated capture of the install line became an entry: {e:?}"
+        );
+        assert_eq!(e[0].command, "echo hi");
+    }
+
     /// The third arrangement, and the one that was **measured wrong before
     /// it was written**: a foreign emitter that supplies no `B`.
     ///
