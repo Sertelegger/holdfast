@@ -80,6 +80,35 @@ pub enum Osc133 {
     CommandDone { exit_code: Option<i32> },
 }
 
+/// Whose OSC 133 markers this session is actually **using** (§18.2a).
+///
+/// Distinct from `shell_integration`, which records only what CLASP
+/// *injected* — a session can carry `shell_integration: Some(Fish)` with
+/// `Osc133Source::External`, meaning the snippet is installed and firing
+/// and its markers are being dropped on arrival (§8.5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Osc133Source {
+    /// Every marker seen so far carries `clasp=1`. The ordinary case.
+    Clasp,
+    /// Every letter seen so far has arrived from a foreign source; all of
+    /// CLASP's are being discarded.
+    External,
+    /// Some letters come from a foreign source and some from CLASP — a
+    /// *partial* foreign integration. Reachable only because §8.5.1's rule
+    /// yields per letter rather than per source.
+    Mixed,
+}
+
+impl Osc133Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clasp => "clasp",
+            Self::External => "external",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
 /// A marker plus the byte span of the escape sequence that carried it.
 /// Offsets are absolute into the raw stream, so they line up with
 /// `OutputBuffer` cursors.
@@ -160,10 +189,14 @@ pub struct Modes {
     /// 0.0.4's Tier B, which needs to know the alternate screen was
     /// entered in order to model the grid.
     ///
-    /// It licenses nothing because availability is *sticky* and this
-    /// signal supports no lasting inference: that a child took the whole
-    /// screen and later gave it back says nothing about whether the shell
-    /// now holding the tty signals its prompts at all. Through rev. 27 it
+    /// It licenses nothing because the observation *record* is sticky and
+    /// this signal supports no lasting inference: that a child took the
+    /// whole screen and later gave it back says nothing about whether the
+    /// shell now holding the tty signals its prompts at all. (The record
+    /// is sticky; the **licence** it confers is not, and since rev. 37 it
+    /// lapses when another program takes the terminal — see `licensed` in
+    /// `detector::snapshot_at`. Both halves are load-bearing.) Through
+    /// rev. 27 it
     /// gated the executing rung, and one `vim` then marked the session
     /// `Executing` at every later live prompt for the rest of its life.
     /// The reasoning is in full at `detector::snapshot_at`.
@@ -214,6 +247,15 @@ pub struct ModeScanner {
     capture_return_pending: bool,
     /// Last OSC 133 marker letter seen (`A`/`B`/`C`/`D`), for the T1 state.
     last_marker: Option<u8>,
+    /// Per marker letter (`A`, `B`, `C`, `D`), whether a **foreign** marker
+    /// of that letter has been observed. Sticky for the session: once a
+    /// letter has a foreign writer, CLASP's markers of that letter are
+    /// discarded for the rest of the session (§8.5.1 rule 3).
+    foreign_letters: [bool; 4],
+    /// Per marker letter, whether one of CLASP's own tagged markers of that
+    /// letter has been *used* — i.e. arrived before the letter went
+    /// foreign. This is what distinguishes `mixed` from `external`.
+    clasp_letters: [bool; 4],
     /// A `\r` was seen and we do not yet know whether it is the first half
     /// of a `\r\n` line terminator or a bare column-0 return.
     pending_cr: bool,
@@ -249,6 +291,8 @@ impl ModeScanner {
             capture: None,
             capture_return_pending: false,
             last_marker: None,
+            foreign_letters: [false; 4],
+            clasp_letters: [false; 4],
             pending_cr: false,
             foreground: None,
         }
@@ -264,6 +308,25 @@ impl ModeScanner {
 
     pub fn last_marker(&self) -> Option<u8> {
         self.last_marker
+    }
+
+    /// Whose markers this session is using (§18.2a, §8.5.1 rule 4).
+    ///
+    /// **`None` until the first marker arrives**, because that is genuinely
+    /// all CLASP knows before the first prompt cycle — reporting a value
+    /// then would be a guess dressed as a measurement.
+    pub fn osc133_source(&self) -> Option<Osc133Source> {
+        let any_foreign = self.foreign_letters.iter().any(|f| *f);
+        // A letter counts toward `clasp` only while it is still CLASP's:
+        // once foreign, CLASP's markers of that letter are discarded, so
+        // the letter's effective source is the foreign one.
+        let any_clasp = (0..4).any(|i| self.clasp_letters[i] && !self.foreign_letters[i]);
+        match (any_clasp, any_foreign) {
+            (false, false) => None,
+            (true, false) => Some(Osc133Source::Clasp),
+            (false, true) => Some(Osc133Source::External),
+            (true, true) => Some(Osc133Source::Mixed),
+        }
     }
 
     pub fn last_line(&mut self) -> String {
@@ -408,8 +471,13 @@ impl ModeScanner {
     /// - `root@prod:/etc# ` → `AtPrompt` / `heuristic` / 0.85 — the floor,
     ///   and the only case rev. 27 recorded
     /// - `\x1b[?2004h` → `AtPrompt` / `terminal_mode` / **0.95**, with
-    ///   `saw_bracketed_paste` set, which is sticky and gates which rungs
-    ///   may answer for the rest of the session
+    ///   `saw_bracketed_paste` set. That *record* is sticky; what it
+    ///   licenses is not — since rev. 37 the forged record licenses the T2
+    ///   executing rung for the forging program alone and lapses when
+    ///   something else holds the terminal (`detector::licensed`,
+    ///   REQ-PD-018, REQ-PD-025). The `AtPrompt` / 0.95 answer above comes
+    ///   from the *current-value* bracketed-paste rung, which is gated on
+    ///   no availability at all, so scoping does not touch it
     /// - `\x1b[?1049h` → `Fullscreen` / `terminal_mode`, `saw_alt_screen`
     ///   set
     /// - `\x1b]133;A\x07root@prod:/etc# ` → a genuine `PromptStart`
@@ -695,13 +763,69 @@ impl ModeScanner {
         }
     }
 
+    /// §8.5.1's tag-and-yield rule, applied per marker **letter**.
+    ///
+    /// CLASP is not the only writer of OSC 133: fish 4.x emits its own from
+    /// the shell core, and Kitty's, WezTerm's and starship-shaped
+    /// integrations emit into bash and zsh. Every marker CLASP's snippet
+    /// emits carries `clasp=1` (rule 1); a marker without it is *foreign*
+    /// (rule 2); and once a foreign marker of a letter has been seen, every
+    /// later `clasp=1` marker of **that letter** is discarded for the rest
+    /// of the session (rule 3).
+    ///
+    /// **Per letter, not per source, and that is the substantive half.** A
+    /// foreign integration may be partial — measured, fish 4.0.2 emits `A`,
+    /// `C` and `D` and never `B` — and whole-source suppression would then
+    /// discard CLASP's `B` along with the rest, leaving the echo capture no
+    /// `B..C` span and `get_command_history` reporting `command: ""` for
+    /// every entry. Yielding per letter keeps exactly the letters the
+    /// foreign emitter does not supply, which is why `osc133_source` needs
+    /// a `mixed` value at all.
+    ///
+    /// **Nesting survives by construction, not by exception:** an inner
+    /// CLASP-integrated shell tags its markers too, so it is not foreign to
+    /// the outer session and §8.5's nesting property is unchanged.
+    ///
+    /// **The residual, bounded and stated.** At most one command may still
+    /// be double-counted per letter per session — when CLASP's marker of a
+    /// letter arrives *before* the first foreign one and there is nothing
+    /// yet to yield to. Measured on fish 4.8.1 the cost is zero, because
+    /// fish emits its own `A` before calling `fish_prompt` and its own `C`
+    /// before CLASP's; that ordering is a property of one emitter and is
+    /// not guaranteed.
     fn osc133(&mut self, rest: &str) -> Option<Osc133> {
         let kind = rest.as_bytes().first().copied()?;
+        // Letters CLASP models. `P`, `L` and anything else stay inert:
+        // they are not evidence about whether a command is running and
+        // CLASP never emits them, so they take part in neither the
+        // yielding rule nor `osc133_source`.
+        let slot = match kind {
+            b'A' => 0,
+            b'B' => 1,
+            b'C' => 2,
+            b'D' => 3,
+            _ => return None,
+        };
+        // §8.5.1 rule 2: a marker without `clasp=1` is foreign. Matched as
+        // a whole `;`-separated field, never as a substring — a foreign
+        // `C;cmdline_url=…clasp=1…` carries user-controlled text and a
+        // `contains` would read it as CLASP's own.
+        let is_clasp = rest[1..].split(';').any(|param| param == "clasp=1");
+        if is_clasp {
+            if self.foreign_letters[slot] {
+                // Dropped *here*, so `capture`, `saw_osc133`, the owner
+                // record and `last_marker` never see it, and neither the
+                // detector nor the history ring can act on it (rule 3's
+                // "before it reaches the detector or the history ring").
+                return None;
+            }
+            self.clasp_letters[slot] = true;
+        } else {
+            self.foreign_letters[slot] = true;
+        }
         // Every modelled marker begins or ends a capture, so none of them
         // may inherit an armed `\r` from the span before it.
-        if matches!(kind, b'A' | b'B' | b'C' | b'D') {
-            self.capture_return_pending = false;
-        }
+        self.capture_return_pending = false;
         let marker = match kind {
             b'A' => {
                 self.capture = None;
@@ -725,9 +849,13 @@ impl ModeScanner {
                     .and_then(|s| s.parse::<i32>().ok());
                 Osc133::CommandDone { exit_code }
             }
-            // Not a marker we model (`P`, `L`, …). Leave the T1 state
-            // exactly as it was: an unmodelled marker is not evidence
-            // about whether a command is running.
+            // **Unreachable**, and kept only because `kind` is a `u8` and
+            // deleting it is `error[E0004]: non-exhaustive patterns`. The
+            // `slot` match above already returned for every letter that
+            // could land here — including the unmodelled `P` and `L`,
+            // which leave the T1 state exactly as it was because an
+            // unmodelled marker is not evidence about whether a command is
+            // running.
             _ => return None,
         };
         self.modes.saw_osc133 = true;
@@ -1386,6 +1514,151 @@ mod tests {
         assert_eq!(ev.len(), 1, "only B is modelled");
         assert!(s.modes().saw_osc133, "a real B must still set availability");
         assert_eq!(s.last_marker(), Some(b'B'));
+    }
+
+    /// §8.5.1, REQ-PD-023 — `detector::osc133_collision` in §11.1's names.
+    /// Per **letter**, not per source.
+    ///
+    /// It lives here rather than in `detector.rs` because `ModeScanner` is
+    /// directly constructible here and the rule is the scanner's: rule 3
+    /// requires the discard "before it reaches the detector or the history
+    /// ring", so the only place that can be asserted is the boundary the
+    /// discard happens at.
+    mod osc133_collision {
+        use super::*;
+
+        const CLASP_A: &[u8] = b"\x1b]133;A;clasp=1\x07";
+        const CLASP_B: &[u8] = b"\x1b]133;B;clasp=1\x07";
+        const CLASP_C: &[u8] = b"\x1b]133;C;clasp=1\x07";
+        const CLASP_D42: &[u8] = b"\x1b]133;D;42;clasp=1\x07";
+        // Foreign markers in the shapes measured on fish 4.8.1 —
+        // parameterised and ST-terminated, which also exercises the
+        // parser's tolerance of both terminators.
+        const FISH_A: &[u8] = b"\x1b]133;A;click_events=1\x1b\\";
+        const FISH_B: &[u8] = b"\x1b]133;B\x1b\\";
+        const FISH_C: &[u8] = b"\x1b]133;C;cmdline_url=echo%20hi\x1b\\";
+        const FISH_D0: &[u8] = b"\x1b]133;D;0\x1b\\";
+        // A foreign marker whose user-controlled parameter text contains
+        // the tag as a substring. A `contains("clasp=1")` test reads this
+        // as CLASP's own and then yields to nothing.
+        const FOREIGN_C_SPOOF: &[u8] = b"\x1b]133;C;cmdline_url=echo%20clasp=1\x1b\\";
+
+        #[test]
+        fn yielding_one_letter_does_not_yield_another() {
+            let mut s = ModeScanner::new();
+            assert_eq!(s.feed(FISH_A, 0, None).len(), 1);
+            assert!(
+                s.feed(CLASP_A, 0, None).is_empty(),
+                "CLASP's A must be discarded"
+            );
+            let ev = s.feed(CLASP_C, 0, None);
+            assert_eq!(ev.len(), 1, "CLASP's C must survive: A went foreign, not C");
+            assert_eq!(s.osc133_source(), Some(Osc133Source::Mixed));
+        }
+
+        #[test]
+        fn a_parameter_containing_the_tag_is_still_foreign() {
+            let mut s = ModeScanner::new();
+            assert_eq!(s.feed(FOREIGN_C_SPOOF, 0, None).len(), 1);
+            assert!(
+                s.feed(CLASP_C, 0, None).is_empty(),
+                "the tag must be matched as a field, not as a substring"
+            );
+        }
+
+        /// **The two streams are ordered, and the order is what makes the
+        /// `last_marker` assertion able to fail.** The foreign emitter runs
+        /// a whole cycle first, arming all four letters; CLASP's own then
+        /// arrive in the order its snippet emits them within one prompt
+        /// cycle — `PS0`'s `C`, `PROMPT_COMMAND`'s `D`, then `PS1`'s `A`
+        /// and `B`. So CLASP's last discarded letter is `B` while the
+        /// foreign one is `D`, and a discard performed *after*
+        /// `last_marker` is written reads `B` here. Written the other way
+        /// round — both streams ending on `D` — the assertion holds
+        /// identically whether the discard precedes the write or follows
+        /// it, and pins nothing.
+        #[test]
+        fn a_fully_foreign_emitter_takes_every_letter() {
+            let mut s = ModeScanner::new();
+            for m in [FISH_A, FISH_B, FISH_C, FISH_D0] {
+                assert_eq!(s.feed(m, 0, None).len(), 1);
+            }
+            for m in [CLASP_C, CLASP_D42, CLASP_A, CLASP_B] {
+                assert!(
+                    s.feed(m, 0, None).is_empty(),
+                    "CLASP's marker must be discarded"
+                );
+            }
+            // A discarded marker must not move the T1 prompt state either:
+            // the last marker the detector saw is the foreign `D`.
+            assert_eq!(
+                s.last_marker(),
+                Some(b'D'),
+                "a discarded marker moved the T1 prompt state"
+            );
+            assert_eq!(s.osc133_source(), Some(Osc133Source::External));
+        }
+
+        /// The negative that separates the three above from a scanner that
+        /// discards everything.
+        #[test]
+        fn clasps_own_markers_are_used_when_nothing_foreign_has_arrived() {
+            let mut s = ModeScanner::new();
+            for m in [CLASP_A, CLASP_B, CLASP_C, CLASP_D42] {
+                assert_eq!(s.feed(m, 0, None).len(), 1);
+            }
+            assert_eq!(s.osc133_source(), Some(Osc133Source::Clasp));
+        }
+
+        /// The bounded residual, asserted rather than described — and the
+        /// one arrangement in which a letter is CLASP's *before* it goes
+        /// foreign, which is what makes `osc133_source`'s "only while it is
+        /// still CLASP's" clause able to fail. Everywhere else a discarded
+        /// marker never records itself as CLASP's, so dropping that clause
+        /// changes no answer.
+        #[test]
+        fn at_most_one_marker_per_letter_precedes_the_yield() {
+            let mut s = ModeScanner::new();
+            assert_eq!(s.feed(CLASP_A, 0, None).len(), 1, "nothing to yield to yet");
+            assert_eq!(
+                s.feed(FISH_A, 0, None).len(),
+                1,
+                "the foreign A arms the yield"
+            );
+            assert!(
+                s.feed(CLASP_A, 0, None).is_empty(),
+                "and every later one is dropped"
+            );
+            // `A` is the only letter this session has seen and it is now
+            // foreign, so the session's markers are the foreign ones —
+            // `mixed` would mean some letter was still CLASP's, and the one
+            // CLASP marker that *was* used before the yield does not make
+            // it one.
+            assert_eq!(s.osc133_source(), Some(Osc133Source::External));
+        }
+
+        /// **Absent** before the first marker (§5.2, §8.5.1 rule 4).
+        #[test]
+        fn the_source_is_absent_until_the_first_marker_arrives() {
+            let mut s = ModeScanner::new();
+            assert_eq!(s.osc133_source(), None);
+            s.feed(b"ordinary output with no markers at all\r\n", 0, None);
+            assert_eq!(s.osc133_source(), None);
+            s.feed(CLASP_A, 0, None);
+            assert_eq!(s.osc133_source(), Some(Osc133Source::Clasp));
+        }
+
+        /// Nesting is unaffected **by construction**: an inner CLASP shell
+        /// tags its markers too. The integration-level assertion is
+        /// `osc133_markers_survive_shell_nesting`.
+        #[test]
+        fn an_inner_clasp_shells_markers_are_not_foreign() {
+            let mut s = ModeScanner::new();
+            for m in [CLASP_A, CLASP_B, CLASP_C, CLASP_A, CLASP_B] {
+                assert_eq!(s.feed(m, 0, None).len(), 1);
+            }
+            assert_eq!(s.osc133_source(), Some(Osc133Source::Clasp));
+        }
     }
 
     #[test]

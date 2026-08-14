@@ -1,7 +1,7 @@
 //! The tiered classifier (spec §8.3, §8.4) and the state it needs.
 
 use super::patterns::PatternSet;
-use super::scanner::{ModeScanner, Osc133Event};
+use super::scanner::{ModeScanner, Osc133Event, Osc133Source};
 use crate::pty::LineDiscipline;
 use std::time::Instant;
 
@@ -131,6 +131,12 @@ impl PromptDetector {
         }
         self.last_output = now;
         self.scanner.feed(bytes, base, foreground)
+    }
+
+    /// Whose OSC 133 markers this session is using (§18.2a, §8.5.1).
+    /// `None` until the first marker arrives.
+    pub fn osc133_source(&self) -> Option<Osc133Source> {
+        self.scanner.osc133_source()
     }
 
     pub fn snapshot(

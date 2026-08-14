@@ -5,7 +5,7 @@ pub use registry::SessionRegistry;
 
 use crate::buffer::{BufferRead, OutputBuffer};
 use crate::detect::history::{CommandEntry, CommandHistory, DEFAULT_MAX_ENTRIES};
-use crate::detect::{Detection, DetectionConfig, PromptDetector, Shell};
+use crate::detect::{Detection, DetectionConfig, Osc133Source, PromptDetector, Shell};
 use crate::pty::{PtyBackend, Signal};
 use crate::{ClaspError, Result};
 use parking_lot::Mutex;
@@ -261,6 +261,17 @@ impl Session {
         let line = self.backend.line_discipline();
         let foreground = self.backend.foreground_group();
         detector.snapshot(alive, line, foreground)
+    }
+
+    /// Whose OSC 133 markers this session is **using** (§18.2a, §8.5.1).
+    ///
+    /// Not the same question as `shell_integration`, which records only
+    /// what CLASP injected and is fixed at spawn: a session can report
+    /// `shell_integration: Some(Fish)` with `Osc133Source::External`, the
+    /// snippet installed and firing and every one of its markers dropped
+    /// on arrival. `None` until the first marker arrives.
+    pub fn osc133_source(&self) -> Option<Osc133Source> {
+        self.detector.lock().osc133_source()
     }
 
     /// True once any OSC 133 marker has arrived, i.e. shell integration is
