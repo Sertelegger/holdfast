@@ -1641,7 +1641,33 @@ async fn the_heuristic_decides_at_exactly_the_threshold_on_a_real_ps2_prompt() {
 /// wrapped prompt (`A`, `B`), then `C`, `D;<code>`, `A`, `B` per command.
 /// The snippet's command emits no `C` because it ran before `PS0`/`preexec`
 /// existed, which is also why it leaves no history entry.
+///
+/// **These are wire payloads, not letters.** Every marker CLASP emits
+/// carries `;clasp=1` (§8.5.1 rule 1), and `markers()` returns the whole
+/// OSC payload after `\x1b]133;`. §8.5's documented *letter* stream is
+/// unchanged and is asserted separately below: a test pinning only the
+/// letters would not notice the tag being dropped, and one pinning only
+/// these payloads would not notice the letters being reordered.
 const MEASURED_MARKER_STREAM: [&str; 15] = [
+    "D;0;clasp=1",
+    "A;clasp=1",
+    "B;clasp=1", //
+    "C;clasp=1",
+    "D;0;clasp=1",
+    "A;clasp=1",
+    "B;clasp=1", //
+    "C;clasp=1",
+    "D;1;clasp=1",
+    "A;clasp=1",
+    "B;clasp=1", //
+    "C;clasp=1",
+    "D;42;clasp=1",
+    "A;clasp=1",
+    "B;clasp=1",
+];
+
+/// §8.5's marker *letter* stream, which §8.5.1's tag leaves unchanged.
+const MEASURED_MARKER_LETTERS: [&str; 15] = [
     "D;0", "A", "B", //
     "C", "D;0", "A", "B", //
     "C", "D;1", "A", "B", //
@@ -1678,6 +1704,21 @@ async fn assert_marker_stream_and_exit_codes(server: &ClaspServer, id: &str, she
 
     let m = markers(&raw(server, id).await);
     assert_eq!(m, MEASURED_MARKER_STREAM, "{shell} marker stream");
+
+    // §8.5's letter stream, which the tag does not move. Derived from the
+    // payloads by dropping every `key=value` parameter, so this cannot
+    // drift away from the assertion above — and it is what fails if the
+    // letters are reordered while every payload stays individually valid.
+    let letters: Vec<String> = m
+        .iter()
+        .map(|p| {
+            p.split(';')
+                .filter(|f| !f.contains('='))
+                .collect::<Vec<_>>()
+                .join(";")
+        })
+        .collect();
+    assert_eq!(letters, MEASURED_MARKER_LETTERS, "{shell} marker letters");
 
     // Waited for, not sampled: `await_markers` above is satisfied by the
     // *buffer*, and the history is applied one step later (see
@@ -1847,14 +1888,30 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
 
     // The same shell, integration left on. CLASP types its snippet at a
     // prompt that is already marking, and both emitters run from then on.
+    // Since §8.5.1's tag, CLASP's markers are distinguishable from the
+    // fixture's on the wire, which is what makes the interleaving below
+    // readable at all: `A;clasp=1`, `A` is CLASP's `PS1` wrapper around the
+    // user's, and `D;42;clasp=1`, `D;42` is CLASP's `PROMPT_COMMAND`
+    // running ahead of the user's.
     const BOTH: [&str; 18] = [
-        "D;0", "A", "B", // the shell's own first prompt
-        "C", // the snippet's command, marked by the user's PS0
-        "D;0", "D;0", // ... and completed by both PROMPT_COMMANDs
-        "A", "A", "B", "B", // ... and prompted by both PS1s
-        "C", "C", // `(exit 42)` starts, marked twice
-        "D;42", "D;0", // and **the user's exit code is destroyed**
-        "A", "A", "B", "B",
+        "D;0",
+        "A",
+        "B", // the shell's own first prompt, before the snippet
+        "C", // the snippet's command, marked by the user's PS0 alone
+        "D;0;clasp=1",
+        "D;0", // ... and completed by both PROMPT_COMMANDs
+        "A;clasp=1",
+        "A",
+        "B",
+        "B;clasp=1", // ... and prompted by both PS1s
+        "C;clasp=1",
+        "C", // `(exit 42)` starts, marked twice
+        "D;42;clasp=1",
+        "D;42", // and **the user's exit code now survives**
+        "A;clasp=1",
+        "A",
+        "B",
+        "B;clasp=1",
     ];
     // The prefix of `BOTH` that the collision itself consists of, before
     // any command is typed into it.
@@ -1881,20 +1938,36 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         both, BOTH,
         "a shell that was already marking was marked again"
     );
-    // The last pair is the finding, and it is worse than duplication.
-    // `PROMPT_COMMAND` becomes `__clasp_d "$?"; <the user's emitter>`, so
-    // `$?` has already been overwritten by CLASP's own `printf` — exit 0 —
-    // by the time the user's emitter reads it. Every command a
-    // starship-style integration reports is therefore reported as
-    // successful, in a session where CLASP's own `D;42` sits two bytes
-    // away saying otherwise. A terminal consuming the same stream (this is
-    // the mechanism terminals use to colour failed commands) reads the
-    // last `D` it saw.
+    // **The `$?` repair, asserted as the property rather than as a count.**
+    // `PROMPT_COMMAND` becomes `__clasp_d "$?"; <the user's emitter>`, and
+    // bash evaluates that as a command list — so before the fix `$?` had
+    // already been overwritten by CLASP's own `printf` (exit 0) by the time
+    // the user's emitter read it, and every command a starship-style
+    // integration reported came back successful while CLASP's own `D;42`
+    // sat two bytes away saying otherwise. A terminal consuming the stream
+    // reads the last `D` it saw.
+    //
+    // A count of `D;42` cannot see this repair: it was 1 before the fix
+    // (CLASP's) and is 1 after it (the user's, now that CLASP's is
+    // tagged). So what is asserted is the third party's *whole* stream,
+    // filtered to the markers CLASP did not emit — it must be exactly what
+    // that shell emits with no CLASP present, which is `ALONE` with the
+    // snippet's own command line in the middle. That is what "CLASP did not
+    // perturb state anything else can read" means here, and dropping
+    // `return "${1:-0}"` turns the final `D;42` back into `D;0`.
+    let foreign: Vec<&str> = both
+        .iter()
+        .filter(|m| !m.contains("clasp=1"))
+        .map(String::as_str)
+        .collect();
     assert_eq!(
-        both.iter().filter(|m| *m == "D;42").count(),
-        1,
-        "the user's own exit code survived, which it must not while the \
-         snippet prepends itself to PROMPT_COMMAND: {both:?}"
+        foreign,
+        vec![
+            "D;0", "A", "B", // its own first prompt
+            "C", "D;0", "A", "B", // CLASP's injection line, which it marks
+            "C", "D;42", "A", "B", // `(exit 42)` — reported truthfully
+        ],
+        "the user's own emitter must see the real exit status: {both:?}"
     );
     assert_eq!(status(&server, &id).await["shell_integration"], "bash");
     kill(&server, &id).await;
@@ -2022,15 +2095,33 @@ async fn osc133_markers_survive_shell_nesting() {
     // The inner shell's markers arrive through the outer one, unaltered
     // and in order. Group four is the inner shell's *first* prompt cycle,
     // which is where the documented limitation below comes from.
+    // Every marker here is CLASP's, inner shell included — which is
+    // §8.5.1's nesting property holding by construction rather than by
+    // exception: an inner CLASP-integrated shell tags its markers too, so
+    // it is not *foreign* to the outer session and nothing yields to
+    // anything.
     assert_eq!(
         m,
         vec![
-            "D;0", "A", "B", // outer: the snippet
-            "C", "D;0", "A", "B", // outer: echo CLASP_PID_A
-            "C", // outer: `bash --norc --noprofile` starts
-            "D;0", "A", "B", // INNER: its own snippet, through the outer shell
-            "C", "D;0", "A", "B", // inner: echo CLASP_PID_B
-            "C", "D;7", "A", "B", // inner: (exit 7)
+            "D;0;clasp=1",
+            "A;clasp=1",
+            "B;clasp=1", // outer: the snippet
+            "C;clasp=1",
+            "D;0;clasp=1",
+            "A;clasp=1",
+            "B;clasp=1", // outer: echo CLASP_PID_A
+            "C;clasp=1", // outer: `bash --norc --noprofile` starts
+            "D;0;clasp=1",
+            "A;clasp=1",
+            "B;clasp=1", // INNER: its own snippet, through the outer shell
+            "C;clasp=1",
+            "D;0;clasp=1",
+            "A;clasp=1",
+            "B;clasp=1", // inner: echo CLASP_PID_B
+            "C;clasp=1",
+            "D;7;clasp=1",
+            "A;clasp=1",
+            "B;clasp=1", // inner: (exit 7)
         ],
         "the nested shell's markers did not reach the detector intact"
     );
