@@ -80,7 +80,7 @@ request runs:
 | `fmt` | `cargo fmt --all --check` |
 | `clippy` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | `windows-cross` | The same clippy invocation against `x86_64-pc-windows-gnu`. A **cross-compilation check, not a test run** — it proves CLASP still *compiles* for Windows; it is not evidence that it *works* there |
-| `probe` | `scripts/ci-probe.sh` — toolchain version, pseudoterminal allocation, and every shell and interpreter the suite spawns by name. Eight of `tests/detection.rs`'s 21 tests skip *and report as passing* when their program is absent, so this gate is part of what makes the test job's green mean something |
+| `probe` | `scripts/ci-probe.sh` — toolchain version, pseudoterminal allocation, and every shell and interpreter the suite spawns by name. Ten of `tests/detection.rs`'s 23 tests skip *and report as passing* when their program is absent, so this gate is part of what makes the test job's green mean something |
 | `test` | `cargo test --workspace --locked --no-fail-fast -- --test-threads=4 --show-output`, then `scripts/ci-skip-census.sh` over the captured log — which fails on any skipped row the pipeline has not agreed to, **and on an agreed one that stopped happening** |
 | `package` | `cargo build --release --locked`, the MCP smoke script against the *release* binary, and a downloadable artifact + SHA-256. It `needs:` a green `test`, so the build that gets installed is the build that was tested |
 
@@ -168,10 +168,15 @@ runner image, at both fish versions obtainable on it:
   subshell in `bash` and `zsh` and a *command substitution* in `fish`, which
   rejects it outright, so the shared assertion helper's expected marker stream
   never arrives.
-- **fish 4.8.1** (the maintainers' PPA, the only route to a fish ≥ 4 here) —
-  zero markers: CLASP's own snippet guard declines to inject, because it probes
-  `status test-feature no-mark-prompt` while the feature is *named*
-  `mark-prompt`, so the probe answers "unrecognised" on every fish.
+- **any fish ≥ 4.0** — a marker collision. Fish emits OSC 133 natively from
+  4.0 onward, and CLASP's snippet now injects unconditionally: the guard that
+  used to decline was deleted, because declining left a session with **no `B`
+  marker at all** on 4.0–4.2 (which emit none of their own), so `command` was
+  empty forever. CLASP tags its markers `clasp=1` and yields **per letter**,
+  which is the correct behaviour and is verified — a live fish 4.0.2 session
+  driven through the MCP surface reports three commands, exit codes
+  `[0, 1, 42]`, `osc133_source: "mixed"`, and no entry for the install line.
+  The row still fails because it asserts the *no-collision* marker stream.
 
 So the gap is real, and it is **explicit rather than silent**:
 `scripts/ci-skip-census.sh` asserts the set of skipped rows is exactly the one

@@ -49,8 +49,8 @@ are gated to public repositories on GitHub Free. Until this repository goes
 public, running these locally is still the actual gate and a red job is
 something a human has to notice.
 
-`cargo test --workspace` is 279 tests today: 194 unit, 21 in
-`tests/detection.rs`, 35 in `tests/integration.rs`, 29 in `tests/schema.rs`.
+`cargo test --workspace` is 311 tests today: 222 unit, 23 in
+`tests/detection.rs`, 37 in `tests/integration.rs`, 29 in `tests/schema.rs`.
 Treat those numbers as a tripwire for "a suite stopped being compiled" rather
 than as a contract. Many of the tests spawn real PTYs and real shells, so they
 are not hermetic and they are not fast.
