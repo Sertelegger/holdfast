@@ -806,18 +806,82 @@ async fn matrix_row_an_idle_bash_prompt_is_at_prompt_via_terminal_mode() {
     kill(&server, &id).await;
 }
 
+/// §8.7 row 2, at rev. 37 — and the scope axis at a **real** PTY, where
+/// the foreground process group is the kernel's rather than a test's
+/// argument (REQ-PD-025, REQ-PD-026).
+///
+/// **The mode and the agent's action are unchanged; the tier is not.** A
+/// running external command still reports `Executing` and §8.4 still says
+/// wait. What changed is that the answer is now labelled a **guess**,
+/// which is what it is: `sleep` is its own process group, and the shell's
+/// bracketed paste says nothing about the command the shell launched. The
+/// old name said `via_terminal_mode` for a row that answers at
+/// `heuristic`, which is a name that lies.
+///
+/// **The wait is what this row is about, and a rename without it would
+/// merely have inverted which side of a race it pins.** Measured three
+/// times over, because the first two repairs were not enough:
+///
+/// 1. The original waited on `interaction_mode == Executing` and asserted
+///    `terminal_mode`. The *first* instant `Executing` holds is the
+///    sub-millisecond window between readline writing `\x1b[?2004l` and
+///    bash's fork reaching `tcsetpgrp` — in which the shell still holds
+///    the terminal, owner == holder, and the licence is still granted. The
+///    row passed in 0.18 s for a `sleep 5`, pinning a transient, and it
+///    passed *whether or not* scoping worked.
+/// 2. Waiting on `Executing` **and** full quiescence is better and is
+///    still not sufficient. `Executing` at a settled instant has **two**
+///    other solutions besides the one this row means: a fork stalled past
+///    the settle threshold, and the window *after* the command exits and
+///    before bash has redrawn its prompt — where bracketed paste is still
+///    off and the shell holds the terminal again. Measured: under
+///    `taskset -c 0` that spelling failed on iteration 7 of 10, reporting
+///    `terminal_mode` at `quiescent_score: 1.0` with an empty last line.
+/// 3. So the wait is on a **fact only the running child can produce**.
+///    `CLASP_RUNNING ` is printed by the child itself, after the fork and
+///    after `tcsetpgrp`, and it stays the last line until the child exits
+///    — at which point bash's prompt replaces it. All three of "before the
+///    fork", "after the exit" and "the child never ran" are excluded by
+///    the wait rather than by luck.
+///
+/// The child is an **external** `bash -c`, not a builtin, because the
+/// whole row is about a program that has its own process group; a builtin
+/// keeps the shell's and is §8.7 row 8's arrangement, not this one. And
+/// `printf "CLASP""_RUNNING "` echoes as `CLASP""_RUNNING` and *prints*
+/// `CLASP_RUNNING`, so the line the wait keys on cannot be produced by the
+/// PTY echoing the command back (this file's rule 1).
+///
+/// **The leading `sleep 1` is load-bearing and is here for a product
+/// residual, measured.** The owner of an availability record is sampled
+/// when the reader thread *processes* the chunk carrying the signal
+/// (`session::spawn`), not when the shell wrote it. Those are the same
+/// instant on an idle box and are not the same instant under load: bash
+/// writes `\x1b[?2004l` and forks microseconds later, so a delayed reader
+/// samples the foreground group *after* `tcsetpgrp` and records the
+/// **child** as the owner of a signal its parent emitted — which makes
+/// owner == holder and grants the licence rev. 37 exists to withhold.
+/// Measured with a throwaway probe under `taskset -c 0`: 5 of 8 runs
+/// reported `terminal_mode` while `/proc/<shell>/stat`'s `tpgid` showed
+/// the kernel had already handed the terminal to the child in **all
+/// eight**. The residual is reported rather than fixed here — it belongs
+/// to the sampling rule, not to this row.
+///
+/// `sleep 1` closes it by construction rather than by timing luck: it puts
+/// an external command between the transition and the process group this
+/// row asserts about, so the owner recorded is either the shell's group
+/// or `sleep`'s, and **both differ from the group that holds the terminal
+/// a second later**. The licence is withheld on either sampling, which is
+/// what makes the row deterministic without weakening what it asserts.
+///
+/// **The pair is on the same session, and it is what makes this the scope
+/// axis rather than an absence.** At the prompt, bash owns the terminal
+/// and holds it, so the licence is granted and the answer is
+/// deterministic; while its child runs, the same licence, from the same
+/// signal, in the same session, is withheld. One session, one signal, two
+/// answers — which no single-sample row can express, and which a rule that
+/// simply stopped observing bracketed paste would fail rather than pass.
 #[tokio::test]
-async fn matrix_row_a_running_command_is_executing_via_terminal_mode() {
-    // §8.7 row 2 (Seen BrktPst yes / ECHO ON / BrktPst off / AltScr off).
-    //
-    // This row is also §8.7's availability row 4 — the one inference
-    // bracketed-paste availability legitimately licenses — and it is the
-    // direction that fails if bracketed paste is *removed* from the
-    // availability rule. Note what such a mutation does and does not
-    // change: `interaction_mode` stays `Executing` and `confidence` stays
-    // 0.00, because a settled `sleep 5` scores nothing on the T3 table
-    // either. The tier is the only field that moves, which is why it is
-    // asserted.
+async fn matrix_row_a_running_external_command_is_executing_via_the_heuristic() {
     let server = ClaspServer::new();
     let id = start(
         &server,
@@ -827,14 +891,49 @@ async fn matrix_row_a_running_command_is_executing_via_terminal_mode() {
         },
     )
     .await;
-    // The prompt first: this row's `Seen BrktPst: yes` is established by
-    // the shell having drawn one, not by anything the row itself does.
-    await_mode(&server, &id, "AtPrompt").await;
 
-    send(&server, &id, "sleep 5").await;
-    let s = await_mode(&server, &id, "Executing").await;
-    assert_classified(&s, "Executing", "terminal_mode", 0.0);
-    assert_history(&raw(&server, &id).await, true, false);
+    // Half 1 — bash at its own prompt. This row's `Seen BrktPst: yes` is
+    // established by the shell having drawn one, and the licence really is
+    // granted here: owner == holder, so the answer is deterministic.
+    let at_prompt = await_status(&server, &id, "a settled bash prompt", |s| {
+        let line = s["prompt"]["last_line"].as_str().unwrap_or_default();
+        s["interaction_mode"] == "AtPrompt" && line.starts_with("bash-") && line.ends_with("$ ")
+    })
+    .await;
+    assert_classified(&at_prompt, "AtPrompt", "terminal_mode", 0.95);
+
+    // Half 2 — the same session with an external command in front of it,
+    // announcing itself from inside its own process group.
+    send(
+        &server,
+        &id,
+        r#"sleep 1; bash --norc --noprofile -c 'printf "CLASP""_RUNNING "; sleep 30'"#,
+    )
+    .await;
+    let s = await_settled(&server, &id, "CLASP_RUNNING ").await;
+    assert_classified(&s, "Executing", "heuristic", 0.0);
+    // 0.00 is the T3 combiner over this row's own tail, not a fixed T2
+    // zero: `CLASP_RUNNING ` scores nothing on the §8.6 table. Asserted so
+    // the confidence cannot be read as the deterministic 0.00 it used to
+    // be — the two are the same number reached two different ways, and the
+    // tier is what says which.
+    assert_eq!(s["prompt"]["pattern_score"], 0.0, "{s}");
+    assert_eq!(s["prompt"]["quiescent_score"], 1.0, "{s}");
+
+    // The history the row rests on, and the separator from the degenerate
+    // case: a child that printed nothing also answers
+    // `Executing`/`heuristic`/0.00 with every score at zero
+    // (`a_session_that_never_prompts_is_never_reported_at_a_prompt`). What
+    // separates this row from it is that a signal *was* observed here — so
+    // `heuristic` is a licence **withheld**, not a licence absent, which is
+    // the difference between the scope axis and the membership axis.
+    let raw = raw(&server, &id).await;
+    assert_history(&raw, true, false);
+    assert!(
+        raw.contains("\x1b[?2004l"),
+        "readline never left bracketed-paste mode, so no command was run \
+         and this row is still measuring the prompt: {raw:?}"
+    );
     kill(&server, &id).await;
 }
 
