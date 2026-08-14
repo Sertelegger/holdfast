@@ -216,7 +216,21 @@ impl Session {
         // and would clobber an inherited PS1 (§8.5). A write failure here
         // is not fatal — the session simply degrades to tier 2.
         if let Some(shell) = config.shell_integration {
-            let mut line = shell.integration_snippet().as_bytes().to_vec();
+            let snippet = shell.integration_snippet();
+            // §8.5.1 rule 5 (REQ-DM-009): the ring needs to know which line
+            // CLASP typed, because "it emits no `C`" stops being true the
+            // moment a foreign emitter is already installed — the user's
+            // `PS0` marks the snippet's own command line and the snippet
+            // becomes the session's first history entry.
+            //
+            // **Before the write, not after.** The reader thread is already
+            // running; a snippet whose `C` arrived before `set_injection_line`
+            // landed would be recorded.
+            session
+                .history
+                .lock()
+                .set_injection_line(snippet.to_string());
+            let mut line = snippet.as_bytes().to_vec();
             line.push(b'\n');
             let _ = backend.write(&line);
         }

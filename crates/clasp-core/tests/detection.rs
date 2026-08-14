@@ -342,40 +342,36 @@ fn pyrepl_python() -> Option<String> {
     have(Need::PyreplPython).then(pyrepl_interpreter).flatten()
 }
 
-/// `fish`'s major version, as the binary reports it (`fish, version
-/// 4.0.2`), or `None` when it cannot be asked.
-fn fish_major_version() -> Option<u32> {
+/// `fish`'s version as the binary reports it (`fish, version 4.0.2`), for
+/// the skip message REQ-TST-007 requires — *"records the fish version it
+/// measured"* — and for nothing else. **No row branches on it.**
+///
+/// It used to gate `--features=no-mark-prompt` behind `major >= 4`, and
+/// that predicate is measured wrong: the flag is inert on fish 4.0–4.2,
+/// where the feature does not exist, so the row silently measured fish's
+/// own stream against an expectation written for CLASP's (§8.5.1,
+/// REQ-TST-007). **The flag's existence does not track the major version.**
+fn fish_version() -> Option<String> {
     let out = std::process::Command::new("fish")
         .arg("--version")
         .output()
         .ok()?;
     let text = String::from_utf8(out.stdout).ok()?;
-    text.split_whitespace()
-        .next_back()?
-        .split('.')
-        .next()?
-        .parse()
-        .ok()
+    Some(text.trim().to_string())
 }
 
-/// How the fish row starts fish.
+/// How the fish row starts fish: `--no-config`, so no rc file
+/// participates, and **nothing else**.
 ///
-/// `--no-config` always, so no rc file participates. On fish 4 and later,
-/// also `--features=no-mark-prompt`: fish marks prompts itself from 4.0
-/// and `shell.rs`'s guard therefore declines to inject there, which would
-/// leave that row measuring fish's own marker stream instead of the
-/// snippet's. Turning fish's marking off restores the row's subject.
-///
-/// Version-gated rather than passed unconditionally because fish 3 has
-/// never heard of the flag, and fish 3 is the version the row passes on
-/// today. **Unverified: fish is not installed on this host**, so neither
-/// the flag nor the version parse has been run against a real fish.
+/// REQ-PD-028 deleted the snippet's native-marking guard, so the snippet
+/// now runs on every fish and the row needs no flag to reach the injection
+/// path. `--features=no-mark-prompt` is deliberately **not** passed: it is
+/// inert on fish 4.0–4.2, so it would leave the collision in place on
+/// exactly the versions it was added to rescue, while suppressing fish's
+/// markers on 4.8.1 and hiding §8.5.1's yielding rule from the one row
+/// that could exercise it against a real shell.
 fn fish_args() -> Vec<String> {
-    let mut args = vec!["--no-config".to_string()];
-    if fish_major_version().is_some_and(|major| major >= 4) {
-        args.push("--features=no-mark-prompt".to_string());
-    }
-    args
+    vec!["--no-config".to_string()]
 }
 
 /// The census that stops the row count dropping silently.
@@ -1774,39 +1770,38 @@ async fn zsh_integration_emits_the_measured_marker_stream_and_exact_exit_codes()
 
 #[tokio::test]
 async fn fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes() {
-    // **fish is unverified.** The spike measured bash and zsh; fish's
-    // snippet was inferred from documented hook equivalence (§24) and has
-    // never been executed anywhere — it passes structural Rust tests only,
-    // and fish is not installed on the machine this milestone was built
-    // on. This test is the measurement, and it has not run.
-    //
-    // The specific open question is `functions -c fish_prompt
-    // __clasp_orig_fish_prompt`: whether copying `fish_prompt` works when
-    // it is the built-in default rather than a user-defined function. If
-    // it does not, the snippet redefines `fish_prompt` as a wrapper around
-    // a function that does not exist and the shell loses its prompt
-    // entirely — a failure no string-level test can see.
+    // **fish is unverified by this suite.** The spike measured bash and
+    // zsh; fish's snippet was inferred from documented hook equivalence
+    // (§24) and fish is not installed on the machine this milestone was
+    // built on, so this row skips here and has never run in CI. The
+    // snippet body itself *has* since been driven on live PTYs in
+    // containers for fish 3.7.0, 4.0.2 and 4.8.1 (§8.5.1) — including
+    // `functions -c fish_prompt` against the built-in default prompt,
+    // which was the open hazard and is discharged — but those are
+    // out-of-band measurements and this row is what makes them regressible.
     //
     // Do not delete this test to make the file honest: the CI matrix
     // (0.0.11) installs fish, and this is the assertion that will run
     // there first.
     //
-    // **What it measures is the snippet, and on fish 4 that has to be
-    // arranged.** fish 4.0 emits OSC 133 itself, so a stock fish 4 session
-    // is already marked before CLASP types anything; measured out of band
-    // on fish 4.0.2, the un-guarded snippet then duplicated every marker,
-    // was echoed as a command, and lost `D;42`. `shell.rs`'s guard makes
-    // the snippet decline there, which would leave this row measuring
-    // fish's *own* stream — a different stream (4.0–4.2 mark prompt start
-    // but not prompt end) that nobody has measured and that this row's
-    // expectation was never written for. `fish_args` turns fish's marking
-    // off on fish 4+ so the row keeps measuring the thing it is named
-    // after. What a *declined* fish 4 session looks like is asserted
-    // nowhere and is an open question in the report.
+    // **Since REQ-PD-028 the arrangement is "no arrangement".** The
+    // snippet's native-marking guard is gone, so it runs on every fish and
+    // `fish_args` passes no `--features=` flag: on 3.7.0 fish emits
+    // nothing of its own and this measures CLASP's stream directly; on
+    // 4.8.1 the two collide and §8.5.1's per-letter yielding decides which
+    // markers reach the detector, which is the behaviour worth measuring
+    // rather than suppressing. The expectation below is CLASP's stream and
+    // is therefore **known to be wrong for a colliding fish**; that arm is
+    // §11.2's collision scenario, and it is named in §25 as an expected
+    // failure on a fish ≥ 4 runner until it is written.
     if !have(Need::Program("fish")) {
-        eprintln!("skipping: fish not installed — the fish snippet remains UNVERIFIED at runtime");
+        eprintln!(
+            "skipping: fish not installed — the fish snippet remains \
+             UNVERIFIED by this suite (fish version: none)"
+        );
         return;
     }
+    eprintln!("fish row running against {:?}", fish_version());
     let server = ClaspServer::new();
     let id = start(
         &server,
@@ -1824,21 +1819,30 @@ async fn fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes(
 
 #[tokio::test]
 async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
-    // §8.5 requires the snippet to be "a no-op if markers are already
-    // present (the user's terminal may already do this)". The two POSIX
-    // snippets implement that as a test on `PS1`'s *text*, and that test
-    // sees a marker only when the user pasted the escape into `PS1`
-    // literally. Every real emitter calls a function instead: starship,
-    // Kitty's and WezTerm's integrations — and fish 4.0, which emits OSC
-    // 133 from the shell binary and has no `PS1` at all. Measured out of
-    // band on fish 4.0.2: every marker duplicated, the snippet echoed as a
-    // command, `D;42` never arriving.
+    // §8.5's rev.-35 claim that the snippet is "a no-op if markers are
+    // already present" was **withdrawn at rev. 36** — it could not be
+    // evaluated at the injection point, which is before the first prompt.
+    // The two POSIX snippets implement it as a test on `PS1`'s *text*, and
+    // that test sees a marker only when the user pasted the escape into
+    // `PS1` literally. Every real emitter calls a function instead:
+    // starship, Kitty's and WezTerm's integrations — and fish 4.x, which
+    // emits OSC 133 from the shell binary and has no `PS1` at all.
     //
-    // This is that collision on a shell this host does have. It is a
-    // record of today's behaviour, not of the desired behaviour: when the
-    // integration learns to *observe* whether markers already arrive
-    // rather than test a string, the injected half moves to one marker per
-    // event and this test's expectation changes with it.
+    // **What the collision actually costs, measured, because the obvious
+    // reading is wrong.** Nothing is lost at the *marker* level: measured
+    // on fish 4.0.2, `D;42` arrives **twice** and both emitters agree on
+    // the code. The damage is entirely in the derived history — two
+    // entries per command, the first permanently orphaned with a null exit
+    // code and the real command text, the second closed with the code and
+    // no text (§8.5.1). A reader looking for the defect in the marker
+    // stream will not find it there and must not conclude it is benign.
+    //
+    // This is that collision on a shell this host does have. Since
+    // §8.5.1's tag-and-yield the *wire* still carries both emitters —
+    // which is what `markers()` reads and what the vector below pins — and
+    // what changed is which of them reach the detector and the ring. The
+    // history half is asserted below; `osc133_source` is what tells an
+    // agent which source it is reading.
     //
     // **Every wait below is the length of what it is about to assert**,
     // and that is not a stylistic preference. Written as a bare `12` next
@@ -1893,7 +1897,8 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     // readable at all: `A;clasp=1`, `A` is CLASP's `PS1` wrapper around the
     // user's, and `D;42;clasp=1`, `D;42` is CLASP's `PROMPT_COMMAND`
     // running ahead of the user's.
-    const BOTH: [&str; 18] = [
+    // The collision itself, before any command is typed into it.
+    const COLLIDING_PROMPT: [&str; 10] = [
         "D;0",
         "A",
         "B", // the shell's own first prompt, before the snippet
@@ -1904,38 +1909,51 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         "A",
         "B",
         "B;clasp=1", // ... and prompted by both PS1s
-        "C;clasp=1",
-        "C", // `(exit 42)` starts, marked twice
-        "D;42;clasp=1",
-        "D;42", // and **the user's exit code now survives**
-        "A;clasp=1",
-        "A",
-        "B",
-        "B;clasp=1",
     ];
-    // The prefix of `BOTH` that the collision itself consists of, before
-    // any command is typed into it.
-    const COLLIDING_PROMPT: usize = 10;
+    // One command's worth, derived rather than transcribed: `PS0` marks the
+    // start twice, both `PROMPT_COMMAND`s report the completion — CLASP's
+    // first, then the user's, which since the `$?` repair carries the same
+    // code — and both `PS1`s draw the next prompt, CLASP's wrapping the
+    // user's.
+    fn cycle(code: i32) -> Vec<String> {
+        vec![
+            "C;clasp=1".to_string(),
+            "C".to_string(),
+            format!("D;{code};clasp=1"),
+            format!("D;{code}"),
+            "A;clasp=1".to_string(),
+            "A".to_string(),
+            "B".to_string(),
+            "B;clasp=1".to_string(),
+        ]
+    }
 
     let id = start(&server, already_marking_bash()).await;
     // Ten, not `FIRST_PROMPT`. Three is the fixture's prompt *before* the
-    // snippet has run, so a wait for three types `(exit 42)` into a
+    // snippet has run, so a wait for three types the first command into a
     // session whose collision has not happened yet — the premise this row
     // is named for, assumed rather than observed. Ten is the first prompt
     // drawn by two emitters at once, and it exists only once the snippet
     // is installed. Asserted, not merely counted: the doubling at the
     // prompt is a separate finding from the doubling at the command, and
     // this is the half that a `PS1`-text guard was supposed to prevent.
-    let colliding = await_markers(&server, &id, COLLIDING_PROMPT).await;
+    let colliding = await_markers(&server, &id, COLLIDING_PROMPT.len()).await;
     assert_eq!(
         colliding.as_slice(),
-        &BOTH[..COLLIDING_PROMPT],
+        COLLIDING_PROMPT,
         "the snippet did not land on a prompt that was already marking"
     );
-    send(&server, &id, "(exit 42)").await;
-    let both = await_markers(&server, &id, BOTH.len()).await;
+    // The same three commands `assert_marker_stream_and_exit_codes` drives,
+    // so the two rows differ only in whether a foreign emitter is present.
+    let mut expected: Vec<String> = COLLIDING_PROMPT.iter().map(|s| (*s).to_string()).collect();
+    let mut both = Vec::new();
+    for (command, code) in [("echo hello", 0), ("false", 1), ("(exit 42)", 42)] {
+        expected.extend(cycle(code));
+        send(&server, &id, command).await;
+        both = await_markers(&server, &id, expected.len()).await;
+    }
     assert_eq!(
-        both, BOTH,
+        both, expected,
         "a shell that was already marking was marked again"
     );
     // **The `$?` repair, asserted as the property rather than as a count.**
@@ -1965,10 +1983,55 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         vec![
             "D;0", "A", "B", // its own first prompt
             "C", "D;0", "A", "B", // CLASP's injection line, which it marks
-            "C", "D;42", "A", "B", // `(exit 42)` — reported truthfully
+            "C", "D;0", "A", "B", // `echo hello`
+            "C", "D;1", "A", "B", // `false`
+            "C", "D;42", "A", "B", // `(exit 42)` — every code reported truthfully
         ],
         "the user's own emitter must see the real exit status: {both:?}"
     );
+
+    // **REQ-DM-009 at a real shell.** Three commands, three entries, each
+    // carrying *both* halves. Under the shipped ring this was six entries —
+    // one orphaned with the command text and no exit code, one closed with
+    // the code and no text — so an assertion on entry **count** alone
+    // passes against a ring that merged the wrong halves, and the commands
+    // and codes below are what separate them.
+    //
+    // `await_closed_history`, not `await_markers`: the reader appends to
+    // the output buffer *before* it feeds the detector, so a `D` is
+    // readable through `read_output` strictly before it has closed an entry.
+    let h = await_closed_history(&server, &id, 3).await;
+    let entries = h["data"]["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 3, "history: {h}");
+    let commands: Vec<&str> = entries
+        .iter()
+        .map(|e| e["command"].as_str().unwrap_or(""))
+        .collect();
+    let codes: Vec<i64> = entries
+        .iter()
+        .map(|e| e["exit_code"].as_i64().unwrap_or(-1))
+        .collect();
+    assert_eq!(
+        commands,
+        vec!["echo hello", "false", "(exit 42)"],
+        "history: {h}"
+    );
+    assert_eq!(codes, vec![0, 1, 42], "history: {h}");
+    for e in entries {
+        assert!(e["output_end_cursor"].is_u64(), "orphaned entry: {e}");
+        assert!(e["duration_ms"].is_u64(), "orphaned entry: {e}");
+    }
+    // And **no entry for the install line**, which the user's `PS0` marked
+    // — the second, quieter consequence of the collision (§8.5.1). The
+    // pre-rev.-36 reason it stayed out was that it emitted no `C`, and that
+    // reasoning stops holding exactly here.
+    assert!(
+        !commands
+            .iter()
+            .any(|c| c.contains("CLASP_SHELL_INTEGRATION")),
+        "the install line became a history entry: {h}"
+    );
+
     assert_eq!(status(&server, &id).await["shell_integration"], "bash");
     kill(&server, &id).await;
 }

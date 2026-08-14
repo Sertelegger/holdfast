@@ -73,6 +73,38 @@ pub struct CommandHistory {
     next_index: u64,
     evicted: bool,
     active: bool,
+    /// The integration line CLASP typed at session start, armed until the
+    /// first `OutputStart` is processed (§8.5.1 rule 5, REQ-DM-009).
+    ///
+    /// Before rev. 36 the injection line stayed out of the history because
+    /// it ran before `PS0`/`preexec` existed and emitted no `C`. **That
+    /// reasoning fails the instant another emitter is installed** — the
+    /// user's `PS0` marks the snippet's own command line, and the snippet
+    /// then appears as the session's first entry carrying its whole text.
+    /// Measured on fish 4.8.1, where it did exactly that.
+    ///
+    /// Armed for exactly one `OutputStart`, matched or not: the injection
+    /// line is the first thing typed, so a later command whose echo happens
+    /// to be a suffix of the snippet cannot reach this.
+    injection_line: Option<String>,
+    /// Set when an `OutputStart` was suppressed, so the `CommandDone` that
+    /// would have closed it cannot close an unrelated entry instead.
+    ///
+    /// **Defensive, and measured to be unobservable, which is stated
+    /// rather than implied.** The injection line is the first thing
+    /// written to the PTY, so at the moment its `D` arrives there is never
+    /// an open entry for that `D` to close — including on the verbatim
+    /// fish 4.0.2 capture below. Removing this field leaves the whole
+    /// workspace green, so **no test here can distinguish its presence
+    /// from its absence** and none pretends to. It is kept because the
+    /// "nothing is open" property is an invariant of *where*
+    /// `set_injection_line` is called, not of this ring, and a later caller
+    /// arming it elsewhere would silently close somebody else's entry.
+    suppress_next_done: bool,
+    /// Whether any `B` has arrived in this session, which is what decides
+    /// whether an *empty* capture means "the capture was lost" or "there
+    /// was never a span to capture from". See `apply`.
+    seen_command_start: bool,
 }
 
 impl Default for CommandHistory {
@@ -89,7 +121,19 @@ impl CommandHistory {
             next_index: 0,
             evicted: false,
             active: false,
+            injection_line: None,
+            suppress_next_done: false,
+            seen_command_start: false,
         }
+    }
+
+    /// Tell the ring which line CLASP itself typed (§8.5.1 rule 5).
+    ///
+    /// Set before the line is written, never after: the reader thread is
+    /// already running, so a snippet that produced its `C` first would be
+    /// recorded.
+    pub fn set_injection_line(&mut self, line: String) {
+        self.injection_line = Some(line);
     }
 
     /// True once any OSC 133 marker has been seen, i.e. shell integration
@@ -125,6 +169,48 @@ impl CommandHistory {
         self.active = true;
         match &event.marker {
             Osc133::OutputStart { command } => {
+                if let Some(line) = self.injection_line.take() {
+                    // Matched against the line CLASP itself typed, never
+                    // against incidental content. The capture is a *suffix*
+                    // of what was typed — §5.2 documents the echo capture
+                    // truncating to its tail at the terminal width — so
+                    // `ends_with` is the right test and equality would
+                    // silently stop matching at narrow widths.
+                    let matched =
+                        !command.is_empty() && line.trim_end().ends_with(command.as_str());
+                    // **The suffix test alone is not enough, and this is
+                    // measured rather than anticipated.** On a foreign
+                    // emitter that supplies no `B` — fish 4.0.2, measured
+                    // on a live PTY — nothing ever arms the echo capture,
+                    // so the injection line's `C` carries an *empty*
+                    // command and there is no text to compare. Left at the
+                    // suffix test, the snippet became entry 0 of every such
+                    // session with `command: ""` and `exit_code: 0`, which
+                    // is REQ-DM-009's "never an entry" failing in the one
+                    // arrangement the requirement was written for.
+                    //
+                    // The second clause identifies the line CLASP typed
+                    // from the session's *structure* rather than from its
+                    // content, which is what §8.5.1 rule 5 permits: the
+                    // injection line is the first thing written to the PTY
+                    // and the agent does not hold the session until after
+                    // it, so nothing of the user's can precede it — and a
+                    // `B`-less first `C` is the structural absence a
+                    // partial foreign emitter creates, not a capture that
+                    // was lost. With no foreign emitter CLASP's own `PS1`
+                    // has already emitted `B` by the first `C`, so this
+                    // cannot reach a user command there.
+                    //
+                    // Residual, bounded at one entry: if the snippet fails
+                    // to install *and* a `B`-less foreign emitter is
+                    // present, the user's first command is suppressed. That
+                    // is a session whose integration is already broken.
+                    let never_had_a_span = command.is_empty() && !self.seen_command_start;
+                    if matched || never_had_a_span {
+                        self.suppress_next_done = true;
+                        return;
+                    }
+                }
                 // The output span starts just past the `C` marker.
                 self.push(CommandEntry {
                     index: self.next_index,
@@ -138,6 +224,14 @@ impl CommandHistory {
                 self.next_index += 1;
             }
             Osc133::CommandDone { exit_code } => {
+                if self.suppress_next_done {
+                    // The `C` this `D` belongs to was CLASP's own install
+                    // line and was suppressed, so there is no entry for it
+                    // to close — and without this it would close whatever
+                    // entry happened to be open instead.
+                    self.suppress_next_done = false;
+                    return;
+                }
                 // A `D` with no open entry is normal exactly once: the
                 // command that *installed* the integration ran before
                 // `PS0`/`preexec` existed, so it emitted no `C`. Ignoring
@@ -184,7 +278,8 @@ impl CommandHistory {
                         Some(now_ms.saturating_sub(open.started_at_unix_ms).max(0) as u64);
                 }
             }
-            Osc133::PromptStart | Osc133::CommandStart => {}
+            Osc133::CommandStart => self.seen_command_start = true,
+            Osc133::PromptStart => {}
         }
     }
 
@@ -267,6 +362,190 @@ mod tests {
         assert!(e[0].output_end_cursor.is_some());
     }
 
+    /// Two whole prompt-command-done cycles, byte for byte off a real PTY
+    /// (**fish 4.0.2**, `debian:trixie`, 2026-08-14), with CLASP's shipped
+    /// snippet installed and fish's own OSC 133 marking left on. This is
+    /// §8.5.1's collision at a real shell, and the only place in the
+    /// workspace where the yielding rule meets one.
+    ///
+    /// **The letters divide the way §8.5.1 says they must**, which is why
+    /// the capture is worth 800 bytes of source. fish 4.0.2 emits
+    /// `A;special_key=1`, `C;cmdline_url=…` and `D;<code>` — and, measured
+    /// here, **never `B`**. So `A`, `C` and `D` go foreign and CLASP's
+    /// tagged copies of them are discarded, while CLASP's `B;clasp=1` is
+    /// **kept**, because fish supplies none to yield to. That kept `B` is
+    /// the only thing that arms the echo capture, so it is what gives
+    /// `command` its `B..C` span. A whole-*source* rule would have
+    /// discarded it along with the rest and left `command: ""` for every
+    /// entry on every fish 4.0–4.2 session — the same loss declining costs
+    /// there, reached by a different route.
+    ///
+    /// **REQ-DM-010, asserted as one value rather than as three columns.**
+    /// Separating them is the whole hazard: applying the `\r` overwrite
+    /// eagerly empties `command` for every entry while leaving the codes
+    /// and spans correct, and deleting `\r` handling makes zsh's
+    /// first-keystroke redraw report `eecho hello` while everything else
+    /// still lines up. Either repair passes a suite that checks one column
+    /// at a time, so the entries here are compared whole.
+    ///
+    /// Verbatim, escapes and all. The only thing not asserted from it is
+    /// the container hostname in the prompt text, which sits between `A`
+    /// and `B` and is therefore never captured.
+    const FISH_402_COLLISION: &[u8] =
+    b"\x1b]0;/\x07\x1b[30m\x1b(B\x1b[m\x1b]133;A;special_key=1\x07\
+     \x1b]133;A;clasp=1\x07root\x1b(B\x1b[m@75952eda0e7a\x1b(B\x1b\
+     [m /\x1b(B\x1b[m\x1b(B\x1b[m# \x1b]133;B;clasp=1\x07\x1b[K\
+     \x0d\x1b[21C\x1b[?2004h\x1b[>4;1m\x1b[=5u\x1b=echo \x0d\x1b\
+     [26Chello\x0d\x1b[31C\x1b[10Decho hello\x0d\x1b[31C\x0d\x0a\
+     \x1b[30m\x1b(B\x1b[m\x1b]133;C;cmdline_url=echo%20hello\x07\
+     \x1b[?2004l\x1b[>4;0m\x1b[=0u\x1b>\x1b]133;C;clasp=1\x07\x1b\
+     ]0;echo hello /\x07\x1b[30m\x1b(B\x1b[m\x0dhello\x0d\x0a\x1b\
+     ]133;D;0\x07\x1b]133;D;0;clasp=1\x07\x1b[?25h\x1b[2m\xe2\x8f\
+     \x8e\x1b(B\x1b[m                                          \
+     \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x0d\xe2\x8f\x8e \x0d\
+     \x1b[K\x1b]0;/\x07\x1b[30m\x1b(B\x1b[m\x1b]133;A;special_k\
+     ey=1\x07\x1b]133;A;clasp=1\x07root\x1b(B\x1b[m@75952eda0e7\
+     a\x1b(B\x1b[m /\x1b(B\x1b[m\x1b(B\x1b[m# \x1b]133;B;clasp=\
+     1\x07\x1b[K\x0d\x1b[21C\x1b[?2004h\x1b[>4;1m\x1b[=5u\x1b=s\
+     h \x0d\x1b[24C-c \x0d\x1b[27C\"exit \x0d\x1b[33C42\"\x0d\x1b\
+     [36C\x1b[15Dsh -c \"exit 42\"\x0d\x1b[36C\x0d\x0a\x1b[30m\x1b\
+     (B\x1b[m\x1b]133;C;cmdline_url=sh%20-c%20%22exit%2042%22\x07\
+     \x1b[?2004l\x1b[>4;0m\x1b[=0u\x1b>\x1b]133;C;clasp=1\x07\x1b\
+     ]0;sh -c \"exit 42\" /\x07\x1b[30m\x1b(B\x1b[m\x0d\x1b]133\
+     ;D;42\x07\x1b]133;D;42;clasp=1\x07";
+
+    #[test]
+    fn a_real_fish_4_0_2_collision_cycle_reports_command_exit_code_and_span_together() {
+        let h = replay(FISH_402_COLLISION, 100);
+        let e = h.entries(0, 50);
+        // One entry per command, not two. Under the shipped ring this
+        // capture produced four — each command opening one entry on the
+        // foreign `C` and another on CLASP's, the first orphaned with the
+        // text and the second closed with the code.
+        assert_eq!(e.len(), 2, "one entry per command: {e:?}");
+
+        assert_eq!(
+            e.iter().map(|x| x.command.as_str()).collect::<Vec<_>>(),
+            vec!["echo hello", "sh -c \"exit 42\""],
+            "the kept `B` did not give the capture its span"
+        );
+        assert_eq!(
+            e.iter().map(|x| x.exit_code).collect::<Vec<_>>(),
+            vec![Some(0), Some(42)]
+        );
+        // The span, read back out of the same bytes — the third column,
+        // so a repair that filled `command` in by moving a cursor lands
+        // here rather than passing.
+        let span = &FISH_402_COLLISION
+            [e[0].output_start_cursor as usize..e[0].output_end_cursor.expect("closed") as usize];
+        let text = String::from_utf8_lossy(span);
+        assert!(
+            text.contains("hello\r\n"),
+            "the output span missed the command's own output: {text:?}"
+        );
+        assert!(
+            !text.contains("exit 42"),
+            "the span ran into the next command: {text:?}"
+        );
+        // **A measured consequence of yielding, asserted rather than
+        // asserted away.** The span opens just past the *foreign* `C` and
+        // closes at the *foreign* `D`, so CLASP's own `C;clasp=1` — which
+        // the yielding rule discarded as an **event** — is still inside it
+        // as **bytes**. Discarding a marker keeps it out of the detector
+        // and the ring; it cannot take it out of the session's raw buffer,
+        // which is what a cursor addresses. An agent reading this span back
+        // gets that escape with the output. Harmless (0.0.3's read-path
+        // stripper removes it, and `command_history_cursors_bound_exactly_
+        // one_commands_output` pins the no-collision case where no such
+        // sequence appears at all) — but it is a difference between a
+        // colliding session and an ordinary one, and it is here so that it
+        // is a recorded fact rather than a surprise.
+        assert!(
+            span.windows(6).any(|w| w == b"\x1b]133;"),
+            "expected CLASP's discarded marker bytes inside the span: {text:?}"
+        );
+        for x in &e {
+            assert!(x.duration_ms.is_some(), "unfinished entry: {x:?}");
+        }
+    }
+
+    /// REQ-DM-010's third shell and its second: **real bash 5.3 and zsh
+    /// 5.9 cycles, replayed byte-identically**, because the carriage-return
+    /// rule is over all three shells and a future change to it would
+    /// otherwise be measured only against fish.
+    ///
+    /// Both were captured on this host through a real PTY with the shipped
+    /// snippet installed, and each carries its shell's own line-editor
+    /// noise. zsh's is the one that matters: `e\x08echo hello` is the
+    /// first-keystroke redraw, and it is the stream that reports
+    /// `eecho hello` if `\r`/backspace handling is deleted rather than
+    /// deferred — the mirror of the fish direction, and the reason
+    /// REQ-DM-010 is pinned from both sides. zsh's `%`-padding row and its
+    /// trailing `\r` are kept verbatim rather than trimmed, since trimming
+    /// is what would remove the very bytes the rule acts on.
+    const BASH_53_CYCLES: &[u8] = b"\x1b[?2004h\x1b]133;A;clasp=1\x07bash-5.3$ \x1b]133;B;clas\
+        p=1\x07echo hello\x0d\x0a\x1b[?2004l\x0d\x1b]133;C;clasp=1\
+        \x07hello\x0d\x0a\x1b]133;D;0;clasp=1\x07\x1b[?2004h\x1b]1\
+        33;A;clasp=1\x07bash-5.3$ \x1b]133;B;clasp=1\x07(exit 42)\x0d\
+        \x0a\x1b[?2004l\x0d\x1b]133;C;clasp=1\x07\x1b]133;D;42;cla\
+        sp=1\x07";
+    const ZSH_59_CYCLES: &[u8] =
+        b"\x0d\x1b[0m\x1b[27m\x1b[24m\x1b[J\x1b]133;A;clasp=1\x07dev\
+        % \x1b]133;B;clasp=1\x07\x1b[K\x1b[?2004he\x08echo hello\x1b\
+        [?2004l\x0d\x0d\x0a\x1b]133;C;clasp=1\x07hello\x0d\x0a\x1b\
+        [1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m                         \
+        \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x0d\
+        \x20\x0d\x1b]133;D;0;clasp=1\x07\x0d\x1b[0m\x1b[27m\x1b[24m\x1b\
+        [J\x1b]133;A;clasp=1\x07dev% \x1b]133;B;clasp=1\x07\x1b[K\x1b\
+        [?2004h(\x08(exit 42)\x1b[?2004l\x0d\x0d\x0a\x1b]133;C;cla\
+        sp=1\x07\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m             \
+        \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\
+        \x20\x20\x20\x20\x20\x20\x20\x20\x0d \x0d\x1b]133;D;42;clasp=1\x07";
+
+    #[test]
+    fn real_bash_and_zsh_cycles_replay_unchanged_under_the_carriage_return_rule() {
+        for (shell, raw) in [("bash 5.3", BASH_53_CYCLES), ("zsh 5.9", ZSH_59_CYCLES)] {
+            let h = replay(raw, 100);
+            let e = h.entries(0, 50);
+            assert_eq!(e.len(), 2, "{shell}: {e:?}");
+            // The whole entry, all three columns at once — a repair that
+            // fills `command` in by breaking the span, or one that keeps
+            // the spans while emptying `command`, fails exactly here.
+            assert_eq!(
+                e.iter().map(|x| x.command.as_str()).collect::<Vec<_>>(),
+                vec!["echo hello", "(exit 42)"],
+                "{shell}: the line editor's redraw reached the capture"
+            );
+            assert_eq!(
+                e.iter().map(|x| x.exit_code).collect::<Vec<_>>(),
+                vec![Some(0), Some(42)],
+                "{shell}"
+            );
+            let span = &raw[e[0].output_start_cursor as usize
+                ..e[0].output_end_cursor.expect("closed") as usize];
+            let text = String::from_utf8_lossy(span);
+            assert!(text.contains("hello\r\n"), "{shell}: span {text:?}");
+            assert!(
+                !span.windows(6).any(|w| w == b"\x1b]133;"),
+                "{shell}: with no foreign emitter no marker belongs in the \
+                 span — {text:?}"
+            );
+        }
+    }
+
+    /// The other half of the same capture, at the scanner: fish 4.0.2
+    /// emits no `B` of its own, so `mixed` is not a constructed state.
+    #[test]
+    fn the_real_fish_4_0_2_collision_reports_a_mixed_marker_source() {
+        let mut sc = ModeScanner::new();
+        sc.feed(FISH_402_COLLISION, 0, None);
+        assert_eq!(
+            sc.osc133_source(),
+            Some(crate::detect::Osc133Source::Mixed),
+            "fish supplied no `B`, so `B` is still CLASP's"
+        );
+    }
+
     #[test]
     fn nonzero_exit_codes_are_kept() {
         let h = replay(
@@ -301,6 +580,175 @@ mod tests {
         );
         assert!(h.entries(0, 50).is_empty(), "bare D invented an entry");
         assert_eq!(h.total(), 0);
+    }
+
+    /// REQ-DM-009, §8.5.1 rule 5 — the *other* arrangement, and it is not
+    /// the same test twice.
+    ///
+    /// `the_injection_command_produces_no_entry` above covers the case with
+    /// no foreign emitter, where the snippet stays out because it emits no
+    /// `C` at all. **That reasoning stops holding the moment another
+    /// emitter is installed:** the user's own `PS0`/`preexec` marks the
+    /// snippet's command line, a real `C` arrives carrying the snippet's
+    /// echoed text, and — measured on fish 4.8.1 — the snippet became the
+    /// session's first `get_command_history` entry. The two arrangements
+    /// reach the same outcome by different routes and only one of them is
+    /// today's behaviour, so both are required.
+    ///
+    /// The markers here are **untagged and therefore foreign** (§8.5.1
+    /// rule 2), which is what makes this the foreign-emitter arrangement
+    /// rather than a restatement of the row above.
+    #[test]
+    fn the_injection_command_produces_no_entry_when_a_foreign_emitter_marks_it() {
+        let snippet =
+            "if [ -z \"${CLASP_SHELL_INTEGRATION-}\" ]; then CLASP_SHELL_INTEGRATION=1; fi";
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        h.set_injection_line(snippet.to_string());
+        let mut raw = Vec::new();
+        // The foreign emitter's prompt, then the snippet's own echoed
+        // command line between `B` and `C`, then its completion.
+        raw.extend_from_slice(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        raw.extend_from_slice(snippet.as_bytes());
+        raw.extend_from_slice(b"\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        // And one ordinary command after it.
+        raw.extend_from_slice(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi\r\n");
+        raw.extend_from_slice(b"\x1b]133;D;0\x07");
+        let mut t = 1_000i64;
+        for ev in sc.feed(&raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        let e = h.entries(0, 50);
+        assert_eq!(e.len(), 1, "the install line became a history entry: {e:?}");
+        assert_eq!(e[0].command, "echo hi");
+        assert_eq!(e[0].exit_code, Some(0));
+        assert!(
+            e[0].output_end_cursor.is_some(),
+            "the suppressed `D` closed the wrong entry"
+        );
+        assert!(
+            h.is_active(),
+            "a marker was seen, so integration is working"
+        );
+    }
+
+    /// The third arrangement, and the one that was **measured wrong before
+    /// it was written**: a foreign emitter that supplies no `B`.
+    ///
+    /// fish 4.0.2 emits `A;special_key=1`, `C;cmdline_url=…` and
+    /// `D;<code>` and never `B` (measured on a live PTY; the marker shapes
+    /// here are that capture's, and `FISH_402_COLLISION` above is the
+    /// verbatim proof that `B` is missing — `mixed` is only reachable
+    /// because CLASP's `B` had nothing to yield to). Nothing arms the echo
+    /// capture before the snippet installs itself, so the injection line's
+    /// `C` carries an **empty** command and the suffix test in §8.5.1 rule
+    /// 5 has no text to compare.
+    ///
+    /// Driven against the real 4571-byte capture, the suffix test alone
+    /// left the snippet as entry 0 with `command: ""` and `exit_code: 0`,
+    /// ahead of the three real commands — REQ-DM-009's "never an entry"
+    /// failing on precisely the shell the requirement was written for. So
+    /// the rule identifies the line by the session's structure as well: a
+    /// first `C` that no `B` ever preceded.
+    #[test]
+    fn the_injection_command_produces_no_entry_when_the_foreign_emitter_supplies_no_b() {
+        let snippet =
+            "if not set -q CLASP_SHELL_INTEGRATION; set -g CLASP_SHELL_INTEGRATION 1; end";
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        h.set_injection_line(snippet.to_string());
+        let mut raw = Vec::new();
+        // fish's own prompt: `A`, and no `B` at all.
+        raw.extend_from_slice(b"\x1b]133;A;special_key=1\x07root@host /# ");
+        // The snippet is typed and echoed, and fish marks it — with no `B`
+        // the capture was never armed, so this `C` carries nothing.
+        raw.extend_from_slice(snippet.as_bytes());
+        raw.extend_from_slice(b"\r\n\x1b]133;C;cmdline_url=if%20not\x1b\\");
+        raw.extend_from_slice(b"\x1b]133;D;0\x1b\\");
+        // Now the snippet is installed, so CLASP's tagged `B` arrives and
+        // gives the next command its span.
+        raw.extend_from_slice(b"\x1b]133;A;special_key=1\x07\x1b]133;A;clasp=1\x07$ ");
+        raw.extend_from_slice(b"\x1b]133;B;clasp=1\x07echo hi\r\n");
+        raw.extend_from_slice(b"\x1b]133;C;cmdline_url=echo%20hi\x1b\\hi\r\n");
+        raw.extend_from_slice(b"\x1b]133;D;0\x1b\\");
+        let mut t = 1_000i64;
+        for ev in sc.feed(&raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        let e = h.entries(0, 50);
+        assert_eq!(
+            e.len(),
+            1,
+            "the install line became an entry with no command text: {e:?}"
+        );
+        assert_eq!(e[0].command, "echo hi");
+        assert_eq!(e[0].exit_code, Some(0));
+        assert!(
+            e[0].output_end_cursor.is_some(),
+            "the suppressed `D` closed the wrong entry"
+        );
+    }
+
+    /// The negative that separates the row above from a ring that drops
+    /// **any** `C` with an empty capture.
+    ///
+    /// Same empty capture, same first `OutputStart` — and a `B` in front of
+    /// it, which is what a session with no foreign emitter always has by
+    /// the time its first command runs, because CLASP's own `PS1` emits
+    /// one. This entry must survive with its empty text: `command` is
+    /// documented best-effort and an empty one is a *lossy capture*, not a
+    /// reason to hide that a command ran at all.
+    #[test]
+    fn a_command_whose_capture_came_out_empty_is_still_an_entry() {
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        h.set_injection_line("some snippet text".to_string());
+        let raw = b"\x1b]133;A;clasp=1\x07$ \x1b]133;B;clasp=1\x07\x1b]133;C;clasp=1\x07\
+                    out\r\n\x1b]133;D;7;clasp=1\x07";
+        let mut t = 1_000i64;
+        for ev in sc.feed(raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        let e = h.entries(0, 50);
+        assert_eq!(e.len(), 1, "a lossy capture cost the whole entry: {e:?}");
+        assert_eq!(e[0].command, "");
+        assert_eq!(e[0].exit_code, Some(7));
+    }
+
+    /// The negative that bounds the suppression: it is armed for exactly
+    /// one `OutputStart`, so it can never become an open-ended filter on
+    /// the user's own commands.
+    ///
+    /// `fi` is deliberately a suffix of every POSIX snippet CLASP types.
+    /// Without the one-shot bound, a session in which the user later runs
+    /// anything ending in `fi` silently loses that command from the
+    /// history — and the entry that vanishes is a real one.
+    #[test]
+    fn only_the_first_command_can_be_the_injection_line() {
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        h.set_injection_line("fi".to_string());
+        let raw = b"\x1b]133;A\x07$ \x1b]133;B\x07echo one\r\n\x1b]133;C\x07one\r\n\
+                    \x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07fi\r\n\x1b]133;C\x07\
+                    \x1b]133;D;2\x07";
+        let mut t = 1_000i64;
+        for ev in sc.feed(raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        let e = h.entries(0, 50);
+        assert_eq!(e.len(), 2, "the suppression outlived the injection line");
+        assert_eq!(
+            e.iter().map(|x| x.command.as_str()).collect::<Vec<_>>(),
+            vec!["echo one", "fi"]
+        );
+        assert_eq!(
+            e.iter().map(|x| x.exit_code).collect::<Vec<_>>(),
+            vec![Some(0), Some(2)]
+        );
     }
 
     #[test]
