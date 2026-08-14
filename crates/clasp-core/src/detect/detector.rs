@@ -201,6 +201,38 @@ impl PromptDetector {
         };
         let at_marker = matches!(self.scanner.last_marker(), Some(b'A') | Some(b'B'));
 
+        // §8.3's echo rung, and the two flags are tri-state independently.
+        //
+        //   echo          icanon        rung
+        //   Some(false)   Some(true)    fires   — a genuine secret prompt
+        //   Some(false)   None          fires   — identical to pre-rev.-36
+        //   Some(false)   Some(false)   skipped — readline's shape
+        //   None/Some(true) any         skipped, as before
+        //
+        // A program that wants a secret *line* turns echo off and stays
+        // canonical, because it wants the kernel's line discipline to
+        // assemble the line. A line editor turns echo off and leaves
+        // canonical mode, because it draws the characters itself.
+        //
+        // Measured, and the reason the conjunct exists: a CPython 3.12
+        // `>>> ` prompt is `ECHO off / ICANON off` with no bracketed paste
+        // — PyREPL, which drives the paste, landed in 3.13 — so before
+        // rev. 36 this rung answered `AwaitingSecret` / 0.95 at an
+        // ordinary REPL prompt, and §8.4 tells the agent that means call
+        // `request_secret_input`.
+        //
+        // `ICANON` is strictly better and it is **not sufficient**.
+        // `read -s -n 1` reports `ECHO off / ICANON off` — the readline
+        // shape — while being a genuine secret prompt, because a
+        // single-character read leaves canonical mode by construction. It
+        // now falls past this rung (§8.7 row 8, REQ-PD-022), and rev. 37's
+        // scoping does not rescue it either: `read` is a **builtin**, so
+        // the shell keeps the foreground group and the T2 executing rung's
+        // premise really does hold. What the change buys is that the
+        // false-positive class shrinks from *every echo-off readline
+        // prompt* to *nothing measured*; what it does not buy is a
+        // complete `AwaitingSecret` signal, and §8.4 says so where an agent
+        // acting on the mode will meet it.
         let (interaction_mode, detection_tier, confidence, reason) = if !alive {
             (
                 InteractionMode::Exited,
@@ -222,12 +254,17 @@ impl PromptDetector {
                 1.0,
                 "osc 133 prompt marker with no command started since".to_string(),
             )
-        } else if line.echo == Some(false) && !modes.bracketed_paste {
+        } else if line.echo == Some(false)
+            && line.canonical != Some(false)
+            && !modes.bracketed_paste
+        {
             (
                 InteractionMode::AwaitingSecret,
                 DetectionTier::TerminalMode,
                 0.95,
-                "echo disabled with no bracketed paste or alternate screen".to_string(),
+                "echo disabled without leaving canonical mode, \
+                 and no bracketed paste"
+                    .to_string(),
             )
         } else if modes.bracketed_paste {
             (
@@ -424,13 +461,14 @@ mod tests {
     /// there. This is the same readline prompt with bracketed paste
     /// **absent**: the classic readline REPL (`PYTHON_BASIC_REPL=1`, and
     /// every CPython before 3.13), a `psql` built against a readline whose
-    /// `enable-bracketed-paste` is off, anything using `editline`. §8.3's
-    /// rung then reads `echo == Some(false) && !bracketed_paste` and
-    /// answers `AwaitingSecret` — at an ordinary REPL prompt, at the 0.95
-    /// §8.4 tells the agent to answer by calling `request_secret_input`.
+    /// `enable-bracketed-paste` is off, anything using `editline`. Before
+    /// rev. 36 §8.3's rung read `echo == Some(false) && !bracketed_paste`
+    /// and answered `AwaitingSecret` — at an ordinary REPL prompt, at the
+    /// 0.95 §8.4 tells the agent to answer by calling
+    /// `request_secret_input`.
     ///
     /// **The termios state is what separates the two, and the detector is
-    /// not handed it.** Measured on this host (`tcgetattr` on the master
+    /// now handed it.** Measured on this host (`tcgetattr` on the master
     /// fd, one sample per scenario):
     ///
     /// ```text
@@ -439,39 +477,45 @@ mod tests {
     /// python3 -q PYTHON_BASIC_REPL=1  ECHO off / ICANON off
     /// getpass()                       ECHO off / ICANON ON
     /// bash read -s                    ECHO off / ICANON ON
-    /// bash read -s -n 1               ECHO off / ICANON off   (§14.1's false negative)
+    /// bash read -s -n 1               ECHO off / ICANON off   (the false negative)
     /// ```
     ///
     /// A line editor turns echo off and *leaves* canonical mode because it
     /// is drawing the characters itself; a shell that wants a whole secret
-    /// line turns echo off and *stays* canonical. `snapshot_at` receives
-    /// `echo` alone, so both collapse onto one answer.
+    /// line turns echo off and *stays* canonical.
     ///
-    /// **This test is written to be flipped, not deleted.** When the rung
-    /// consults `ICANON` (§14.1, REQ-PDS-001), the first row's expectation
-    /// becomes `AtPrompt` / `heuristic` / 0.9 — the T3 answer the tail
-    /// already scores, sitting inertly in `pattern_score` below — and the
-    /// second row does not move. The third row moves *with* the first, and
-    /// that is REQ-PDS-003's point rather than a regression: `read -s -n 1`
-    /// measures `off/off` while being a genuine secret prompt.
+    /// **This test was written to be flipped, and this is the flip.** The
+    /// rung now consults `ICANON` (REQ-PD-020), so half 1's answer is the
+    /// T3 answer its own tail already scores — `AtPrompt` / `heuristic` /
+    /// 0.9, the value that used to sit inertly in `pattern_score`
+    /// contradicting the payload it arrived in. Halves 2 and 3 do not
+    /// move, and that is what makes the flip mean something: half 2 is the
+    /// pair, differing from half 1 in `ICANON` and in nothing else, so a
+    /// rung that stopped firing altogether would take half 1 to the right
+    /// answer *and* half 2 to the wrong one. Half 3 separates both from
+    /// the degenerate case where the tail alone carries the answer.
+    ///
+    /// `read -s -n 1` measures `off/off` while being a genuine secret
+    /// prompt and therefore moves *with* half 1. That is REQ-PD-022's
+    /// point rather than a regression: `ICANON` is a strictly better
+    /// discriminator and not a sufficient one.
     #[test]
     fn matrix_echo_off_at_a_prompt_shaped_tail_with_no_bracketed_paste() {
         let (mut d, start, now) = detector();
         feed(&mut d, start, b">>> ");
         let s = d.snapshot_at(true, ld(false, false), now);
-        assert_eq!(s.interaction_mode, InteractionMode::AwaitingSecret);
-        assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
-        assert_eq!(s.confidence, 0.95);
-        // The corroborating signal disagrees inside the same payload — the
-        // shape §8.3 records for the rev.-27 alt-screen defect, one rung
-        // over. It is also the value the answer becomes when the rung
-        // learns to tell the two states apart.
+        assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
+        assert_eq!(s.detection_tier, DetectionTier::Heuristic);
+        assert!((s.confidence - 0.9).abs() < 1e-6, "{}", s.confidence);
+        // 0.90 is `quiescent_score 1.0 x pattern_score 0.9`. This
+        // assertion predates the flip and used to contradict the answer
+        // beside it; it now corroborates it.
         assert!((s.pattern_score - 0.9).abs() < 1e-6, "{}", s.pattern_score);
 
-        // The genuine secret prompt, on the same rung, answered
-        // identically. This is the pair: the two rows differ in `ICANON`
-        // (off vs ON, measured above) and in nothing the classifier is
-        // given, so no implementation of this signature can separate them.
+        // The genuine secret prompt, unmoved. This is the pair: the two
+        // halves differ in `ICANON` (off vs ON, measured above) and in
+        // nothing else, so a rung that stopped firing at all would take
+        // half 1 to the right answer and this one to the wrong one.
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"Password: ");
         let secret = d.snapshot_at(true, ld(false, true), now);
@@ -897,6 +941,109 @@ mod tests {
         feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lPassword: ");
         let s = d.snapshot_at(true, LineDiscipline::UNKNOWN, now);
         assert_eq!(s.interaction_mode, InteractionMode::Executing);
+    }
+
+    /// §8.3's echo rung across both flags' tri-state, with the §8.7 row
+    /// each cell corresponds to named in the failure message.
+    ///
+    /// The second row is the requirement, not filler: REQ-PD-021 says an
+    /// unreadable `ICANON` must reproduce the pre-rev.-36 classification
+    /// **exactly** — degrade to today's answer, never to a third path —
+    /// which is why the conjunct is spelled `!= Some(false)` and not
+    /// `== Some(true)`. A two-valued `icanon` axis cannot fail on that
+    /// rule and is the one shape this test must not have.
+    #[test]
+    fn the_echo_rung_crosses_both_flags_tri_state() {
+        /// `(echo, canonical, mode, tier, confidence, which §8.7 row)`.
+        type Row = (
+            Option<bool>,
+            Option<bool>,
+            InteractionMode,
+            DetectionTier,
+            f32,
+            &'static str,
+        );
+        let rows: &[Row] = &[
+            (
+                Some(false),
+                Some(true),
+                InteractionMode::AwaitingSecret,
+                DetectionTier::TerminalMode,
+                0.95,
+                "getpass/read -s/ssh: echo off, canonical on — §8.7 rows 3,4,5",
+            ),
+            (
+                Some(false),
+                None,
+                InteractionMode::AwaitingSecret,
+                DetectionTier::TerminalMode,
+                0.95,
+                "ICANON unreadable: REQ-PD-021, the pre-rev.-36 answer exactly",
+            ),
+            (
+                Some(false),
+                Some(false),
+                InteractionMode::AtPrompt,
+                DetectionTier::Heuristic,
+                0.9,
+                "readline with no bracketed paste: §8.7 row 7",
+            ),
+            (
+                Some(true),
+                Some(true),
+                InteractionMode::AtPrompt,
+                DetectionTier::Heuristic,
+                0.9,
+                "echo on: never this rung",
+            ),
+            (
+                Some(true),
+                Some(false),
+                InteractionMode::AtPrompt,
+                DetectionTier::Heuristic,
+                0.9,
+                "echo on, canonical off: still never this rung",
+            ),
+            (
+                None,
+                Some(true),
+                InteractionMode::AtPrompt,
+                DetectionTier::Heuristic,
+                0.9,
+                "no line discipline: ConPTY today",
+            ),
+            (
+                None,
+                None,
+                InteractionMode::AtPrompt,
+                DetectionTier::Heuristic,
+                0.9,
+                "LineDiscipline::UNKNOWN",
+            ),
+        ];
+        for (echo, canonical, mode, tier, confidence, what) in rows {
+            let (mut d, start, now) = detector();
+            // `>>> ` scores 0.9 in the T3 table, so every row that falls
+            // past the rung lands on one number and a row that stopped
+            // falling past it shows as a different tier, not just a
+            // different mode.
+            feed(&mut d, start, b">>> ");
+            let s = d.snapshot_at(
+                true,
+                LineDiscipline {
+                    echo: *echo,
+                    canonical: *canonical,
+                },
+                now,
+            );
+            assert_eq!(s.interaction_mode, *mode, "{what}");
+            assert_eq!(s.detection_tier, *tier, "{what}");
+            assert!(
+                (s.confidence - *confidence).abs() < 1e-6,
+                "{what}: {}",
+                s.confidence
+            );
+        }
     }
 
     #[test]

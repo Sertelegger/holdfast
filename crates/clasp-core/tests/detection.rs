@@ -931,15 +931,20 @@ struct EchoOffRow {
     /// asserted on — the value is then measured out of band and named in
     /// the comment.
     canonical: Option<bool>,
-    /// **The flip point: `(interaction_mode, detection_tier, confidence)`
-    /// as §8.3's ladder answers today.** The rung consults `ECHO` alone,
-    /// so all three rows answer identically, and the first is a readline
-    /// prompt being reported as a password prompt at 0.95 — the reading
-    /// §8.4 tells the agent to answer with `request_secret_input`.
+    /// **`(interaction_mode, detection_tier, confidence)` as §8.3's ladder
+    /// answers, and this is the flipped side of it.** Until REQ-PD-020 the
+    /// rung consulted `ECHO` alone, so all three rows answered identically
+    /// and the first was a readline prompt reported as a password prompt
+    /// at 0.95 — the reading §8.4 tells the agent to answer with
+    /// `request_secret_input`. The rung now also requires `ICANON` not to
+    /// be known off, so rows 1 and 3 have moved and row 2 has not, which
+    /// is what makes row 2 the pair rather than a duplicate: rows 1 and 2
+    /// differ in `ICANON` and in nothing else.
     ///
-    /// When the rung consults `ICANON` (§14.1, REQ-PDS-001..003), rows 1
-    /// and 3 move and row 2 does not. Edit these three literals; the
-    /// sessions above them are the part that took the work.
+    /// Row 3 moving *with* row 1 is REQ-PD-022's point rather than a
+    /// regression: `read -s -n 1` is a genuine secret prompt in the
+    /// readline shape, and no combination of these signals separates it
+    /// from row 1.
     answer: (&'static str, &'static str, f64),
 }
 
@@ -981,7 +986,7 @@ async fn echo_off_prompts_with_and_without_canonical_mode() {
             command: "stty -echo -icanon; stty -a; printf '>>> '; sleep 30",
             last_line: ">>> ",
             canonical: Some(false),
-            answer: ("AwaitingSecret", "terminal_mode", 0.95),
+            answer: ("AtPrompt", "heuristic", 0.9),
         },
         EchoOffRow {
             what: "a secret prompt: echo off, canonical mode on",
@@ -995,10 +1000,21 @@ async fn echo_off_prompts_with_and_without_canonical_mode() {
             // Measured out of band: `ECHO off / ICANON off`. `read` sets
             // the state itself, so the session cannot dump `stty -a`
             // without putting it on the line the row settles on.
+            //
+            // The tier here is `heuristic` and §8.7 row 8 records
+            // `terminal_mode`, and the difference is the *arrangement*
+            // rather than the ladder: this row is driven with `bash -c`,
+            // which never enters readline and so never drives bracketed
+            // paste, while §8.7 row 8 is a builtin inside an interactive
+            // shell that has. `Key: ` scores 0 on the T3 table, so both
+            // arrangements report `Executing` at 0.00 and only the tier
+            // separates them. Driving it interactively — which is what
+            // makes this row assert §8.7 row 8 rather than a neighbour of
+            // it — is the outstanding half.
             command: "read -s -n 1 -p 'Key: ' k",
             last_line: "Key: ",
             canonical: None,
-            answer: ("AwaitingSecret", "terminal_mode", 0.95),
+            answer: ("Executing", "heuristic", 0.0),
         },
     ];
 
