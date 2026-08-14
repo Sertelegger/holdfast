@@ -1,0 +1,547 @@
+# CLASP built-in secret-redaction rules (spec §9.2).
+#
+# Derived from the gitleaks default rule set (MIT) plus CLASP additions
+# for AI provider keys. Refreshed quarterly; `source_version` records the
+# upstream snapshot this file was derived from.
+#
+# Field reference:
+#   name      unique rule id; a user rule with the same name overrides it
+#   kind      what the agent sees: `[REDACTED:<kind>]`
+#   pattern   `regex::bytes` syntax. If it has a capture group named
+#             `value`, only that group is redacted and the rest of the
+#             match (the context prefix) is left intact.
+#   prefixes  optional literal prefixes for the partial-secret index
+#             (§4.1). Omit to auto-derive from `pattern`.
+#   binary    optional; true when the value may contain whitespace or
+#             control bytes (PEM blocks). Defaults to false.
+#   positive  MUST match. At least one required.
+#   negative  MUST NOT match. At least one required.
+#
+# ORDER MATTERS. More specific rules come first: when two rules cover the
+# same bytes the earlier one names the kind (see `merge_spans`).
+
+source_version = "gitleaks-8.28.0"
+
+# ------------------------------------------------------------ AI providers
+
+[[rule]]
+name = "anthropic-api-key"
+kind = "anthropic"
+pattern = '''\bsk-ant-[A-Za-z0-9_-]{24,}'''
+positive = ["sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGG"]
+negative = ["sk-ant-short"]
+
+[[rule]]
+name = "openrouter-api-key"
+kind = "openrouter"
+pattern = '''\bsk-or-v1-[a-f0-9]{64}'''
+positive = [
+  "sk-or-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+]
+negative = ["sk-or-v1-0123"]
+
+[[rule]]
+name = "openai-api-key"
+kind = "openai"
+pattern = '''\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{24,}'''
+prefixes = ["sk-", "sk-proj-", "sk-svcacct-", "sk-admin-"]
+positive = [
+  "sk-AAAABBBBCCCCDDDDEEEEFFFFGGGG",
+  "sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGG",
+]
+negative = ["sk-tiny"]
+
+[[rule]]
+name = "openai-session-key"
+kind = "openai"
+pattern = '''\bsess-[A-Za-z0-9]{32,}'''
+positive = ["sess-0123456789abcdef0123456789abcdef"]
+negative = ["sess-0123"]
+
+[[rule]]
+name = "google-api-key"
+kind = "google"
+pattern = '''\bAIza[0-9A-Za-z_-]{35}'''
+positive = ["AIzaSyA0123456789abcdefghijklmnopqrstuv"]
+negative = ["AIzaSyA0123"]
+
+[[rule]]
+name = "gcp-oauth-token"
+kind = "gcp"
+pattern = '''\bya29\.[0-9A-Za-z_-]{20,}'''
+positive = ["ya29.a0AfB_byABCDEFGHIJKLMNOPQRSTUVWX"]
+negative = ["ya29.short"]
+
+[[rule]]
+name = "xai-api-key"
+kind = "xai"
+pattern = '''\bxai-[A-Za-z0-9]{32,}'''
+positive = ["xai-0123456789abcdef0123456789abcdef"]
+negative = ["xai-0123"]
+
+[[rule]]
+name = "huggingface-token"
+kind = "huggingface"
+pattern = '''\bhf_[A-Za-z0-9]{34,}'''
+positive = ["hf_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"]
+negative = ["hf_ABCDEF"]
+
+[[rule]]
+name = "nvidia-api-key"
+kind = "nvidia"
+pattern = '''\bnvapi-[A-Za-z0-9_-]{40,}'''
+positive = [
+  "nvapi-0123456789abcdefghijABCDEFGHIJ0123456789abcdefghijABCDEFGHIJ",
+]
+negative = ["nvapi-0123456789"]
+
+[[rule]]
+name = "groq-api-key"
+kind = "groq"
+pattern = '''\bgsk_[A-Za-z0-9]{40,}'''
+positive = ["gsk_0123456789abcdef0123456789abcdef01234567"]
+negative = ["gsk_0123456789"]
+
+[[rule]]
+name = "perplexity-api-key"
+kind = "perplexity"
+pattern = '''\bpplx-[A-Za-z0-9]{32,}'''
+positive = ["pplx-0123456789abcdef0123456789abcdef"]
+negative = ["pplx-0123"]
+
+[[rule]]
+name = "replicate-api-token"
+kind = "replicate"
+pattern = '''\br8_[A-Za-z0-9]{35,}'''
+positive = ["r8_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"]
+negative = ["r8_ABCDEF"]
+
+[[rule]]
+name = "fireworks-api-key"
+kind = "fireworks"
+pattern = '''\bfw_[A-Za-z0-9]{24,}'''
+positive = ["fw_0123456789abcdef01234567"]
+negative = ["fw_0123"]
+
+# ------------------------------------------- source control / package registries
+
+[[rule]]
+name = "github-token"
+kind = "github"
+pattern = '''\bgh[pousr]_[0-9A-Za-z]{36,}'''
+positive = [
+  "ghp_0123456789abcdefghijABCDEFGHIJ012345",
+  "gho_0123456789abcdefghijABCDEFGHIJ012345",
+]
+negative = ["ghp_abcdef", "ghz_0123456789abcdefghijABCDEFGHIJ012345"]
+
+[[rule]]
+name = "github-fine-grained-pat"
+kind = "github"
+pattern = '''\bgithub_pat_[0-9A-Za-z_]{40,}'''
+positive = [
+  "github_pat_11ABCDEFG0123456789_0123456789abcdefghijABCDEFGHIJ0123456789",
+]
+negative = ["github_pat_short"]
+
+[[rule]]
+name = "gitlab-pat"
+kind = "gitlab"
+pattern = '''\bglpat-[A-Za-z0-9_-]{20,}'''
+positive = ["glpat-0123456789abcdefghij"]
+negative = ["glpat-0123"]
+
+[[rule]]
+name = "npm-access-token"
+kind = "npm"
+pattern = '''\bnpm_[A-Za-z0-9]{36,}'''
+positive = ["npm_0123456789abcdefghijABCDEFGHIJ012345"]
+negative = ["npm_0123"]
+
+[[rule]]
+name = "pypi-upload-token"
+kind = "pypi"
+pattern = '''\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}'''
+positive = [
+  "pypi-AgEIcHlwaS5vcmcABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123",
+]
+negative = ["pypi-AgEIcHlwaS5vcmcSHORT"]
+
+[[rule]]
+name = "crates-io-token"
+kind = "crates-io"
+pattern = '''\bcio[A-Za-z0-9]{32,}'''
+positive = ["cio0123456789abcdef0123456789abcdef"]
+negative = ["cio0123"]
+
+# ------------------------------------------------------------------- cloud
+
+[[rule]]
+name = "aws-access-key-id"
+kind = "aws"
+pattern = '''\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}'''
+prefixes = ["AKIA", "ASIA", "ABIA", "ACCA"]
+positive = ["AKIAIOSFODNN7EXAMPLE"]
+negative = ["AKIAIOSF"]
+
+[[rule]]
+name = "aws-secret-access-key"
+kind = "aws"
+pattern = '''(?i)aws_secret_access_key["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9/+=]{40})'''
+positive = ["AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY01"]
+negative = ["AWS_SECRET_ACCESS_KEY=short"]
+
+[[rule]]
+name = "digitalocean-token"
+kind = "digitalocean"
+pattern = '''\bdop_v1_[a-f0-9]{64}'''
+positive = [
+  "dop_v1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+]
+negative = ["dop_v1_0123"]
+
+[[rule]]
+name = "cloudflare-origin-ca-key"
+kind = "cloudflare"
+pattern = '''\bv1\.0-[A-Za-z0-9-]{40,}'''
+positive = ["v1.0-0123456789abcdef0123456789abcdef01234567"]
+negative = ["v1.0-0123"]
+
+# Cloudflare API tokens are 40 unprefixed `[A-Za-z0-9_-]` characters, so
+# they can only be recognised from their label. `CLOUDFLARE_API_TOKEN`
+# contains neither `api_key` nor `auth_token`, so the generic assignment
+# rule does not reach it -- this rule is what covers it.
+[[rule]]
+name = "cloudflare-api-token"
+kind = "cloudflare"
+pattern = '''(?i)\bcloudflare[a-z0-9_.-]{0,24}(?:token|key|secret)\b["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9_.-]{20,})'''
+positive = [
+  "CLOUDFLARE_API_TOKEN=0123456789abcdefghij0123456789abcdefghij",
+  "cloudflare_global_api_key: 'abcdef0123456789abcdef0123456789abcd'",
+]
+negative = [
+  "CLOUDFLARE_ACCOUNT_ID=0123",
+  "https://api.cloudflare.com/client/v4/zones",
+]
+
+[[rule]]
+name = "flyio-token"
+kind = "flyio"
+pattern = '''\bfo1_[A-Za-z0-9_-]{40,}'''
+positive = ["fo1_0123456789abcdef0123456789abcdef01234567"]
+negative = ["fo1_0123"]
+
+[[rule]]
+name = "render-api-key"
+kind = "render"
+pattern = '''\brnd_[A-Za-z0-9]{28,}'''
+positive = ["rnd_0123456789abcdef0123456789ab"]
+negative = ["rnd_0123"]
+
+# Railway project and account tokens are bare UUIDs, so like Cloudflare
+# they are only recognisable from their label. `RAILWAY_TOKEN` matches no
+# alternative in `generic-secret-assignment`.
+[[rule]]
+name = "railway-token"
+kind = "railway"
+pattern = '''(?i)\brailway[a-z0-9_.-]{0,24}(?:token|key|secret)\b["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9_.-]{16,})'''
+positive = [
+  "RAILWAY_TOKEN=0123abcd-4567-89ef-0123-456789abcdef",
+  "railway_api_token: 'abcdef0123456789abcdef'",
+]
+negative = ["RAILWAY_ENVIRONMENT=production", "RAILWAY_TOKEN="]
+
+# --------------------------------------------------------- databases / sync
+
+[[rule]]
+name = "supabase-service-key"
+kind = "supabase"
+pattern = '''\bsbp_[a-f0-9]{40,}'''
+positive = ["sbp_0123456789abcdef0123456789abcdef01234567"]
+negative = ["sbp_0123"]
+
+[[rule]]
+name = "planetscale-token"
+kind = "planetscale"
+pattern = '''\bpscale_(?:pw|tkn)_[A-Za-z0-9_.-]{32,}'''
+prefixes = ["pscale_pw_", "pscale_tkn_"]
+positive = ["pscale_pw_0123456789abcdef0123456789abcdef"]
+negative = ["pscale_pw_0123"]
+
+# PowerSync publishes no fixed-prefix token format: development and client
+# tokens are JWTs (caught separately by the `jwt` rule) and the CLI's
+# personal access token is opaque. Both reach a terminal as an assignment
+# to a `POWERSYNC_*` variable, and `POWERSYNC_TOKEN` matches no alternative
+# in `generic-secret-assignment` -- so without this rule PowerSync
+# credentials are covered by nothing at all.
+[[rule]]
+name = "powersync-token"
+kind = "powersync"
+pattern = '''(?i)\bpowersync[a-z0-9_.-]{0,24}(?:token|key|secret|password)\b["'\s]*[:=]\s*["']?(?P<value>[^\s"';,)]{8,})'''
+positive = [
+  "POWERSYNC_TOKEN=eyJhbGciOiJSUzI1NiJ9.PLACEHOLDERPLACEHOLDER",
+  "export POWERSYNC_DEV_TOKEN='abcdef0123456789'",
+  "powersync_private_key: 'abcdef0123456789abcdef'",
+]
+negative = [
+  "POWERSYNC_URL=https://example.powersync.journeyapps.com",
+  "POWERSYNC_TOKEN=",
+]
+
+[[rule]]
+name = "database-connection-password"
+kind = "connection-string"
+pattern = '''\b(?:postgres|postgresql|mysql|mongodb\+srv|mongodb|redis|amqp)://[^:@/\s]+:(?P<value>[^@/\s]+)@'''
+prefixes = [
+  "postgres://",
+  "postgresql://",
+  "mysql://",
+  "mongodb://",
+  "mongodb+srv://",
+  "redis://",
+  "amqp://",
+]
+positive = ["postgresql://svc:hunter2GOESHERE@db.internal:5432/app"]
+negative = ["postgresql://db.internal:5432/app"]
+
+# ---------------------------------------------------------- communication
+
+[[rule]]
+name = "slack-token"
+kind = "slack"
+pattern = '''\bxox[baprs]-[A-Za-z0-9-]{16,}'''
+positive = ["xoxb-0123456789-0123456789012-ABCDEFGHIJ"]
+negative = ["xoxb-0123"]
+
+[[rule]]
+name = "slack-webhook-url"
+kind = "slack"
+pattern = '''https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]{16,}'''
+positive = [
+  "https://hooks.slack.com/services/T00000000/B00000000/ABCDEFGHIJKLMNOPQRSTUVWX",
+]
+negative = ["https://hooks.slack.com/services/T0/B0/short"]
+
+[[rule]]
+name = "discord-webhook-url"
+kind = "discord"
+pattern = '''https://discord(?:app)?\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,}'''
+positive = [
+  "https://discord.com/api/webhooks/01234567890123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+]
+negative = ["https://discord.com/api/webhooks/0123/short"]
+
+[[rule]]
+name = "telegram-bot-token"
+kind = "telegram"
+pattern = '''\b[0-9]{8,10}:AA[A-Za-z0-9_-]{33}'''
+positive = ["123456789:AAF0123456789abcdefghijABCDEFGHIJ01"]
+negative = ["123456789:AAshort"]
+
+[[rule]]
+name = "sendgrid-api-key"
+kind = "sendgrid"
+pattern = '''\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'''
+positive = [
+  "SG.0123456789abcdefghijkl.0123456789abcdefghijklmnopqrstuvwxyz0123456789",
+]
+negative = ["SG.short.short"]
+
+[[rule]]
+name = "mailgun-api-key"
+kind = "mailgun"
+pattern = '''\bkey-[a-f0-9]{32}'''
+positive = ["key-0123456789abcdef0123456789abcdef"]
+negative = ["key-0123"]
+
+[[rule]]
+name = "resend-api-key"
+kind = "resend"
+pattern = '''\bre_[A-Za-z0-9_]{24,}'''
+positive = ["re_0123456789abcdef01234567"]
+negative = ["re_0123"]
+
+# ---------------------------------------------------------------- payments
+
+[[rule]]
+name = "stripe-secret-key"
+kind = "stripe"
+pattern = '''\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{24,}'''
+prefixes = ["sk_live_", "sk_test_", "rk_live_", "rk_test_"]
+positive = ["sk_live_0123456789abcdef01234567"]
+negative = ["sk_live_0123"]
+
+[[rule]]
+name = "stripe-webhook-secret"
+kind = "stripe"
+pattern = '''\bwhsec_[A-Za-z0-9]{32,}'''
+positive = ["whsec_0123456789abcdef0123456789abcdef"]
+negative = ["whsec_0123"]
+
+# ----------------------------------------------------------- observability
+
+[[rule]]
+name = "sentry-org-token"
+kind = "sentry"
+pattern = '''\bsntrys_[A-Za-z0-9_.-]{40,}'''
+positive = ["sntrys_0123456789abcdef0123456789abcdef01234567"]
+negative = ["sntrys_0123"]
+
+[[rule]]
+name = "newrelic-api-key"
+kind = "newrelic"
+pattern = '''\bNR(?:AK|RA)-[A-Z0-9]{27}'''
+prefixes = ["NRAK-", "NRRA-"]
+positive = ["NRAK-0123456789ABCDEFGHIJKLMNOPQ"]
+negative = ["NRAK-0123"]
+
+[[rule]]
+name = "launchdarkly-key"
+kind = "launchdarkly"
+pattern = '''\b(?:sdk|mob|api)-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'''
+prefixes = ["sdk-", "mob-"]
+positive = ["sdk-0123abcd-4567-89ef-0123-456789abcdef"]
+negative = ["sdk-0123abcd"]
+
+[[rule]]
+name = "posthog-key"
+kind = "posthog"
+pattern = '''\bph[cx]_[A-Za-z0-9]{40,}'''
+positive = ["phc_0123456789abcdef0123456789abcdef01234567"]
+negative = ["phc_0123"]
+
+[[rule]]
+name = "honeycomb-key"
+kind = "honeycomb"
+pattern = '''\bhc[aw]ik_[A-Za-z0-9]{40,}'''
+prefixes = ["hcaik_", "hcwik_"]
+positive = ["hcaik_0123456789abcdef0123456789abcdef01234567"]
+negative = ["hcaik_0123"]
+
+[[rule]]
+name = "datadog-api-key"
+kind = "datadog"
+pattern = '''(?i)dd_api_key["'\s]*[:=]\s*["']?(?P<value>[a-f0-9]{32})'''
+positive = ["DD_API_KEY=0123456789abcdef0123456789abcdef"]
+negative = ["DD_API_KEY=nothex"]
+
+# ----------------------------------------------------------------- generic
+
+[[rule]]
+name = "private-key-block"
+kind = "private-key"
+pattern = '''-----BEGIN[ A-Z]{0,20}PRIVATE KEY[ A-Z]{0,10}-----[\s\S]*?-----END[ A-Z]{0,20}PRIVATE KEY[ A-Z]{0,10}-----'''
+prefixes = ["-----BEGIN"]
+binary = true
+positive = [
+  "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQ==\n-----END RSA PRIVATE KEY-----",
+]
+negative = ["-----BEGIN CERTIFICATE-----"]
+
+[[rule]]
+name = "jwt"
+kind = "jwt"
+pattern = '''\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'''
+positive = [
+  "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
+]
+negative = ["eyJhbGciOiJIUzI1NiJ9.short"]
+
+[[rule]]
+name = "bearer-authorization"
+kind = "bearer"
+pattern = '''(?i)bearer\s+(?P<value>[A-Za-z0-9._~+/-]{20,}=*)'''
+positive = ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz"]
+negative = ["Bearer short"]
+
+# Two-word `*_KEY` labels. Found by walking the providers that have no
+# dedicated rule and checking each one's canonical environment-variable
+# name against `generic-secret-assignment` below: every one of them is
+# reached through `password|secret|api_key|access_token|auth_token|token`
+# EXCEPT the `<something>_KEY` shape, because that rule's `secret\b` needs
+# a word boundary and `SECRET_KEY` continues with `_`. So `SECRET_KEY=`
+# (Django's canonical name), `CLERK_SECRET_KEY=`, `PRIVATE_KEY=`,
+# `ENCRYPTION_KEY=` and `FCM_SERVER_KEY=` were reached by nothing at all.
+#
+# This is a label-keyed rule, not a shape-keyed one: it is correct by
+# construction because it keys on the variable name rather than on a token
+# format nobody can cite. `PUBLIC_KEY=` and `SECRET_KEY_FILE=` are the
+# negatives that keep it from swallowing non-secrets.
+[[rule]]
+name = "secret-key-assignment"
+kind = "generic"
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:secret|private|encryption|signing|master|session)[_-]key\b["'\s]*[:=]\s*["']?(?P<value>[^\s"';,)]{8,})'''
+prefixes = [
+  "secret_key",
+  "secret-key",
+  "private_key",
+  "private-key",
+  "encryption_key",
+  "encryption-key",
+  "signing_key",
+  "signing-key",
+  "master_key",
+  "master-key",
+  "session_key",
+  "session-key",
+]
+positive = [
+  "CLERK_SECRET_KEY=sk_test_0123456789abcdef01234567",
+  "SECRET_KEY = 'django-insecure-0123456789abcdef'",
+  "app.encryption_key: 0123456789abcdef",
+]
+negative = ["SECRET_KEY_FILE=/run/secrets/app", "PUBLIC_KEY=0123456789abcdef", "SECRET_KEY="]
+
+# The catch-all. `token` is in the alternation deliberately: without it an
+# assignment to a bare `*_TOKEN` variable -- the shape Linode, Vercel,
+# Postmark, Doppler and most one-off CI credentials take -- is covered by
+# nothing at all, because their values carry no recognisable prefix.
+[[rule]]
+name = "generic-secret-assignment"
+kind = "generic"
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token)\b["'\s]*[:=]\s*["']?(?P<value>[^\s"';,)]{8,})'''
+prefixes = [
+  "password",
+  "passwd",
+  "secret",
+  "apikey",
+  "api_key",
+  "api-key",
+  "accesstoken",
+  "access_token",
+  "access-token",
+  "authtoken",
+  "auth_token",
+  "auth-token",
+]
+positive = [
+  "export DB_PASSWORD=hunter2hunter2",
+  "api_key: 's3cr3t-value'",
+  "LINODE_TOKEN=0123456789abcdef0123456789abcdef",
+]
+negative = ["password: short", "PASSWORD_FILE_PATH", "token = 1234"]
+
+# --------------------------------------------------------- the group-3 walk
+#
+# Providers with no dedicated rule above, walked one by one and left to the
+# two generic rules deliberately: Bitbucket, Azure, Linode, Vercel, Netlify,
+# Heroku, Turso, Twilio, Square, PayPal, Auth0, Clerk, Firebase, WorkOS,
+# Postmark, Doppler, Mistral, Cohere, Together, DeepSeek, Azure OpenAI,
+# ElevenLabs, Deepgram, AssemblyAI, Weights & Biases, Cerebras, LangSmith,
+# Voyage, Modal, AI21.
+#
+# None of them was given a shape-keyed rule, because none of their token
+# formats can be cited from a primary source here, and a rule whose only
+# evidence is the example written beside it proves the regex is
+# self-consistent rather than that it matches a real credential.
+#
+# The walk was mechanical: each provider's canonical environment-variable
+# name was run against `generic-secret-assignment`. All of them are reached
+# except the `*_KEY` shape, which is why `secret-key-assignment` exists.
+# One residual is left knowingly: `MODAL_TOKEN_ID` is reached by nothing,
+# because `token` there is followed by `_ID` and the rule needs a word
+# boundary. That value is an identifier, not the credential -- Modal's
+# secret half is `MODAL_TOKEN_SECRET`, which is covered.
+#
+# Everything these two rules catch is reported as `[REDACTED:generic]`, not
+# by provider name. A value pasted with no label at all is not redacted.
