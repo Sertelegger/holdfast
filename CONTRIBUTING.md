@@ -33,8 +33,7 @@ CLI are later milestones.
 
 ## The checks
 
-All four must pass before a change is ready. There is no CI yet, so running
-them locally is the whole gate.
+All four must pass before a change is ready.
 
 ```bash
 cargo fmt --all --check
@@ -43,10 +42,18 @@ cargo test --workspace --no-fail-fast
 cargo build --workspace && ./scripts/mcp-smoke.sh
 ```
 
-`cargo test --workspace` is 272 tests today: 189 unit, 19 in
+CI runs all four on every push and pull request (see
+[README.md](./README.md#continuous-integration)), but **it cannot block a
+merge**: required status checks need branch protection or a ruleset, and both
+are gated to public repositories on GitHub Free. Until this repository goes
+public, running these locally is still the actual gate and a red job is
+something a human has to notice.
+
+`cargo test --workspace` is 279 tests today: 194 unit, 21 in
 `tests/detection.rs`, 35 in `tests/integration.rs`, 29 in `tests/schema.rs`.
-Many of them spawn real PTYs and real shells, so they are not hermetic and they
-are not fast.
+Treat those numbers as a tripwire for "a suite stopped being compiled" rather
+than as a contract. Many of the tests spawn real PTYs and real shells, so they
+are not hermetic and they are not fast.
 
 `scripts/mcp-smoke.sh` (30 checks) is **the only thing that drives the real
 JSON-RPC surface**. Every Rust test asserts against in-process objects, so a
