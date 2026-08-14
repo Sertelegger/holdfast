@@ -5,6 +5,8 @@
 //! `status`, and `list_sessions` all report the same fields, and a tool
 //! that quietly stopped reporting them would be a silent regression.
 
+use crate::output::redact::redact_str;
+use crate::output::rules::RuleSet;
 use crate::session::Session;
 use serde_json::{json, Value};
 
@@ -25,7 +27,24 @@ fn round3(x: f32) -> f64 {
 ///
 /// The enums are siblings of `prompt`, not nested inside it: they describe
 /// the session, not the heuristic (§5.4).
-pub fn with_detection(mut data: Value, session: &Session) -> Value {
+///
+/// **`last_line` is redacted here, at the one builder, and that is what
+/// makes REQ-T-011 hold everywhere at once.** This helper serves every
+/// prompt-bearing response, so redacting at a call site instead would
+/// leave the other four leaking — and the last line of output is where a
+/// secret the child just echoed lands.
+///
+/// `reason` is deliberately **not** redacted: it is CLASP's own
+/// branch-name vocabulary from §8.3's ladder (`"bracketed paste off"` and
+/// friends), never child output, so it cannot carry a secret. Running the
+/// redactor over a fixed vocabulary only creates a way for a rule change
+/// to corrupt an enum.
+///
+/// `title` is not redacted here either, and that is a scope statement
+/// rather than an oversight: §9.2 lists it, but it arrives from OSC 0/2
+/// in 0.0.4's `ScreenTracker` and is `None` on every response this
+/// milestone can produce. 0.0.4 owns that call site.
+pub fn with_detection(mut data: Value, session: &Session, rules: &RuleSet) -> Value {
     let d = session.detection();
     let Some(map) = data.as_object_mut() else {
         return data;
@@ -45,7 +64,7 @@ pub fn with_detection(mut data: Value, session: &Session) -> Value {
             "pattern_score": round3(d.pattern_score),
             "cursor_score": round3(d.cursor_score),
             "reason": d.reason,
-            "last_line": d.last_line,
+            "last_line": redact_str(rules, &d.last_line),
         }),
     );
     data
@@ -100,6 +119,11 @@ mod tests {
             .collect()
     }
 
+    /// The built-in rule set, which is what production passes.
+    fn rules() -> Arc<crate::output::rules::RuleSet> {
+        crate::output::rules::builtin_shared()
+    }
+
     fn set<'a>(names: &[&'a str]) -> BTreeSet<&'a str> {
         names.iter().copied().collect()
     }
@@ -120,7 +144,7 @@ mod tests {
     #[test]
     fn every_documented_field_is_present() {
         let (s, _pty) = session_with_output(b"\x1b[?2004h\x1b]0;build\x07bash-5.3$ ", "bash-5.3$ ");
-        let v = with_detection(json!({ "output": "" }), &s);
+        let v = with_detection(json!({ "output": "" }), &s, &rules());
 
         assert_eq!(v["output"], "");
         assert_eq!(v["interaction_mode"], "AtPrompt");
@@ -140,10 +164,27 @@ mod tests {
         assert_eq!(v["prompt"]["last_line"], "bash-5.3$ ");
     }
 
+    /// REQ-T-011 at the builder. Its paired negative is
+    /// `every_documented_field_is_present`, which pins an ordinary
+    /// `last_line` byte-identical — without that, a `last_line` replaced
+    /// by a constant marker would satisfy this test.
+    #[test]
+    fn a_secret_on_the_last_line_is_redacted_before_any_tool_sees_it() {
+        let secret = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        let line = format!("TOKEN={secret}");
+        let (s, _pty) = session_with_output(line.as_bytes(), &line);
+        let v = with_detection(json!({}), &s, &rules());
+        assert_eq!(v["prompt"]["last_line"], "TOKEN=[REDACTED:github]");
+        assert!(
+            !v.to_string().contains(secret),
+            "the token survived somewhere in the block: {v}"
+        );
+    }
+
     #[test]
     fn scores_serialise_without_float_noise() {
         let (s, _pty) = session_with_output(b"\x1b[?2004h$ ", "$ ");
-        let v = with_detection(json!({}), &s);
+        let v = with_detection(json!({}), &s, &rules());
         assert_eq!(v["prompt"]["confidence"], 0.95);
         assert_eq!(
             serde_json::to_string(&v["prompt"]["confidence"]).unwrap(),
@@ -154,13 +195,16 @@ mod tests {
     #[test]
     fn a_session_with_no_title_reports_null() {
         let (s, _pty) = session_with_output(b"$ ", "$ ");
-        assert_eq!(with_detection(json!({}), &s)["title"], Value::Null);
+        assert_eq!(
+            with_detection(json!({}), &s, &rules())["title"],
+            Value::Null
+        );
     }
 
     #[test]
     fn a_non_object_payload_is_returned_unchanged() {
         let (s, _pty) = session_with_output(b"$ ", "$ ");
-        assert_eq!(with_detection(json!("plain"), &s), json!("plain"));
+        assert_eq!(with_detection(json!("plain"), &s, &rules()), json!("plain"));
     }
 
     #[test]
@@ -182,7 +226,7 @@ mod tests {
             d.last_line == ">>> " && d.quiescent_score >= 1.0
         });
 
-        let v = with_detection(json!({}), &s);
+        let v = with_detection(json!({}), &s, &rules());
 
         assert_eq!(v["interaction_mode"], "AtPrompt");
         assert_eq!(v["detection_tier"], "terminal_mode");
@@ -207,7 +251,7 @@ mod tests {
         // wants the key present and null, and 0.0.2's `outputSchema` work
         // makes the difference load-bearing.
         let (s, _pty) = session_with_output(b"$ ", "$ ");
-        let v = with_detection(json!({}), &s);
+        let v = with_detection(json!({}), &s, &rules());
         let map = v.as_object().expect("payload stays an object");
         assert!(
             map.contains_key("title"),
@@ -234,7 +278,7 @@ mod tests {
         // The payload starts non-empty so the assertion also proves the
         // block is *added to* the caller's data rather than replacing it.
         let (s, _pty) = session_with_output(b"\x1b[?2004h\x1b]0;t\x07$ ", "$ ");
-        let v = with_detection(json!({ "output": "", "cursor": 0 }), &s);
+        let v = with_detection(json!({ "output": "", "cursor": 0 }), &s, &rules());
 
         assert_eq!(
             key_set(&v),

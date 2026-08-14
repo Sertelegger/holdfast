@@ -102,7 +102,19 @@ pub struct Session {
     /// difference is the contract.
     redaction_stats: Mutex<BTreeMap<String, u64>>,
     last_activity_ms: Arc<AtomicI64>,
+    /// Unix seconds at which the exit was *first observed*, 0 while alive.
+    /// Observation time, not the child's true death instant: nothing in
+    /// the tree can see the latter, and a field that implies it would be
+    /// a more precise lie than no field at all.
+    exited_at_secs: Arc<AtomicI64>,
     pub created_at: std::time::SystemTime,
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn now_ms() -> i64 {
@@ -141,6 +153,7 @@ impl Session {
             state: Mutex::new(SessionState::Running),
             redaction_stats: Mutex::new(BTreeMap::new()),
             last_activity_ms: Arc::clone(&last_activity_ms),
+            exited_at_secs: Arc::new(AtomicI64::new(0)),
             created_at: std::time::SystemTime::now(),
         });
 
@@ -324,6 +337,17 @@ impl Session {
         // if nothing has read since.
         if !self.backend.is_alive() {
             let code = self.backend.exit_code().unwrap_or(-1);
+            // Latched with `compare_exchange`, not stored: `state()` runs
+            // on every response and several of them run concurrently, so a
+            // plain store would move the reported instant forward on every
+            // call — a timestamp that drifts is worse than none, and a
+            // single-read test cannot see it.
+            let _ = self.exited_at_secs.compare_exchange(
+                0,
+                now_secs(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             let mut s = self.state.lock();
             if matches!(*s, SessionState::Starting | SessionState::Running) {
                 *s = SessionState::Exited(code);
@@ -343,6 +367,18 @@ impl Session {
 
     pub fn pid(&self) -> Option<u32> {
         self.backend.pid()
+    }
+
+    /// Unix seconds at which this session's exit was first observed
+    /// (§5.2's `exited_at_unix_secs`), or `None` while it is alive.
+    ///
+    /// Observed, not latched by the reaper: the value is written by the
+    /// first `state()` call that finds the child gone.
+    pub fn exited_at_secs(&self) -> Option<u64> {
+        match self.exited_at_secs.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(secs as u64),
+        }
     }
 
     pub fn last_activity_ms(&self) -> i64 {

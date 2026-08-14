@@ -2728,3 +2728,254 @@ async fn a_child_that_really_exits_1_is_reported_the_same_way() {
 
     kill_all(&server).await;
 }
+
+// ------------------------------------------- REQ-T-011, Step 5c
+// `status` and `list_sessions` shipped `command`, `args` and
+// `prompt.last_line` unredacted through 0.0.2. This milestone builds the
+// redactor, so this is where they stop.
+
+/// A live AWS-shaped key. Split so the constant itself is not the string
+/// the assertions look for; only the concatenation is.
+fn aws_key() -> String {
+    format!("AKIA{}", "IOSFODNN7EXAMPLE")
+}
+
+async fn status_data(server: &ClaspServer, id: &str) -> Value {
+    let r = server
+        .status(Parameters(StatusArgs {
+            session: id.to_string(),
+        }))
+        .await
+        .expect("status must not be a protocol error");
+    body(&r)["data"].clone()
+}
+
+#[tokio::test]
+async fn status_redacts_the_command_that_started_the_session() {
+    let server = ClaspServer::new();
+    let key = aws_key();
+    let started = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: vec![
+                "--norc".into(),
+                "--noprofile".into(),
+                "-c".into(),
+                format!("sleep 30 # {key}"),
+            ],
+            shell_integration: Some(false),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let id = body(&started)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let data = status_data(&server, &id).await;
+    let args = data["args"].as_array().unwrap();
+    let joined = args
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !joined.contains(&key),
+        "status handed the credential back: {joined}"
+    );
+    // `aws`, not `aws-access-key-id`: the marker carries the rule's
+    // `kind`, and the `aws-access-key-id` rule's kind is `aws` — one kind
+    // covers the access-key and secret-key rules both, so the agent is
+    // told what class of credential was withheld rather than which regex
+    // caught it.
+    assert!(
+        joined.contains("[REDACTED:aws]"),
+        "expected a marker naming the kind that fired: {joined}"
+    );
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn status_leaves_an_ordinary_command_byte_identical() {
+    // The negative half. Without it, replacing `redact_str` with a
+    // function that returns `"[REDACTED]"` unconditionally passes the
+    // test above.
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+
+    let data = status_data(&server, &id).await;
+    assert_eq!(data["command"], json!("bash"));
+    assert_eq!(data["args"], json!(["--norc", "--noprofile"]));
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn list_sessions_redacts_args_element_wise() {
+    // Joining `args` before redacting would hide the secret *and* return
+    // one string where the agent expects an array, so the shape assertion
+    // is what separates the two implementations.
+    let server = ClaspServer::new();
+    let token = format!("ghp_{TOKEN_TAIL}");
+    let started = server
+        .start_session(Parameters(StartSessionArgs {
+            command: "bash".into(),
+            args: vec![
+                "--norc".into(),
+                "--noprofile".into(),
+                "-c".into(),
+                format!("sleep 30 # --token {token} --verbose"),
+            ],
+            shell_integration: Some(false),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let id = body(&started)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let r = server.list_sessions().await.unwrap();
+    let sessions = body(&r)["data"]["sessions"].as_array().unwrap().clone();
+    let entry = sessions
+        .iter()
+        .find(|s| s["id"] == json!(id))
+        .expect("the session we just started");
+    let args = entry["args"].as_array().expect("args is still an array");
+    assert_eq!(args.len(), 4, "element-wise redaction preserves the shape");
+    assert_eq!(args[0], json!("--norc"));
+    assert_eq!(args[1], json!("--noprofile"));
+    assert_eq!(args[2], json!("-c"));
+    let script = args[3].as_str().unwrap();
+    assert!(!script.contains(&token), "the token survived: {script}");
+    assert!(
+        script.contains("[REDACTED:github]") && script.contains("--verbose"),
+        "the surrounding argument text must survive: {script}"
+    );
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn prompt_last_line_is_redacted_on_every_prompt_bearing_tool() {
+    // Redacting at one call site instead of inside `with_detection`
+    // passes a single-tool version of this test with three surfaces
+    // still leaking, which is why all four are driven here.
+    let server = ClaspServer::new();
+    let id = started_session(&server).await;
+    let session = server.registry.get(&id).unwrap();
+    let full_token = format!("ghp_{TOKEN_TAIL}");
+
+    // Printed WITHOUT a trailing newline, so it stays the last line.
+    session
+        .write_input(format!("printf 'CLASP''_LAST=%s%s' ghp_ {TOKEN_TAIL}\n").as_bytes())
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let last = status_data(&server, &id).await["prompt"]["last_line"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        if last.contains("CLASP_LAST=") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the shell never printed the line: {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let read = body(
+        &server
+            .read_output(Parameters(read_args(&id)))
+            .await
+            .unwrap(),
+    );
+    let sent = body(
+        &server
+            .send_input(Parameters(SendInputArgs {
+                session: id.clone(),
+                data: String::new(),
+                append_newline: Some(false),
+            }))
+            .await
+            .unwrap(),
+    );
+    let stat = status_data(&server, &id).await;
+    let listed = body(&server.list_sessions().await.unwrap())["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == json!(id))
+        .expect("the session")
+        .clone();
+
+    for (tool, line) in [
+        ("read_output", read["data"]["prompt"]["last_line"].clone()),
+        ("send_input", sent["data"]["prompt"]["last_line"].clone()),
+        ("status", stat["prompt"]["last_line"].clone()),
+        ("list_sessions", listed["prompt"]["last_line"].clone()),
+    ] {
+        let line = line.as_str().unwrap_or_default().to_string();
+        assert!(
+            !line.contains(&full_token),
+            "{tool} leaked the token in prompt.last_line: {line:?}"
+        );
+        // Paired: the line itself must still be there, or a tool that
+        // reported an empty `last_line` would pass the absence check.
+        assert!(
+            line.contains("CLASP_LAST=[REDACTED:github]"),
+            "{tool} lost the line instead of redacting it: {line:?}"
+        );
+    }
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn exited_at_is_absent_while_the_child_lives_and_set_once_after_it_dies() {
+    let server = ClaspServer::new();
+    let id = started_session(&server).await;
+
+    let alive = status_data(&server, &id).await;
+    assert_eq!(
+        alive["exited_at_unix_secs"],
+        Value::Null,
+        "a live session has no exit time"
+    );
+    let started_at = alive["started_at_unix_secs"].as_u64().unwrap();
+
+    let session = server.registry.get(&id).unwrap();
+    let _ = session.signal(Signal::Kill);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.is_alive() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let first = status_data(&server, &id).await;
+    let at = first["exited_at_unix_secs"]
+        .as_u64()
+        .expect("an exited session reports when that was observed");
+    assert!(
+        at >= started_at,
+        "the exit cannot precede the start: {at} < {started_at}"
+    );
+
+    // Latched, not restamped. A plain `store` passes a single read and
+    // drifts on the second, which is the whole reason this reads twice
+    // with a second of real time in between.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let second = status_data(&server, &id).await;
+    assert_eq!(
+        second["exited_at_unix_secs"],
+        json!(at),
+        "the observation instant must not move on later reads"
+    );
+
+    kill_all(&server).await;
+}

@@ -164,7 +164,9 @@ pub struct Prompt {
     pub cursor_score: f64,
     /// Which branch of the §8.3 ladder answered, in words.
     pub reason: String,
-    /// Last logical line of output, escape-free. Unredacted until 0.0.3.
+    /// Last logical line of output, escape-free, and **redacted**
+    /// (§9.2, REQ-T-011) — it is the line a child that just echoed a
+    /// secret puts it on.
     pub last_line: String,
 }
 
@@ -235,6 +237,8 @@ pub struct SendInput {
 pub struct Terminate {
     pub exit_code: Option<i32>,
     pub already_exited: Option<bool>,
+    /// Unix seconds at which the exit was first observed (§5.2).
+    pub exited_at_unix_secs: Option<u64>,
 }
 
 /// Ring-buffer extent for one session.
@@ -256,6 +260,9 @@ pub struct SessionRecord {
     pub state: Option<SessionState>,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
+    /// Unix seconds at which the exit was first *observed*, absent while
+    /// the session is alive (§5.2). Named for its unit per REQ-T-018.
+    pub exited_at_unix_secs: Option<u64>,
     pub shell_integration: Option<ShellIntegration>,
     /// Whose markers the session is using (§8.5.1). Null until the first
     /// marker arrives.

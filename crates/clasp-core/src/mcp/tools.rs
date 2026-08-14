@@ -9,6 +9,8 @@ use crate::detect::{
 };
 use crate::output::ansi::AnsiMode;
 use crate::output::encoding::TextEncoding;
+use crate::output::redact::redact_str;
+use crate::output::rules::RuleSet;
 use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::session::{new_session_id, Session, SessionConfig};
@@ -460,6 +462,7 @@ impl ClaspServer {
                     "exit_code": session.exit_code(),
                 }),
                 &session,
+                &self.processor.rules,
             ),
             format!("{} bytes", read.bytes_returned),
         ))
@@ -579,6 +582,7 @@ impl ClaspServer {
             detection::with_detection(
                 json!({ "bytes_written": written, "warning": warning }),
                 &session,
+                &self.processor.rules,
             ),
             format!("wrote {written} bytes"),
         ))
@@ -608,7 +612,11 @@ impl ClaspServer {
         // cached exit info rather than an error.
         if !session.is_alive() {
             return Ok(envelope::ok(
-                json!({ "exit_code": session.exit_code(), "already_exited": true }),
+                json!({
+                    "exit_code": session.exit_code(),
+                    "already_exited": true,
+                    "exited_at_unix_secs": session.exited_at_secs(),
+                }),
                 "session had already exited",
             ));
         }
@@ -639,7 +647,14 @@ impl ClaspServer {
         // second `terminate` a `session_not_found` error, which REQ-T-010
         // forbids.
         Ok(envelope::ok(
-            json!({ "exit_code": session.exit_code(), "already_exited": false }),
+            json!({
+                "exit_code": session.exit_code(),
+                "already_exited": false,
+                // Read *after* the kill and the reap sleep above, so the
+                // latch has been armed by the `state()`/`is_alive()` calls
+                // on the way through.
+                "exited_at_unix_secs": session.exited_at_secs(),
+            }),
             "terminated",
         ))
     }
@@ -663,7 +678,11 @@ impl ClaspServer {
             Err(e) => return envelope::from_error(&e),
         };
         Ok(envelope::ok(
-            detection::with_detection(session_record(&session), &session),
+            detection::with_detection(
+                session_record(&session, &self.processor.rules),
+                &session,
+                &self.processor.rules,
+            ),
             format!("status of {}", session.id),
         ))
     }
@@ -686,7 +705,13 @@ impl ClaspServer {
             .registry
             .all()
             .iter()
-            .map(|s| detection::with_detection(session_record(s), s))
+            .map(|s| {
+                detection::with_detection(
+                    session_record(s, &self.processor.rules),
+                    s,
+                    &self.processor.rules,
+                )
+            })
             .collect();
         let n = sessions.len();
         Ok(envelope::ok(
@@ -773,16 +798,36 @@ impl ClaspServer {
 
 /// The fields `status` and `list_sessions` share. Both are prompt-bearing
 /// responses (§5.4), so both pass the result through `with_detection`.
-fn session_record(session: &Session) -> serde_json::Value {
+///
+/// **One record, one builder, and it stays that way** (REQ-T-016):
+/// `schema::SessionRecord` is the advertised `outputSchema` for both
+/// tools, so a field emitted by only one of them is the
+/// declared-but-unemitted fault REQ-T-015 names.
+///
+/// It takes the rule set because REQ-T-011 makes `command` and `args`
+/// redacted surfaces: a session started as
+/// `aws --key AKIAIOSFODNN7EXAMPLE` would otherwise hand the credential
+/// back on every `status` call, and `list_sessions` would hand back
+/// every session's.
+fn session_record(session: &Session, rules: &RuleSet) -> serde_json::Value {
     let state = session.state();
     json!({
         "id": session.id,
         "name": session.name,
-        "command": session.command,
-        "args": session.args,
+        "command": redact_str(rules, &session.command),
+        // Element-wise, never joined: joining with a space and redacting
+        // the result would let a rule match across an argument boundary
+        // and return one string where the agent expects an array.
+        "args": session.args.iter().map(|a| redact_str(rules, a)).collect::<Vec<_>>(),
         "state": state.as_str(),
         "pid": session.pid(),
         "exit_code": session.exit_code(),
+        // §5.4 names this field and 0.0.1 left it out with a stated
+        // unblocker — "RFC-3339 needs a date crate that arrives in 0.0.3".
+        // The crate arrived; the format did not change with it. The tree's
+        // settled convention is an explicit `_unix_*` suffix (REQ-T-018),
+        // so the wire format cannot silently claim to be RFC 3339.
+        "exited_at_unix_secs": session.exited_at_secs(),
         "shell_integration": session.shell_integration.map(|s| s.as_str()),
         // What CLASP *injected* is the line above; this is what has since
         // been observed on the wire (§18.2a, §8.5.1). The two answer

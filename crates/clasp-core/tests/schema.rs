@@ -322,6 +322,7 @@ fn session_record_keys() -> BTreeSet<String> {
         "osc133_source",
         "command_count",
         "started_at_unix_secs",
+        "exited_at_unix_secs",
         "last_activity_unix_ms",
         "buffer",
         // The session's cumulative redaction tally (§9.2, REQ-O-012).
@@ -1219,7 +1220,7 @@ async fn terminate_responses_match_their_schema() {
     assert_eq!(payload["status"], "ok");
     assert_eq!(
         keys(&payload["data"]),
-        set(&["exit_code", "already_exited"])
+        set(&["exit_code", "already_exited", "exited_at_unix_secs"])
     );
     assert_eq!(payload["data"]["already_exited"], false);
 
