@@ -153,9 +153,22 @@ const HOST_DEPENDENT_ROWS: &[(&str, &[Need])] = &[
         "matrix_row_the_python_repl_is_at_prompt_with_no_repl_specific_config",
         &[Need::PyreplPython],
     ),
+    // Not in `ROWS_THAT_MAY_SKIP`, deliberately: `python3` is present on
+    // any host that runs the `getpass` row above, and `PYTHON_BASIC_REPL=1`
+    // makes the rows version-independent, so there is no host that can run
+    // this file at all and not run this row. The census is what keeps that
+    // honest.
+    (
+        "matrix_rows_7_and_7b_a_readline_repl_answers_the_same_either_way",
+        &[Need::Program("python3")],
+    ),
     ("matrix_row_a_pager_is_fullscreen", &[Need::Program("less")]),
     (
         "matrix_row_dash_degrades_silently_to_the_heuristic_tier",
+        &[Need::Program("dash")],
+    ),
+    (
+        "a_single_leaked_dollar_byte_is_indistinguishable_from_a_dash_prompt",
         &[Need::Program("dash")],
     ),
     (
@@ -1045,6 +1058,20 @@ struct EchoOffRow {
     /// readline shape, and no combination of these signals separates it
     /// from row 1.
     answer: (&'static str, &'static str, f64),
+    /// Whether the row is driven as the session's own command (`bash -c`)
+    /// or typed into an interactive shell.
+    ///
+    /// Row 3 needs the second: §8.7 row 8 is measured *in its realistic
+    /// arrangement* — `read` is a bash **builtin**, so the session has
+    /// always driven bracketed paste **and the shell keeps the foreground
+    /// group**, which is what puts the answer on the T2 executing rung
+    /// rather than on T3 even after rev. 37's scoping. Under `bash -c`
+    /// there is no bracketed-paste history at all and the same command
+    /// answers at `heuristic` — a neighbour of §8.7 row 8 rather than the
+    /// row itself.
+    interactive: bool,
+    /// The `Seen BrktPst` column, asserted from the raw stream.
+    seen_bracketed_paste: bool,
 }
 
 /// The `ECHO off` states a real PTY reaches, and what CLASP answers for
@@ -1071,12 +1098,16 @@ struct EchoOffRow {
 ///
 /// A line editor drops echo and *leaves* canonical mode because it draws
 /// the characters itself; a program that wants a whole secret line drops
-/// echo and *stays* canonical. `PtyBackend::echo_enabled` reports one bit
-/// of that, so rows 1 and 2 are the same session as far as the ladder can
-/// tell. Row 3 is the measured limit of the remedy rather than a case for
-/// it (REQ-PDS-003): `read -s -n 1` is a genuine secret prompt in the
-/// readline shape, because a single-character read leaves canonical mode
-/// by construction.
+/// echo and *stays* canonical. `PtyBackend::line_discipline` reports both
+/// bits from one `tcgetattr`, which is what lets rows 1 and 2 answer
+/// differently at all (REQ-PD-020).
+///
+/// Row 3 is the measured **limit** of the remedy rather than a case for it
+/// (REQ-PD-022): `read -s -n 1` is a genuine secret prompt in the readline
+/// shape, because a single-character read leaves canonical mode by
+/// construction, and no combination of the sampled signals separates it
+/// from row 1. It is driven interactively so that it is §8.7 row 8 rather
+/// than a neighbour of it — see `EchoOffRow::interactive`.
 #[tokio::test]
 async fn echo_off_prompts_with_and_without_canonical_mode() {
     const ROWS: &[EchoOffRow] = &[
@@ -1086,6 +1117,8 @@ async fn echo_off_prompts_with_and_without_canonical_mode() {
             last_line: ">>> ",
             canonical: Some(false),
             answer: ("AtPrompt", "heuristic", 0.9),
+            interactive: false,
+            seen_bracketed_paste: false,
         },
         EchoOffRow {
             what: "a secret prompt: echo off, canonical mode on",
@@ -1093,33 +1126,61 @@ async fn echo_off_prompts_with_and_without_canonical_mode() {
             last_line: "Password: ",
             canonical: Some(true),
             answer: ("AwaitingSecret", "terminal_mode", 0.95),
+            interactive: false,
+            seen_bracketed_paste: false,
         },
         EchoOffRow {
             what: "read -s -n 1: a secret prompt in the readline shape",
+            // §8.7 row 8, in the arrangement §8.7 measures it in.
+            //
             // Measured out of band: `ECHO off / ICANON off`. `read` sets
             // the state itself, so the session cannot dump `stty -a`
             // without putting it on the line the row settles on.
             //
-            // The tier here is `heuristic` and §8.7 row 8 records
-            // `terminal_mode`, and the difference is the *arrangement*
-            // rather than the ladder: this row is driven with `bash -c`,
-            // which never enters readline and so never drives bracketed
-            // paste, while §8.7 row 8 is a builtin inside an interactive
-            // shell that has. `Key: ` scores 0 on the T3 table, so both
-            // arrangements report `Executing` at 0.00 and only the tier
-            // separates them. Driving it interactively — which is what
-            // makes this row assert §8.7 row 8 rather than a neighbour of
-            // it — is the outstanding half.
+            // **Rev. 37's scoping does not rescue this row, and that is
+            // the point of driving it here rather than under `bash -c`.**
+            // `read` is a bash **builtin**: it forks nothing, so the shell
+            // keeps the foreground process group, owner == holder, and the
+            // T2 executing rung's premise — *this program signals its
+            // prompts with bracketed paste, and it is off* — really does
+            // hold. The false negative therefore belongs to the **echo
+            // rung**, not to availability, and narrowing availability
+            // further would not touch it. §8.4 tells the agent
+            // `Executing` at `terminal_mode` is deterministic and means
+            // wait, so the agent waits at a prompt that cannot proceed
+            // without a secret.
+            //
+            // `Key: ` scores 0 on the T3 table, so this row and its
+            // `bash -c` neighbour both report `Executing` at 0.00 and the
+            // **tier** is the only field that tells them apart — which is
+            // why `interactive` and `seen_bracketed_paste` are fields
+            // rather than a comment.
             command: "read -s -n 1 -p 'Key: ' k",
             last_line: "Key: ",
             canonical: None,
-            answer: ("Executing", "heuristic", 0.0),
+            answer: ("Executing", "terminal_mode", 0.0),
+            interactive: true,
+            seen_bracketed_paste: true,
         },
     ];
 
     for row in ROWS {
         let server = ClaspServer::new();
-        let id = start(&server, bash_c(row.command)).await;
+        let id = if row.interactive {
+            let id = start(
+                &server,
+                StartSessionArgs {
+                    shell_integration: Some(false),
+                    ..bash()
+                },
+            )
+            .await;
+            await_mode(&server, &id, "AtPrompt").await;
+            send(&server, &id, row.command).await;
+            id
+        } else {
+            start(&server, bash_c(row.command)).await
+        };
 
         let s = await_settled(&server, &id, row.last_line).await;
         let (mode, tier, confidence) = row.answer;
@@ -1128,10 +1189,12 @@ async fn echo_off_prompts_with_and_without_canonical_mode() {
         assert_eq!(s["prompt"]["confidence"], confidence, "{}: {s}", row.what);
 
         let raw = raw(&server, &id).await;
-        // No bracketed paste anywhere, which is what puts these rows on
-        // the echo rung at all: with the paste on, the rung above answers
-        // first and none of this is reachable (§8.3, §8.7 finding 1).
-        assert_history(&raw, false, false);
+        // The `Seen BrktPst` column. False for rows 1 and 2, which is what
+        // puts them on the echo rung at all — with the paste on, the rung
+        // above answers first and neither is reachable (§8.3, §8.7
+        // finding 1). True for row 3, which is what puts *it* on the T2
+        // executing rung once the echo rung has declined it.
+        assert_history(&raw, row.seen_bracketed_paste, false);
         if let Some(canonical) = row.canonical {
             // The premise, read off the session's own `stty -a` rather
             // than assumed. Without it a mistyped `stty` argument turns
@@ -1220,6 +1283,107 @@ async fn matrix_row_the_python_repl_is_at_prompt_with_no_repl_specific_config() 
     assert_history(&raw, true, false);
     assert!(!raw.contains("\x1b]133;"), "the REPL emitted OSC 133");
     kill(&server, &id).await;
+}
+
+/// §8.7 rows 7 and 7b, at a real PTY, on any supported interpreter.
+///
+/// **Version-independent by construction (REQ-TST-007).**
+/// `PYTHON_BASIC_REPL=1` selects the pre-PyREPL readline REPL on 3.13 and
+/// 3.14; measured on both, it reproduces CPython 3.12's shape —
+/// `ECHO off / ICANON off`, bracketed paste **off** — byte for byte. A
+/// test that spawns `python3` and hopes is a test whose outcome depends on
+/// an undeclared interpreter version, which is how this defect reached CI
+/// as a *test* failure on three runner VMs while passing on the author's
+/// machine.
+///
+/// **The premise is asserted, not assumed.** Whether a readline build
+/// drives bracketed paste is a property of that build and of `inputrc`, so
+/// the `assert_history` calls are what make a host on which the premise
+/// fails go red with the reason rather than silently measure another row.
+///
+/// **The two must agree, and the equality is asserted alongside the values
+/// rather than instead of them** — an equality assertion alone passes if
+/// both regress together (REQ-PD-024). The agreement is the acceptance
+/// criterion for rev. 37, not an incidental result: rows 7 and 7b are the
+/// same program at the same prompt, sampled identically on every signal,
+/// and a rule under which they disagree is reading the session's history
+/// where the premise names a program.
+#[tokio::test]
+async fn matrix_rows_7_and_7b_a_readline_repl_answers_the_same_either_way() {
+    if !have(Need::Program("python3")) {
+        eprintln!("skipping: python3 not installed");
+        return;
+    }
+    let server = ClaspServer::new();
+    let mut env = term().unwrap_or_default();
+    env.insert("PYTHON_BASIC_REPL".into(), "1".into());
+
+    // Row 7 — the session *is* the REPL. Nothing has ever driven the paste.
+    let own = start(
+        &server,
+        StartSessionArgs {
+            command: "python3".into(),
+            args: vec!["-q".into()],
+            env: Some(env.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let a = await_settled(&server, &own, ">>> ").await;
+    assert_history(&raw(&server, &own).await, false, false);
+    assert_classified(&a, "AtPrompt", "heuristic", 0.9);
+    kill(&server, &own).await;
+
+    // Row 7b — the same interpreter at the same prompt, launched from a
+    // bash session that has already driven the paste. Before rev. 37 this
+    // answered `Executing` / `terminal_mode` / 0.00 and §8.4 told the
+    // agent to wait, at a live prompt, forever.
+    //
+    // The leading `sleep 1` is the same guard
+    // `matrix_row_a_running_external_command_is_executing_via_the_heuristic`
+    // documents and is here for the same measured reason: the owner of an
+    // availability record is sampled when the reader *processes* the chunk
+    // carrying the signal, not when the shell wrote it, so a delayed
+    // reader can record the launched program as the owner of the shell's
+    // own bracketed paste and hand it back the licence rev. 37 withholds.
+    // An external command in between makes the recorded owner either the
+    // shell's group or `sleep`'s, both of which differ from the REPL's.
+    // It changes nothing this row is about: bash still drove the paste,
+    // and the REPL still drives none.
+    let launched = start(
+        &server,
+        StartSessionArgs {
+            shell_integration: Some(false),
+            ..bash()
+        },
+    )
+    .await;
+    await_mode(&server, &launched, "AtPrompt").await;
+    send(
+        &server,
+        &launched,
+        "sleep 1; PYTHON_BASIC_REPL=1 python3 -q",
+    )
+    .await;
+    let b = await_settled(&server, &launched, ">>> ").await;
+    assert_history(&raw(&server, &launched).await, true, false);
+    assert_classified(&b, "AtPrompt", "heuristic", 0.9);
+    kill(&server, &launched).await;
+
+    assert_eq!(
+        (
+            &a["interaction_mode"],
+            &a["detection_tier"],
+            &a["prompt"]["confidence"]
+        ),
+        (
+            &b["interaction_mode"],
+            &b["detection_tier"],
+            &b["prompt"]["confidence"]
+        ),
+        "rows 7 and 7b must answer identically — the same program at the \
+         same prompt"
+    );
 }
 
 #[tokio::test]
@@ -1944,6 +2108,102 @@ async fn printed_number(server: &ClaspServer, id: &str, marker: &str) -> String 
 // ---------------------------------------------------------------------
 // Documented limitations
 // ---------------------------------------------------------------------
+
+/// REQ-PD-014 / §8.8 / §11.4 — **one leaked byte is a prompt**, asserted
+/// at its concrete score rather than described.
+///
+/// §8.6 has rows that fire on a *single trailing character* (`$`, `#`,
+/// `%`, `>`) at 0.5–0.6, so a hostile or merely careless program needs one
+/// `$` at the end of its tail line to reach `confidence >= 0.5` at full
+/// quiescence, which §8.6 maps to `interaction_mode: AtPrompt`. That is the
+/// whole cost of the attack: no convincing prompt string, and — the second
+/// variant below — not even a well-formed escape sequence.
+///
+/// **This asserts an accepted risk, not a bug.** The rows stay because a
+/// `dash` session has nothing else, and the mitigation is the one already
+/// in place: the answer is labelled `detection_tier: "heuristic"` and §8.4
+/// tells the agent to treat it as a guess. The fix would be to stop
+/// recognising `dash` prompts at all. What must not happen is the residual
+/// changing without anyone noticing, which is what this row is for.
+///
+/// **The genuine prompt is asserted in the same session, and that is the
+/// point of the row rather than a bonus.** Read as "forged prompts are
+/// detected", this row would say the opposite of what it measures: they are
+/// **not** distinguished. A test asserting a *lower* score for the forgery
+/// would be asserting a discrimination the system does not have. So the
+/// pairing is an equality — the same session, at its real `$ ` prompt and
+/// at a line of output, scoring identically — and it is what proves a
+/// later "hardening" of the `$` head guard did not buy its narrowing at
+/// the cost of every real `dash` prompt. `matrix_row_dash_degrades_
+/// silently_to_the_heuristic_tier` asserts the real-prompt half's absolute
+/// values; this asserts that the forgery cannot be told from it.
+///
+/// **`confidence` is deliberately an inequality.** It is
+/// `quiescent_score * max(pattern_score, cursor_score)` (REQ-PD-008), so
+/// pinning the product would make this row fail whenever the settle window
+/// is retuned. `pattern_score` is the fact the requirement is about and is
+/// pinned exactly; `confidence >= 0.5` is how §20.10 words the consequence.
+#[tokio::test]
+async fn a_single_leaked_dollar_byte_is_indistinguishable_from_a_dash_prompt() {
+    if !have(Need::Program("dash")) {
+        eprintln!("skipping: dash not installed");
+        return;
+    }
+    for (what, command, forged_line) in [
+        (
+            // §11.4's plain `\r$ ` — output, not a prompt.
+            "a carriage return and a trailing $",
+            r"printf '\rCLASP''_OUTPUT: $ '; sleep 30",
+            "CLASP_OUTPUT: $ ",
+        ),
+        (
+            // §11.4's malformed carrier. `\030` is CAN, which abandons the
+            // CSI in progress (the scanner resynchronises on it exactly as
+            // xterm and VTE do), so the sequence never terminates properly
+            // and its surviving remainder is handed back as text. §8.8:
+            // "it does not require the escape to be well-formed".
+            "a malformed escape whose surviving remainder ends in $",
+            r"printf 'CLASP''_ESC \033[1;32\030$ '; sleep 30",
+            "CLASP_ESC $ ",
+        ),
+    ] {
+        let server = ClaspServer::new();
+        let id = start(&server, program("dash", &[])).await;
+
+        // Half 1 — the real thing. `dash` drives no terminal mode, so this
+        // is a T3 answer about a genuine live prompt.
+        let genuine = await_settled(&server, &id, "$ ").await;
+        assert_classified(&genuine, "AtPrompt", "heuristic", 0.6);
+        assert_eq!(genuine["prompt"]["pattern_score"], 0.6, "{what}");
+
+        // Half 2 — a running command's output, ending in one `$`. The
+        // `sleep 30` keeps the shell busy so `dash` cannot redraw its
+        // prompt, which is what makes this sample the forgery rather than
+        // the prompt again; and `CLASP''_OUTPUT` echoes with the quotes and
+        // *prints* without them, so the line cannot come from the PTY
+        // echoing the command back.
+        send(&server, &id, command).await;
+        let forged = await_settled(&server, &id, forged_line).await;
+        assert_eq!(forged["prompt"]["pattern_score"], 0.6, "{what}: {forged}");
+        assert_eq!(forged["interaction_mode"], "AtPrompt", "{what}: {forged}");
+        assert_eq!(forged["detection_tier"], "heuristic", "{what}: {forged}");
+        assert!(
+            forged["prompt"]["confidence"].as_f64().unwrap_or(0.0) >= 0.5,
+            "{what}: one leaked byte no longer reaches the AtPrompt \
+             threshold — the accepted residual moved: {forged}"
+        );
+
+        // The pairing, and the claim the row is actually making.
+        assert_eq!(
+            forged["prompt"]["pattern_score"], genuine["prompt"]["pattern_score"],
+            "{what}: the forgery and a real `dash` prompt must score the \
+             same — they are not distinguished, and a row asserting \
+             otherwise would be asserting a discrimination §8.6 does not \
+             have"
+        );
+        kill(&server, &id).await;
+    }
+}
 
 #[tokio::test]
 async fn a_program_that_fakes_bracketed_paste_fools_tier_2() {
