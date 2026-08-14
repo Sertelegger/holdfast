@@ -198,19 +198,24 @@ impl PromptDetector {
         //   `dash` has a perfectly readable `ECHO` and it is *on* at a
         //   `dash` prompt, so a T2 answer there would be actively wrong.
         //
-        // **Four instances of one cause, and scope is the fix for the
-        // cause.** Through rev. 27 this read `saw_bracketed_paste ||
-        // saw_alt_screen`, and one alt-screen toggle marked a session
-        // T2-available for life — the executing rung then answered
-        // `Executing` at every later live prompt of a shell driving no
-        // terminal modes at all, with `pattern_score: 0.60` contradicting
-        // it in the same payload and §8.4 telling the agent to wait.
-        // Rev. 28 narrowed the *signal list* and the identical failure
+        // **Three instances of one cause, and scope is the fix for the
+        // cause.** The count is three — §8.3's, and this comment said
+        // *four* while enumerating the same three, which is the discrepancy
+        // rev. 42 asked to be settled. Through rev. 27 this read
+        // `saw_bracketed_paste || saw_alt_screen`, and one alt-screen toggle
+        // marked a session T2-available for life — the executing rung then
+        // answered `Executing` at every later live prompt of a shell driving
+        // no terminal modes at all, with `pattern_score: 0.60` contradicting
+        // it in the same payload and §8.4 telling the agent to wait. That is
+        // one. Rev. 28 narrowed the *signal list* and the identical failure
         // re-entered through the one signal it had just finished arguing
-        // was legitimate (§8.7 row 7b), and again through `saw_osc133`.
+        // was legitimate (§8.7 row 7b) — two — and `saw_osc133` was found
+        // unpinned in the T1 dimension by the 0.0.2 final review — three.
         // Each was treated as a defect in one flag. It was not: the defect
         // is that the licence outlived its subject. Narrowing the list a
-        // fourth time would have been the same move a fourth time.
+        // **fourth** time would have been the same move a fourth time, and
+        // the fourth instance would have arrived through whichever signal
+        // is added next.
         //
         // **Both executing rungs are scoped by the one rule**, because
         // both have the same shape. The T2 rung infers *prompt mode is
@@ -464,13 +469,26 @@ mod tests {
         assert_eq!(s.confidence, 0.95);
     }
 
+    /// §8.7 row 2 — `sleep 2`, at rev. 37's values.
+    ///
+    /// **Flipped, not relaxed.** Through rev. 36 this row answered
+    /// `Executing` / `terminal_mode` / 0.00 and the fixture passed `None`
+    /// for both the owner and the holder, which is the *unknown* arm —
+    /// correct under the old rule and blind to the new one. bash drove the
+    /// paste; `sleep` is its own process group and holds the terminal, so
+    /// the licence bash earned says nothing about it and the answer is a
+    /// guess. Same mode, same action for the agent, honest tier.
+    ///
+    /// `Some(100)` / `Some(200)` are the measured shape of that transition
+    /// (a real bash launching an external command was sampled at
+    /// `3708113 → 3708114`); the values themselves only have to differ.
     #[test]
     fn matrix_during_a_running_command() {
         let (mut d, start, now) = detector();
-        feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lsleep 2\r\n");
-        let s = d.snapshot_at(true, ld(true, true), None, now);
+        d.feed_at(b"\x1b[?2004h\x1b[?2004lsleep 2\r\n", 0, Some(100), start);
+        let s = d.snapshot_at(true, ld(true, true), Some(200), now);
         assert_eq!(s.interaction_mode, InteractionMode::Executing);
-        assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
+        assert_eq!(s.detection_tier, DetectionTier::Heuristic);
         assert_eq!(s.confidence, 0.0);
     }
 
@@ -639,6 +657,186 @@ mod tests {
         assert_eq!(s.detection_tier, DetectionTier::Heuristic);
         assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
         assert!((s.confidence - 0.6).abs() < 1e-6, "{}", s.confidence);
+    }
+
+    /// One row of the §8.7 matrix as `the_8_7_matrix_…` walks it:
+    /// `(row, stream, line discipline, owner at scan, holder at classify,
+    /// mode, tier, confidence)`.
+    ///
+    /// A named alias rather than the tuple inline because
+    /// `clippy::type_complexity` is a hard error here; the field order is
+    /// the same as the table's columns.
+    type MatrixRow = (
+        &'static str,
+        &'static [u8],
+        LineDiscipline,
+        Option<i32>,
+        Option<i32>,
+        InteractionMode,
+        DetectionTier,
+        f32,
+    );
+
+    /// The §8.7 matrix at rev. 37, **every** row, at mode, tier **and**
+    /// confidence, with the foreground group each row was measured with.
+    ///
+    /// The individual `matrix_*` tests above assert the rows they are named
+    /// for; this one asserts that no *other* row moved. That is REQ-PD-004's
+    /// "and nothing else in the §8.7 matrix", and no per-row test can express
+    /// it — a per-row test is a fixed point, and "nothing else fires" is a
+    /// property of the whole table.
+    ///
+    /// Row 8 is a **wrong answer asserted as present** (REQ-PD-022): a
+    /// genuine secret prompt the ladder does not label, because
+    /// `read -s -n 1` is a builtin — it keeps the shell's group, so rev. 37's
+    /// scoping does not touch it, and it leaves canonical mode, so the echo
+    /// rung does not fire. It answers `Executing` deterministically at a
+    /// prompt that cannot proceed without a secret. Asserted at what the
+    /// ladder answers so a rewrite of the rung has to edit an assertion to
+    /// change the limit.
+    #[test]
+    fn the_8_7_matrix_classifies_every_row_and_awaiting_secret_fires_on_exactly_three() {
+        let rows: &[MatrixRow] = &[
+            (
+                "1 idle bash prompt",
+                b"\x1b[?2004hbash-5.3$ ",
+                ld(false, false),
+                Some(100),
+                Some(100),
+                InteractionMode::AtPrompt,
+                DetectionTier::TerminalMode,
+                0.95,
+            ),
+            (
+                "2 during sleep 2 — external command, own group",
+                b"\x1b[?2004h\x1b[?2004lsleep 2\r\n",
+                ld(true, true),
+                Some(100),
+                Some(200),
+                InteractionMode::Executing,
+                DetectionTier::Heuristic,
+                0.0,
+            ),
+            (
+                "3 getpass()",
+                b"Password: ",
+                ld(false, true),
+                Some(100),
+                Some(200),
+                InteractionMode::AwaitingSecret,
+                DetectionTier::TerminalMode,
+                0.95,
+            ),
+            (
+                "4 bash read -s — builtin, shell's group",
+                b"\x1b[?2004h\x1b[?2004lPassword: ",
+                ld(false, true),
+                Some(100),
+                Some(100),
+                InteractionMode::AwaitingSecret,
+                DetectionTier::TerminalMode,
+                0.95,
+            ),
+            (
+                "5 real ssh password prompt",
+                b"\x1b[?2004h\x1b[?2004lssh prod-01\r\njane@prod-01's password: ",
+                ld(false, true),
+                Some(100),
+                Some(200),
+                InteractionMode::AwaitingSecret,
+                DetectionTier::TerminalMode,
+                0.95,
+            ),
+            (
+                "6 PyREPL, bracketed paste on",
+                b"\x1b[?2004h>>> ",
+                ld(false, false),
+                Some(200),
+                Some(200),
+                InteractionMode::AtPrompt,
+                DetectionTier::TerminalMode,
+                0.95,
+            ),
+            (
+                "7 readline REPL, session is the REPL",
+                b">>> ",
+                ld(false, false),
+                Some(200),
+                Some(200),
+                InteractionMode::AtPrompt,
+                DetectionTier::Heuristic,
+                0.9,
+            ),
+            (
+                "7b the same REPL launched from bash",
+                b"\x1b[?2004h\x1b[?2004lpython3 -q\r\n>>> ",
+                ld(false, false),
+                Some(100),
+                Some(200),
+                InteractionMode::AtPrompt,
+                DetectionTier::Heuristic,
+                0.9,
+            ),
+            (
+                "8 bash read -s -n 1 — builtin, shell's group",
+                b"\x1b[?2004h\x1b[?2004lread -s -n 1 -p 'Key: ' k\r\nKey: ",
+                ld(false, false),
+                Some(100),
+                Some(100),
+                InteractionMode::Executing,
+                DetectionTier::TerminalMode,
+                0.0,
+            ),
+            (
+                "9 inside less",
+                b"\x1b[?1049h:",
+                ld(false, false),
+                Some(100),
+                Some(200),
+                InteractionMode::Fullscreen,
+                DetectionTier::TerminalMode,
+                0.0,
+            ),
+        ];
+        let mut fired = Vec::new();
+        let mut by_row = std::collections::BTreeMap::new();
+        for (row, bytes, line, owner, holder, mode, tier, confidence) in rows {
+            let (mut d, start, now) = detector();
+            d.feed_at(bytes, 0, *owner, start);
+            let s = d.snapshot_at(true, *line, *holder, now);
+            assert_eq!(s.interaction_mode, *mode, "row {row}");
+            assert_eq!(s.detection_tier, *tier, "row {row}");
+            assert!(
+                (s.confidence - *confidence).abs() < 1e-6,
+                "row {row}: {}",
+                s.confidence
+            );
+            if s.interaction_mode == InteractionMode::AwaitingSecret {
+                fired.push(*row);
+            }
+            by_row.insert(*row, (s.interaction_mode, s.detection_tier, s.confidence));
+        }
+        // REQ-PD-004: `getpass()`, `read -s`, a real `ssh` prompt — and
+        // nothing else in the matrix. Soundness, not completeness: row 8 is
+        // a genuine secret prompt and is deliberately not among them.
+        assert_eq!(
+            fired.len(),
+            3,
+            "AwaitingSecret fires on exactly three rows: {fired:?}"
+        );
+
+        // REQ-PD-026's acceptance criterion, and it is a *property*, not a
+        // value: rows 7 and 7b are the same program at the same prompt,
+        // sampled identically on every signal, differing only in what the
+        // session observed earlier. Any rule under which they disagree is
+        // reading session history where the premise names a program.
+        // Asserted alongside the values above, never instead of them — an
+        // equality assertion alone passes if both regress together.
+        assert_eq!(
+            by_row["7 readline REPL, session is the REPL"],
+            by_row["7b the same REPL launched from bash"],
+            "rows 7 and 7b must answer identically"
+        );
     }
 
     // ---- tier precedence ----
@@ -1240,44 +1438,76 @@ mod tests {
     }
 
     /// §11.1 `detector::availability` — the §8.3 availability rule, pinned
-    /// in **both** directions (REQ-PD-011, REQ-PD-015).
+    /// in **both** directions on **both** axes (REQ-PD-011, REQ-PD-015,
+    /// REQ-PD-026).
     ///
-    /// Availability is a *sticky per-signal* fact: observed once, never
-    /// un-observed. So whatever a signal's availability licenses has to
-    /// hold for the rest of the session, and exactly one of the three T2
-    /// signals supports such a claim. Bracketed paste licenses the T2
-    /// executing rung — *prompt mode is off, therefore not at a prompt* is
-    /// valid only for a program known to signal its prompts that way.
-    /// Observing the alternate screen says a child took the screen and
-    /// gave it back; it licenses nothing about whether the shell now
-    /// holding the tty signals its prompts at all.
+    /// **The observation is sticky; the licence is scoped. Those are two
+    /// facts and conflating them breaks two rules at once.** `saw_*` is a
+    /// per-signal record: observed once, never un-observed, and correctly
+    /// so — REQ-PD-016's exited tier reads it *after* the child has been
+    /// reaped, so a flag that cleared itself would have nothing left to
+    /// report. What rev. 37 narrowed is not that record but what it
+    /// *licenses*: a record belongs to the program that emitted the signal
+    /// and licenses its rung only while that program still holds the
+    /// terminal (`licensed`, above). Scoping the flag as well as the licence
+    /// would break the exited-tier rule and the ConPTY degradation
+    /// together.
+    ///
+    /// Which signals confer a licence at all is unchanged and is the other
+    /// axis. Bracketed paste licenses the T2 executing rung — *prompt mode
+    /// is off, therefore not at a prompt* is valid only for a program known
+    /// to signal its prompts that way. Observing the alternate screen says a
+    /// child took the screen and gave it back; it licenses nothing about
+    /// whether the program now holding the tty signals its prompts at all.
     ///
     /// **Why this module exists as a module.** The rule was previously
     /// unpinned in *both* directions: the entire 0.0.2 suite passed with
     /// and without the `|| saw_alt_screen` disjunct, so two implementations
     /// that classify a live `dash` prompt differently both satisfied the
-    /// text. A rule that only fails one way is half-pinned. The two
-    /// mutations these rows exist to kill are:
+    /// text. A rule that only fails one way is half-pinned. **Since rev. 37
+    /// there are two axes, and REQ-PD-015 and REQ-PD-026 are separate
+    /// obligations: satisfying one does not satisfy the other.** Four
+    /// mutations, and each names the rows it must redden and the rows it
+    /// must leave alone:
     ///
-    /// - **drop bracketed paste** from the rule — row 4 breaks, and note
-    ///   that its `interaction_mode` (`Executing`) and its `confidence`
-    ///   (`0.00`) are *unchanged* by that mutation. Only the tier moves.
-    ///   A row asserted at its mode alone would not notice.
-    /// - **add alt-screen back** to the rule — rows 2 and 3 break, on all
-    ///   three fields.
+    /// | Axis | Injection | Red | Green |
+    /// |---|---|---|---|
+    /// | signal membership — remove | `t2_prompt_mode = false` | **4a**, **4c** | 1, 2, 3, 4b, 5, 6 |
+    /// | signal membership — add | `licensed(saw_bracketed_paste \|\| saw_alt_screen, …)` | **2**, **3**, independently | 1, 4a, 4b, 4c, 5, 6 |
+    /// | scope — widen (the rev.-36 behaviour) | `licensed` ignores owner and holder | **4b**, **6**, independently | 1, 2, 3, 4a, 4c, 5 |
+    /// | scope — narrow | `licensed` is false whenever the holder is known | **4a**, **4c** | 1, 2, 3, 4b, 5, 6 |
     ///
-    /// Rows 1 and 5 must not move under either mutation. Row 1 is the
+    /// The narrow direction is the one rev. 28 left unpinned and the one
+    /// most easily missed: an implementation that clears availability on
+    /// every classification makes **both** executing rungs unreachable
+    /// while still satisfying every row that expects a heuristic answer.
+    ///
+    /// Rows 2 and 3 exist as a pair, and so do 4b and 6, because one of
+    /// each is a shell and one is not — if a mutation reddens only one of a
+    /// pair, the two have collapsed into one assertion made twice and the
+    /// other must be re-derived.
+    ///
+    /// Rows 1 and 5 must not move under any of the four. Row 1 is the
     /// baseline `dash` prompt the availability gate was introduced (rev.
     /// 23) to protect; row 5 reads alt-screen's *current* value at the
     /// `Fullscreen` rung, which sits earlier in the ladder and is untouched
     /// by any change to availability.
+    ///
+    /// **`ld(true, true)` on rows 1–4c is load-bearing, not a default.**
+    /// `dash` leaves `ECHO` **on** at its prompt — the measured fact that
+    /// makes it a T3 case and the reason a readable `ECHO` confers no
+    /// availability. With `ld(false, _)` these rows would route through the
+    /// echo rung or its neighbours and would stop testing availability at
+    /// all. Row 5 is a pager's shape and row 6 is a readline child's; both
+    /// answer above or below the availability rung regardless, and their
+    /// docstrings say which.
     mod availability {
         use super::*;
 
         /// Assert the session *history* a row's byte stream is supposed to
         /// establish, before asking what the classifier makes of it.
         ///
-        /// These five rows differ from one another only in that history —
+        /// These rows differ from one another only in that history —
         /// rows 1 and 2 end on byte-identical prompts — so a stream that
         /// silently stops establishing it degrades into another row that
         /// is already covered and keeps passing. A mistyped `\x1b[?1049h`
@@ -1286,20 +1516,30 @@ mod tests {
         /// the row name mean something.
         ///
         /// Argument order is `(bracketed paste seen, alt screen seen, alt
-        /// screen now, osc 133 seen)`. All four are `bool`, so a
-        /// transposition compiles; what stops it is that no two rows below
-        /// carry the same four values, and the failure names the field.
+        /// screen now, osc 133 seen, bracketed-paste owner)`. The first
+        /// four are `bool`, so a transposition compiles; what stops it is
+        /// that no two rows below carry the same values, and the failure
+        /// names the field.
         ///
         /// `saw_osc133` is the *third* tier-gating flag and the one
         /// REQ-PD-016's exited matrix keys on. Without it here, that
         /// matrix's OSC-133 row and its never-observed row are, as far as
         /// this guard can tell, the same stream.
+        ///
+        /// **The recorded owner is here for rev. 37's rows 4a/4b/4c**,
+        /// which differ from one another only in who owned the signal and
+        /// who holds the terminal now. Without it, 4c — the REPL that drove
+        /// the paste *itself* — establishes the same history as 4a and the
+        /// three collapse into one assertion made three times. The holder
+        /// is not history and is not asserted here: it is the argument each
+        /// row passes to `snapshot_at`, in plain sight at the call.
         fn assert_history(
             d: &PromptDetector,
             saw_bp: bool,
             saw_alt: bool,
             alt_now: bool,
             saw_osc133: bool,
+            bp_owner: Option<i32>,
         ) {
             let m = d.scanner.modes();
             assert_eq!(
@@ -1309,18 +1549,26 @@ mod tests {
             assert_eq!(m.saw_alt_screen, saw_alt, "observed-alt-screen history");
             assert_eq!(m.alt_screen, alt_now, "alternate screen right now");
             assert_eq!(m.saw_osc133, saw_osc133, "observed-osc-133 history");
+            assert_eq!(
+                m.bracketed_paste_owner, bp_owner,
+                "the program that drove the bracketed-paste signal"
+            );
         }
 
         /// Row 1 — `dash`, no terminal mode ever seen, sitting at `$ `.
         /// The case that always worked, asserted so the fix cannot buy
         /// rows 2 and 3 at its expense.
+        ///
+        /// **The rung expected to answer is T3.** `dash` drives no terminal
+        /// mode and leaves `ECHO` on, which is why `ld(true, true)` here is
+        /// the measured state rather than a filler.
         #[test]
         fn row_1_dash_that_never_saw_a_mode_answers_at_prompt_via_t3() {
             let (mut d, start, now) = detector();
-            feed(&mut d, start, b"$ ");
-            assert_history(&d, false, false, false, false);
+            d.feed_at(b"$ ", 0, Some(100), start);
+            assert_history(&d, false, false, false, false, None);
 
-            let s = d.snapshot_at(true, ld(true, true), None, now);
+            let s = d.snapshot_at(true, ld(true, true), Some(100), now);
             assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
             assert_eq!(s.detection_tier, DetectionTier::Heuristic);
             assert!((s.confidence - 0.60).abs() < 1e-6, "{}", s.confidence);
@@ -1335,13 +1583,18 @@ mod tests {
         /// `Executing` at `terminal_mode` is deterministic and to wait, so
         /// the agent waited at a prompt nothing in the session could ever
         /// clear.
+        ///
+        /// **The rung expected to answer is T3**, and the owner and holder
+        /// are the same group throughout: nothing about the *scope* axis is
+        /// under test here, which is what makes this row a clean witness for
+        /// the signal-membership axis alone.
         #[test]
         fn row_2_dash_after_less_entered_and_left_the_alt_screen_still_answers_via_t3() {
             let (mut d, start, now) = detector();
-            feed(&mut d, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n$ ");
-            assert_history(&d, false, true, false, false);
+            d.feed_at(b"\x1b[?1049h(END)\x1b[?1049l\r\n$ ", 0, Some(100), start);
+            assert_history(&d, false, true, false, false, None);
 
-            let s = d.snapshot_at(true, ld(true, true), None, now);
+            let s = d.snapshot_at(true, ld(true, true), Some(100), now);
             assert_eq!(
                 s.interaction_mode,
                 InteractionMode::AtPrompt,
@@ -1360,62 +1613,188 @@ mod tests {
         /// different pattern row carrying the answer, so the two rows fail
         /// the add-alt-screen mutation independently rather than as one
         /// duplicated assertion.
+        ///
+        /// **The rung expected to answer is T3**, and as in row 2 the owner
+        /// and holder never differ.
         #[test]
         fn row_3_a_bespoke_cli_that_alt_screened_once_and_now_prompts_answers_via_t3() {
             let (mut d, start, now) = detector();
-            feed(
-                &mut d,
-                start,
+            d.feed_at(
                 b"\x1b[?1049h drawing \x1b[?1049l\r\nEnter a value: ",
+                0,
+                Some(100),
+                start,
             );
-            assert_history(&d, false, true, false, false);
+            assert_history(&d, false, true, false, false, None);
 
-            let s = d.snapshot_at(true, ld(true, true), None, now);
+            let s = d.snapshot_at(true, ld(true, true), Some(100), now);
             assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
             assert_eq!(s.detection_tier, DetectionTier::Heuristic);
             assert!((s.confidence - 0.80).abs() < 1e-6, "{}", s.confidence);
         }
 
-        /// Row 4 — bash, bracketed paste seen and now disabled, a command
-        /// running. The one inference bracketed-paste availability
-        /// legitimately licenses, and the row that breaks if the signal is
-        /// *removed* from the rule.
+        /// Row 4a — bash, bracketed paste seen then disabled, a **builtin**
+        /// running. The group does not change across a builtin (measured),
+        /// so bash really is still the program at the terminal and the
+        /// rung's premise — *this program signals its prompts with
+        /// bracketed paste, and it is off* — is literally true of it.
+        ///
+        /// **The rung expected to answer is the T2 executing rung.** This is
+        /// the row that breaks if the signal is *removed* from the rule, and
+        /// also the row that breaks if the licence is withdrawn with no
+        /// foreground change. It is one of the two rows on which the whole
+        /// remaining reach of that rung rests.
         #[test]
-        fn row_4_bash_with_bracketed_paste_seen_then_disabled_answers_executing_via_t2() {
+        fn row_4a_bash_running_a_builtin_answers_executing_via_t2() {
             let (mut d, start, now) = detector();
-            feed(&mut d, start, b"\x1b[?2004h\x1b[?2004lsleep 2\r\n");
-            assert_history(&d, true, false, false, false);
+            d.feed_at(
+                b"\x1b[?2004h\x1b[?2004lread -r answer\r\n",
+                0,
+                Some(100),
+                start,
+            );
+            assert_history(&d, true, false, false, false, Some(100));
 
-            let s = d.snapshot_at(true, ld(true, true), None, now);
+            let s = d.snapshot_at(true, ld(true, true), Some(100), now);
             assert_eq!(s.interaction_mode, InteractionMode::Executing);
             assert_eq!(
                 s.detection_tier,
                 DetectionTier::TerminalMode,
-                "removing bracketed paste from the availability rule drops \
+                "removing bracketed paste from the availability rule — or \
+                 withdrawing the licence with no foreground change — drops \
                  this row to the heuristic tier while leaving its mode \
                  (`Executing`) and its confidence (0.00) untouched — the \
-                 tier is the only field that catches that direction"
+                 tier is the only field that catches either direction"
             );
             assert_eq!(s.confidence, 0.0);
         }
 
-        /// Row 5 — the alternate screen currently **on**. Unaffected in
-        /// both directions: the `Fullscreen` rung reads alt-screen's
-        /// current value and sits above every availability question, which
-        /// is why the fix narrows the executing rung rather than dropping
-        /// alt-screen from the classifier. Note the session has never
-        /// driven bracketed paste, so this holds with no T2 availability
-        /// at all.
+        /// Row 4b — the same bash, running an **external** command. The
+        /// reach rev. 37 gives up: `sleep` is its own process group, so the
+        /// licence bash earned says nothing about it.
+        ///
+        /// **The rung expected to answer is T3.** This is the row that
+        /// breaks if the licence is widened back to the session — the
+        /// rev.-36 behaviour, which is a *passing* test today and must
+        /// become a failing one (REQ-PD-026). Its pair is row 6: one is a
+        /// shell's child that is still executing, the other is a shell's
+        /// child sitting at its own prompt, and a mutation that reddens only
+        /// one of the two has found them collapsed into a single assertion.
+        ///
+        /// The mode (`Executing`) and the confidence (0.00) are identical to
+        /// row 4a's — a settled `sleep` scores nothing on the T3 table
+        /// either — so the tier is again the only field that moves.
+        #[test]
+        fn row_4b_bash_running_an_external_command_answers_executing_via_t3() {
+            let (mut d, start, now) = detector();
+            d.feed_at(b"\x1b[?2004h\x1b[?2004lsleep 2\r\n", 0, Some(100), start);
+            assert_history(&d, true, false, false, false, Some(100));
+
+            let s = d.snapshot_at(true, ld(true, true), Some(200), now);
+            assert_eq!(s.interaction_mode, InteractionMode::Executing);
+            assert_eq!(
+                s.detection_tier,
+                DetectionTier::Heuristic,
+                "the licence stops at the program that earned it: bash's \
+                 bracketed paste says nothing about the command it launched"
+            );
+            assert_eq!(s.confidence, 0.0);
+        }
+
+        /// Row 4c — a REPL that drove bracketed paste **itself**, now
+        /// running its own computation. Measured: such a program keeps its
+        /// own group throughout, so the record it armed is still its own.
+        ///
+        /// **The rung expected to answer is the T2 executing rung**, and
+        /// this row is why the owner is re-recorded on *every* transition
+        /// rather than only the first: launched from bash, the REPL's own
+        /// `\x1b[?2004h` has to overwrite bash's ownership or the row can
+        /// never be licensed again.
+        #[test]
+        fn row_4c_a_repl_running_its_own_computation_answers_executing_via_t2() {
+            let (mut d, start, now) = detector();
+            // bash drives the paste, launches the REPL; the REPL draws its
+            // own prompt (its own transition, its own group) and then goes
+            // away to compute.
+            d.feed_at(b"\x1b[?2004h\x1b[?2004lpython3 -q\r\n", 0, Some(100), start);
+            d.feed_at(
+                b"\x1b[?2004h>>> \x1b[?2004lworking\r\n",
+                0,
+                Some(200),
+                start,
+            );
+            assert_history(&d, true, false, false, false, Some(200));
+
+            let s = d.snapshot_at(true, ld(true, true), Some(200), now);
+            assert_eq!(s.interaction_mode, InteractionMode::Executing);
+            assert_eq!(
+                s.detection_tier,
+                DetectionTier::TerminalMode,
+                "the REPL drove the signal itself and still holds the \
+                 terminal, so the rung's premise holds exactly here"
+            );
+            assert_eq!(s.confidence, 0.0);
+        }
+
+        /// Row 5 — the alternate screen currently **on**. Unaffected on
+        /// both axes and in both directions: the `Fullscreen` rung reads
+        /// alt-screen's current value and sits above every availability
+        /// question, which is why the fix narrows the executing rung rather
+        /// than dropping alt-screen from the classifier. Note the session
+        /// has never driven bracketed paste, so this holds with no T2
+        /// availability at all, and the foreground group changes under it
+        /// without moving the answer.
+        ///
+        /// **The rung expected to answer is `Fullscreen`**, above every
+        /// availability question — which is why `ld(false, false)` here is a
+        /// pager's shape rather than the `dash` shape rows 1–4c need.
         #[test]
         fn row_5_a_live_alt_screen_reports_fullscreen_with_no_availability_at_all() {
             let (mut d, start, now) = detector();
-            feed(&mut d, start, b"\x1b[?1049h:");
-            assert_history(&d, false, true, true, false);
+            d.feed_at(b"\x1b[?1049h:", 0, Some(100), start);
+            assert_history(&d, false, true, true, false, None);
 
-            let s = d.snapshot_at(true, ld(true, true), None, now);
+            let s = d.snapshot_at(true, ld(false, false), Some(200), now);
             assert_eq!(s.interaction_mode, InteractionMode::Fullscreen);
             assert_eq!(s.detection_tier, DetectionTier::TerminalMode);
             assert_eq!(s.confidence, 0.0);
+        }
+
+        /// Row 6 — bash drove bracketed paste, and a **readline child
+        /// driving none** is now sitting at its own prompt. §8.7 row 7b, and
+        /// what rev. 37 buys for what row 4b gives up.
+        ///
+        /// **The rung expected to answer is T3.** Under the rev.-36 rule
+        /// this answered `Executing` / `terminal_mode` / 0.00 — §8.4 tells
+        /// the agent that is deterministic and means wait, so the agent
+        /// waited at a live prompt until its own timeout. Before rev. 36 it
+        /// was worse: `AwaitingSecret` / 0.95, at an ordinary REPL prompt.
+        ///
+        /// `ld(false, false)` is a readline child's measured shape — echo
+        /// off, canonical off — and the echo rung's `ICANON` conjunct is
+        /// what lets it fall this far. It is the pair of row 4b on the
+        /// scope-widen mutation: same signal, same owner, same holder,
+        /// opposite answer, because the child is at a prompt rather than
+        /// executing.
+        #[test]
+        fn row_6_a_readline_child_driving_no_paste_answers_at_prompt_via_t3() {
+            let (mut d, start, now) = detector();
+            d.feed_at(
+                b"\x1b[?2004h\x1b[?2004lpython3 -q\r\n>>> ",
+                0,
+                Some(100),
+                start,
+            );
+            assert_history(&d, true, false, false, false, Some(100));
+
+            let s = d.snapshot_at(true, ld(false, false), Some(200), now);
+            assert_eq!(
+                s.interaction_mode,
+                InteractionMode::AtPrompt,
+                "a live REPL prompt, reported as a running command"
+            );
+            assert_eq!(s.detection_tier, DetectionTier::Heuristic);
+            assert!((s.confidence - 0.90).abs() < 1e-6, "{}", s.confidence);
         }
 
         /// The rule stated as a rule, rather than as five of its
@@ -1444,7 +1823,7 @@ mod tests {
                 let (mut toggled, start, now) = detector();
                 feed(&mut toggled, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n");
                 feed(&mut toggled, start, tail);
-                assert_history(&toggled, false, true, false, false);
+                assert_history(&toggled, false, true, false, false, None);
                 let with = toggled.snapshot_at(true, ld(true, true), None, now);
 
                 assert_eq!(
@@ -1472,7 +1851,7 @@ mod tests {
         fn an_exited_alt_screen_only_session_reports_the_tier_that_could_have_answered() {
             let (mut d, start, now) = detector();
             feed(&mut d, start, b"\x1b[?1049h(END)\x1b[?1049l\r\n$ ");
-            assert_history(&d, false, true, false, false);
+            assert_history(&d, false, true, false, false, None);
             assert_eq!(
                 d.snapshot_at(false, LineDiscipline::UNKNOWN, None, now)
                     .detection_tier,
@@ -1506,7 +1885,7 @@ mod tests {
         fn an_exited_integrated_shell_reports_the_semantic_tier_it_reached() {
             let (mut d, start, now) = detector();
             feed(&mut d, start, b"\x1b]133;A\x07bash-5.3$ ");
-            assert_history(&d, false, false, false, true);
+            assert_history(&d, false, false, false, true, None);
 
             let s = d.snapshot_at(false, LineDiscipline::UNKNOWN, None, now);
             assert_eq!(s.interaction_mode, InteractionMode::Exited);
@@ -1523,7 +1902,11 @@ mod tests {
         /// scanner does not model must not confer T1 availability.
         ///
         /// `saw_osc133` alone decides `session_tier` and gates *both* T1
-        /// rungs, and like every availability flag it is sticky. Set it
+        /// rungs, and like every availability *record* it is sticky —
+        /// rev. 37 scoped the licence a record confers, not the record
+        /// itself (see this module's docstring). So a forged record is
+        /// never un-observed, and here it is forged by the *same* program
+        /// throughout, which leaves scope with nothing to withhold. Set it
         /// from an unmodelled subcommand and `t1` is true while
         /// `at_marker` never can be — `last_marker` stays `None` — so the
         /// ladder falls past the T1 prompt rung to the T1 *executing* rung
@@ -1545,7 +1928,7 @@ mod tests {
                 let shown = String::from_utf8_lossy(raw).into_owned();
                 let (mut d, start, now) = detector();
                 feed(&mut d, start, raw);
-                assert_history(&d, false, false, false, false);
+                assert_history(&d, false, false, false, false, None);
 
                 let s = d.snapshot_at(true, ld(true, true), None, now);
                 assert_eq!(
@@ -1600,7 +1983,7 @@ mod tests {
         fn an_exited_session_that_observed_nothing_reports_the_heuristic_tier() {
             let (mut d, start, now) = detector();
             feed(&mut d, start, b"bash-5.3$ ");
-            assert_history(&d, false, false, false, false);
+            assert_history(&d, false, false, false, false, None);
 
             let s = d.snapshot_at(false, LineDiscipline::UNKNOWN, None, now);
             assert_eq!(s.interaction_mode, InteractionMode::Exited);
@@ -1626,6 +2009,8 @@ mod tests {
     /// §8.6 scores 0.85". That is the floor. The ceiling is a genuine OSC
     /// 133 `PromptStart` event and `AtPrompt` / `semantic` / **1.00** — the
     /// highest-confidence answer the system can produce — plus two sticky
+    /// (and, since rev. 37, program-scoped — a forged record is owned by
+    /// the program that forged it, which is the program at the terminal)
     /// tier-gating flags and chosen text inside `get_command_history`.
     ///
     /// **Why this is written down rather than fixed.** It does not close:
@@ -1773,9 +2158,19 @@ mod tests {
 
         /// Row 2 — and the first step past what the record claimed. The
         /// answer is no longer a 0.85 guess labelled `heuristic`; it is
-        /// 0.95 labelled `terminal_mode`, and `saw_bracketed_paste` is
-        /// sticky, so it also decides which rungs may answer for the rest
-        /// of the session (§8.3).
+        /// 0.95 labelled `terminal_mode`, from the bracketed-paste rung,
+        /// which reads the mode's **current value** and is gated on no
+        /// availability at all (§8.3).
+        ///
+        /// The forgery also leaves `saw_bracketed_paste` set, and that
+        /// record is sticky. What it *licenses* is not: since rev. 37 the
+        /// licence is `observed && !(owner and holder both known and
+        /// different)`, so the record the forging program armed licenses
+        /// the T2 executing rung for **that program**, and lapses the
+        /// moment something else holds the terminal. The flag is sticky and
+        /// the licence is not — both halves are load-bearing, and scoping
+        /// the flag as well would break REQ-PD-016's exited tier and
+        /// REQ-PD-025's ConPTY degradation in one move (§11.4, rev. 42).
         #[test]
         fn a_bracketed_paste_set_after_the_payloads_newline_answers_at_prompt_via_terminal_mode() {
             for Carrier {
