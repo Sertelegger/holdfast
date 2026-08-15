@@ -63,6 +63,19 @@ pub struct Detection {
     pub cursor_score: f32,
     pub reason: String,
     pub last_line: String,
+    /// Whether `last_line` lost bytes off its front to the scanner's
+    /// `TAIL_LINE_MAX` bound (§4.1's 512-byte tail).
+    ///
+    /// **This is not an MCP field and must not become one.** It travels
+    /// only as far as `mcp::detection`, which needs it to decide whether
+    /// the line can be *reported* (§9.2): a front-truncated line has lost
+    /// the leading literal both redaction mechanisms anchor on, so
+    /// "no rule matched" no longer means "no secret is present".
+    ///
+    /// Nothing in the classifier reads it. `pattern_score` below is scored
+    /// from `last_line` as it stands, which is what it has always been —
+    /// the truncation happens in the scanner, upstream of every score.
+    pub last_line_truncated: bool,
     pub title: Option<String>,
 }
 
@@ -406,6 +419,7 @@ impl PromptDetector {
             cursor_score,
             reason,
             last_line,
+            last_line_truncated: self.scanner.last_line_truncated(),
             title,
         }
     }

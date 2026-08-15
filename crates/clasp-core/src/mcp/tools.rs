@@ -1534,6 +1534,10 @@ mod tests {
     /// minimum, so no rule can match it and only §4.1's holdback protects
     /// it.
     const IN_FLIGHT: &str = "ghp_0123456789abcdefghijABCDEFGHIJ01234";
+    /// The **second** command's secret, and a third rule so the two
+    /// history entries are distinguishable from each other rather than
+    /// only from the unredacted form. See `every_tool`'s history row.
+    const AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 
     struct Row {
         tool: &'static str,
@@ -1742,12 +1746,28 @@ mod tests {
 
     /// Arrangement 1 of 2: the secrets have fully arrived, so every rule
     /// that can fire has fired and every surface must show a marker.
+    ///
+    /// **Two commands, not one, and the second one is the assertion rather
+    /// than the behaviour.** The shipped code redacts every entry; a
+    /// mutation that redacts only `entries[0]` survived the whole 479-test
+    /// workspace and was caught by `scripts/mcp-smoke.sh` alone, because a
+    /// fixture with exactly one command cannot tell a per-entry loop from
+    /// a first-element special case. Any per-entry regression that spares
+    /// the first element now reddens `cargo test`.
     #[tokio::test]
     async fn no_tool_returns_a_completed_secret_anywhere_in_its_response() {
         let server = ClaspServer::new();
         let echoed = format!("export GH_TOKEN={GITHUB_TOKEN} DD_API_KEY={DATADOG_KEY}");
+        // A different rule on the second command, so the two entries are
+        // distinguishable from each other: an implementation that redacted
+        // entry 0 and copied its text into every later entry passes a pair
+        // of identical commands.
+        let echoed2 = format!("aws configure set aws_access_key_id {AWS_KEY}");
         let mut bytes = b"\x1b]133;A\x07$ ".to_vec();
         bytes.extend_from_slice(format!("\x1b]133;B\x07{echoed}\r\n").as_bytes());
+        bytes.extend_from_slice(b"\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07");
+        bytes.extend_from_slice(b"\x1b]133;A\x07$ ");
+        bytes.extend_from_slice(format!("\x1b]133;B\x07{echoed2}\r\n").as_bytes());
         bytes.extend_from_slice(b"\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07");
         bytes.extend_from_slice(
             format!("\x1b]133;A\x07LAST={GITHUB_TOKEN} DD_API_KEY={DATADOG_KEY}").as_bytes(),
@@ -1761,8 +1781,8 @@ mod tests {
         let session = server.registry.get(&id).expect("the session");
         settle(
             &session,
-            "the command to close and the last line to land",
-            |s| s.command_count() == 1 && s.detection().last_line.starts_with("LAST="),
+            "both commands to close and the last line to land",
+            |s| s.command_count() == 2 && s.detection().last_line.starts_with("LAST="),
         )
         .await;
 
@@ -1787,7 +1807,11 @@ mod tests {
         covers_every_advertised_tool(&rows);
         no_row_contains(
             &rows,
-            &[("github token", GITHUB_TOKEN), ("datadog key", DATADOG_KEY)],
+            &[
+                ("github token", GITHUB_TOKEN),
+                ("datadog key", DATADOG_KEY),
+                ("aws key", AWS_KEY),
+            ],
         );
 
         // The companions. `!contains` passes against a redactor that
@@ -1798,6 +1822,8 @@ mod tests {
             read["output"],
             json!(format!(
                 "$ export GH_TOKEN=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]\r\n\
+                 ok\r\n\
+                 $ aws configure set aws_access_key_id [REDACTED:aws]\r\n\
                  ok\r\nLAST=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]"
             ))
         );
@@ -1811,12 +1837,30 @@ mod tests {
             json!("[REDACTED:datadog]"),
             "a match whose rule keys on a label outside it (C3)"
         );
+        // **Both** entries, by index. `entries[0]` alone is the one-entry
+        // blind spot this fixture's second command exists to close.
+        let entries = data_of(&rows, "get_command_history")["entries"].clone();
         assert_eq!(
-            data_of(&rows, "get_command_history")["entries"][0]["command"],
+            entries.as_array().map(Vec::len),
+            Some(2),
+            "the arrangement must really carry two closed commands: {entries}"
+        );
+        assert_eq!(
+            entries[0]["command"],
             json!("export GH_TOKEN=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]"),
             "the command line is an output boundary (C2)"
         );
+        assert_eq!(
+            entries[1]["command"],
+            json!("aws configure set aws_access_key_id [REDACTED:aws]"),
+            "every entry, not the first one"
+        );
         let status = data_of(&rows, "status");
+        // The non-degenerate positive for the whole §9.2 `last_line` rule,
+        // and it lives *here* rather than in arrangement 2 because this is
+        // the arrangement where nothing is withheld. A `last_line` blanked
+        // unconditionally — the shape of the two suppression cases below —
+        // fails this line and only this line.
         assert_eq!(
             status["prompt"]["last_line"],
             json!("LAST=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]")
@@ -1888,10 +1932,36 @@ mod tests {
             "everything up to the boundary is still delivered"
         );
         assert_eq!(read["held_back"], json!(true));
+        // §9.2's holdback case, and it reads as a loss until you put the
+        // two lines beside each other: `read_output` is withholding from
+        // `TOKEN=` onward on this very response, so the reconstruction of
+        // the same region is not reportable either. It answered `"TOKEN="`
+        // through 0.0.3 — a per-line clip, which is sound only when the
+        // anchor licensing the holdback is *on* the line. `cat id_rsa`
+        // proves it is not always: the `-----BEGIN` sits lines above and
+        // the rendered last line is unrecognisable base64.
+        //
+        // What the agent loses here is four characters of label. What it
+        // keeps is everything it acts on, asserted below so a change that
+        // blanked the block wholesale cannot pass as this rule.
+        let status = data_of(&rows, "status");
         assert_eq!(
-            data_of(&rows, "status")["prompt"]["last_line"],
-            json!("TOKEN="),
-            "the clip is targeted at the candidate, not a blanket erase (C1)"
+            status["prompt"]["last_line"],
+            json!(""),
+            "an active holdback suppresses the line it is withholding"
+        );
+        assert!(
+            status["prompt"]["reason"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty()),
+            "the rest of the block is untouched: {}",
+            status["prompt"]
+        );
+        assert!(
+            status["interaction_mode"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty() && m != "Unknown"),
+            "the session is still classified while its line is withheld: {status}"
         );
         let matched = data_of(&rows, "wait_for_pattern");
         assert_eq!(matched["matched"], json!(true));

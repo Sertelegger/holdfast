@@ -3030,6 +3030,158 @@ async fn prompt_last_line_is_redacted_on_every_prompt_bearing_tool() {
     kill_all(&server).await;
 }
 
+// ------------------------------------------- §9.2's `last_line` rule
+//
+// F2 and F1 measured against 0.0.3's HEAD, end to end through the tools an
+// agent actually calls. Both were closed only for part of their class by
+// the per-line clip: it looks at one line, and it looks at a *whole* one.
+
+/// F2. The review's wording, verbatim: *the bytes the holdback is
+/// withholding, in the same response.* `read_output` answered `held_back:
+/// true` with the boundary at the `-----BEGIN`; `status` — `readOnlyHint:
+/// true`, reading no buffer at all — handed back a full key-body line.
+///
+/// **Paired in the same session rather than in a second test**: once the
+/// `-----END` lands the holdback releases and an ordinary prompt is
+/// reported again. Without the second phase, a `last_line` wired to the
+/// empty string passes the first.
+#[tokio::test]
+async fn status_withholds_the_last_line_while_a_key_is_still_streaming() {
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "streaming-key");
+    let key_body = "PjLkMnBvCxZaSdFgHjKlQwErTyUiOpAsDfGhJkLzXcVbNmQwErTyUiOpAsDfGhJk";
+    let head = format!("$ cat id_rsa\n-----BEGIN RSA PRIVATE KEY-----\n{key_body}");
+    pty.queue_output(head.as_bytes());
+    let session = server.registry.get(&id).unwrap();
+    wait_until_head(&session, head.len() as u64);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.detection().last_line != key_body && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let read = body(
+        &server
+            .read_output(Parameters(read_args(&id)))
+            .await
+            .unwrap(),
+    )["data"]
+        .clone();
+    let stat = status_data(&server, &id).await;
+
+    assert_eq!(
+        read["held_back"],
+        json!(true),
+        "the arrangement must really be withholding: {read}"
+    );
+    assert_eq!(
+        read["output"],
+        json!("$ cat id_rsa\n"),
+        "the read stops at the `-----BEGIN`"
+    );
+    assert_eq!(
+        stat["prompt"]["last_line"],
+        json!(""),
+        "the same region, reconstructed, is not reportable either"
+    );
+    for (tool, payload) in [("read_output", &read), ("status", &stat)] {
+        assert!(
+            !payload.to_string().contains(key_body),
+            "{tool} returned the key body: {payload}"
+        );
+    }
+
+    // Phase 2 — the negative. The block completes, the holdback releases,
+    // and the prompt behind it comes back.
+    pty.queue_output(b"\n-----END RSA PRIVATE KEY-----\nuser@host:~$ ");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.detection().last_line != "user@host:~$ " && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let after = status_data(&server, &id).await;
+    assert_eq!(
+        after["prompt"]["last_line"],
+        json!("user@host:~$ "),
+        "an ordinary prompt is still reported once nothing is withheld"
+    );
+    let after_read = body(
+        &server
+            .read_output(Parameters(read_args(&id)))
+            .await
+            .unwrap(),
+    )["data"]
+        .clone();
+    assert_eq!(after_read["held_back"], json!(false));
+    assert!(
+        !after_read.to_string().contains(key_body),
+        "the completed block is redacted, not released: {after_read}"
+    );
+
+    kill_all(&server).await;
+}
+
+/// F1. A JWT of 643 characters: `read_output.output` correctly returns
+/// `[REDACTED:jwt]` while `status.prompt.last_line` returned 512 verbatim
+/// characters, signature segment included. Nothing is in flight and
+/// `held_back` is `false` — the line simply outgrew the 512-byte tail the
+/// scanner keeps, taking the `eyJ` both mechanisms anchor on with it.
+#[tokio::test]
+async fn status_withholds_a_last_line_too_long_to_carry_its_own_anchor() {
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "long-jwt");
+    let signature = "S".repeat(202);
+    let jwt = format!(
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ{}.{signature}",
+        "A".repeat(400)
+    );
+    assert_eq!(jwt.len(), 643);
+    let stream = format!("$ echo $T\n{jwt}");
+    pty.queue_output(stream.as_bytes());
+    let session = server.registry.get(&id).unwrap();
+    wait_until_head(&session, stream.len() as u64);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.detection().last_line.len() != 512 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let read = body(
+        &server
+            .read_output(Parameters(read_args(&id)))
+            .await
+            .unwrap(),
+    )["data"]
+        .clone();
+    let stat = status_data(&server, &id).await;
+
+    // The half that was already right, asserted so the other half cannot
+    // be mistaken for a holdback case.
+    assert_eq!(read["output"], json!("$ echo $T\n[REDACTED:jwt]"));
+    assert_eq!(read["held_back"], json!(false), "nothing is in flight");
+    assert_eq!(stat["prompt"]["last_line"], json!(""));
+    assert!(
+        !stat.to_string().contains(&signature),
+        "the signature segment survived: {stat}"
+    );
+
+    // The negative, and the one that bounds the cost: the record is a
+    // property of the **current** line. A flag that stayed set once tripped
+    // would mean one `cat` of a long file suppressed every prompt for the
+    // rest of the session's life — an availability failure far worse than
+    // the disclosure it closes, and invisible to a fixture that stops at
+    // the long line.
+    pty.queue_output(b"\nuser@host:~$ ");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.detection().last_line != "user@host:~$ " && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        status_data(&server, &id).await["prompt"]["last_line"],
+        json!("user@host:~$ "),
+        "the next line starts clean"
+    );
+
+    kill_all(&server).await;
+}
+
 #[tokio::test]
 async fn exited_at_is_absent_while_the_child_lives_and_set_once_after_it_dies() {
     let server = ClaspServer::new();

@@ -5,6 +5,7 @@
 //! `status`, and `list_sessions` all report the same fields, and a tool
 //! that quietly stopped reporting them would be a silent regression.
 
+use crate::detect::Detection;
 use crate::output::redact::redact_str;
 use crate::output::OutputProcessor;
 use crate::session::Session;
@@ -23,41 +24,82 @@ fn round3(x: f32) -> f64 {
     ((x as f64) * 1000.0).round() / 1000.0
 }
 
-/// `last_line` as an agent may see it: an in-flight secret dropped, and
-/// what remains redacted.
+/// `last_line` as an agent may see it — **vouched-for text, or nothing**
+/// (§9.2's `prompt.last_line` rule).
 ///
-/// **The redactor alone is not enough here, and the reason is the whole
-/// point of §4.1's holdback.** `redact_str` replaces *complete* matches; a
-/// token one character short of its rule's minimum matches nothing by
-/// construction, so a 39-character `ghp_…` came back verbatim on a
-/// response that was simultaneously withholding those very bytes from
-/// `output`. `status` is `readOnlyHint: true` and reads no buffer at all,
-/// so an agent polling it while a token streamed in collected everything
-/// up to `rule_minimum − 1` characters — one poll per keystroke's worth of
-/// arrival.
+/// The field is a *diagnostic*: it exists so an agent can read the prompt
+/// it is about to answer. It is not a data channel, and the recourse when
+/// it is empty is `read_output`, which redacts over the whole buffer with
+/// §4.1's lookbehind and its multi-line rules and reports `held_back` when
+/// it is withholding. That asymmetry is what licenses a rule that reports
+/// nothing whenever the line cannot be judged: the value of a line that
+/// shows a prompt is high, the value of one that shows key material is
+/// negative, and everything the agent *acts* on — `interaction_mode`,
+/// `confidence`, `quiescent_score`, `pattern_score` — is still computed
+/// from the full line and still reported.
 ///
-/// **The clip runs over `last_line` itself rather than over the buffer's
-/// `holdback_boundary`, and that is deliberate.** `last_line` is a
-/// *reconstruction* — the scanner's post-strip tail (§4.1's last
-/// paragraph) — not a slice of the byte stream, so §9.2's screen-state
-/// rule applies to it and not §4.1's byte arithmetic: "the redactor must
-/// run on the rendered rows, not on the bytes that produced them". Two
-/// consequences decide it. A raw-byte count cannot be converted to a
-/// position in a rendered line at all — a `\r` redraw, a multi-byte
-/// character, or a withheld region spanning lines each break the
-/// arithmetic in a different direction. And `ghp_\x1b[0m0123…` **has no
-/// holdback boundary**: `ESC` is not a value byte, so the buffer-side
-/// scanner correctly declines to call it a token in flight, while the
-/// stripped line the agent is handed reads as a contiguous 39-character
-/// partial. Clipping at the boundary would leak exactly that line; running
-/// the same `earliest_partial` predicate over the rendered text catches
-/// it. The unit is the string being emitted, which is the only unit that
-/// covers a surface built by reconstruction.
+/// Three conditions make a line unjudgeable. Each is a separate failure of
+/// the same mechanism, and none subsumes another:
 ///
-/// Detection is unaffected: `pattern_score` is computed inside the
-/// detector from the full line (`detect::detector`), before any response
-/// exists, so this clips what is *reported* and never what is *decided*.
-fn safe_last_line(processor: &OutputProcessor, line: &str) -> String {
+/// **1. An in-flight candidate is visible in the rendered line — clip at
+/// it.** `redact_str` replaces *complete* matches; a token one character
+/// short of its rule's minimum matches nothing by construction, so a
+/// 39-character `ghp_…` came back verbatim on a response that was
+/// simultaneously withholding those very bytes from `output`. The clip
+/// runs over `last_line` itself rather than over the buffer's
+/// `holdback_boundary`, and that is deliberate: `ghp_\x1b[0m0123…` **has
+/// no holdback boundary**, because `ESC` is not a value byte, so the
+/// buffer-side scanner correctly declines to call it a token in flight
+/// while the stripped line the agent is handed reads as a contiguous
+/// 39-character partial. §9.2's screen-state rule is the one that applies
+/// — "the redactor must run on the rendered rows, not on the bytes that
+/// produced them" — because `last_line` is a *reconstruction*, the
+/// scanner's post-strip tail (§4.1's last paragraph), not a slice of the
+/// byte stream.
+///
+/// **2. The session's holdback is active — report nothing.** Rule 1 is a
+/// per-line predicate and cannot see an anchor on an earlier line. `cat
+/// id_rsa` on a key still streaming is the case: the `-----BEGIN` that
+/// licenses the withholding sits lines above, the rendered last line is
+/// 64 characters of base64 with no anchor anywhere in it, and every
+/// per-line mechanism reports it clean. Meanwhile `read_output` on the
+/// *same response* answered `held_back: true` with the boundary at the
+/// `-----BEGIN`. The rule is `holdback_boundary < buffer.head`, and it
+/// closes that by construction rather than by pattern: the withheld
+/// region always ends at `head`, and the tail line is always built from
+/// bytes ending at `head`, so an active holdback means the reconstruction
+/// necessarily overlaps the bytes the session is refusing to hand over.
+/// No byte-to-rendered-position arithmetic is attempted, because none is
+/// possible — a `\r` redraw, a multi-byte character, or a withheld region
+/// spanning lines each break it in a different direction — so the flag is
+/// used at the coarsest granularity it is sound at: the whole line.
+///
+/// **3. The line was front-truncated — report nothing.** Both mechanisms
+/// above are *anchored*: `redact_str` finds a rule's leading literal and
+/// `earliest_partial` finds an indexed prefix. `TailLine::push` evicts
+/// from the front at `TAIL_LINE_MAX`, so a 643-character JWT loses its
+/// `eyJ` and hands back 512 characters — signature included — that no rule
+/// can recognise. That is not a race; it persists until the next line
+/// arrives. Widening what the redactor may see was the alternative and it
+/// is not a fix: any bound can be exceeded by one more byte, and the field
+/// would trade a bounded reconstruction for an unbounded scan while still
+/// leaving case 2 open.
+///
+/// **Detection is unaffected by all three.** `pattern_score` is computed
+/// inside the detector from the full line (`detect::detector`), before any
+/// response exists. These decide what is *reported* and never what is
+/// *decided* — the property `suppressing_the_report_does_not_move_the_
+/// pattern_score` asserts directly.
+fn safe_last_line(processor: &OutputProcessor, session: &Session, d: &Detection) -> String {
+    // Case 3 first, and case 2 before any per-line work: both answer for
+    // the whole line, so there is nothing for the clip to improve on.
+    if d.last_line_truncated {
+        return String::new();
+    }
+    if session.holdback_boundary(processor) < session.buffer_head() {
+        return String::new();
+    }
+    let line = d.last_line.as_str();
     let visible = match processor
         .index
         .earliest_partial(&processor.rules, line.as_bytes(), 0)
@@ -118,7 +160,7 @@ pub fn with_detection(mut data: Value, session: &Session, processor: &OutputProc
             "pattern_score": round3(d.pattern_score),
             "cursor_score": round3(d.cursor_score),
             "reason": d.reason,
-            "last_line": safe_last_line(processor, &d.last_line),
+            "last_line": safe_last_line(processor, session, &d),
         }),
     );
     data
@@ -148,6 +190,27 @@ mod tests {
     /// `scores_serialise_without_float_noise` every time. Uncorrelated is
     /// not the same as closed.
     fn session_with_output(bytes: &[u8], last_line: &str) -> (Arc<Session>, Arc<MockPty>) {
+        session_until(bytes, "the detector to consume the queued output", |d| {
+            d.last_line == last_line
+        })
+    }
+
+    /// The same arrangement, waiting on an arbitrary property of the
+    /// detection rather than on `last_line`'s exact text.
+    ///
+    /// **The reason it exists is diagnostic quality, not flexibility.** A
+    /// test whose fixture waits for `last_line == <the exact string>`
+    /// reports every mutation that blanks that field as *"timed out
+    /// waiting for the detector"* — including the one mutation it is the
+    /// only test able to catch, an implementation of §9.2's rule sited in
+    /// the scanner or the detector instead of at the response boundary.
+    /// Waiting on the property under test and asserting the string
+    /// afterwards makes that failure land on the assertion that names it.
+    fn session_until(
+        bytes: &[u8],
+        what: &str,
+        mut pred: impl FnMut(&crate::detect::Detection) -> bool,
+    ) -> (Arc<Session>, Arc<MockPty>) {
         let pty = Arc::new(MockPty::new());
         pty.queue_output(bytes);
         let s = Session::new(
@@ -158,9 +221,7 @@ mod tests {
             Arc::clone(&pty) as Arc<dyn PtyBackend>,
             SessionConfig::with_buffer_capacity(4096),
         );
-        wait_until("the detector to consume the queued output", || {
-            s.detection().last_line == last_line
-        });
+        wait_until(what, || pred(&s.detection()));
         (s, pty)
     }
 
@@ -245,6 +306,13 @@ mod tests {
     /// before_any_tool_sees_it` (a *completed* token still comes back as
     /// a marker, not as nothing) and `a_prefix_that_is_no_longer_in_
     /// flight_is_left_alone` below.
+    ///
+    /// **Its answer is over-determined since the holdback case landed**:
+    /// this fixture has a real byte-stream boundary as well as a rendered
+    /// candidate, so either mechanism alone produces `""`. That is fine
+    /// for what it pins — the field must not carry the partial — and it is
+    /// why the clip keeps a fixture of its own below, where no boundary
+    /// exists at all.
     #[test]
     fn an_in_flight_partial_secret_is_dropped_from_the_last_line() {
         let partial = format!("ghp_{}", "0123456789abcdefghijABCDEFGHIJ01234");
@@ -299,14 +367,194 @@ mod tests {
     /// everything after a known prefix". A space after `ghp_abc` means the
     /// token can never complete, so nothing is in flight and the line is
     /// returned byte-identical.
+    ///
+    /// It is also the paired negative for the **holdback** case: the
+    /// boundary is asserted inactive, so a rule that suppressed on
+    /// `holdback_boundary <= buffer.head` rather than `<` — or on nothing
+    /// at all — fails here rather than passing everywhere.
     #[test]
     fn a_prefix_that_is_no_longer_in_flight_is_left_alone() {
         let line = "TOKEN=ghp_abc ready";
         let (s, _pty) = session_with_output(line.as_bytes(), line);
+        let processor = rules();
         assert_eq!(
-            with_detection(json!({}), &s, &rules())["prompt"]["last_line"],
+            s.holdback_boundary(&processor),
+            s.buffer_head(),
+            "nothing is in flight, so nothing is withheld"
+        );
+        assert_eq!(
+            with_detection(json!({}), &s, &processor)["prompt"]["last_line"],
             line
         );
+    }
+
+    // -------------------------------------- §9.2's other two cases
+    //
+    // The clip above is a **per-line** predicate over a **whole** line, and
+    // both of those words carry a failure. F2 breaks the first: a rule
+    // whose anchor is on an earlier line is invisible to anything that
+    // looks only at the last one. F1 breaks the second: the front of a long
+    // line is evicted at `TAIL_LINE_MAX`, and the front is where an anchor
+    // lives. Neither is reachable from the other, so each gets a fixture
+    // that the other mechanism provably cannot answer.
+
+    /// F2 — `cat id_rsa` with the key still streaming.
+    ///
+    /// **The discriminating property is that every per-line mechanism is
+    /// blind here, and it is asserted rather than described**: the rendered
+    /// last line is 64 characters of base64 with no rule anchor anywhere in
+    /// it, so `redact_str` returns it verbatim and `earliest_partial` finds
+    /// nothing. An implementation carrying only the clip hands the agent a
+    /// private-key body on a `readOnlyHint: true` tool, on the same
+    /// response whose `read_output` is withholding those bytes.
+    #[test]
+    fn a_last_line_the_holdback_is_withholding_is_not_reported() {
+        let body = "PjLkMnBvCxZaSdFgHjKlQwErTyUiOpAsDfGhJkLzXcVbNmQwErTyUiOpAsDfGhJk";
+        let stream = format!("$ cat id_rsa\n-----BEGIN RSA PRIVATE KEY-----\n{body}");
+        let (s, _pty) = session_with_output(stream.as_bytes(), body);
+        let processor = rules();
+
+        // The clip cannot see this line, and neither can the redactor.
+        assert_eq!(
+            redact_str(&processor.rules, body),
+            body,
+            "no complete match on this line — the `-----END` has not arrived"
+        );
+        assert_eq!(
+            processor
+                .index
+                .earliest_partial(&processor.rules, body.as_bytes(), 0),
+            None,
+            "no in-flight candidate on this line either; the anchor is two \
+             lines above it"
+        );
+        // What *can* see it, and does.
+        assert!(
+            s.holdback_boundary(&processor) < s.buffer_head(),
+            "the byte stream is withholding from the `-----BEGIN` onward"
+        );
+
+        let v = with_detection(json!({}), &s, &processor);
+        assert_eq!(v["prompt"]["last_line"], "");
+        assert!(!v.to_string().contains(body), "the key body survived: {v}");
+    }
+
+    /// F1 — a secret longer than the tail bound, so its anchor is evicted.
+    ///
+    /// **The holdback is asserted inactive**, which is what makes this a
+    /// separate case rather than a second spelling of the one above: the
+    /// JWT is *complete*, `read_output` redacts it correctly to
+    /// `[REDACTED:jwt]`, nothing is in flight, and the only thing wrong is
+    /// that `last_line` is the final 512 characters of a 643-character
+    /// line. It is not a race; it persists until the next line arrives.
+    #[test]
+    fn a_last_line_too_long_to_carry_its_own_anchor_is_not_reported() {
+        // header.payload.signature, 643 characters. The `\beyJ` both the
+        // rule and the index anchor on is 131 characters past eviction.
+        let jwt = format!(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ{}.{}",
+            "A".repeat(400),
+            "S".repeat(202)
+        );
+        assert_eq!(jwt.len(), 643);
+        let reported = &jwt[jwt.len() - 512..];
+        // Waits on the eviction, then asserts the text — so a §9.2 rule
+        // wrongly sited upstream of the response boundary fails on the
+        // assertion below rather than in this fixture's timeout.
+        let (s, _pty) = session_until(
+            format!("$ echo $T\n{jwt}").as_bytes(),
+            "the detector to record a front-truncated tail line",
+            |d| d.last_line_truncated,
+        );
+        assert_eq!(
+            s.detection().last_line,
+            reported,
+            "the detector must still hold the 512-byte tail: suppression \
+             belongs at the response boundary, not upstream of every score"
+        );
+        let processor = rules();
+
+        // The evidence is gone, and both mechanisms say so.
+        assert_eq!(
+            redact_str(&processor.rules, reported),
+            reported,
+            "the `eyJ` anchor was evicted, so the jwt rule cannot fire"
+        );
+        assert_eq!(
+            processor
+                .index
+                .earliest_partial(&processor.rules, reported.as_bytes(), 0),
+            None
+        );
+        assert_eq!(
+            s.holdback_boundary(&processor),
+            s.buffer_head(),
+            "the token is complete, so nothing is in flight — the holdback \
+             case cannot be what answers this one"
+        );
+        assert!(
+            s.detection().last_line_truncated,
+            "the scanner must have recorded the eviction"
+        );
+
+        let v = with_detection(json!({}), &s, &processor);
+        assert_eq!(v["prompt"]["last_line"], "");
+        assert!(
+            !v.to_string().contains(&jwt[jwt.len() - 202..]),
+            "the signature segment survived: {v}"
+        );
+    }
+
+    /// The paired negative for the truncation case, at the boundary: a line
+    /// of **exactly** `TAIL_LINE_MAX` bytes lost nothing and is reported in
+    /// full. Without it, "suppress a line of 512 characters" passes as
+    /// "suppress a line that was truncated", and every long-but-ordinary
+    /// line — a `ls -l` of a deep path, a wrapped compiler diagnostic —
+    /// disappears from the field.
+    #[test]
+    fn a_long_line_that_lost_nothing_is_reported_in_full() {
+        let line = format!("{}$ ", "x".repeat(510));
+        assert_eq!(line.len(), 512, "exactly the bound, so nothing is evicted");
+        let (s, _pty) = session_with_output(line.as_bytes(), &line);
+        assert!(!s.detection().last_line_truncated);
+        assert_eq!(
+            with_detection(json!({}), &s, &rules())["prompt"]["last_line"],
+            json!(line)
+        );
+    }
+
+    /// The property the whole §9.2 rule is written to preserve, asserted
+    /// directly on the case the review named: `user@host:~$ ghp_<39>`.
+    ///
+    /// `pattern_score` is computed inside the detector from the **full**
+    /// line, before any response exists, so suppression changes what is
+    /// *reported* and never what is *decided*. This is the assertion that
+    /// would fail if the rule were ever implemented by blanking
+    /// `Detection::last_line` in the scanner or the detector — which is the
+    /// obvious place to put it and the wrong one, because every score, tier
+    /// and `interaction_mode` downstream reads that field.
+    #[test]
+    fn suppressing_the_report_does_not_move_the_pattern_score() {
+        use crate::detect::PatternSet;
+        let line = format!("user@host:~$ ghp_{}", "0123456789abcdefghijABCDEFGHIJ01234");
+        let (s, _pty) = session_with_output(format!("building\n{line}").as_bytes(), &line);
+        let processor = rules();
+
+        let d = s.detection();
+        assert_eq!(d.last_line, line, "the detector still holds the whole line");
+        assert_eq!(
+            d.pattern_score,
+            PatternSet::defaults().score(&line),
+            "the score is the full line's, unchanged by anything below"
+        );
+
+        let v = with_detection(json!({}), &s, &processor);
+        assert_eq!(
+            v["prompt"]["last_line"], "",
+            "and the reported line is suppressed, so this really is a case \
+             where reporting and deciding disagree"
+        );
+        assert_eq!(v["prompt"]["pattern_score"], round3(d.pattern_score));
     }
 
     #[test]

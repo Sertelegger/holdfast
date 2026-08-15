@@ -147,6 +147,25 @@ enum State {
 #[derive(Debug, Default)]
 struct TailLine {
     buf: VecDeque<u8>,
+    /// Whether any byte of the **current** line has been evicted from the
+    /// front to stay inside `TAIL_LINE_MAX`.
+    ///
+    /// The eviction is what keeps this structure bounded and it is not
+    /// going away, but it destroys evidence: every mechanism that decides
+    /// whether the line is safe to *report* — `redact_str` and
+    /// `earliest_partial` alike — is anchored on a rule's leading literal,
+    /// and the front of the line is exactly where an anchor lives. A
+    /// 643-character JWT arrives, the leading `eyJ` is evicted, and what
+    /// is left is 512 characters that no rule can recognise (§9.2's
+    /// last-line rule). The flag is what lets the reporting boundary tell
+    /// "nothing here matched" from "the thing that would have matched is
+    /// gone".
+    ///
+    /// It is **not** consulted by the detector: `pattern_score` is scored
+    /// from the line as it stands, truncated or not, exactly as before.
+    /// This records a property of the reconstruction, and only
+    /// `mcp::detection` reads it.
+    truncated: bool,
 }
 
 impl TailLine {
@@ -154,6 +173,7 @@ impl TailLine {
         self.buf.push_back(b);
         while self.buf.len() > TAIL_LINE_MAX {
             self.buf.pop_front();
+            self.truncated = true;
         }
     }
 
@@ -161,8 +181,11 @@ impl TailLine {
     /// carriage return must not inherit the progress bar in front of it.
     fn reset(&mut self) {
         self.buf.clear();
+        self.truncated = false;
     }
 
+    /// A backspace un-draws the last cell; it does not un-evict the front,
+    /// so `truncated` deliberately stays set. Those bytes are gone.
     fn backspace(&mut self) {
         self.buf.pop_back();
     }
@@ -331,6 +354,12 @@ impl ModeScanner {
 
     pub fn last_line(&mut self) -> String {
         self.tail.as_string()
+    }
+
+    /// Whether `last_line` is the *whole* current line or only its final
+    /// `TAIL_LINE_MAX` bytes. See `TailLine::truncated`.
+    pub fn last_line_truncated(&self) -> bool {
+        self.tail.truncated
     }
 
     /// Feed one chunk of raw PTY bytes. `base` is the absolute offset of
@@ -1749,6 +1778,42 @@ mod tests {
         let line = s.last_line();
         assert_eq!(line.len(), TAIL_LINE_MAX);
         assert!(line.ends_with("$ "), "kept the head instead of the tail");
+    }
+
+    /// The eviction is **reported**, because the bytes it drops are the
+    /// ones a rule's leading literal lives in (§9.2's `last_line` rule,
+    /// case 3). Without this flag, `mcp::detection` cannot tell "no rule
+    /// matched this line" from "the anchor that would have matched is no
+    /// longer in it".
+    ///
+    /// Three positions, because the boundary is where a flag of this shape
+    /// goes wrong: exactly `TAIL_LINE_MAX` is **not** truncation — a
+    /// `>` in the eviction loop would report it as such and cost every
+    /// 512-byte line — and one byte more is.
+    #[test]
+    fn the_tail_line_reports_whether_it_dropped_anything_off_its_front() {
+        let mut s = ModeScanner::new();
+        s.feed(b"user@host:~$ ", 0, None);
+        assert!(!s.last_line_truncated(), "a short line loses nothing");
+
+        let mut s = ModeScanner::new();
+        s.feed(&vec![b'x'; TAIL_LINE_MAX], 0, None);
+        assert_eq!(s.last_line().len(), TAIL_LINE_MAX);
+        assert!(
+            !s.last_line_truncated(),
+            "exactly the bound fits; nothing was evicted"
+        );
+
+        let mut s = ModeScanner::new();
+        s.feed(&vec![b'x'; TAIL_LINE_MAX + 1], 0, None);
+        assert!(s.last_line_truncated(), "one byte over evicts one byte");
+
+        // And it is a property of the *current* line: the next line starts
+        // clean, or one long `cat` would suppress every prompt after it
+        // for the life of the session.
+        s.feed(b"\nuser@host:~$ ", TAIL_LINE_MAX as u64 + 1, None);
+        assert_eq!(s.last_line(), "user@host:~$ ");
+        assert!(!s.last_line_truncated(), "a newline restarts the record");
     }
 
     #[test]
