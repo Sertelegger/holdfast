@@ -54,7 +54,14 @@ if [ "$#" -eq 0 ]; then
   fi
 fi
 
-BIN="${1:-./target/debug/clasp}"
+# The default path must resolve to the binary the build above *produced*,
+# not to a hardcoded `./target`. `CARGO_TARGET_DIR` is honoured by cargo
+# and was not honoured here, so with one set the script built one binary
+# and smoked another. Measured: a stale `./target/debug/clasp` 23 minutes
+# older than the fresh build, different hashes, `SMOKE OK` reported. That
+# is worse than the staleness this self-build was added to prevent -- a
+# false pass rather than a misleading failure.
+BIN="${1:-${CARGO_TARGET_DIR:-./target}/debug/clasp}"
 if [ ! -x "$BIN" ]; then
   echo "build first: cargo build --workspace" >&2
   exit 1
