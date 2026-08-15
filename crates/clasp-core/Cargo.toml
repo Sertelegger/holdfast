@@ -21,9 +21,11 @@ thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 uuid.workspace = true
+vt100.workspace = true
 
 [dev-dependencies]
 jsonschema.workspace = true
 libc.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+vt100.workspace = true

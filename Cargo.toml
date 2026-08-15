@@ -27,3 +27,4 @@ thiserror = "2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }
 toml = "1.1.4"
 uuid = { version = "1", features = ["v4"] }
+vt100 = "0.16.2"

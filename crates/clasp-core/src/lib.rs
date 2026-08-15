@@ -7,6 +7,7 @@ pub mod error;
 pub mod mcp;
 pub mod output;
 pub mod pty;
+pub mod screen;
 pub mod session;
 
 pub use error::{ClaspError, Result};
