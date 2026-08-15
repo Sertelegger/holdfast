@@ -45,7 +45,7 @@ set -uo pipefail
 # Only on the default path. An explicit argument names a binary the
 # caller has already produced -- CI passes `./target/release/clasp` after
 # its own `cargo build --release`, and `./scripts/mcp-smoke.sh /bin/true`
-# is the negative control that must fail all 30 checks -- so building in
+# is the negative control that must fail all 34 checks -- so building in
 # that case would either be wrong or a no-op.
 if [ "$#" -eq 0 ]; then
   if ! cargo build --workspace >&2; then
@@ -123,6 +123,18 @@ OUT="$(
     req '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"smoke","tail_bytes":512}}}'
     req '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"send_input","arguments":{"session":"smoke","data":"hunter2"}}}'
     sleep 2
+    # The milestone's headline behaviour, on the only surface that drives
+    # real JSON-RPC. A GitHub-shaped token is TYPED INTO THE SHELL, so it
+    # reaches three places at once: the terminal's echo of the line (which
+    # `read_output` must redact), the OSC 133 command capture (which
+    # `get_command_history` must redact -- it did not, and shell
+    # integration is on by default, so that was the default
+    # configuration), and the shell's own environment. The token is a
+    # fixture, not a credential: it is the `github-token` rule's own
+    # `positive` example from `redaction_default.toml`.
+    req '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"send_input","arguments":{"session":"smoke","data":"export GH_TOKEN=ghp_0123456789abcdefghijABCDEFGHIJ012345"}}}'
+    sleep 2
+    req '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"smoke","since_cursor":0}}}'
     req '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}'
     req '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_command_history","arguments":{"session":"smoke"}}}'
     req '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"status","arguments":{"session":"smoke"}}}'
@@ -158,6 +170,37 @@ check() {
     echo "  FAIL  $1"
     echo "        (no match for: $2)"
     fails=$((fails + 1))
+  fi
+}
+
+# `absent <description> <forbidden substring> <witness substring>`
+#
+# The same assertion inverted, over the WHOLE transcript rather than over
+# one response. That scope is the point: a field-by-field check covers
+# only the fields whoever wrote it thought of, which is how a secret
+# shipped in `prompt.last_line` while four other fields of the same
+# response were being asserted redacted. Every byte the server wrote is
+# inside this one -- `details` strings, the `content[0]` text mirror, and
+# every response added later.
+#
+# The **witness** is not decoration. An absence check passes against an
+# empty transcript, so without it this would be the one line in the file
+# that stays green against `/bin/true` -- and rule 2 of this script says
+# every positive needs the negative that separates it from the degenerate
+# case. `[REDACTED:github]` can only appear if the redactor ran on real
+# session content, so the pair says "the secret is gone AND something
+# removed it" rather than "nothing came back".
+absent() {
+  if printf '%s' "$OUT" | grep -F -- "$2" >/dev/null; then
+    echo "  FAIL  $1"
+    echo "        (the transcript contains: $2)"
+    fails=$((fails + 1))
+  elif ! printf '%s' "$OUT" | grep -F -- "$3" >/dev/null; then
+    echo "  FAIL  $1"
+    echo "        (nothing to prove it: no match for: $3)"
+    fails=$((fails + 1))
+  else
+    echo "  ok    $1"
   fi
 }
 
@@ -340,7 +383,7 @@ jcheck "responses carry interaction_mode" \
         | select(.interaction_mode? != null)
         | [.interaction_mode, .detection_tier]] as $seen
    | [($seen | any(. == ["AtPrompt","semantic"])), ($seen | length)]' \
-  '[true,8]'
+  '[true,10]'
 
 # `semantic` is only reachable if the injected OSC 133 snippet was typed
 # into a real shell and that shell ran it -- it cannot be faked by the
@@ -402,6 +445,26 @@ jcheck "send_input does not flag an ordinary write" \
 jcheck "send_input flags a write to an echo-off session" \
   'data(12).warning' '"session_awaiting_secret"'
 
+# ------------------------------------------------------------ redaction
+#
+# 0.0.3's headline behaviour, and it was absent from this file entirely --
+# the one place that drives the real JSON-RPC surface had no check for the
+# milestone's whole subject. `get_command_history` returned the command
+# line unredacted for the length of the milestone, and this is the surface
+# that bug lived on.
+
+absent "no response carries the token typed into the shell" \
+  'ghp_0123456789abcdefghijABCDEFGHIJ012345' '[REDACTED:github]'
+
+# The two companions, per tool, because the line above passes just as well
+# against a server that returned nothing at all. Each pins the SURROUNDING
+# text as well as the marker, so a redactor that ate the line fails them.
+jcheck "read_output redacts the terminal's echo of the token" \
+  'data(16).output | contains("export GH_TOKEN=[REDACTED:github]")' 'true'
+jcheck "get_command_history redacts the command line" \
+  'data(7).entries[3] | [.command, .exit_code]' \
+  '["export GH_TOKEN=[REDACTED:github]",0]'
+
 # `index` is emitted only by get_command_history, and the exit code
 # beside it came from an OSC 133 `D;<code>` marker. Entry 0's `0` is the
 # value a broken parser defaults to; entry 1's `42` is not, and the two
@@ -413,7 +476,7 @@ jcheck "command history recorded an exit code" \
   '[0,"echo SMOKE_$((6*7))",0]'
 jcheck "command history reports each command its own exit code" \
   'data(7) | [(.entries[1] | [.index, .command, .exit_code]), .total, .truncated_at_tail]' \
-  '[[1,"(exit 42)",42],3,false]'
+  '[[1,"(exit 42)",42],4,false]'
 
 # `list_sessions` and `status` must answer about the session
 # `start_session` created, by the id it handed back -- not about "the
@@ -433,7 +496,7 @@ jcheck "status answers about the named session" \
   'data(3).session_id as $id
    | data(8) | [.id == $id, .name, .command, .state, .shell_integration,
                 .osc133_source, .command_count]' \
-  '[true,"smoke","bash","Running","bash","clasp",3]'
+  '[true,"smoke","bash","Running","bash","clasp",4]'
 
 check "terminate reports ok" '"already_exited":false'
 

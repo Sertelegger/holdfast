@@ -2468,6 +2468,90 @@ async fn read_output_redacts_by_default_and_reports_the_new_flags() {
     let _ = session.signal(Signal::Kill);
 }
 
+/// The `redact` **tool argument**, all three of its arms.
+///
+/// `redact: args.redact.unwrap_or(true)` → `redact: true` survived the
+/// whole suite: `disabling_redaction_returns_the_secret_verbatim` and
+/// `a_raw_read_of_a_real_session_is_recorded_in_the_audit_log` both build
+/// a `ReadOptions` by hand and never travel through the tool, so nothing
+/// observed the argument being read at all. Under that mutation the
+/// documented escape hatch becomes a silent no-op — the agent asks for raw
+/// bytes, is told nothing went wrong, and receives markers — and §4.1's
+/// only route to a **withheld partial** closes for ever, which is the
+/// half that matters: a token one character short of its rule's minimum
+/// is unreachable by any other means, `tail_bytes` included, once the
+/// bytes have scrolled past.
+///
+/// Three arms, because two of them are separable: absent and `true` must
+/// agree (that is `unwrap_or(true)`, not `unwrap_or(false)`), and `false`
+/// must differ from both (that is the argument being read at all).
+#[tokio::test]
+async fn read_outputs_redact_argument_is_honoured_on_every_arm() {
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "hatch");
+    let token = format!("ghp_{TOKEN_TAIL}");
+    // One character short of the rule's minimum, so no rule can match it
+    // and only the holdback stands in the way.
+    let partial = &token[..token.len() - 1];
+    let buffer = format!("t={token}\nbuilding\n{partial}");
+    pty.queue_output(buffer.as_bytes());
+    wait_until_head(&server.registry.get(&id).unwrap(), buffer.len() as u64);
+
+    let read = |redact: Option<bool>| {
+        let server = &server;
+        let id = id.clone();
+        async move {
+            body(
+                &server
+                    .read_output(Parameters(ReadOutputArgs {
+                        session: id,
+                        since_cursor: Some(0),
+                        redact,
+                        ..Default::default()
+                    }))
+                    .await
+                    .expect("read_output must not be a protocol error"),
+            )["data"]
+                .clone()
+        }
+    };
+
+    let default = read(None).await;
+    assert_eq!(
+        default["output"], "t=[REDACTED:github]\nbuilding\n",
+        "the default redacts the completed token and withholds the partial"
+    );
+    assert_eq!(default["held_back"], json!(true));
+
+    // Field by field rather than object by object: `quiescent_score`
+    // climbs with wall-clock time, so two identical reads a millisecond
+    // apart are not equal objects.
+    let explicit = read(Some(true)).await;
+    for field in ["output", "held_back", "redactions", "next_cursor"] {
+        assert_eq!(
+            explicit[field], default[field],
+            "`redact: true` and no argument at all are the same read; \
+             {field} differs"
+        );
+    }
+
+    let raw = read(Some(false)).await;
+    assert_eq!(
+        raw["output"],
+        json!(buffer),
+        "the audited hatch returns the bytes verbatim — including the \
+         in-flight partial, which nothing else can reach"
+    );
+    assert_eq!(
+        raw["held_back"],
+        json!(false),
+        "disabling redaction disables the holdback with it (§4.1)"
+    );
+    assert!(raw["output"].as_str().unwrap().contains(partial));
+
+    let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+}
+
 /// `status.redaction_stats` as the agent sees it.
 async fn redaction_stats(server: &ClaspServer, id: &str) -> Value {
     let r = server
@@ -3127,6 +3211,43 @@ async fn a_completed_secret_match_returns_the_redacted_text() {
         data["match"]["offset"],
         json!(2),
         "the offset is the raw one, redacted or not"
+    );
+
+    let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+}
+
+/// The sibling `a_completed_secret_match_returns_the_redacted_text` could
+/// not catch: its `ghp_…` is a **prefix** rule, which self-identifies from
+/// the value alone and is therefore redacted even by a redactor run over
+/// the match span in isolation. A **context** rule keys on a label lying
+/// *outside* the caller's match — `DD_API_KEY=` sits eleven bytes before
+/// the 32 hex characters the pattern selects — so redacting a zero-width
+/// window can never fire it. 8 of the 51 built-in rules are that shape,
+/// and this returned the value verbatim beside an `output_since_start`
+/// that showed `[REDACTED:datadog]` for the very same bytes.
+///
+/// §5.2 says `match.text` is "routed through the OutputProcessor"; the
+/// assertion that the two fields agree is what that sentence means.
+#[tokio::test]
+async fn a_match_whose_rule_keys_on_a_label_outside_it_is_still_redacted() {
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "context-rule");
+    let value = "0123456789abcdef0123456789abcdef";
+    pty.queue_output(format!("DD_API_KEY={value}\ndone\n").as_bytes());
+    wait_until_head(&server.registry.get(&id).unwrap(), 49);
+
+    let payload = wait_data(&server, wait_args(&id, "[0-9a-f]{32}")).await;
+    let data = &payload["data"];
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(data["match"]["offset"], json!(11), "the raw offset stands");
+    assert_eq!(data["match"]["text"], json!("[REDACTED:datadog]"));
+    assert_eq!(
+        data["output_since_start"], "DD_API_KEY=[REDACTED:datadog]\ndone\n",
+        "the two fields see the same window, so they agree"
+    );
+    assert!(
+        !payload.to_string().contains(value),
+        "the key reached the agent: {payload}"
     );
 
     let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);

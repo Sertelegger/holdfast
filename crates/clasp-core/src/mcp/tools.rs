@@ -503,7 +503,7 @@ impl ClaspServer {
                     "exit_code": session.exit_code(),
                 }),
                 &session,
-                &self.processor.rules,
+                &self.processor,
             ),
             format!("{} bytes", read.bytes_returned),
         ))
@@ -561,11 +561,7 @@ impl ClaspServer {
             .unwrap_or(false);
         Ok(envelope::envelope(
             status,
-            detection::with_detection(
-                serde_json::Value::Object(fields),
-                &session,
-                &self.processor.rules,
-            ),
+            detection::with_detection(serde_json::Value::Object(fields), &session, &self.processor),
             if matched {
                 "pattern matched".to_string()
             } else {
@@ -702,7 +698,7 @@ impl ClaspServer {
                 detection::with_detection(
                     json!({ "bytes_written": written, "warning": warning }),
                     &session,
-                    &self.processor.rules,
+                    &self.processor,
                 ),
                 format!("wrote {written} bytes"),
             ));
@@ -731,11 +727,7 @@ impl ClaspServer {
             .unwrap_or(false);
         Ok(envelope::envelope(
             status,
-            detection::with_detection(
-                serde_json::Value::Object(fields),
-                &session,
-                &self.processor.rules,
-            ),
+            detection::with_detection(serde_json::Value::Object(fields), &session, &self.processor),
             if matched {
                 format!("wrote {written} bytes; pattern matched")
             } else {
@@ -837,7 +829,7 @@ impl ClaspServer {
             detection::with_detection(
                 session_record(&session, &self.processor.rules),
                 &session,
-                &self.processor.rules,
+                &self.processor,
             ),
             format!("status of {}", session.id),
         ))
@@ -865,7 +857,7 @@ impl ClaspServer {
                 detection::with_detection(
                     session_record(s, &self.processor.rules),
                     s,
-                    &self.processor.rules,
+                    &self.processor,
                 )
             })
             .collect();
@@ -930,7 +922,17 @@ impl ClaspServer {
             .map(|e| {
                 json!({
                     "index": e.index,
-                    "command": e.command,
+                    // **A redacted surface, and the one where secrets are
+                    // likeliest** (§9.2, REQ-O-010): `command` is the
+                    // terminal's echo of a line the human or the agent
+                    // typed, and `export GH_TOKEN=…` is how a token
+                    // reaches a shell. `read_output` redacts that same
+                    // echo and `session_record` redacts `command`/`args`,
+                    // so an unredacted copy here was a bypass of the
+                    // redactor at an output boundary — with shell
+                    // integration on by default for bash/zsh/fish, in the
+                    // default configuration.
+                    "command": redact_str(&self.processor.rules, &e.command),
                     "exit_code": e.exit_code,
                     "started_at_unix_ms": e.started_at_unix_ms,
                     "duration_ms": e.duration_ms,
@@ -1030,13 +1032,39 @@ impl ClaspServer {
                     let mut obj = serde_json::Map::new();
                     obj.insert("offset".into(), json!(m.start));
                     if !withheld {
-                        let raw = session.buffer_slice(m.start, m.end);
-                        let text =
-                            String::from_utf8_lossy(&crate::output::ansi::strip(&raw)).into_owned();
-                        obj.insert(
-                            "text".into(),
-                            json!(redact_str(&self.processor.rules, &text)),
+                        // **Through `read_processed`, over the expanded
+                        // window** — §5.2's "`match.text` is routed
+                        // through the OutputProcessor", which
+                        // `redact_str` over the match slice alone was
+                        // not. A *context* rule keys on a label lying
+                        // outside the caller's match (`DD_API_KEY=`
+                        // before a 32-hex value), so redacting a
+                        // zero-context window can never fire it: 8 of the
+                        // 51 built-in rules returned their value
+                        // verbatim, beside an `output_since_start` that
+                        // showed `[REDACTED:datadog]` for the same bytes
+                        // in the same response. The read below is the
+                        // same pass `output_since_start` runs — 512 bytes
+                        // of lookbehind, trimmed back to the match — so
+                        // the two agree by construction rather than by
+                        // coincidence.
+                        //
+                        // It is a second `read_processed` and therefore a
+                        // second contribution to `redaction_stats`, which
+                        // is correct: that tally counts substitutions
+                        // *delivered*, and this response delivers the
+                        // marker twice (§5.2, REQ-O-012).
+                        let text = session.read_processed(
+                            &ReadRequest {
+                                start: ReadStart::Cursor(m.start),
+                                max_bytes: (m.end - m.start) as usize,
+                                options: ReadOptions::default(),
+                                tool: "wait_for_pattern",
+                                client_kind: "in_process",
+                            },
+                            &self.processor,
                         );
+                        obj.insert("text".into(), json!(text.output));
                     }
                     serde_json::Value::Object(obj)
                 }
@@ -1236,6 +1264,10 @@ pub struct GetCommandHistoryArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pty::MockPty;
+    use crate::session::{new_session_id, Session, SessionConfig};
+    use serde_json::Value;
+    use std::time::Instant;
 
     /// The set of tools the router actually advertises.
     ///
@@ -1387,5 +1419,489 @@ mod tests {
             "list_sessions' advertised description still promises a \
              live-only list, which `registry.all()` does not produce:\n{description}"
         );
+    }
+
+    /// REQ-T-008's four arms, on the pure function, in microseconds.
+    ///
+    /// **Nothing observed the returned `Duration` before this.** The only
+    /// test named for the timeout —
+    /// `a_zero_timeout_is_clamped_to_the_hour_cap_and_says_so` — asserts
+    /// the *reported* `clamped_timeout_secs` field, and its fixture
+    /// matches in the historical phase, so the deadline it was handed is
+    /// never reached. Two mutations survive that arrangement:
+    /// `Some(0) => (Duration::from_secs(0), Some(cap))`, which turns
+    /// §5.2's "no caller deadline" into a call that returns immediately,
+    /// and `DEFAULT_WAIT_TIMEOUT_SECS: 30 → 3600`, which turns the
+    /// default wait into an hour. Neither is observable by waiting — an
+    /// hour-long default is precisely the thing a suite cannot afford to
+    /// measure — and both are four assertions here.
+    ///
+    /// The cap boundary is included because `n > cap` and `n >= cap` are
+    /// one character apart and differ only at exactly 3600, where the
+    /// second reports a clamp that did not happen.
+    #[test]
+    fn resolve_wait_timeout_answers_every_arm_with_the_deadline_it_will_use() {
+        assert_eq!(
+            resolve_wait_timeout(None),
+            (Duration::from_secs(30), None),
+            "no argument is a 30-second deadline, unclamped"
+        );
+        assert_eq!(
+            resolve_wait_timeout(Some(0)),
+            (Duration::from_secs(3600), Some(3600)),
+            "0 is `no caller deadline`, bounded at the cap — never an \
+             immediate return"
+        );
+        assert_eq!(
+            resolve_wait_timeout(Some(99_999)),
+            (Duration::from_secs(3600), Some(3600))
+        );
+        assert_eq!(
+            resolve_wait_timeout(Some(3600)),
+            (Duration::from_secs(3600), None),
+            "exactly the cap is not a clamp"
+        );
+        assert_eq!(
+            resolve_wait_timeout(Some(45)),
+            (Duration::from_secs(45), None)
+        );
+
+        // The same second clause the byte-cap test carries: these two
+        // numbers are advertised to the agent, on both tools that take
+        // the argument, and a constant that drifts from its description
+        // is a deadline the agent cannot predict.
+        for (tool, schema) in [
+            (
+                "wait_for_pattern",
+                ClaspServer::wait_for_pattern_tool_attr(),
+            ),
+            ("send_input", ClaspServer::send_input_tool_attr()),
+        ] {
+            let described = arg_description(&schema.input_schema, "timeout_secs");
+            for needle in ["30", "3600"] {
+                assert!(
+                    described.contains(needle),
+                    "{tool}'s advertised `timeout_secs` no longer names \
+                     {needle}:\n{described}"
+                );
+            }
+        }
+    }
+
+    // ------------------------------------------------------- the leak table
+    //
+    // **One assertion, every tool, both arrangements**: no tool response
+    // may contain the secret anywhere in it, checked over the whole
+    // serialised `CallToolResult` rather than field by field.
+    //
+    // Field-by-field is how C1 shipped. `prompt_last_line_is_redacted_on_
+    // every_prompt_bearing_tool` reads four `last_line` values and asserts
+    // on those four strings; the field it never thought to name is the
+    // field that leaked. The whole-object form cannot have that gap: a
+    // field added to a response next milestone is inside it on the day it
+    // is added, and so is a tool, because the covered set is compared
+    // against `tool_router()` rather than against a list someone
+    // remembered to extend.
+    //
+    // What it cannot cover, stated rather than implied:
+    //
+    //   * `read_output(tail_bytes|tail_lines)` **bypasses the holdback by
+    //     design** (REQ-O-003, §4.1's documented residual risk), so a tail
+    //     read of an in-flight secret returns it and must. The table
+    //     drives cursor reads only.
+    //   * `read_output(redact: false)` is the audited escape hatch (§4.1)
+    //     and returns secrets on purpose; `read_outputs_redact_argument_
+    //     is_honoured…` in `tests/integration.rs` is what pins *that*
+    //     direction.
+    //   * `start_session` echoes no session content at all — its `data`
+    //     carries ids, pid, cwd and flags. The only caller string it
+    //     returns is `command`, in `details`, which is the agent's own
+    //     argument coming back. It is driven here for enumeration, and
+    //     its row is honestly a weak one.
+    //   * A *closed* `get_command_history` entry has no in-flight tail:
+    //     the line was submitted, so nothing more is arriving and there is
+    //     nothing to withhold. The in-flight arrangement is therefore
+    //     vacuous for it, for `terminate` (which returns no content at
+    //     all) and for `start_session`.
+
+    /// Complete, and therefore redactable by rule.
+    const GITHUB_TOKEN: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+    /// A **context**-rule value: the rule keys on the `DD_API_KEY=` label
+    /// beside it, which lies outside any match a caller writes for the
+    /// value itself. 8 of the 51 built-in rules are this shape.
+    const DATADOG_KEY: &str = "0123456789abcdef0123456789abcdef";
+    /// 39 characters — one short of the github rule's 40-character
+    /// minimum, so no rule can match it and only §4.1's holdback protects
+    /// it.
+    const IN_FLIGHT: &str = "ghp_0123456789abcdefghijABCDEFGHIJ01234";
+
+    struct Row {
+        tool: &'static str,
+        /// The serialised `CallToolResult`: `content[0]` mirrors the
+        /// structured body and `details` is free text, so a needle hiding
+        /// in either is inside this.
+        whole: Value,
+        /// `structuredContent.data`, for the companion assertions.
+        data: Value,
+    }
+
+    fn row(tool: &'static str, r: &CallToolResult) -> Row {
+        Row {
+            tool,
+            whole: serde_json::to_value(r).expect("a tool result serialises"),
+            data: r
+                .structured_content
+                .clone()
+                .expect("every tool returns a structured envelope")["data"]
+                .clone(),
+        }
+    }
+
+    fn mock_session(
+        server: &ClaspServer,
+        name: &str,
+        args: Vec<String>,
+        bytes: &[u8],
+    ) -> (String, Arc<MockPty>) {
+        let pty = Arc::new(MockPty::new());
+        pty.queue_output(bytes);
+        let session = Session::new(
+            new_session_id(),
+            Some(name.to_string()),
+            "bash".into(),
+            args,
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(64 * 1024),
+        );
+        let id = session.id.clone();
+        server.registry.insert(session).expect("registry insert");
+        (id, pty)
+    }
+
+    /// Poll the *session* until `pred` holds, so the arrangement is really
+    /// in place before any tool is called.
+    async fn settle(session: &Session, what: &str, mut pred: impl FnMut(&Session) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pred(session) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(pred(session), "timed out waiting for {what}");
+    }
+
+    /// Every advertised tool, once each, plus `send_input(wait_for=)`
+    /// because that shape carries `match.text` and the plain write does
+    /// not. `terminate` runs last for the obvious reason.
+    async fn every_tool(
+        server: &ClaspServer,
+        id: &str,
+        start_args: StartSessionArgs,
+        pattern: &str,
+    ) -> Vec<Row> {
+        let session = |s: &str| s.to_string();
+        let mut rows = Vec::new();
+        rows.push(row(
+            "start_session",
+            &server
+                .start_session(Parameters(start_args))
+                .await
+                .expect("start_session"),
+        ));
+        rows.push(row(
+            "read_output",
+            &server
+                .read_output(Parameters(ReadOutputArgs {
+                    session: session(id),
+                    since_cursor: Some(0),
+                    ..Default::default()
+                }))
+                .await
+                .expect("read_output"),
+        ));
+        rows.push(row(
+            "send_input",
+            &server
+                .send_input(Parameters(SendInputArgs {
+                    session: session(id),
+                    data: String::new(),
+                    append_newline: Some(false),
+                    ..Default::default()
+                }))
+                .await
+                .expect("send_input"),
+        ));
+        rows.push(row(
+            "send_input",
+            &server
+                .send_input(Parameters(SendInputArgs {
+                    session: session(id),
+                    data: String::new(),
+                    append_newline: Some(false),
+                    wait_for: Some(pattern.to_string()),
+                    timeout_secs: Some(1),
+                }))
+                .await
+                .expect("send_input(wait_for)"),
+        ));
+        rows.push(row(
+            "wait_for_pattern",
+            &server
+                .wait_for_pattern(Parameters(WaitForPatternArgs {
+                    session: session(id),
+                    pattern: pattern.to_string(),
+                    timeout_secs: Some(1),
+                    since_cursor: Some(0),
+                    max_bytes: None,
+                }))
+                .await
+                .expect("wait_for_pattern"),
+        ));
+        rows.push(row(
+            "status",
+            &server
+                .status(Parameters(StatusArgs {
+                    session: session(id),
+                }))
+                .await
+                .expect("status"),
+        ));
+        rows.push(row(
+            "list_sessions",
+            &server.list_sessions().await.expect("list_sessions"),
+        ));
+        rows.push(row(
+            "get_command_history",
+            &server
+                .get_command_history(Parameters(GetCommandHistoryArgs {
+                    session: session(id),
+                    limit: None,
+                    since_index: None,
+                }))
+                .await
+                .expect("get_command_history"),
+        ));
+        rows.push(row(
+            "terminate",
+            &server
+                .terminate(Parameters(TerminateArgs {
+                    session: session(id),
+                    force: Some(true),
+                    timeout_secs: None,
+                }))
+                .await
+                .expect("terminate"),
+        ));
+        rows
+    }
+
+    /// The enumeration link: a tool added to the router and not to the
+    /// table above is an unchecked surface, and this is what says so.
+    fn covers_every_advertised_tool(rows: &[Row]) {
+        let mut covered: Vec<String> = rows.iter().map(|r| r.tool.to_string()).collect();
+        covered.sort();
+        covered.dedup();
+        let mut advertised: Vec<String> = ClaspServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        advertised.sort();
+        assert_eq!(
+            covered, advertised,
+            "the leak table does not drive every advertised tool; a tool \
+             outside it is a response nothing checks for secrets"
+        );
+    }
+
+    fn no_row_contains(rows: &[Row], needles: &[(&str, &str)]) {
+        for r in rows {
+            let text = r.whole.to_string();
+            for (what, needle) in needles {
+                assert!(
+                    !text.contains(needle),
+                    "{} returned the {what}:\n{text}",
+                    r.tool
+                );
+            }
+        }
+    }
+
+    fn data_of<'a>(rows: &'a [Row], tool: &str) -> &'a Value {
+        &rows
+            .iter()
+            .find(|r| r.tool == tool)
+            .unwrap_or_else(|| panic!("{tool} is not in the table"))
+            .data
+    }
+
+    async fn kill_everything(server: &ClaspServer) {
+        for s in server.registry.all() {
+            let _ = s.signal(crate::pty::Signal::Kill);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Arrangement 1 of 2: the secrets have fully arrived, so every rule
+    /// that can fire has fired and every surface must show a marker.
+    #[tokio::test]
+    async fn no_tool_returns_a_completed_secret_anywhere_in_its_response() {
+        let server = ClaspServer::new();
+        let echoed = format!("export GH_TOKEN={GITHUB_TOKEN} DD_API_KEY={DATADOG_KEY}");
+        let mut bytes = b"\x1b]133;A\x07$ ".to_vec();
+        bytes.extend_from_slice(format!("\x1b]133;B\x07{echoed}\r\n").as_bytes());
+        bytes.extend_from_slice(b"\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07");
+        bytes.extend_from_slice(
+            format!("\x1b]133;A\x07LAST={GITHUB_TOKEN} DD_API_KEY={DATADOG_KEY}").as_bytes(),
+        );
+        let (id, _pty) = mock_session(
+            &server,
+            "leak-complete",
+            vec!["--norc".into(), format!("--token={GITHUB_TOKEN}")],
+            &bytes,
+        );
+        let session = server.registry.get(&id).expect("the session");
+        settle(
+            &session,
+            "the command to close and the last line to land",
+            |s| s.command_count() == 1 && s.detection().last_line.starts_with("LAST="),
+        )
+        .await;
+
+        let rows = every_tool(
+            &server,
+            &id,
+            StartSessionArgs {
+                command: "bash".into(),
+                args: vec![
+                    "--norc".into(),
+                    "--noprofile".into(),
+                    "-c".into(),
+                    format!("sleep 30 # GH_TOKEN={GITHUB_TOKEN}"),
+                ],
+                shell_integration: Some(false),
+                ..Default::default()
+            },
+            "[0-9a-f]{32}",
+        )
+        .await;
+
+        covers_every_advertised_tool(&rows);
+        no_row_contains(
+            &rows,
+            &[("github token", GITHUB_TOKEN), ("datadog key", DATADOG_KEY)],
+        );
+
+        // The companions. `!contains` passes against a redactor that
+        // deletes everything, so each surface that carried a secret is
+        // pinned to the exact text it must have kept.
+        let read = data_of(&rows, "read_output");
+        assert_eq!(
+            read["output"],
+            json!(format!(
+                "$ export GH_TOKEN=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]\r\n\
+                 ok\r\nLAST=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]"
+            ))
+        );
+        assert_eq!(
+            read["held_back"],
+            json!(false),
+            "nothing is in flight in this arrangement"
+        );
+        assert_eq!(
+            data_of(&rows, "wait_for_pattern")["match"]["text"],
+            json!("[REDACTED:datadog]"),
+            "a match whose rule keys on a label outside it (C3)"
+        );
+        assert_eq!(
+            data_of(&rows, "get_command_history")["entries"][0]["command"],
+            json!("export GH_TOKEN=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]"),
+            "the command line is an output boundary (C2)"
+        );
+        let status = data_of(&rows, "status");
+        assert_eq!(
+            status["prompt"]["last_line"],
+            json!("LAST=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]")
+        );
+        assert_eq!(
+            status["args"],
+            json!(["--norc", "--token=[REDACTED:github]"])
+        );
+
+        kill_everything(&server).await;
+    }
+
+    /// Arrangement 2 of 2: a token one character short of its rule's
+    /// minimum, still arriving. No rule can match it, so **only the
+    /// holdback stands between it and the agent** — and the holdback was
+    /// wired to `read_output.output` alone.
+    #[tokio::test]
+    async fn no_tool_returns_an_in_flight_partial_secret_anywhere_in_its_response() {
+        let server = ClaspServer::new();
+        let mut bytes = b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07".to_vec();
+        bytes.extend_from_slice(b"building\r\n\x1b]133;D;0\x07");
+        // The tail, and nothing after it: a partial with bytes behind it
+        // is no longer in flight and is released by design (§4.1).
+        bytes.extend_from_slice(format!("TOKEN={IN_FLIGHT}").as_bytes());
+        let (id, _pty) = mock_session(
+            &server,
+            "leak-partial",
+            // Benign: an argument is the caller's own string coming back,
+            // and an unredactable partial there would fail this table for
+            // a self-echo rather than for a disclosure.
+            vec!["--norc".into()],
+            &bytes,
+        );
+        let session = server.registry.get(&id).expect("the session");
+        settle(&session, "the partial to reach the tail", |s| {
+            s.command_count() == 1 && s.detection().last_line.starts_with("TOKEN=")
+        })
+        .await;
+        assert!(
+            session.holdback_boundary(&server.processor) < session.buffer_head(),
+            "the arrangement must really be withholding something"
+        );
+
+        let rows = every_tool(
+            &server,
+            &id,
+            StartSessionArgs {
+                command: "bash".into(),
+                args: vec!["--norc".into(), "--noprofile".into()],
+                shell_integration: Some(false),
+                ..Default::default()
+            },
+            r"ghp_\w+",
+        )
+        .await;
+
+        covers_every_advertised_tool(&rows);
+        no_row_contains(&rows, &[("in-flight token", IN_FLIGHT)]);
+        // Four bytes of a token are not a secret, but they are the seam:
+        // an implementation clipping one character too few leaks 38 of
+        // the 39 and still passes the line above.
+        no_row_contains(&rows, &[("start of the token", "ghp_")]);
+
+        // The companions: withheld, not erased.
+        let read = data_of(&rows, "read_output");
+        assert_eq!(
+            read["output"],
+            json!("$ echo hi\r\nbuilding\r\nTOKEN="),
+            "everything up to the boundary is still delivered"
+        );
+        assert_eq!(read["held_back"], json!(true));
+        assert_eq!(
+            data_of(&rows, "status")["prompt"]["last_line"],
+            json!("TOKEN="),
+            "the clip is targeted at the candidate, not a blanket erase (C1)"
+        );
+        let matched = data_of(&rows, "wait_for_pattern");
+        assert_eq!(matched["matched"], json!(true));
+        assert_eq!(matched["held_back"], json!(true));
+        assert!(
+            matched["match"].get("text").is_none(),
+            "a withheld match reports its offset and no text: {}",
+            matched["match"]
+        );
+
+        kill_everything(&server).await;
     }
 }

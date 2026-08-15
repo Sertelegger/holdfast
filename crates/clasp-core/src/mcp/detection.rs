@@ -6,7 +6,7 @@
 //! that quietly stopped reporting them would be a silent regression.
 
 use crate::output::redact::redact_str;
-use crate::output::rules::RuleSet;
+use crate::output::OutputProcessor;
 use crate::session::Session;
 use serde_json::{json, Value};
 
@@ -21,6 +21,60 @@ pub const SCREEN_TRACKING: &str = "off";
 /// of these signals carries.
 fn round3(x: f32) -> f64 {
     ((x as f64) * 1000.0).round() / 1000.0
+}
+
+/// `last_line` as an agent may see it: an in-flight secret dropped, and
+/// what remains redacted.
+///
+/// **The redactor alone is not enough here, and the reason is the whole
+/// point of §4.1's holdback.** `redact_str` replaces *complete* matches; a
+/// token one character short of its rule's minimum matches nothing by
+/// construction, so a 39-character `ghp_…` came back verbatim on a
+/// response that was simultaneously withholding those very bytes from
+/// `output`. `status` is `readOnlyHint: true` and reads no buffer at all,
+/// so an agent polling it while a token streamed in collected everything
+/// up to `rule_minimum − 1` characters — one poll per keystroke's worth of
+/// arrival.
+///
+/// **The clip runs over `last_line` itself rather than over the buffer's
+/// `holdback_boundary`, and that is deliberate.** `last_line` is a
+/// *reconstruction* — the scanner's post-strip tail (§4.1's last
+/// paragraph) — not a slice of the byte stream, so §9.2's screen-state
+/// rule applies to it and not §4.1's byte arithmetic: "the redactor must
+/// run on the rendered rows, not on the bytes that produced them". Two
+/// consequences decide it. A raw-byte count cannot be converted to a
+/// position in a rendered line at all — a `\r` redraw, a multi-byte
+/// character, or a withheld region spanning lines each break the
+/// arithmetic in a different direction. And `ghp_\x1b[0m0123…` **has no
+/// holdback boundary**: `ESC` is not a value byte, so the buffer-side
+/// scanner correctly declines to call it a token in flight, while the
+/// stripped line the agent is handed reads as a contiguous 39-character
+/// partial. Clipping at the boundary would leak exactly that line; running
+/// the same `earliest_partial` predicate over the rendered text catches
+/// it. The unit is the string being emitted, which is the only unit that
+/// covers a surface built by reconstruction.
+///
+/// Detection is unaffected: `pattern_score` is computed inside the
+/// detector from the full line (`detect::detector`), before any response
+/// exists, so this clips what is *reported* and never what is *decided*.
+fn safe_last_line(processor: &OutputProcessor, line: &str) -> String {
+    let visible = match processor
+        .index
+        .earliest_partial(&processor.rules, line.as_bytes(), 0)
+    {
+        // Prefixes are ASCII, so the offset is already a char boundary;
+        // the walk is there so a future non-ASCII prefix truncates *more*
+        // rather than panicking on a split code point.
+        Some(cut) => {
+            let mut cut = cut as usize;
+            while cut > 0 && !line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            &line[..cut]
+        }
+        None => line,
+    };
+    redact_str(&processor.rules, visible)
 }
 
 /// Insert the session-state block into a tool's `data` object.
@@ -44,7 +98,7 @@ fn round3(x: f32) -> f64 {
 /// rather than an oversight: §9.2 lists it, but it arrives from OSC 0/2
 /// in 0.0.4's `ScreenTracker` and is `None` on every response this
 /// milestone can produce. 0.0.4 owns that call site.
-pub fn with_detection(mut data: Value, session: &Session, rules: &RuleSet) -> Value {
+pub fn with_detection(mut data: Value, session: &Session, processor: &OutputProcessor) -> Value {
     let d = session.detection();
     let Some(map) = data.as_object_mut() else {
         return data;
@@ -64,7 +118,7 @@ pub fn with_detection(mut data: Value, session: &Session, rules: &RuleSet) -> Va
             "pattern_score": round3(d.pattern_score),
             "cursor_score": round3(d.cursor_score),
             "reason": d.reason,
-            "last_line": redact_str(rules, &d.last_line),
+            "last_line": safe_last_line(processor, &d.last_line),
         }),
     );
     data
@@ -119,9 +173,9 @@ mod tests {
             .collect()
     }
 
-    /// The built-in rule set, which is what production passes.
-    fn rules() -> Arc<crate::output::rules::RuleSet> {
-        crate::output::rules::builtin_shared()
+    /// The built-in processor, which is what production passes.
+    fn rules() -> OutputProcessor {
+        OutputProcessor::builtin().expect("the built-in rules must compile")
     }
 
     fn set<'a>(names: &[&'a str]) -> BTreeSet<&'a str> {
@@ -178,6 +232,80 @@ mod tests {
         assert!(
             !v.to_string().contains(secret),
             "the token survived somewhere in the block: {v}"
+        );
+    }
+
+    /// C1. `redact_str` replaces *complete* matches, so a token one
+    /// character short of its rule's minimum matches nothing — and the
+    /// holdback, which exists for exactly that case, was applied to
+    /// `output` and not to this field. The same response withheld these
+    /// bytes from `read_output.output` and handed them back here.
+    ///
+    /// Its paired negative is `a_secret_on_the_last_line_is_redacted_
+    /// before_any_tool_sees_it` (a *completed* token still comes back as
+    /// a marker, not as nothing) and `a_prefix_that_is_no_longer_in_
+    /// flight_is_left_alone` below.
+    #[test]
+    fn an_in_flight_partial_secret_is_dropped_from_the_last_line() {
+        let partial = format!("ghp_{}", "0123456789abcdefghijABCDEFGHIJ01234");
+        assert_eq!(partial.len(), 39, "one short of the rule's 40-char minimum");
+        let (s, _pty) = session_with_output(format!("building\n{partial}").as_bytes(), &partial);
+
+        let v = with_detection(json!({}), &s, &rules());
+        assert_eq!(
+            v["prompt"]["last_line"], "",
+            "the candidate tail is the whole line, so nothing is left of it"
+        );
+        assert!(
+            !v.to_string().contains(&partial),
+            "the in-flight token survived somewhere in the block: {v}"
+        );
+    }
+
+    /// The discriminating fixture: **the input never contains the secret**
+    /// (§9.2's reconstruction rule). `ghp_\x1b[0m…` is a token in flight
+    /// only in the *rendered* line; in the byte stream an `ESC` sits in
+    /// the middle of it, which is not a value byte, so the buffer-side
+    /// holdback correctly declines to fire — asserted here, because that
+    /// is what makes this test separate the implementation that clips at
+    /// `Session::holdback_boundary` from the one that runs the same
+    /// predicate over the rendered text. The first returns this line in
+    /// full.
+    #[test]
+    fn a_partial_contiguous_only_in_the_rendering_is_dropped_too() {
+        let tail = "0123456789abcdefghijABCDEFGHIJ01234";
+        let rendered = format!("ghp_{tail}");
+        let bytes = format!("building\nghp_\x1b[0m{tail}");
+        assert!(
+            !bytes.contains(&rendered),
+            "the fixture must not contain the partial contiguously, or it \
+             tests the wrong layer"
+        );
+        let (s, _pty) = session_with_output(bytes.as_bytes(), &rendered);
+
+        let processor = rules();
+        assert_eq!(
+            s.holdback_boundary(&processor),
+            s.buffer_head(),
+            "no byte-stream boundary exists here; a clip at the boundary \
+             would return the line in full"
+        );
+        let v = with_detection(json!({}), &s, &processor);
+        assert_eq!(v["prompt"]["last_line"], "");
+        assert!(!v.to_string().contains(&rendered), "{v}");
+    }
+
+    /// The separator between "drop the in-flight candidate" and "delete
+    /// everything after a known prefix". A space after `ghp_abc` means the
+    /// token can never complete, so nothing is in flight and the line is
+    /// returned byte-identical.
+    #[test]
+    fn a_prefix_that_is_no_longer_in_flight_is_left_alone() {
+        let line = "TOKEN=ghp_abc ready";
+        let (s, _pty) = session_with_output(line.as_bytes(), line);
+        assert_eq!(
+            with_detection(json!({}), &s, &rules())["prompt"]["last_line"],
+            line
         );
     }
 
