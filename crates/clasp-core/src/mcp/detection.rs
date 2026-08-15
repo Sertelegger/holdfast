@@ -136,10 +136,30 @@ fn safe_last_line(processor: &OutputProcessor, session: &Session, d: &Detection)
 /// redactor over a fixed vocabulary only creates a way for a rule change
 /// to corrupt an enum.
 ///
-/// `title` is not redacted here either, and that is a scope statement
-/// rather than an oversight: §9.2 lists it, but it arrives from OSC 0/2
-/// in 0.0.4's `ScreenTracker` and is `None` on every response this
-/// milestone can produce. 0.0.4 owns that call site.
+/// **`title` is redacted here too, and the comment this replaces is why it
+/// was not.** It read: *"a scope statement rather than an oversight: §9.2
+/// lists it, but it arrives from OSC 0/2 in 0.0.4's `ScreenTracker` and is
+/// `None` on every response this milestone can produce. 0.0.4 owns that
+/// call site."* Every clause of that is true except the load-bearing one.
+/// `d.title` comes from **0.0.2's `ModeScanner`**, which has parsed OSC 0/2
+/// since it was written — `every_documented_field_is_present`, three
+/// screens up this file, feeds `\x1b]0;build\x07` and asserts `"build"`
+/// comes back. So the field was non-`None` on ordinary responses and went
+/// out verbatim, and `printf '\033]0;%s\007' "$GH_TOKEN"` put a live token
+/// on `status` and `list_sessions` — both of which §5.2 says redact it.
+///
+/// It is recorded at this length because the *shape* of the mistake
+/// outlives it: a premise about which milestone owns a field, written
+/// beside the code, with nothing asserting the premise. The redaction is
+/// unconditional now, so there is no premise left to go stale, and
+/// `a_secret_in_the_window_title_does_not_reach_any_tool` fails if it is
+/// removed.
+///
+/// This is **not** an instance of §9.2's bounded-reconstruction class that
+/// `safe_last_line` above exists for. A title is a single contiguous OSC
+/// payload with nothing evicted from it, and an over-long one is discarded
+/// wholesale by the scanner rather than truncated — so the redactor sees
+/// the whole of whatever it sees. It was simply not being run.
 pub fn with_detection(mut data: Value, session: &Session, processor: &OutputProcessor) -> Value {
     let d = session.detection();
     let Some(map) = data.as_object_mut() else {
@@ -151,7 +171,10 @@ pub fn with_detection(mut data: Value, session: &Session, processor: &OutputProc
     );
     map.insert("detection_tier".into(), json!(d.detection_tier.as_str()));
     map.insert("screen_tracking".into(), json!(SCREEN_TRACKING));
-    map.insert("title".into(), json!(d.title));
+    map.insert(
+        "title".into(),
+        json!(d.title.as_deref().map(|t| redact_str(&processor.rules, t))),
+    );
     map.insert(
         "prompt".into(),
         json!({
@@ -574,6 +597,43 @@ mod tests {
         assert_eq!(
             with_detection(json!({}), &s, &rules())["title"],
             Value::Null
+        );
+    }
+
+    /// §5.2 says `title` is redacted at `status` and `list_sessions`; it was
+    /// not, at any of the seven call sites, because this builder emitted
+    /// `d.title` raw under a comment asserting the field was always `None`
+    /// this milestone. Any child can set it: `printf '\033]0;%s\007' "$T"`.
+    ///
+    /// Its paired negative is `an_ordinary_window_title_is_reported_byte_
+    /// identical` below — without it, dropping the field or emitting a
+    /// constant marker passes this.
+    #[test]
+    fn a_secret_in_the_window_title_does_not_reach_any_tool() {
+        let secret = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        let (s, _pty) =
+            session_with_output(format!("\x1b]0;deploy {secret}\x07$ ").as_bytes(), "$ ");
+        assert_eq!(
+            s.detection().title.as_deref(),
+            Some(format!("deploy {secret}").as_str()),
+            "the premise the old comment rested on: the scanner really does \
+             produce a title this milestone"
+        );
+
+        let v = with_detection(json!({}), &s, &rules());
+        assert_eq!(v["title"], "deploy [REDACTED:github]");
+        assert!(
+            !v.to_string().contains(secret),
+            "the token survived somewhere in the block: {v}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_window_title_is_reported_byte_identical() {
+        let (s, _pty) = session_with_output(b"\x1b]0;~/src/clasp\x07$ ", "$ ");
+        assert_eq!(
+            with_detection(json!({}), &s, &rules())["title"],
+            "~/src/clasp"
         );
     }
 

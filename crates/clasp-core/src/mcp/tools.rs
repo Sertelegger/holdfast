@@ -1763,7 +1763,14 @@ mod tests {
         // entry 0 and copied its text into every later entry passes a pair
         // of identical commands.
         let echoed2 = format!("aws configure set aws_access_key_id {AWS_KEY}");
-        let mut bytes = b"\x1b]133;A\x07$ ".to_vec();
+        // **A window title, because the table could not see one.** Every
+        // fixture here set OSC 133 markers and no OSC 0/2, so `title` was
+        // `None` on every row and the whole-object check passed over a
+        // field this builder emitted verbatim. Same species as the
+        // one-command history fixture below: a whole-response assertion is
+        // only as wide as the response the fixture provokes.
+        let mut bytes = format!("\x1b]0;deploy {GITHUB_TOKEN}\x07").into_bytes();
+        bytes.extend_from_slice(b"\x1b]133;A\x07$ ");
         bytes.extend_from_slice(format!("\x1b]133;B\x07{echoed}\r\n").as_bytes());
         bytes.extend_from_slice(b"\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07");
         bytes.extend_from_slice(b"\x1b]133;A\x07$ ");
@@ -1818,10 +1825,20 @@ mod tests {
         // deletes everything, so each surface that carried a secret is
         // pinned to the exact text it must have kept.
         let read = data_of(&rows, "read_output");
+        // The leading marker is the **title sequence**, and it is worth a
+        // sentence rather than a fixture that avoids it. A secret inside an
+        // OSC payload is found by `find_spans` over the raw bytes, and the
+        // marker is emitted in place of that span rather than fed to the
+        // stripper — so where a terminal renders nothing for
+        // `\x1b]0;…\x07`, `read_output` renders `[REDACTED:github]`. That
+        // is pre-existing, correct, and pinned here because this is the
+        // first fixture in the suite to put a secret inside an escape
+        // sequence at all.
         assert_eq!(
             read["output"],
             json!(format!(
-                "$ export GH_TOKEN=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]\r\n\
+                "[REDACTED:github]\
+                 $ export GH_TOKEN=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]\r\n\
                  ok\r\n\
                  $ aws configure set aws_access_key_id [REDACTED:aws]\r\n\
                  ok\r\nLAST=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]"
@@ -1869,6 +1886,9 @@ mod tests {
             status["args"],
             json!(["--norc", "--token=[REDACTED:github]"])
         );
+        // Paired with `an_ordinary_window_title_is_reported_byte_identical`
+        // in `mcp::detection`, which keeps a dropped field from passing.
+        assert_eq!(status["title"], json!("deploy [REDACTED:github]"));
 
         kill_everything(&server).await;
     }
