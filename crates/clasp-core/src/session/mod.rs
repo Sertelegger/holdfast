@@ -7,16 +7,18 @@ pub use registry::SessionRegistry;
 use crate::buffer::{BufferRead, OutputBuffer};
 use crate::detect::history::{CommandEntry, CommandHistory, DEFAULT_MAX_ENTRIES};
 use crate::detect::{Detection, DetectionConfig, Osc133Source, PromptDetector, Shell};
+use crate::output::rules::RuleSet;
 use crate::output::{
     OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
 };
 use crate::pty::{PtyBackend, Signal};
+use crate::screen::{CursorSignal, ScreenCapture, ScreenConfig, ScreenTracker};
 use crate::{ClaspError, Result};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 pub type SessionId = String;
@@ -114,6 +116,18 @@ pub struct Session {
     pub args: Vec<String>,
     backend: Arc<dyn PtyBackend>,
     buffer: Arc<Mutex<OutputBuffer>>,
+    /// Tier-B terminal state (spec §4.5). Locked *before* `buffer` on the
+    /// one path that needs both — a re-seed reads the ring buffer — so
+    /// nothing may ever take `buffer` and then this.
+    screen: Arc<Mutex<ScreenTracker>>,
+    /// Spec §9.2 rule table, shared with the screen tracker so
+    /// `set_screen_config` can rebuild it. Sourced from
+    /// `output::rules::builtin_shared()` (0.0.3) — the process-wide table
+    /// every session shares. **Not** the `Arc` an `OutputProcessor` holds:
+    /// `Session` owns no processor, and `OutputProcessor::builtin`
+    /// compiles a fresh `RuleSet` anyway, so the two are different
+    /// allocations even when they hold identical rules.
+    rules: Arc<RuleSet>,
     detector: Arc<Mutex<PromptDetector>>,
     history: Arc<Mutex<CommandHistory>>,
     /// Which shell integration was injected, if any.
@@ -181,6 +195,16 @@ impl Session {
         let last_activity_ms = Arc::new(AtomicI64::new(now_ms()));
         let (output_tx, _) = broadcast::channel(OUTPUT_BROADCAST_FRAMES);
 
+        // Geometry and mode are applied by `set_screen_config` right
+        // after construction; the default matches `PtySpawnConfig::new`
+        // so a session created without one still seeds a correct grid.
+        let rules = crate::output::rules::builtin_shared();
+        let screen = Arc::new(Mutex::new(ScreenTracker::new(
+            ScreenConfig::default(),
+            Arc::clone(&rules),
+            Instant::now(),
+        )));
+
         let session = Arc::new(Self {
             id,
             name,
@@ -188,6 +212,8 @@ impl Session {
             args,
             backend: Arc::clone(&backend),
             buffer: Arc::clone(&buffer),
+            screen: Arc::clone(&screen),
+            rules,
             detector: Arc::clone(&detector),
             history: Arc::clone(&history),
             shell_integration: config.shell_integration,
@@ -207,6 +233,7 @@ impl Session {
         // since the thread's exit condition belongs to the session it
         // would be keeping alive.
         let weak_buffer = Arc::downgrade(&buffer);
+        let weak_screen = Arc::downgrade(&screen);
         let weak_detector = Arc::downgrade(&detector);
         let weak_history = Arc::downgrade(&history);
         let activity = Arc::clone(&last_activity_ms);
@@ -233,24 +260,26 @@ impl Session {
                 // Upgrade only around the push, so the thread never holds
                 // a strong reference across a sleep or a blocking read —
                 // that would defeat the `strong_count` check above.
-                let (Some(buffer), Some(detector), Some(history)) = (
+                let (Some(buffer), Some(screen), Some(detector), Some(history)) = (
                     weak_buffer.upgrade(),
+                    weak_screen.upgrade(),
                     weak_detector.upgrade(),
                     weak_history.upgrade(),
                 ) else {
                     break;
                 };
-                // The detector needs the offset the chunk landed at, so
-                // OSC 133 spans line up with agent-visible cursors. Read
-                // the head and append under one lock; nothing else writes
-                // to this buffer, so the pair cannot interleave.
+                // The chunk's absolute offset is what lets both consumers
+                // line up with agent-visible cursors: the detector maps
+                // OSC 133 spans onto it (0.0.2) and Tier B uses it to skip
+                // bytes a re-seed already absorbed (spec §4.5). Computed
+                // once, under one lock acquisition — reading `head()` a
+                // second time would race the push.
                 let base = {
                     let mut b = buffer.lock();
                     let base = b.head();
                     b.push(&buf[..n]);
                     base
                 };
-                drop(buffer);
 
                 // Published outside the buffer lock, and the error is
                 // dropped on purpose: `send` fails only when nobody is
@@ -260,6 +289,22 @@ impl Session {
                     end: base + n as u64,
                     bytes: Arc::from(&buf[..n]),
                 });
+
+                // Push first, feed second: the seed comes from the ring
+                // buffer, so this chunk must already be in it. `buffer` is
+                // still alive here on purpose — it is the `SeedSource`,
+                // which is why the `drop` below it moved down from where
+                // 0.0.2 left it. Lock order `screen -> buffer`, never the
+                // reverse.
+                //
+                // Sited *after* the fan-out rather than before it: this is
+                // a VT100 parse on every chunk once Tier B is on, and ahead
+                // of the `send` it would sit in `wait_for_pattern`'s
+                // latency path for nothing.
+                screen
+                    .lock()
+                    .feed(base, &buf[..n], Instant::now(), &*buffer);
+                drop(buffer);
 
                 // Detection runs outside the buffer lock: §4.3's invariant
                 // is that no lock is held across work that can block, and
@@ -347,10 +392,32 @@ impl Session {
     /// two describe different instants.
     pub fn detection(&self) -> Detection {
         let alive = self.backend.is_alive();
+        // Sampled *before* `detector.lock()` — the opposite of the two
+        // samples below, and for a reason that does not apply to them.
+        //
+        // Mechanically it has to be: this takes `screen` and then
+        // `buffer` (a re-seed reads the ring buffer), so holding
+        // `detector` across it would make this path
+        // `detector -> screen -> buffer` while the reader thread runs
+        // `screen -> buffer` and then `detector`. Neither holds two at
+        // once today; nesting them here is the change that would make a
+        // cycle possible.
+        //
+        // And unlike the line discipline it is safe outside: a chunk
+        // arriving between this sample and the classification can only
+        // make the cursor score *stale*, never contradictory. `echo` had
+        // to move inside because a stale `echo == false` pairs with a
+        // fresh bracketed-paste-off to satisfy a *deterministic* rung
+        // outright. `cursor_score` reaches only the T3 branch, through
+        // `quiescent_score * max(pattern, cursor)` — and that same
+        // arriving chunk resets quiescence under this very lock, so it
+        // drives confidence down. A stale cursor cannot manufacture a
+        // high one.
+        let cursor = self.cursor_signal().map(|c| c.score);
         let mut detector = self.detector.lock();
         let line = self.backend.line_discipline();
         let foreground = self.backend.foreground_group();
-        detector.snapshot(alive, line, foreground)
+        detector.snapshot(alive, line, foreground, cursor)
     }
 
     /// Whose OSC 133 markers this session is **using** (§18.2a, §8.5.1).
@@ -659,6 +726,64 @@ impl Session {
         read
     }
 
+    /// Apply the session's real geometry and `screen_tracking` mode.
+    ///
+    /// **Call this exactly once, immediately after construction and
+    /// before the session is registered** (`start_session` does). It
+    /// replaces the whole tracker, and the reader thread is already
+    /// running by then: bytes the child emitted in between are still in
+    /// the ring buffer, so a later seed recovers them for the *grid*, but
+    /// the new tracker's Tier-A probe starts blank, so a bracketed-paste
+    /// or OSC 133 sequence that landed in that window is not latched and
+    /// the §4.5 three-second no-signal trigger can fire on a session that
+    /// did emit one. The window is microseconds before any shell has
+    /// printed a prompt; calling this later widens it for no gain.
+    pub fn set_screen_config(&self, cfg: ScreenConfig) {
+        *self.screen.lock() = ScreenTracker::new(cfg, Arc::clone(&self.rules), Instant::now());
+    }
+
+    /// `screen_tracking` for the agent-facing responses: `"off"` or
+    /// `"on"` per spec §18.2a — whether Tier B is *running*, not which
+    /// mode was configured.
+    ///
+    /// The two-valued wire enum is derived from the policy's `enabled`
+    /// flag inside the tracker, never from `ScreenTracking::as_str()`,
+    /// which has a third spelling (`"adaptive"`) that no response schema
+    /// accepts. A response builder calls **this**.
+    pub fn screen_tracking(&self) -> &'static str {
+        self.screen.lock().tracking_state()
+    }
+
+    /// Serve `get_screen_state`. Enables Tier B if it is off and the
+    /// session's mode allows it, at the cost of one buffer re-seed.
+    ///
+    /// `redact` is §5.2's argument, already defaulted by the caller — the
+    /// tool layer resolves `None` to `true` and writes §9.4's
+    /// `redaction_disabled` entry when it is false, because that is where
+    /// the caller is known. A `bool` here rather than an `Option` so the
+    /// default cannot be re-decided in two places.
+    pub fn screen_state(&self, diff_from: Option<u64>, redact: bool) -> ScreenCapture {
+        self.screen
+            .lock()
+            .capture(diff_from, redact, Instant::now(), &*self.buffer)
+    }
+
+    /// The §8.6 T3c cursor sub-signal, or `None` when Tier B is off.
+    /// Also advances the adaptive policy clock, so a session that has
+    /// gone quiet still reaches its enable and disable deadlines.
+    pub fn cursor_signal(&self) -> Option<CursorSignal> {
+        self.screen
+            .lock()
+            .cursor_signal(Instant::now(), &*self.buffer)
+    }
+
+    /// Bytes this session has handed to a `vt100::Parser`. Zero for a
+    /// session that never enabled Tier B; the §11.4 write-path guard
+    /// asserts exactly that.
+    pub fn vt100_bytes_parsed(&self) -> u64 {
+        self.screen.lock().parsed_bytes()
+    }
+
     pub fn write_input(&self, data: &[u8]) -> Result<usize> {
         self.write_input_acked(data).map(|ack| ack.bytes_written)
     }
@@ -703,6 +828,7 @@ mod tests {
     use super::*;
     use crate::detect::{DetectionTier, InteractionMode, PatternSet, PromptPattern};
     use crate::pty::MockPty;
+    use crate::screen::{ScreenCapture, ScreenGrid, ScreenTracking};
     use std::time::Instant;
 
     fn mock_session() -> (Arc<Session>, Arc<MockPty>) {
@@ -1656,5 +1782,174 @@ mod tests {
             (s.detection().pattern_score - 0.9).abs() < 1e-6,
             "the session's own pattern table was not used"
         );
+    }
+
+    fn grid(capture: ScreenCapture) -> ScreenGrid {
+        match capture {
+            ScreenCapture::Full(g) => g,
+            ScreenCapture::Delta(d) => panic!("expected a full grid, got {d:?}"),
+        }
+    }
+
+    #[test]
+    fn tier_b_stays_off_for_line_oriented_output() {
+        let (s, pty) = mock_session();
+        s.set_screen_config(ScreenConfig {
+            rows: 24,
+            cols: 80,
+            ..ScreenConfig::default()
+        });
+        let out = b"\x1b[?2004h$ make\r\nCompiling everything\r\n";
+        pty.queue_output(out);
+        wait_for_bytes(&s, out.len() as u64);
+
+        assert_eq!(s.screen_tracking(), "off");
+        assert_eq!(
+            s.vt100_bytes_parsed(),
+            0,
+            "the reader thread ran the VT100 parser without a trigger"
+        );
+        assert!(s.cursor_signal().is_none());
+    }
+
+    #[test]
+    fn get_screen_state_enables_tier_b_and_seeds_from_the_ring_buffer() {
+        let (s, pty) = mock_session();
+        s.set_screen_config(ScreenConfig {
+            rows: 24,
+            cols: 80,
+            ..ScreenConfig::default()
+        });
+        // Painted while Tier B is off: only a re-seed can recover it.
+        let out = b"\x1b[?2004h\x1b[H\x1b[2JSEEDED FROM BUFFER\r\n";
+        pty.queue_output(out);
+        wait_for_bytes(&s, out.len() as u64);
+        assert_eq!(s.vt100_bytes_parsed(), 0);
+
+        let g = grid(s.screen_state(None, true));
+        assert_eq!(s.screen_tracking(), "on");
+        assert_eq!(g.rows, 24);
+        assert_eq!(g.cols, 80);
+        assert_eq!(g.lines[0].trim_end(), "SEEDED FROM BUFFER");
+        assert!(s.vt100_bytes_parsed() > 0);
+    }
+
+    #[test]
+    fn alt_screen_output_enables_tier_b_without_an_agent_call() {
+        let (s, pty) = mock_session();
+        s.set_screen_config(ScreenConfig {
+            rows: 24,
+            cols: 80,
+            ..ScreenConfig::default()
+        });
+        let first = b"\x1b[?2004h$ less notes\r\n";
+        pty.queue_output(first);
+        wait_for_bytes(&s, first.len() as u64);
+        assert_eq!(s.screen_tracking(), "off");
+
+        let second = b"\x1b[?1049h\x1b[H\x1b[2JPAGER";
+        pty.queue_output(second);
+        wait_for_bytes(&s, (first.len() + second.len()) as u64);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while s.screen_tracking() == "off" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(s.screen_tracking(), "on");
+
+        let g = grid(s.screen_state(None, true));
+        assert!(g.alt_screen);
+        assert_eq!(g.lines[0].trim_end(), "PAGER");
+    }
+
+    #[test]
+    fn screen_tracking_off_never_parses_on_the_write_path() {
+        let (s, pty) = mock_session();
+        s.set_screen_config(ScreenConfig {
+            mode: ScreenTracking::Off,
+            rows: 24,
+            cols: 80,
+            ..ScreenConfig::default()
+        });
+        let out = b"\x1b[?1049h\x1b[H\x1b[2JTUI";
+        pty.queue_output(out);
+        wait_for_bytes(&s, out.len() as u64);
+
+        assert_eq!(
+            s.vt100_bytes_parsed(),
+            0,
+            "`off` ran the parser on the write path anyway"
+        );
+        // The call still answers — §5.2 says it succeeds either way.
+        let g = grid(s.screen_state(None, true));
+        assert_eq!(g.lines[0].trim_end(), "TUI");
+        assert_eq!(s.screen_tracking(), "off");
+    }
+
+    /// REQ-PD-008's wiring, which is a `Session` fact and not a detector
+    /// one: `detection()` has to *hand* the detector §8.6's third term.
+    ///
+    /// Without this the only thing that notices `detection()` passing
+    /// `None` is the live-`dash` row in `tests/detection.rs`, which
+    /// notices it by polling for twenty seconds and timing out. The
+    /// detector's own combiner test cannot see it at all — it calls
+    /// `snapshot_at` directly.
+    ///
+    /// `mode: On` rather than a three-second wait: the §4.5 trigger is
+    /// tested where it lives, and a unit test should not sleep past it.
+    #[test]
+    fn detection_carries_the_cursor_sub_signal_once_tier_b_is_running() {
+        let (s, pty) = mock_session();
+        s.set_screen_config(ScreenConfig {
+            mode: ScreenTracking::On,
+            rows: 24,
+            cols: 80,
+            ..ScreenConfig::default()
+        });
+        let out = b"$ ";
+        pty.queue_output(out);
+        wait_for_bytes(&s, out.len() as u64);
+
+        // Each `detection()` samples the cursor once, and
+        // `cursor_stable_samples` is 3.
+        wait_until("the cursor position to be stable", || {
+            s.detection().cursor_score > 0.0
+        });
+        let d = s.detection();
+        assert_eq!(
+            d.cursor_score, 0.9,
+            "the cursor is parked after `$ `, which is §8.6's 0.9 row"
+        );
+        // …and the combiner used it: `$ ` scores 0.6 on the pattern rung,
+        // so a confidence built from the pattern alone would be lower.
+        assert!(
+            (d.confidence - d.quiescent_score * 0.9).abs() < 1e-6,
+            "max(pattern {}, cursor {}) did not carry: {d:?}",
+            d.pattern_score,
+            d.cursor_score
+        );
+        assert!(d.pattern_score < d.cursor_score);
+    }
+
+    #[test]
+    fn the_reader_thread_does_not_double_apply_the_triggering_chunk() {
+        // The chunk that turns Tier B on is already in the ring buffer
+        // when the seed is taken. If the reader then fed it to the parser
+        // as well, the grid would show it twice.
+        let (s, pty) = mock_session();
+        s.set_screen_config(ScreenConfig {
+            mode: ScreenTracking::On,
+            rows: 24,
+            cols: 80,
+            ..ScreenConfig::default()
+        });
+        // No `\x1b[2J`: a clear inside the same chunk would erase the first
+        // paint, and the doubled output would be invisible.
+        let out = b"ONCE";
+        pty.queue_output(out);
+        wait_for_bytes(&s, out.len() as u64);
+
+        let g = grid(s.screen_state(None, true));
+        assert_eq!(g.lines[0].trim_end(), "ONCE");
+        assert_eq!((g.cursor_row, g.cursor_col), (0, 4));
     }
 }

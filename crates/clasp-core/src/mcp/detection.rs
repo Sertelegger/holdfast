@@ -671,9 +671,13 @@ mod tests {
         assert_eq!(v["prompt"]["confidence"], 0.95);
         assert_eq!(v["prompt"]["quiescent_score"], 1.0);
         assert_eq!(v["prompt"]["pattern_score"], 0.9);
-        // Constant until the Tier-B cursor heuristic lands in 0.0.4: the
-        // field is reported now so that milestone changes a value rather
-        // than the response shape.
+        // Zero because this session's Tier B is off, not because the
+        // field is a constant — since 0.0.4 it carries the §8.6 T3c score
+        // whenever the tracker is running, so what this pins is the off
+        // case. Deterministically off, and by the fixture rather than by
+        // luck: the `\x1b[?2004h` above is a §4.5 deterministic signal, so
+        // the three-second no-signal trigger never arms. A fixture without
+        // one would answer 0.0 for under three seconds and 0.9 after.
         assert_eq!(v["prompt"]["cursor_score"], 0.0);
         assert_eq!(v["prompt"]["reason"], "bracketed paste is enabled");
         assert_eq!(v["prompt"]["last_line"], ">>> ");

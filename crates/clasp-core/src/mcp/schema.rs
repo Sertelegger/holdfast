@@ -160,7 +160,10 @@ pub struct Prompt {
     pub quiescent_score: f64,
     /// Best tier-3 pattern match against the last line, in [0,1] (§8.6 T3b).
     pub pattern_score: f64,
-    /// Cursor sub-signal (§8.6 T3c). Always 0.0 until 0.0.4.
+    /// Cursor sub-signal (§8.6 T3c). `0.0` whenever Tier B is off for
+    /// the session, which is the ordinary line-oriented case, and
+    /// whenever the cursor has not held position for
+    /// `cursor_stable_samples`.
     pub cursor_score: f64,
     /// Which branch of the §8.3 ladder answered, in words.
     pub reason: String,

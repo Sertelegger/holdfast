@@ -577,6 +577,36 @@ async fn await_settled(server: &ClaspServer, id: &str, last_line: &str) -> Value
     .await
 }
 
+/// `await_settled`, and then past §4.5's three-second no-signal trigger.
+///
+/// **A session that drives no bracketed paste and no OSC 133 answers two
+/// different — and both correct — things about itself depending on when
+/// you ask.** `dash` is the shell this file tests it with. For the first
+/// three seconds of its life Tier B is off, so §8.6's T3c term is
+/// unavailable and `cursor_score` is `0.0`; after the trigger fires Tier B
+/// is on, the cursor is stable after `$ `, and the term is `0.9` — which
+/// carries the `max` and takes `confidence` from `0.60` to `0.90`.
+///
+/// Any assertion on those two numbers is therefore a race unless the test
+/// says which side of the trigger it is on. These rows want the steady
+/// state, so they wait for it rather than sampling whichever the machine
+/// happened to be quick enough to produce. The polling supplies the
+/// stability samples as a side effect: each `status` observes the cursor
+/// once, and `cursor_stable_samples` is 3.
+async fn await_settled_with_cursor(server: &ClaspServer, id: &str, last_line: &str) -> Value {
+    await_status(
+        server,
+        id,
+        &format!("a settled {last_line:?} with the cursor signal up"),
+        |s| {
+            s["prompt"]["last_line"] == last_line
+                && s["prompt"]["quiescent_score"] == 1.0
+                && s["prompt"]["cursor_score"] != 0.0
+        },
+    )
+    .await
+}
+
 async fn kill(server: &ClaspServer, id: &str) {
     if let Ok(s) = server.registry.get(id) {
         // The whole process group (§4.4): these sessions leave `sleep`s and
@@ -1427,12 +1457,22 @@ async fn matrix_row_dash_degrades_silently_to_the_heuristic_tier() {
     let server = ClaspServer::new();
     let id = start(&server, program("dash", &[])).await;
 
-    let s = await_settled(&server, &id, "$ ").await;
-    assert_classified(&s, "AtPrompt", "heuristic", 0.6);
+    // The steady state, three seconds in, when §4.5's no-signal trigger
+    // has brought Tier B up and §8.6's third sub-signal is available. The
+    // *first* three seconds answer 0.6 with `cursor_score: 0.0` and are
+    // equally correct; see `await_settled_with_cursor` for why a test that
+    // asserts either number has to say which one it means.
+    let s = await_settled_with_cursor(&server, &id, "$ ").await;
+    assert_classified(&s, "AtPrompt", "heuristic", 0.9);
     assert_eq!(s["prompt"]["pattern_score"], 0.6);
     assert_eq!(s["prompt"]["quiescent_score"], 1.0);
-    assert_eq!(s["prompt"]["cursor_score"], 0.0, "Tier B is 0.0.4");
-    // confidence = quiescent x max(pattern, cursor) = 1.0 x 0.6, exactly.
+    assert_eq!(
+        s["prompt"]["cursor_score"], 0.9,
+        "the cursor is parked after `$ `, which is §8.6's 0.9 row"
+    );
+    // confidence = quiescent x max(pattern, cursor) = 1.0 x max(0.6, 0.9).
+    // This is the shell REQ-PD-008 exists for: the pattern rung alone left
+    // `dash` under §8.4's act threshold, and the cursor rung carries it.
     assert_history(&raw(&server, &id).await, false, false);
 
     // Degradation is silent *and* legible: REQ-DM-002 requires the history
@@ -1544,8 +1584,17 @@ async fn an_alt_screen_episode_leaves_a_dash_prompt_on_the_heuristic_tier() {
     let id = start(&server, program("dash", &[])).await;
 
     // Row 1 — no mode ever seen.
-    let before = await_settled(&server, &id, "$ ").await;
-    assert_classified(&before, "AtPrompt", "heuristic", 0.6);
+    //
+    // Sampled past §4.5's no-signal trigger, so that the byte-identical
+    // assertion at the end of this test compares two samples taken with
+    // Tier B in the *same* state. Before 0.0.4 both were trivially taken
+    // with it off; now the `less` episode below turns it on by itself
+    // (alt-screen is a trigger), and dash emits no deterministic signal,
+    // so it never turns off again. Sampling row 1 early would compare a
+    // `cursor_score: 0.0` to a `0.9` and fail for a reason that has
+    // nothing to do with availability — which is this test's subject.
+    let before = await_settled_with_cursor(&server, &id, "$ ").await;
+    assert_classified(&before, "AtPrompt", "heuristic", 0.9);
     assert_history(&raw(&server, &id).await, false, false);
 
     send(&server, &id, "seq 1 500 | less").await;
@@ -1563,8 +1612,8 @@ async fn an_alt_screen_episode_leaves_a_dash_prompt_on_the_heuristic_tier() {
 
     // Row 2 — the same prompt as row 1, with an alt-screen episode behind
     // it. Byte-identical answer required, including the scores.
-    let after = await_settled(&server, &id, "$ ").await;
-    assert_classified(&after, "AtPrompt", "heuristic", 0.6);
+    let after = await_settled_with_cursor(&server, &id, "$ ").await;
+    assert_classified(&after, "AtPrompt", "heuristic", 0.9);
     assert_eq!(
         after["prompt"], before["prompt"],
         "the episode changed the answer"
@@ -1626,15 +1675,32 @@ async fn the_heuristic_decides_at_exactly_the_threshold_on_a_real_ps2_prompt() {
         eprintln!("skipping: dash not installed");
         return;
     }
+    //
+    // **Since 0.0.4 this row can no longer observe the product it is
+    // named for, and the honest thing is to say so here rather than to
+    // assert a number that depends on how fast the machine was.** `dash`
+    // emits no deterministic signal, so §4.5 brings Tier B up three
+    // seconds in, and §8.6's cursor rung then scores the `> ` prompt 0.9
+    // — `max(0.5, 0.9)` is 0.9 and the exact-0.5 product exists only in
+    // the first three seconds of the session. The two factors it is made
+    // of are still asserted here, exactly, so a change to either is still
+    // caught; the `>=` versus `>` decision itself is pinned
+    // deterministically by the unit twin
+    // `detect::detector::tests::the_heuristic_decides_at_exactly_the_threshold_not_above_it`,
+    // which passes `cursor: None` and therefore always sees 0.5.
     let server = ClaspServer::new();
     let id = start(&server, program("dash", &[])).await;
     await_settled(&server, &id, "$ ").await;
 
     send(&server, &id, "for i in 1 2; do").await;
-    let s = await_settled(&server, &id, "> ").await;
-    assert_eq!(s["prompt"]["pattern_score"], 0.5);
+    let s = await_settled_with_cursor(&server, &id, "> ").await;
+    assert_eq!(
+        s["prompt"]["pattern_score"], 0.5,
+        "the bundled `^>\\s*$` row is what lands bit-exactly on the cut"
+    );
     assert_eq!(s["prompt"]["quiescent_score"], 1.0);
-    assert_classified(&s, "AtPrompt", "heuristic", 0.5);
+    assert_eq!(s["prompt"]["cursor_score"], 0.9);
+    assert_classified(&s, "AtPrompt", "heuristic", 0.9);
     kill(&server, &id).await;
 }
 
@@ -2357,8 +2423,20 @@ async fn a_single_leaked_dollar_byte_is_indistinguishable_from_a_dash_prompt() {
 
         // Half 1 — the real thing. `dash` drives no terminal mode, so this
         // is a T3 answer about a genuine live prompt.
-        let genuine = await_settled(&server, &id, "$ ").await;
-        assert_classified(&genuine, "AtPrompt", "heuristic", 0.6);
+        //
+        // Sampled past §4.5's no-signal trigger so that both halves are
+        // taken with the same signals available; see
+        // `await_settled_with_cursor`. **The residual this row measures got
+        // more expensive when 0.0.4 landed REQ-PD-008**, and the number
+        // below is where that is visible: the forgery and the real prompt
+        // both reach `0.9`, not `0.6`, because the cursor rung scores a
+        // parked cursor after `$ ` at 0.9 whatever put it there. §8.8
+        // records the cost of this attack as "reach `confidence >= 0.5`,
+        // which maps to `AtPrompt`", with the mitigation being that §8.4
+        // tells an agent to treat a heuristic answer as a guess — but
+        // §8.4's line for *acting* on one is 0.85, and this now clears it.
+        let genuine = await_settled_with_cursor(&server, &id, "$ ").await;
+        assert_classified(&genuine, "AtPrompt", "heuristic", 0.9);
         assert_eq!(genuine["prompt"]["pattern_score"], 0.6, "{what}");
 
         // Half 2 — a running command's output, ending in one `$`. The
