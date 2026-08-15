@@ -6,6 +6,14 @@
 # so it is exactly the kind of file an `git add -A` sweeps up.
 /test-output.log
 
+# Scratch test binaries. `zz_` is the established convention here for a
+# throwaway harness -- a race hammer, a trace probe, a leak reproduction --
+# and three have now had to be cleaned up by hand after the fact. Cargo
+# collects anything in `tests/`, so one left behind runs in CI; ignoring
+# them means a stray cannot be swept into a commit by `git add -A`, while
+# still running locally for whoever wrote it.
+crates/*/tests/zz_*.rs
+
 # graphify knowledge graph (generated; rebuilt by the post-commit hook)
 graphify-out/
 
