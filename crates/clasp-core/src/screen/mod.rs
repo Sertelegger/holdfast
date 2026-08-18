@@ -8,10 +8,12 @@
 //! line-oriented session is **off**.
 
 pub mod cursor;
+pub mod queries;
 pub mod signals;
 pub mod tracking;
 
 pub use cursor::{CursorSignal, DEFAULT_CURSOR_STABLE_SAMPLES, DEFAULT_PROMPT_CHARS};
+pub use queries::{QueryResponder, DEFAULT_TERMINAL_QUERY_REPLIES_PER_MIN};
 pub use tracking::{EnableReason, ScreenTracking, TrackingPolicy};
 
 use crate::buffer::OutputBuffer;

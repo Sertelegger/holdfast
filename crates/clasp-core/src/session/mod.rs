@@ -12,7 +12,10 @@ use crate::output::{
     OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
 };
 use crate::pty::{PtyBackend, Signal};
-use crate::screen::{CursorSignal, ScreenCapture, ScreenConfig, ScreenTracker};
+use crate::screen::{
+    CursorSignal, QueryResponder, ScreenCapture, ScreenConfig, ScreenTracker,
+    DEFAULT_TERMINAL_QUERY_REPLIES_PER_MIN,
+};
 use crate::{ClaspError, Result};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -86,6 +89,14 @@ pub struct SessionConfig {
     /// When set, CLASP types the shell's OSC 133 integration snippet into
     /// the session at start-up (spec §8.5).
     pub shell_integration: Option<Shell>,
+    /// §4.2 `terminal_queries`, default **true**. `false` accepts the
+    /// §4.5.1 stall in exchange for writing nothing into the child's
+    /// input — the knob exists for a session that must be byte-exact
+    /// about what enters the child, and it is off by default in no
+    /// configuration.
+    pub terminal_queries: bool,
+    /// §4.2 `terminal_query_replies_per_min`, default **60**.
+    pub terminal_query_replies_per_min: u32,
 }
 
 impl Default for SessionConfig {
@@ -95,6 +106,8 @@ impl Default for SessionConfig {
             detection: DetectionConfig::default(),
             history_max_entries: DEFAULT_MAX_ENTRIES,
             shell_integration: None,
+            terminal_queries: true,
+            terminal_query_replies_per_min: DEFAULT_TERMINAL_QUERY_REPLIES_PER_MIN,
         }
     }
 }
@@ -269,6 +282,13 @@ impl Session {
         let weak_history = Arc::downgrade(&history);
         let activity = Arc::clone(&last_activity_ms);
         let reader_backend = Arc::clone(&backend);
+        // §4.5.1's responder is used from the reader thread alone, so it
+        // needs no `Mutex` and no `Weak` — it is moved into the closure
+        // and owned there for the life of the session.
+        let mut responder = QueryResponder::new(
+            config.terminal_queries,
+            config.terminal_query_replies_per_min,
+        );
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             // A read error ends the output stream, so `while let Ok` is
@@ -336,6 +356,29 @@ impl Session {
                     .lock()
                     .feed(base, &buf[..n], Instant::now(), &*buffer);
                 drop(buffer);
+
+                // §4.5.1: answer Primary DA and nothing else. Written
+                // through the backend directly and **never** through
+                // `Session::write_input` — that is the agent's path and
+                // it stamps `last_activity`, which would make a session a
+                // child is querying in a loop immortal (REQ-TS-009). It
+                // is also not a `send_input` audit event and never a
+                // command-history entry, both of which follow from the
+                // write never reaching `mcp::tools`: this block holds no
+                // `AuditLog`, no `ClaspServer` and no `Session`.
+                //
+                // The placement is not free. After the buffer push and
+                // the fan-out, so the query's own bytes are in the ring
+                // and published to `wait_for_pattern` subscribers before
+                // the reply is written; before the detector feed, so a
+                // reply cannot be reordered behind a classification that
+                // the reply's own echo might change.
+                for reply in responder.feed(&buf[..n], Instant::now()) {
+                    // A closed master is the ordinary end of a session,
+                    // not an error worth logging: the loop's own read
+                    // will end it on the next pass.
+                    let _ = reader_backend.write(reply);
+                }
 
                 // Detection runs outside the buffer lock: §4.3's invariant
                 // is that no lock is held across work that can block, and
@@ -1806,6 +1849,10 @@ mod tests {
         // Each assertion below is chosen to fail if its field is defaulted
         // *or* transposed with the other one.
         let mut bytes = Vec::new();
+        // Two DA1 queries, first so nothing below them can disturb the
+        // "last logical line" the pattern assertion reads. The reply
+        // budget is 1, so exactly one of them is answered.
+        bytes.extend_from_slice(b"\x1b[0c\x1b[0c");
         for i in 0..3u8 {
             bytes.extend_from_slice(b"\x1b]133;B\x07cmd");
             bytes.push(b'0' + i);
@@ -1838,6 +1885,17 @@ mod tests {
                     ..DetectionConfig::default()
                 },
                 shell_integration: None,
+                // §4.5.1's two knobs, exhaustively named here for the
+                // reason the whole test exists: `terminal_queries: bool`
+                // sits beside `shell_integration: Option<Shell>` and
+                // `terminal_query_replies_per_min: u32` beside
+                // `history_max_entries: usize`, and same-typed neighbours
+                // transpose silently. The `\x1b[0c` in `bytes` above is
+                // what makes the first one reachable, and the limit is
+                // set to 1 so that a value that never arrived (the
+                // default is 60) answers both queries instead of one.
+                terminal_queries: true,
+                terminal_query_replies_per_min: 1,
             },
         );
         pty.queue_output(&bytes);
@@ -1867,6 +1925,299 @@ mod tests {
             (s.detection().pattern_score - 0.9).abs() < 1e-6,
             "the session's own pattern table was not used"
         );
+        // Both §4.5.1 knobs, and each one fails differently: a defaulted
+        // `terminal_queries` is still `true` so the count would be right
+        // for the wrong reason — which is why the *limit* is what is
+        // asserted. Two queries and a budget of one gives exactly one
+        // reply; a defaulted budget of 60 gives two, and a
+        // `terminal_queries` that never reached the responder gives none.
+        assert_eq!(
+            pty.written(),
+            b"\x1b[?6c",
+            "terminal_queries / terminal_query_replies_per_min did not \
+             reach the responder"
+        );
+    }
+
+    /// §4.5.1's reply, byte for byte.
+    const DA1_REPLY: &[u8] = b"\x1b[?6c";
+
+    /// A session over `pty` with the §4.5.1 knobs set explicitly.
+    fn query_session(pty: &Arc<MockPty>, terminal_queries: bool) -> Arc<Session> {
+        Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(pty) as Arc<dyn PtyBackend>,
+            SessionConfig {
+                terminal_queries,
+                ..SessionConfig::with_buffer_capacity(4096)
+            },
+        )
+    }
+
+    /// §4.5.1's reply reaches the child, and it is the only thing written.
+    ///
+    /// `SessionConfig::default()` sets `shell_integration: None`, so
+    /// `written()` is empty until the reply lands — anything else in it is
+    /// a second writer nobody declared.
+    #[test]
+    fn a_da1_query_from_the_child_is_answered_on_the_pty() {
+        let pty = Arc::new(MockPty::new());
+        let s = query_session(&pty, true);
+        pty.queue_output(b"\x1b[0c");
+        wait_until("the reply to reach the child", || {
+            pty.written() == DA1_REPLY
+        });
+        drop(s);
+    }
+
+    /// The negative half, at the session level: a declined query travels
+    /// the same reader path and must produce **no write at all**. Without
+    /// it the test above passes identically against a session that answers
+    /// everything, which is the outcome §4.5.1's admission rule exists to
+    /// prevent.
+    #[test]
+    fn a_declined_query_from_the_child_is_answered_with_silence() {
+        let pty = Arc::new(MockPty::new());
+        let s = query_session(&pty, true);
+        // CPR — §4.5.1's worked example of the rule saying no — followed
+        // by a DA1 the reader must still answer, which is what proves the
+        // silence above was a decision and not a dead reply path.
+        pty.queue_output(b"\x1b[6n\x1b]11;?\x07\x1b[>0q");
+        wait_for_bytes(&s, 15);
+        assert!(
+            pty.written().is_empty(),
+            "a declined query was answered: {:?}",
+            pty.written()
+        );
+        pty.queue_output(b"\x1b[0c");
+        wait_until("DA1 to still be answered", || pty.written() == DA1_REPLY);
+    }
+
+    /// §4.2's `terminal_queries` knob, both arms in one test: `false` must
+    /// be indistinguishable from a build with no reply path, and the
+    /// positive arm is what stops that from passing against exactly such a
+    /// build.
+    #[test]
+    fn terminal_queries_false_writes_nothing_into_the_child() {
+        let off = Arc::new(MockPty::new());
+        let s_off = query_session(&off, false);
+        off.queue_output(b"\x1b[0c");
+        wait_for_bytes(&s_off, 4);
+        // The reader stamps activity at the end of the chunk's iteration,
+        // strictly after the point the reply would have been written, so
+        // waiting for the stamp is waiting past the write site.
+        wait_until("the chunk's iteration to complete", || {
+            s_off.last_activity_ms() > 0
+        });
+        assert!(
+            off.written().is_empty(),
+            "terminal_queries: false wrote {:?} into the child",
+            off.written()
+        );
+
+        let on = Arc::new(MockPty::new());
+        let s_on = query_session(&on, true);
+        on.queue_output(b"\x1b[0c");
+        wait_until("the same bytes to be answered when the knob is on", || {
+            on.written() == DA1_REPLY
+        });
+        drop((s_off, s_on));
+    }
+
+    /// A backend that samples the session's activity stamp **at the moment
+    /// each write reaches the child**, which is the one instant at which
+    /// the reply's write path is distinguishable from the reader's own
+    /// end-of-chunk stamp.
+    struct ActivityProbe {
+        inner: Arc<MockPty>,
+        session: Mutex<Option<std::sync::Weak<Session>>>,
+        samples: Mutex<Vec<i64>>,
+    }
+
+    impl ActivityProbe {
+        fn new(inner: Arc<MockPty>) -> Self {
+            Self {
+                inner,
+                session: Mutex::new(None),
+                samples: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// `Weak`, not `Arc`: the probe outlives nothing and must not keep
+        /// the session alive, or `the_reader_thread_exits_when_the_session_is_dropped`
+        /// becomes a lie for every test that uses this.
+        fn watch(&self, s: &Arc<Session>) {
+            *self.session.lock() = Some(Arc::downgrade(s));
+        }
+
+        fn samples(&self) -> Vec<i64> {
+            self.samples.lock().clone()
+        }
+    }
+
+    impl PtyBackend for ActivityProbe {
+        fn write(&self, data: &[u8]) -> Result<()> {
+            // `now_ms()` has millisecond resolution, so two writes in the
+            // same iteration would otherwise tie and a stamp taken between
+            // them would be invisible.
+            std::thread::sleep(Duration::from_millis(2));
+            let stamp = self
+                .session
+                .lock()
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .map(|s| s.last_activity_ms());
+            if let Some(stamp) = stamp {
+                self.samples.lock().push(stamp);
+            }
+            self.inner.write(data)
+        }
+        fn read(&self, buf: &mut [u8]) -> Result<usize> {
+            self.inner.read(buf)
+        }
+        fn signal(&self, sig: Signal) -> Result<()> {
+            self.inner.signal(sig)
+        }
+        fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+            self.inner.resize(cols, rows)
+        }
+        fn is_alive(&self) -> bool {
+            self.inner.is_alive()
+        }
+        fn exit_code(&self) -> Option<i32> {
+            self.inner.exit_code()
+        }
+        fn pid(&self) -> Option<u32> {
+            self.inner.pid()
+        }
+    }
+
+    /// REQ-TS-009: a reply is CLASP's own answer, not agent input, and it
+    /// stamps nothing.
+    ///
+    /// **Why the probe rather than a stamp read after the fact.** The
+    /// reader already stamps `last_activity` once per chunk — the child's
+    /// own output is activity, which §4.5.1 says in as many words — and
+    /// that stamp lands *after* the reply write, so a reply routed through
+    /// `Session::write_input` is invisible to any reading taken once the
+    /// iteration has finished. It is visible between two replies in the
+    /// same chunk: `write_input` stamps after each write returns, so the
+    /// second write sees a stamp the correct path never produces. Two
+    /// queries in one chunk is therefore the arrangement, and one is not.
+    #[test]
+    fn answering_a_query_does_not_bump_last_activity() {
+        let mock = Arc::new(MockPty::new());
+        let probe = Arc::new(ActivityProbe::new(Arc::clone(&mock)));
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&probe) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(4096),
+        );
+        probe.watch(&s);
+        let before = s.last_activity_ms();
+
+        mock.queue_output(b"\x1b[0c\x1b[0c");
+        wait_until("both replies to reach the child", || {
+            probe.samples().len() == 2
+        });
+        for (i, stamp) in probe.samples().into_iter().enumerate() {
+            assert_eq!(
+                stamp, before,
+                "reply {i} was written by a path that stamped last_activity"
+            );
+        }
+
+        // The negative arm, in the same test: without it this passes
+        // against a session whose clock never moves at all.
+        let seen = probe.samples().len();
+        std::thread::sleep(Duration::from_millis(2));
+        s.write_input(b"x").expect("write_input");
+        assert!(
+            s.last_activity_ms() > before,
+            "agent input did not advance the stamp either, so the \
+             assertion above proves nothing"
+        );
+        assert_eq!(
+            probe.samples().len(),
+            seen + 1,
+            "the probe stopped observing writes"
+        );
+    }
+
+    /// REQ-TS-009's immortality clause, on the reaper's terms.
+    ///
+    /// There is no reaper in the tree yet, so "past its deadline" is the
+    /// arithmetic one will use: `now - last_activity >= idle`. The clause
+    /// this pins is that the deadline runs from the **child's own output**
+    /// and the replies add nothing after it — a reply path that stamped
+    /// would leave a queried session's deadline running from whenever
+    /// CLASP last answered rather than from when the child last spoke.
+    #[test]
+    fn a_session_whose_only_traffic_is_queries_still_reaps_on_schedule() {
+        const IDLE_MS: i64 = 60;
+        let past_deadline = |s: &Session| now_ms() - s.last_activity_ms() >= IDLE_MS;
+
+        // Queried, then quiet.
+        let queried_pty = Arc::new(MockPty::new());
+        let queried = query_session(&queried_pty, true);
+        for _ in 0..8 {
+            queried_pty.queue_output(b"\x1b[0c");
+        }
+        wait_until("every query to be answered", || {
+            queried_pty.written().len() == 8 * DA1_REPLY.len()
+        });
+
+        // Ordinary output on a schedule, which is the control: a session
+        // still being spoken to is *not* past its deadline, so an
+        // implementation whose stamp never advances cannot pass both arms.
+        let busy_pty = Arc::new(MockPty::new());
+        let busy = query_session(&busy_pty, true);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !past_deadline(&queried) && Instant::now() < deadline {
+            busy_pty.queue_output(b".");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            past_deadline(&queried),
+            "a session whose only traffic was queries never went idle: \
+             answering is extending its deadline"
+        );
+        assert!(
+            !past_deadline(&busy),
+            "the control session went idle while it was still being \
+             written to, so the arm above proves nothing"
+        );
+    }
+
+    /// REQ-TS-009: a reply is never a command-history entry.
+    #[test]
+    fn a_query_reply_is_not_a_command_history_entry() {
+        let pty = Arc::new(MockPty::new());
+        let s = query_session(&pty, true);
+        for _ in 0..5 {
+            pty.queue_output(b"\x1b[0c");
+        }
+        wait_until("all five replies to reach the child", || {
+            pty.written().len() == 5 * DA1_REPLY.len()
+        });
+        assert_eq!(s.command_count(), 0, "a reply was folded into a command");
+        assert!(s.command_history(0, 10).is_empty());
+
+        // The negative, on the same session: one real OSC 133 cycle
+        // records exactly one entry, so an always-empty ring cannot pass
+        // the arm above.
+        pty.queue_output(
+            b"\x1b]133;A\x07\x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07",
+        );
+        wait_until("the OSC 133 cycle to be folded", || s.command_count() == 1);
+        assert_eq!(s.command_history(0, 10).len(), 1);
     }
 
     fn grid(capture: ScreenCapture) -> ScreenGrid {

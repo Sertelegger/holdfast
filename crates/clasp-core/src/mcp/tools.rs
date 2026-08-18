@@ -174,6 +174,11 @@ pub struct StartSessionArgs {
     /// or fish. Defaults to true.
     #[serde(default)]
     pub shell_integration: Option<bool>,
+    /// Answer the closed terminal-query set (Primary Device Attributes
+    /// only). Defaults to true; `false` accepts the startup stall — 10 s
+    /// for fish — in exchange for writing nothing into the child's input.
+    #[serde(default)]
+    pub terminal_queries: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -304,6 +309,10 @@ impl ClaspServer {
             } else {
                 None
             },
+            // §4.2/§4.5.1. The per-session half of a knob §4.2 lists as
+            // "global config + per-session"; 0.0.5 brings the config file
+            // and with it the global half.
+            terminal_queries: args.terminal_queries.unwrap_or(true),
             ..SessionConfig::default()
         };
 
