@@ -116,7 +116,10 @@ pub const MAX_ROWS: u16 = 1000;
 /// every caller applies it **before** the backend call and stores the
 /// clamped pair as the session's size.
 pub fn clamp_geometry(cols: u16, rows: u16) -> (u16, u16) {
-    (cols.clamp(MIN_COLS, MAX_COLS), rows.clamp(MIN_ROWS, MAX_ROWS))
+    (
+        cols.clamp(MIN_COLS, MAX_COLS),
+        rows.clamp(MIN_ROWS, MAX_ROWS),
+    )
 }
 
 /// The slave's line-discipline flags, read from **one** `tcgetattr` on the

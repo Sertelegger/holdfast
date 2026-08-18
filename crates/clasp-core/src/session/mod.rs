@@ -2553,16 +2553,25 @@ mod tests {
         // otherwise decide what the next one does.
         for (name, stream) in [
             ("narrow wrap", "abcdefghijklmnopqrstuvwxyz".as_bytes()),
-            ("wide characters", "\u{4f60}\u{597d}\u{4e16}\u{754c}".as_bytes()),
+            (
+                "wide characters",
+                "\u{4f60}\u{597d}\u{4e16}\u{754c}".as_bytes(),
+            ),
             ("newlines", b"a\r\nb\r\nc\r\nd\r\n"),
             ("tabs", b"a\tb\tc\td\t"),
-            ("one-row scroll region", b"\x1b[1;1r\x1b[2Jabc\r\ndef\r\nghi"),
+            (
+                "one-row scroll region",
+                b"\x1b[1;1r\x1b[2Jabc\r\ndef\r\nghi",
+            ),
             ("reverse index", b"\x1bMabc\x1bM\x1bDdef\x1bE\x1bE"),
             (
                 "off-screen cursor moves",
                 b"\x1b[99;99H\x1b[2Jx\x1b[9A\x1b[9B\x1b[9C\x1b[9D\x1b[H\x1b[K",
             ),
-            ("insert and delete", b"\x1b[2Jabc\x1b[9L\x1b[9M\x1b[9P\x1b[9@"),
+            (
+                "insert and delete",
+                b"\x1b[2Jabc\x1b[9L\x1b[9M\x1b[9P\x1b[9@",
+            ),
             ("alt screen", b"\x1b[?1049habcdef\r\nghi\x1b[?1049ljkl"),
         ] {
             let (s, pty) = painted_session(ScreenTracking::On);
