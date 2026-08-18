@@ -3,8 +3,10 @@
 //! Wire format, normative: a 4-byte **big-endian** unsigned length,
 //! followed by exactly that many bytes of CBOR. The length is exclusive
 //! of the four prefix bytes. A frame body larger than
-//! [`MAX_FRAME_BYTES`] is refused at the codec boundary and the
-//! connection is closed.
+//! [`MAX_FRAME_BYTES`] is refused at the codec boundary and the caller
+//! must close the connection (§7.4) — nothing in this module closes
+//! anything, and which codes close is [`super::method::ErrorCode::closes_connection`]'s
+//! answer, not this one's.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -21,11 +23,19 @@ pub const LENGTH_PREFIX_BYTES: usize = 4;
 /// cannot split a secret at its boundary.** Stated because the obvious
 /// justification is on the wrong side: "`read_output` is bounded by the
 /// 1 MiB buffer cap" bounds this frame's *input*, not the frame.
-/// Redaction can make a body **grow** — `[REDACTED:aws-access-key-id]`
-/// is longer than the twenty bytes of `AKIAIOSFODNN7EXAMPLE` it
-/// replaces — so a post-redaction container sized by a pre-redaction
-/// argument is unsound reasoning even where, as here, the 16x headroom
-/// makes it unreachable. Do not restore the shorter comment.
+/// Redaction can make a body **grow**, and the shipped rules reach it:
+/// `database-connection-password` captures only the password inside
+/// `postgres://svc:<pw>@host` and replaces it with the 28-byte
+/// `[REDACTED:connection-string]`, so a one-byte password grows 28x
+/// (`output::redact`'s
+/// `a_connection_string_keeps_its_host_and_loses_its_password`). A
+/// post-redaction container sized by a pre-redaction argument is
+/// therefore unsound reasoning even where, as here, the 16x headroom
+/// makes it unreachable. Do not restore the shorter comment — and do
+/// not reach for an `AKIA…` example, which is the trap this comment
+/// fell into once: a marker names the rule's **`kind`**, never its
+/// `name`, so `aws-access-key-id` yields `[REDACTED:aws]` and the
+/// twenty bytes of `AKIAIOSFODNN7EXAMPLE` *shrink* to fourteen.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -79,6 +89,13 @@ where
 /// declared length yields [`FrameError::TooLarge`] *without* reading or
 /// allocating the body — the caller must close the connection, which is
 /// what §7.4 requires anyway.
+///
+/// An *in*-limit declared length is allocated up front, so four
+/// attacker-chosen bytes buy up to 16 MiB of zeroed buffer per
+/// connection before a body byte arrives. Accepted rather than
+/// mitigated: `SO_PEERCRED` has already established that the peer is
+/// this same uid (`daemon::peer`), so the attacker is the owner. A
+/// chunked read with a growing buffer is the fix if that ever changes.
 pub async fn read_frame<R, T>(r: &mut R) -> Result<T, FrameError>
 where
     R: AsyncRead + Unpin,
@@ -126,12 +143,22 @@ mod tests {
         // CBOR was chosen over JSON because PTY output is arbitrary bytes
         // (§7.4). A codec that lost the 8-bit range — or that widened
         // bytes into an array of integers — fails the variant assertion.
+        //
+        // The variant assertion comes **first** on purpose. Behind
+        // `assert_eq!(back, payload)` it is a tautology — anything that
+        // widened bytes into an array has already reddened the equality
+        // — so it could not fail and read as coverage it did not add.
         let payload = Cbor::Bytes((0u8..=255).collect());
         let mut buf = Vec::new();
         write_frame(&mut buf, &payload).await.unwrap();
         let back: Cbor = read_frame(&mut buf.as_slice()).await.unwrap();
+        // No `{back:?}` in the message: a widened array prints 256
+        // entries and buries the one word that matters.
+        assert!(
+            matches!(back, Cbor::Bytes(ref b) if b.len() == 256),
+            "still a 256-byte bstr, not an array of integers"
+        );
         assert_eq!(back, payload);
-        assert!(matches!(back, Cbor::Bytes(ref b) if b.len() == 256));
     }
 
     #[tokio::test]
@@ -178,10 +205,55 @@ mod tests {
         );
     }
 
+    /// A CBOR byte string longer than 65535 encodes as `0x5a` plus a
+    /// four-byte length, so its body is the payload plus five. Named
+    /// because both cap tests below size a payload to land the *body*
+    /// on an exact boundary, and a wrong constant here would silently
+    /// test the wrong size rather than fail.
+    const BSTR_HEADER_BYTES: usize = 5;
+
     #[test]
     fn oversized_body_is_refused_on_encode() {
         let big = Cbor::Bytes(vec![0u8; MAX_FRAME_BYTES + 1]);
-        assert!(matches!(encode(&big), Err(FrameError::TooLarge { .. })));
+        // The `len` pin matches the read-side twin above: without it a
+        // mutation that reports the wrong length on the encode path
+        // survives. The body is the payload plus the bstr header.
+        let r = encode(&big);
+        assert!(
+            matches!(r, Err(FrameError::TooLarge { len })
+                if len == MAX_FRAME_BYTES + 1 + BSTR_HEADER_BYTES),
+            "got {:?}",
+            r.err()
+        );
+    }
+
+    #[test]
+    fn a_body_of_exactly_the_cap_is_encoded_not_refused() {
+        // §7.4's bound is **exclusive**: `length > 16 MiB` is refused,
+        // `length == 16 MiB` is not, and both peers must agree to the
+        // byte. Every other size test here uses `MAX_FRAME_BYTES + 1`,
+        // which is green under `>` and under `>=` alike; this is the
+        // assertion that separates them on the encode path.
+        let payload = MAX_FRAME_BYTES - BSTR_HEADER_BYTES;
+        let frame = encode(&Cbor::Bytes(vec![0u8; payload]))
+            .expect("a body of exactly the cap is legal, not TooLarge");
+        assert_eq!(
+            frame.len() - LENGTH_PREFIX_BYTES,
+            MAX_FRAME_BYTES,
+            "the fixture must land on the cap exactly, or the expect above proves nothing"
+        );
+        assert_eq!(frame[LENGTH_PREFIX_BYTES], 0x5a, "bstr, 4-byte length");
+    }
+
+    #[tokio::test]
+    async fn a_declared_length_of_exactly_the_cap_is_not_refused() {
+        // The read-side twin of the test above, and the same mutant:
+        // `len > MAX_FRAME_BYTES` versus `len >= MAX_FRAME_BYTES`. Only
+        // the prefix is on the wire, so the body read runs out and
+        // yields Eof — the point is that it is *not* TooLarge.
+        let prefix = (MAX_FRAME_BYTES as u32).to_be_bytes();
+        let r: Result<Cbor, _> = read_frame(&mut &prefix[..]).await;
+        assert!(matches!(r, Err(FrameError::Eof)), "got {r:?}");
     }
 
     #[tokio::test]

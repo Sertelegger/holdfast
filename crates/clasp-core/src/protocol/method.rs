@@ -98,14 +98,26 @@ impl ErrorCode {
     /// `limit_reached` is **not** retriable and §18.3 says why in as many
     /// words: *"nothing the caller can do makes room; the operator
     /// revokes or waits for a TTL"*. A caller that retried it would spin.
+    ///
+    /// §18.3 writes the retriable cell as *"true (after restart)"*, and
+    /// the qualifier is lost here because §7.4.1 makes the wire field a
+    /// bare `bool` — there is nowhere to put it. It is recorded instead:
+    /// the retry must follow a **reconnect**, since the connection this
+    /// code arrived on is being torn down. A client that retries
+    /// immediately on the same socket spins.
     pub fn retriable(self) -> bool {
         matches!(self, Self::DaemonShuttingDown)
     }
 
     /// Whether the connection must be closed after emitting this code.
     /// `unknown_method`, `bad_params` and `limit_reached` are per-request
-    /// faults and leave the connection usable; the other three mean the
-    /// peer is mis-framing or unwelcome (§7.4, §18.3).
+    /// faults and leave the connection usable; `frame_too_large`,
+    /// `no_handshake` and `protocol_violation` mean the peer is
+    /// mis-framing or unwelcome (§7.4, §18.3). `daemon_shutting_down` is
+    /// in neither group and answers `false` deliberately: the daemon
+    /// does close that connection, but on its own schedule and not on
+    /// this code's account, so a peer must not read the code as the
+    /// instruction.
     ///
     /// `limit_reached` is in the *first* group deliberately. §18.3 marks
     /// only `frame_too_large` as closing, and the caller that meets
@@ -209,6 +221,13 @@ impl Response {
         }
     }
 
+    /// Whether this is a §7.4.1 **transport**-level error response.
+    ///
+    /// Scope matters: this answers the control protocol's two-valued
+    /// `status` (`"ok"` / `"error"`), not §18.1's tool-status vocabulary.
+    /// A tool-passthrough response carrying `status: "session_not_found"`
+    /// is a *successful* control exchange and answers `false` here;
+    /// `envelope::status_is_error` is the §18.1 question.
     pub fn is_error(&self) -> bool {
         self.status == "error"
     }
@@ -244,6 +263,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn method_names_are_the_7_4_1_catalogue_strings() {
+        // Both peers are built from this crate, so every other use in
+        // this milestone and the ones after it is `method::METHOD_*`
+        // against `method::METHOD_*`. A typo in a const round-trips
+        // against itself perfectly and fails only against a peer built
+        // from §7.4.1 — verbatim the argument `frame.rs` makes for the
+        // big-endian length prefix, one layer up. The **literals** are
+        // the pinning; replacing them with the constants deletes the
+        // test while leaving it green.
+        assert_eq!(METHOD_HANDSHAKE, "clasp/handshake");
+        assert_eq!(METHOD_DAEMON_STATUS, "daemon/status");
+        assert_eq!(METHOD_DAEMON_STOP, "daemon/stop");
+        assert_eq!(TOOL_METHOD_PREFIX, "tool/");
+    }
+
+    #[test]
+    fn frame_bodies_are_cbor_maps_keyed_by_the_7_4_1_field_names() {
+        // §7.4 is normative on the body — `{ id, method, params }` and
+        // `{ id, status, data, details }` — and §7.4.1 adds that "the
+        // wire form is CBOR with the same field names".
+        //
+        // The round-trip tests below cannot see this: they encode and
+        // decode through the *same* derived serde impls, so they stay
+        // green against integer keys, a `#[serde(rename_all)]`, or a
+        // ciborium change to how it represents structs. Decoding the
+        // body as a raw CBOR map is the only formulation that fails
+        // against a peer built from §7.4.1. A **set** comparison is
+        // right here: §7.4 fixes the field names, not a map order.
+        fn field_names<T: Serialize>(value: &T) -> Vec<String> {
+            let framed = frame::encode(value).unwrap();
+            let body: CborValue = frame::decode(&framed[frame::LENGTH_PREFIX_BYTES..]).unwrap();
+            let CborValue::Map(entries) = body else {
+                panic!("§7.4's body is a map, got {body:?}")
+            };
+            let mut keys: Vec<String> = entries
+                .iter()
+                .map(|(k, _)| {
+                    k.as_text()
+                        .expect("text keys — an integer-keyed map is a different wire format")
+                        .to_owned()
+                })
+                .collect();
+            keys.sort_unstable();
+            keys
+        }
+
+        assert_eq!(
+            field_names(&Request::new(1, "tool/read_output", &probe()).unwrap()),
+            ["id", "method", "params"]
+        );
+        assert_eq!(
+            field_names(&Response::ok(1, &probe(), "done").unwrap()),
+            ["data", "details", "id", "status"]
+        );
+    }
+
+    #[test]
+    fn tool_name_strips_the_prefix_and_answers_none_for_every_other_method() {
+        // The positive case alone is passed by a mutant returning
+        // `self.method.rsplit('/').next()`, which would then report
+        // `daemon/status` as tool `status` — and 0.0.2 ships a `status`
+        // MCP tool, so that mutant routes a daemon-internal method into
+        // the tool dispatcher. The negatives are what separate a prefix
+        // strip from a last-segment split.
+        let tool = Request::new(1, "tool/read_output", &()).unwrap();
+        assert_eq!(tool.tool_name(), Some("read_output"));
+
+        for method in [METHOD_HANDSHAKE, METHOD_DAEMON_STATUS, METHOD_DAEMON_STOP] {
+            let req = Request::new(2, method, &()).unwrap();
+            assert_eq!(req.tool_name(), None, "{method} is not a tool method");
+        }
+    }
+
     #[tokio::test]
     async fn request_survives_a_frame_round_trip_with_typed_params() {
         let req = Request::new(7, "tool/read_output", &probe()).unwrap();
@@ -269,23 +362,49 @@ mod tests {
         assert_eq!(back.data_as::<Probe>().unwrap(), probe());
     }
 
-    #[test]
-    fn error_response_carries_the_catalogued_code_and_retriability() {
-        let r = Response::error(3, ErrorCode::DaemonShuttingDown, "stopping");
+    #[tokio::test]
+    async fn error_response_carries_the_catalogued_code_and_retriability() {
+        // Round-tripped through the frame codec rather than inspected in
+        // memory: this payload is what every failure path on the wire
+        // sends, and only the `ok` response was proven to survive it.
+        let sent = Response::error(3, ErrorCode::DaemonShuttingDown, "stopping");
+        let mut buf = Vec::new();
+        frame::write_frame(&mut buf, &sent).await.unwrap();
+        let r: Response = frame::read_frame(&mut buf.as_slice()).await.unwrap();
+        assert_eq!(r, sent);
+
         let e = r.control_error().expect("error payload");
         assert_eq!(e.code, "daemon_shutting_down");
         assert_eq!(e.message, "stopping");
         assert!(e.retriable, "§18.3 marks this code retriable");
         assert_eq!(r.details, "stopping");
+        assert!(r.is_error());
 
         let r = Response::error(4, ErrorCode::BadParams, "nope");
         assert!(!r.control_error().unwrap().retriable);
     }
 
     #[test]
-    fn ok_responses_have_no_control_error_payload() {
-        let r = Response::ok(1, &probe(), "").unwrap();
-        assert!(r.control_error().is_none());
+    fn an_ok_response_has_no_control_error_even_when_its_data_is_shaped_like_one() {
+        // The fixture is adversarial on purpose. With `probe()` as the
+        // data this test is green even with `control_error`'s
+        // `if !self.is_error()` guard **deleted** — a `Probe` fails to
+        // deserialise as a `ControlError` anyway, so `.ok()` yields
+        // `None` either way, and the test would be asserting that a
+        // `Probe` is not shaped like a `ControlError` rather than that
+        // the *status* decides. A payload that decodes cleanly leaves
+        // the status as the only thing that can answer.
+        let payload = ControlError {
+            code: ErrorCode::BadParams.as_str().into(),
+            message: "m".into(),
+            retriable: false,
+        };
+        let r = Response::ok(1, &payload, "").unwrap();
+        assert!(
+            r.data_as::<ControlError>().is_ok(),
+            "the fixture must decode as a ControlError, or the assertion below is vacuous"
+        );
+        assert!(r.control_error().is_none(), "status decides, not shape");
     }
 
     #[test]
@@ -316,30 +435,40 @@ mod tests {
             "§18.3's rows, in §18.3's order"
         );
 
-        // The negative that separates "in order" from "the right set".
-        // If §18.3 happened to be alphabetical the assertion above could
-        // not tell one from the other; it is not, and this row is what
-        // says so out loud rather than leaving it to be noticed.
-        let mut sorted = seen.clone();
-        sorted.sort_unstable();
-        assert_ne!(
-            sorted, seen,
-            "§18.3 is not in alphabetical order, so the assertion above \
-             is a sequence check and not a disguised set comparison"
-        );
+        // The literal above is deliberately not in alphabetical order,
+        // which is what makes it a *sequence* check rather than a
+        // disguised set comparison. An earlier draft said so with
+        // `assert_ne!(sorted, seen)` — a line that cannot fail, because
+        // the `assert_eq!` above already pins `seen` to a literal that
+        // is not sorted, so any mutation reaching it has panicked one
+        // assertion earlier. Its only reachable future was a red on
+        // correct code if §18.3 were ever reordered alphabetically.
+        // Demoted to this comment rather than left as dead ceremony.
+    }
 
-        // §18.3's "Retriable" column: exactly one row is true, and it is
-        // `daemon_shutting_down`. Naming both ends stops a mutation that
-        // moves which row is true from passing the count.
+    // §18.3's "Retriable" and closing columns are separate tests, not
+    // more assertions on the sequence test above: they are independent
+    // properties, and the plan's own step asks for two of them to go red
+    // under one mutation — which the first panic would hide if they
+    // shared a test.
+
+    #[test]
+    fn exactly_daemon_shutting_down_is_the_retriable_row() {
+        // Naming both ends — the count and the two named rows — stops a
+        // mutation that *moves* which row is true from passing on the
+        // count alone.
         assert_eq!(ErrorCode::ALL.iter().filter(|c| c.retriable()).count(), 1);
         assert!(ErrorCode::DaemonShuttingDown.retriable());
         assert!(!ErrorCode::LimitReached.retriable());
+    }
 
-        // §18.3's closing column: exactly three codes close, and
-        // `limit_reached` is not one of them. Without this arm the new
-        // variant could join `closes_connection`'s `matches!` unnoticed,
-        // and a full bridge table would drop a control connection the
-        // caller still needs for every other method.
+    #[test]
+    fn exactly_three_codes_close_the_connection() {
+        // §18.3's closing column, and `limit_reached` is not in it.
+        // Without this the new variant could join `closes_connection`'s
+        // `matches!` unnoticed, and a full bridge table would drop a
+        // control connection the caller still needs for every other
+        // method. A sequence assertion again, for the same reason.
         let closing: Vec<&str> = ErrorCode::ALL
             .iter()
             .filter(|c| c.closes_connection())
@@ -366,15 +495,32 @@ mod tests {
     async fn params_carry_raw_bytes_intact() {
         // The reason §7.4 chose CBOR. A JSON transport would have to
         // base64 this, and the equality below would fail.
+        //
+        // The bstr is wrapped in a one-entry map because §7.4 declares
+        // `params: object`; a top-level `CborValue::Bytes` is a shape
+        // the wire format does not permit, and the next reader would
+        // copy it.
         let raw = vec![0x00, 0x1b, 0x5b, 0xff, 0x7f];
+        let params = CborValue::Map(vec![(
+            CborValue::Text("data".into()),
+            CborValue::Bytes(raw.clone()),
+        )]);
         let req = Request {
             id: 1,
             method: "tool/send_input".into(),
-            params: CborValue::Bytes(raw.clone()),
+            params: params.clone(),
         };
         let mut buf = Vec::new();
         frame::write_frame(&mut buf, &req).await.unwrap();
         let back: Request = frame::read_frame(&mut buf.as_slice()).await.unwrap();
-        assert_eq!(back.params, CborValue::Bytes(raw));
+        let CborValue::Map(entries) = &back.params else {
+            panic!("§7.4's params is an object, got {:?}", back.params)
+        };
+        assert_eq!(
+            entries[0].1,
+            CborValue::Bytes(raw),
+            "still a bstr, not an array of integers"
+        );
+        assert_eq!(back.params, params);
     }
 }
