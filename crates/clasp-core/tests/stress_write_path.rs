@@ -40,6 +40,30 @@ const BUFFER_BYTES: usize = 64 * 1024;
 /// OSC 133, so nothing in it is a Tier-B trigger — while the Tier-A
 /// scanner still has real escape sequences to walk.
 struct StreamPty {
+    /// Set by `arm()`, which the caller runs **after**
+    /// `set_screen_config`. Until then `read` produces nothing at all.
+    ///
+    /// **This closes a race, and the race is the reason `parsed == 0` went
+    /// red on a 2-vCPU CI runner at 85,342,208 bytes.** `Session::new`
+    /// starts the reader thread and the caller runs `set_screen_config`
+    /// immediately afterwards, which replaces the whole tracker — Tier-A
+    /// probe included. A deterministic signal that lands in that window is
+    /// latched by the tracker about to be discarded, so the session looks
+    /// signal-less and §4.5 correctly enables Tier B three seconds later.
+    /// `Session::set_screen_config` documents the window and 0.0.4 accepts
+    /// it, on the grounds that it is microseconds wide and no real shell
+    /// has printed a prompt that early. That is true of a shell and was
+    /// not true of this fixture, which spoke on the reader's very first
+    /// call — a hundred chances per run, and on two vCPUs with a hundred
+    /// runnable threads the main thread loses some of them.
+    ///
+    /// A longer sleep before the preamble was the first fix and is the
+    /// wrong shape: it trades a race for a timing margin, and the
+    /// assertion it protects is the one the plan calls machine-
+    /// independent. A gate has no margin. Arming happens per session
+    /// rather than after all hundred, so the stream still spans the
+    /// creation loop and the load arithmetic below is unchanged.
+    armed: AtomicBool,
     preamble: Vec<u8>,
     preamble_sent: AtomicBool,
     pattern: Vec<u8>,
@@ -57,6 +81,7 @@ impl StreamPty {
             pattern.extend_from_slice(line);
         }
         Self {
+            armed: AtomicBool::new(false),
             preamble: b"\x1b[?2004h$ cargo build --release\x1b[?2004l\r\n".to_vec(),
             preamble_sent: AtomicBool::new(false),
             pattern,
@@ -65,6 +90,12 @@ impl StreamPty {
             alive: AtomicBool::new(true),
             produced: AtomicU64::new(0),
         }
+    }
+
+    /// Let the stream start. Called once the session's real screen config
+    /// is in place — see `armed`.
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Relaxed);
     }
 
     fn stop(&self) {
@@ -85,26 +116,12 @@ impl PtyBackend for StreamPty {
         if !self.alive.load(Ordering::Relaxed) {
             return Err(ClaspError::Pty("stream ended".into()));
         }
+        if !self.armed.load(Ordering::Relaxed) {
+            // `Ok(0)` from a live backend is "nothing yet" to the reader
+            // thread, which then idles — the same shape a quiet PTY has.
+            return Ok(0);
+        }
         if !self.preamble_sent.swap(true, Ordering::Relaxed) {
-            // **Not on the very first read, and the delay is the point.**
-            // `Session::new` starts the reader thread, and the caller calls
-            // `set_screen_config` immediately afterwards — which replaces
-            // the whole tracker, Tier-A probe included. A deterministic
-            // signal landing in that window is latched by the tracker that
-            // is about to be discarded, so the session looks signal-less
-            // and §4.5 correctly enables Tier B three seconds later.
-            // `Session::set_screen_config` documents the window and 0.0.4
-            // accepts it: it is microseconds wide and no real shell has
-            // printed a prompt that early. A fixture that emits its
-            // bracketed paste on the reader's *first* call is the one thing
-            // that can be inside it, which would make `parsed == 0` depend
-            // on winning a race rather than on the property it guards. One
-            // failure in roughly twenty-five whole-workspace runs was
-            // observed before this sleep, under a mutation that cannot
-            // reach this file; the other two assertions have 3.7x and 460x
-            // margins, so this is the only one that can plausibly have
-            // moved.
-            std::thread::sleep(CHUNK_INTERVAL);
             let n = buf.len().min(self.preamble.len());
             buf[..n].copy_from_slice(&self.preamble[..n]);
             self.produced.fetch_add(n as u64, Ordering::Relaxed);
@@ -205,6 +222,8 @@ fn tier_b_stays_off_and_the_control_path_stays_responsive_under_load() {
             cols: 80,
             ..ScreenConfig::default()
         });
+        // **After** `set_screen_config`, never before: see `armed`.
+        pty.arm();
         ids.push(session.id.clone());
         registry.insert(session).expect("registry insert");
         ptys.push(pty);
