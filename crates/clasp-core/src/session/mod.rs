@@ -854,11 +854,17 @@ impl Session {
     /// number rather than three — and since `size()` is what the tool
     /// reports, the agent is told the geometry it got rather than the one
     /// it asked for.
+    ///
+    /// **The ring buffer goes with it, because a width shrink re-seeds the
+    /// tracker rather than resizing its parser** — see
+    /// [`ScreenTracker::resize`] for why `vt100::set_size` is unsafe in
+    /// that direction. The locks are taken `screen → buffer`, which is the
+    /// order the tracker documents and the one `capture` already uses.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         let (cols, rows) = clamp_geometry(cols, rows);
         self.backend.resize(cols, rows)?;
         self.size.store(pack_size(cols, rows), Ordering::Relaxed);
-        self.screen.lock().resize(cols, rows);
+        self.screen.lock().resize(cols, rows, &*self.buffer);
         Ok(())
     }
 

@@ -388,14 +388,75 @@ impl ScreenTracker {
     /// describes a reflow the agent's replay cannot reproduce. Dropping
     /// them degrades the next `diff_from` to a full grid, which is the same
     /// graceful path an evicted revision already takes.
-    pub fn resize(&mut self, cols: u16, rows: u16) {
+    ///
+    /// # A width shrink re-seeds instead of calling `set_size`
+    ///
+    /// **`vt100` 0.16.2 `set_size` truncates a row without repairing the
+    /// wide character it cuts in half, and the next write to that cell is
+    /// a panic** (`screen.rs:870`, `Option::unwrap` on `None`). `Grid`'s
+    /// shrink path calls `Row::resize`, which is a bare `Vec::truncate`
+    /// plus `wrapped = false` — unlike `Row::truncate`, which does clear a
+    /// wide flag left in the last cell. So a double-width glyph whose lead
+    /// cell lands on the new right edge keeps `is_wide()` while its
+    /// continuation cell is gone, and `Screen::text` then reaches for
+    /// `col + 1` to blank the other half and unwraps a `None`.
+    ///
+    /// This needs no exotic geometry: 132 → 80 with any CJK character or
+    /// emoji at column 79, and the "write" is just the child printing
+    /// there afterwards. It is **not** the degenerate-size case
+    /// [`crate::session::clamp_geometry`] covers.
+    ///
+    /// And the panic does not stay contained. `parking_lot` does not
+    /// poison, so the unwind escapes the session's screen lock and leaves
+    /// a **usable mutex around a half-written parser**; the corruption
+    /// resurfaces later, on the reader thread, far from this call.
+    ///
+    /// A re-seeded parser cannot hold a truncated half-wide cell, because
+    /// the bytes are re-parsed at the new width and the emulator's own
+    /// `col_wrap` refuses to place a wide glyph that does not fit — which
+    /// is exactly why 80 columns throughout never panics while 132 → 80
+    /// does. [`Self::seed_parser`] is the machinery `set_screen_config`
+    /// and the idle-disable cycle already use, so this adds a trigger
+    /// rather than a second rebuild path; in particular it keeps
+    /// `seeded_from`/`consumed_head` describing the parser's true input
+    /// range, which is what [`Self::boundary_screen`]'s §4.1 mask is a
+    /// function of.
+    ///
+    /// **Only on `cols < self.cfg.cols`, and the narrowness is the point.**
+    /// A width *growth* extends every row with blank cells and a height
+    /// change adds or drops whole rows; neither can bisect a wide glyph,
+    /// because rows are only ever truncated by a narrowing. Re-seeding on
+    /// every resize would be simpler, but a re-seed is **lossy** — it
+    /// rebuilds from the ring buffer's last `rows * cols * 4` bytes, so
+    /// anything still on screen whose bytes have since been evicted comes
+    /// back blank. Paying that on a resize that could not have corrupted
+    /// anything would trade a real panic for a routine loss of grid
+    /// content. `set_size` keeps the full live state and is kept wherever
+    /// it is safe.
+    ///
+    /// **When the ring cannot reconstruct, the degradation is the one
+    /// already specified.** `SeedSource::recent` clamps to what the buffer
+    /// still holds, so a short window yields a correctly-sized grid whose
+    /// unreachable rows are blank — §4.5's "older scrollback is not
+    /// recovered", reached by a second route. An empty buffer yields an
+    /// empty grid. No input makes it worse than that, and none of them
+    /// panic.
+    pub fn resize(&mut self, cols: u16, rows: u16, seed: &dyn SeedSource) {
         if self.cfg.cols == cols && self.cfg.rows == rows {
             return;
         }
+        let narrowed = cols < self.cfg.cols;
         self.cfg.cols = cols;
         self.cfg.rows = rows;
-        if let Some(parser) = self.parser.as_mut() {
-            parser.screen_mut().set_size(rows, cols);
+        if self.parser.is_some() {
+            if narrowed {
+                // Rebuilds at the new `cfg` geometry and resets
+                // `seeded_from`, `consumed_head`, `retained` and the
+                // cursor stability window.
+                self.seed_parser(seed);
+            } else if let Some(parser) = self.parser.as_mut() {
+                parser.screen_mut().set_size(rows, cols);
+            }
         }
         self.retained.clear();
     }
@@ -2150,5 +2211,308 @@ negative = ["MARK"]
             apply(&unchanged, &moved.diff).screen().contents_formatted(),
             after.contents_formatted()
         );
+    }
+
+    /// U+4E16, two columns wide. Any double-width glyph does — CJK, an
+    /// emoji — and the width is the only property that matters.
+    const WIDE: &str = "\u{4e16}";
+
+    /// A tracker whose grid carries a double-width character at 0-indexed
+    /// column 79 — the cell that becomes the **last** one when the width
+    /// shrinks to 80, and so the one `vt100`'s `set_size` orphans.
+    ///
+    /// `\x1b[1;80H` is 1-based and therefore addresses column 79. At
+    /// `cols = 132` the wide character fits there (79 + 2 <= 132) and takes
+    /// cells 79 and 80; at `cols = 80` it does not fit, and the emulator's
+    /// own `col_wrap` moves it to row 1 rather than splitting it. That
+    /// difference *is* the defect: a state the parser refuses to enter by
+    /// writing, it enters by truncating.
+    fn wide_at_column_79(cols: u16) -> (ScreenTracker, ByteLog, Instant) {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(
+            ScreenConfig {
+                mode: ScreenTracking::On,
+                rows: 24,
+                cols,
+                ..ScreenConfig::default()
+            },
+            rules(),
+            t0,
+        );
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        feed(&mut t, &mut log, t0, format!("\x1b[1;80H{WIDE}").as_bytes());
+        (t, log, t0)
+    }
+
+    /// Arm 1 — the defect. 132 columns, a wide character at column 79, a
+    /// shrink to 80, then the child prints over that cell.
+    #[test]
+    fn a_width_shrink_onto_a_wide_character_survives_the_next_write() {
+        let (mut t, mut log, t0) = wide_at_column_79(132);
+        t.resize(80, 24, &log);
+
+        // The reflow first: re-parsed at 80 columns the wide character no
+        // longer fits at 79, so it is on row 1. A `set_size` leaves it
+        // half-present on row 0 instead, which is the corrupt state.
+        let reflowed = full(t.capture(None, true, t0, &log, None));
+        assert_eq!((reflowed.rows, reflowed.cols), (24, 80));
+        assert_eq!(reflowed.lines[0].trim_end(), "");
+        assert_eq!(reflowed.lines[1].trim_end(), WIDE);
+
+        // ...and now the write that panicked.
+        feed(&mut t, &mut log, t0, b"\x1b[1;80HX");
+        let g = full(t.capture(None, true, t0, &log, None));
+        assert_eq!(g.lines[0].chars().nth(79), Some('X'));
+        assert_eq!(g.lines[1].trim_end(), WIDE);
+    }
+
+    /// Arm 2 — the control that says it is the shrink and not the wide
+    /// character. Same shape at 80 columns throughout: the emulator wraps
+    /// the glyph to row 1 rather than placing it at column 79, so no write
+    /// can ever find an orphaned lead cell there.
+    #[test]
+    fn a_wide_character_alone_never_reaches_the_last_column() {
+        let (mut t, mut log, t0) = wide_at_column_79(80);
+        feed(&mut t, &mut log, t0, b"\x1b[1;80HX");
+        let g = full(t.capture(None, true, t0, &log, None));
+        assert_eq!((g.rows, g.cols), (24, 80));
+        assert_eq!(g.lines[0].chars().nth(79), Some('X'));
+        assert_eq!(
+            g.lines[1].trim_end(),
+            WIDE,
+            "the emulator's own col_wrap, not CLASP, is what keeps a wide \
+             glyph off the last column"
+        );
+    }
+
+    /// Arm 3 — the control that says it takes a *write*, and the one that
+    /// had to be rewritten to mean anything.
+    ///
+    /// **A render is not a discriminator here, and assuming it was is the
+    /// trap.** `rendered_screen` rebuilds a *fresh* parser at the new
+    /// geometry and replays the joined text into it, so the truncated lead
+    /// cell reflows on the way out whether or not the live parser was
+    /// re-seeded: both fixes produce byte-identical grids, and the first
+    /// version of this arm passed against the unfixed tree. What differs
+    /// is the **live parser**, so that is what is asserted — as the
+    /// invariant the defect violates rather than as a rendering of it.
+    #[test]
+    fn a_width_shrink_leaves_no_orphaned_wide_cell_in_the_last_column() {
+        let (mut t, log, t0) = wide_at_column_79(132);
+        t.resize(80, 24, &log);
+
+        let screen = t.parser.as_ref().expect("Tier B is on").screen();
+        let (rows, cols) = screen.size();
+        assert_eq!((rows, cols), (24, 80));
+        for r in 0..rows {
+            assert!(
+                !screen.cell(r, cols - 1).expect("in-range cell").is_wide(),
+                "row {r} ends in a wide lead cell with no continuation after \
+                 it; the next write to that column is vt100's screen.rs:870 \
+                 unwrap"
+            );
+        }
+
+        // And the reads the probe exercised still answer, which is the part
+        // of the diagnosis this arm was named for: the corrupt state was
+        // never reachable through a render.
+        let first = full(t.capture(None, true, t0, &log, None));
+        assert_eq!(first.lines[1].trim_end(), WIDE);
+        let base = t.retained.back().expect("base retained").2.clone();
+        let d = delta(t.capture(Some(first.screen_revision), true, t0, &log, None));
+        assert_eq!(
+            apply(&base, &d.diff).screen().rows(0, 80).nth(1).as_deref(),
+            Some(WIDE),
+            "the diff replayed to a grid that lost the reflow"
+        );
+    }
+
+    /// The trigger is `cols < cfg.cols` and nothing else, and both
+    /// directions of that are pinned here. A re-seed is lossy — it can
+    /// only rebuild from what the ring buffer still holds — so spending
+    /// one on a resize that could not have bisected a wide glyph trades a
+    /// panic for a routine loss of grid content.
+    ///
+    /// `parsed_bytes` is the observable: `seed_parser` is the only thing
+    /// on this path that hands bytes to an emulator.
+    #[test]
+    fn only_a_width_shrink_re_seeds() {
+        let (mut t, log, _t0) = wide_at_column_79(132);
+        let seeded = t.parsed_bytes();
+        assert!(seeded > 0, "the fixture never started Tier B");
+
+        t.resize(132, 50, &log); // taller
+        t.resize(132, 24, &log); // shorter
+        t.resize(200, 24, &log); // wider
+        assert_eq!(
+            t.parsed_bytes(),
+            seeded,
+            "a resize that cannot truncate a wide cell must keep the live \
+             parser rather than rebuild it from an evictable buffer"
+        );
+
+        t.resize(80, 24, &log);
+        assert!(
+            t.parsed_bytes() > seeded,
+            "a width shrink must re-seed; set_size leaves the orphaned cell"
+        );
+    }
+
+    /// The re-seed must not cost §4.1 its mask. The mask is a function of
+    /// `seeded_from`/`consumed_head` — `boundary_screen` replays exactly
+    /// that range and compares cells — so a rebuild that installed a
+    /// parser without moving those two in step would mask the wrong cells
+    /// or none at all. Composition order is untouched: join → redact →
+    /// mask.
+    #[test]
+    fn a_width_shrink_keeps_the_holdback_mask() {
+        let unresolved = marker(UNRESOLVED_KIND);
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(
+            ScreenConfig {
+                mode: ScreenTracking::On,
+                rows: 24,
+                cols: 132,
+                ..ScreenConfig::default()
+            },
+            rules(),
+            t0,
+        );
+        // Everything before the boundary is a cleared screen, so every cell
+        // the withheld bytes paint differs from the boundary render.
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        let boundary = log.bytes.len() as u64;
+        feed(
+            &mut t,
+            &mut log,
+            t0,
+            format!("\x1b[1;80H{WIDE}withheld words").as_bytes(),
+        );
+
+        let before = full(t.capture(None, true, t0, &log, Some(boundary)));
+        assert!(before.held_back, "the fixture never opened a holdback");
+
+        t.resize(80, 24, &log);
+        let after = full(t.capture(None, true, t0, &log, Some(boundary)));
+        assert!(after.held_back, "the re-seed dropped the §4.1 mask");
+        assert!(
+            after.lines.iter().any(|l| l.contains(&unresolved)),
+            "held_back was set with no marker on the grid: {:?}",
+            after.lines
+        );
+        assert!(
+            !after.lines.iter().any(|l| l.contains("withheld")),
+            "the withheld text reached the grid: {:?}",
+            after.lines
+        );
+
+        // The control that makes the two assertions above mean the mask
+        // and not the re-seed: with no holdback the same rebuilt parser
+        // renders the text plainly.
+        let plain = full(t.capture(None, true, t0, &log, None));
+        assert!(!plain.held_back);
+        assert!(
+            plain.lines.iter().any(|l| l.contains("withheld")),
+            "the re-seed lost the text outright: {:?}",
+            plain.lines
+        );
+    }
+
+    /// The chunk that must be the only thing a wrapped ring can still
+    /// reach in the test below.
+    const LAST_CHUNK: &[u8] = b"\x1b[5;1HFIFTH ROW";
+
+    /// A `SeedSource` that has evicted all but its newest `keep` bytes —
+    /// the session's ring buffer once it has wrapped. Absolute offsets
+    /// stay honest and only the reachable range shrinks, which is exactly
+    /// how `impl SeedSource for Mutex<OutputBuffer>` clamps `replay` to
+    /// `buffer.tail()`.
+    struct WrappedRing<'a> {
+        log: &'a ByteLog,
+        keep: usize,
+    }
+
+    impl SeedSource for WrappedRing<'_> {
+        fn recent(&self, n: usize) -> Seed {
+            self.log.recent(n.min(self.keep))
+        }
+
+        fn replay(&self, start: u64, end: u64) -> Replay {
+            let tail = (self.log.bytes.len() - self.keep.min(self.log.bytes.len())) as u64;
+            self.log.replay(start.max(tail), end)
+        }
+    }
+
+    fn three_painted_rows() -> (ScreenTracker, ByteLog, Instant) {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(
+            ScreenConfig {
+                mode: ScreenTracking::On,
+                rows: 24,
+                cols: 132,
+                ..ScreenConfig::default()
+            },
+            rules(),
+            t0,
+        );
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J\x1b[1;1HFIRST ROW");
+        feed(&mut t, &mut log, t0, format!("\x1b[3;80H{WIDE}").as_bytes());
+        feed(&mut t, &mut log, t0, LAST_CHUNK);
+        (t, log, t0)
+    }
+
+    /// What a width shrink degrades to when the ring buffer no longer
+    /// holds the bytes that painted the screen: a **correctly sized grid
+    /// with blank rows** where the evicted paint was. That is §4.5's
+    /// "older scrollback is not recovered", reached by a second route —
+    /// the same outcome an idle-disable cycle or an `off` session's
+    /// one-shot already produces — and it is defined rather than worse
+    /// than the panic it replaces.
+    #[test]
+    fn a_width_shrink_the_ring_cannot_reconstruct_degrades_to_blank_rows() {
+        // The control: with the whole log reachable, the shrink keeps
+        // every painted row, so the blanking below is the eviction and not
+        // the re-seed itself.
+        let (mut whole, whole_log, t0) = three_painted_rows();
+        whole.resize(80, 24, &whole_log);
+        let kept = full(whole.capture(None, true, t0, &whole_log, None));
+        assert_eq!(kept.lines[0].trim_end(), "FIRST ROW");
+        assert_eq!(kept.lines[3].trim_end(), WIDE, "row 2's glyph reflowed");
+        assert_eq!(kept.lines[4].trim_end(), "FIFTH ROW");
+
+        let (mut t, log, t0) = three_painted_rows();
+        let ring = WrappedRing {
+            log: &log,
+            keep: LAST_CHUNK.len(),
+        };
+        t.resize(80, 24, &ring);
+
+        let g = full(t.capture(None, true, t0, &ring, None));
+        assert_eq!(
+            (g.rows, g.cols),
+            (24, 80),
+            "the degraded grid still has the geometry the agent was told"
+        );
+        assert_eq!(
+            g.lines[0].trim_end(),
+            "",
+            "content the ring can no longer reach comes back blank"
+        );
+        assert_eq!(g.lines[3].trim_end(), "");
+        assert_eq!(
+            g.lines[4].trim_end(),
+            "FIFTH ROW",
+            "what the ring *does* hold must survive"
+        );
+
+        // And the degraded parser is still a well-formed one: writing into
+        // it is the operation the defect turned into a panic.
+        let screen = t.parser.as_ref().expect("Tier B is on").screen();
+        for r in 0..24 {
+            assert!(!screen.cell(r, 79).expect("in-range cell").is_wide());
+        }
     }
 }
