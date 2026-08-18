@@ -2301,6 +2301,20 @@ mod tests {
     /// print every one of these bytes directly with no ceiling involved
     /// (REQ-PD-010).
     ///
+    /// **The two T3 sub-signals do not see the same bytes here, and rev.
+    /// 46 measures the disagreement instead of assuming they do.** The
+    /// leak belongs to the discard-to-newline rule, which is Tier A's;
+    /// Tier B is a `vt100` parser and a line feed terminates neither an
+    /// OSC nor a DCS string on the shipped `vt100` 0.16.2 / `vte` 0.15.
+    /// So the residual's T3 reach is not one number: it is
+    /// `pattern_score` alone where Tier B parsed through the payload, and
+    /// `max(pattern, cursor)` where §4.5's seed started a fresh parser
+    /// *inside* it. The two arms are asserted separately below and each
+    /// names itself, because a suite carrying only the first reports the
+    /// cursor sub-signal as irrelevant to this residual — true of that
+    /// arrangement, false of the one the 3 s no-signal trigger makes
+    /// ordinary (REQ-PD-018).
+    ///
     /// **This is a §11.4 accepted-limitation assertion: update it when the
     /// ceiling changes, never delete it.** Every input below is sized
     /// relative to `SEQUENCE_MAX`, so changing the constant re-aims these
@@ -2313,6 +2327,8 @@ mod tests {
     mod sequence_ceiling_residual {
         use super::*;
         use crate::detect::scanner::{Osc133, SEQUENCE_MAX};
+        use crate::screen::cursor::raw_cursor_score;
+        use crate::screen::{ScreenConfig, DEFAULT_PROMPT_CHARS, SEED_BYTES_PER_CELL};
 
         /// A control string that runs past the ceiling, carrying `\r\n`
         /// inside its payload and then `smuggled`.
@@ -2733,6 +2749,215 @@ mod tests {
                 DetectionTier::Heuristic,
                 "a DCS under the ceiling kept its payload opaque"
             );
+        }
+
+        /// `drive_as`'s classification step with the T3c term supplied,
+        /// so a row can say **which Tier-B arm it is** (REQ-PD-018).
+        ///
+        /// `drive` and `drive_as` pass `cursor: None`, which is Tier B
+        /// off — the right default for every row above, and the one
+        /// arrangement in which the question the two arms disagree about
+        /// cannot be asked at all.
+        fn classify_with_cursor(payload: &[u8], cursor: f32) -> Detection {
+            let (mut d, start, now) = detector();
+            d.feed_at(payload, 0, Some(100), start);
+            d.snapshot_at(true, ld(true, true), Some(100), Some(cursor), now)
+        }
+
+        /// The forged tails, with the T3b score each reaches. Both of
+        /// REQ-PD-018's stated numbers, so neither arm can be pinned on
+        /// one shape of prompt and generalised.
+        const FORGED_TAILS: &[(&[u8], f32)] = &[(b"root@prod:/etc# ", 0.85), (b"$ ", 0.60)];
+
+        /// A payload is only a fixture for this residual if it carries a
+        /// newline: `give_up` discards to the next `\n`, so size alone
+        /// leaks nothing and a payload without one asserts nothing.
+        fn assert_the_payload_can_leak(payload: &[u8], name: &str, arm: &str) {
+            assert!(
+                payload.contains(&b'\n'),
+                "{arm}: {name}: the payload carries no newline, so `give_up` \
+                 has nothing to discard *to* and this fixture cannot leak \
+                 whatever else it asserts"
+            );
+        }
+
+        /// **Arm 1 of 2 — parsed through** (§8.8 rev. 46, REQ-PD-018).
+        ///
+        /// Measured on the shipped `vt100` 0.16.2 / `vte` 0.15, a line
+        /// feed terminates neither an OSC nor a DCS string. A parser that
+        /// was already running when the introducer arrived therefore
+        /// stays inside the payload across the `\r\n` that Tier A stops
+        /// at: the smuggled bytes never reach the grid, `cursor_score` is
+        /// 0.00, and the combined answer is `pattern_score` alone.
+        ///
+        /// This is the one measured place in the system where the two T3
+        /// sub-signals read *different views of the same stream* —
+        /// everywhere else they read one line twice (§8.6). The leak is a
+        /// property of the discard-to-newline rule, which is Tier A's,
+        /// and Tier B does not share it.
+        ///
+        /// Both arms are required and each has to say which it is,
+        /// because a suite carrying only this one concludes the cursor
+        /// sub-signal is irrelevant to this residual — true of this
+        /// arrangement, false of the one §4.5's 3 s no-signal trigger
+        /// makes ordinary for exactly the sessions this tier serves. See
+        /// `..._when_tier_b_is_seeded_inside_the_payload`, which
+        /// disagrees with this row by 0.9 on the cursor term.
+        #[test]
+        fn the_residual_does_not_reach_the_cursor_sub_signal_when_tier_b_parsed_through_the_payload(
+        ) {
+            let cfg = ScreenConfig::default();
+            for Carrier {
+                name,
+                introducer,
+                terminator,
+            } in CARRIERS
+            {
+                for (smuggled, want_pattern) in FORGED_TAILS {
+                    let payload = over_ceiling(introducer, *terminator, smuggled);
+                    assert_the_payload_can_leak(&payload, name, "parsed-through arm");
+
+                    let mut p = vt100::Parser::new(cfg.rows, cfg.cols, 0);
+                    p.process(&payload);
+                    let cursor = raw_cursor_score(p.screen(), DEFAULT_PROMPT_CHARS);
+                    assert_eq!(
+                        cursor, 0.0,
+                        "parsed-through arm: {name}: a parser running from byte \
+                         0 scored the forged tail, so the line feed terminated \
+                         the control string after all and §8.8's measurement \
+                         no longer holds"
+                    );
+                    // Not the same claim as the cursor score, and it is
+                    // what says *why* the score is 0: the grid is empty
+                    // because the bytes never arrived, not because the
+                    // cursor happens to sit at column 0 on a painted row.
+                    assert!(
+                        p.screen().contents().is_empty(),
+                        "parsed-through arm: {name}: the payload reached the grid"
+                    );
+
+                    let s = classify_with_cursor(&payload, cursor);
+                    assert_eq!(
+                        s.last_line,
+                        String::from_utf8_lossy(smuggled),
+                        "parsed-through arm: {name}"
+                    );
+                    assert_eq!(s.interaction_mode, InteractionMode::AtPrompt, "{name}");
+                    assert_eq!(s.detection_tier, DetectionTier::Heuristic, "{name}");
+                    assert!(
+                        (s.pattern_score - want_pattern).abs() < 1e-6,
+                        "parsed-through arm: {name}: pattern {}",
+                        s.pattern_score
+                    );
+                    // `max(pattern, cursor)` with cursor at 0 is pattern:
+                    // the residual's T3 reach on this arm is one number,
+                    // and it is T3b's.
+                    assert!(
+                        (s.confidence - want_pattern).abs() < 1e-6,
+                        "parsed-through arm: {name}: confidence {}",
+                        s.confidence
+                    );
+                }
+            }
+        }
+
+        /// **Arm 2 of 2 — seeded inside** (§8.8 rev. 46, REQ-PD-018), and
+        /// the arrangement §4.5 makes the ordinary one.
+        ///
+        /// Tier B is off for a line-oriented session until something asks
+        /// for it, and §4.5's no-signal trigger brings it up 3 s after
+        /// start — which for a multi-megabyte payload is *while the
+        /// payload is still arriving*. A parser seeded then does not
+        /// inherit the running parser's state: it starts at `Ground`
+        /// inside the control string, paints the remainder as text, and
+        /// scores the forged prompt at 0.9. Same bytes as the arm above,
+        /// 0.9 apart on the cursor term.
+        ///
+        /// The `$ ` row is where the disagreement is visible in the
+        /// *answer* and not merely in a sub-score: 0.60 parsed through,
+        /// 0.90 seeded inside, across §8.4's act threshold.
+        ///
+        /// **The seed window is modelled arithmetically here rather than
+        /// driven through a `ScreenTracker`.** It reproduces
+        /// `ScreenTracker::seed_parser`, which feeds a fresh parser the
+        /// ring buffer's most recent `rows * cols * SEED_BYTES_PER_CELL`
+        /// bytes at the shipped geometry. What this arm turns on is
+        /// *where that window starts*, and stating it in one expression
+        /// is what makes the degeneracy assertable rather than arguable —
+        /// see the `window_start` check, which is what stops a change to
+        /// `SEQUENCE_MAX` or to the seed size turning this row silently
+        /// back into the arm above.
+        #[test]
+        fn the_residual_reaches_the_cursor_sub_signal_when_tier_b_is_seeded_inside_the_payload() {
+            let cfg = ScreenConfig::default();
+            let seed_bytes = cfg.seed_bytes();
+            assert_eq!(
+                seed_bytes,
+                usize::from(cfg.rows) * usize::from(cfg.cols) * SEED_BYTES_PER_CELL,
+                "the window is §4.5's, derived from the shipped geometry"
+            );
+
+            for Carrier {
+                name,
+                introducer,
+                terminator,
+            } in CARRIERS
+            {
+                for (smuggled, want_pattern) in FORGED_TAILS {
+                    let payload = over_ceiling(introducer, *terminator, smuggled);
+                    assert_the_payload_can_leak(&payload, name, "seeded-inside arm");
+
+                    // Saturating, not panicking: a payload shorter than
+                    // the window is exactly the degeneracy the assertion
+                    // below is here to name, and it should be named
+                    // rather than reported as an arithmetic overflow.
+                    let window_start = payload.len().saturating_sub(seed_bytes);
+                    assert!(
+                        window_start > introducer.len(),
+                        "seeded-inside arm: {name}: the {seed_bytes}-byte seed \
+                         window opens at byte {window_start} of a {}-byte \
+                         payload, at or before the {}-byte introducer — so the \
+                         parser below no longer starts *inside* the control \
+                         string and this row has quietly become the \
+                         parsed-through arm, which it would still pass",
+                        payload.len(),
+                        introducer.len()
+                    );
+
+                    let mut p = vt100::Parser::new(cfg.rows, cfg.cols, 0);
+                    p.process(&payload[window_start..]);
+                    let cursor = raw_cursor_score(p.screen(), DEFAULT_PROMPT_CHARS);
+                    assert!(
+                        (cursor - 0.9).abs() < 1e-6,
+                        "seeded-inside arm: {name}: a parser seeded inside the \
+                         payload scored the forged tail {cursor}, not 0.9 — the \
+                         forgery no longer reaches the cursor sub-signal by \
+                         §4.5's route"
+                    );
+
+                    let s = classify_with_cursor(&payload, cursor);
+                    assert_eq!(
+                        s.last_line,
+                        String::from_utf8_lossy(smuggled),
+                        "seeded-inside arm: {name}"
+                    );
+                    assert_eq!(s.interaction_mode, InteractionMode::AtPrompt, "{name}");
+                    assert_eq!(s.detection_tier, DetectionTier::Heuristic, "{name}");
+                    // The same payload as the arm above, scoring the same
+                    // on T3b — asserted so the two rows cannot drift into
+                    // being tests of different inputs.
+                    assert!(
+                        (s.pattern_score - want_pattern).abs() < 1e-6,
+                        "seeded-inside arm: {name}: pattern {}",
+                        s.pattern_score
+                    );
+                    assert!(
+                        (s.confidence - 0.9).abs() < 1e-6,
+                        "seeded-inside arm: {name}: confidence {}",
+                        s.confidence
+                    );
+                }
+            }
         }
 
         /// A format-faithful sixel image of `graphics` bytes whose final
