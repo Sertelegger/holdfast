@@ -834,6 +834,69 @@ mod tests {
         );
     }
 
+    /// REQ-PD-008's *"a character that later gains a T3b guard inherits
+    /// it without a second edit"*, made into a red test because the
+    /// implementation cannot literally inherit.
+    ///
+    /// `screen::cursor` transplants the guarded rows **by value** — it
+    /// holds its own copy of each row string — so "inherits" can only
+    /// mean, in code, that adding a guarded row here or editing one
+    /// cannot leave the two copies disagreeing *quietly*. This derives
+    /// the guarded set from `DEFAULT_PATTERNS` mechanically and requires
+    /// the T3c table to be exactly it, character for character and byte
+    /// for byte: a new guarded row fails here until T3c is taught it, and
+    /// a widened or narrowed guard fails here until both copies move
+    /// together.
+    ///
+    /// **Deliberately not folded into
+    /// `every_head_guard_is_pinned_from_both_sides`.** That test's
+    /// `Guard` table is hand-written, one entry per guard, and a T3c
+    /// check driven off it would need the same hand edit the new row
+    /// needs — so a row could gain a guard, gain a `Guard` entry, and
+    /// still never reach the cursor sub-signal. A derivation is the only
+    /// form of this check that a forgotten edit cannot pass.
+    ///
+    /// What it does **not** claim is that T3c has the table's rows.
+    /// `^>\s*$` is a row anchor rather than a character guard and is
+    /// excluded below by shape, which is what keeps `foo> ` scoring 0.9
+    /// on the cursor (§8.6 rev. 46's first carve-out).
+    #[test]
+    fn the_t3c_head_guard_carries_every_character_head_guarded_row() {
+        use crate::screen::cursor::HEAD_GUARDS;
+        use crate::screen::DEFAULT_PROMPT_CHARS;
+
+        // A *character* head guard, as against the bare `^` anchors and
+        // the `\?` qualifier the sweep above also counts: the row opens
+        // `(?:^|` — an alternation whose first branch is the start of the
+        // line — and the character it guards is the one immediately
+        // before the trailing `\s*$`.
+        let mut derived: Vec<(char, &str)> = DEFAULT_PATTERNS
+            .iter()
+            .filter_map(|(re, _)| {
+                let c = re.strip_suffix(r"\s*$")?.chars().next_back()?;
+                (re.starts_with(r"(?:^|") && DEFAULT_PROMPT_CHARS.contains(&c)).then_some((c, *re))
+            })
+            .collect();
+        derived.sort_unstable();
+        let mut implemented = HEAD_GUARDS.to_vec();
+        implemented.sort_unstable();
+
+        assert_eq!(
+            derived, implemented,
+            "the T3b table and `screen::cursor::HEAD_GUARDS` disagree about \
+             which `PROMPT_CHARS` members carry a character head guard \
+             (REQ-PD-008). T3c scores 0.9 on every character it is missing \
+             a guard for, and `confidence = quiescent x max(pattern, \
+             cursor)` takes the larger of the two — so the guard on this \
+             side holds nothing down on its own"
+        );
+        // ...and the derivation must not be vacuous: a filter that
+        // selected nothing would satisfy the equality above against an
+        // empty T3c table, which is the degenerate pair this exists to
+        // catch.
+        assert_eq!(derived.len(), 2, "§8.6 rev. 46 guards `#` and `%`");
+    }
+
     #[test]
     fn the_percent_guard_admits_a_hosts_digits_and_not_a_percentages() {
         // The rule rev. 34 replaced "a non-digit before the `%`" with, and

@@ -2044,6 +2044,235 @@ mod tests {
         }
     }
 
+    /// §11.1 corpus 3 — the §8.6 head guards read through the combiner
+    /// (REQ-PD-008, REQ-PD-017, REQ-PD-013).
+    ///
+    /// **Why a third corpus rather than more rows in `patterns.rs`.**
+    /// Every number in §8.6's two tables belongs to *one* sub-signal, and
+    /// `confidence = quiescent x max(pattern, cursor)` takes the larger.
+    /// So a corpus asserting T3b alone stays perfectly green against a
+    /// combiner in which T3c answers 0.9 on the same line — which is
+    /// exactly what shipped, for every guarded row, until rev. 46. The
+    /// only assertion that can see that is one made on both sub-signals
+    /// *and* on the answer they combine to, which is what the rows below
+    /// are.
+    ///
+    /// **The cursor is parked at each line's end, and that is the
+    /// fixture, not a detail.** A parked cursor is the arrangement in
+    /// which a guarded line is reachable at all; a corpus whose lines end
+    /// in a newline is asserting `raw_cursor_score`'s `col == 0` branch
+    /// and would pass against no head guard whatever
+    /// (`the_same_corpus_newline_terminated_pins_column_zero_and_nothing_else`
+    /// below is that claim, written out so it cannot be mistaken for
+    /// coverage).
+    mod head_guard_corpus {
+        use super::*;
+        use crate::screen::cursor::raw_cursor_score;
+        use crate::screen::DEFAULT_PROMPT_CHARS;
+
+        /// `(line, cursor_score, pattern_score, confidence)` with the
+        /// cursor parked at the line's end and the session fully
+        /// quiescent, so `confidence` is `max` of the two sub-scores.
+        ///
+        /// The three groups are the three things rev. 46 has to be true
+        /// of at once: the guards reject on the cursor where they reject
+        /// on the pattern; they still admit every real prompt on their
+        /// near side; and they reach neither the row-anchored `>` nor the
+        /// unguarded `:` and `)`.
+        const CORPUS: &[(&str, f32, f32, f32)] = &[
+            // --- far side: the guard rejects, and the answer is 0.00 ---
+            ("Receiving objects:  47%", 0.0, 0.0, 0.0),
+            ("[####------] 40%", 0.0, 0.0, 0.0),
+            ("Coverage: 92%", 0.0, 0.0, 0.0),
+            ("  100%", 0.0, 0.0, 0.0),
+            ("############################", 0.0, 0.0, 0.0),
+            ("Coverage change: -2.1%", 0.0, 0.0, 0.0),
+            ("cpu -40%", 0.0, 0.0, 0.0),
+            ("lines......: 87.5%", 0.0, 0.0, 0.0),
+            ("width:100%", 0.0, 0.0, 0.0),
+            // A real `csh`-family prompt answering 0.00 — the rev.-34
+            // recall loss, now costed on both sub-signals rather than
+            // one. It is in the corpus precisely because it is the row a
+            // future widening would recover, and recovering it has to be
+            // a deliberate edit to §8.6, to `patterns.rs` and to here.
+            ("10.0.0.5% ", 0.0, 0.0, 0.0),
+            // --- near side: the guard admits (REQ-PD-017) ---
+            ("build01% ", 0.9, 0.6, 0.9),
+            ("prod-01% ", 0.9, 0.6, 0.9),
+            ("web1% ", 0.9, 0.6, 0.9),
+            ("user@build01% ", 0.9, 0.6, 0.9),
+            ("hostname% ", 0.9, 0.6, 0.9),
+            ("% ", 0.9, 0.6, 0.9),
+            ("zsh% ", 0.9, 0.6, 0.9),
+            ("bash-5.3# ", 0.9, 0.6, 0.9),
+            ("# ", 0.9, 0.6, 0.9),
+            ("root@prod:/etc# ", 0.9, 0.85, 0.9),
+            // The two the rev.-34 letter rule re-admits at 0.6 on T3b.
+            // Both end in a `PROMPT_CHARS` member, so the cursor scores
+            // them 0.9 and the combined answer is 0.90 — §8.6 rev. 46
+            // says so in as many words, and this is where it is costed.
+            ("mem2%", 0.9, 0.6, 0.9),
+            ("x50%", 0.9, 0.6, 0.9),
+            // --- carve-out 1: `^>\s*$` is a row anchor, not a character
+            // guard, and is not transplanted. `foo> ` scoring 0 on the
+            // pattern rung and 0.9 on the cursor is the case T3c exists
+            // for; requiring the *line* to be recognised would collapse
+            // the two sub-signals into one.
+            ("sqlite>", 0.9, 0.95, 0.95),
+            ("mysql>", 0.9, 0.95, 0.95),
+            ("foo> ", 0.9, 0.0, 0.9),
+            ("> ", 0.9, 0.5, 0.9),
+            // --- carve-out 2: `:` and `)` have no T3b row and so no
+            // guard to inherit. A parked cursor after either still scores
+            // 0.9 — the residual §8.6 accepts by name, asserted here so
+            // that narrowing it later is a deliberate edit rather than a
+            // silent one.
+            ("Password: ", 0.9, 0.95, 0.95),
+            ("Enter the following commands:", 0.9, 0.8, 0.9),
+            ("Continue) ", 0.9, 0.0, 0.9),
+        ];
+
+        /// The cursor parked at the end of `line`, which is what a shell
+        /// that has finished writing its prompt leaves behind.
+        fn parked(line: &str) -> vt100::Parser {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(line.as_bytes());
+            p
+        }
+
+        #[test]
+        fn every_guarded_line_is_pinned_on_both_sub_signals_and_on_the_answer() {
+            for (line, want_cursor, want_pattern, want_confidence) in CORPUS {
+                let cursor = raw_cursor_score(parked(line).screen(), DEFAULT_PROMPT_CHARS);
+                assert!(
+                    (cursor - want_cursor).abs() < 1e-6,
+                    "{line:?}: cursor_score {cursor}, want {want_cursor}"
+                );
+
+                let (mut d, start, settled) = detector();
+                feed(&mut d, start, line.as_bytes());
+                let s = d.snapshot_at(true, ld(true, true), None, Some(cursor), settled);
+
+                assert_eq!(s.last_line, *line, "the scanner did not see the line");
+                assert_eq!(s.detection_tier, DetectionTier::Heuristic, "{line:?}");
+                assert!(
+                    (s.quiescent_score - 1.0).abs() < 1e-6,
+                    "{line:?}: not settled"
+                );
+                assert!(
+                    (s.pattern_score - want_pattern).abs() < 1e-6,
+                    "{line:?}: pattern_score {}, want {want_pattern}",
+                    s.pattern_score
+                );
+                assert!(
+                    (s.cursor_score - want_cursor).abs() < 1e-6,
+                    "{line:?}: cursor_score {}, want {want_cursor}",
+                    s.cursor_score
+                );
+                assert!(
+                    (s.confidence - want_confidence).abs() < 1e-6,
+                    "{line:?}: confidence {}, want {want_confidence}",
+                    s.confidence
+                );
+                // The mode is what the agent acts on, and it is the half
+                // of the answer that changed: a stalled progress bar used
+                // to read `AtPrompt` off the cursor alone.
+                let want_mode = if *want_confidence >= 0.5 {
+                    InteractionMode::AtPrompt
+                } else {
+                    InteractionMode::Executing
+                };
+                assert_eq!(s.interaction_mode, want_mode, "{line:?}");
+            }
+        }
+
+        /// The corpus that asserts nothing, written out so that it cannot
+        /// be arrived at by accident.
+        ///
+        /// Terminate every line above and all thirty collapse to the same
+        /// `cursor_score` — `raw_cursor_score` returns at `col == 0`
+        /// before it examines a character, so the far side and the near
+        /// side become indistinguishable and the whole corpus passes
+        /// against an implementation with no head guard in it at all.
+        /// That is the arrangement task 4's fixtures were in.
+        #[test]
+        fn the_same_corpus_newline_terminated_pins_column_zero_and_nothing_else() {
+            let mut distinct = std::collections::BTreeSet::new();
+            for (line, want_cursor, ..) in CORPUS {
+                let terminated = format!("{line}\r\n");
+                let p = parked(&terminated);
+                assert_eq!(
+                    p.screen().cursor_position().1,
+                    0,
+                    "{line:?}: the newline did not return the cursor to column 0"
+                );
+                assert_eq!(
+                    raw_cursor_score(p.screen(), DEFAULT_PROMPT_CHARS),
+                    0.0,
+                    "{line:?}"
+                );
+                distinct.insert(want_cursor.to_bits());
+            }
+            assert_eq!(
+                distinct.len(),
+                2,
+                "the parked corpus must carry both a 0.9 and a 0.0 side, or \
+                 the collapse asserted above is not a collapse"
+            );
+        }
+
+        /// The end-to-end shape of the defect: a `git clone` that stalls
+        /// mid-transfer (§8.6 rev. 46, REQ-PD-008).
+        ///
+        /// Nothing here is contrived. `git` redraws its counter in place
+        /// with a carriage return and never ends the line, so the last
+        /// logical line really is `Receiving objects:  47%` with the
+        /// cursor really parked after the `%`; a stall is silence, so
+        /// `quiescent_score` really does climb to 1.0 with nothing left
+        /// to disagree. Before rev. 46 that combination answered
+        /// `AtPrompt` / `heuristic` / **0.90** — §8.4's act threshold —
+        /// and told the agent to type at a download.
+        #[test]
+        fn a_stalled_git_clone_answers_executing_and_zero() {
+            let (mut d, start, settled) = detector();
+            let mut p = vt100::Parser::new(24, 80, 0);
+            for pct in ["1", "7", "19", "47"] {
+                let chunk = format!("\rReceiving objects:  {pct}%");
+                feed(&mut d, start, chunk.as_bytes());
+                p.process(chunk.as_bytes());
+            }
+
+            let cursor = raw_cursor_score(p.screen(), DEFAULT_PROMPT_CHARS);
+            assert_eq!(cursor, 0.0, "the redrawn percentage scored as a prompt");
+            let s = d.snapshot_at(true, ld(true, true), None, Some(cursor), settled);
+            assert_eq!(s.last_line, "Receiving objects:  47%");
+            assert!(
+                (s.quiescent_score - 1.0).abs() < 1e-6,
+                "{}",
+                s.quiescent_score
+            );
+            assert_eq!(s.interaction_mode, InteractionMode::Executing);
+            assert_eq!(s.detection_tier, DetectionTier::Heuristic);
+            assert_eq!(s.confidence, 0.0);
+
+            // ...and the clone finishing, which is the same fixture with
+            // the guard on the other side of its boundary. Without this
+            // the row above passes against a combiner that has stopped
+            // answering `AtPrompt` at all — and the shell whose prompt
+            // this is, `csh` on a numbered host, is one of the sessions
+            // T3 exists for.
+            let done = "\r\nbuild01% ";
+            feed(&mut d, start, done.as_bytes());
+            p.process(done.as_bytes());
+            let cursor = raw_cursor_score(p.screen(), DEFAULT_PROMPT_CHARS);
+            assert_eq!(cursor, 0.9);
+            let s = d.snapshot_at(true, ld(true, true), None, Some(cursor), settled);
+            assert_eq!(s.last_line, "build01% ");
+            assert_eq!(s.interaction_mode, InteractionMode::AtPrompt);
+            assert!((s.confidence - 0.9).abs() < 1e-6, "{}", s.confidence);
+        }
+    }
+
     /// §11.4 — the escape-length ceiling's residual, asserted at what it
     /// actually *reaches* rather than at its cheapest form (§8.8 rev. 34,
     /// REQ-PD-018).
