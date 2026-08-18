@@ -12,7 +12,7 @@ use crate::output::encoding::TextEncoding;
 use crate::output::redact::redact_str;
 use crate::output::rules::RuleSet;
 use crate::output::{ReadOptions, ReadRequest, ReadStart};
-use crate::pty::{InProcessPty, PtyBackend, PtySpawnConfig};
+use crate::pty::{clamp_geometry, InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
 use crate::session::{new_session_id, wait, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
@@ -147,10 +147,12 @@ pub struct StartSessionArgs {
     /// secrets: these values cross the MCP boundary (spec §5.2).
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
-    /// Terminal width in columns. Defaults to 120.
+    /// Terminal width in columns, 1 to 1000. Defaults to 120. A value
+    /// outside that range is clamped to it, not rejected.
     #[serde(default)]
     pub cols: Option<u16>,
-    /// Terminal height in rows. Defaults to 40.
+    /// Terminal height in rows, 1 to 1000. Defaults to 40. A value
+    /// outside that range is clamped to it, not rejected.
     #[serde(default)]
     pub rows: Option<u16>,
     /// Tier-B VT100 emulation: "off", "adaptive" (default), or "on".
@@ -263,6 +265,16 @@ impl ClaspServer {
         if let Some(r) = args.rows {
             cfg.rows = r;
         }
+        // The same bound `resize` applies, applied *before* the spawn.
+        // `Session::resize` is the funnel for every later change of
+        // geometry, but the spawn predates the session, so a zero or
+        // 65 535-wide grid could otherwise be set here and never pass
+        // through it. Clamping `cfg` rather than a copy is what keeps the
+        // child's `winsize`, the `ScreenConfig` below and the size the
+        // session reports from being three different numbers.
+        let (cols, rows) = clamp_geometry(cfg.cols, cfg.rows);
+        cfg.cols = cols;
+        cfg.rows = rows;
 
         // Validate before spawning: an unrecognised mode is an input
         // error, and silently falling back to the default would leave the
@@ -652,8 +664,10 @@ impl ClaspServer {
     /// Resize a session's terminal, raising `SIGWINCH` in the child so a
     /// full-screen program redraws at the new size. The reported
     /// dimensions are read back from the session rather than echoed from
-    /// the request. Resizing to the size already in force is a no-op and
-    /// leaves any outstanding `get_screen_state` revision usable.
+    /// the request, so a request outside the supported 1..=1000 range
+    /// comes back carrying the clamped size it actually reached. Resizing
+    /// to the size already in force is a no-op and leaves any outstanding
+    /// `get_screen_state` revision usable.
     #[tool(
         annotations(
             title = "Resize a session's terminal",
@@ -1504,9 +1518,11 @@ pub struct GetScreenStateArgs {
 pub struct ResizeArgs {
     /// Session id or live session name.
     pub session: String,
-    /// New terminal width in columns.
+    /// New terminal width in columns, 1 to 1000. A value outside that
+    /// range is clamped to it; the response reports the size reached.
     pub cols: u16,
-    /// New terminal height in rows.
+    /// New terminal height in rows, 1 to 1000. A value outside that
+    /// range is clamped to it; the response reports the size reached.
     pub rows: u16,
 }
 

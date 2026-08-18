@@ -11,7 +11,7 @@ use crate::output::rules::RuleSet;
 use crate::output::{
     OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
 };
-use crate::pty::{PtyBackend, Signal};
+use crate::pty::{clamp_geometry, PtyBackend, Signal};
 use crate::screen::{
     CursorSignal, QueryResponder, ScreenCapture, ScreenConfig, ScreenTracker,
     DEFAULT_TERMINAL_QUERY_REPLIES_PER_MIN,
@@ -844,7 +844,18 @@ impl Session {
     /// told the size changed would leave `get_screen_state` rendering a
     /// 132×43 session through an 80×24 grid, silently and with no error
     /// anywhere.
+    ///
+    /// **The clamp is here because this is the funnel.** `resize` the tool
+    /// reaches it, and so does every internal caller; `start_session`
+    /// cannot (it has no session yet when it spawns the child), so it
+    /// applies the same [`clamp_geometry`] to its `PtySpawnConfig` before
+    /// the spawn. Clamping *before* the backend call is what keeps the
+    /// child's `winsize`, the stored size and the tracker's grid one
+    /// number rather than three — and since `size()` is what the tool
+    /// reports, the agent is told the geometry it got rather than the one
+    /// it asked for.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        let (cols, rows) = clamp_geometry(cols, rows);
         self.backend.resize(cols, rows)?;
         self.size.store(pack_size(cols, rows), Ordering::Relaxed);
         self.screen.lock().resize(cols, rows);
@@ -955,7 +966,7 @@ impl Session {
 mod tests {
     use super::*;
     use crate::detect::{DetectionTier, InteractionMode, PatternSet, PromptPattern};
-    use crate::pty::MockPty;
+    use crate::pty::{MockPty, MAX_COLS, MAX_ROWS, MIN_COLS, MIN_ROWS};
     use crate::screen::{ScreenCapture, ScreenGrid, ScreenTracking};
     use std::time::Instant;
 
@@ -2387,5 +2398,192 @@ mod tests {
         let g = grid(s.screen_state(None, true, &OutputProcessor::builtin().unwrap()));
         assert_eq!(g.lines[0].trim_end(), "ONCE");
         assert_eq!((g.cursor_row, g.cursor_col), (0, 4));
+    }
+
+    // ---------------------------------------------- geometry bounds (C3)
+
+    fn capture(s: &Session) -> ScreenGrid {
+        grid(s.screen_state(None, true, &OutputProcessor::builtin().unwrap()))
+    }
+
+    /// A live-parser session, painted, with Tier B already running — so a
+    /// `resize` reaches `vt100::Screen::set_size` rather than only
+    /// `ScreenConfig`.
+    fn painted_session(mode: ScreenTracking) -> (Arc<Session>, Arc<MockPty>) {
+        let (s, pty) = mock_session();
+        s.set_screen_config(ScreenConfig {
+            mode,
+            rows: 24,
+            cols: 80,
+            ..ScreenConfig::default()
+        });
+        let out = b"PAINTED";
+        pty.queue_output(out);
+        wait_for_bytes(&s, out.len() as u64);
+        (s, pty)
+    }
+
+    /// A terminal with zero rows or columns is not a terminal, and
+    /// `TIOCSWINSZ` is perfectly happy to make one — so the value arrives
+    /// at the tracker verbatim and `Grid::set_size` computes
+    /// `size.rows - 1` on a `u16`. Under the `overflow-checks` a test
+    /// build has on, that panics *inside the screen lock*; `parking_lot`
+    /// does not poison, so the session would carry on with a parser the
+    /// reader thread hits next.
+    #[test]
+    fn a_zero_geometry_resize_is_clamped_before_it_reaches_the_grid() {
+        let (s, _pty) = painted_session(ScreenTracking::On);
+        let before = capture(&s);
+        assert_eq!(
+            (before.cols, before.rows),
+            (80, 24),
+            "the parser has to exist before the resize, or `set_size` is \
+             never called and this test exercises nothing"
+        );
+
+        s.resize(0, 0).expect("a clamped resize is not an error");
+        assert_eq!(s.size(), (MIN_COLS, MIN_ROWS));
+        let g = capture(&s);
+        assert_eq!(
+            (g.cols, g.rows),
+            (MIN_COLS, MIN_ROWS),
+            "the grid and the session disagree about the clamped geometry"
+        );
+
+        // The control, and it is what separates "clamped" from "refuses
+        // every resize": an in-range pair still passes through untouched.
+        s.resize(132, 43).expect("resize");
+        assert_eq!(s.size(), (132, 43));
+        let wide = capture(&s);
+        assert_eq!((wide.cols, wide.rows), (132, 43));
+    }
+
+    /// The other end. `Row::new(cols)` allocates every cell eagerly and
+    /// `vt100::Cell` is statically asserted at 32 bytes, so an unclamped
+    /// `resize(65535, 65535)` asks for ~137 GB in one allocation loop —
+    /// which in hybrid mode takes the daemon, and every other session
+    /// with it.
+    #[test]
+    fn a_resize_past_the_supported_maximum_is_clamped_rather_than_allocated() {
+        // The bound is spelled out as a literal here rather than read
+        // back from the constant: a test that only compares
+        // `size() == MAX_COLS` cannot tell a clamp from a ceiling that
+        // has been raised out from under it, and this bound is a
+        // deliberate choice (32 MB per grid) rather than an incidental
+        // one.
+        assert_eq!(
+            (MIN_COLS, MIN_ROWS, MAX_COLS, MAX_ROWS),
+            (2, 2, 1000, 1000),
+            "the geometry bounds moved; the measurement in `pty`'s \
+             `MIN_COLS`/`MAX_ROWS` doc comments is what justifies them"
+        );
+
+        let (s, _pty) = painted_session(ScreenTracking::On);
+        let _ = capture(&s);
+
+        s.resize(u16::MAX, u16::MAX)
+            .expect("a clamped resize is not an error");
+        assert_eq!(s.size(), (1000, 1000));
+        let g = capture(&s);
+        assert_eq!((g.cols, g.rows), (1000, 1000));
+        assert_eq!(
+            g.lines.len(),
+            1000,
+            "the rendered grid is a different shape from the one the \
+             session reports"
+        );
+
+        // The control: an in-range pair is not clamped.
+        s.resize(132, 43).expect("resize");
+        assert_eq!(s.size(), (132, 43));
+        assert_eq!((capture(&s).cols, capture(&s).rows), (132, 43));
+    }
+
+    /// Tier B *off* is a second path to the same subtraction, and it does
+    /// not go through `set_size` at all: `ScreenTracker::resize` on a
+    /// parserless tracker updates only `cfg`, and the next read builds
+    /// `vt100::Parser::new(rows, cols, 0)` from it — where `Grid::new`
+    /// has the identical `size.rows - 1`.
+    #[test]
+    fn the_tier_b_off_render_never_sees_an_unclamped_geometry() {
+        let (s, _pty) = painted_session(ScreenTracking::Off);
+        s.resize(0, 0).expect("a clamped resize is not an error");
+        assert_eq!(
+            s.screen_tracking(),
+            "off",
+            "the arm under test is the one with no live parser; with Tier \
+             B running this would exercise `set_size` instead"
+        );
+        assert_eq!(s.size(), (MIN_COLS, MIN_ROWS));
+
+        let g = capture(&s);
+        assert_eq!((g.cols, g.rows), (MIN_COLS, MIN_ROWS));
+        assert_eq!(
+            s.screen_tracking(),
+            "off",
+            "the one-shot render must not have turned Tier B on"
+        );
+
+        // The control, and it also shows the one-shot still renders the
+        // buffer rather than merely surviving: at the minimum there is
+        // nowhere to put `PAINTED`.
+        s.resize(80, 24).expect("resize");
+        let back = capture(&s);
+        assert_eq!((back.cols, back.rows), (80, 24));
+        assert_eq!(back.lines[0].trim_end(), "PAINTED");
+    }
+
+    /// **Why the floor is two and not one.** Measured against
+    /// `vt100` 0.16.2, each of these streams panics at one row or one
+    /// column and survives at two:
+    ///
+    /// - one row — `Grid::col_wrap`'s `prev_pos.row -= scrolled`, on any
+    ///   wrap, scroll region, reverse index or off-screen cursor move;
+    /// - one column — `Grid::col_wrap`'s `self.size.cols - width`, on any
+    ///   wide character.
+    ///
+    /// So this is the test that *chooses* the constant rather than
+    /// restating it: set `MIN_COLS` or `MIN_ROWS` to 1 and it panics —
+    /// inside the screen lock, which is where the shipped defect was.
+    /// Raising them cannot make it pass by accident either, because the
+    /// grid it asserts on is read back from the session.
+    #[test]
+    fn the_minimum_geometry_survives_the_streams_that_underflow_below_it() {
+        // One session per stream: escape state left by one payload would
+        // otherwise decide what the next one does.
+        for (name, stream) in [
+            ("narrow wrap", "abcdefghijklmnopqrstuvwxyz".as_bytes()),
+            ("wide characters", "\u{4f60}\u{597d}\u{4e16}\u{754c}".as_bytes()),
+            ("newlines", b"a\r\nb\r\nc\r\nd\r\n"),
+            ("tabs", b"a\tb\tc\td\t"),
+            ("one-row scroll region", b"\x1b[1;1r\x1b[2Jabc\r\ndef\r\nghi"),
+            ("reverse index", b"\x1bMabc\x1bM\x1bDdef\x1bE\x1bE"),
+            (
+                "off-screen cursor moves",
+                b"\x1b[99;99H\x1b[2Jx\x1b[9A\x1b[9B\x1b[9C\x1b[9D\x1b[H\x1b[K",
+            ),
+            ("insert and delete", b"\x1b[2Jabc\x1b[9L\x1b[9M\x1b[9P\x1b[9@"),
+            ("alt screen", b"\x1b[?1049habcdef\r\nghi\x1b[?1049ljkl"),
+        ] {
+            let (s, pty) = painted_session(ScreenTracking::On);
+            let _ = capture(&s);
+            s.resize(MIN_COLS, MIN_ROWS).expect("resize");
+
+            let head = s.buffer_head();
+            pty.queue_output(stream);
+            wait_for_bytes(&s, head + stream.len() as u64);
+
+            let g = capture(&s);
+            assert_eq!(
+                (g.cols, g.rows),
+                (MIN_COLS, MIN_ROWS),
+                "{name} left the grid a different shape from the session's"
+            );
+            assert_eq!(
+                g.lines.len(),
+                usize::from(MIN_ROWS),
+                "{name} rendered the wrong number of rows"
+            );
+        }
     }
 }

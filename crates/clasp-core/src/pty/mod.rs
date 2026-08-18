@@ -42,6 +42,83 @@ impl PtySpawnConfig {
     }
 }
 
+/// The narrowest terminal CLASP will drive.
+///
+/// **Two, not one, and it is measured rather than chosen.** A terminal
+/// with zero columns is not a terminal, and nothing below CLASP says so:
+/// `TIOCSWINSZ` accepts a zero `winsize`, the backend answers `Ok`, and
+/// the value reaches the tracker verbatim — where `vt100` 0.16.2 treats
+/// it as a programming error rather than as input. At **zero**,
+/// `Grid::new` and `Grid::set_size` compute `size.cols - 1` on a `u16`.
+/// At **one**, `Grid::col_wrap` computes `self.size.cols - width` with
+/// `width == 2` for any wide character — a CJK glyph or an emoji is
+/// enough — and underflows the same way.
+///
+/// Both **panic** under the `overflow-checks` a dev or test build has on,
+/// and in release both **wrap to 65 535** on a grid that has just been
+/// resized to nothing. `parking_lot` does not poison, so the panic
+/// unwinds out of the screen lock and the session carries on with a
+/// corrupt parser; the failure then resurfaces in the reader thread, far
+/// from the call that caused it.
+///
+/// `the_minimum_geometry_survives_the_streams_that_underflow_below_it`
+/// is what keeps this honest across a `vt100` upgrade: it drives the
+/// offending streams at exactly this size, so lowering the constant
+/// makes it panic rather than quietly pass.
+pub const MIN_COLS: u16 = 2;
+
+/// The shortest terminal CLASP will drive. Two for the same reason as
+/// [`MIN_COLS`] and by the same measurement, but a different subtraction:
+/// at **one row**, any wrap, scroll region, reverse index or off-screen
+/// cursor move reaches `Grid::col_wrap`'s `prev_pos.row -= scrolled`
+/// with `prev_pos.row == 0` and `scrolled == 1`.
+pub const MIN_ROWS: u16 = 2;
+
+/// The widest terminal CLASP will drive. See [`MAX_ROWS`] for the
+/// reasoning — it is a memory bound, not a display one.
+pub const MAX_COLS: u16 = 1000;
+
+/// The tallest terminal CLASP will drive.
+///
+/// **A memory bound rather than a display one.** `vt100::Cell` is
+/// statically asserted to be exactly 32 bytes and a grid allocates every
+/// cell eagerly (`Grid::set_size` resizes the row vector, `Row::new` is
+/// `vec![Cell::new(); cols]`), so one grid at this limit is
+/// 1000 × 1000 × 32 B ≈ 32 MB, and a tracked session holds the live grid
+/// plus the boundary replay, the repaint and `retained_revisions` clones
+/// of it — a couple of hundred megabytes at the very top, from a caller
+/// who asked for it. The unbounded `u16` alternative is
+/// 65 535 × 65 535 × 32 B ≈ **137 GB** in one allocation loop, which in
+/// hybrid mode takes down the daemon hosting every other session, from a
+/// single in-schema tool call.
+///
+/// 1000 is comfortably past anything a real terminal is: a 4K display at
+/// a 6-pixel font is ~640 columns, and 1000 rows would want a
+/// 10 000-pixel-tall one.
+pub const MAX_ROWS: u16 = 1000;
+
+/// Bring a requested geometry inside `MIN_COLS..=MAX_COLS` by
+/// `MIN_ROWS..=MAX_ROWS`.
+///
+/// **Clamped rather than rejected, and the response contract is why.**
+/// `resize` reports `Session::size()`, read back from the session *after*
+/// the backend call rather than echoed from the request — a discipline
+/// `resize_reports_the_size_it_reached_not_the_size_requested` already
+/// pins — so a clamped request comes back carrying the geometry the
+/// terminal actually reached. The agent is told the truth either way; the
+/// difference is that clamping also leaves it with a working terminal
+/// instead of an error it has no better value to retry with. It is also
+/// what a real terminal does: an emulator asked to be one row tall gives
+/// you the smallest one it has.
+///
+/// The one thing this must never become is a silent lie — a clamp whose
+/// result is *not* what gets reported would be worse than either arm, so
+/// every caller applies it **before** the backend call and stores the
+/// clamped pair as the session's size.
+pub fn clamp_geometry(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.clamp(MIN_COLS, MAX_COLS), rows.clamp(MIN_ROWS, MAX_ROWS))
+}
+
 /// The slave's line-discipline flags, read from **one** `tcgetattr` on the
 /// master (spec §8.2). The master reports the slave's `c_lflag`, which is
 /// what §8.3's echo rung consults.
