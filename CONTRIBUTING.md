@@ -5,8 +5,8 @@ have to pass, and the two testing standards this project actually enforces —
 they are unusual enough that they trip people up, and they are the reason the
 suite is worth anything.
 
-CLASP is **early**. Milestones 0.0.1 and 0.0.2 are merged, nothing is released,
-and the surface moves. [ROADMAP.md](./ROADMAP.md) shows what is being built
+CLASP is **early**. Milestones 0.0.1 through 0.0.4 are merged, nothing is
+released, and the surface moves. [ROADMAP.md](./ROADMAP.md) shows what is being built
 next; opening an issue before a large change is appreciated.
 
 ## Development setup
@@ -49,13 +49,18 @@ are gated to public repositories on GitHub Free. Until this repository goes
 public, running these locally is still the actual gate and a red job is
 something a human has to notice.
 
-`cargo test --workspace` is 311 tests today: 222 unit, 23 in
-`tests/detection.rs`, 37 in `tests/integration.rs`, 29 in `tests/schema.rs`.
+`cargo test --workspace` is 607 tests today: 452 unit, 23 in
+`tests/detection.rs`, 71 in `tests/integration.rs`, 42 in `tests/schema.rs`,
+18 in `tests/screen.rs`, 1 in `tests/stress_write_path.rs`.
 Treat those numbers as a tripwire for "a suite stopped being compiled" rather
 than as a contract. Many of the tests spawn real PTYs and real shells, so they
-are not hermetic and they are not fast.
+are not hermetic and they are not fast — and two of the suites are *supposed*
+to be slow. `tests/screen.rs` and `tests/stress_write_path.rs` are dominated
+by real waiting (a 3 s grace window and a 3 s stress run), so a materially
+faster result there means the scenario did not happen, not that the machine
+is quick.
 
-`scripts/mcp-smoke.sh` (30 checks) is **the only thing that drives the real
+`scripts/mcp-smoke.sh` (37 checks) is **the only thing that drives the real
 JSON-RPC surface**. Every Rust test asserts against in-process objects, so a
 bug that lives in serialisation — a tool whose `outputSchema` never reaches the
 wire, a doc comment the router drops, an enum serialised outside its declared
@@ -86,9 +91,12 @@ matched the PTY's echo of their own command line, and so passed against a
 session running `sleep 300` instead of a shell. The recurring class has a name
 here: **a test whose assertion is weaker than its name.**
 
-The smoke script is held to the same standard: it fails all 30 of its checks
+The smoke script is held to the same standard: it fails all 37 of its checks
 when pointed at `/bin/true`, so the script itself is known to be capable of
-failing.
+failing. That is a check you can run, not a claim to take on trust —
+`./scripts/mcp-smoke.sh /bin/true` must report `SMOKE FAILED: 37 check(s) did
+not pass`, and a number lower than the passing run's is a check that went
+green against a server that never started.
 
 ### 2. Pair every positive assertion with the negative that separates it from the degenerate case
 
