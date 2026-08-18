@@ -16,7 +16,7 @@ use crate::screen::{CursorSignal, ScreenCapture, ScreenConfig, ScreenTracker};
 use crate::{ClaspError, Result};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -120,6 +120,20 @@ pub struct Session {
     /// one path that needs both — a re-seed reads the ring buffer — so
     /// nothing may ever take `buffer` and then this.
     screen: Arc<Mutex<ScreenTracker>>,
+    /// The PTY's **current** dimensions, packed `cols << 16 | rows`.
+    ///
+    /// Nothing tracked this before: `PtySpawnConfig`'s `cols`/`rows` are
+    /// consumed at `openpty` and then forgotten, so the only thing a
+    /// `resize` tool could report was the argument it was handed — which
+    /// reports success for a resize that failed. Seeded at construction
+    /// with `PtySpawnConfig::new`'s defaults, corrected by
+    /// `set_screen_config` (which is where the real geometry arrives), and
+    /// written by `resize` *after* the backend call.
+    ///
+    /// Atomic rather than behind the screen mutex because `size()` is a
+    /// cheap read on the control path, and because the two are updated
+    /// together under `resize` anyway.
+    size: AtomicU32,
     /// Spec §9.2 rule table, shared with the screen tracker so
     /// `set_screen_config` can rebuild it. Sourced from
     /// `output::rules::builtin_shared()` (0.0.3) — the process-wide table
@@ -178,6 +192,16 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// `(cols, rows)` in one `u32`, so a reader can never observe a half-applied
+/// resize (a width from after the call beside a height from before it).
+fn pack_size(cols: u16, rows: u16) -> u32 {
+    (u32::from(cols) << 16) | u32::from(rows)
+}
+
+fn unpack_size(packed: u32) -> (u16, u16) {
+    ((packed >> 16) as u16, (packed & 0xffff) as u16)
+}
+
 impl Session {
     /// Wrap a spawned backend and start the reader thread draining it
     /// into the buffer.
@@ -213,6 +237,13 @@ impl Session {
             backend: Arc::clone(&backend),
             buffer: Arc::clone(&buffer),
             screen: Arc::clone(&screen),
+            // Matches `ScreenConfig::default()` above, which matches
+            // `PtySpawnConfig::new`. `set_screen_config` replaces both with
+            // the geometry the child was actually spawned at.
+            size: AtomicU32::new(pack_size(
+                ScreenConfig::default().cols,
+                ScreenConfig::default().rows,
+            )),
             rules,
             detector: Arc::clone(&detector),
             history: Arc::clone(&history),
@@ -738,8 +769,43 @@ impl Session {
     /// the §4.5 three-second no-signal trigger can fire on a session that
     /// did emit one. The window is microseconds before any shell has
     /// printed a prompt; calling this later widens it for no gain.
+    /// It is also where the session learns the geometry it was spawned at
+    /// — `Session::new` is handed a `SessionConfig`, which carries none —
+    /// so `size()` answers from the same numbers the Tier-B grid is built
+    /// against rather than from a second copy that could disagree with it.
     pub fn set_screen_config(&self, cfg: ScreenConfig) {
+        self.size
+            .store(pack_size(cfg.cols, cfg.rows), Ordering::Relaxed);
         *self.screen.lock() = ScreenTracker::new(cfg, Arc::clone(&self.rules), Instant::now());
+    }
+
+    /// The PTY's current dimensions as `(cols, rows)` — what `resize`
+    /// reports back, read after the backend call rather than echoed from
+    /// the request.
+    pub fn size(&self) -> (u16, u16) {
+        unpack_size(self.size.load(Ordering::Relaxed))
+    }
+
+    /// Resize the terminal (spec §5.2 `resize`, REQ-T-009): `SIGWINCH` to
+    /// the child, then the two pieces of CLASP-side state that describe the
+    /// same geometry.
+    ///
+    /// **Backend first, and the ordering is the contract.** The stored size
+    /// is what `size()` reports, so writing it before the `ioctl` would
+    /// have `resize` answering with dimensions the terminal never reached
+    /// when the call fails.
+    ///
+    /// The tracker is told too, because this milestone introduces the one
+    /// thing in the tree whose correctness depends on the dimensions: a
+    /// `vt100::Parser` constructed from `ScreenConfig` and otherwise never
+    /// told the size changed would leave `get_screen_state` rendering a
+    /// 132×43 session through an 80×24 grid, silently and with no error
+    /// anywhere.
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.backend.resize(cols, rows)?;
+        self.size.store(pack_size(cols, rows), Ordering::Relaxed);
+        self.screen.lock().resize(cols, rows);
+        Ok(())
     }
 
     /// `screen_tracking` for the agent-facing responses: `"off"` or

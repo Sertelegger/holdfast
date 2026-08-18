@@ -11,11 +11,6 @@ use crate::output::OutputProcessor;
 use crate::session::Session;
 use serde_json::{json, Value};
 
-/// Tier-B VT100 tracking arrives in 0.0.4. Until then the answer is always
-/// `"off"`; the field exists now so the response shape does not change
-/// when tracking becomes real (§4.5).
-pub const SCREEN_TRACKING: &str = "off";
-
 /// f32 scores serialise through f64 and pick up representation noise
 /// (`0.95f32` prints as `0.949999988079071`, which an agent thresholding
 /// on 0.95 would never match). Three decimals is more precision than any
@@ -170,7 +165,17 @@ pub fn with_detection(mut data: Value, session: &Session, processor: &OutputProc
         json!(d.interaction_mode.as_str()),
     );
     map.insert("detection_tier".into(), json!(d.detection_tier.as_str()));
-    map.insert("screen_tracking".into(), json!(SCREEN_TRACKING));
+    // REQ-TS-006, in full and at the one place the value is produced. This
+    // helper is the single source of the §5.4 block for `read_output`,
+    // `send_input`, `wait_for_pattern`, `status`, `list_sessions` and
+    // 0.0.4's `interrupt`, so there is no per-tool half to defer — and a
+    // `"screen_tracking"` key inserted by a *caller* upstream of this line
+    // would simply be overwritten here, which is a defect that changes no
+    // key set and therefore fails no test.
+    //
+    // `Session::screen_tracking()`, never `ScreenTracking::as_str()`: the
+    // reported vocabulary is two-valued and the mode enum is three-valued.
+    map.insert("screen_tracking".into(), json!(session.screen_tracking()));
     map.insert(
         "title".into(),
         json!(d.title.as_deref().map(|t| redact_str(&processor.rules, t))),
@@ -193,6 +198,7 @@ pub fn with_detection(mut data: Value, session: &Session, processor: &OutputProc
 mod tests {
     use super::*;
     use crate::pty::{MockPty, PtyBackend};
+    use crate::screen::{ScreenConfig, ScreenTracking};
     use crate::session::{new_session_id, Session, SessionConfig};
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -589,6 +595,43 @@ mod tests {
             serde_json::to_string(&v["prompt"]["confidence"]).unwrap(),
             "0.95"
         );
+    }
+
+    /// REQ-TS-006. The mutation this kills is the whole of the
+    /// `screen_tracking` edit: the pre-0.0.4
+    /// `map.insert("screen_tracking".into(), json!(SCREEN_TRACKING))`,
+    /// where `SCREEN_TRACKING` was the constant `"off"`. That version
+    /// passes every other test in this module and in `tests/schema.rs`,
+    /// because it emits the same key with the same type — only the *value*
+    /// is wrong, and every other fixture in the tree has Tier B genuinely
+    /// off, where the constant and the truth agree.
+    ///
+    /// **A test that asserts the key exists is the can't-fail test that
+    /// let this through.** So this asserts the value, on a session that has
+    /// tracking on.
+    #[test]
+    fn screen_tracking_reports_the_sessions_actual_state_not_a_constant() {
+        let (s, _pty) = session_with_output(b"\x1b[?2004h$ ", "$ ");
+        // The negative half, and the reason it is not redundant: with
+        // tracking off the honest answer is also "off", so the positive
+        // below cannot be satisfied by hard-coding either literal.
+        assert_eq!(
+            with_detection(json!({}), &s, &rules())["screen_tracking"],
+            "off"
+        );
+
+        s.set_screen_config(ScreenConfig {
+            mode: ScreenTracking::On,
+            rows: 24,
+            cols: 80,
+            ..ScreenConfig::default()
+        });
+        assert_eq!(
+            with_detection(json!({}), &s, &rules())["screen_tracking"],
+            "on",
+            "the field is wired to the constant, not to the session"
+        );
+        assert_eq!(s.screen_tracking(), "on", "…and the session really is on");
     }
 
     #[test]

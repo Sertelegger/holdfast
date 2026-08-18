@@ -24,8 +24,8 @@
 use clasp_core::detect::Shell;
 use clasp_core::mcp::envelope;
 use clasp_core::mcp::tools::{
-    GetCommandHistoryArgs, ReadOutputArgs, SendInputArgs, StartSessionArgs, StatusArgs,
-    TerminateArgs, WaitForPatternArgs,
+    GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ReadOutputArgs, ResizeArgs,
+    SendInputArgs, StartSessionArgs, StatusArgs, TerminateArgs, WaitForPatternArgs,
 };
 use clasp_core::mcp::ClaspServer;
 use clasp_core::pty::{MockPty, PtyBackend};
@@ -52,14 +52,23 @@ fn advertised(name: &str) -> Tool {
         "list_sessions" => ClaspServer::list_sessions_tool_attr(),
         "get_command_history" => ClaspServer::get_command_history_tool_attr(),
         "wait_for_pattern" => ClaspServer::wait_for_pattern_tool_attr(),
+        "get_screen_state" => ClaspServer::get_screen_state_tool_attr(),
+        "resize" => ClaspServer::resize_tool_attr(),
+        "interrupt" => ClaspServer::interrupt_tool_attr(),
         other => panic!("no such tool: {other}"),
     }
 }
 
-/// Every tool 0.0.3 ships. REQ-T-013 says "every tool", so this is
+/// Every tool 0.0.4 ships. REQ-T-013 says "every tool", so this is
 /// enumerated rather than spot-checked: a tool added later without a
 /// schema, or without annotations, fails the loops below.
-const TOOLS: [&str; 8] = [
+///
+/// **This array cannot see a tool that is in the router and not here** —
+/// `advertised()` panics on an unknown *name*, which is the other
+/// direction. `mcp::tools::tests::the_router_advertises_exactly_the_0_0_4_
+/// tool_set` is the link that closes it, because it reads `tool_router()`
+/// and this file cannot (`tool_router` is `pub(crate)`).
+const TOOLS: [&str; 11] = [
     "start_session",
     "read_output",
     "send_input",
@@ -68,6 +77,9 @@ const TOOLS: [&str; 8] = [
     "list_sessions",
     "get_command_history",
     "wait_for_pattern",
+    "get_screen_state",
+    "resize",
+    "interrupt",
 ];
 
 fn output_schema(name: &str) -> Value {
@@ -620,6 +632,38 @@ fn every_tool_declares_the_annotations_5_3_assigns_it() {
             None,
             None,
             Some(false),
+        ),
+        // §5.3: read-only even though the call can enable Tier B, because
+        // that changes CLASP's bookkeeping and not the session.
+        (
+            "get_screen_state",
+            "Read the rendered terminal screen",
+            Some(true),
+            None,
+            None,
+            Some(false),
+        ),
+        // The one non-read-only tool that is `idempotentHint: true` and
+        // `destructiveHint: false` — resizing to the size already in force
+        // is a no-op, and no other row in this table carries that pair.
+        (
+            "resize",
+            "Resize a session's terminal",
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(false),
+        ),
+        // REQ-T-010's interrupt half: `interrupt` and `terminate` differ
+        // exactly here. Copying `terminate`'s row by reflex gives
+        // `idempotent: true, open_world: false`, and both are wrong.
+        (
+            "interrupt",
+            "Send Ctrl+C to a session's process group",
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
         ),
     ];
     assert_eq!(
@@ -1944,7 +1988,15 @@ async fn a_wrongly_typed_field_is_rejected() {
         ("truncated_at_tail", json!("yes")),
         ("interaction_mode", json!("NotAMode")),
         ("detection_tier", json!("terminal-mode")),
-        ("screen_tracking", json!("on")),
+        // `"adaptive"`, and it replaces `"on"`, which 0.0.4 made a legal
+        // value. It is not an arbitrary replacement: `screen_tracking` is
+        // a **three**-valued `start_session` argument and a **two**-valued
+        // reported state, and `adaptive` is the default mode — so
+        // `ScreenTracking::as_str()` on the policy's mode is the obvious
+        // accessor, is wrong, and would emit exactly this on every
+        // session's first response. This row is what makes that a
+        // validation failure rather than a value an agent has to guess at.
+        ("screen_tracking", json!("adaptive")),
         ("prompt", json!({ "confidence": 1.0 })),
     ] {
         let mut broken = payload.clone();
@@ -2068,6 +2120,309 @@ async fn wait_for_pattern_response_matches_its_schema() {
     assert_eq!(payload["data"]["clamped_timeout_secs"], 3600);
 
     kill(&server, &id).await;
+}
+
+// ------------------------------------------------------- 0.0.4's three tools
+
+/// A session whose child has really exited, with a **distinctive** code.
+///
+/// `exit 7` rather than a kill: `0` is what a broken exit-status read
+/// produces by default and a signalled child reports a code the caller did
+/// not choose, so neither would prove the field was read.
+async fn exited_session(server: &ClaspServer) -> String {
+    let (id, _) = start_bash(server).await;
+    wait_for(server, &id, "$").await;
+    let session = server.registry.get(&id).expect("the session");
+    session.write_input(b"exit 7\n").expect("write");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.is_alive() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!session.is_alive(), "bash never exited");
+    id
+}
+
+/// `get_screen_state`'s full-grid shape, with its key set pinned exactly
+/// (REQ-T-015).
+///
+/// **The fixture paints a screen, and that is the point of it.** A key-set
+/// assertion sees a key that is present-and-`null` exactly the way it sees
+/// one carrying a value, so a green run against a bare prompt would prove
+/// nothing whatever about `title`, `alt_screen` or the cursor — which is
+/// precisely how `title` shipped unredacted for three milestones
+/// underneath a whole-response leak guard whose fixtures never set one. So
+/// this session enters the alternate screen, sets an OSC 0 title, paints
+/// text on row 3, and leaves the cursor off `(0, 0)`; every one of those
+/// four fields is then asserted by value below the key set.
+#[tokio::test]
+async fn get_screen_state_full_response_matches_its_schema() {
+    let server = ClaspServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    // `GRID''_ROW` echoes with the quotes and prints without them, so the
+    // wait below cannot be satisfied by the PTY's echo of the command.
+    let session = server.registry.get(&id).expect("the session");
+    session
+        .write_input(
+            b"printf '\\033[?1049h\\033[H\\033[2J\\033]0;clasp-grid\\007\\033[3;5HGRID''_ROW'\n",
+        )
+        .expect("write");
+    wait_for(&server, &id, "GRID_ROW").await;
+
+    let r = server
+        .get_screen_state(Parameters(GetScreenStateArgs {
+            session: id.clone(),
+            ..Default::default()
+        }))
+        .await
+        .expect("get_screen_state must not be a protocol error");
+    let payload = assert_matches_schema("get_screen_state", &r);
+    assert_eq!(payload["status"], "ok", "{payload}");
+    // REQ-T-015: exactly, not "contains". `screen_revision` proves this is
+    // the full shape; the absence of `base_revision`/`diff` proves it is
+    // not the diff shape; the absence of `exit_code` proves that field is
+    // conditional rather than always emitted. A subset check would pass
+    // against all three faults.
+    assert_eq!(
+        keys(&payload["data"]),
+        set(&[
+            "screen_revision",
+            "rows",
+            "cols",
+            "cursor",
+            "alt_screen",
+            "title",
+            "lines",
+            "screen_tracking",
+        ]),
+    );
+    assert_eq!(
+        keys(&payload["data"]["cursor"]),
+        set(&["row", "col", "visible"]),
+    );
+    // This call is what enables Tier B, so it is also the first response
+    // in the whole suite that can carry `screen_tracking: "on"` — which is
+    // what proves the `ScreenTracking::On` variant landed. Without it this
+    // line is where the suite goes red.
+    assert_eq!(payload["data"]["screen_tracking"], "on");
+
+    // The four fields the fixture exists to populate. Without these the
+    // key set above is satisfied by a grid of nulls.
+    let data = &payload["data"];
+    assert_eq!(data["title"], "clasp-grid", "{data}");
+    assert_eq!(data["alt_screen"], true, "{data}");
+    assert_ne!(
+        (
+            data["cursor"]["row"].as_u64(),
+            data["cursor"]["col"].as_u64()
+        ),
+        (Some(0), Some(0)),
+        "the cursor was never moved, so `cursor` proves nothing: {data}"
+    );
+    let lines = data["lines"].as_array().expect("lines is an array");
+    assert_eq!(lines.len(), 40, "the default geometry is 120x40");
+    // `starts_with`, not equality: bash prints its prompt where the
+    // `printf` left the cursor, so this row carries `PS1` after the text
+    // and the prompt string differs between bash versions. The four
+    // leading spaces are the load-bearing part — they are the `\033[3;5H`,
+    // which is what makes this a rendered grid rather than a line of
+    // output.
+    assert!(
+        lines[2].as_str().unwrap_or("").starts_with("    GRID_ROW"),
+        "row 3, painted at column 5: {lines:?}"
+    );
+
+    kill(&server, &id).await;
+}
+
+/// The diff shape, and the separator from the full grid.
+///
+/// The key set has to be exact for a reason specific to this tool: every
+/// field of `schema::GetScreenState` is optional, so a diff capture that
+/// silently degraded to a full grid would still validate. The grid keys
+/// must be *absent*, not merely unchecked.
+#[tokio::test]
+async fn get_screen_state_diff_response_matches_its_schema() {
+    let server = ClaspServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    let first = assert_matches_schema(
+        "get_screen_state",
+        &server
+            .get_screen_state(Parameters(GetScreenStateArgs {
+                session: id.clone(),
+                ..Default::default()
+            }))
+            .await
+            .expect("get_screen_state"),
+    );
+    let rev = first["data"]["screen_revision"]
+        .as_u64()
+        .expect("a full capture carries a revision");
+
+    let r = server
+        .get_screen_state(Parameters(GetScreenStateArgs {
+            session: id.clone(),
+            diff_from: Some(rev),
+            ..Default::default()
+        }))
+        .await
+        .expect("get_screen_state");
+    let payload = assert_matches_schema("get_screen_state", &r);
+    assert_eq!(
+        keys(&payload["data"]),
+        set(&[
+            "screen_revision",
+            "base_revision",
+            "diff",
+            "screen_tracking"
+        ]),
+    );
+    assert_eq!(payload["data"]["base_revision"], rev);
+    assert!(payload["data"]["diff"].is_string());
+
+    kill(&server, &id).await;
+}
+
+/// The only path that emits `get_screen_state.exit_code`, and therefore
+/// the only response that can close the declared-but-never-emitted half of
+/// REQ-T-015 for this tool. §5.1: `session_died` is a status, not an
+/// error, and here it comes back with the final screen still in it.
+#[tokio::test]
+async fn get_screen_state_on_a_dead_session_matches_its_schema() {
+    let server = ClaspServer::new();
+    let id = exited_session(&server).await;
+
+    let r = server
+        .get_screen_state(Parameters(GetScreenStateArgs {
+            session: id.clone(),
+            ..Default::default()
+        }))
+        .await
+        .expect("get_screen_state");
+    let payload = assert_matches_schema("get_screen_state", &r);
+    assert_eq!(payload["status"], "session_died", "{payload}");
+    assert_eq!(
+        keys(&payload["data"]),
+        set(&[
+            "screen_revision",
+            "rows",
+            "cols",
+            "cursor",
+            "alt_screen",
+            "title",
+            "lines",
+            "screen_tracking",
+            "exit_code",
+        ]),
+    );
+    // The value, not just the key: `0` is what a broken exit-status read
+    // produces by default, so a non-zero code is what proves it was read.
+    assert_eq!(payload["data"]["exit_code"], 7);
+    // And the grid survived the child, which is the behaviour §5.2
+    // describes and the reason `session_died` carries data at all.
+    assert!(payload["data"]["lines"].is_array());
+    assert!(
+        payload["data"]["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .any(|l| l.as_str().unwrap_or("").contains("exit 7")),
+        "the final screen is empty, so `session_died carries data` is \
+         untested here: {}",
+        payload["data"]["lines"]
+    );
+}
+
+/// `resize`'s two shapes. The `ok` one carries the dimensions the session
+/// *reached*; the `session_died` one is the only path that emits
+/// `exit_code`, which `schema::Resize` declares.
+#[tokio::test]
+async fn resize_responses_match_their_schema() {
+    let server = ClaspServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    let r = server
+        .resize(Parameters(ResizeArgs {
+            session: id.clone(),
+            cols: 132,
+            rows: 43,
+        }))
+        .await
+        .expect("resize must not be a protocol error");
+    let payload = assert_matches_schema("resize", &r);
+    assert_eq!(payload["status"], "ok", "{payload}");
+    assert_eq!(keys(&payload["data"]), set(&["cols", "rows"]));
+    // Unequal on purpose: a transposition is invisible on a square
+    // terminal, and `cols`/`rows` are the same type.
+    assert_eq!(payload["data"]["cols"], 132);
+    assert_eq!(payload["data"]["rows"], 43);
+    kill(&server, &id).await;
+
+    let dead = exited_session(&server).await;
+    let r = server
+        .resize(Parameters(ResizeArgs {
+            session: dead,
+            cols: 132,
+            rows: 43,
+        }))
+        .await
+        .expect("resize must not be a protocol error");
+    let payload = assert_matches_schema("resize", &r);
+    assert_eq!(payload["status"], "session_died", "{payload}");
+    assert_eq!(keys(&payload["data"]), set(&["exit_code"]));
+    assert_eq!(payload["data"]["exit_code"], 7);
+}
+
+/// `interrupt`'s two shapes.
+///
+/// The `ok` one is **prompt-bearing** (§5.2, REQ-T-019), so its key set is
+/// `delivered` plus the whole §5.4 block — and the nested `prompt` object
+/// is pinned too, because REQ-T-016's equality obligation is recursive and
+/// the top level cannot see a `prompt` that gained a field.
+#[tokio::test]
+async fn interrupt_responses_match_their_schema() {
+    let server = ClaspServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for_at_prompt(&server, &id).await;
+
+    let r = server
+        .interrupt(Parameters(InterruptArgs {
+            session: id.clone(),
+        }))
+        .await
+        .expect("interrupt must not be a protocol error");
+    let payload = assert_matches_schema("interrupt", &r);
+    assert_eq!(payload["status"], "ok", "{payload}");
+    assert_eq!(
+        keys(&payload["data"]),
+        set(&[
+            "delivered",
+            "interaction_mode",
+            "detection_tier",
+            "screen_tracking",
+            "title",
+            "prompt",
+        ]),
+    );
+    assert_eq!(payload["data"]["delivered"], true);
+    assert_eq!(keys(&payload["data"]["prompt"]), prompt_keys());
+    kill(&server, &id).await;
+
+    let dead = exited_session(&server).await;
+    let r = server
+        .interrupt(Parameters(InterruptArgs { session: dead }))
+        .await
+        .expect("interrupt must not be a protocol error");
+    let payload = assert_matches_schema("interrupt", &r);
+    assert_eq!(payload["status"], "session_died", "{payload}");
+    // No `delivered` at all, rather than `delivered: false`: nothing was
+    // written, so there is no delivery to report on.
+    assert_eq!(keys(&payload["data"]), set(&["exit_code"]));
+    assert_eq!(payload["data"]["exit_code"], 7);
 }
 
 // ------------------------------------ the four §5.4 rules, asserted generally

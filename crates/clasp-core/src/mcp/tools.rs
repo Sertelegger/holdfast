@@ -13,6 +13,7 @@ use crate::output::redact::redact_str;
 use crate::output::rules::RuleSet;
 use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{InProcessPty, PtyBackend, PtySpawnConfig};
+use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
 use crate::session::{new_session_id, wait, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -152,6 +153,12 @@ pub struct StartSessionArgs {
     /// Terminal height in rows. Defaults to 40.
     #[serde(default)]
     pub rows: Option<u16>,
+    /// Tier-B VT100 emulation: "off", "adaptive" (default), or "on".
+    /// Full emulation costs ~11.6 ms per MiB on the write path, so
+    /// "adaptive" turns it on only when something needs the rendered
+    /// screen. Leave it alone unless you are profiling.
+    #[serde(default)]
+    pub screen_tracking: Option<String>,
     /// Extra tier-3 prompt patterns, each `{regex, score}` with score in
     /// [0,1]. Added to the bundled table unless `prompt_patterns_replace`.
     #[serde(default)]
@@ -252,6 +259,22 @@ impl ClaspServer {
             cfg.rows = r;
         }
 
+        // Validate before spawning: an unrecognised mode is an input
+        // error, and silently falling back to the default would leave the
+        // operator believing they had turned emulation off.
+        let mode = match args.screen_tracking.as_deref() {
+            None => ScreenTracking::default(),
+            Some(s) => match ScreenTracking::parse(s) {
+                Some(m) => m,
+                None => {
+                    return Err(ErrorData::invalid_params(
+                        format!("screen_tracking must be off, adaptive or on; got {s:?}"),
+                        None,
+                    ));
+                }
+            },
+        };
+
         // Detection config is built *before* the spawn: a bad regex is
         // the caller's error and must not leave a live child behind.
         let extra: Vec<PromptPattern> = args
@@ -305,6 +328,17 @@ impl ClaspServer {
             backend,
             config,
         );
+
+        // Before the registry insert, so no caller can observe a session
+        // whose Tier-B geometry still holds the constructor default. It is
+        // also what teaches the session its own size, which `resize`
+        // reports back.
+        session.set_screen_config(ScreenConfig {
+            mode,
+            rows: cfg.rows,
+            cols: cfg.cols,
+            ..ScreenConfig::default()
+        });
 
         if let Err(e) = self.registry.insert(Arc::clone(&session)) {
             // Registry rejected it; don't leak the child.
@@ -506,6 +540,186 @@ impl ClaspServer {
                 &self.processor,
             ),
             format!("{} bytes", read.bytes_returned),
+        ))
+    }
+
+    /// Return the rendered terminal grid instead of the byte stream. This
+    /// is the right read for a full-screen program: `read_output` on a TUI
+    /// returns redraw soup, this returns what a human would see.
+    ///
+    /// Pass `diff_from` with the `screen_revision` of your previous call
+    /// to get only the changed regions, which for a single keystroke is
+    /// typically tens of bytes rather than a whole grid.
+    #[tool(
+        annotations(
+            title = "Read the rendered terminal screen",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = schema::envelope_schema::<schema::GetScreenState>()
+    )]
+    pub async fn get_screen_state(
+        &self,
+        Parameters(args): Parameters<GetScreenStateArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = match self.registry.get(&args.session) {
+            Ok(s) => s,
+            Err(e) => return envelope::from_error(&e),
+        };
+
+        // §5.2: `redact` defaults to **true**. Resolved here and nowhere
+        // else, so the default lives in one place.
+        let redact = args.redact.unwrap_or(true);
+        // §9.4: turning redaction off is an auditable event, and the
+        // record is written where the caller is known rather than inside
+        // the tracker. `tool` is a `&'static str` literal at the call site
+        // — §9.4 forbids any code path from request params to it — and
+        // `client_kind` is `"in_process"` until 0.0.5's `mcp::caller`
+        // derives it from a uid-checked handshake (REQ-SEC-018). The same
+        // pair 0.0.3's `read_processed` passes, for the same reasons.
+        if !redact {
+            self.processor.audit.record_redaction_disabled(
+                Some(&session.id),
+                "get_screen_state",
+                "in_process",
+            );
+        }
+
+        // Enabling Tier B costs one buffer re-seed (§4.5); the call
+        // succeeds either way, so this is never an error path — which is
+        // also why §5.3 classifies the tool `readOnlyHint: true` despite
+        // it: the change is to CLASP's bookkeeping, not to the session.
+        let capture = session.screen_state(args.diff_from, redact);
+        let tracking = session.screen_tracking();
+
+        let (mut data, details) = match capture {
+            ScreenCapture::Full(g) => (
+                json!({
+                    "screen_revision": g.screen_revision,
+                    "rows": g.rows,
+                    "cols": g.cols,
+                    "cursor": { "row": g.cursor_row, "col": g.cursor_col, "visible": g.cursor_visible },
+                    "alt_screen": g.alt_screen,
+                    "title": g.title,
+                    "lines": g.lines,
+                }),
+                format!("full {}x{} grid", g.rows, g.cols),
+            ),
+            ScreenCapture::Delta(d) => (
+                json!({
+                    "screen_revision": d.screen_revision,
+                    "base_revision": d.base_revision,
+                    "diff": d.diff,
+                }),
+                format!("diff from revision {}", d.base_revision),
+            ),
+        };
+        // Read *after* the capture, which is the call that can change it:
+        // this is the one tool that reports the tier it left the session
+        // in, and it is what tells the agent whether the next call costs a
+        // re-seed (§5.2).
+        data["screen_tracking"] = json!(tracking);
+
+        // A grid remains readable after the child exits — the agent still
+        // wants to see the final screen — so `session_died` carries data
+        // rather than replacing it. It is not an error status (§5.1).
+        let status = if session.is_alive() {
+            Status::Ok
+        } else {
+            data["exit_code"] = json!(session.exit_code());
+            Status::SessionDied
+        };
+        Ok(envelope::envelope(status, data, details))
+    }
+
+    /// Resize a session's terminal, raising `SIGWINCH` in the child so a
+    /// full-screen program redraws at the new size. The reported
+    /// dimensions are read back from the session rather than echoed from
+    /// the request. Resizing to the size already in force is a no-op and
+    /// leaves any outstanding `get_screen_state` revision usable.
+    #[tool(
+        annotations(
+            title = "Resize a session's terminal",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = schema::envelope_schema::<schema::Resize>()
+    )]
+    pub async fn resize(
+        &self,
+        Parameters(args): Parameters<ResizeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = match self.registry.get(&args.session) {
+            Ok(s) => s,
+            Err(e) => return envelope::from_error(&e),
+        };
+        if !session.is_alive() {
+            return Ok(envelope::envelope(
+                Status::SessionDied,
+                json!({ "exit_code": session.exit_code() }),
+                "session has exited",
+            ));
+        }
+        // A failing `ioctl` is CLASP failing to do its job, not a session
+        // outcome, so it takes the protocol channel (§5.1) — and it
+        // matters that it does: the alternative is an `ok` reporting
+        // dimensions the terminal never reached.
+        if let Err(e) = session.resize(args.cols, args.rows) {
+            return envelope::from_error(&e);
+        }
+        let (cols, rows) = session.size();
+        Ok(envelope::ok(
+            json!({ "cols": cols, "rows": rows }),
+            format!("resized to {cols}x{rows}"),
+        ))
+    }
+
+    /// Send Ctrl+C (SIGINT) to the session's foreground process group, so
+    /// it reaches the command being interrupted rather than the shell
+    /// hosting it.
+    ///
+    /// `delivered` reports that the signal was **written**, not that the
+    /// child reacted — nothing in CLASP can observe the latter. The
+    /// session-state block beside it is what tells you whether it landed:
+    /// a session that was `Executing` and is now `AtPrompt` is an
+    /// interrupt that worked.
+    #[tool(
+        annotations(
+            title = "Send Ctrl+C to a session's process group",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema::envelope_schema::<schema::Interrupt>()
+    )]
+    pub async fn interrupt(
+        &self,
+        Parameters(args): Parameters<InterruptArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = match self.registry.get(&args.session) {
+            Ok(s) => s,
+            Err(e) => return envelope::from_error(&e),
+        };
+        if !session.is_alive() {
+            return Ok(envelope::envelope(
+                Status::SessionDied,
+                json!({ "exit_code": session.exit_code() }),
+                "session has exited",
+            ));
+        }
+        // `Signal::Interrupt`, which `InProcessPty` routes to the
+        // *foreground* group via `killpg(tcgetpgrp(master) ?: pgid)`.
+        // Never `terminate`'s sweep: that hits every group in the session
+        // and would kill the shell hosting the command being interrupted.
+        if let Err(e) = session.signal(crate::pty::Signal::Interrupt) {
+            return envelope::from_error(&e);
+        }
+        Ok(envelope::ok(
+            detection::with_detection(json!({ "delivered": true }), &session, &self.processor),
+            "SIGINT sent to the foreground process group",
         ))
     }
 
@@ -1249,6 +1463,42 @@ pub struct StatusArgs {
     pub session: String,
 }
 
+/// `Default` for the reason 0.0.2 put it on `StartSessionArgs`: every
+/// later milestone adds arguments here, and an exhaustive literal repaired
+/// by naming the new field breaks again next milestone.
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GetScreenStateArgs {
+    /// Session id or live session name.
+    pub session: String,
+    /// A `screen_revision` returned by an earlier call. When it names a
+    /// revision CLASP still retains, the response carries only the
+    /// changed regions; otherwise a full grid comes back.
+    #[serde(default)]
+    pub diff_from: Option<u64>,
+    /// Redact secrets in the rendered rows (default true). Setting false
+    /// returns the screen with secret values intact and is recorded in
+    /// the audit log. A `diff_from` naming a revision captured under the
+    /// other setting returns a full grid rather than a diff.
+    #[serde(default)]
+    pub redact: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ResizeArgs {
+    /// Session id or live session name.
+    pub session: String,
+    /// New terminal width in columns.
+    pub cols: u16,
+    /// New terminal height in rows.
+    pub rows: u16,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct InterruptArgs {
+    /// Session id or live session name.
+    pub session: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GetCommandHistoryArgs {
     /// Session id or live session name.
@@ -1280,7 +1530,7 @@ mod tests {
     /// makes the enumeration complete: add a tool without listing it there
     /// and this goes red first.
     #[test]
-    fn the_router_advertises_exactly_the_0_0_3_tool_set() {
+    fn the_router_advertises_exactly_the_0_0_4_tool_set() {
         let mut names: Vec<String> = ClaspServer::tool_router()
             .list_all()
             .into_iter()
@@ -1291,8 +1541,11 @@ mod tests {
             names,
             vec![
                 "get_command_history",
+                "get_screen_state",
+                "interrupt",
                 "list_sessions",
                 "read_output",
+                "resize",
                 "send_input",
                 "start_session",
                 "status",
@@ -1683,6 +1936,39 @@ mod tests {
                 .await
                 .expect("get_command_history"),
         ));
+        // Before `resize`, so the grid is rendered at the geometry the
+        // fixture's lines were written for rather than at a width this
+        // table chose for an unrelated reason.
+        rows.push(row(
+            "get_screen_state",
+            &server
+                .get_screen_state(Parameters(GetScreenStateArgs {
+                    session: session(id),
+                    ..Default::default()
+                }))
+                .await
+                .expect("get_screen_state"),
+        ));
+        rows.push(row(
+            "resize",
+            &server
+                .resize(Parameters(ResizeArgs {
+                    session: session(id),
+                    cols: 100,
+                    rows: 30,
+                }))
+                .await
+                .expect("resize"),
+        ));
+        rows.push(row(
+            "interrupt",
+            &server
+                .interrupt(Parameters(InterruptArgs {
+                    session: session(id),
+                }))
+                .await
+                .expect("interrupt"),
+        ));
         rows.push(row(
             "terminate",
             &server
@@ -1890,6 +2176,43 @@ mod tests {
         // in `mcp::detection`, which keeps a dropped field from passing.
         assert_eq!(status["title"], json!("deploy [REDACTED:github]"));
 
+        // **The grid, and which of its fields this fixture populates.**
+        // `no_row_contains` covers exactly the fields the response
+        // actually carries, so a `get_screen_state` row whose `lines` were
+        // empty and whose `title` were null would pass it while saying
+        // nothing about either — which is how `title` survived three
+        // milestones under this very guard. Each field the tool renders
+        // separately is therefore pinned to the text it must have kept.
+        let screen = data_of(&rows, "get_screen_state");
+        assert_eq!(
+            screen["screen_tracking"],
+            json!("on"),
+            "the call must have enabled Tier B, or the grid below is a \
+             one-shot rather than the tracked screen"
+        );
+        // Rendered by `ScreenTracker` from its own parser, not by
+        // `with_detection` from the scanner — two copies of one field, and
+        // this is the one 0.0.4 adds.
+        assert_eq!(screen["title"], json!("deploy [REDACTED:github]"));
+        let lines: Vec<String> = screen["lines"]
+            .as_array()
+            .expect("a full grid")
+            .iter()
+            .map(|l| l.as_str().unwrap_or_default().trim_end().to_string())
+            .collect();
+        assert_eq!(
+            lines[0], "$ export GH_TOKEN=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]",
+            "the rendered row, redacted and otherwise intact: {lines:?}"
+        );
+        assert_eq!(
+            lines[2], "$ aws configure set aws_access_key_id [REDACTED:aws]",
+            "every row, not the first one: {lines:?}"
+        );
+        assert_eq!(
+            lines[4], "LAST=[REDACTED:github] DD_API_KEY=[REDACTED:datadog]",
+            "{lines:?}"
+        );
+
         kill_everything(&server).await;
     }
 
@@ -1990,6 +2313,125 @@ mod tests {
             matched["match"].get("text").is_none(),
             "a withheld match reports its offset and no text: {}",
             matched["match"]
+        );
+
+        // **`get_screen_state`'s row is clean here for a reason that is
+        // not the holdback, and recording that is the point of this
+        // block.** The rendered row reads `TOKEN=ghp_<39>`, and the
+        // *generic* rule — label plus a long enough value — matches it
+        // whole, so the grid is redacted by REQ-O-011 rather than
+        // protected by §4.1. Change the label and no rule fires; see
+        // `the_screen_grid_does_not_apply_the_byte_stream_holdback`, which
+        // pins that case rather than leaving it to be discovered under a
+        // guard that looks like it covers it.
+        let screen_lines: Vec<String> = data_of(&rows, "get_screen_state")["lines"]
+            .as_array()
+            .expect("a full grid")
+            .iter()
+            .map(|l| l.as_str().unwrap_or_default().trim_end().to_string())
+            .collect();
+        assert_eq!(
+            screen_lines[2], "TOKEN=[REDACTED:generic]",
+            "a complete rule matched the rendered row: {screen_lines:?}"
+        );
+
+        kill_everything(&server).await;
+    }
+
+    /// **A documented residual, pinned rather than assumed away.**
+    ///
+    /// §4.1's holdback withholds an in-flight secret prefix from
+    /// `read_output(since_cursor:)`. The rendered grid does **not** apply
+    /// it, and this test is what makes that visible instead of leaving it
+    /// to be found by whoever changes a fixture's label.
+    ///
+    /// The reasoning it rests on is §4.1's own: *"`tail_lines` and
+    /// `tail_bytes` reads do not apply the holdback — the agent has asked
+    /// for the freshest bytes and accepts the trade-off. Documented
+    /// residual risk."* The grid is that read — `ScreenTracker` seeds from
+    /// `OutputBuffer::read_tail_bytes` and is fed every chunk on the write
+    /// path — and "the screen as it is now" is a recency request by
+    /// construction, with no cursor form to fall back to.
+    ///
+    /// **It is not obviously the right answer, and the spec has not
+    /// decided it.** §9.2's `get_screen_state` row and REQ-O-011/011a
+    /// specify *redaction* — where it runs and over how much — and are
+    /// silent on the holdback. The one place the spec does state the rule
+    /// for a reconstruction is §9.2's `prompt.last_line` case 2, which
+    /// answers *"report nothing"* while the holdback is active; that
+    /// answer is explicitly licensed there by the agent's recourse to
+    /// `read_output`, and a full-screen program has no such recourse —
+    /// `read_output` on a TUI is redraw soup. So the transferable part of
+    /// the rule transfers and the remedy does not, which is a spec
+    /// decision and not a plan's to make. Escalated with the 0.0.4 report.
+    ///
+    /// If that decision lands the other way, this test is the one that
+    /// goes red, which is the point of writing it as an assertion.
+    #[tokio::test]
+    async fn the_screen_grid_does_not_apply_the_byte_stream_holdback() {
+        let server = ClaspServer::new();
+        // The same 39-character partial as arrangement 2, behind a label
+        // **no rule keys on** — `TOKEN=` is matched by the generic rule
+        // and would hide the behaviour under a redaction.
+        let bytes = format!("$ cat note\r\nsee {IN_FLIGHT}");
+        let (id, _pty) = mock_session(&server, "grid-holdback", vec![], bytes.as_bytes());
+        let session = server.registry.get(&id).expect("the session");
+        settle(&session, "the partial to reach the tail", |s| {
+            s.detection().last_line.starts_with("see ")
+        })
+        .await;
+
+        // The arrangement really is one the byte stream is withholding
+        // from, and the redactor really cannot see it. Both are asserted,
+        // because either one failing would make this test a statement
+        // about something else.
+        assert!(
+            session.holdback_boundary(&server.processor) < session.buffer_head(),
+            "nothing is being withheld, so there is no bypass to describe"
+        );
+        let read = row(
+            "read_output",
+            &server
+                .read_output(Parameters(ReadOutputArgs {
+                    session: id.clone(),
+                    since_cursor: Some(0),
+                    ..Default::default()
+                }))
+                .await
+                .expect("read_output"),
+        )
+        .data;
+        assert_eq!(read["held_back"], json!(true));
+        assert!(
+            !read["output"].as_str().unwrap_or_default().contains("ghp_"),
+            "the cursor read must be withholding it: {}",
+            read["output"]
+        );
+
+        let screen = row(
+            "get_screen_state",
+            &server
+                .get_screen_state(Parameters(GetScreenStateArgs {
+                    session: id.clone(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("get_screen_state"),
+        )
+        .data;
+        let lines: Vec<String> = screen["lines"]
+            .as_array()
+            .expect("a full grid")
+            .iter()
+            .map(|l| l.as_str().unwrap_or_default().trim_end().to_string())
+            .collect();
+        assert_eq!(
+            lines[1],
+            format!("see {IN_FLIGHT}"),
+            "the current answer: the grid returns what the same session's \
+             cursor read is withholding. If this line is now the redacted \
+             or suppressed form, the spec decision landed and this test is \
+             the record of what changed: {lines:?}"
         );
 
         kill_everything(&server).await;

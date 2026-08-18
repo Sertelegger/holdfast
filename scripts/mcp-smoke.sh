@@ -45,7 +45,7 @@ set -uo pipefail
 # Only on the default path. An explicit argument names a binary the
 # caller has already produced -- CI passes `./target/release/clasp` after
 # its own `cargo build --release`, and `./scripts/mcp-smoke.sh /bin/true`
-# is the negative control that must fail all 34 checks -- so building in
+# is the negative control that must fail all 37 checks -- so building in
 # that case would either be wrong or a no-op.
 if [ "$#" -eq 0 ]; then
   if ! cargo build --workspace >&2; then
@@ -247,30 +247,32 @@ check "initialize advertises tool capability" '"capabilities":{"tools":'
 # server, and it described a four-tool 0.0.1 surface for the whole of
 # 0.0.2. Asserting the names rather than the prose keeps it honest
 # without pinning wording.
-jcheck "initialize's instructions name every 0.0.3 tool" \
+jcheck "initialize's instructions name every tool" \
   'resp(1).result.instructions as $i
    | ["start_session","send_input","read_output","wait_for_pattern","terminate",
-      "status","list_sessions","get_command_history"]
+      "status","list_sessions","get_command_history","get_screen_state",
+      "resize","interrupt"]
    | map(. as $n | select(($i | contains($n)) | not))' \
   '[]'
 
 # ------------------------------------------------- the advertised surface
 
 for tool in start_session read_output send_input terminate status list_sessions \
-            get_command_history wait_for_pattern; do
+            get_command_history wait_for_pattern get_screen_state resize \
+            interrupt; do
   check "tools/list contains $tool" "\"name\":\"$tool\""
 done
 # The loop above cannot see an *extra* tool, and "every tool has X" is
-# only a claim about the eight if eight is all there is.
-jcheck "tools/list advertises exactly the eight 0.0.3 tools" \
+# only a claim about the eleven if eleven is all there is.
+jcheck "tools/list advertises exactly the eleven tools" \
   'tools | map(.name) | sort' \
-  '["get_command_history","list_sessions","read_output","send_input","start_session","status","terminate","wait_for_pattern"]'
+  '["get_command_history","get_screen_state","interrupt","list_sessions","read_output","resize","send_input","start_session","status","terminate","wait_for_pattern"]'
 
 # REQ-T-014. Four same-typed booleans per tool: a transposition
 # serialises perfectly and passes any check that greps for the word
 # `annotations`, or for `"readOnlyHint":true` somewhere in the blob. The
-# whole table is pinned instead, tool by tool, and the three read-only
-# tools share a hint combination so the *title* is what separates them.
+# whole table is pinned instead, tool by tool, and the read-only
+# tools share one hint combination so the *title* is what separates them.
 # This is the wire-side half of `tests/schema.rs::
 # every_tool_declares_the_annotations_5_3_assigns_it`.
 jcheck "tools carry MCP annotations" \
@@ -278,18 +280,18 @@ jcheck "tools carry MCP annotations" \
    | map([.name, .annotations.title, .annotations.readOnlyHint,
           .annotations.destructiveHint, .annotations.idempotentHint,
           .annotations.openWorldHint])' \
-  '[["get_command_history","List commands run, with exit codes",true,null,null,false],["list_sessions","List all sessions",true,null,null,false],["read_output","Read session output",true,null,null,false],["send_input","Send keystrokes to a session",false,true,false,true],["start_session","Start a PTY-backed shell session",false,true,false,true],["status","Get detailed session status",true,null,null,false],["terminate","Terminate a session",false,true,true,false],["wait_for_pattern","Wait for a regex to match output",true,null,null,false]]'
+  '[["get_command_history","List commands run, with exit codes",true,null,null,false],["get_screen_state","Read the rendered terminal screen",true,null,null,false],["interrupt","Send Ctrl+C to a session'"'"'s process group",false,true,false,true],["list_sessions","List all sessions",true,null,null,false],["read_output","Read session output",true,null,null,false],["resize","Resize a session'"'"'s terminal",false,false,true,false],["send_input","Send keystrokes to a session",false,true,false,true],["start_session","Start a PTY-backed shell session",false,true,false,true],["status","Get detailed session status",true,null,null,false],["terminate","Terminate a session",false,true,true,false],["wait_for_pattern","Wait for a regex to match output",true,null,null,false]]'
 
 # REQ-T-013, on the wire rather than in Rust. The `$ref` column is the
-# load-bearing one: it is what distinguishes eight tools that each
-# advertise an `outputSchema` from eight tools that advertise the *same*
+# load-bearing one: it is what distinguishes eleven tools that each
+# advertise an `outputSchema` from eleven tools that advertise the *same*
 # `outputSchema`, which is the shape a copy-paste error takes here and
 # which a presence check cannot see.
 jcheck "tools declare an outputSchema" \
   'tools | sort_by(.name)
    | map([.name, .outputSchema.type, .outputSchema.required,
           .outputSchema.properties.data["$ref"]])' \
-  '[["get_command_history","object",["status","data","details"],"#/$defs/CommandHistory"],["list_sessions","object",["status","data","details"],"#/$defs/ListSessions"],["read_output","object",["status","data","details"],"#/$defs/ReadOutput"],["send_input","object",["status","data","details"],"#/$defs/SendInput"],["start_session","object",["status","data","details"],"#/$defs/StartSession"],["status","object",["status","data","details"],"#/$defs/SessionRecord"],["terminate","object",["status","data","details"],"#/$defs/Terminate"],["wait_for_pattern","object",["status","data","details"],"#/$defs/WaitForPattern"]]'
+  '[["get_command_history","object",["status","data","details"],"#/$defs/CommandHistory"],["get_screen_state","object",["status","data","details"],"#/$defs/GetScreenState"],["interrupt","object",["status","data","details"],"#/$defs/Interrupt"],["list_sessions","object",["status","data","details"],"#/$defs/ListSessions"],["read_output","object",["status","data","details"],"#/$defs/ReadOutput"],["resize","object",["status","data","details"],"#/$defs/Resize"],["send_input","object",["status","data","details"],"#/$defs/SendInput"],["start_session","object",["status","data","details"],"#/$defs/StartSession"],["status","object",["status","data","details"],"#/$defs/SessionRecord"],["terminate","object",["status","data","details"],"#/$defs/Terminate"],["wait_for_pattern","object",["status","data","details"],"#/$defs/WaitForPattern"]]'
 
 # A `$ref` that resolves to nothing describes nothing. `additionalProperties:
 # false` is separately load-bearing: without it a schema that merely omitted
@@ -300,7 +302,7 @@ jcheck "each tool's data schema resolves to a closed object" \
    | map(.outputSchema
          | (.properties.data["$ref"] | ltrimstr("#/$defs/")) as $d
          | [.["$defs"][$d].type, .["$defs"][$d].additionalProperties])' \
-  '[["object",false],["object",false],["object",false],["object",false],["object",false],["object",false],["object",false],["object",false]]'
+  '[["object",false],["object",false],["object",false],["object",false],["object",false],["object",false],["object",false],["object",false],["object",false],["object",false],["object",false]]'
 
 # `$defs` only appears in a schemars-generated schema, so this cannot be
 # satisfied by a hand-written stub that says `{"type":"object"}`.
@@ -319,7 +321,7 @@ jcheck "the §18.2a vocabularies reach the wire" \
       .ScreenTracking.enum, .SessionState.enum]
    + [tool("status").outputSchema["$defs"].ShellIntegration.enum,
       tool("status").outputSchema["$defs"].Osc133Source.enum]' \
-  '[["ok","timeout","session_died","session_not_found","name_taken","limit_reached","spawn_failed","unavailable"],["AtPrompt","Executing","AwaitingSecret","Fullscreen","Exited"],["semantic","terminal_mode","heuristic"],["off"],["Starting","Running","Exited","Dead"],["bash","zsh","fish"],["clasp","external","mixed"]]'
+  '[["ok","timeout","session_died","session_not_found","name_taken","limit_reached","spawn_failed","unavailable"],["AtPrompt","Executing","AwaitingSecret","Fullscreen","Exited"],["semantic","terminal_mode","heuristic"],["off","on"],["Starting","Running","Exited","Dead"],["bash","zsh","fish"],["clasp","external","mixed"]]'
 
 # The caveats have to be in the text the AGENT reads, and scoped to the
 # tool that carries them rather than to the transcript. `80 columns` and

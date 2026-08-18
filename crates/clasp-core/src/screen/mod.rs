@@ -306,6 +306,43 @@ impl ScreenTracker {
         }
     }
 
+    /// Reflow the tracked grid after the PTY's dimensions changed.
+    ///
+    /// **Both the live parser and `cfg` are updated, and the second one is
+    /// the half that is easy to forget.** `set_size` fixes the parser that
+    /// exists now; `cfg.rows`/`cfg.cols` are what `new_parser` and
+    /// `seed_bytes` read, so leaving them stale means the *next* re-seed —
+    /// after an idle disable, or the one-shot an `off` session renders —
+    /// silently rebuilds the old geometry. A grid that is right until the
+    /// tracker cycles is worse than one that is wrong immediately.
+    ///
+    /// `set_size` takes **rows first**, which is the transposition trap
+    /// `Parser::new` carries as well; this method's own argument order is
+    /// `(cols, rows)`, matching `PtyBackend::resize`.
+    ///
+    /// **A resize to the size already in force returns before touching
+    /// anything**, which is what earns `resize`'s `idempotentHint: true`:
+    /// the retained revisions survive, so an agent's outstanding
+    /// `diff_from` still resolves. Clearing them unconditionally would make
+    /// every no-op resize cost the agent a full grid.
+    ///
+    /// A *real* resize does drop them, and must: a retained `Screen` is the
+    /// old geometry, and `contents_diff` between screens of different sizes
+    /// describes a reflow the agent's replay cannot reproduce. Dropping
+    /// them degrades the next `diff_from` to a full grid, which is the same
+    /// graceful path an evicted revision already takes.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        if self.cfg.cols == cols && self.cfg.rows == rows {
+            return;
+        }
+        self.cfg.cols = cols;
+        self.cfg.rows = rows;
+        if let Some(parser) = self.parser.as_mut() {
+            parser.screen_mut().set_size(rows, cols);
+        }
+        self.retained.clear();
+    }
+
     /// The §8.6 T3c sub-signal, or `None` when Tier B is not running.
     pub fn cursor_signal(&mut self, now: Instant, seed: &dyn SeedSource) -> Option<CursorSignal> {
         self.poll(now, seed);

@@ -205,8 +205,8 @@ fn signal_after_exit_is_a_no_op() {
 }
 
 use clasp_core::mcp::tools::{
-    GetCommandHistoryArgs, PromptPatternArg, ReadOutputArgs, SendInputArgs, StartSessionArgs,
-    StatusArgs, TerminateArgs, WaitForPatternArgs,
+    GetCommandHistoryArgs, InterruptArgs, PromptPatternArg, ReadOutputArgs, SendInputArgs,
+    StartSessionArgs, StatusArgs, TerminateArgs, WaitForPatternArgs,
 };
 use clasp_core::mcp::ClaspServer;
 use clasp_core::pty::MockPty;
@@ -3619,4 +3619,193 @@ fn send_input_wait_for_sees_the_echo_of_its_own_write() {
 
         kill_all(&server).await;
     });
+}
+
+// ---------------------------------------------------- `interrupt` (§5.2)
+//
+// The backend half has existed and been pinned since 0.0.1
+// (`interrupt_reaches_the_foreground_job_not_the_shell`, at the top of this
+// file): `InProcessPty` sends SIGINT to `tcgetpgrp(master)` and falls back
+// to the session's own group. What 0.0.4 adds is the tool over it, so these
+// three are about the tool — the envelope, the statuses, and the one
+// property that separates `interrupt` from `terminate`.
+
+async fn interrupt(server: &ClaspServer, id: &str) -> Value {
+    let r = server
+        .interrupt(Parameters(InterruptArgs {
+            session: id.to_string(),
+        }))
+        .await
+        .expect("interrupt must not be a protocol error");
+    body(&r)
+}
+
+/// **Unix-only, and the reason is the assertion rather than the API**: the
+/// discriminating half probes a *descendant* pid with `kill(pid, 0)`.
+/// Windows job objects are 0.0.11's and get their own test.
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupt_stops_a_running_command_and_leaves_the_shell_alive() {
+    let server = ClaspServer::new();
+    let id = start_bash(&server).await;
+    let session = server.registry.get(&id).unwrap();
+    read_until_contains(&server, &id, "$", 50).await;
+
+    // **A backgrounded job, and it is what makes this test discriminate.**
+    // Written first as `assert!(session.is_alive())` after the interrupt,
+    // this test was measured **green** against `Signal::Interrupt` swapped
+    // for `Signal::Terminate` — the session sweep, which is the exact
+    // mutation it was named for — because an interactive bash ignores
+    // SIGTERM and SIGINT alike, so the shell survives either way and only
+    // the foreground `sleep` visibly dies. The sweep's real signature is
+    // that it reaches **every** process group in the session, so a job in
+    // its *own* group that must survive is the assertion the shell's own
+    // liveness cannot be.
+    session
+        .write_input(b"sleep 300 & echo BG''_PID=$!\n")
+        .unwrap();
+    let out = read_until_contains(&server, &id, "BG_PID=", 60).await;
+    let bg_pid: i32 = out
+        .split("BG_PID=")
+        .nth(1)
+        .map(|s| {
+            s.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no background pid in: {out:?}"));
+    assert!(pid_alive(bg_pid), "the background job never started");
+
+    // Foreground, so job control gives `sleep` its own process group —
+    // which is what makes this a test of the *foreground* targeting rather
+    // than of signalling in general.
+    session.write_input(b"sleep 30\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.detection().interaction_mode != clasp_core::detect::InteractionMode::Executing
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Asserted rather than merely waited for: if the `sleep` never
+    // started, the marker below comes back because there was nothing to
+    // interrupt, and this test proves nothing at all.
+    assert_eq!(
+        session.detection().interaction_mode,
+        clasp_core::detect::InteractionMode::Executing,
+        "the shell never started the `sleep`"
+    );
+
+    let r = interrupt(&server, &id).await;
+    assert_eq!(r["status"], "ok", "{r}");
+    assert_eq!(r["data"]["delivered"], json!(true));
+    // Prompt-bearing (§5.2, REQ-T-019): the block beside `delivered` is
+    // what tells the agent whether the signal landed.
+    assert!(
+        r["data"]["prompt"]["reason"].is_string(),
+        "the §5.4 block is missing from a prompt-bearing response: {r}"
+    );
+
+    // The discriminating wait. `sleep 30` outlives this budget by an order
+    // of magnitude, so the marker can only come back from a shell that got
+    // its terminal returned.
+    session.write_input(b"echo BACK''_AT_PROMPT\n").unwrap();
+    let out = read_until_contains(&server, &id, "BACK_AT_PROMPT", 60).await;
+    assert!(
+        out.contains("BACK_AT_PROMPT"),
+        "the shell never returned to a prompt after the interrupt: {out:?}"
+    );
+    assert!(session.is_alive(), "the interrupt killed the shell");
+    // The mutation this kills is using `terminate`'s session sweep. The
+    // foreground `sleep` dies either way and the shell survives either
+    // way; the background job is the only observer that separates the two.
+    assert!(
+        pid_alive(bg_pid),
+        "the background job {bg_pid} was signalled too — this is a session \
+         sweep, not a foreground-group interrupt"
+    );
+
+    kill_all(&server).await;
+    // The sweep is what `kill_all` does, so it is also the cleanup: the
+    // background `sleep 300` outlives the test otherwise.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pid_alive(bg_pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !pid_alive(bg_pid),
+        "the background job outlived the session"
+    );
+}
+
+#[tokio::test]
+async fn interrupt_is_not_idempotent_and_does_not_claim_to_be() {
+    // REQ-T-010's interrupt half: `terminate` is idempotent and
+    // `interrupt` is not, and the two are one attribute apart. A mock
+    // backend, because the property is "a second call delivers a second
+    // signal" and only a backend that records signals can say so — a real
+    // shell absorbs both Ctrl+Cs at an idle prompt and looks identical.
+    let server = ClaspServer::new();
+    let (id, pty) = mock_session_in(&server, "interrupt-twice");
+
+    for n in 1..=2 {
+        let r = interrupt(&server, &id).await;
+        assert_eq!(r["status"], "ok", "call {n}: {r}");
+        assert_eq!(r["data"]["delivered"], json!(true), "call {n}");
+    }
+    assert_eq!(
+        pty.signals(),
+        vec![Signal::Interrupt, Signal::Interrupt],
+        "the second call must reach the child too; an `interrupt` that \
+         short-circuited would be idempotent in fact whatever it advertises"
+    );
+    assert!(
+        server.registry.get(&id).unwrap().is_alive(),
+        "neither interrupt may end the session"
+    );
+
+    // And the advertised hint, asserted *against `terminate`'s* rather than
+    // against a literal: copying `terminate`'s annotation block by reflex
+    // is the mutation, and a per-tool literal cannot see that the two rows
+    // became the same row.
+    let interrupt_hints = ClaspServer::interrupt_tool_attr()
+        .annotations
+        .expect("interrupt carries annotations");
+    let terminate_hints = ClaspServer::terminate_tool_attr()
+        .annotations
+        .expect("terminate carries annotations");
+    assert_eq!(interrupt_hints.idempotent_hint, Some(false));
+    assert_eq!(terminate_hints.idempotent_hint, Some(true));
+    assert_ne!(
+        interrupt_hints.idempotent_hint, terminate_hints.idempotent_hint,
+        "REQ-T-010 is exactly that these two tools differ here"
+    );
+
+    kill_all(&server).await;
+}
+
+#[tokio::test]
+async fn interrupt_on_an_exited_session_reports_session_died() {
+    let server = ClaspServer::new();
+    let id = start_script(&server, "exit 7").await;
+    let session = server.registry.get(&id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.is_alive() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!session.is_alive(), "bash never exited");
+
+    let r = interrupt(&server, &id).await;
+    assert_eq!(r["status"], "session_died", "{r}");
+    assert_eq!(r["data"]["exit_code"], json!(7));
+    // Not `delivered: false` — the field is absent, because nothing was
+    // written and there is no delivery to report on. The mutation this
+    // kills is answering `ok` with `delivered: true` for a signal sent to
+    // nothing.
+    assert!(
+        r["data"].get("delivered").is_none(),
+        "a signal sent to nothing must not be reported as delivered: {r}"
+    );
+
+    kill_all(&server).await;
 }

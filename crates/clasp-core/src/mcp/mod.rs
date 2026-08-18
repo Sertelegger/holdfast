@@ -92,7 +92,16 @@ impl ServerHandler for ClaspServer {
              it printed using a cursor you carry between calls; \
              wait_for_pattern blocks until a regex matches new output, which \
              is how you wait for a command to finish or for a prompt to \
-             appear; terminate stops it and its process group. status and list_sessions report what each \
+             appear; interrupt sends Ctrl+C to the foreground process group, \
+             which stops the running command without killing the shell, and \
+             terminate stops the session and its whole process group. \
+             get_screen_state returns the rendered terminal grid rather than \
+             the byte stream, which is the right read for a full-screen \
+             program; pass diff_from with the screen_revision from your \
+             previous call to get only the changed regions. screen_tracking on \
+             a session's responses says whether that emulation is already \
+             running. resize changes the terminal's dimensions and raises \
+             SIGWINCH in the child, so a TUI redraws at the new size. status and list_sessions report what each \
              session is doing: interaction_mode is one of AtPrompt, Executing, \
              AwaitingSecret, Fullscreen, Exited, and detection_tier says whether \
              that was measured from OSC 133 shell integration (semantic), from a \

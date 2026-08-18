@@ -85,12 +85,24 @@ pub enum DetectionTier {
     Heuristic,
 }
 
-/// Tier-B tracking state (§4.5). 0.0.2 only ever reports `off`; 0.0.4 adds
-/// the other values. Declared as an enum so the agent sees the vocabulary.
+/// Tier-B tracking state (§4.5, §18.2a): whether emulation is **running**,
+/// not which mode was configured. Declared as an enum so the agent sees the
+/// vocabulary.
+///
+/// **Two values, and `adaptive` is deliberately not one of them.**
+/// `screen_tracking` is a three-valued *`start_session` argument* and a
+/// two-valued *reported state*; §4.5 and §18.2a both enumerate only `off`
+/// and `on` for the report. `Session::screen_tracking()` derives the wire
+/// value from the policy's `enabled` flag rather than from
+/// `screen::ScreenTracking::as_str()`, which has the third spelling — and
+/// since the default mode is `adaptive`, the wrong accessor would fail this
+/// closed schema on the *first* response of *every* session rather than on
+/// a rare one.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScreenTracking {
     Off,
+    On,
 }
 
 /// Lifecycle state of a session (§5.2).
@@ -356,6 +368,77 @@ pub struct CommandEntry {
     pub output_start_cursor: u64,
     /// Absolute offset just past its last output byte; null while running.
     pub output_end_cursor: Option<u64>,
+}
+
+/// Cursor position within the rendered grid.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Cursor {
+    pub row: u16,
+    pub col: u16,
+    pub visible: bool,
+}
+
+/// `get_screen_state`.
+///
+/// One tool, two `data` shapes: a full capture carries the grid, a
+/// `diff_from` capture carries `base_revision` + `diff` instead, and
+/// either can come back as `session_died` with an `exit_code` beside a
+/// still-populated screen. Optional-but-declared is 0.0.2's rule for
+/// exactly this case.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetScreenState {
+    pub screen_revision: Option<u64>,
+    pub rows: Option<u16>,
+    pub cols: Option<u16>,
+    pub cursor: Option<Cursor>,
+    pub alt_screen: Option<bool>,
+    pub title: Option<String>,
+    pub lines: Option<Vec<String>>,
+    /// Diff captures only: the revision the diff applies to.
+    pub base_revision: Option<u64>,
+    /// Diff captures only: the changed regions, as the escape sequence
+    /// that turns the base screen into this one.
+    pub diff: Option<String>,
+    pub screen_tracking: Option<ScreenTracking>,
+    /// Present on `session_died`.
+    pub exit_code: Option<i32>,
+}
+
+/// `resize`.
+///
+/// The dimensions are read back from the session **after** the backend
+/// call, so a resize that did not take effect cannot report success — they
+/// are not an echo of the request.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Resize {
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
+    /// Present on `session_died`.
+    pub exit_code: Option<i32>,
+}
+
+/// `interrupt`.
+///
+/// A **prompt-bearing** response (§5.2, REQ-T-019): `delivered` says the
+/// signal was written to the process group, and the session-state block
+/// beside it is what tells the agent whether anything acted on it — a
+/// session that was `Executing` and is now `AtPrompt` is an interrupt that
+/// landed. Declaring `prompt` without the four siblings is what
+/// `every_tool_that_declares_prompt_declares_the_same_block` refuses.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Interrupt {
+    pub delivered: Option<bool>,
+    /// Present on `session_died`.
+    pub exit_code: Option<i32>,
+    pub interaction_mode: Option<InteractionMode>,
+    pub detection_tier: Option<DetectionTier>,
+    pub screen_tracking: Option<ScreenTracking>,
+    pub title: Option<String>,
+    pub prompt: Option<Prompt>,
 }
 
 /// `get_command_history`.
