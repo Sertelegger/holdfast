@@ -86,6 +86,25 @@ impl PtyBackend for StreamPty {
             return Err(ClaspError::Pty("stream ended".into()));
         }
         if !self.preamble_sent.swap(true, Ordering::Relaxed) {
+            // **Not on the very first read, and the delay is the point.**
+            // `Session::new` starts the reader thread, and the caller calls
+            // `set_screen_config` immediately afterwards — which replaces
+            // the whole tracker, Tier-A probe included. A deterministic
+            // signal landing in that window is latched by the tracker that
+            // is about to be discarded, so the session looks signal-less
+            // and §4.5 correctly enables Tier B three seconds later.
+            // `Session::set_screen_config` documents the window and 0.0.4
+            // accepts it: it is microseconds wide and no real shell has
+            // printed a prompt that early. A fixture that emits its
+            // bracketed paste on the reader's *first* call is the one thing
+            // that can be inside it, which would make `parsed == 0` depend
+            // on winning a race rather than on the property it guards. One
+            // failure in roughly twenty-five whole-workspace runs was
+            // observed before this sleep, under a mutation that cannot
+            // reach this file; the other two assertions have 3.7x and 460x
+            // margins, so this is the only one that can plausibly have
+            // moved.
+            std::thread::sleep(CHUNK_INTERVAL);
             let n = buf.len().min(self.preamble.len());
             buf[..n].copy_from_slice(&self.preamble[..n]);
             self.produced.fetch_add(n as u64, Ordering::Relaxed);
