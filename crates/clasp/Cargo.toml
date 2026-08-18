@@ -12,4 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clasp-core = { path = "../clasp-core" }
 anyhow.workspace = true
+libc.workspace = true
+rmcp.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
