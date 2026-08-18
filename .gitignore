@@ -29,3 +29,10 @@ graphify-out/
 # stripped from history rather than merely untracked, so they are absent from
 # the remote entirely.
 docs/
+
+# Python bytecode from the checks in scripts/. Untracked and swept up by an
+# `git add -A` exactly like the zz_ scratch tests were, and for the same
+# reason: the convention is fine, depending on everyone remembering to clean
+# up is not.
+__pycache__/
+*.pyc
