@@ -114,6 +114,25 @@ mod tests {
         assert!(!is_authorized(0, us), "root gets no exception");
     }
 
+    /// RAII cleanup, mirroring `daemon::paths`'s guard of the same name.
+    /// Cleanup at the end of the function runs only on the *passing*
+    /// path, so a failing assertion leaks `/tmp/clasp-t-peer-*` —
+    /// exactly when someone is re-running the test. The retry loop is
+    /// kept: the socket inside may not be unlinked the instant its
+    /// listener drops.
+    struct Scoped(String);
+    impl Drop for Scoped {
+        fn drop(&mut self) {
+            for _ in 0..20 {
+                match std::fs::remove_dir_all(&self.0) {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn peer_cred_reports_this_processs_real_uid() {
         // The assertion is `== current_uid()`, not `>= 0`: a stub that
@@ -124,6 +143,8 @@ mod tests {
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
         std::fs::create_dir_all(&dir).unwrap();
+        // Declared before the listener, so it drops after it.
+        let _scoped = Scoped(dir.clone());
         let path = format!("{dir}/s.sock");
         let listener = UnixListener::bind(&path).unwrap();
 
@@ -143,16 +164,5 @@ mod tests {
             Some(std::process::id() as i32),
             "SO_PEERCRED must report the connecting pid"
         );
-
-        drop(listener);
-        drop(client);
-        drop(server);
-        for _ in 0..20 {
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
-            }
-        }
     }
 }
