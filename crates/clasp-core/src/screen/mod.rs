@@ -976,6 +976,19 @@ fn write_row(
 /// claimed becomes `unresolved`. A masked run split by a span yields two
 /// markers, one either side, because two separate runs of unvouched-for
 /// cells is what that is.
+///
+/// **And a run that only *looks* split because it crossed a wrapped row
+/// is rejoined first.** `write_row` flushes its run at every row
+/// boundary, so a withheld region continuing onto a wrapped row arrives
+/// here as two entries that touch exactly (`prev.end == start`) — the
+/// join puts no separator between a wrapped row and its continuation.
+/// Left alone they become two `[REDACTED:unresolved]` markers for one
+/// region, which is precisely what `rendered_screen`'s step 2 says cannot
+/// happen: a span crossing a row boundary emits one marker on the row it
+/// opened on, and the rows it continues onto lose the covered text. Two
+/// runs touch only in that case — within a row a flush means padding or
+/// an unchanged cell came between, and an unwrapped row break puts a
+/// `\n` between — so coalescing on `==` merges the wrap and nothing else.
 fn compose(rules: &RuleSet, spans: &[Span], masked: &[(usize, usize)]) -> (Vec<Cut>, bool) {
     let unresolved = marker(UNRESOLVED_KIND);
     let mut cuts: Vec<Cut> = spans
@@ -986,6 +999,13 @@ fn compose(rules: &RuleSet, spans: &[Span], masked: &[(usize, usize)]) -> (Vec<C
             text: marker(&rules.rules[s.rule].kind),
         })
         .collect();
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(masked.len());
+    for &(start, end) in masked {
+        match runs.last_mut() {
+            Some(last) if last.1 == start => last.1 = end,
+            _ => runs.push((start, end)),
+        }
+    }
     let mut held_back = false;
     let mut mask = |start: usize, end: usize, cuts: &mut Vec<Cut>| {
         held_back = true;
@@ -995,7 +1015,7 @@ fn compose(rules: &RuleSet, spans: &[Span], masked: &[(usize, usize)]) -> (Vec<C
             text: unresolved.clone(),
         });
     };
-    for &(start, end) in masked {
+    for &(start, end) in &runs {
         let mut cursor = start;
         for span in spans
             .iter()
@@ -1995,5 +2015,140 @@ negative = ["MARK"]
         let later = t0 + NO_SIGNAL_GRACE;
         assert!(t.cursor_signal(later, &log).is_some());
         assert_eq!(t.tracking_state(), "on");
+    }
+
+    /// Paint `text` after a holdback boundary onto an otherwise cleared
+    /// grid, and hand back both renders: masked, and the same bytes with
+    /// no holdback at all.
+    ///
+    /// The second is what keeps every assertion below off the degenerate
+    /// reading. "Row 1 carries no marker" is satisfied by a grid that was
+    /// never painted and by a mask that swallowed everything; only the
+    /// unmasked render says which.
+    fn masked_and_plain(text: &str) -> (ScreenGrid, ScreenGrid) {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
+
+        // Everything before the boundary: a cleared screen. So every cell
+        // the withheld bytes paint differs from the boundary render, and
+        // the masked extent is exactly `text`.
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        let boundary = log.bytes.len() as u64;
+        feed(&mut t, &mut log, t0, text.as_bytes());
+
+        let masked = full(t.capture(None, true, t0, &log, Some(boundary)));
+        let plain = full(t.capture(None, true, t0, &log, None));
+        (masked, plain)
+    }
+
+    /// §4.1's mask, at this module's own level.
+    ///
+    /// A withheld region that continues onto a **wrapped** row is one
+    /// region. `write_row` flushes its run at every row boundary, so it
+    /// reaches `compose` as two entries that touch; without the coalesce
+    /// there, rows 0 and 1 each get their own `[REDACTED:unresolved]` for
+    /// one withheld thing — the exact case `rendered_screen`'s step 2
+    /// states cannot happen, and one that spends the marker's 21
+    /// characters of `clip_to_cols` budget on two rows instead of one.
+    #[test]
+    fn a_masked_region_crossing_a_wrapped_row_emits_one_marker() {
+        let unresolved = marker(UNRESOLVED_KIND);
+        // 90 columns of prose on an 80-column grid: row 0 fills and
+        // wraps, row 1 takes the remaining 10 cells. Prose rather than a
+        // filler run so no redaction rule claims part of it and turns the
+        // marker count into a measurement of something else.
+        let text: String = "the quick brown fox jumps over the lazy dog "
+            .chars()
+            .cycle()
+            .take(90)
+            .collect();
+        let (masked, plain) = masked_and_plain(&text);
+
+        // The control first: the bytes really did land, and they really
+        // did wrap, so "row 1 is blank" below is the mask's doing.
+        assert!(!plain.held_back);
+        assert_eq!(plain.lines[0].trim_end(), &text[..80]);
+        assert_eq!(plain.lines[1].trim_end(), &text[80..]);
+        assert!(!plain.lines.iter().any(|l| l.contains("[REDACTED:")));
+
+        assert!(masked.held_back, "the holdback was open");
+        let markers: usize = masked
+            .lines
+            .iter()
+            .map(|l| l.matches(&unresolved).count())
+            .sum();
+        assert_eq!(
+            markers, 1,
+            "one withheld region across a wrap must emit one marker; grid \
+             rows 0-1 were {:?} / {:?}",
+            masked.lines[0], masked.lines[1]
+        );
+        assert_eq!(masked.lines[0].trim_end(), unresolved);
+        assert_eq!(
+            masked.lines[1].trim_end(),
+            "",
+            "the wrapped continuation must lose the covered text, not gain \
+             a second marker"
+        );
+    }
+
+    /// The other side of the same coalesce: two masked runs on rows that
+    /// are **not** a wrap are two regions and keep their own markers. A
+    /// merge that keyed on anything looser than "the ranges touch" would
+    /// glue these into one and delete the row break.
+    #[test]
+    fn two_masked_rows_that_are_not_a_wrap_keep_their_own_markers() {
+        let unresolved = marker(UNRESOLVED_KIND);
+        let (masked, plain) = masked_and_plain("alpha\r\nbeta");
+
+        assert_eq!(plain.lines[0].trim_end(), "alpha");
+        assert_eq!(plain.lines[1].trim_end(), "beta");
+
+        assert!(masked.held_back);
+        assert_eq!(masked.lines[0].trim_end(), unresolved);
+        assert_eq!(masked.lines[1].trim_end(), unresolved);
+    }
+
+    /// An empty diff is the truthful answer to "nothing changed", and
+    /// `render` says it as a `Delta` rather than degrading to a full grid.
+    /// Nothing pinned that, so an implementation that fell back to a full
+    /// grid on the empty case was indistinguishable to the suite.
+    #[test]
+    fn a_diff_across_no_change_is_an_empty_delta_that_still_replays() {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2Jhello");
+
+        let first = full(t.capture(None, true, t0, &log, None));
+        let base = t.retained.back().expect("base retained").2.clone();
+
+        let quiet = delta(t.capture(Some(first.screen_revision), true, t0, &log, None));
+        assert_eq!(quiet.base_revision, first.screen_revision);
+        assert_eq!(quiet.diff, "", "no bytes were fed between the two captures");
+        assert!(!quiet.held_back);
+        let unchanged = t.retained.back().expect("revision retained").2.clone();
+        assert_eq!(
+            apply(&base, &quiet.diff).screen().contents_formatted(),
+            unchanged.contents_formatted(),
+            "the empty diff did not replay to the current screen"
+        );
+
+        // The negative that separates "correct on the empty case" from
+        // "always empty": one byte of change must produce a diff that
+        // carries it.
+        feed(&mut t, &mut log, t0, b" world");
+        let moved = delta(t.capture(Some(quiet.screen_revision), true, t0, &log, None));
+        assert_eq!(moved.base_revision, quiet.screen_revision);
+        assert!(
+            !moved.diff.is_empty(),
+            "the screen changed and the diff was still empty"
+        );
+        let after = t.retained.back().expect("revision retained").2.clone();
+        assert_eq!(
+            apply(&unchanged, &moved.diff).screen().contents_formatted(),
+            after.contents_formatted()
+        );
     }
 }
