@@ -88,7 +88,36 @@ jobs:
       # halves: the real config is where the tool looks, and no inert decoy
       # has reappeared at the root for someone to edit in good faith.
       - run: test -f .cargo/mutants.toml && test ! -e mutants.toml
-      - run: cargo mutants --package clasp-core --no-shuffle --jobs 2 -- --locked
+      # ONE SHARD PER WEEK, rotating; the whole crate every three weeks.
+      #
+      # The unsharded sweep stopped fitting. Measured: 464 mutants on
+      # 2026-08-13, 1110 on 2026-08-17 -- the crate more than doubled across
+      # 0.0.3 and 0.0.4 -- and run 31883173007 was CANCELLED at the 350-minute
+      # timeout on 2026-08-15 having produced no verdict at all. Raising the
+      # timeout only moves that date: mutant count tracks the codebase, and
+      # this codebase is a third of the way through its spec.
+      #
+      # `--shard k/n` partitions the generated set. Verified 2026-08-17:
+      # 0/3, 1/3 and 2/3 list 370 mutants each, summing to exactly 1110, so
+      # no mutant is dropped and none is run twice. ~370 fits comfortably in
+      # the budget that 1110 overran.
+      #
+      # Why not `--in-diff`, which is the obvious answer: every task in this
+      # project already runs a manual mutation sweep over its own diff, and
+      # that is where essentially every mutation finding has come from. The
+      # unique value of the scheduled job is finding survivors in code
+      # NOBODY HAS TOUCHED -- which is exactly what a diff-scoped run cannot
+      # do. Sharding keeps that property; `--in-diff` would have made the
+      # job a slower duplicate of work already done.
+      #
+      # The rotation is by ISO week so it needs no state. `--no-shuffle` and
+      # the pinned tool version keep shard membership stable between runs,
+      # so week N+3 re-runs the same 370 mutants unless the code moved.
+      - run: |
+          shard=$(( $(date -u +%V) % 3 ))
+          echo "ISO week $(date -u +%V) -> shard ${shard}/3"
+          cargo mutants --package clasp-core --no-shuffle --jobs 2 \
+            --shard "${shard}/3" -- --locked
       # mutants.out/ is the only durable evidence this job produced anything.
       # `if-no-files-found: error` is what stops a sweep that produced
       # nothing from uploading nothing and looking identical to a clean one.
