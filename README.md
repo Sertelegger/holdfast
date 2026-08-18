@@ -2,12 +2,12 @@
 
 An MCP server that gives AI agents persistent, PTY-backed shell sessions.
 
-> **Status: milestone 0.0.3 — early development.** Eight tools, stdio
+> **Status: milestone 0.0.4 — early development.** Eleven tools, stdio
 > only, Unix only. Sessions die with the MCP process. Output is
 > ANSI-stripped and secret-redacted by default. Not yet suitable for
 > real use.
 
-## What works today (0.0.3)
+## What works today (0.0.4)
 
 - `start_session` — spawn a shell or program on a real PTY
 - `send_input` — type into it
@@ -22,6 +22,15 @@ An MCP server that gives AI agents persistent, PTY-backed shell sessions.
 - `list_sessions` — every session this server knows about, live or exited
 - `get_command_history` — per-command exit codes and output spans, for
   integrated shells
+- `get_screen_state` — read the rendered terminal grid of a full-screen
+  program, with `diff_from` for incremental updates. VT100 emulation is
+  adaptive: it is off for ordinary line-oriented sessions and turns on
+  only when something needs the rendered screen
+- `resize` — change a session's terminal dimensions. The child gets
+  `SIGWINCH`, and the tracked grid reflows so the rendered screen is not
+  still clipped at the old width
+- `interrupt` — send Ctrl+C to the foreground process group, stopping the
+  command that is running without killing the shell hosting it
 
 Sessions report **what the program is doing**, not a guess:
 
@@ -29,11 +38,39 @@ Sessions report **what the program is doing**, not a guess:
   `Fullscreen` | `Exited`
 - `detection_tier`: `semantic` (OSC 133) | `terminal_mode` (bracketed
   paste / alternate screen / termios `ECHO`) | `heuristic` (output
-  quiescence × prompt patterns)
+  quiescence × the stronger of prompt patterns and cursor position)
 
 `detection_tier` is there so an agent can tell a measurement from a
 guess. Every tool also ships an `outputSchema`, so a client can validate
 what it gets back.
+
+### Full-screen programs
+
+VT100 emulation is **adaptive**, and off is the ordinary case: a
+line-oriented `bash` session reports `screen_tracking: "off"` from start
+to exit and pays nothing for a screen nobody is rendering. It turns on
+when the child does something that only makes sense against a rendered
+screen — the alternate screen buffer, cursor addressing — and
+`get_screen_state` then answers with the grid, the cursor, `alt_screen`
+and the window title. Pass `diff_from: <screen_revision>` and the reply
+is the escape sequence that turns the screen you last saw into the
+current one, instead of the whole grid again.
+
+Tracking is also where the heuristic tier gets its third signal: where
+the cursor is sitting relative to a prompt character on the rendered
+line. The cursor term is 0 whenever tracking is off, so it can only add
+recall, never take it away.
+
+CLASP answers exactly one terminal query — Primary Device Attributes,
+replying `\x1b[?6c` with no optional parameter, so it claims no
+capability it does not have. A PTY master is not a terminal, so a shell
+that *waits* on a query stalls until its own timeout: measured, `fish`
+takes 10.04 s to reach its first prompt with no reply and 0.02 s with
+this one answered. The reply is rate-limited, is never recorded as a
+`send_input`, and deliberately does **not** count as session activity —
+otherwise a child querying in a loop would be immortal. Pass
+`terminal_queries: false` to `start_session` to write nothing at all
+into the child and accept the stall.
 
 ### Shell integration
 
@@ -58,6 +95,14 @@ replaced with `[REDACTED:<kind>]` markers, and `read_output` with
 `prompt.last_line` on the way out, and every string written to the audit
 log goes through the redactor first — so a session's own trail cannot
 carry the secret whose disclosure it is recording.
+
+The rendered screen is held to the same rule, and is **masked rather
+than truncated**: while the redactor is withholding bytes that may turn
+out to be the start of a secret, the cells those bytes would have
+written read `[REDACTED:unresolved]` and the response carries
+`held_back: true`. The exemption that lets a tail read see those bytes
+is licensed by `read_output`'s own `tail_lines` / `tail_bytes` argument
+— a per-call opt-in `get_screen_state` does not have.
 
 ## Build and try it
 
@@ -224,7 +269,7 @@ more, the assertion simply runs and the census says so.
   standards this project actually enforces
 - [SECURITY.md](./SECURITY.md) — what is in scope. CLASP runs commands on your
   machine by design, so the interesting surface is the machinery around that:
-  detection, signals, and the redaction that has not shipped yet.
+  detection, signals, and the redactor that now runs at every output boundary.
 
 The design specification and the per-milestone implementation plans are kept
 as the author's working documents and are not part of this repository. The
