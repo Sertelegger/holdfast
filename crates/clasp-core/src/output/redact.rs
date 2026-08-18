@@ -22,6 +22,21 @@ pub fn marker(kind: &str) -> String {
     format!("[REDACTED:{kind}]")
 }
 
+/// The one marker kind that names **no rule**, and the reason it is a
+/// constant rather than a string literal at its one call site.
+///
+/// Every other `[REDACTED:<kind>]` an agent sees says *a rule matched
+/// this and here is which class it was*; a human or an agent parsing
+/// markers is entitled to that reading. `unresolved` means the opposite —
+/// *nothing matched, and we declined to show you bytes we could not vouch
+/// for* — so it is a **reserved pseudo-kind** and [`RuleSet::compile`]
+/// refuses any rule that claims it (REQ-O-011a). Two different facts need
+/// two different strings, and a rule named `unresolved` would collide
+/// with the one string that must not name a rule.
+///
+/// [`RuleSet::compile`]: super::rules::RuleSet
+pub const UNRESOLVED_KIND: &str = "unresolved";
+
 /// Find every secret span in `window`, whose first byte is at absolute
 /// offset `window_start`. Spans come back sorted and non-overlapping.
 pub fn find_spans(rules: &RuleSet, window: &[u8], window_start: u64) -> Vec<Span> {

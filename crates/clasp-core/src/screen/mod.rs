@@ -18,7 +18,7 @@ use crate::buffer::OutputBuffer;
 // `find_spans` + `marker` for the grid (REQ-O-011a needs the *spans*, so
 // it can tell which rows a cross-row match covered); plain `redact_str`
 // for the window title, which is one contiguous string with no rows in it.
-use crate::output::redact::{find_spans, marker, redact_str};
+use crate::output::redact::{find_spans, marker, redact_str, Span, UNRESOLVED_KIND};
 use crate::output::rules::RuleSet;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -90,10 +90,26 @@ pub struct Seed {
     pub head: u64,
 }
 
+/// A replay of a *past* range of the raw stream, for the render at
+/// §4.1's `holdback_boundary`. `start` is where the returned bytes
+/// actually begin, which is later than the requested start when the ring
+/// buffer has evicted the front of the range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replay {
+    pub bytes: Vec<u8>,
+    pub start: u64,
+}
+
 /// Where a re-seed gets its bytes. Implemented for the session's ring
 /// buffer; a plain `Vec` implementation lives in the unit tests.
 pub trait SeedSource {
     fn recent(&self, n: usize) -> Seed;
+
+    /// The raw stream in `[start, end)`, clamped to what the buffer still
+    /// holds. Used only when §4.1 is withholding: the tracker replays its
+    /// *own* input up to the boundary to obtain the render the withheld
+    /// bytes had not yet touched.
+    fn replay(&self, start: u64, end: u64) -> Replay;
 }
 
 impl SeedSource for Mutex<OutputBuffer> {
@@ -103,6 +119,15 @@ impl SeedSource for Mutex<OutputBuffer> {
         Seed {
             bytes: read.bytes,
             head: read.cursor,
+        }
+    }
+
+    fn replay(&self, start: u64, end: u64) -> Replay {
+        let buffer = self.lock();
+        let from = start.max(buffer.tail());
+        Replay {
+            bytes: buffer.slice(from, end),
+            start: from,
         }
     }
 }
@@ -119,6 +144,13 @@ pub struct ScreenGrid {
     pub alt_screen: bool,
     pub title: Option<String>,
     pub lines: Vec<String>,
+    /// Some cells carry `[REDACTED:unresolved]` instead of what the child
+    /// painted, because §4.1 is withholding the bytes that wrote them.
+    /// **`true` only when a cell was actually masked**, not merely when a
+    /// holdback is open — an in-flight secret elsewhere in the session
+    /// that never reached the screen costs this grid nothing, which is
+    /// §4.1's own "ordinary output pays nothing" applied here.
+    pub held_back: bool,
 }
 
 /// The changed regions between two retained revisions, as the terminal
@@ -128,6 +160,11 @@ pub struct ScreenDelta {
     pub screen_revision: u64,
     pub base_revision: u64,
     pub diff: String,
+    /// As [`ScreenGrid::held_back`], and on this shape for the same
+    /// reason `screen_tracking` is: §5.2's two response shapes are one
+    /// closed `outputSchema`, and a field the tool emits on one shape and
+    /// not the other fails validation the first time that path runs.
+    pub held_back: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +205,12 @@ pub struct ScreenTracker {
     parser: Option<vt100::Parser<TitleSink>>,
     /// Absolute offset of the first stream byte the parser has *not* seen.
     consumed_head: u64,
+    /// Absolute offset of the first stream byte the parser *has* seen —
+    /// where its seed window began. With `consumed_head` it names the
+    /// exact byte range the live grid is a function of, which is what
+    /// lets the boundary render be an exact replay of the same input
+    /// rather than an approximation of it (see `boundary_screen`).
+    seeded_from: u64,
     next_revision: u64,
     /// `(revision, redacted, screen)`. The flag is not bookkeeping: §9.2's
     /// screen-state row requires a `diff_from` naming a revision rendered
@@ -190,6 +233,7 @@ impl ScreenTracker {
             probe: signals::TierAProbe::new(),
             parser: None,
             consumed_head: 0,
+            seeded_from: 0,
             next_revision: UNRETAINED_REVISION + 1,
             retained: VecDeque::new(),
             stability: cursor::CursorStability::new(),
@@ -266,12 +310,23 @@ impl ScreenTracker {
     /// one, so a caller that forgets cannot silently get the raw grid.
     /// The audit obligation for `redact: false` (§9.4) belongs to the tool
     /// layer too, because that is where the caller is known.
+    ///
+    /// **`holdback` is §4.1's boundary, and the grid is inside it.**
+    /// §4.1 exempts `read_output`'s `tail_lines`/`tail_bytes` *arguments*
+    /// and nothing else — the licence is the per-call opt-in, not the tail
+    /// shape, and this tool has no such argument (REQ-O-003). `None` means
+    /// the caller is not a holdback-bearing surface at all; `Some(b)` with
+    /// `b` at or past `consumed_head` is the ordinary case and masks
+    /// nothing. The value is computed by the *session*, from the same
+    /// `OutputProcessor::holdback_boundary` call `read_output` uses, so
+    /// this never becomes a second rule.
     pub fn capture(
         &mut self,
         diff_from: Option<u64>,
         redact: bool,
         now: Instant,
         seed: &dyn SeedSource,
+        holdback: Option<u64>,
     ) -> ScreenCapture {
         if self.cfg.mode == ScreenTracking::Off {
             // The operator said never to run emulation on the write path.
@@ -289,20 +344,20 @@ impl ScreenTracker {
             // an `off` session from touching the policy at all — but a
             // reader must not take `off_answers_without_ever_running_…`
             // as pinning this branch, because it does not.
-            return ScreenCapture::Full(self.one_shot(redact, seed));
+            return ScreenCapture::Full(self.one_shot(redact, seed, holdback));
         }
         self.policy.note_consumer(now);
         self.policy.evaluate(now);
         self.sync_parser(seed);
         match self.parser.take() {
             Some(parser) => {
-                let capture = self.render(&parser, diff_from, redact);
+                let capture = self.render(&parser, diff_from, redact, seed, holdback);
                 self.parser = Some(parser);
                 capture
             }
             // Unreachable: note_consumer enables every non-`off` mode.
             // Answer anyway rather than inventing a failure status.
-            None => ScreenCapture::Full(self.one_shot(redact, seed)),
+            None => ScreenCapture::Full(self.one_shot(redact, seed, holdback)),
         }
     }
 
@@ -392,6 +447,7 @@ impl ScreenTracker {
         self.parsed_bytes += seed.bytes.len() as u64;
         self.parser = Some(parser);
         self.consumed_head = seed.head;
+        self.seeded_from = seed.head - seed.bytes.len() as u64;
         self.retained.clear();
         self.stability.reset();
     }
@@ -417,16 +473,81 @@ impl ScreenTracker {
         self.stability.observe(pos);
     }
 
-    fn one_shot(&mut self, redact: bool, seed: &dyn SeedSource) -> ScreenGrid {
-        let seed = seed.recent(self.cfg.seed_bytes());
+    fn one_shot(
+        &mut self,
+        redact: bool,
+        seed: &dyn SeedSource,
+        holdback: Option<u64>,
+    ) -> ScreenGrid {
+        let taken = seed.recent(self.cfg.seed_bytes());
         let mut parser = self.new_parser();
-        parser.process(&seed.bytes);
-        self.parsed_bytes += seed.bytes.len() as u64;
+        parser.process(&taken.bytes);
+        self.parsed_bytes += taken.bytes.len() as u64;
         // `off` is a performance switch, not a security one: the one-shot
-        // render goes through the same redaction as every other capture.
-        let rendered = self.rendered_screen(&parser, redact);
+        // render goes through the same redaction — and the same §4.1
+        // mask — as every other capture. Its input range is the seed
+        // window rather than the tracked range, so that is what the
+        // boundary render replays.
+        let from = taken.head - taken.bytes.len() as u64;
+        let boundary = self.boundary_screen(&parser, from, taken.head, redact, seed, holdback);
+        let (rendered, held_back) = self.rendered_screen(&parser, redact, boundary.as_ref());
         let title = self.rendered_title(&parser, redact);
-        grid_of(rendered.screen(), title, UNRETAINED_REVISION)
+        grid_of(rendered.screen(), title, UNRETAINED_REVISION, held_back)
+    }
+
+    /// The render as it stood at §4.1's `holdback_boundary` — the grid the
+    /// withheld bytes had not yet written to. `None` when nothing is being
+    /// withheld, which is the ordinary case and costs nothing.
+    ///
+    /// **It is an exact replay of the live parser's own input, truncated,
+    /// and that is what makes the diff below mean what it says.** The live
+    /// grid is a pure function of the stream range
+    /// `[seeded_from, consumed_head)` (a seed window plus every chunk fed
+    /// since), so feeding `[seeded_from, boundary)` to a fresh parser of
+    /// the same geometry yields precisely the state the live parser passed
+    /// through on its way here. No byte offset is mapped onto a cell
+    /// anywhere in this: the extent is found by rendering twice and
+    /// comparing cells, because a `\r` redraw, a multi-byte character and
+    /// a withheld region spanning rows each break that arithmetic
+    /// differently.
+    ///
+    /// **`redact: false` skips it, deliberately.** §4.1 answers the same
+    /// way — `holdback_boundary` returns `head` when `!opts.redact` — and
+    /// names the audited opt-out as the agent's recourse *from* the
+    /// holdback. A masked grid under `redact: false` would be a hole in
+    /// that recourse, not a second layer of safety.
+    ///
+    /// **The one residual, and it fails safe.** If the ring buffer has
+    /// evicted the front of `[seeded_from, boundary)` the replay starts
+    /// late and its grid is missing whatever those bytes painted; the
+    /// affected cells then differ from the live ones and are *masked*
+    /// rather than shown. Over-masking is the direction this must fail in,
+    /// and it is the direction it does: a cell can only escape the mask by
+    /// being identical to a cell the pre-boundary bytes produced.
+    ///
+    /// The replay is **not** added to `parsed_bytes`, on the same rule the
+    /// repaint parser in `rendered_screen` already follows: that counter
+    /// measures what the *write path* handed to an emulator (§11.4's guard
+    /// asserts it stays at zero for a line-oriented session), and this is
+    /// render-time reconstruction on a read.
+    fn boundary_screen(
+        &self,
+        live: &vt100::Parser<TitleSink>,
+        from: u64,
+        head: u64,
+        redact: bool,
+        seed: &dyn SeedSource,
+        holdback: Option<u64>,
+    ) -> Option<vt100::Screen> {
+        let boundary = holdback?;
+        if !redact || boundary >= head {
+            return None;
+        }
+        let replay = seed.replay(from, boundary);
+        let (rows, cols) = live.screen().size();
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(&replay.bytes);
+        Some(parser.screen().clone())
     }
 
     /// Re-render the raw parser grid into the screen that leaves this
@@ -490,7 +611,40 @@ impl ScreenTracker {
     /// The `vt100::Parser` itself keeps parsing **raw** bytes. It has to:
     /// redacting the byte stream would corrupt escape sequences, and the
     /// ring buffer it re-seeds from is raw by design (§4.1).
-    fn rendered_screen(&self, parser: &vt100::Parser<TitleSink>, redact: bool) -> vt100::Parser {
+    ///
+    /// **And after redaction comes §4.1's mask, in that order.** REQ-O-011
+    /// and REQ-O-011a between them site the redactor and fix its extent
+    /// and say nothing about the holdback; an implementation reading
+    /// §4.1's tail-read bypass as covering the grid returns, on a
+    /// `readOnlyHint: true` tool, exactly the in-flight bytes
+    /// `read_output` is answering `held_back: true` about in the same
+    /// moment. The bypass is licensed by a **per-call opt-in** — the
+    /// `tail_lines`/`tail_bytes` arguments — and this tool has none, so
+    /// the rule transfers (REQ-O-003).
+    ///
+    /// Its *remedy* does not. `prompt.last_line` may report nothing while
+    /// a holdback is open because the agent's recourse is `read_output`;
+    /// a full-screen program has no such recourse — `read_output` on a TUI
+    /// is redraw soup, which is the whole reason this tool exists — so the
+    /// grid is **masked, not suppressed**. `mask_against` is the render at
+    /// the boundary; the cells where the live grid differs from it are
+    /// exactly the region the withheld bytes wrote, and each differing run
+    /// becomes one `[REDACTED:unresolved]`.
+    ///
+    /// **Redaction claims its spans first, and the mask covers what is
+    /// left.** A value that is *complete* in the grid should come back as
+    /// its own `[REDACTED:<kind>]` rather than as `unresolved`: the agent
+    /// learns more from the kind, and the two markers mean different
+    /// things — one names a rule that matched, the other says nothing
+    /// matched and the bytes were withheld anyway. Neither ordering leaks,
+    /// since both replace the cell's contents; the order is about which
+    /// true thing the agent is told.
+    fn rendered_screen(
+        &self,
+        parser: &vt100::Parser<TitleSink>,
+        redact: bool,
+        mask_against: Option<&vt100::Screen>,
+    ) -> (vt100::Parser, bool) {
         let screen = parser.screen();
         let (rows, cols) = screen.size();
         let mut out = vt100::Parser::new(rows, cols, 0);
@@ -503,15 +657,22 @@ impl ScreenTracker {
         //    is a continuation and gets no separator; every other row
         //    break is a real one and gets a `\n`. That distinction is the
         //    normative part of REQ-O-011a — see the doc comment.
-        let raw: Vec<String> = screen.rows(0, cols).collect();
+        //
+        //    The rows are built cell by cell rather than by
+        //    `Screen::rows`, which is the same walk (this reproduces its
+        //    padding and its wide-character handling) with one thing added
+        //    the mask needs: where each *cell* landed in the join, so a
+        //    differing cell can be named as a byte range without ever
+        //    converting a stream offset into a column.
         let mut joined = String::new();
-        let mut at: Vec<(usize, usize)> = Vec::with_capacity(raw.len());
-        for (i, row) in raw.iter().enumerate() {
-            if i > 0 && !screen.row_wrapped(i as u16 - 1) {
+        let mut at: Vec<(usize, usize)> = Vec::with_capacity(usize::from(rows));
+        let mut masked: Vec<(usize, usize)> = Vec::new();
+        for i in 0..rows {
+            if i > 0 && !screen.row_wrapped(i - 1) {
                 joined.push('\n');
             }
             let start = joined.len();
-            joined.push_str(row);
+            write_row(screen, i, cols, &mut joined, mask_against, &mut masked);
             at.push((start, joined.len()));
         }
 
@@ -527,7 +688,11 @@ impl ScreenTracker {
             Vec::new()
         };
 
-        // 3. Repaint row by row, at absolute positions, so the grid's
+        // 3. Compose: the redaction's spans, plus whatever of the mask
+        //    they did not already cover.
+        let (cuts, held_back) = compose(&self.rules, &spans, &masked);
+
+        // 4. Repaint row by row, at absolute positions, so the grid's
         //    geometry is exactly the source grid's. A redaction that
         //    shortens a wrapped value leaves its trailing rows blank; one
         //    that lengthens a line is clipped at `cols`, which is what the
@@ -535,18 +700,14 @@ impl ScreenTracker {
         for (i, &(start, end)) in at.iter().enumerate() {
             let mut line = String::new();
             let mut cursor = start;
-            for span in spans
-                .iter()
-                .filter(|s| (s.start as usize) < end && (s.end as usize) > start)
-            {
-                let (s_start, s_end) = (span.start as usize, span.end as usize);
-                if s_start > cursor {
-                    line.push_str(char_slice(&joined, cursor, s_start.min(end)));
+            for cut in cuts.iter().filter(|c| c.start < end && c.end > start) {
+                if cut.start > cursor {
+                    line.push_str(char_slice(&joined, cursor, cut.start.min(end)));
                 }
-                if s_start >= start {
-                    line.push_str(&marker(&self.rules.rules[span.rule].kind));
+                if cut.start >= start {
+                    line.push_str(&cut.text);
                 }
-                cursor = s_end.max(cursor).min(end);
+                cursor = cut.end.max(cursor).min(end);
             }
             if cursor < end {
                 line.push_str(char_slice(&joined, cursor, end));
@@ -563,7 +724,7 @@ impl ScreenTracker {
         if screen.hide_cursor() {
             out.process(b"\x1b[?25l");
         }
-        out
+        (out, held_back)
     }
 
     /// The title is part of the screen this tool returns, so it is
@@ -597,14 +758,27 @@ impl ScreenTracker {
         parser: &vt100::Parser<TitleSink>,
         diff_from: Option<u64>,
         redact: bool,
+        seed: &dyn SeedSource,
+        holdback: Option<u64>,
     ) -> ScreenCapture {
         let revision = self.next_revision;
         self.next_revision += 1;
 
-        // Redact first. Everything below — the diff, the retained
-        // revision, the grid — is derived from this screen, never from
-        // the raw one.
-        let redacted = self.rendered_screen(parser, redact);
+        // Redact first, then mask. Everything below — the diff, the
+        // retained revision, the grid — is derived from this screen, never
+        // from the raw one: §9.2 requires diffs between already-redacted
+        // renderings and the mask joins that rule rather than getting a
+        // second one, so a `diff_from` across a moving holdback describes
+        // the masking as an ordinary screen change.
+        let boundary = self.boundary_screen(
+            parser,
+            self.seeded_from,
+            self.consumed_head,
+            redact,
+            seed,
+            holdback,
+        );
+        let (redacted, held_back) = self.rendered_screen(parser, redact, boundary.as_ref());
         let title = self.rendered_title(parser, redact);
 
         // The `mode == redact` conjunct is REQ-O-011's second normative
@@ -630,11 +804,14 @@ impl ScreenTracker {
                         screen_revision: revision,
                         base_revision,
                         diff,
+                        held_back,
                     }),
-                    Err(_) => ScreenCapture::Full(grid_of(redacted.screen(), title, revision)),
+                    Err(_) => {
+                        ScreenCapture::Full(grid_of(redacted.screen(), title, revision, held_back))
+                    }
                 }
             }
-            None => ScreenCapture::Full(grid_of(redacted.screen(), title, revision)),
+            None => ScreenCapture::Full(grid_of(redacted.screen(), title, revision, held_back)),
         };
 
         self.retained
@@ -683,7 +860,12 @@ fn char_slice(text: &str, start: usize, end: usize) -> &str {
     }
 }
 
-fn grid_of(screen: &vt100::Screen, title: Option<String>, screen_revision: u64) -> ScreenGrid {
+fn grid_of(
+    screen: &vt100::Screen,
+    title: Option<String>,
+    screen_revision: u64,
+    held_back: bool,
+) -> ScreenGrid {
     let (rows, cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
     ScreenGrid {
@@ -696,7 +878,139 @@ fn grid_of(screen: &vt100::Screen, title: Option<String>, screen_revision: u64) 
         alt_screen: screen.alternate_screen(),
         title,
         lines: screen.rows(0, cols).collect(),
+        held_back,
     }
+}
+
+/// One replacement in the joined render: a byte range and the marker that
+/// stands in for it.
+struct Cut {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+/// Append row `row`'s text to `joined` exactly as `Screen::rows` would
+/// build it, and record — in `masked` — the byte ranges of the cells that
+/// differ from `against`.
+///
+/// This mirrors `vt100::row::Row::write_contents`: a cell with no contents
+/// emits nothing and is instead paid for by padding spaces in front of the
+/// next cell that has some, the second half of a wide character is skipped,
+/// and trailing empty cells emit nothing at all. Reproducing that walk is
+/// what keeps `joined` byte-identical to the string the previous
+/// implementation redacted, so the mask is additive rather than a second
+/// rendering with its own rounding.
+///
+/// **Only a cell with contents can be masked.** A cell the withheld bytes
+/// *blanked* holds nothing to withhold, and marking it would paint
+/// `[REDACTED:unresolved]` where the child painted nothing — text the
+/// agent would then have to disbelieve. The safety argument is unaffected:
+/// a cell can only escape the mask by being empty or by being identical to
+/// what the pre-boundary bytes put there.
+fn write_row(
+    screen: &vt100::Screen,
+    row: u16,
+    cols: u16,
+    joined: &mut String,
+    against: Option<&vt100::Screen>,
+    masked: &mut Vec<(usize, usize)>,
+) {
+    let mut prev_was_wide = false;
+    let mut prev_col = 0u16;
+    let mut run: Option<(usize, usize)> = None;
+    for col in 0..cols {
+        let Some(cell) = screen.cell(row, col) else {
+            break;
+        };
+        if prev_was_wide {
+            prev_was_wide = false;
+            continue;
+        }
+        prev_was_wide = cell.is_wide();
+        if !cell.has_contents() {
+            continue;
+        }
+        for _ in prev_col..col {
+            joined.push(' ');
+        }
+        prev_col = col + if cell.is_wide() { 2 } else { 1 };
+        let start = joined.len();
+        joined.push_str(cell.contents());
+        let end = joined.len();
+
+        let differs = against.is_some_and(|base| {
+            base.cell(row, col).map(vt100::Cell::contents) != Some(cell.contents())
+        });
+        match (differs, run) {
+            // Cells adjacent in the join extend one run, so a withheld
+            // value becomes one marker rather than one per character.
+            (true, Some((s, e))) if e == start => run = Some((s, end)),
+            (true, Some(prev)) => {
+                masked.push(prev);
+                run = Some((start, end));
+            }
+            (true, None) => run = Some((start, end)),
+            (false, Some(prev)) => {
+                masked.push(prev);
+                run = None;
+            }
+            (false, None) => {}
+        }
+    }
+    if let Some(prev) = run {
+        masked.push(prev);
+    }
+}
+
+/// Merge the redaction's spans with the holdback's masked runs into one
+/// sorted, disjoint list of replacements (§9.2: join, redact, then mask),
+/// and report whether any `unresolved` survived — which is exactly §5.2's
+/// `held_back`.
+///
+/// **The spans win where the two overlap**, which is the whole of what
+/// "redact first" decides: a complete value inside the withheld region
+/// comes back as its own kind, and only the part of the mask no rule
+/// claimed becomes `unresolved`. A masked run split by a span yields two
+/// markers, one either side, because two separate runs of unvouched-for
+/// cells is what that is.
+fn compose(rules: &RuleSet, spans: &[Span], masked: &[(usize, usize)]) -> (Vec<Cut>, bool) {
+    let unresolved = marker(UNRESOLVED_KIND);
+    let mut cuts: Vec<Cut> = spans
+        .iter()
+        .map(|s| Cut {
+            start: s.start as usize,
+            end: s.end as usize,
+            text: marker(&rules.rules[s.rule].kind),
+        })
+        .collect();
+    let mut held_back = false;
+    let mut mask = |start: usize, end: usize, cuts: &mut Vec<Cut>| {
+        held_back = true;
+        cuts.push(Cut {
+            start,
+            end,
+            text: unresolved.clone(),
+        });
+    };
+    for &(start, end) in masked {
+        let mut cursor = start;
+        for span in spans
+            .iter()
+            .filter(|s| (s.start as usize) < end && (s.end as usize) > start)
+        {
+            let (s_start, s_end) = (span.start as usize, span.end as usize);
+            if s_start > cursor {
+                mask(cursor, s_start, &mut cuts);
+            }
+            cursor = cursor.max(s_end);
+        }
+        if cursor < end {
+            mask(cursor, end, &mut cuts);
+        }
+    }
+    cuts.sort_by_key(|c| c.start);
+    (cuts, held_back)
 }
 
 #[cfg(test)]
@@ -724,6 +1038,18 @@ mod tests {
             Seed {
                 bytes: self.bytes[self.bytes.len() - take..].to_vec(),
                 head: self.bytes.len() as u64,
+            }
+        }
+
+        /// Nothing is ever evicted from a `Vec`, so `start` comes back
+        /// unchanged — which is the case the session's ring buffer is in
+        /// too until it wraps.
+        fn replay(&self, start: u64, end: u64) -> Replay {
+            let end = (end as usize).min(self.bytes.len());
+            let start = (start as usize).min(end);
+            Replay {
+                bytes: self.bytes[start..end].to_vec(),
+                start: start as u64,
             }
         }
     }
@@ -815,7 +1141,7 @@ mod tests {
         );
         assert_eq!(t.tracking_state(), "on");
 
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert!(g.alt_screen);
         assert_eq!(g.lines[0].trim_end(), "PAGER LINE ONE");
     }
@@ -838,7 +1164,7 @@ mod tests {
         feed(&mut t, &mut log, fired, b"ABC");
         assert_eq!(t.tracking_state(), "on", "the trigger did not fire");
 
-        let g = full(t.capture(None, true, fired, &log));
+        let g = full(t.capture(None, true, fired, &log, None));
         assert_eq!(
             g.lines[0].trim_end(),
             "ABC",
@@ -863,7 +1189,7 @@ mod tests {
         }
         assert_eq!(t.parsed_bytes(), 0, "still off");
 
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert_eq!(t.tracking_state(), "on");
         assert_eq!(g.lines[0].trim_end(), "HEADER");
         assert_eq!(g.lines[3].trim_end(), "row 2");
@@ -883,7 +1209,7 @@ mod tests {
         for _ in 0..600 {
             feed(&mut t, &mut log, t0, b"filler line of output text\r\n");
         }
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert!(
             !g.lines.iter().any(|l| l.contains("ANCIENT HEADER")),
             "header should have rolled out of the seed window"
@@ -908,12 +1234,12 @@ mod tests {
                     .as_bytes(),
             );
         }
-        let first = full(t.capture(None, true, t0, &log));
+        let first = full(t.capture(None, true, t0, &log, None));
         let base_screen = t.retained.back().expect("revision retained").2.clone();
 
         // One keystroke.
         feed(&mut t, &mut log, t0, b"\x1b[12;7HX");
-        let second = t.capture(Some(first.screen_revision), true, t0, &log);
+        let second = t.capture(Some(first.screen_revision), true, t0, &log, None);
         let d = delta(second);
         assert_eq!(d.base_revision, first.screen_revision);
 
@@ -949,7 +1275,7 @@ mod tests {
         let mut log = ByteLog::default();
         let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
         feed(&mut t, &mut log, t0, b"hello");
-        let g = full(t.capture(Some(9_999), true, t0, &log));
+        let g = full(t.capture(Some(9_999), true, t0, &log, None));
         assert_eq!(g.lines[0].trim_end(), "hello");
     }
 
@@ -968,30 +1294,30 @@ mod tests {
         // Every capture mints and retains a revision, so three captures
         // with a retention of two leave only the newest two.
         feed(&mut t, &mut log, t0, b"a");
-        let first = full(t.capture(None, true, t0, &log)).screen_revision;
+        let first = full(t.capture(None, true, t0, &log, None)).screen_revision;
         feed(&mut t, &mut log, t0, b"b");
-        let second = full(t.capture(None, true, t0, &log)).screen_revision;
+        let second = full(t.capture(None, true, t0, &log, None)).screen_revision;
         feed(&mut t, &mut log, t0, b"c");
-        let third = full(t.capture(None, true, t0, &log)).screen_revision;
+        let third = full(t.capture(None, true, t0, &log, None)).screen_revision;
 
         feed(&mut t, &mut log, t0, b"d");
         assert!(
             matches!(
-                t.capture(Some(third), true, t0, &log),
+                t.capture(Some(third), true, t0, &log, None),
                 ScreenCapture::Delta(_)
             ),
             "the newest retained revision must still diff"
         );
         assert!(
             matches!(
-                t.capture(Some(second), true, t0, &log),
+                t.capture(Some(second), true, t0, &log, None),
                 ScreenCapture::Full(_)
             ),
             "revision {second} should have been evicted by now"
         );
         assert!(
             matches!(
-                t.capture(Some(first), true, t0, &log),
+                t.capture(Some(first), true, t0, &log, None),
                 ScreenCapture::Full(_)
             ),
             "revision {first} should have been evicted long ago"
@@ -1004,8 +1330,8 @@ mod tests {
         let mut log = ByteLog::default();
         let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
         feed(&mut t, &mut log, t0, b"x");
-        let a = full(t.capture(None, true, t0, &log)).screen_revision;
-        let b = full(t.capture(None, true, t0, &log)).screen_revision;
+        let a = full(t.capture(None, true, t0, &log, None)).screen_revision;
+        let b = full(t.capture(None, true, t0, &log, None)).screen_revision;
         assert!(a > UNRETAINED_REVISION);
         assert!(b > a);
     }
@@ -1022,13 +1348,13 @@ mod tests {
             "`off` must not parse on the write path, even inside a TUI"
         );
 
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert_eq!(g.lines[0].trim_end(), "TUI CONTENT");
         assert_eq!(g.screen_revision, UNRETAINED_REVISION);
         assert_eq!(t.tracking_state(), "off", "the one-shot must not latch on");
 
         // A revision that is never retained can never satisfy a diff.
-        let again = full(t.capture(Some(UNRETAINED_REVISION), true, t0, &log));
+        let again = full(t.capture(Some(UNRETAINED_REVISION), true, t0, &log, None));
         assert_eq!(again.screen_revision, UNRETAINED_REVISION);
     }
 
@@ -1038,7 +1364,7 @@ mod tests {
         let mut log = ByteLog::default();
         let mut t = ScreenTracker::new(cfg(ScreenTracking::Adaptive), rules(), t0);
         feed(&mut t, &mut log, t0, b"\x1b[?2004h$ ");
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert_eq!(t.tracking_state(), "on");
         assert!(t.parser.is_some());
 
@@ -1049,7 +1375,7 @@ mod tests {
         assert!(t.retained.is_empty());
 
         // Coming back is a fresh seed, so the stale revision cannot diff.
-        let again = t.capture(Some(g.screen_revision), true, later, &log);
+        let again = t.capture(Some(g.screen_revision), true, later, &log, None);
         assert!(matches!(again, ScreenCapture::Full(_)));
     }
 
@@ -1059,7 +1385,7 @@ mod tests {
         let mut log = ByteLog::default();
         let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
         feed(&mut t, &mut log, t0, b"\x1b]0;clasp: build\x07ready");
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert_eq!(g.title.as_deref(), Some("clasp: build"));
     }
 
@@ -1163,7 +1489,7 @@ mod tests {
 
         feed(&mut t, &mut log, t0, b"\x1b[?1049h\x1b[H\x1b[2J");
         feed(&mut t, &mut log, t0, b"\x1b[1;1Hharmless header line");
-        let base = full(t.capture(None, true, t0, &log));
+        let base = full(t.capture(None, true, t0, &log, None));
         let base_screen = t.retained.back().expect("revision retained").2.clone();
         assert_eq!(base.lines[0].trim_end(), "harmless header line");
 
@@ -1174,7 +1500,7 @@ mod tests {
             format!("\x1b[2;1Hexport GH_TOKEN={SECRET}").as_bytes(),
         );
 
-        let d = delta(t.capture(Some(base.screen_revision), true, t0, &log));
+        let d = delta(t.capture(Some(base.screen_revision), true, t0, &log, None));
         let after_screen = t.retained.back().expect("revision retained").2.clone();
         assert!(
             !d.diff.contains("ghp_"),
@@ -1192,7 +1518,7 @@ mod tests {
             d.diff
         );
 
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert!(
             !g.lines.iter().any(|l| l.contains("ghp_")),
             "the secret reached the full grid: {:?}",
@@ -1285,7 +1611,7 @@ mod tests {
              cannot tell a stream redactor from a row redactor"
         );
 
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert_eq!(
             g.lines[1].trim_end(),
             "export GH_TOKEN=[REDACTED:github]",
@@ -1321,7 +1647,7 @@ mod tests {
             format!("\x1b[1;1Hexport GH_TOKEN={SECRET}").as_bytes(),
         );
 
-        let redacted = full(t.capture(None, true, t0, &log));
+        let redacted = full(t.capture(None, true, t0, &log, None));
         assert_eq!(
             redacted.lines[0].trim_end(),
             "export GH_TOKEN=[REDACTED:github]"
@@ -1329,7 +1655,7 @@ mod tests {
 
         // Same base revision, opposite mode: a full grid, and an
         // unredacted one, because that is what the caller asked for.
-        let raw = full(t.capture(Some(redacted.screen_revision), false, t0, &log));
+        let raw = full(t.capture(Some(redacted.screen_revision), false, t0, &log, None));
         assert_eq!(
             raw.lines[0].trim_end(),
             format!("export GH_TOKEN={SECRET}"),
@@ -1343,7 +1669,7 @@ mod tests {
         feed(&mut t, &mut log, t0, b"\x1b[3;1Hone more line");
         assert!(
             matches!(
-                t.capture(Some(redacted.screen_revision), true, t0, &log),
+                t.capture(Some(redacted.screen_revision), true, t0, &log, None),
                 ScreenCapture::Delta(_)
             ),
             "a base retained under the same redact value must still diff"
@@ -1388,7 +1714,7 @@ mod tests {
             );
         }
 
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert_eq!(
             g.lines[2].trim_end(),
             "[REDACTED:private-key]",
@@ -1448,7 +1774,7 @@ mod tests {
         );
         feed(&mut t, &mut log, t0, b"\x1b[4;1Hplain untouched line");
 
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert_eq!(g.lines[0].trim_end(), "export JWT=[REDACTED:jwt]");
         assert!(
             !g.lines.iter().any(|l| l.contains("eyJ")),
@@ -1493,7 +1819,7 @@ mod tests {
             b"\x1b[2;1H6789.eyJ0123456789.0123456789012",
         );
 
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert_eq!(g.lines[0].trim_end(), "eyJ0123456789012345");
         assert_eq!(g.lines[1].trim_end(), "6789.eyJ0123456789.0123456789012");
         // The premise, asserted rather than assumed: these two really do
@@ -1536,8 +1862,8 @@ mod tests {
             );
         }
 
-        let redacted = full(t.capture(None, true, t0, &log));
-        let raw = full(t.capture(None, false, t0, &log));
+        let redacted = full(t.capture(None, true, t0, &log, None));
+        let raw = full(t.capture(None, false, t0, &log, None));
         assert_eq!(
             redacted.lines, raw.lines,
             "the whole-render pass altered text that contains no secret"
@@ -1591,7 +1917,7 @@ negative = ["MARK"]
             "\x1b[1;1HMARK\u{276f}\u{276f}tail".as_bytes(),
         );
 
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert_eq!(
             g.lines[0].trim_end(),
             "[REDACTED:bytes]tail",
@@ -1634,7 +1960,7 @@ negative = ["MARK"]
             format!("\x1b[1;1H{pad}TOKEN=abcdefgh").as_bytes(),
         );
 
-        let g = full(t.capture(None, true, t0, &log));
+        let g = full(t.capture(None, true, t0, &log, None));
         assert!(
             !g.lines[0].contains("abcdefgh"),
             "the secret survived: {:?}",

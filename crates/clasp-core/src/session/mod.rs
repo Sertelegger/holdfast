@@ -828,10 +828,29 @@ impl Session {
     /// `redaction_disabled` entry when it is false, because that is where
     /// the caller is known. A `bool` here rather than an `Option` so the
     /// default cannot be re-decided in two places.
-    pub fn screen_state(&self, diff_from: Option<u64>, redact: bool) -> ScreenCapture {
-        self.screen
-            .lock()
-            .capture(diff_from, redact, Instant::now(), &*self.buffer)
+    ///
+    /// **The `processor` is here for §4.1's boundary, and taking it as an
+    /// argument is what keeps the grid on the same rule as every other
+    /// read.** `get_screen_state` has no `tail_lines`/`tail_bytes` to opt
+    /// out with, so it is inside the holdback (REQ-O-003) and the tracker
+    /// masks the cells the withheld bytes wrote. The boundary is computed
+    /// **before** the screen lock is taken: a re-seed reaches into the
+    /// ring buffer, so the lock order is `screen → buffer` and this call
+    /// must not hold the screen while it takes the buffer.
+    pub fn screen_state(
+        &self,
+        diff_from: Option<u64>,
+        redact: bool,
+        processor: &OutputProcessor,
+    ) -> ScreenCapture {
+        let holdback = self.holdback_boundary(processor);
+        self.screen.lock().capture(
+            diff_from,
+            redact,
+            Instant::now(),
+            &*self.buffer,
+            Some(holdback),
+        )
     }
 
     /// The §8.6 T3c cursor sub-signal, or `None` when Tier B is off.
@@ -1892,7 +1911,7 @@ mod tests {
         wait_for_bytes(&s, out.len() as u64);
         assert_eq!(s.vt100_bytes_parsed(), 0);
 
-        let g = grid(s.screen_state(None, true));
+        let g = grid(s.screen_state(None, true, &OutputProcessor::builtin().unwrap()));
         assert_eq!(s.screen_tracking(), "on");
         assert_eq!(g.rows, 24);
         assert_eq!(g.cols, 80);
@@ -1922,7 +1941,7 @@ mod tests {
         }
         assert_eq!(s.screen_tracking(), "on");
 
-        let g = grid(s.screen_state(None, true));
+        let g = grid(s.screen_state(None, true, &OutputProcessor::builtin().unwrap()));
         assert!(g.alt_screen);
         assert_eq!(g.lines[0].trim_end(), "PAGER");
     }
@@ -1946,7 +1965,7 @@ mod tests {
             "`off` ran the parser on the write path anyway"
         );
         // The call still answers — §5.2 says it succeeds either way.
-        let g = grid(s.screen_state(None, true));
+        let g = grid(s.screen_state(None, true, &OutputProcessor::builtin().unwrap()));
         assert_eq!(g.lines[0].trim_end(), "TUI");
         assert_eq!(s.screen_tracking(), "off");
     }
@@ -2014,7 +2033,7 @@ mod tests {
         pty.queue_output(out);
         wait_for_bytes(&s, out.len() as u64);
 
-        let g = grid(s.screen_state(None, true));
+        let g = grid(s.screen_state(None, true, &OutputProcessor::builtin().unwrap()));
         assert_eq!(g.lines[0].trim_end(), "ONCE");
         assert_eq!((g.cursor_row, g.cursor_col), (0, 4));
     }

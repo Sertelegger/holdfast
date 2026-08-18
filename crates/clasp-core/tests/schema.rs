@@ -2195,6 +2195,7 @@ async fn get_screen_state_full_response_matches_its_schema() {
             "title",
             "lines",
             "screen_tracking",
+            "held_back",
         ]),
     );
     assert_eq!(
@@ -2277,7 +2278,8 @@ async fn get_screen_state_diff_response_matches_its_schema() {
             "screen_revision",
             "base_revision",
             "diff",
-            "screen_tracking"
+            "screen_tracking",
+            "held_back"
         ]),
     );
     assert_eq!(payload["data"]["base_revision"], rev);
@@ -2315,6 +2317,7 @@ async fn get_screen_state_on_a_dead_session_matches_its_schema() {
             "title",
             "lines",
             "screen_tracking",
+            "held_back",
             "exit_code",
         ]),
     );

@@ -402,6 +402,12 @@ pub struct GetScreenState {
     /// that turns the base screen into this one.
     pub diff: Option<String>,
     pub screen_tracking: Option<ScreenTracking>,
+    /// Both shapes: some cells carry `[REDACTED:unresolved]` because
+    /// §4.1's holdback is withholding the bytes that wrote them. The grid
+    /// is **masked, not truncated** — it is not covered by the tail-read
+    /// bypass, which is licensed by a per-call opt-in this tool does not
+    /// have (§5.2, REQ-O-003).
+    pub held_back: Option<bool>,
     /// Present on `session_died`.
     pub exit_code: Option<i32>,
 }

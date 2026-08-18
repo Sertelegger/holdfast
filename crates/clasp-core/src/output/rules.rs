@@ -20,6 +20,15 @@ pub enum RuleError {
     Pattern { name: String, source: regex::Error },
     #[error("rule `{0}` must declare at least one positive and one negative example")]
     MissingExamples(String),
+    /// REQ-O-011a: `unresolved` is the marker a bounded window emits for a
+    /// match it *could not judge*, so it is the one kind that names no
+    /// rule. A rule claiming it would make `[REDACTED:unresolved]`
+    /// ambiguous between "this rule matched" and "nothing matched and we
+    /// withheld anyway", which is exactly the distinction the string
+    /// exists to carry. Rejected at compile time so an operator's
+    /// `extra_redaction_patterns` cannot take it either (§10.2).
+    #[error("rule `{0}` claims the reserved kind `unresolved`, which names no rule (REQ-O-011a)")]
+    ReservedKind(String),
 }
 
 /// Top level of the rule file.
@@ -120,6 +129,9 @@ impl RuleSet {
         for spec in file.rules {
             if spec.positive.is_empty() || spec.negative.is_empty() {
                 return Err(RuleError::MissingExamples(spec.name));
+            }
+            if spec.kind == super::redact::UNRESOLVED_KIND {
+                return Err(RuleError::ReservedKind(spec.name));
             }
             let regex = Regex::new(&spec.pattern).map_err(|source| RuleError::Pattern {
                 name: spec.name.clone(),

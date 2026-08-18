@@ -589,7 +589,7 @@ impl ClaspServer {
         // succeeds either way, so this is never an error path — which is
         // also why §5.3 classifies the tool `readOnlyHint: true` despite
         // it: the change is to CLASP's bookkeeping, not to the session.
-        let capture = session.screen_state(args.diff_from, redact);
+        let capture = session.screen_state(args.diff_from, redact, &self.processor);
         let tracking = session.screen_tracking();
 
         let (mut data, details) = match capture {
@@ -602,6 +602,13 @@ impl ClaspServer {
                     "alt_screen": g.alt_screen,
                     "title": g.title,
                     "lines": g.lines,
+                    // §5.2, REQ-O-003: on **both** shapes, and it reports
+                    // a *masked* grid rather than a truncated read — some
+                    // cells carry `[REDACTED:unresolved]` instead of what
+                    // the child painted. An installer's masked field and a
+                    // genuinely blank one are the same pixels, so an agent
+                    // driving a TUI has to be able to tell.
+                    "held_back": g.held_back,
                 }),
                 format!("full {}x{} grid", g.rows, g.cols),
             ),
@@ -610,6 +617,7 @@ impl ClaspServer {
                     "screen_revision": d.screen_revision,
                     "base_revision": d.base_revision,
                     "diff": d.diff,
+                    "held_back": d.held_back,
                 }),
                 format!("diff from revision {}", d.base_revision),
             ),
@@ -2338,37 +2346,35 @@ mod tests {
         kill_everything(&server).await;
     }
 
-    /// **A documented residual, pinned rather than assumed away.**
+    /// **The record of a decision that landed, kept as an assertion.**
     ///
-    /// §4.1's holdback withholds an in-flight secret prefix from
-    /// `read_output(since_cursor:)`. The rendered grid does **not** apply
-    /// it, and this test is what makes that visible instead of leaving it
-    /// to be found by whoever changes a fixture's label.
+    /// This test was written as the reverse of what it now asserts. §4.1's
+    /// holdback withholds an in-flight secret prefix from
+    /// `read_output(since_cursor:)`, and the rendered grid used to ignore
+    /// it — handing back 39 characters of a 40-character PAT while the
+    /// same session's cursor read withheld exactly those bytes. It was
+    /// pinned that way deliberately, so that whoever decided the question
+    /// would find an assertion rather than a silence.
     ///
-    /// The reasoning it rests on is §4.1's own: *"`tail_lines` and
-    /// `tail_bytes` reads do not apply the holdback — the agent has asked
-    /// for the freshest bytes and accepts the trade-off. Documented
-    /// residual risk."* The grid is that read — `ScreenTracker` seeds from
-    /// `OutputBuffer::read_tail_bytes` and is fed every chunk on the write
-    /// path — and "the screen as it is now" is a recency request by
-    /// construction, with no cursor form to fall back to.
+    /// **Spec rev. 47 decided it, and the grid now masks.** §4.1's
+    /// exemption narrows to `read_output`'s `tail_lines`/`tail_bytes`
+    /// *arguments* — the licence is the per-call opt-in, not the tail
+    /// *shape* — and `get_screen_state` is named a non-member beside
+    /// `clasp logs --tail` and the `observer` stream. Cells the holdback is
+    /// withholding carry `[REDACTED:unresolved]`, and `held_back` says so
+    /// on the response, the way `read_output` already did.
     ///
-    /// **It is not obviously the right answer, and the spec has not
-    /// decided it.** §9.2's `get_screen_state` row and REQ-O-011/011a
-    /// specify *redaction* — where it runs and over how much — and are
-    /// silent on the holdback. The one place the spec does state the rule
-    /// for a reconstruction is §9.2's `prompt.last_line` case 2, which
-    /// answers *"report nothing"* while the holdback is active; that
-    /// answer is explicitly licensed there by the agent's recourse to
-    /// `read_output`, and a full-screen program has no such recourse —
-    /// `read_output` on a TUI is redraw soup. So the transferable part of
-    /// the rule transfers and the remedy does not, which is a spec
-    /// decision and not a plan's to make. Escalated with the 0.0.4 report.
+    /// `unresolved` is a **reserved pseudo-kind**: every other
+    /// `[REDACTED:<kind>]` marker names a rule that *matched*, and this one
+    /// means the opposite — bytes withheld because a partial is still open.
     ///
-    /// If that decision lands the other way, this test is the one that
-    /// goes red, which is the point of writing it as an assertion.
+    /// **The second arrangement is the control**, and it is not optional. A
+    /// masked row and a `held_back: true` are both satisfied by an
+    /// implementation that masks unconditionally, so an otherwise identical
+    /// session whose tail is *not* a secret prefix goes through the same
+    /// call and must come back unmasked.
     #[tokio::test]
-    async fn the_screen_grid_does_not_apply_the_byte_stream_holdback() {
+    async fn the_screen_grid_masks_what_the_byte_stream_holdback_withholds() {
         let server = ClaspServer::new();
         // The same 39-character partial as arrangement 2, behind a label
         // **no rule keys on** — `TOKEN=` is matched by the generic rule
@@ -2387,7 +2393,7 @@ mod tests {
         // about something else.
         assert!(
             session.holdback_boundary(&server.processor) < session.buffer_head(),
-            "nothing is being withheld, so there is no bypass to describe"
+            "nothing is being withheld, so there is no masking to describe"
         );
         let read = row(
             "read_output",
@@ -2426,12 +2432,59 @@ mod tests {
             .map(|l| l.as_str().unwrap_or_default().trim_end().to_string())
             .collect();
         assert_eq!(
-            lines[1],
-            format!("see {IN_FLIGHT}"),
-            "the current answer: the grid returns what the same session's \
-             cursor read is withholding. If this line is now the redacted \
-             or suppressed form, the spec decision landed and this test is \
-             the record of what changed: {lines:?}"
+            lines[1], "see [REDACTED:unresolved]",
+            "the grid must mask what the same session's cursor read is \
+             withholding (rev. 47: §4.1, §9.2, REQ-O-003): {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("ghp_")),
+            "no row may carry the partial, not merely the row it landed on: {lines:?}"
+        );
+        assert_eq!(
+            screen["held_back"],
+            json!(true),
+            "a masked grid must say so, or the marker reads as program output"
+        );
+
+        // **The control.** Same tool, same path, same shape of payload —
+        // the only difference is that the tail is not a secret prefix, so
+        // no partial is open and nothing may be masked.
+        let (clean_id, _clean_pty) = mock_session(
+            &server,
+            "grid-no-holdback",
+            vec![],
+            b"$ cat note\r\nsee plain",
+        );
+        let clean = server.registry.get(&clean_id).expect("the session");
+        settle(&clean, "the clean tail to arrive", |s| {
+            s.detection().last_line.starts_with("see ")
+        })
+        .await;
+        let clean_screen = row(
+            "get_screen_state",
+            &server
+                .get_screen_state(Parameters(GetScreenStateArgs {
+                    session: clean_id.clone(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("get_screen_state"),
+        )
+        .data;
+        let clean_lines: Vec<String> = clean_screen["lines"]
+            .as_array()
+            .expect("a full grid")
+            .iter()
+            .map(|l| l.as_str().unwrap_or_default().trim_end().to_string())
+            .collect();
+        assert_eq!(
+            clean_lines[1], "see plain",
+            "nothing is in flight, so nothing may be masked: {clean_lines:?}"
+        );
+        assert_eq!(
+            clean_screen["held_back"],
+            json!(false),
+            "held_back must separate the two arrangements, not be a constant"
         );
 
         kill_everything(&server).await;
