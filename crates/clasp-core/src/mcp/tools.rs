@@ -2423,6 +2423,42 @@ mod tests {
             read["output"]
         );
 
+        // **The third arm, and REQ-O-011a requires it in this same moment.**
+        // Arms one and two together are also satisfied by an
+        // implementation that withdrew the tail-read exemption
+        // altogether. §4.1 narrows that exemption to `read_output`'s
+        // `tail_lines`/`tail_bytes` *arguments* — the licence is the
+        // per-call opt-in, not the tail *shape* — so the same session,
+        // asked the exempt way, must still hand the partial over.
+        // Covering this only by separate unit tests elsewhere is the
+        // arrangement REQ-O-011a names as insufficient.
+        let tail = row(
+            "read_output",
+            &server
+                .read_output(Parameters(ReadOutputArgs {
+                    session: id.clone(),
+                    tail_bytes: Some(256),
+                    ..Default::default()
+                }))
+                .await
+                .expect("read_output"),
+        )
+        .data;
+        assert!(
+            tail["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(IN_FLIGHT),
+            "the per-call tail opt-in is still exempt and must return the \
+             partial whole (§4.1, REQ-O-003): {}",
+            tail["output"]
+        );
+        assert_eq!(
+            tail["held_back"],
+            json!(false),
+            "a read that bypasses the holdback is not withholding anything"
+        );
+
         let screen = row(
             "get_screen_state",
             &server
