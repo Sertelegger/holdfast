@@ -982,3 +982,285 @@ async fn an_exited_session_still_renders_its_final_screen() {
     assert_eq!(state["data"]["exit_code"], 3);
     assert_eq!(lines_of(&state)[0].trim_end(), "LAST_SCREEN");
 }
+
+// ---------------------------------------------------------------------------
+// REQ-TS-008 — §4.5.1's reply against a real shell
+// ---------------------------------------------------------------------------
+
+/// What fish's prompt prints once it is drawn. The marker is what turns
+/// "fish started" into "fish reached its first prompt", which is the only
+/// quantity §4.5.1 measured.
+const FISH_READY: &str = "CLASP_FISH_READY";
+
+/// Everything fish is asked to do at startup: silence the greeting and
+/// replace the prompt with the marker. `--no-config` is passed separately,
+/// so no rc file participates.
+const FISH_INIT: &str =
+    "set -g fish_greeting; function fish_prompt; printf 'CLASP_FISH_READY\\n'; end";
+
+/// The stall arms wait this long before giving up. The measured stall is
+/// 10.04 s; anything past this is a hang, not a slow shell.
+const FISH_DEADLINE: Duration = Duration::from_secs(40);
+
+/// `fish`'s version as the binary reports it (`fish, version 4.8.1`), for
+/// the declaration REQ-TST-007 requires. **No arm branches on it** beyond
+/// the `>= 4.0` gate this row is scoped to.
+fn fish_version() -> Option<String> {
+    let out = std::process::Command::new("fish")
+        .arg("--version")
+        .output()
+        .ok()?;
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
+}
+
+fn fish_major(version: &str) -> Option<u32> {
+    version
+        .rsplit(' ')
+        .next()?
+        .split('.')
+        .next()?
+        .parse::<u32>()
+        .ok()
+}
+
+/// The queries the middle arm answers — **every probe fish emits except
+/// Primary DA**, each with a reply a real terminal would send.
+///
+/// **This table cannot come from `clasp_core::screen::queries` and must
+/// never be "unified" with it.** Answering XTVERSION, OSC 11, XTGETTCAP or
+/// the kitty-keyboard query is precisely what §4.5.1's admission rule
+/// excludes from the shipped set: each fails test 1 of the rule, and
+/// XTGETTCAP has a truthful negative reply and is excluded anyway. An
+/// implementer who moves this into the production table has shipped the
+/// thing this row exists to prevent.
+///
+/// `(name, query prefix, terminator, reply)`. A `None` terminator means
+/// the query is exactly the prefix; `Some(t)` means it runs to the next
+/// `t` (XTGETTCAP's DCS payload is variable-length).
+type DeclinedQuery = (
+    &'static str,
+    &'static [u8],
+    Option<&'static [u8]>,
+    &'static [u8],
+);
+const FIXTURE_QUERIES: [DeclinedQuery; 4] = [
+    ("kitty keyboard", b"\x1b[?u", None, b"\x1b[?0u"),
+    (
+        "XTVERSION",
+        b"\x1b[>0q",
+        None,
+        b"\x1bP>|clasp-fixture\x1b\\",
+    ),
+    (
+        "OSC 11 background",
+        b"\x1b]11;?",
+        None,
+        b"\x1b]11;rgb:0000/0000/0000\x07",
+    ),
+    // The truthful negative: "I do not have that capability".
+    ("XTGETTCAP", b"\x1bP+q", Some(b"\x1b\\"), b"\x1bP0+r\x1b\\"),
+];
+
+/// The earliest fixture query at or after `from`, as `(start, end, reply)`.
+/// `None` means nothing complete is pending yet.
+fn next_fixture_query(acc: &[u8], from: usize) -> Option<(usize, usize, &'static [u8])> {
+    let mut best: Option<(usize, usize, &'static [u8])> = None;
+    for (_, prefix, terminator, reply) in FIXTURE_QUERIES {
+        let mut at = from;
+        while at + prefix.len() <= acc.len() {
+            if !acc[at..].starts_with(prefix) {
+                at += 1;
+                continue;
+            }
+            let end = match terminator {
+                None => at + prefix.len(),
+                Some(t) => {
+                    let mut e = at + prefix.len();
+                    loop {
+                        if e + t.len() > acc.len() {
+                            // The DCS payload has not arrived in full; try
+                            // again on the next pass rather than replying
+                            // to half a query.
+                            return best;
+                        }
+                        if acc[e..].starts_with(t) {
+                            break e + t.len();
+                        }
+                        e += 1;
+                    }
+                }
+            };
+            if best.is_none_or(|(b, _, _)| at < b) {
+                best = Some((at, end, reply));
+            }
+            break;
+        }
+    }
+    best
+}
+
+/// Time from session start to fish's first prompt.
+///
+/// `fixture` drives the middle arm: a responder that lives **in this test
+/// file**, reads the session's own raw buffer and writes through
+/// `send_input`'s path, answering every probe fish emits except DA1.
+fn fish_time_to_first_prompt(terminal_queries: bool, fixture: bool) -> Duration {
+    let mut cfg = PtySpawnConfig::new("fish");
+    cfg.args = vec!["--no-config".into(), "-C".into(), FISH_INIT.into()];
+    cfg.cols = COLS;
+    cfg.rows = ROWS;
+    // fish only probes a terminal it believes can answer.
+    cfg.env = vec![("TERM".into(), "xterm-256color".into())];
+    let backend = InProcessPty::spawn(&cfg).expect("spawn fish");
+    let started = Instant::now();
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "fish".into(),
+        vec![],
+        Arc::new(backend) as Arc<dyn PtyBackend>,
+        SessionConfig {
+            terminal_queries,
+            // No OSC 133 snippet: an injected line is a write into the
+            // child's input, and this row is measuring what happens when
+            // CLASP writes exactly one thing or nothing at all.
+            shell_integration: None,
+            ..SessionConfig::with_buffer_capacity(1 << 20)
+        },
+    );
+
+    let deadline = started + FISH_DEADLINE;
+    let mut acc: Vec<u8> = Vec::new();
+    let mut cursor = 0u64;
+    let mut answered_upto = 0usize;
+    let elapsed = loop {
+        let (_, head) = session.buffer_extent();
+        if head > cursor {
+            // `buffer_slice`, not `read_from`: raw ring bytes, so 0.0.3's
+            // holdback cannot withhold the escape sequences the fixture
+            // matches on or delay the marker.
+            acc.extend_from_slice(&session.buffer_slice(cursor, head));
+            cursor = head;
+        }
+        if String::from_utf8_lossy(&acc).contains(FISH_READY) {
+            break started.elapsed();
+        }
+        if fixture {
+            while let Some((_, end, reply)) = next_fixture_query(&acc, answered_upto) {
+                session.write_input(reply).expect("fixture write");
+                answered_upto = end;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "fish never reached its first prompt in {FISH_DEADLINE:?} \
+                 (terminal_queries={terminal_queries}, fixture={fixture}); \
+                 saw {:?}",
+                String::from_utf8_lossy(&acc)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let _ = session.signal(Signal::Kill);
+    elapsed
+}
+
+/// REQ-TS-008 — three arms, and the middle one is what pins DA1 as the
+/// fence rather than as one stall among four.
+///
+/// Measured 2026-08-13 on `alpine:edge`, fish 4.8.1, two trials each:
+/// silent **10.04 s**, all-but-DA1 **10.04 s**, DA1 **0.02 s**. The
+/// assertions are at **5 s / 1 s**, in the middle of a 500x gap: a
+/// threshold at the measurement is a flake, and one in the middle of that
+/// gap cannot be reached by noise.
+///
+/// Without the middle arm, the third asserts only "fish is fast when CLASP
+/// answers queries" — satisfied equally by an implementation that answers
+/// everything, and by a fish that simply got faster.
+#[test]
+fn only_answering_da1_takes_fish_to_its_first_prompt() {
+    let Some(version) = fish_version() else {
+        eprintln!(
+            "skipping: fish not installed — REQ-TS-008's three arms need \
+             fish >= 4.0 (REQ-TST-007)"
+        );
+        return;
+    };
+    if fish_major(&version).is_none_or(|major| major < 4) {
+        eprintln!(
+            "skipping: fish not installed at a version this row measures — \
+             found {version:?}, need >= 4.0 (REQ-TST-007)"
+        );
+        return;
+    }
+    eprintln!("REQ-TS-008 measured against {version}");
+
+    let silent = fish_time_to_first_prompt(false, false);
+    let all_but_da1 = fish_time_to_first_prompt(false, true);
+    let da1 = fish_time_to_first_prompt(true, false);
+    eprintln!(
+        "REQ-TS-008 ({version}): silent {silent:?}, all-but-DA1 \
+         {all_but_da1:?}, DA1 {da1:?}"
+    );
+
+    assert!(
+        silent >= Duration::from_secs(5),
+        "fish reached its first prompt in {silent:?} with nothing answered; \
+         the stall this row measures is not happening, so the DA1 arm below \
+         proves nothing"
+    );
+    assert!(
+        all_but_da1 >= Duration::from_secs(5),
+        "answering XTGETTCAP, OSC 11, kitty-keyboard and XTVERSION took \
+         fish to its prompt in {all_but_da1:?}. §4.5.1's set is one query \
+         because those four were measured to change nothing; if that has \
+         stopped being true, the set is what has to be re-decided"
+    );
+    assert!(
+        da1 < Duration::from_secs(1),
+        "DA1 was answered and fish still took {da1:?}; measured 0.02 s"
+    );
+}
+
+/// The middle arm's fixture, exercised without fish — because on a host
+/// with no fish ≥ 4.0 the arm above never runs, and an unrun scanner is
+/// not a scanner.
+///
+/// The DA1 assertion is the one that matters: a fixture that answered
+/// Primary DA would make the middle arm fast, the row would read
+/// "everything answered is also fast", and the fence measurement would be
+/// gone.
+#[test]
+fn the_all_but_da1_fixture_answers_every_probe_except_primary_da() {
+    for (name, prefix, terminator, reply) in FIXTURE_QUERIES {
+        let mut query = prefix.to_vec();
+        if let Some(t) = terminator {
+            query.extend_from_slice(b"696e646e");
+            query.extend_from_slice(t);
+        }
+        let found = next_fixture_query(&query, 0);
+        let (start, end, got) = found.unwrap_or_else(|| panic!("{name} was not matched"));
+        assert_eq!(
+            (start, end),
+            (0, query.len()),
+            "{name} matched a wrong span"
+        );
+        assert_eq!(got, reply, "{name} got the wrong reply");
+    }
+
+    // Primary DA, both spellings: the fixture must be silent, or the
+    // middle arm stops measuring the fence.
+    for da1 in [b"\x1b[c".as_slice(), b"\x1b[0c".as_slice()] {
+        assert!(
+            next_fixture_query(da1, 0).is_none(),
+            "the all-but-DA1 fixture answered {da1:?}"
+        );
+    }
+    // An XTGETTCAP whose DCS payload has not arrived in full is not yet a
+    // query: replying to half of one would corrupt fish's parse.
+    assert!(next_fixture_query(b"\x1bP+q696e", 0).is_none());
+
+    assert_eq!(fish_major("fish, version 4.8.1"), Some(4));
+    assert_eq!(fish_major("fish, version 3.7.0"), Some(3));
+    assert_eq!(fish_major("not a version"), None);
+}
