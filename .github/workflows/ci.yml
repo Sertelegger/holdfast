@@ -251,15 +251,23 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The census's own gates, deleted one at a time against fixtures with
+      # known answers. It reads no log, needs no build and takes under a
+      # second, and it runs BEFORE the suite so a census that can no longer
+      # fail is found in seconds rather than after the forty-minute job it
+      # is supposed to be guarding.
+      - name: Prove the skip census can still fail
+        run: ./scripts/ci-skip-census.sh --self-test
       # --no-fail-fast is not optional. Measured on this project: without it
       # a lib-test failure hides whether the integration suite catches the
       # same defect, which is the only way to tell a narrow defect from a
       # broad one.
       #
       # --show-output prints the captured stdout/stderr of *passing* tests,
-      # so a `skipping: …` notice is visible in the log instead of
-      # swallowed by libtest. It is also what the census step below reads,
-      # which is why the log is teed rather than only printed.
+      # so a `skipping: …` notice — and a `not-asserted: …` one, from an
+      # assertion gated off inside a row that RAN — is visible in the log
+      # instead of swallowed by libtest. It is also what the census step
+      # below reads, which is why the log is teed rather than only printed.
       #
       # `set -o pipefail` is not decoration: the default shell for `run:`
       # is `bash -e {0}` WITHOUT pipefail, so a failing `cargo test` piped
@@ -270,7 +278,13 @@ jobs:
           cargo test --workspace --locked --no-fail-fast -- --test-threads=${{ env.TEST_THREADS }} --show-output 2>&1 | tee test-output.log
       # The census the variable would have enforced from inside the suite.
       # It fails on any skip this pipeline has not agreed to, and on an
-      # agreed one that stopped happening.
+      # agreed one that stopped happening — and, since it grew a second
+      # marker, on any ASSERTION gated off inside a row that ran without an
+      # agreed entry, and on an agreed entry whose assertion turns out to
+      # have run. The one entry today is §11.4's control-path p99, which
+      # this 2-core runner cannot make a statement about; it goes red here
+      # the day the runner is big enough, which is the only notice anyone
+      # will get.
       - run: ./scripts/ci-skip-census.sh test-output.log
 
   # --- the artifact --------------------------------------------------------

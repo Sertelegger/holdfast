@@ -312,10 +312,15 @@ fn tier_b_stays_off_and_the_control_path_stays_responsive_under_load() {
         // Loud rather than silent, and it carries the reading so a small
         // runner's log still says what the control path did.
         eprintln!(
-            "NOT ASSERTED: §11.4's p99 needs >= {P99_MIN_CORES} cores to be a \
-             statement about CLASP rather than about the scheduler; this box \
-             has {cores}. Measured anyway: p99 {p99:?}, max {:?}, {} samples, \
-             {produced} bytes streamed.",
+            "not-asserted: stress_write_path::control_path_p99 cores={cores} \
+             min_cores={P99_MIN_CORES} — §11.4's p99 needs >= \
+             {P99_MIN_CORES} cores to be a statement about CLASP rather than \
+             about the scheduler; this box has {cores}. Measured anyway: p99 \
+             {p99:?}, max {:?}, {} samples, {produced} bytes streamed. The \
+             `not-asserted: ` prefix, the id and the two `k=v` fields are the \
+             machine-readable half: scripts/ci-skip-census.sh censuses this \
+             non-assertion the way it censuses a skipped row, and fails if it \
+             stops appearing where the pipeline agreed it would.",
             samples.last().unwrap(),
             samples.len()
         );

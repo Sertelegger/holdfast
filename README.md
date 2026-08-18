@@ -92,7 +92,7 @@ request runs:
 | `clippy` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | `windows-cross` | The same clippy invocation against `x86_64-pc-windows-gnu`. A **cross-compilation check, not a test run** — it proves CLASP still *compiles* for Windows; it is not evidence that it *works* there |
 | `probe` | `scripts/ci-probe.sh` — toolchain version, pseudoterminal allocation, and every shell and interpreter the suite spawns by name. Ten of `tests/detection.rs`'s 23 tests skip *and report as passing* when their program is absent, so this gate is part of what makes the test job's green mean something |
-| `test` | `cargo test --workspace --locked --no-fail-fast -- --test-threads=4 --show-output`, then `scripts/ci-skip-census.sh` over the captured log — which fails on any skipped row the pipeline has not agreed to, **and on an agreed one that stopped happening** |
+| `test` | `scripts/ci-skip-census.sh --self-test` (the census's own gates, deleted one at a time against fixtures), then `cargo test --workspace --locked --no-fail-fast -- --test-threads=4 --show-output`, then `scripts/ci-skip-census.sh` over the captured log — which fails on any skipped row the pipeline has not agreed to, on any *assertion* gated off inside a row that ran without an agreed entry, **and on an agreed one of either kind that stopped happening** |
 | `package` | `cargo build --release --locked`, the MCP smoke script against the *release* binary, and a downloadable artifact + SHA-256. It `needs:` a green `test`, so the build that gets installed is the build that was tested |
 
 Scheduled: a nightly flake hunt (the suite 20× at 4× oversubscribed
@@ -146,6 +146,7 @@ Reproduce any job locally — every job body is a command, not YAML logic:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+./scripts/ci-skip-census.sh --self-test
 cargo test --workspace --locked --no-fail-fast -- --test-threads=4 --show-output 2>&1 | tee test-output.log
 ./scripts/ci-skip-census.sh test-output.log
 taskset -c 0,1 env TEST_THREADS=4 ./scripts/ci-flake-hunt.sh 20
@@ -193,6 +194,25 @@ So the gap is real, and it is **explicit rather than silent**:
 `scripts/ci-skip-census.sh` asserts the set of skipped rows is exactly the one
 named row, and fails both on an unexpected skip and on that expected skip
 disappearing.
+
+**Spec §11.4's control-path p99 is never asserted in CI.**
+`crates/clasp-core/tests/stress_write_path.rs` asserts it only where
+`available_parallelism()` reports at least 8 cores, and GitHub's standard
+hosted runners are 2-core on a private repository — so the row runs, guards
+its other two assertions (`parsed == 0`, and the produced-bytes floor that
+stops the run passing vacuously) on every host, and *reports the p99 instead
+of asserting it*. That is deliberate: measured on 2 cores, the sampling loop
+gets 13 turns in three seconds instead of ~590, `percentile(0.99)` of
+thirteen samples **is** the maximum, and the number describes the Linux
+scheduler rather than CLASP — a real 2-core run of this suite answers
+p99 = 1.11 s against a 500 ms budget, where 48 cores answer 731 µs.
+
+It is **explicit rather than silent** the same way the fish row is. The test
+prints a `not-asserted: <id> cores=… min_cores=…` line, `ci-skip-census.sh`
+censuses those lines against an agreed list exactly as it censuses skips, and
+the entry fails the job the day it stops being true — when the runner grows,
+or when `P99_MIN_CORES` moves under it. Locally, on a machine with 8 cores or
+more, the assertion simply runs and the census says so.
 
 ## Documentation
 
