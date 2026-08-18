@@ -70,6 +70,50 @@ pub fn ok(data: Value, details: impl Into<String>) -> CallToolResult {
     envelope(Status::Ok, data, details)
 }
 
+/// Spec §18.1's `isError` column, keyed by the wire status string.
+///
+/// The control protocol carries `status` but not `isError` (§7.4.1), so
+/// the shim re-derives the flag here. The table covers every §18.1 row,
+/// not just the statuses this build can produce, so a status introduced
+/// by a later milestone crosses the wire correctly without a protocol
+/// change. An unrecognised status is treated as an error: a shim that is
+/// older than its daemon must not downgrade an unknown failure into a
+/// success the agent will act on.
+pub fn status_is_error(status: &str) -> bool {
+    !matches!(
+        status,
+        "ok" | "timeout"
+            | "session_died"
+            | "requires_confirmation"
+            | "secret_provided"
+            | "secret_cancelled"
+            | "unavailable"
+    )
+}
+
+/// Rebuild a `CallToolResult` from the `{status, data, details}` triple
+/// that crossed the control protocol.
+///
+/// Unlike [`envelope`], the status is an opaque string rather than the
+/// [`Status`] enum: the daemon is the authority on which statuses exist,
+/// and a shim that only knew this build's variants would corrupt a newer
+/// daemon's response into an enum variant it happened to match.
+pub fn result_from_wire(status: &str, data: Value, details: impl Into<String>) -> CallToolResult {
+    let body = json!({
+        "status": status,
+        "data": data,
+        "details": details.into(),
+    });
+    let text = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
+    let mut result = if status_is_error(status) {
+        CallToolResult::structured_error(body)
+    } else {
+        CallToolResult::structured(body)
+    };
+    result.content = vec![ContentBlock::text(text)];
+    result
+}
+
 /// Map a `ClaspError` onto the envelope.
 ///
 /// Only the variants that have a catalogued `status` in spec §18.1 become
@@ -269,5 +313,84 @@ mod tests {
 
         let long = std::io::Error::other("x".repeat(500));
         assert!(brief(&long).chars().count() <= 201, "bounded");
+    }
+
+    #[test]
+    fn the_wire_status_table_agrees_with_the_status_enum() {
+        // Two representations of §18.1's isError column: the enum, used
+        // in-process, and the string table, used after a control-protocol
+        // hop. If they disagree, the same tool call is an error on one
+        // transport and a success on the other.
+        //
+        // `Timeout` is in this list deliberately. It is the newest status
+        // (`send_input`'s write deadline, §5.2/§18.1), it is
+        // `isError: false`, and it is exactly the kind of row a wire
+        // table maintained by hand forgets — leaving the agent told that
+        // a recoverable timeout was a hard failure.
+        //
+        // `Unavailable` is 0.0.2's and is live, not hypothetical
+        // (`get_command_history` returns it), and it is the second
+        // `isError: false` row — so it is exactly as easy to lose as
+        // `Timeout` and belongs in this loop for the same reason.
+        for s in [
+            Status::Ok,
+            Status::Timeout,
+            Status::SessionDied,
+            Status::SessionNotFound,
+            Status::NameTaken,
+            Status::LimitReached,
+            Status::SpawnFailed,
+            Status::Unavailable,
+        ] {
+            assert_eq!(
+                status_is_error(s.as_str()),
+                s.is_error(),
+                "{} disagrees between the enum and the wire table",
+                s.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_status_is_treated_as_an_error() {
+        // A shim older than its daemon must fail loudly, not quietly
+        // hand the agent a failure dressed as a success.
+        assert!(status_is_error("transfer_failed"));
+        assert!(status_is_error("some_status_from_the_future"));
+        assert!(!status_is_error("ok"));
+    }
+
+    #[test]
+    fn result_from_wire_reproduces_the_in_process_envelope() {
+        for (status, data, details) in [
+            ("name_taken", json!({"n": 1}), "taken"),
+            // The `timeout` row twice over: it must rebuild identically
+            // *and* keep `isError` false across a transport that never
+            // carries the flag.
+            (
+                "timeout",
+                json!({"bytes_written": Value::Null, "timeout_ms": 5000}),
+                "the child did not accept the input",
+            ),
+        ] {
+            let enum_status = match status {
+                "name_taken" => Status::NameTaken,
+                "timeout" => Status::Timeout,
+                other => panic!("unmapped status {other}"),
+            };
+            let direct = envelope(enum_status, data.clone(), details);
+            let rebuilt = result_from_wire(status, data, details);
+            assert_eq!(rebuilt.structured_content, direct.structured_content);
+            assert_eq!(rebuilt.is_error, direct.is_error, "{status}");
+            assert_eq!(
+                rebuilt.content[0].as_text().unwrap().text,
+                direct.content[0].as_text().unwrap().text
+            );
+        }
+        assert_ne!(
+            result_from_wire("timeout", json!({}), "").is_error,
+            Some(true),
+            "§18.1 lists timeout with isError:false; the wire must not upgrade it"
+        );
     }
 }

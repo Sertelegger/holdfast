@@ -2,7 +2,7 @@
 //! status, list_sessions, get_command_history.
 
 use super::envelope::{self, Status};
-use super::{detection, schema, ClaspServer};
+use super::{caller, detection, schema, ClaspServer};
 use crate::detect::{
     detect_shell, DetectionConfig, InteractionMode, PatternSet, PromptPattern,
     DEFAULT_SETTLE_THRESHOLD_MS,
@@ -521,6 +521,14 @@ impl ClaspServer {
             ReadStart::TailBytes(args.tail_bytes.unwrap().min(max_bytes))
         };
 
+        // The §9.4 caller seam, derived server-side from the
+        // authenticated connection: there is deliberately no path from a
+        // tool argument to either field, because a caller that can name
+        // itself can lie about it (REQ-SEC-018). `tool` stays a literal
+        // at the call site; `client_kind` comes from the uid-checked
+        // handshake the daemon scoped this call to, and is `in_process`
+        // when there is no control-protocol connection at all.
+        let surface = caller::audit_surface("read_output");
         let read = session.read_processed(
             &ReadRequest {
                 start,
@@ -530,14 +538,8 @@ impl ClaspServer {
                     text_encoding,
                     redact: args.redact.unwrap_or(true),
                 },
-                // The §9.4 caller seam. 0.0.5 replaces these two literals
-                // with `caller::audit_surface("read_output")`, derived
-                // server-side from the authenticated connection; there is
-                // deliberately no path from a tool argument to either,
-                // because a caller that can name itself can lie about it
-                // (REQ-SEC-018).
-                tool: "read_output",
-                client_kind: "in_process",
+                tool: surface.tool,
+                client_kind: surface.client_kind,
             },
             &self.processor,
         );
@@ -595,14 +597,15 @@ impl ClaspServer {
         // record is written where the caller is known rather than inside
         // the tracker. `tool` is a `&'static str` literal at the call site
         // — §9.4 forbids any code path from request params to it — and
-        // `client_kind` is `"in_process"` until 0.0.5's `mcp::caller`
-        // derives it from a uid-checked handshake (REQ-SEC-018). The same
-        // pair 0.0.3's `read_processed` passes, for the same reasons.
+        // `client_kind` is derived by `mcp::caller` from the uid-checked
+        // handshake the daemon scoped this call to (REQ-SEC-018). The
+        // same pair 0.0.3's `read_processed` passes, for the same reasons.
         if !redact {
+            let surface = caller::audit_surface("get_screen_state");
             self.processor.audit.record_redaction_disabled(
                 Some(&session.id),
-                "get_screen_state",
-                "in_process",
+                surface.tool,
+                surface.client_kind,
             );
         }
 
@@ -1253,13 +1256,14 @@ impl ClaspServer {
             }
             _ => max_bytes,
         };
+        let context_surface = caller::audit_surface("wait_for_pattern");
         let context = session.read_processed(
             &ReadRequest {
                 start: ReadStart::Cursor(outcome.scan_start),
                 max_bytes: context_cap,
                 options: ReadOptions::default(),
-                tool: "wait_for_pattern",
-                client_kind: "in_process",
+                tool: context_surface.tool,
+                client_kind: context_surface.client_kind,
             },
             &self.processor,
         );
@@ -1299,13 +1303,14 @@ impl ClaspServer {
                         // is correct: that tally counts substitutions
                         // *delivered*, and this response delivers the
                         // marker twice (§5.2, REQ-O-012).
+                        let match_surface = caller::audit_surface("wait_for_pattern");
                         let text = session.read_processed(
                             &ReadRequest {
                                 start: ReadStart::Cursor(m.start),
                                 max_bytes: (m.end - m.start) as usize,
                                 options: ReadOptions::default(),
-                                tool: "wait_for_pattern",
-                                client_kind: "in_process",
+                                tool: match_surface.tool,
+                                client_kind: match_surface.client_kind,
                             },
                             &self.processor,
                         );
