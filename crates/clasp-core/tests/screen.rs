@@ -10,6 +10,7 @@ use clasp_core::session::{new_session_id, Session, SessionConfig};
 use clasp_core::{ClaspError, Result};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1061,11 +1062,21 @@ const FIXTURE_QUERIES: [DeclinedQuery; 4] = [
     ("XTGETTCAP", b"\x1bP+q", Some(b"\x1b\\"), b"\x1bP0+r\x1b\\"),
 ];
 
-/// The earliest fixture query at or after `from`, as `(start, end, reply)`.
-/// `None` means nothing complete is pending yet.
-fn next_fixture_query(acc: &[u8], from: usize) -> Option<(usize, usize, &'static [u8])> {
-    let mut best: Option<(usize, usize, &'static [u8])> = None;
-    for (_, prefix, terminator, reply) in FIXTURE_QUERIES {
+/// The earliest fixture query at or after `from`, as
+/// `(name, start, end, reply)`. `None` means nothing complete is pending
+/// yet.
+///
+/// The **name** rides along because it is the only thing that survives
+/// into the arm's assertions: a `Duration` alone cannot distinguish "the
+/// four declined queries were answered and fish stalled anyway" from "the
+/// fixture matched nothing", and those two readings of REQ-TS-008's
+/// middle arm are opposites.
+fn next_fixture_query(
+    acc: &[u8],
+    from: usize,
+) -> Option<(&'static str, usize, usize, &'static [u8])> {
+    let mut best: Option<(&'static str, usize, usize, &'static [u8])> = None;
+    for (name, prefix, terminator, reply) in FIXTURE_QUERIES {
         let mut at = from;
         while at + prefix.len() <= acc.len() {
             if !acc[at..].starts_with(prefix) {
@@ -1090,8 +1101,8 @@ fn next_fixture_query(acc: &[u8], from: usize) -> Option<(usize, usize, &'static
                     }
                 }
             };
-            if best.is_none_or(|(b, _, _)| at < b) {
-                best = Some((at, end, reply));
+            if best.is_none_or(|(_, b, _, _)| at < b) {
+                best = Some((name, at, end, reply));
             }
             break;
         }
@@ -1099,12 +1110,43 @@ fn next_fixture_query(acc: &[u8], from: usize) -> Option<(usize, usize, &'static
     best
 }
 
+/// Answer every complete fixture query in `acc` at or after `*answered_upto`,
+/// handing each reply to `send` and recording which query it was.
+///
+/// Split out of the measurement loop so the accounting the middle arm's
+/// conclusion rests on is exercised on hosts with no fish — which is
+/// every host in CI, and this one.
+fn answer_pending(
+    acc: &[u8],
+    answered_upto: &mut usize,
+    answered: &mut BTreeSet<&'static str>,
+    mut send: impl FnMut(&'static [u8]),
+) {
+    while let Some((name, _, end, reply)) = next_fixture_query(acc, *answered_upto) {
+        send(reply);
+        *answered_upto = end;
+        answered.insert(name);
+    }
+}
+
+/// One arm of REQ-TS-008: how long fish took to reach its first prompt,
+/// and **what the fixture actually answered while it waited**.
+///
+/// The second field is the whole point. With only a `Duration`, a fixture
+/// that matched nothing makes the middle arm byte-identical to the silent
+/// arm, `all_but_da1 >= 5 s` still passes, and the row reports green while
+/// claiming four queries were answered that were not.
+struct FishArm {
+    elapsed: Duration,
+    answered: BTreeSet<&'static str>,
+}
+
 /// Time from session start to fish's first prompt.
 ///
 /// `fixture` drives the middle arm: a responder that lives **in this test
 /// file**, reads the session's own raw buffer and writes through
 /// `send_input`'s path, answering every probe fish emits except DA1.
-fn fish_time_to_first_prompt(terminal_queries: bool, fixture: bool) -> Duration {
+fn fish_time_to_first_prompt(terminal_queries: bool, fixture: bool) -> FishArm {
     let mut cfg = PtySpawnConfig::new("fish");
     cfg.args = vec!["--no-config".into(), "-C".into(), FISH_INIT.into()];
     cfg.cols = COLS;
@@ -1133,6 +1175,7 @@ fn fish_time_to_first_prompt(terminal_queries: bool, fixture: bool) -> Duration 
     let mut acc: Vec<u8> = Vec::new();
     let mut cursor = 0u64;
     let mut answered_upto = 0usize;
+    let mut answered: BTreeSet<&'static str> = BTreeSet::new();
     let elapsed = loop {
         let (_, head) = session.buffer_extent();
         if head > cursor {
@@ -1146,23 +1189,22 @@ fn fish_time_to_first_prompt(terminal_queries: bool, fixture: bool) -> Duration 
             break started.elapsed();
         }
         if fixture {
-            while let Some((_, end, reply)) = next_fixture_query(&acc, answered_upto) {
+            answer_pending(&acc, &mut answered_upto, &mut answered, |reply| {
                 session.write_input(reply).expect("fixture write");
-                answered_upto = end;
-            }
+            });
         }
         if Instant::now() >= deadline {
             panic!(
                 "fish never reached its first prompt in {FISH_DEADLINE:?} \
                  (terminal_queries={terminal_queries}, fixture={fixture}); \
-                 saw {:?}",
+                 answered {answered:?}; saw {:?}",
                 String::from_utf8_lossy(&acc)
             );
         }
         std::thread::sleep(Duration::from_millis(5));
     };
     let _ = session.signal(Signal::Kill);
-    elapsed
+    FishArm { elapsed, answered }
 }
 
 /// REQ-TS-008 — three arms, and the middle one is what pins DA1 as the
@@ -1199,26 +1241,61 @@ fn only_answering_da1_takes_fish_to_its_first_prompt() {
     let all_but_da1 = fish_time_to_first_prompt(false, true);
     let da1 = fish_time_to_first_prompt(true, false);
     eprintln!(
-        "REQ-TS-008 ({version}): silent {silent:?}, all-but-DA1 \
-         {all_but_da1:?}, DA1 {da1:?}"
+        "REQ-TS-008 ({version}): silent {:?} answered {:?}, all-but-DA1 \
+         {:?} answered {:?}, DA1 {:?} answered {:?}",
+        silent.elapsed,
+        silent.answered,
+        all_but_da1.elapsed,
+        all_but_da1.answered,
+        da1.elapsed,
+        da1.answered
+    );
+
+    // What each arm answered, **before** what it timed. A middle arm whose
+    // fixture matched nothing is byte-identical to the silent arm, so the
+    // 5 s assertion below passes either way; asserting the timing first
+    // would report the misleading conclusion rather than the real fault.
+    let declined: BTreeSet<&str> = FIXTURE_QUERIES.iter().map(|(name, ..)| *name).collect();
+    assert_eq!(
+        all_but_da1.answered, declined,
+        "the middle arm's conclusion is that answering these four changed \
+         nothing, but the fixture answered {:?}. Unanswered, this arm is \
+         the silent arm under another name and its {:?} says nothing about \
+         DA1 being the fence",
+        all_but_da1.answered, all_but_da1.elapsed
+    );
+    assert!(
+        silent.answered.is_empty(),
+        "the silent arm answered {:?}; it is the control and must answer \
+         nothing at all",
+        silent.answered
+    );
+    assert!(
+        da1.answered.is_empty(),
+        "the DA1 arm answered {:?} through the test's own fixture; its speed \
+         has to come from CLASP's reply, not from this file's",
+        da1.answered
     );
 
     assert!(
-        silent >= Duration::from_secs(5),
-        "fish reached its first prompt in {silent:?} with nothing answered; \
+        silent.elapsed >= Duration::from_secs(5),
+        "fish reached its first prompt in {:?} with nothing answered; \
          the stall this row measures is not happening, so the DA1 arm below \
-         proves nothing"
+         proves nothing",
+        silent.elapsed
     );
     assert!(
-        all_but_da1 >= Duration::from_secs(5),
+        all_but_da1.elapsed >= Duration::from_secs(5),
         "answering XTGETTCAP, OSC 11, kitty-keyboard and XTVERSION took \
-         fish to its prompt in {all_but_da1:?}. §4.5.1's set is one query \
+         fish to its prompt in {:?}. §4.5.1's set is one query \
          because those four were measured to change nothing; if that has \
-         stopped being true, the set is what has to be re-decided"
+         stopped being true, the set is what has to be re-decided",
+        all_but_da1.elapsed
     );
     assert!(
-        da1 < Duration::from_secs(1),
-        "DA1 was answered and fish still took {da1:?}; measured 0.02 s"
+        da1.elapsed < Duration::from_secs(1),
+        "DA1 was answered and fish still took {:?}; measured 0.02 s",
+        da1.elapsed
     );
 }
 
@@ -1239,7 +1316,8 @@ fn the_all_but_da1_fixture_answers_every_probe_except_primary_da() {
             query.extend_from_slice(t);
         }
         let found = next_fixture_query(&query, 0);
-        let (start, end, got) = found.unwrap_or_else(|| panic!("{name} was not matched"));
+        let (matched, start, end, got) = found.unwrap_or_else(|| panic!("{name} was not matched"));
+        assert_eq!(matched, name, "{name} was reported under another name");
         assert_eq!(
             (start, end),
             (0, query.len()),
@@ -1263,4 +1341,60 @@ fn the_all_but_da1_fixture_answers_every_probe_except_primary_da() {
     assert_eq!(fish_major("fish, version 4.8.1"), Some(4));
     assert_eq!(fish_major("fish, version 3.7.0"), Some(3));
     assert_eq!(fish_major("not a version"), None);
+}
+
+/// The accounting REQ-TS-008's middle arm now asserts on, exercised
+/// without fish — because on a host with no fish >= 4.0 that arm never
+/// runs, and an unrun accounting is not an accounting.
+///
+/// Both directions matter and only together. That a full stream is
+/// reported as all four is satisfied by a recorder that unconditionally
+/// reports all four; that a DA1-only stream is reported as none is
+/// satisfied by one that never reports anything.
+#[test]
+fn the_fixture_records_exactly_the_queries_it_answered() {
+    let declined: BTreeSet<&str> = FIXTURE_QUERIES.iter().map(|(name, ..)| *name).collect();
+
+    // Every declined query back to back, with Primary DA in the middle so
+    // the scan has to walk past it rather than stop at it.
+    let mut stream: Vec<u8> = Vec::new();
+    for (_, prefix, terminator, _) in FIXTURE_QUERIES {
+        stream.extend_from_slice(prefix);
+        if let Some(t) = terminator {
+            stream.extend_from_slice(b"696e646e");
+            stream.extend_from_slice(t);
+        }
+        stream.extend_from_slice(b"\x1b[c");
+    }
+
+    let mut upto = 0usize;
+    let mut answered = BTreeSet::new();
+    let mut sent: Vec<&'static [u8]> = Vec::new();
+    answer_pending(&stream, &mut upto, &mut answered, |reply| sent.push(reply));
+    assert_eq!(
+        answered, declined,
+        "the fixture did not record every query it answered"
+    );
+    assert_eq!(
+        sent.len(),
+        FIXTURE_QUERIES.len(),
+        "one reply per query, and no query answered twice"
+    );
+
+    // The negative: a stream that is nothing but Primary DA. If this came
+    // back non-empty the middle arm would be answering the one query
+    // §4.5.1 reserves for CLASP, and the fence measurement would be gone —
+    // and if the recorder simply reported everything, this is where it
+    // shows.
+    let mut upto = 0usize;
+    let mut answered = BTreeSet::new();
+    let mut sent: Vec<&'static [u8]> = Vec::new();
+    answer_pending(b"\x1b[c\x1b[0c", &mut upto, &mut answered, |reply| {
+        sent.push(reply)
+    });
+    assert!(
+        answered.is_empty() && sent.is_empty(),
+        "a Primary-DA-only stream was answered as {answered:?}"
+    );
+    assert_eq!(upto, 0, "nothing was answered, so nothing was consumed");
 }
