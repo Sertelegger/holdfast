@@ -35,7 +35,7 @@ use std::sync::Arc;
 // agent that trusted it never learned that `status`,
 // `list_sessions` or `get_command_history` existed.
 // `scripts/mcp-smoke.sh` asserts every tool name appears here.
-pub const INSTRUCTIONS: &str = "CLASP gives you PTY-backed shell sessions. start_session spawns a \
+pub const INSTRUCTIONS: &str = "Holdfast gives you PTY-backed shell sessions. start_session spawns a \
      shell or program; send_input types into it; read_output reads what \
      it printed using a cursor you carry between calls; \
      wait_for_pattern blocks until a regex matches new output, which \
@@ -55,7 +55,7 @@ pub const INSTRUCTIONS: &str = "CLASP gives you PTY-backed shell sessions. start
      that was measured from OSC 133 shell integration (semantic), from a \
      terminal mode such as bracketed paste or termios ECHO \
      (terminal_mode), or guessed from output quiescence and prompt \
-     patterns (heuristic). For bash, zsh and fish, CLASP injects OSC 133 \
+     patterns (heuristic). For bash, zsh and fish, Holdfast injects OSC 133 \
      markers at start-up, and get_command_history then reports each \
      command's exit code and output span. Output is ANSI-stripped \
      and secret-redacted by default; secrets are replaced with \
@@ -335,7 +335,7 @@ impl ServerHandler for HoldfastServer {
         // #[non_exhaustive]: build from Default, then assign.
         let mut info = ServerInfo::default();
         info.capabilities = server_capabilities();
-        info.server_info = Implementation::new("clasp", env!("CARGO_PKG_VERSION"));
+        info.server_info = Implementation::new("holdfast", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(INSTRUCTIONS.into());
         info
     }

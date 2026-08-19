@@ -265,7 +265,7 @@ impl ServerHandler for ShimServer {
         // mode that object runs inside the daemon with no MCP peer to
         // notify. See `super::shim_capabilities` for the deferral.
         info.capabilities = super::shim_capabilities();
-        info.server_info = Implementation::new("clasp", env!("CARGO_PKG_VERSION"));
+        info.server_info = Implementation::new("holdfast", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(instructions());
         info
     }
