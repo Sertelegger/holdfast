@@ -137,6 +137,21 @@ impl TestDaemon {
             .await
             .expect("request_secret_input")
     }
+
+    /// The same call, for the rows whose subject is the **refusal**.
+    ///
+    /// Every bound on the arguments is a protocol error and not a status
+    /// (§5.1): an input-schema violation is `invalid_params`, the shape
+    /// `read_output`'s cursor rule already uses. `secret_cancelled`
+    /// describes a request that was raised and did not complete, which
+    /// none of these is.
+    async fn try_call(&self, args: RequestSecretInputArgs) -> Result<CallToolResult, String> {
+        self.daemon
+            .server
+            .request_secret_input(Parameters(args))
+            .await
+            .map_err(|e| format!("{e:?}"))
+    }
 }
 
 impl Drop for TestDaemon {
@@ -1683,6 +1698,251 @@ async fn a_collision_logs_concurrent_request_pending_and_no_frame() {
     assert_eq!(
         joined(first, "the first call").await["status"],
         "secret_provided"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+// ------------------------------------------------------- prompt_text
+
+/// A GitHub PAT, 40 characters, matching `\bgh[pousr]_[0-9A-Za-z]{36,}`
+/// — the `github-token` rule of the shipped default rule set, whose
+/// `kind` is `github`.
+const SHAPED_TOKEN: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+
+/// §9.5, §9.2, REQ-SEC-005.
+///
+/// `AuditLog::record` redacts every string it is handed, so this is
+/// automatic — and it is asserted end to end **anyway**, because
+/// "automatic" is a claim about a function this task does not own, and
+/// because building the line by concatenation outside `record` would walk
+/// straight past it.
+#[tokio::test]
+async fn a_secret_shaped_prompt_text_is_redacted_in_the_audit_log() {
+    let d = TestDaemon::start("promptaudit").await;
+    let s = d.shell_running("cat");
+    let payload = joined(
+        spawn_call(
+            &d,
+            RequestSecretInputArgs {
+                prompt_text: format!("key is {SHAPED_TOKEN}"),
+                ..secret_args(&s.id, 2)
+            },
+        ),
+        "the shaped-prompt call",
+    )
+    .await;
+    assert_eq!(cancelled_reason(&payload), "timeout");
+
+    let line = &audit_entries(&d, &s.id, "secret_input_request")[0];
+    assert_eq!(
+        line["prompt_text"], "key is [REDACTED:github]",
+        "the field was written before it reached the redactor"
+    );
+    let whole = std::fs::read_to_string(d.paths.audit_log()).expect("the audit log");
+    assert!(
+        !whole.contains(SHAPED_TOKEN),
+        "the token survived somewhere else in the trail:\n{whole}"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// **The pairing**, and it is the half that keeps the field useful: a
+/// redactor applied so broadly that `prompt_text` becomes unreadable
+/// means an operator cannot see what an agent asked for, which is the
+/// reason §9.5 logs it at all.
+#[tokio::test]
+async fn a_plain_english_prompt_text_survives_the_redactor_intact() {
+    let d = TestDaemon::start("promptplain").await;
+    let s = d.shell_running("cat");
+    let payload = joined(
+        spawn_call(
+            &d,
+            RequestSecretInputArgs {
+                prompt_text: "sudo password for deploy-user".into(),
+                ..secret_args(&s.id, 2)
+            },
+        ),
+        "the plain-prompt call",
+    )
+    .await;
+    assert_eq!(cancelled_reason(&payload), "timeout");
+
+    assert_eq!(
+        audit_entries(&d, &s.id, "secret_input_request")[0]["prompt_text"],
+        "sudo password for deploy-user"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// §9.2's table names only the audit surface; redacting the broadcast as
+/// well costs one call, keeps one rule for the string, and stops a human
+/// being shown a secret-shaped value in the modal they are about to type
+/// into. It cannot affect REQ-SEC-010a's byte-identity assertion, because
+/// both sides of that comparison are post-redaction.
+#[tokio::test]
+async fn the_broadcast_prompt_text_is_redacted() {
+    let d = TestDaemon::start("promptcast").await;
+
+    // `cat`, so the slot is vacant and this call is the one that raises —
+    // only a raising call broadcasts its own text.
+    let shaped = d.shell_running("cat");
+    let mut sc = attach_ok(&d, &shaped.id, AttachMode::ReadWrite).await;
+    let call = spawn_call(
+        &d,
+        RequestSecretInputArgs {
+            prompt_text: format!("paste {SHAPED_TOKEN} here"),
+            ..secret_args(&shaped.id, 3)
+        },
+    );
+    let (_, prompt) = next_awaiting_secret(&mut sc, 20).await;
+    assert_eq!(
+        prompt, "paste [REDACTED:github] here",
+        "the token was broadcast to every attached client"
+    );
+    assert_eq!(
+        cancelled_reason(&joined(call, "the shaped call").await),
+        "timeout"
+    );
+
+    // The pairing: a prompt with nothing secret-shaped in it arrives
+    // verbatim, so this row cannot pass against a broadcast that redacts
+    // everything to a constant.
+    let plain = d.shell_running("cat");
+    let mut pc = attach_ok(&d, &plain.id, AttachMode::ReadWrite).await;
+    let call = spawn_call(
+        &d,
+        RequestSecretInputArgs {
+            prompt_text: "the deploy user's sudo password".into(),
+            ..secret_args(&plain.id, 3)
+        },
+    );
+    let (_, plain_prompt) = next_awaiting_secret(&mut pc, 20).await;
+    assert_eq!(plain_prompt, "the deploy user's sudo password");
+    assert_eq!(
+        cancelled_reason(&joined(call, "the plain call").await),
+        "timeout"
+    );
+
+    let _ = shaped.signal(Signal::Kill);
+    let _ = plain.signal(Signal::Kill);
+}
+
+/// REQ-SEC-010a, the exact split — **and two opposite mutations, both
+/// killed by this one test**, which is why it asserts both fields in one
+/// run: logging the raised text means an operator can no longer see what
+/// the agent asked for, and broadcasting the agent's means a human sees
+/// the prompt change under their cursor.
+///
+/// The broadcast half is read at a client that attaches **after** the
+/// adoption. A client that was already there holds the original frame and
+/// could not see a replacement; the late attacher's replay can.
+#[tokio::test]
+async fn an_adopting_calls_prompt_text_is_logged_and_not_broadcast() {
+    let d = TestDaemon::start("adoptsplit").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut first = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let (raised_id, raised_prompt) = next_awaiting_secret(&mut first, 20).await;
+
+    let call = spawn_call(
+        &d,
+        RequestSecretInputArgs {
+            prompt_text: "AGENT SUPPLIED LABEL".into(),
+            ..secret_args(&s.id, 20)
+        },
+    );
+    await_waiter(&d, &s.id, "the adopting call").await;
+
+    let mut late = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+    let (replayed_id, replayed_prompt) = next_awaiting_secret(&mut late, 20).await;
+    assert_eq!(replayed_id, raised_id);
+    assert_eq!(
+        replayed_prompt, raised_prompt,
+        "the adopting call replaced the prompt a human may already be typing into"
+    );
+    assert_ne!(
+        replayed_prompt, "AGENT SUPPLIED LABEL",
+        "the agent relabelled a request it did not raise"
+    );
+
+    send(
+        &mut first,
+        &ClientFrame::SecretInput {
+            request_id: raised_id.clone(),
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        joined(call, "the adopting call").await["status"],
+        "secret_provided"
+    );
+
+    let logged = &audit_entries(&d, &s.id, "secret_input_request")[0];
+    assert_eq!(
+        logged["request_id"], raised_id,
+        "the entry names a request the adopting call did not adopt"
+    );
+    assert_eq!(
+        logged["prompt_text"], "AGENT SUPPLIED LABEL",
+        "the raised text was logged, so an operator cannot see what the agent asked for"
+    );
+    assert_ne!(
+        logged["prompt_text"], replayed_prompt,
+        "the two surfaces carry the same string, so one of the two rules is not \
+         being applied"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// §9.5 says **bytes**. A `chars().count()` cap admits 512 three-byte
+/// code points — 1536 bytes — into a field broadcast to every attached
+/// client and written to the audit log.
+///
+/// Task 3 pins this against the schema; this pins it against a real call,
+/// which is where a cap could be re-decided in a second place.
+#[tokio::test]
+async fn the_512_cap_is_bytes_not_characters() {
+    let d = TestDaemon::start("promptcap").await;
+    let s = d.shell_running("cat");
+
+    // 171 three-byte code points: 513 bytes, 171 characters. A character
+    // cap waves it through.
+    let wide = "\u{4f60}".repeat(171);
+    assert_eq!(wide.len(), 513);
+    assert_eq!(wide.chars().count(), 171);
+    let refused = d
+        .try_call(RequestSecretInputArgs {
+            prompt_text: wide,
+            ..secret_args(&s.id, 2)
+        })
+        .await
+        .expect_err("513 bytes must be refused whole, not truncated");
+    assert!(
+        refused.contains("513") && refused.contains("512"),
+        "the refusal does not name the bound it applied: {refused}"
+    );
+
+    // **The pairing**, one byte under, and it must get past the cap: a
+    // rejection of everything passes the half above perfectly. It goes on
+    // to raise, so the audit line proves it was not merely a different
+    // error.
+    let ok = joined(
+        spawn_call(
+            &d,
+            RequestSecretInputArgs {
+                prompt_text: "a".repeat(512),
+                ..secret_args(&s.id, 2)
+            },
+        ),
+        "the 512-byte call",
+    )
+    .await;
+    assert_eq!(cancelled_reason(&ok), "timeout");
+    assert_eq!(
+        audit_entries(&d, &s.id, "secret_input_request")[0]["prompt_text"],
+        "a".repeat(512),
+        "the accepted prompt was truncated somewhere; §18.5 refuses a body whole \
+         rather than clipping it, and nothing here truncates"
     );
     let _ = s.signal(Signal::Kill);
 }
