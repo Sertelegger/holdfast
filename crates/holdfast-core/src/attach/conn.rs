@@ -48,41 +48,16 @@ use std::time::Instant;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-use super::frames::{ClientDecode, ClientFrame, ClientFrameKind, ServerFrame};
+use super::frames::{
+    AttachMode, AttachRole, ClientDecode, ClientFrame, ClientFrameKind, ServerFrame,
+};
 use super::handshake::{evaluate_attach, REJECT_SESSION_NOT_FOUND};
-use super::{AttachMode, AttachRole};
 use crate::daemon::server::Daemon;
 use crate::protocol::frame::{self, FrameError};
 use crate::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use crate::session::{Session, SessionState, WriteRequest};
 
-/// §4.3's per-connection outbound bound. **Not configurable in
-/// v0.1.0.** Overflow detaches this client and never blocks the reader.
-pub const ATTACH_QUEUE_FRAMES: usize = 64;
-
-/// One attached client, as the hub and the audit trail see it.
-pub struct AttachConn {
-    /// Monotonic and never reused, so an `unregister` cannot remove a
-    /// connection that happened to land in the same slot.
-    pub client_id: u64,
-    pub session_id: String,
-    pub mode: AttachMode,
-    /// **Attribution only, never a redaction switch.** §7.5's
-    /// orthogonality paragraph forbids deriving `role` from
-    /// `client_kind`; what decides whether this connection gets raw
-    /// bytes is `role`, and nothing else.
-    pub role: AttachRole,
-    /// Derived server-side from the uid-checked handshake, and the
-    /// audit surface is derived from *this*, never from a request
-    /// argument (§9.4, `mcp::caller`'s precedent).
-    pub client_kind: ClientKind,
-    pub client_version: String,
-    /// Bounded per-connection queue (§4.3: *"their own bounded mpsc,
-    /// default 64 frames"*). Overflow detaches this client and never
-    /// blocks the reader task.
-    pub tx: mpsc::Sender<ServerFrame>,
-    pub connected_at: Instant,
-}
+pub use super::hub::{AttachConn, ATTACH_QUEUE_FRAMES};
 
 /// The `Attach` frame's fields, once it is known to be one.
 struct Handshake {

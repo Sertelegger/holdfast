@@ -24,7 +24,9 @@
 pub mod conn;
 pub mod frames;
 pub mod handshake;
-#[cfg(unix)]
+/// **Not gated.** `AttachConn` and the hub name no platform type, and
+/// keeping them off `#[cfg(unix)]` is what leaves the per-connection
+/// shape type-checked for the transport that mirrors it in 0.0.10.
 pub mod hub;
 
 pub use frames::{
