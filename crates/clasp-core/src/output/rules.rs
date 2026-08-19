@@ -5,6 +5,8 @@
 //! index, the partial-secret scanner — derives from it, so there is no
 //! second list to keep in sync.
 
+pub use super::redact::UNRESOLVED_KIND;
+
 use regex::bytes::{Regex, RegexSet};
 use serde::Deserialize;
 use std::sync::{Arc, OnceLock};
@@ -127,11 +129,16 @@ impl RuleSet {
         let mut rules = Vec::with_capacity(file.rules.len());
         let mut patterns = Vec::with_capacity(file.rules.len());
         for spec in file.rules {
+            // **First**, ahead of the examples guard, so a rule
+            // declaring the reserved kind is reported on *that* ground
+            // rather than on whatever else happens to be wrong with it.
+            // Nothing shipped reaches either branch: `unresolved`
+            // appears zero times under `crates/`.
+            if spec.kind == UNRESOLVED_KIND {
+                return Err(RuleError::ReservedKind(spec.name));
+            }
             if spec.positive.is_empty() || spec.negative.is_empty() {
                 return Err(RuleError::MissingExamples(spec.name));
-            }
-            if spec.kind == super::redact::UNRESOLVED_KIND {
-                return Err(RuleError::ReservedKind(spec.name));
             }
             let regex = Regex::new(&spec.pattern).map_err(|source| RuleError::Pattern {
                 name: spec.name.clone(),
@@ -309,6 +316,90 @@ mod tests {
         )
         .expect_err("must refuse a rule with no examples");
         assert!(matches!(err, RuleError::MissingExamples(n) if n == "no-examples"));
+    }
+
+    #[test]
+    fn a_user_rule_declaring_the_reserved_kind_is_rejected() {
+        // §9.2(b): `unresolved` is the marker for a match the redactor's
+        // window could not *judge*. Every other `[REDACTED:<kind>]`
+        // names a rule that matched; this one means the opposite, so a
+        // rule able to claim it makes a genuinely matched secret
+        // indistinguishable from a withheld partial — the one
+        // distinction the marker exists to carry.
+        //
+        // The rule below is **valid in every other respect** — a
+        // compiling pattern, non-empty examples, a name no built-in
+        // uses — or `MissingExamples` or `Pattern` fires first and this
+        // row passes with no guard present at all.
+        let err = RuleSet::builtin_with_extra(
+            r#"
+            [[rule]]
+            name = "impostor"
+            kind = "unresolved"
+            pattern = 'IMP_[A-Z0-9]{8}'
+            positive = ["IMP_ABCD1234"]
+            negative = ["IMP_ABC"]
+            "#,
+        )
+        .expect_err("`compile` must refuse the reserved kind");
+        assert!(
+            matches!(err, RuleError::ReservedKind(ref n) if n == "impostor"),
+            "the error must name the offending rule; got {err:?}"
+        );
+        assert!(err.to_string().contains("impostor"), "{err}");
+    }
+
+    #[test]
+    fn an_ordinary_user_rule_still_loads() {
+        // **The pairing, and it is what makes the row above mean
+        // anything.** A loader that rejected every user rule, and a
+        // guard written as `contains("unresolved")`, both pass the
+        // rejection row on their own — the blocklist-shaped failure
+        // reached through the *absence* of a negative.
+        let builtin = RuleSet::builtin().unwrap();
+        let set = RuleSet::builtin_with_extra(
+            r#"
+            [[rule]]
+            name = "ordinary"
+            kind = "internal-token"
+            pattern = 'ORD_[A-Z0-9]{8}'
+            positive = ["ORD_ABCD1234"]
+            negative = ["ORD_ABC"]
+            "#,
+        )
+        .expect("an ordinary user rule must load");
+        // Computed, never a literal count: the shipped set drifts.
+        assert_eq!(set.len(), builtin.len() + 1);
+        assert!(set.rules.iter().any(|r| r.kind == "internal-token"));
+
+        // Second arm, in the same test: the reservation is **exact
+        // equality**, not a prefix and not a substring. `marker`
+        // interpolates `kind` verbatim, so `unresolved-token` produces a
+        // different string that collides with nothing — and under
+        // REQ-CFG-003 an over-rejected config is a daemon that refuses
+        // to start, which is a real cost for no safety.
+        let set = RuleSet::builtin_with_extra(
+            r#"
+            [[rule]]
+            name = "near-miss"
+            kind = "unresolved-token"
+            pattern = 'NMS_[A-Z0-9]{8}'
+            positive = ["NMS_ABCD1234"]
+            negative = ["NMS_ABC"]
+            "#,
+        )
+        .expect("`unresolved-token` is a legal kind and must still load");
+        assert!(set.rules.iter().any(|r| r.kind == "unresolved-token"));
+    }
+
+    #[test]
+    fn the_reserved_kind_constant_has_one_definition() {
+        // 0.0.6 imports it from *this* module while `redact` defines it,
+        // so the re-export is the thing under test: two `const`s with
+        // the same text would satisfy every other assertion here and
+        // diverge in silence.
+        assert_eq!(UNRESOLVED_KIND, "unresolved");
+        assert_eq!(UNRESOLVED_KIND, crate::output::redact::UNRESOLVED_KIND);
     }
 
     #[test]
