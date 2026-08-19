@@ -679,6 +679,65 @@ async fn an_unknown_method_is_an_error_that_keeps_the_connection_open() {
     assert_eq!(status.pid, std::process::id());
 }
 
+/// §18.3's **only** retriable code needs something that emits it.
+///
+/// `ErrorCode::retriable()` answers `true` for exactly one row and
+/// `ClientError::retriable()` defers to the wire flag, so the whole
+/// retry story rests on a daemon that is on its way out saying so. With
+/// no producer the `Method` arm of `retriable()` can only ever answer
+/// `false`, and a caller whose call landed one instant after a
+/// `daemon/stop` — or after SIGTERM, or after §7.3's client-less exit —
+/// is told nothing that distinguishes "come back in a moment" from "that
+/// daemon crashed".
+///
+/// The shutdown is signalled **out of band** here rather than by issuing
+/// `daemon/stop` on a second connection. That is the honest premise: all
+/// three production paths converge on `Daemon::shutdown`, and driving it
+/// directly means this row cannot be satisfied by a `daemon/stop` arm
+/// that happens to special-case its own connection.
+#[tokio::test]
+async fn a_request_to_a_stopping_daemon_is_refused_with_the_retriable_code() {
+    let d = TestDaemon::start("shuttingdown").await;
+    let client = d.client().await.unwrap();
+
+    // The control: the same call on the same connection succeeds while
+    // the daemon is up. Without it this row would also pass against a
+    // daemon that refused `daemon/status` unconditionally.
+    let before: DaemonStatus = client
+        .call(method::METHOD_DAEMON_STATUS, &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(before.pid, std::process::id());
+
+    d.daemon.shutdown();
+
+    let err = client
+        .call::<_, DaemonStatus>(method::METHOD_DAEMON_STATUS, &json!({}))
+        .await
+        .expect_err("a daemon that has been asked to stop must not serve a new request");
+    let ClientError::Method {
+        code,
+        retriable,
+        message,
+        ..
+    } = &err
+    else {
+        panic!("expected §18.3's catalogued refusal, got {err:?}")
+    };
+    // The literal, not `ErrorCode::DaemonShuttingDown.as_str()`: this is
+    // the one string a peer built from §18.3 rather than from this crate
+    // has to recognise.
+    assert_eq!(code, "daemon_shutting_down", "{message}");
+    assert!(
+        retriable,
+        "§18.3 marks this row retriable, and it is the only row that is"
+    );
+    // The classifier the reconnect hook actually consults. `code` alone
+    // would stay green against a producer that emitted the string with
+    // the flag cleared.
+    assert!(err.retriable(), "ClientError::retriable() must agree");
+}
+
 #[tokio::test]
 async fn daemon_status_reports_real_session_counts() {
     let d = TestDaemon::start("status").await;

@@ -461,6 +461,25 @@ impl Daemon {
         self.shutdown_tx.subscribe()
     }
 
+    /// Whether a shutdown has been asked for and not yet finished.
+    ///
+    /// The **producer side** of §18.3's `daemon_shutting_down`, and the
+    /// only one. Every path that ends this daemon — `daemon/stop`
+    /// ([`dispatch`]), SIGTERM ([`run_with_config`]) and §7.3's
+    /// client-less exit ([`reaper_loop`]) — goes through
+    /// [`Daemon::shutdown`] or [`Daemon::shutdown_graceful`], and both
+    /// set this flag before the process gets anywhere near exiting.
+    ///
+    /// It reads the same `watch` channel [`shutdown_signalled`] hands
+    /// out rather than a second `AtomicBool`, so there is one answer to
+    /// "is this daemon stopping" and no way for the accept loop and the
+    /// dispatcher to disagree.
+    ///
+    /// [`shutdown_signalled`]: Daemon::shutdown_signalled
+    pub fn is_shutting_down(&self) -> bool {
+        *self.shutdown_tx.borrow()
+    }
+
     /// §19.1's periodic half: rotate, retire, and **reopen**.
     ///
     /// The daemon has held `audit.log` open since start-up, so a
@@ -863,6 +882,29 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
                 return;
             }
         };
+
+        // §18.3's one retriable code, and the only place that produces
+        // it. A daemon that has been asked to stop is still holding
+        // every connection it had — `shutdown()` ends the *accept* loop,
+        // not the tasks already serving — so without this arm an
+        // in-flight caller on another connection either gets served by a
+        // daemon that is dismantling itself or, once the process
+        // actually exits, gets `Eof`. `Eof` is indistinguishable from a
+        // crash and `ClientError::retriable()` classifies it `false`, so
+        // the reconnect that would have worked is never attempted.
+        //
+        // Checked **after** the read and before the dispatch, so the
+        // `daemon/stop` that set the flag is itself dispatched normally
+        // and answers its own caller with a `StopOutcome`.
+        if daemon.is_shutting_down() {
+            let resp = Response::error(
+                req.id,
+                ErrorCode::DaemonShuttingDown,
+                "the daemon is shutting down; reconnect and retry",
+            );
+            let _ = frame::write_frame(&mut stream, &resp).await;
+            return;
+        }
 
         let (resp, stop_after) = dispatch(&daemon, &req, client_kind).await;
         if frame::write_frame(&mut stream, &resp).await.is_err() {
