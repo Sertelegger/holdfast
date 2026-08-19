@@ -169,6 +169,35 @@ pub fn daemon_start() -> ExitCode {
 /// resolve. That is what `TestEnv::drop` was paying `CLI_TIMEOUT` for.
 const FORCE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long `clasp daemon stop` **without** `--force` waits for the
+/// graceful `daemon/stop` to answer before it gives up.
+///
+/// §3.2 bounds this call in as many words — *"`SIGTERM` to the daemon,
+/// wait up to 10 seconds for clean shutdown … then return"* — and §18.8
+/// gives exit code 1 for *"Operation failed: couldn't stop"*. So an
+/// unbounded wait here is a divergence from normative prose, not a
+/// missing nicety, and "the daemon accepts the connection and then never
+/// replies" is exactly the state `--force` was already bounded for.
+/// `ControlClient` has no deadline of its own past the handshake — a
+/// legitimate `wait_for_pattern` runs to 3600 s — so the bound belongs
+/// here.
+///
+/// **It is deliberately not [`FORCE_RPC_TIMEOUT`], and reusing that
+/// would be a defect.** The daemon answers this method only *after* its
+/// own grace has run: `shutdown_graceful` SIGTERMs every live session,
+/// waits [`server::DEFAULT_STOP_GRACE_SECS`] — §3.2's ten — and then
+/// SIGKILLs whatever is left. An interactive shell ignores SIGTERM
+/// (§4.4) and therefore **always** reaches that escalation, so the full
+/// grace is the *ordinary* duration of this call rather than its worst
+/// case. A two-second bound would report failure on every stop that had
+/// a shell to kill, while the daemon went on stopping correctly.
+///
+/// The five seconds on top cover the round trip and the SIGKILL sweep
+/// that follows the grace. The daemon's grace is the floor and this must
+/// stay strictly above it — see
+/// `the_graceful_bound_leaves_room_for_the_daemons_own_grace`.
+const STOP_RPC_TIMEOUT: Duration = Duration::from_secs(server::DEFAULT_STOP_GRACE_SECS as u64 + 5);
+
 /// What the `daemon/stop` RPC did, kept separate from what `--force`
 /// then does about it.
 enum StopRpc {
@@ -180,8 +209,15 @@ enum StopRpc {
     Failed(String),
 }
 
-async fn stop_rpc(force: bool) -> StopRpc {
-    let client = match connect(ClientKind::Cli).await {
+async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
+    // No discoverable runtime directory means no socket to call on and
+    // no `clasp.pid` to read, which is the same outcome as nothing
+    // listening — and is what the old `connect()` reported too, since a
+    // failed `discover()` was raised as `ClientError::Connect`.
+    let Some(paths) = paths else {
+        return StopRpc::NotRunning;
+    };
+    let client = match ControlClient::connect(&paths.control_sock(), ClientKind::Cli).await {
         Ok(c) => c,
         Err(ClientError::Connect { .. }) => return StopRpc::NotRunning,
         Err(e) => return StopRpc::Failed(e.to_string()),
@@ -209,40 +245,70 @@ async fn stop_rpc(force: bool) -> StopRpc {
 /// the daemon process itself, whether the RPC answered, failed, or never
 /// came back.
 pub async fn daemon_stop(force: bool) -> ExitCode {
+    let deadline = if force {
+        FORCE_RPC_TIMEOUT
+    } else {
+        STOP_RPC_TIMEOUT
+    };
+    // `paths()` is resolved once, here, rather than twice inside. An
+    // undiscoverable runtime directory means no socket and no
+    // `clasp.pid`, and both halves below have to agree about that.
+    ExitCode::from(daemon_stop_within(force, paths().ok(), deadline).await)
+}
+
+/// [`daemon_stop`] with the runtime directory resolved and the RPC
+/// deadline supplied, returning §18.8's exit code as a `u8`.
+///
+/// Both seams exist for the same test: "the daemon accepts and never
+/// replies" is the state this bound was written for, and driving it
+/// through `daemon_stop` would mean discovering a real runtime directory
+/// and waiting a real [`STOP_RPC_TIMEOUT`]. `u8` rather than `ExitCode`
+/// because `ExitCode` cannot be compared, so a test could only assert on
+/// its `Debug` formatting.
+async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeout: Duration) -> u8 {
+    // **Both paths are bounded now.** `--force`'s bound was already here
+    // because a daemon that accepts and never replies is the state
+    // `--force` exists for; the graceful path had the same exposure with
+    // nothing to catch it, and §3.2 bounds it too.
+    let rpc = match tokio::time::timeout(rpc_timeout, stop_rpc(force, paths.as_ref())).await {
+        Ok(rpc) => rpc,
+        Err(_) => StopRpc::Failed(format!(
+            "the daemon did not answer daemon/stop within {}s",
+            rpc_timeout.as_secs()
+        )),
+    };
+
     if !force {
-        return match stop_rpc(false).await {
+        return match rpc {
             StopRpc::Stopped(outcome) => {
                 println!(
                     "daemon stopped ({} session(s) terminated)",
                     outcome.sessions_terminated
                 );
-                ExitCode::SUCCESS
+                0
             }
             StopRpc::NotRunning => {
                 println!("no daemon running");
-                ExitCode::SUCCESS
+                0
             }
+            // §18.8's "Operation failed: couldn't stop". Without
+            // `--force` there is nothing else to try — escalating on the
+            // strength of a pid file is precisely what
+            // `confirm_daemon_pid` refuses to do — so the elapse is the
+            // verdict and the operator is told to reach for `--force`.
             StopRpc::Failed(e) => {
                 eprintln!("clasp daemon stop: {e}");
-                ExitCode::from(EXIT_FAILED)
+                EXIT_FAILED
             }
         };
     }
 
-    let rpc = match tokio::time::timeout(FORCE_RPC_TIMEOUT, stop_rpc(true)).await {
-        Ok(rpc) => rpc,
-        Err(_) => StopRpc::Failed(format!(
-            "the daemon did not answer daemon/stop within {}s",
-            FORCE_RPC_TIMEOUT.as_secs()
-        )),
-    };
-
-    let escalation = match paths() {
-        Ok(p) => escalate_to_sigkill(&p),
+    let escalation = match &paths {
+        Some(p) => escalate_to_sigkill(p),
         // No runtime directory means no `clasp.pid` to read. The RPC arm
         // below already reports what it saw, which for an undiscoverable
         // directory is `NotRunning`.
-        Err(_) => Escalation::Nothing,
+        None => Escalation::Nothing,
     };
 
     match rpc {
@@ -258,7 +324,7 @@ pub async fn daemon_stop(force: bool) -> ExitCode {
             // answered, so the ordinary reason its pid no longer confirms
             // is that it has already dropped its listener and is on its
             // way out. The escalation declined was one nothing needed.
-            ExitCode::SUCCESS
+            0
         }
         // The RPC got nowhere, which is when `--force` has to earn its
         // name. A confirmed kill *is* the stop, so it exits 0 and the
@@ -267,16 +333,16 @@ pub async fn daemon_stop(force: bool) -> ExitCode {
         StopRpc::NotRunning => match escalation {
             Escalation::Killed(pid) => {
                 println!("daemon killed (pid {pid})");
-                ExitCode::SUCCESS
+                0
             }
             Escalation::Nothing => {
                 println!("no daemon running");
-                ExitCode::SUCCESS
+                0
             }
             Escalation::NotSignalled { pid, why } => {
                 println!("no daemon running");
                 eprintln!("clasp daemon stop: clasp.pid names pid {pid}, not signalled: {why}");
-                ExitCode::SUCCESS
+                0
             }
         },
         StopRpc::Failed(e) => {
@@ -284,12 +350,12 @@ pub async fn daemon_stop(force: bool) -> ExitCode {
             match escalation {
                 Escalation::Killed(pid) => {
                     println!("daemon killed (pid {pid})");
-                    ExitCode::SUCCESS
+                    0
                 }
-                Escalation::Nothing => ExitCode::from(EXIT_FAILED),
+                Escalation::Nothing => EXIT_FAILED,
                 Escalation::NotSignalled { pid, why } => {
                     eprintln!("clasp daemon stop: clasp.pid names pid {pid}, not signalled: {why}");
-                    ExitCode::from(EXIT_FAILED)
+                    EXIT_FAILED
                 }
             }
         }
@@ -648,4 +714,154 @@ pub fn version() -> ExitCode {
         clasp_core::protocol::PROTOCOL_MINOR,
     );
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clasp_core::protocol::frame;
+    use clasp_core::protocol::handshake::{self, HandshakeData};
+    use clasp_core::protocol::method::{Request, Response};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A short, unique `/tmp` runtime directory. `sockaddr_un.sun_path`
+    /// cannot hold a path under the workspace's `target/`.
+    fn scratch(tag: &str) -> RuntimePaths {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        RuntimePaths::with_dir(format!("/tmp/clasp-t-cmd-{tag}-{}-{n}", std::process::id()))
+    }
+
+    struct Scoped(RuntimePaths);
+    impl Drop for Scoped {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.dir());
+        }
+    }
+
+    /// A daemon that accepts, completes the handshake, and then answers
+    /// **nothing**.
+    ///
+    /// The handshake has to succeed or the test would be measuring
+    /// `ControlClient::connect`'s own deadline rather than the stop RPC's
+    /// — a different bound, added for a different finding.
+    fn wedged_daemon(paths: &RuntimePaths) -> tokio::task::JoinHandle<()> {
+        // Bound **before** the spawn, so the socket exists by the time
+        // this returns. Binding inside the task makes the connect below a
+        // race, and losing it reports "no daemon running" — a green exit
+        // 0 that has nothing to do with the property under test.
+        let listener = tokio::net::UnixListener::bind(paths.control_sock()).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let Ok(hs) = frame::read_frame::<_, Request>(&mut stream).await else {
+                        return;
+                    };
+                    let data = HandshakeData {
+                        protocol_major: handshake::PROTOCOL_MAJOR,
+                        protocol_minor: handshake::PROTOCOL_MINOR,
+                        daemon_version: "wedged".into(),
+                        build: "wedged".into(),
+                        accepted: true,
+                        reject_reason: None,
+                    };
+                    let resp = Response::ok(hs.id, &data, "handshake accepted").unwrap();
+                    if frame::write_frame(&mut stream, &resp).await.is_err() {
+                        return;
+                    }
+                    // Read the `daemon/stop` and never answer it. The
+                    // stream is held for the life of this task: letting
+                    // it drop would EOF the client's read, the call would
+                    // return an error on its own, and the row would be
+                    // green against a `daemon stop` with no bound at all.
+                    let _ = frame::read_frame::<_, Request>(&mut stream).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        })
+    }
+
+    /// §3.2 bounds `clasp daemon stop`, and nothing bounded it.
+    ///
+    /// `--force`'s RPC was already capped by `FORCE_RPC_TIMEOUT`,
+    /// precisely because "the daemon accepts the connection and then
+    /// never replies" is a real state that path was written for. The
+    /// graceful path had the same exposure with nothing to catch it, and
+    /// `ControlClient` has no deadline of its own past the handshake — so
+    /// the command hung, forever, against a divergence from §3.2's
+    /// *"wait up to 10 seconds … then return"* and §18.8's exit code 1.
+    ///
+    /// **The outer bound is a red test, not a hang.** The failure mode
+    /// here is a command that never returns, and there is no
+    /// `nextest.toml` in this repo to turn that into anything but a hung
+    /// CI job, so the elapsed arm is `expect`ed rather than matched as
+    /// success.
+    #[tokio::test]
+    async fn a_graceful_stop_gives_up_on_a_daemon_that_never_answers() {
+        let paths = scratch("wedged");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = wedged_daemon(&paths);
+
+        let code = tokio::time::timeout(
+            Duration::from_secs(20),
+            daemon_stop_within(false, Some(paths.clone()), Duration::from_millis(200)),
+        )
+        .await
+        .expect(
+            "`clasp daemon stop` never returned: §3.2 bounds the wait and §18.8 gives \
+             it an exit code, so a hang is a divergence from normative prose",
+        );
+        assert_eq!(
+            code, EXIT_FAILED,
+            "§18.8: \"Operation failed: couldn't stop\" is exit 1"
+        );
+        daemon.abort();
+    }
+
+    /// The control. Without it the row above is satisfied by a
+    /// `daemon stop` that reports failure unconditionally.
+    #[tokio::test]
+    async fn a_graceful_stop_against_an_absent_daemon_is_still_success() {
+        let paths = scratch("absent");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+
+        let code = tokio::time::timeout(
+            Duration::from_secs(20),
+            daemon_stop_within(false, Some(paths.clone()), Duration::from_millis(200)),
+        )
+        .await
+        .expect("nothing to connect to must not wait for anything");
+        assert_eq!(code, 0, "§3.2 makes `daemon stop` idempotent");
+    }
+
+    /// The bound the shipped command really passes must leave room for
+    /// the grace the *daemon* takes before it answers.
+    ///
+    /// `shutdown_graceful` SIGTERMs every live session, waits
+    /// `DEFAULT_STOP_GRACE_SECS`, and only then SIGKILLs and replies. An
+    /// interactive shell ignores SIGTERM (§4.4) and therefore always
+    /// reaches that escalation, so the full grace is the **ordinary**
+    /// duration of this call. Reusing `FORCE_RPC_TIMEOUT` here — the
+    /// obvious reading of "bound it like the force path" — would report
+    /// failure on every stop that had a shell to kill, while the daemon
+    /// went on stopping correctly.
+    ///
+    /// A strict inequality against the daemon's own constant, not a
+    /// second copy of this one.
+    #[test]
+    fn the_graceful_bound_leaves_room_for_the_daemons_own_grace() {
+        let grace = Duration::from_secs(u64::from(server::DEFAULT_STOP_GRACE_SECS));
+        assert!(
+            STOP_RPC_TIMEOUT > grace,
+            "the CLI would give up at {STOP_RPC_TIMEOUT:?} on a stop the daemon \
+             is entitled to spend {grace:?} on"
+        );
+        // And it is a bound rather than an absence of one.
+        assert!(STOP_RPC_TIMEOUT <= grace * 3);
+    }
 }
