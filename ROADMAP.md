@@ -17,10 +17,14 @@ still ahead.
 
 ## Where it is now
 
-Seven MCP tools over stdio, Unix only, sessions die with the MCP process, and
-**output is returned raw and unredacted**. Detection is real — sessions report
-`interaction_mode` with the `detection_tier` that produced it — but everything
-around it is still bare. See the README for the accurate current surface and
+Eleven MCP tools, Unix only, in **hybrid mode**: a background `clasp daemon`
+owns the sessions and a `clasp mcp` shim proxies to it over a Unix socket, so
+sessions outlive the MCP client rather than dying with it. Output is
+ANSI-stripped and **secret-redacted by default**, with `--raw` and
+`read_output(redact: false)` as audited opt-outs. Detection is real — sessions
+report `interaction_mode` with the `detection_tier` that produced it. Windows
+is not there yet, and neither is attach, the web UI, or the dangerous-command
+preflight. See the README for the accurate current surface and
 [SECURITY.md](./SECURITY.md) for what that means in practice.
 
 ## Output processing

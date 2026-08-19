@@ -2,12 +2,14 @@
 
 An MCP server that gives AI agents persistent, PTY-backed shell sessions.
 
-> **Status: milestone 0.0.4 — early development.** Eleven tools, stdio
-> only, Unix only. Sessions die with the MCP process. Output is
-> ANSI-stripped and secret-redacted by default. Not yet suitable for
-> real use.
+> **Status: milestone 0.0.5 — early development.** Eleven tools, hybrid
+> mode on Linux/macOS/WSL, Unix only. Sessions live in a background
+> daemon and survive the MCP client, so a Claude Code restart no longer
+> takes them with it. Output is ANSI-stripped and secret-redacted by
+> default. Not yet suitable for real use; see [ROADMAP.md](./ROADMAP.md)
+> for what is and is not there.
 
-## What works today (0.0.4)
+## What works today (0.0.5)
 
 - `start_session` — spawn a shell or program on a real PTY
 - `send_input` — type into it
@@ -31,6 +33,13 @@ An MCP server that gives AI agents persistent, PTY-backed shell sessions.
   still clipped at the old width
 - `interrupt` — send Ctrl+C to the foreground process group, stopping the
   command that is running without killing the shell hosting it
+- `clasp daemon start|stop|status|run` — manage the background daemon
+- `clasp list` / `clasp logs <session> [--tail N] [--raw]` — inspect
+  sessions from any terminal
+
+Sessions outlive the MCP client: `clasp mcp` auto-spawns a daemon on
+first use and reconnects to it afterwards. `clasp mcp --no-daemon` runs
+everything in-process instead.
 
 Sessions report **what the program is doing**, not a guess:
 

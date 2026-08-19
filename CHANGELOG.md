@@ -6,15 +6,20 @@ upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
 ## [Unreleased]
 
-**Nothing has been released yet.** The workspace version is `0.0.2`, which
-marks the second completed milestone rather than a published artifact: there is
-no tag, nothing on crates.io, and no distributed binary. Everything below has
-landed on `main` and will be folded into the first release's notes.
+**Nothing has been released yet.** The workspace version is `0.0.2` and has not
+tracked the milestone number since; it is a placeholder rather than a published
+artifact, and there is no tag, nothing on crates.io, and no distributed binary.
+Everything below has landed on `main` and will be folded into the first
+release's notes.
 
-Two milestones are merged. Both were built task by task from self-contained
-briefs, each task reviewed against its brief and then again as a whole branch —
-which is why the "Fixed" section names classes of defect rather than issue
-numbers.
+Every milestone here was built task by task from self-contained briefs, each
+task reviewed against its brief and then again as a whole branch — which is why
+the "Fixed" section names classes of defect rather than issue numbers.
+
+**This file is behind the tree.** Milestones 0.0.3 (output processing and
+redaction) and 0.0.4 (screen state, resize, interrupt) are merged and have no
+sections of their own; README and ROADMAP describe what they added. The gap is
+recorded here rather than guessed at.
 
 ### Added
 
@@ -81,6 +86,36 @@ numbers.
 - **Session options on `start_session`**: `cwd` (validated and canonicalised),
   `env`, `cols`/`rows`, `prompt_patterns`, `prompt_patterns_replace`,
   `settle_threshold_ms`, `shell_integration`.
+
+#### Milestone 0.0.5 — the daemon and the control protocol
+
+- **Sessions no longer die with the MCP client.** `clasp mcp` is now a thin
+  shim: on first use it auto-spawns a background `clasp daemon`, and afterwards
+  it reconnects to the one already running. The daemon owns the PTYs, so
+  quitting and restarting Claude Code leaves every session alive, at the same
+  prompt, with its output buffer intact. `clasp mcp --no-daemon` keeps the old
+  single-process behaviour, and is the shape the Windows build will reuse.
+- **A versioned control protocol** over a Unix socket — length-prefixed CBOR
+  frames with a 16 MiB cap, a `clasp/handshake` that both peers check, and the
+  §18.3 error catalogue. Mismatched protocol majors refuse to connect from
+  *either* side, so a protocol break cannot be papered over by one end being
+  lenient.
+- **The daemon never opens a TCP listener.** The socket is Unix-domain only,
+  its directory is `0700` and verified after creation, and every connection's
+  peer credentials are read with `SO_PEERCRED` and compared to the daemon's own
+  uid *before a single frame is parsed*. A credential that cannot be read fails
+  closed.
+- **New CLI subcommands** — `clasp daemon run|start|stop|status`, `clasp list`,
+  and `clasp logs <session> [--tail N] [--raw]`, with §18.8's exit codes and
+  §3.2's idempotence contracts (`daemon start` on a running daemon and
+  `daemon stop` on a dead one both succeed and say so).
+- **The §9.4 caller is derived from the connection, never from the request.**
+  A read that disables redaction records two facts: `tool`, the mechanism, and
+  `client_kind`, the accountable party — taken from the uid-checked handshake,
+  so `clasp logs --raw` is logged as `cli` and an agent's
+  `read_output(redact: false)` as `shim`. There is deliberately no argument an
+  agent could set to label itself as a human. `client_kind` is attribution
+  only; nothing in the read path branches on it.
 
 ### Fixed
 
