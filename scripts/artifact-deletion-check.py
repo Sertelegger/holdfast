@@ -1436,6 +1436,15 @@ def scan(plans: list[Path], root: Path) -> dict:
         "item_undecidable": 0,
         "item_addition_suppressed": 0,
         "item_clean": 0,
+        # WHERE the clean ones are, as (plan, line, kind, item, path). Not
+        # printed: this is the check reporting which real blocks it resolved
+        # to a real file and diffed and found accurate, and the self-test
+        # consumes it. A corpus acceptance case that pins a FINDING goes red
+        # the day somebody fixes the finding (see `self_test`); one that
+        # injects a deletion into a block the check itself says is clean
+        # keeps working, and cannot be satisfied by re-implementing the
+        # resolution inside the test.
+        "item_clean_where": [],
         "item_superseded": 0,
         "item_anchored_edit": 0,
         "item_whole_file": 0,
@@ -1542,6 +1551,8 @@ def scan(plans: list[Path], root: Path) -> dict:
             continue
         if not f["deleted"]:
             stats["item_clean"] += 1
+            stats["item_clean_where"].append(
+                [f["plan"], f["line"], f["kind"], f["item"], f["path"]])
             continue
         kept.append(f)
 
@@ -1838,6 +1849,51 @@ use std::fmt;
 pub fn tiny() -> u8 {
     let base = 1;
     base + 1
+}
+"""
+
+# THE 0.0.8 SHAPE, frozen. This is `crates/clasp-core/src/mcp/mod.rs` reduced
+# to the two items 0.0.8 Task 7 Step 1 handed over and the one below them it
+# said it was leaving alone: a struct that has grown a second field since the
+# step was written, and an inherent `impl` that has grown a second
+# constructor. The `impl Default` is what keeps the block from accounting for
+# the whole file, which is a different tier's question. See PLAN_ITEM_SERVER
+# for why this is a fixture rather than a corpus assertion.
+FIX_SERVER_RS = """\
+//! Fake MCP server module.
+
+use crate::output::OutputProcessor;
+use crate::session::SessionRegistry;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct ClaspServer {
+    pub registry: Arc<SessionRegistry>,
+    /// Added after the stale block below was written, and read on every
+    /// call. Deleting it does not fail a test; it fails to compile.
+    pub processor: Arc<OutputProcessor>,
+}
+
+impl ClaspServer {
+    /// A server with the audit trail disabled.
+    pub fn new() -> Self {
+        Self::with_audit_path(None)
+    }
+
+    /// What `new` delegates to, and what the real server process calls.
+    pub fn with_audit_path(path: Option<PathBuf>) -> Self {
+        Self {
+            registry: Arc::new(SessionRegistry::with_defaults()),
+            processor: Arc::new(OutputProcessor::new(path)),
+        }
+    }
+}
+
+impl Default for ClaspServer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 """
 
@@ -2541,6 +2597,113 @@ PLAN_ITEM_SMALL_ARRAY = """\
 ```
 """
 
+# THE 0.0.8 REGRESSION, frozen, and the reason it is frozen here rather than
+# asserted against the corpus.
+#
+# This is 0.0.8 Task 7 Step 1 as it stood: a complete `pub struct ClaspServer`
+# and a complete inherent `impl` to paste over the existing ones, introduced
+# by prose asserting the premise that makes it safe -- "the struct really does
+# still have exactly one field ... and the inherent impl exactly one method".
+# Both halves were false, and false in the deleting direction: the struct had
+# grown a `processor` field that seventeen call sites read, and the impl a
+# `with_audit_path` that `new` delegates to.
+#
+# The self-test used to assert that finding against the live plan. It is the
+# best case this tier has -- a real shape, a real file, a real deletion -- and
+# pinning it was still wrong, because a finding is a thing whose purpose is to
+# be fixed. Somebody fixed it (docs 64610f2 rewrote the step into an explicit
+# addition, and the step's own prose now carries the table of what the block
+# would have deleted), the finding correctly disappeared, and the suite went
+# red for the project succeeding. A check that goes red when the defect it
+# hunts is repaired is a check people learn to ignore.
+#
+# So the shape lives here, where no repair can reach it, with the accurate
+# counterpart below to separate it. What tier 2 asserts against the real
+# corpus instead is the property that survives every repair: inject a member
+# into a file a real block claims to be the whole of, and the check reports
+# it.
+PLAN_ITEM_SERVER = """\
+# Fake server plan
+
+## Task 7: Wire the store into `ClaspServer`
+
+**Files:**
+- Modify: `src/server.rs`
+
+- [ ] **Step 1: Give `ClaspServer` a confirmation store**
+
+In `src/server.rs`, rewrite `pub struct ClaspServer` together with its
+**inherent** `impl` — those two items only. `impl Default for ClaspServer`
+sits directly below and is untouched. This is the one replacement in this
+task that is safe, because the struct really does still have exactly one
+field and the inherent impl exactly one method.
+
+```rust
+#[derive(Clone)]
+pub struct ClaspServer {
+    pub registry: Arc<SessionRegistry>,
+    /// Pending dangerous-command confirmations. Shared, because the
+    /// trusted surfaces that redeem codes are other tasks today and
+    /// other processes later.
+    pub confirmations: Arc<ConfirmationStore>,
+}
+
+impl ClaspServer {
+    /// Build a server, taking `strict_confirmation` from the environment
+    /// in the fail-closed direction only.
+    pub fn new() -> Self {
+        Self::with_safety(SafetyConfig::from_env(SafetyConfig::default()))
+    }
+
+    pub fn with_safety(safety: SafetyConfig) -> Self {
+        Self {
+            registry: Arc::new(SessionRegistry::with_defaults()),
+            confirmations: Arc::new(ConfirmationStore::new(safety.strict_confirmation)),
+        }
+    }
+}
+```
+"""
+
+# THE SEPARATOR, in its own plan so the supersede rule cannot hide it. The
+# same two items, the same file, the same block shape -- and it accounts for
+# what is there. A tier that flagged every struct-plus-impl block would report
+# this one too, which is what the corpus half of this pair used to prove
+# (0.0.3 Task 9 Step 1 against the same `mcp/mod.rs`).
+PLAN_ITEM_SERVER_OK = """\
+# Fake accurate server plan
+
+## Task 9: The server as it stands
+
+**Files:**
+- Modify: `src/server.rs`
+
+- [ ] **Step 1: The struct and its inherent `impl`**
+
+In `src/server.rs`:
+
+```rust
+#[derive(Clone)]
+pub struct ClaspServer {
+    pub registry: Arc<SessionRegistry>,
+    pub processor: Arc<OutputProcessor>,
+}
+
+impl ClaspServer {
+    pub fn new() -> Self {
+        Self::with_audit_path(None)
+    }
+
+    pub fn with_audit_path(path: Option<PathBuf>) -> Self {
+        Self {
+            registry: Arc::new(SessionRegistry::with_defaults()),
+            processor: Arc::new(OutputProcessor::new(path)),
+        }
+    }
+}
+```
+"""
+
 # The RECORD half of tier 3: the same shape in a plan that has run.
 PLAN_ITEM_RECORD = """\
 # Fake executed item plan
@@ -2577,6 +2740,7 @@ def _fixture_tree(td: Path) -> tuple[Path, Path]:
     (root / "src" / "twin.rs").write_text(FIX_TWIN_RS, encoding="utf-8")
     (root / "src" / "namesake.rs").write_text(FIX_NAMESAKE_RS, encoding="utf-8")
     (root / "src" / "small.rs").write_text(FIX_SMALL_RS, encoding="utf-8")
+    (root / "src" / "server.rs").write_text(FIX_SERVER_RS, encoding="utf-8")
     (root / "scripts" / "fixture-vocab.sh").write_text(FIX_VOCAB_SH, encoding="utf-8")
     (root / "scripts" / "fixture-vocab2.sh").write_text(FIX_VOCAB2_SH, encoding="utf-8")
     (root / "Cargo.toml").write_text(FIX_MANIFEST, encoding="utf-8")
@@ -2598,6 +2762,30 @@ def _fixture_block(plan_text: str, marker: str) -> list[str]:
     while not lines[j].startswith("```"):
         j += 1
     return lines[i + 1:j]
+
+
+def _mirror_with_one_file_changed(src: Path, dst: Path, rel: Path,
+                                  content: str) -> None:
+    """A symlink mirror of `src` with `rel` alone replaced by `content`.
+
+    A mirror rather than a one-file tree, and the difference is load-bearing:
+    tier 3 decides by requiring EXACTLY ONE candidate path to contain the
+    item, so a tree missing the other candidates would let a block resolve
+    that does not resolve in reality, and the injection below claims to be
+    about the same real block. Symlinks, so nothing is copied and nothing in
+    the real tree is written -- `TemporaryDirectory` unlinks a symlinked
+    directory rather than recursing into it.
+    """
+    dst.mkdir(parents=True, exist_ok=True)
+    head = rel.parts[0]
+    for entry in src.iterdir():
+        if entry.name != head:
+            (dst / entry.name).symlink_to(entry)
+    if len(rel.parts) == 1:
+        (dst / head).write_text(content, encoding="utf-8")
+    else:
+        _mirror_with_one_file_changed(src / head, dst / head,
+                                      Path(*rel.parts[1:]), content)
 
 
 def _find(report: dict, bucket: str, plan_frag: str, path: str):
@@ -2642,6 +2830,8 @@ def self_test(corpus_root: Path | None) -> int:
         (plans / "itemsecond.md").write_text(PLAN_ITEM_TWOBLOCK, encoding="utf-8")
         (plans / "itemfar.md").write_text(PLAN_ITEM_FAR, encoding="utf-8")
         (plans / "itemsmall.md").write_text(PLAN_ITEM_SMALL_ARRAY, encoding="utf-8")
+        (plans / "serverstale.md").write_text(PLAN_ITEM_SERVER, encoding="utf-8")
+        (plans / "serverok.md").write_text(PLAN_ITEM_SERVER_OK, encoding="utf-8")
 
         rep = _run(plans, root)
 
@@ -2766,6 +2956,23 @@ def self_test(corpus_root: Path | None) -> int:
               (f is not None and f["deleted"], f and f["names"]),
               (["fn with_count"], ["item `fn with_count`"]))
 
+        # THE 0.0.8 REGRESSION, and its separator. Both halves are asserted
+        # here, against a frozen fixture, because this pair used to be
+        # asserted against the live corpus and the positive half went red the
+        # day the plan was repaired. See PLAN_ITEM_SERVER for the history.
+        f = item("blocking", "serverstale", "struct", "ClaspServer")
+        g = item("blocking", "serverstale", "impl", "impl ClaspServer")
+        check("TIER 3 — a struct-plus-impl replacement written against a "
+              "smaller file names BOTH the dropped field and the dropped "
+              "constructor",
+              (f is not None and f["deleted"], f and f["path"],
+               g is not None and g["deleted"], g and g["names"]),
+              (["processor"], "src/server.rs",
+               ["fn with_audit_path"], ["item `fn with_audit_path`"]))
+        check("TIER 3 — the same two items, the same file, handed over "
+              "accurately, are silent",
+              item_hits("serverok"), [])
+
         f = item("blocking", "item", "fn", "describe")
         check("TIER 3 — a function body handed over whole names the dropped "
               "statements",
@@ -2875,11 +3082,37 @@ def self_test(corpus_root: Path | None) -> int:
             FIX_ITEM_RS.replace("    pub tags: BTreeMap<String, String>,\n", ""),
             encoding="utf-8")
         mrep = _run(plans, root)
+        # Scoped to the file that was mutated. Written as "no struct finding
+        # anywhere" it passed only because `item.md` was the only fixture
+        # with a struct in it, and it went red the moment a second one was
+        # added -- a mutation assertion that fails on an unrelated fixture is
+        # measuring the fixture set, not the gate.
         check("MUTATION — with the field removed from the tree, the struct "
               "finding disappears (tier 3 reads disk, not prose)",
               [x for x in mrep["blocking"]
-               if x.get("tier") == "item" and x["kind"] == "struct"], [])
+               if x.get("tier") == "item" and x["kind"] == "struct"
+               and x["path"] == "src/item.rs"], [])
         (root / "src" / "item.rs").write_text(FIX_ITEM_RS, encoding="utf-8")
+
+        # MUTATION 4b: the frozen 0.0.8 regression reads the disk too, and the
+        # two halves of it are independent. Drop the field the stale block
+        # does not mention and its struct finding must vanish while its impl
+        # finding -- a different member set in the same block -- stays.
+        (root / "src" / "server.rs").write_text(
+            FIX_SERVER_RS.replace(
+                "    pub processor: Arc<OutputProcessor>,\n", ""),
+            encoding="utf-8")
+        mrep = _run(plans, root)
+        check("MUTATION — with the field removed from the tree, the frozen "
+              "0.0.8 struct finding disappears and its impl finding stays",
+              ([x["deleted"] for x in mrep["blocking"]
+                if x.get("tier") == "item" and "serverstale" in x["plan"]
+                and x["kind"] == "struct"],
+               [x["deleted"] for x in mrep["blocking"]
+                if x.get("tier") == "item" and "serverstale" in x["plan"]
+                and x["kind"] == "impl"]),
+              ([], [["fn with_audit_path"]]))
+        (root / "src" / "server.rs").write_text(FIX_SERVER_RS, encoding="utf-8")
 
         # MUTATION 5: the EXECUTED stamp is load-bearing for tier 3 as well.
         (plans / "itemrec.md").write_text(
@@ -2953,16 +3186,33 @@ def self_test(corpus_root: Path | None) -> int:
 
     # The negative half of the brief's acceptance set. These four plans are
     # clean and a check that flags them is over-firing.
+    #
+    # NON-VACUITY. `hits` is empty both when the plan is clean and when the
+    # plan is not there at all -- a rename is enough -- so the plan's presence
+    # in the corpus is asserted alongside the emptiness. Without it these four
+    # become four assertions about nothing the first time somebody renames a
+    # file, and pass forever after.
     for frag in ("0.0.2-deterministic", "0.0.3-output", "0.0.6-attach",
                  "0.0.2-followup"):
         hits = [x["path"] for x in rep["blocking"] if frag in x["plan"]]
-        check(f"no BLOCKING finding in {frag}", hits, [])
+        check(f"no BLOCKING finding in {frag}, and that plan is in the corpus",
+              (len([p for p in rep["plans"] if frag in p]), hits), (1, []))
 
     every = rep["blocking"] + rep["record"]
     check("every finding names a path that exists on disk",
           all((corpus_root / x["path"]).is_file() for x in every), True)
-    check("no BLOCKING finding sits in a plan marked EXECUTED",
-          [x["plan"] for x in rep["blocking"] if x["executed_record"]], [])
+
+    # The bucket a finding lands in IS `executed_record`, so asserting one
+    # against the other proves nothing at all. Cross-check it against the
+    # stamps read from the plan files instead, in both directions: a finding
+    # in BLOCKING whose plan is stamped, or one in RECORD whose plan is not,
+    # is the flag having been lost on its way into the record.
+    stamped = set(rep["plans_marked_executed"])
+    check("BLOCKING and RECORD partition the findings by the plans' own "
+          "EXECUTED stamps, both directions",
+          (sorted({x["plan"] for x in rep["blocking"]} & stamped),
+           sorted({x["plan"] for x in rep["record"]} - stamped)),
+          ([], []))
 
     # ---- tier 3 against the real corpus ---------------------------------
 
@@ -2979,32 +3229,80 @@ def self_test(corpus_root: Path | None) -> int:
                           if (g["plan"], g["line"]) == (f["plan"], f["line"])}) > 1}),
           [])
 
-    # THE REAL-CORPUS ACCEPTANCE CASE. 0.0.8 Task 7 Step 1 hands over
-    # `pub struct ClaspServer` and its inherent `impl` as they were before
-    # 0.0.3 put a processor on them, and its own prose says the replacement
-    # is safe "because the struct really does still have exactly one field".
-    # It has two, and `start_session` reads the second on every call.
-    got = sorted(
-        (f["kind"], f["item"], tuple(f["deleted"]))
-        for f in rep["blocking"]
-        if f.get("tier") == "item" and "0.0.8" in f["plan"]
-        and f["path"] == "crates/clasp-core/src/mcp/mod.rs")
-    check("TIER 3 — 0.0.8 Task 7 Step 1's `ClaspServer` replacement is reported, "
-          "naming the dropped field and the dropped constructor",
-          got,
-          [("impl", "impl ClaspServer", ("fn with_audit_path",)),
-           ("struct", "ClaspServer", ("processor",))])
+    # THE REAL-CORPUS ACCEPTANCE CASE, and why it INJECTS a deletion rather
+    # than pinning one.
+    #
+    # It used to pin one: 0.0.8 Task 7 Step 1's `pub struct ClaspServer` and
+    # its inherent `impl`, handed over as they were before 0.0.3 put a
+    # `processor` on them, with the step's own prose asserting the block was
+    # safe "because the struct really does still have exactly one field". The
+    # check reported the dropped field and the dropped `with_audit_path`, and
+    # the assertion pinned exactly that. Then somebody acted on it: the step
+    # was rewritten into an explicit addition, the finding disappeared as it
+    # was meant to, and this suite went red for the project succeeding.
+    #
+    # That is the failure mode, stated generally: a corpus assertion that
+    # names a finding is an assertion with an expiry date, because the whole
+    # point of a finding is to stop existing. The shape is not lost -- it is
+    # frozen in `PLAN_ITEM_SERVER`, with its separator, where no repair can
+    # reach it. What is asserted here is the part that cannot expire: on a
+    # REAL plan against a REAL file, a block the check itself says accounts
+    # for its item exactly must turn into a finding the moment that item
+    # grows a member the block does not have. Inject, watch it go red,
+    # restore -- and the restore half is that the block was picked BECAUSE
+    # the unmutated run found it clean.
+    #
+    # `item_clean_where` is the check's own bookkeeping. Choosing the block
+    # by re-deciding which corpus blocks resolve would put a second copy of
+    # `check_item_block` inside its own test, and that copy would go on
+    # passing with the original deleted.
+    INJECTED = "__clasp_selftest_injected_field"
+    clean_structs = sorted(c for c in rep["stats"]["item_clean_where"]
+                           if c[2] == "struct")
+    check("TIER 3 — the corpus holds at least one block that hands over a "
+          "whole struct and accounts for it exactly (the un-injected half, "
+          "and what the injection below is done to)",
+          bool(clean_structs), True)
 
-    # ...and the separator. 0.0.3 Task 9 Step 1 replaces the SAME two items
-    # with the same shape of block, and today it accounts for both of them
-    # exactly. A tier that flagged every struct-plus-impl block would report
-    # this one too.
-    check("TIER 3 — 0.0.3 Task 9 Step 1's `ClaspServer` block, the same shape "
-          "against the same file, is silent because it still accounts for it",
-          [(f["kind"], f["item"]) for f in every
-           if f.get("tier") == "item" and "0.0.3" in f["plan"]
-           and f["path"] == "crates/clasp-core/src/mcp/mod.rs"],
-          [])
+    inj_deleted: object = "the injection never ran"
+    inj_bucket_ok: object = "the injection never ran"
+    if clean_structs:
+        plan_name, blk_line, _, item_name, rel = clean_structs[0]
+        src_lines = (corpus_root / rel).read_text(
+            encoding="utf-8", errors="replace").splitlines()
+        src_masked = mask_rust(src_lines)
+        rx = item_locator(RItem("struct", item_name, [], []))
+        starts = [k for k, l in enumerate(src_lines)
+                  if src_masked[k].strip() and rx.match(l)]
+        # One, because the block resolved: `locate_in_file` declines two.
+        check(f"TIER 3 — INJECTION: `struct {item_name}` is at exactly one "
+              f"place in {rel}, which is why that block resolved to it",
+              len(starts), 1)
+        if len(starts) == 1:
+            j = starts[0]
+            while "{" not in src_masked[j]:
+                j += 1
+            mutated = (src_lines[:j + 1] + [f"    pub {INJECTED}: u8,"]
+                       + src_lines[j + 1:])
+            with tempfile.TemporaryDirectory() as td:
+                troot = Path(td) / "root"
+                _mirror_with_one_file_changed(
+                    corpus_root, troot, Path(rel), "\n".join(mutated) + "\n")
+                irep = scan([plans_dir / plan_name], troot)
+            hit = [f for f in irep["blocking"] + irep["record"]
+                   if f.get("tier") == "item" and f["line"] == blk_line
+                   and f["kind"] == "struct" and f["item"] == item_name]
+            inj_deleted = [f["deleted"] for f in hit]
+            # ...and it lands in the bucket the plan's own stamp dictates,
+            # which is the half of the RECORD/BLOCKING split that a fixture
+            # cannot exercise against a real header.
+            inj_bucket_ok = all(
+                f["executed_record"] == (plan_name in stamped) for f in hit)
+
+    check("TIER 3 — INJECTION: with one field added to the file a real corpus "
+          "block is the whole of, that same block turns into a finding "
+          "naming it, in the bucket its plan's stamp dictates",
+          (inj_deleted, inj_bucket_ok), ([[INJECTED]], True))
 
     print()
     if failures:
