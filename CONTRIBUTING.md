@@ -85,13 +85,13 @@ of every run, `SMOKE OK (N checks)` or `SMOKE FAILED: F of N check(s) did not
 pass`, and **that printed total is the only place the number lives** — a
 literal copied into this paragraph went stale five times and nothing went red
 when it did, so it is not written here any more) is **the only thing that
-drives the real JSON-RPC surface**. Every Rust test asserts against in-process objects, so a
-bug that lives in serialisation — a tool whose `outputSchema` never reaches the
-wire, a doc comment the router drops, an enum serialised outside its declared
-vocabulary — is invisible to all of them and visible only here. Run it after
-any change to the tool surface, and **read its header comment before adding a
-check to it**; it states two rules that the rest of this file's testing section
-generalises.
+drives the real JSON-RPC surface**. Every Rust test asserts against in-process
+objects, so a bug that lives in serialisation — a tool whose `outputSchema`
+never reaches the wire, a doc comment the router drops, an enum serialised
+outside its declared vocabulary — is invisible to all of them and visible only
+here. Run it after any change to the tool surface, and **read its header
+comment before adding a check to it**; it states two rules that the rest of
+this file's testing section generalises.
 
 Clippy is also expected to be clean cross-compiled to Windows
 (`cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings`)
