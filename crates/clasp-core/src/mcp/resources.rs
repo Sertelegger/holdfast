@@ -246,14 +246,39 @@ impl ResourceUri {
     /// The next offset is encoded **inside** `next_uri` as a query
     /// parameter and not as a separate `_meta.clasp.cursor` field, which
     /// is §5.5.3's own rule.
-    pub fn continuation(&self, next_cursor: u64) -> String {
+    ///
+    /// **`session_id` is the session the bytes actually came from, and a
+    /// name-keyed read continues under its id.** A cursor is an offset
+    /// into one session's buffer and means nothing in another's. A name
+    /// is released when a session exits (§5.5.4, REQ-R-007) and may be
+    /// reused immediately, so an agent handed
+    /// `clasp://session-name/build/buffer?since_cursor=4096`, that
+    /// retried after `build` exited and a new `build` started, was
+    /// served the **new** session's bytes at an offset that means
+    /// nothing there — with no flag saying the identity had changed.
+    /// Hybrid mode widens that window by an MCP round trip plus an agent
+    /// turn.
+    ///
+    /// REQ-R-007 is unaffected: its rule governs the *initial*
+    /// resolution of a name, which [`resolve`] still refuses for a dead
+    /// session. Ids resolve whether or not the session is running
+    /// (§5.5.1), so switching keys here preserves the byte stream and
+    /// keeps `truncated_at_tail` meaningful instead of trading a
+    /// stale-read hazard for a cross-session one.
+    pub fn continuation(&self, session_id: &str, next_cursor: u64) -> String {
         let base = match &self.target {
-            ResourceTarget::SessionId(id) => format!("clasp://session/{id}/buffer"),
-            ResourceTarget::SessionName(name) => format!("clasp://session-name/{name}/buffer"),
-            ResourceTarget::File {
-                session_id,
-                transfer_id,
-            } => format!("clasp://session/{session_id}/file/{transfer_id}"),
+            // Both buffer shapes continue under the id, and they are
+            // written as one arm rather than two so that a later edit
+            // cannot restore the name-keyed form for one of them alone.
+            ResourceTarget::SessionId(_) | ResourceTarget::SessionName(_) => {
+                format!("clasp://session/{session_id}/buffer")
+            }
+            // Unreachable while §5.5.6 is unserved — `resolve` refuses
+            // this shape — and left keyed on its own fields so that
+            // 0.0.9 inherits a transfer URI rather than a buffer one.
+            ResourceTarget::File { transfer_id, .. } => {
+                format!("clasp://session/{session_id}/file/{transfer_id}")
+            }
         };
         let q = &self.query;
         format!(
@@ -489,7 +514,14 @@ pub fn read_resource(
         clasp.insert("truncated_at_tail".into(), json!(true));
     }
     if let Some(next) = read.next_cursor {
-        clasp.insert("next_uri".into(), json!(uri.continuation(next)));
+        // The **resolved** session's id, not the URI's own key: a
+        // name-keyed read continues under the id it resolved to, so the
+        // cursor cannot be replayed against a different session that
+        // has since taken the name.
+        clasp.insert(
+            "next_uri".into(),
+            json!(uri.continuation(&session.id, next)),
+        );
     }
     let has_meta = !clasp.is_empty();
     meta.0
@@ -611,10 +643,19 @@ mod tests {
     /// A registry holding one live `MockPty`-backed session whose buffer
     /// already holds `bytes`.
     fn registry_with_session(bytes: &[u8]) -> (SessionRegistry, Arc<Session>) {
+        registry_with_named_session(None, bytes)
+    }
+
+    /// The same, with §5.5.4's `name` set, so a read can be driven
+    /// through the name-keyed URI shape.
+    fn registry_with_named_session(
+        name: Option<&str>,
+        bytes: &[u8],
+    ) -> (SessionRegistry, Arc<Session>) {
         let pty = Arc::new(MockPty::new());
         let session = Session::new(
             new_session_id(),
-            None,
+            name.map(str::to_string),
             "bash".into(),
             vec![],
             Arc::clone(&pty) as Arc<dyn crate::pty::PtyBackend>,
@@ -700,7 +741,7 @@ mod tests {
             "clasp://session/s/buffer?ansi=raw&text_encoding=base64&redact=false",
         )
         .unwrap();
-        let next = uri.continuation(4096);
+        let next = uri.continuation("s", 4096);
         assert!(next.contains("since_cursor=4096"), "{next}");
         assert!(next.contains("ansi=raw"), "{next}");
         assert!(next.contains("text_encoding=base64"), "{next}");
@@ -712,19 +753,73 @@ mod tests {
         assert!(!reparsed.query.redact);
     }
 
+    /// A name-keyed read continues under the **id** it resolved to.
+    ///
+    /// This test previously asserted the opposite, on the reading that a
+    /// name-keyed continuation protects REQ-R-007's release-on-exit
+    /// rule. It does not: REQ-R-007 governs the *initial* resolution of
+    /// a name, which [`resolve`] still refuses for a dead session.
+    /// Keeping the name in the continuation instead created a
+    /// cross-session read. A name is released on exit and may be reused,
+    /// so an agent that retried `?since_cursor=4096` after `build`
+    /// exited and a new `build` started got the **new** session's bytes
+    /// at an offset that means nothing there, with nothing marking the
+    /// identity change. A cursor is an offset into one buffer.
     #[test]
-    fn a_name_keyed_continuation_stays_name_keyed() {
+    fn a_name_keyed_continuation_switches_to_the_id_it_resolved_to() {
         let uri = ResourceUri::parse("clasp://session-name/build/buffer").unwrap();
-        let next = uri.continuation(10);
-        assert!(
-            next.starts_with("clasp://session-name/build/buffer?"),
-            "{next}"
-        );
+        let next = uri.continuation("sess_9f3a", 10);
         assert_eq!(
             ResourceUri::parse(&next).unwrap().target,
-            ResourceTarget::SessionName("build".into()),
-            "a continuation that silently switched to an id would defeat \
-             REQ-R-007's release-on-exit rule"
+            ResourceTarget::SessionId("sess_9f3a".into()),
+            "the continuation must name the session the bytes came from, not a \
+             name a different session may hold by the time it is followed: {next}"
+        );
+        // The negative that separates "switched keys" from "dropped the
+        // name and kept the shape": a `clasp://session-name/sess_9f3a/`
+        // URI parses as a *name* and would resolve against a live
+        // session called `sess_9f3a`, which is not what was read.
+        assert!(
+            !next.contains("session-name"),
+            "the continuation is id-keyed, not a name that looks like an id: {next}"
+        );
+        // And the cursor still travels, or the switch has cost the
+        // agent its place in the stream.
+        assert_eq!(
+            ResourceUri::parse(&next).unwrap().query.since_cursor,
+            Some(10)
+        );
+    }
+
+    /// The seam the test above cannot see: `read_resource` has to hand
+    /// `continuation` the id of the session it **resolved**, and nothing
+    /// in the type system says it does.
+    ///
+    /// Driven through a name-keyed URI end to end, with a cap small
+    /// enough to force a `next_uri`.
+    #[test]
+    fn a_name_keyed_read_publishes_an_id_keyed_next_uri() {
+        let (registry, session) = registry_with_named_session(Some("build"), b"abcdefghijklmnop");
+        let processor = crate::output::OutputProcessor::builtin().expect("built-in rules compile");
+        let result = read_resource(
+            &registry,
+            &processor,
+            "clasp://session-name/build/buffer?since_cursor=0&redact=false&max_bytes=4",
+            4096,
+        )
+        .expect("a live named session resolves");
+
+        let ResourceContents::TextResourceContents { meta, .. } = &result.contents[0] else {
+            panic!("utf8 travels in `text`")
+        };
+        let next = meta.as_ref().expect("a capped read carries `_meta`").0["clasp"]["next_uri"]
+            .as_str()
+            .expect("§5.5.3's next_uri")
+            .to_string();
+        assert_eq!(
+            ResourceUri::parse(&next).unwrap().target,
+            ResourceTarget::SessionId(session.id.clone()),
+            "the published continuation must key on the resolved session: {next}"
         );
     }
 
