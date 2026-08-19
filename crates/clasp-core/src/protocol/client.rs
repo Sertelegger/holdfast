@@ -5,10 +5,10 @@
 
 use super::frame::{self, FrameError};
 use super::handshake::{self, ClientKind, HandshakeData, HandshakeParams};
-use super::method::{self, CborValue, Request, Response};
+use super::method::{self, CborValue, ErrorCode, Request, Response};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
@@ -40,87 +40,118 @@ pub enum ClientError {
     },
 }
 
-/// One connection to `control.sock`, with the handshake already done.
+/// How many idle connections to keep parked between calls.
 ///
-/// Calls are serialised by an internal mutex. v0.1.0 has no streaming
-/// (§7.4.1 reserves the frames but does not use them), so a single
-/// in-flight request per connection is the whole concurrency model —
-/// and it makes response correlation trivially correct.
+/// Connections are opened on demand and returned here when their call
+/// finishes; a burst of concurrency that leaves more than this many idle
+/// closes the surplus rather than hoarding descriptors for a peak that
+/// may not recur. The sequential case — every CLI subcommand, and an
+/// agent issuing one tool call at a time — never exceeds the one
+/// connection [`ControlClient::connect`] already opened.
+const MAX_IDLE_CONNECTIONS: usize = 8;
+
+/// A set of connections to `control.sock`, each with the handshake
+/// already done, one of which carries each call.
+///
+/// **One connection per *in-flight* call, not per client**, and that is
+/// the whole of the concurrency model. v0.1.0 has no streaming (§7.4.1
+/// reserves the frames but does not use them) and the daemon serves one
+/// request at a time per connection
+/// ([`daemon::server::handle_connection`]), so a call owns its
+/// connection for the round trip. Response correlation stays trivially
+/// correct — a reply arrives on the socket its request went out on, and
+/// `id` is re-checked besides.
+///
+/// [`daemon::server::handle_connection`]: crate::daemon::server
+///
+/// ## Why this is not one connection under a mutex
+///
+/// It was, and holding that mutex across **both** the write and the read
+/// made the whole MCP tool surface serialise behind whichever call was
+/// outstanding. The shim holds one `Arc<ControlClient>` for the process
+/// (`clasp mcp`), so a `wait_for_pattern` — 30 s by default,
+/// [3600 s at the cap](crate::mcp::tools::WAIT_FOR_PATTERN_MAX_TIMEOUT_SECS)
+/// — blocked `interrupt`, `terminate`, `read_output`, `status` and
+/// `list_sessions`, **on every other session**, for its entire duration.
+///
+/// That is not a throughput note. The agent's documented escape from a
+/// wait that will not finish is `interrupt`, and `interrupt` was
+/// precisely the call it could not issue. Under `--no-daemon` the same
+/// tools dispatch concurrently — `rmcp` spawns a task per request — so
+/// the two transports disagreed about whether the escape hatch existed,
+/// on the transport that is the default.
+///
+/// ## The bound, and why it is on *idle* rather than on in-flight
+///
+/// Capping in-flight calls would re-introduce the defect one level
+/// deeper: with a cap of N, the N+1st call blocks, and the N+1st call is
+/// the `interrupt`. So concurrency is bounded by the caller — which for
+/// the shim is `rmcp`'s in-flight request count, exactly the bound the
+/// in-process transport has — and what is capped is how many idle
+/// connections are *kept*. The cost of a burst is one file descriptor
+/// per overlapping call, on a uid-gated local socket driven by a trusted
+/// agent; a descriptor limit reached here surfaces as
+/// [`ClientError::Connect`] on one call rather than as a hang.
 #[derive(Debug)]
 pub struct ControlClient {
-    stream: Mutex<UnixStream>,
+    /// Connections not currently carrying a call.
+    idle: Mutex<Vec<UnixStream>>,
+    /// How to open another one. `None` for a client built by
+    /// [`handshake_on`](ControlClient::handshake_on) on a stream someone
+    /// else connected, which cannot be reopened.
+    dial: Option<Dial>,
     next_id: AtomicU64,
     daemon: HandshakeData,
+}
+
+/// What [`ControlClient`] needs to open a further connection.
+#[derive(Debug)]
+struct Dial {
+    path: PathBuf,
+    kind: ClientKind,
 }
 
 impl ControlClient {
     /// Connect and complete the `clasp/handshake` exchange.
     pub async fn connect(path: &Path, kind: ClientKind) -> Result<Self, ClientError> {
-        let stream = UnixStream::connect(path)
-            .await
-            .map_err(|source| ClientError::Connect {
-                path: path.display().to_string(),
-                source,
-            })?;
-        Self::handshake_on(stream, kind).await
+        let mut stream = dial(path).await?;
+        let daemon = handshake_exchange(&mut stream, kind).await?;
+        Ok(Self {
+            idle: Mutex::new(vec![stream]),
+            dial: Some(Dial {
+                path: path.to_path_buf(),
+                kind,
+            }),
+            next_id: AtomicU64::new(1),
+            daemon,
+        })
     }
 
     /// Handshake over an already-connected stream. Split out so tests can
     /// drive a stand-in daemon over a socket pair.
+    ///
+    /// A client built this way holds exactly the one connection it was
+    /// given: nothing here names a path to reopen, so a caller that
+    /// wants concurrency wants [`connect`](ControlClient::connect).
     pub async fn handshake_on(
         mut stream: UnixStream,
         kind: ClientKind,
     ) -> Result<Self, ClientError> {
-        let params = HandshakeParams::current(kind);
-        let req = Request::new(0, method::METHOD_HANDSHAKE, &params)?;
-        frame::write_frame(&mut stream, &req).await?;
-        let resp: Response = frame::read_frame(&mut stream).await?;
-        if resp.id != 0 {
-            return Err(ClientError::IdMismatch {
-                expected: 0,
-                got: resp.id,
-            });
-        }
-        if let Some(e) = resp.control_error() {
-            return Err(ClientError::Refused(format!("[{}] {}", e.code, e.message)));
-        }
-        let daemon: HandshakeData = resp.data_as()?;
-
-        // Two independent gates (§18.3a). `accepted` is the daemon's own
-        // verdict; the major comparison is ours. A daemon from a
-        // different major that (wrongly) accepted us is still refused
-        // here, so a protocol break can never be papered over by one side
-        // being lenient.
-        //
-        // Both gates are exercised **separately** over a socket, because
-        // a suite that only ever meets a daemon failing both cannot tell
-        // one gate from two:
-        // `the_client_refuses_a_daemon_that_rejects_it_on_a_matching_major`
-        // reaches only the first, and
-        // `the_client_refuses_a_daemon_that_advertises_another_major`
-        // only the second.
-        if !daemon.accepted {
-            return Err(ClientError::Refused(
-                daemon
-                    .reject_reason
-                    .unwrap_or_else(|| "no reason given".into()),
-            ));
-        }
-        if daemon.protocol_major != handshake::PROTOCOL_MAJOR {
-            return Err(ClientError::VersionMismatch {
-                ours: handshake::PROTOCOL_MAJOR,
-                theirs: daemon.protocol_major,
-            });
-        }
-
+        let daemon = handshake_exchange(&mut stream, kind).await?;
         Ok(Self {
-            stream: Mutex::new(stream),
+            idle: Mutex::new(vec![stream]),
+            dial: None,
             next_id: AtomicU64::new(1),
             daemon,
         })
     }
 
     /// What the daemon told us about itself during the handshake.
+    ///
+    /// The first connection's answer. Every later one handshakes against
+    /// the same daemon and is refused outright if it disagrees, so there
+    /// is no reading of this that could go stale without the call that
+    /// opened the connection having already failed.
     pub fn daemon_info(&self) -> &HandshakeData {
         &self.daemon
     }
@@ -134,16 +165,52 @@ impl ControlClient {
             method: method.to_string(),
             params,
         };
-        let mut stream = self.stream.lock().await;
-        frame::write_frame(&mut *stream, &req).await?;
-        let resp: Response = frame::read_frame(&mut *stream).await?;
-        if resp.id != id {
-            return Err(ClientError::IdMismatch {
-                expected: id,
-                got: resp.id,
-            });
+
+        // The connection is checked out for the round trip and nothing
+        // else is held — no lock spans the `await`s below, which is the
+        // entire point of the change.
+        let mut stream = self.checkout().await?;
+        let resp = exchange(&mut stream, &req, id).await;
+        if reusable(&resp) {
+            self.checkin(stream).await;
         }
-        Ok(resp)
+        resp
+    }
+
+    /// A connection ready to carry one call: a parked one if there is
+    /// one, otherwise a new one, handshake included.
+    async fn checkout(&self) -> Result<UnixStream, ClientError> {
+        // Bound the guard to this statement. Holding it across the dial
+        // below would serialise exactly what this function exists to
+        // stop serialising.
+        let parked = self.idle.lock().await.pop();
+        if let Some(stream) = parked {
+            return Ok(stream);
+        }
+        let Some(d) = &self.dial else {
+            return Err(ClientError::Connect {
+                path: "the caller-supplied stream this client was built on".into(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "that connection is gone and this client cannot open another",
+                ),
+            });
+        };
+        let mut stream = dial(&d.path).await?;
+        // Every connection handshakes for itself. A daemon replaced
+        // mid-session by one from another protocol major refuses here,
+        // on the call that opened the connection, rather than being
+        // papered over by the first connection's verdict.
+        handshake_exchange(&mut stream, d.kind).await?;
+        Ok(stream)
+    }
+
+    /// Park a connection for the next call, or let it close.
+    async fn checkin(&self, stream: UnixStream) {
+        let mut idle = self.idle.lock().await;
+        if idle.len() < MAX_IDLE_CONNECTIONS {
+            idle.push(stream);
+        }
     }
 
     /// Typed call: serialise params, deserialise data, and turn an error
@@ -164,6 +231,114 @@ impl ControlClient {
         }
         Ok(resp.data_as()?)
     }
+}
+
+async fn dial(path: &Path) -> Result<UnixStream, ClientError> {
+    UnixStream::connect(path)
+        .await
+        .map_err(|source| ClientError::Connect {
+            path: path.display().to_string(),
+            source,
+        })
+}
+
+/// One request/response round trip on a connection nobody else holds.
+async fn exchange(
+    stream: &mut UnixStream,
+    req: &Request,
+    id: u64,
+) -> Result<Response, ClientError> {
+    frame::write_frame(stream, req).await?;
+    let resp: Response = frame::read_frame(stream).await?;
+    // Belt and braces now that correlation is also structural: a reply
+    // arrives on the socket its request left on, and it must still carry
+    // the id that request had.
+    if resp.id != id {
+        return Err(ClientError::IdMismatch {
+            expected: id,
+            got: resp.id,
+        });
+    }
+    Ok(resp)
+}
+
+/// Whether the connection that produced this outcome can carry another
+/// call.
+///
+/// Two ways it cannot. A transport fault leaves the stream at an unknown
+/// offset — half a frame may be written, or a length prefix read without
+/// its body — and re-using it would desynchronise every later call on
+/// it. And §18.3's `closes_connection()` codes are the ones the daemon
+/// answers and then hangs up on (`handle_connection`), so parking that
+/// stream would hand a later call a socket already at EOF.
+///
+/// The remaining case is `daemon/stop`, which the daemon answers `ok`
+/// and then closes. It is deliberately not special-cased here: teaching
+/// this function one method's semantics would put the daemon's shutdown
+/// rule in two places, and the only caller that issues it —
+/// `clasp daemon stop` — drops the client immediately afterwards.
+fn reusable(outcome: &Result<Response, ClientError>) -> bool {
+    match outcome {
+        Err(_) => false,
+        Ok(resp) => !resp
+            .control_error()
+            .and_then(|e| ErrorCode::from_wire(&e.code))
+            .is_some_and(|code| code.closes_connection()),
+    }
+}
+
+/// The `clasp/handshake` exchange, and both of §18.3a's gates.
+///
+/// A free function because **every** connection performs it, not just
+/// the first: it is what a pooled connection must do before it may carry
+/// a call, and having it inside `handshake_on` meant the only way to
+/// perform it was to build a whole client around it.
+async fn handshake_exchange(
+    stream: &mut UnixStream,
+    kind: ClientKind,
+) -> Result<HandshakeData, ClientError> {
+    let params = HandshakeParams::current(kind);
+    let req = Request::new(0, method::METHOD_HANDSHAKE, &params)?;
+    frame::write_frame(stream, &req).await?;
+    let resp: Response = frame::read_frame(stream).await?;
+    if resp.id != 0 {
+        return Err(ClientError::IdMismatch {
+            expected: 0,
+            got: resp.id,
+        });
+    }
+    if let Some(e) = resp.control_error() {
+        return Err(ClientError::Refused(format!("[{}] {}", e.code, e.message)));
+    }
+    let daemon: HandshakeData = resp.data_as()?;
+
+    // Two independent gates (§18.3a). `accepted` is the daemon's own
+    // verdict; the major comparison is ours. A daemon from a different
+    // major that (wrongly) accepted us is still refused here, so a
+    // protocol break can never be papered over by one side being
+    // lenient.
+    //
+    // Both gates are exercised **separately** over a socket, because a
+    // suite that only ever meets a daemon failing both cannot tell one
+    // gate from two:
+    // `the_client_refuses_a_daemon_that_rejects_it_on_a_matching_major`
+    // reaches only the first, and
+    // `the_client_refuses_a_daemon_that_advertises_another_major`
+    // only the second.
+    if !daemon.accepted {
+        return Err(ClientError::Refused(
+            daemon
+                .reject_reason
+                .unwrap_or_else(|| "no reason given".into()),
+        ));
+    }
+    if daemon.protocol_major != handshake::PROTOCOL_MAJOR {
+        return Err(ClientError::VersionMismatch {
+            ours: handshake::PROTOCOL_MAJOR,
+            theirs: daemon.protocol_major,
+        });
+    }
+    Ok(daemon)
 }
 
 impl ClientError {
@@ -195,6 +370,11 @@ impl ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::method::CborValue;
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     /// Everything this client does over a socket is tested in
     /// `tests/control_protocol.rs`, against a real daemon — a unit test
@@ -203,6 +383,15 @@ mod tests {
     /// the error enum, and 0.0.5 has no reconnecting caller to exercise
     /// them, so without a test here they ship unasserted (see **Notes
     /// for the next milestone**: they are hooks 0.0.11's shim uses).
+    ///
+    /// The concurrency row at the bottom is the other exception, and for
+    /// the opposite reason: what it asserts is a property of *this*
+    /// type — that one call does not wait on another — and the only
+    /// thing it needs from the far end is that a request go
+    /// unanswered. A real daemon can supply that only by really waiting
+    /// 30 s, and the arrival of the first request has to be observed
+    /// exactly rather than slept for, or the row passes against the
+    /// defect whenever the second call happens to reach the wire first.
     fn connect_error() -> ClientError {
         ClientError::Connect {
             path: "/tmp/nope/control.sock".into(),
@@ -273,5 +462,202 @@ mod tests {
         assert!(!ClientError::Refused("attach session is read-only".into()).is_version_mismatch());
         assert!(!connect_error().is_version_mismatch());
         assert!(!method_error(true).is_version_mismatch());
+    }
+
+    // ------------------------------------- one call per connection (C-3)
+
+    /// A `/tmp` path short enough for `sockaddr_un.sun_path`.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        PathBuf::from(format!("/tmp/clasp-t-client-{tag}-{}", &unique[..8]))
+    }
+
+    struct Scoped(PathBuf);
+    impl Drop for Scoped {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn no_params() -> CborValue {
+        CborValue::Map(Vec::new())
+    }
+
+    /// Answer `clasp/handshake` as an accepting daemon of this build.
+    async fn accept_handshake(stream: &mut UnixStream) {
+        let req: Request = frame::read_frame(stream).await.expect("a handshake first");
+        let data = HandshakeData {
+            protocol_major: handshake::PROTOCOL_MAJOR,
+            protocol_minor: handshake::PROTOCOL_MINOR,
+            daemon_version: "stand-in".into(),
+            build: "stand-in".into(),
+            accepted: true,
+            reject_reason: None,
+        };
+        let resp = Response::ok(req.id, &data, "handshake accepted").unwrap();
+        frame::write_frame(stream, &resp).await.unwrap();
+    }
+
+    /// **Imp C-3.** A call must not wait on another call outstanding on
+    /// the same client.
+    ///
+    /// The shim holds one `Arc<ControlClient>` for the whole process
+    /// (`clasp mcp`), so while `call_raw` held one mutex across both the
+    /// write and the read, a `wait_for_pattern` — 30 s by default, 3600 s
+    /// at the cap — blocked `interrupt`, `terminate`, `read_output`,
+    /// `status` and `list_sessions`, **on every other session**, for its
+    /// whole duration. The agent's documented escape from a wait that
+    /// will not finish is `interrupt`, and `interrupt` was exactly the
+    /// call it could not issue. Under `--no-daemon` the same tools
+    /// dispatch concurrently, so the two transports disagreed about
+    /// whether the escape hatch existed.
+    ///
+    /// **The premise is observed, not slept for.** `started_rx` fires
+    /// only once the stand-in has read the first request off the wire, so
+    /// the first call is provably in flight before the second is issued.
+    /// Without that, a second call that happened to reach the mutex first
+    /// would pass against the very defect this row exists to catch —
+    /// `tokio::sync::Mutex::lock` on an uncontended mutex need not yield.
+    ///
+    /// **The timeout is a red test, not a hang.** Every failure here is
+    /// something that does not return, and there is no `nextest.toml` in
+    /// this repo to turn an unbounded wait into anything but a hung CI
+    /// job — so the elapsed arm is `expect`ed, never matched as success.
+    #[tokio::test]
+    async fn a_call_proceeds_while_another_is_outstanding_on_the_same_client() {
+        let dir = scratch_dir("concurrent");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let listen_at = sock.clone();
+        tokio::spawn(async move {
+            let listener = tokio::net::UnixListener::bind(&listen_at).unwrap();
+
+            // The first connection takes one request and never answers
+            // it. `held` stays in scope for the life of this task on
+            // purpose: dropping it would EOF the client's read, the
+            // "outstanding" call would complete, and the row would pass
+            // against the defect.
+            let (mut held, _) = listener.accept().await.unwrap();
+            accept_handshake(&mut held).await;
+            let _outstanding: Request = frame::read_frame(&mut held).await.unwrap();
+            let _ = started_tx.send(());
+
+            // Every later connection is answered immediately. There is
+            // no second connection to accept unless the client opened
+            // one, which is the whole question.
+            loop {
+                let (mut next, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    accept_handshake(&mut next).await;
+                    while let Ok(req) = frame::read_frame::<_, Request>(&mut next).await {
+                        let resp =
+                            Response::ok(req.id, &json!({ "delivered": true }), "ok").unwrap();
+                        if frame::write_frame(&mut next, &resp).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break Arc::new(c),
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+
+        let outstanding = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.call_raw("tool/wait_for_pattern", no_params()).await })
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("the stand-in never received the first request")
+            .expect("the stand-in dropped the channel");
+
+        let escape = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_raw("tool/interrupt", no_params()),
+        )
+        .await
+        .expect(
+            "an outstanding wait blocked the interrupt that is the documented way \
+             out of it — one client serialised the entire tool surface, on every \
+             session, for the wait's whole duration",
+        )
+        .expect("the stand-in answered the second call");
+        assert_eq!(escape.status, "ok");
+
+        // The two really did overlap. Without this the row would also
+        // pass against a client that simply queued the second call
+        // behind the first and got lucky with the timings.
+        assert!(
+            !outstanding.is_finished(),
+            "the first call completed, so the second never overtook anything"
+        );
+    }
+
+    /// The pairing: a client that opened a *fresh* connection for every
+    /// call would satisfy the row above and leak a descriptor per tool
+    /// call for the life of the shim.
+    ///
+    /// Sequential calls must reuse the one connection `connect` already
+    /// opened — which is also what keeps every CLI subcommand, and an
+    /// agent working one tool call at a time, byte-identical to the
+    /// single-connection client this replaced.
+    #[tokio::test]
+    async fn sequential_calls_reuse_one_connection() {
+        let dir = scratch_dir("reuse");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+
+        let (count_tx, count_rx) = std::sync::mpsc::channel();
+        let listen_at = sock.clone();
+        tokio::spawn(async move {
+            let listener = tokio::net::UnixListener::bind(&listen_at).unwrap();
+            loop {
+                let (mut next, _) = listener.accept().await.unwrap();
+                count_tx.send(()).unwrap();
+                tokio::spawn(async move {
+                    accept_handshake(&mut next).await;
+                    while let Ok(req) = frame::read_frame::<_, Request>(&mut next).await {
+                        let resp = Response::ok(req.id, &json!({}), "ok").unwrap();
+                        if frame::write_frame(&mut next, &resp).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        for _ in 0..5 {
+            let resp = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.call_raw("tool/status", no_params()),
+            )
+            .await
+            .expect("a sequential call did not come back")
+            .expect("the stand-in answered");
+            assert_eq!(resp.status, "ok");
+        }
+
+        assert_eq!(
+            count_rx.try_iter().count(),
+            1,
+            "five sequential calls opened more than the one connection `connect` \
+             made: a connection per call leaks a descriptor per tool call"
+        );
     }
 }
