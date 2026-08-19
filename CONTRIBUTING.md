@@ -80,11 +80,12 @@ suites are *supposed* to be slow. `tests/screen.rs` and
 window and a 3 s stress run), so a materially faster result there means the
 scenario did not happen, not that the machine is quick.
 
-`scripts/mcp-smoke.sh` (38 checks — the script counts and prints its own
-total at the end of every run, `SMOKE OK (N checks)` or `SMOKE FAILED: F of N
-check(s) did not pass`, so this number is easy to re-verify and does not have
-to be taken on trust) is **the only thing that drives the real JSON-RPC
-surface**. Every Rust test asserts against in-process objects, so a
+`scripts/mcp-smoke.sh` (the script counts and prints its own total at the end
+of every run, `SMOKE OK (N checks)` or `SMOKE FAILED: F of N check(s) did not
+pass`, and **that printed total is the only place the number lives** — a
+literal copied into this paragraph went stale five times and nothing went red
+when it did, so it is not written here any more) is **the only thing that
+drives the real JSON-RPC surface**. Every Rust test asserts against in-process objects, so a
 bug that lives in serialisation — a tool whose `outputSchema` never reaches the
 wire, a doc comment the router drops, an enum serialised outside its declared
 vocabulary — is invisible to all of them and visible only here. Run it after
@@ -114,13 +115,32 @@ matched the PTY's echo of their own command line, and so passed against a
 session running `sleep 300` instead of a shell. The recurring class has a name
 here: **a test whose assertion is weaker than its name.**
 
-The smoke script is held to the same standard: it fails all 38 of its checks
-when pointed at `/bin/true`, so the script itself is known to be capable of
-failing. That is a check you can run, not a claim to take on trust —
-`./scripts/mcp-smoke.sh /bin/true` must report `SMOKE FAILED: 38 of 38
-check(s) did not pass`, and an `F of N` where `F` is less than `N`, or an `N`
-lower than the passing run's `SMOKE OK (N checks)`, is a check that went
-green against a server that never started.
+The smoke script is held to the same standard: **every check it counts fails
+when it is pointed at `/bin/true`**, so the script itself is known to be
+capable of failing. That is a check you can run, not a claim to take on trust —
+`./scripts/mcp-smoke.sh /bin/true` must report `SMOKE FAILED: N of N check(s)
+did not pass` with the same `N` the passing run prints, and an `F of N` where
+`F` is less than `N`, or an `N` lower than the passing run's `SMOKE OK (N
+checks)`, is a check that went green against a server that never started.
+
+**The invariant is `F == N`, and it carries no number on purpose.** Stating it
+as "all 38" made it a fact about a count, and the count moved five times
+without the sentence moving with it — 0.0.6 shipped 47 checks of which four
+stayed green against `/bin/true` while this paragraph still said 38. `F == N`
+is true of any number of checks, so adding a check cannot make it stale.
+Two consequences when you add one:
+
+- **A check that asserts the script's own setup is a precondition, not a
+  check.** It cannot fail under any server, so counting it makes `F == N`
+  false by construction. Make it an `exit`, the way the
+  `HOLDFAST_RUNTIME_DIR` guard in the 0.0.6 phase is.
+- **A check that drives a `holdfast` subcommand other than `mcp` is still
+  substituted** — `$BIN` is the whole binary, so `/bin/true attach …` runs
+  in place of the real client. Asserting only its exit status is degenerate,
+  because `/bin/true` exits 0. Pair it with output only a live run can
+  produce, exactly as `absent` takes a witness.
+
+CI runs the negative control, so this is enforced rather than remembered.
 
 ### 2. Pair every positive assertion with the negative that separates it from the degenerate case
 

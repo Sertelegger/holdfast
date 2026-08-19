@@ -45,8 +45,19 @@ set -uo pipefail
 # Only on the default path. An explicit argument names a binary the
 # caller has already produced -- CI passes `./target/release/holdfast` after
 # its own `cargo build --release`, and `./scripts/mcp-smoke.sh /bin/true`
-# is the negative control that must fail all 38 checks -- so building in
-# that case would either be wrong or a no-op.
+# is the negative control, which must fail EVERY check it counts -- so
+# building in that case would either be wrong or a no-op.
+#
+# **No number in that sentence, on purpose.** It used to read "all 38
+# checks", and that literal went stale five times without anything going
+# red -- most recently at 0.0.6, which shipped 47 checks of which four
+# stayed green against `/bin/true` while the prose still said 38. Stating
+# the invariant as `F == N` retires the number rather than refreshing it:
+# both sides come from the run that just happened, so the claim cannot go
+# stale when a check is added, and a check that stays green against a
+# binary that does nothing is a check that cannot fail. CI runs this
+# control (`.github/workflows/ci.yml`), so it is a check and not a
+# sentence.
 if [ "$#" -eq 0 ]; then
   if ! cargo build --workspace >&2; then
     echo "mcp-smoke: cargo build --workspace failed; nothing to smoke" >&2
@@ -323,10 +334,12 @@ jcheck "initialize advertises the tools capability" \
 # `.capabilities.resources.listChanged` on a wholly *absent*
 # `capabilities.resources` is also `null` in jq, so the listChanged half
 # passed against a server that never started -- against `/bin/true` it
-# was the one check in this file (of 39) that stayed green. Anding
+# was the one check in this file that stayed green. Anding
 # `resources != null` back in closes it, because that clause is false in
 # exactly the case that let the other one through, and the pair also
-# collapses two `jcheck`s into one, which is why the total below is 38.
+# collapses two `jcheck`s into one. (The count this comment used to quote
+# is gone on purpose; see the header. The script prints its own total, and
+# a literal here was one of the five that went stale.)
 #
 # This check read `.listChanged == true` at one point and was green for
 # the wrong reason: it asserted the advertisement, and nothing anywhere
@@ -634,23 +647,35 @@ check_eq() { # check_eq <description> <actual> <expected>
 echo
 echo "-- 0.0.6 attach socket"
 
-# Fail loudly rather than silently skipping: if 0.0.5 Task 13 Step 4b did not
-# land, this whole phase would otherwise assert against the invoking user's
-# real daemon.
-total=$((total + 1))
+# A PRECONDITION, and deliberately not a counted check. It asserts this
+# script's own setup -- line 106 exports the variable unconditionally, before
+# anything has run -- so no server, stub or real, can make it fail. Counted, it
+# was a row that could not go red, which is the one thing rule 2 above forbids
+# and the defect class this whole file exists to stop.
+#
+# Exiting is also the stronger response. With the variable unset, every
+# assertion below would silently retarget the invoking user's real daemon, and
+# one red row inside a run that keeps going is not enough to stop that.
 if [ -z "${HOLDFAST_RUNTIME_DIR:-}" ]; then
-  echo "  FAIL  HOLDFAST_RUNTIME_DIR is unset -- 0.0.5 Task 13 Step 4b did not land"
-  fails=$((fails + 1))
-else
-  echo "  ok    HOLDFAST_RUNTIME_DIR is set, so this phase is isolated"
+  echo "mcp-smoke: HOLDFAST_RUNTIME_DIR is unset -- 0.0.5 Task 13 Step 4b did not land," >&2
+  echo "           so this phase would assert against your real daemon. Refusing." >&2
+  exit 1
 fi
 
-check_eq "attach.sock is bound" \
-  "$(test -S "$HOLDFAST_RUNTIME_DIR/attach.sock" && echo yes || echo no)" "yes"
+# **One check over both sockets, because either half alone is degenerate.**
+# `http.sock is not bound` is an absence, and an absence is satisfied by a
+# directory in which nothing ever happened -- against `/bin/true` it passed
+# for exactly that reason, joining the `listChanged` clause and the bare
+# `warning: null` as the third assertion in this file to go green on an empty
+# transcript. The witness rule at `absent` above is the fix and it is the same
+# fix: pair the negative with a positive that only a live daemon produces.
+# Anding them also makes the row say the thing 0.0.10 will change -- *this
+# daemon speaks unix and not tcp* -- rather than "no file appeared".
+check_eq "the daemon binds attach.sock and not http.sock (0.0.10)" \
+  "$(test -S "$HOLDFAST_RUNTIME_DIR/attach.sock" && echo yes || echo no)/$(test -e "$HOLDFAST_RUNTIME_DIR/http.sock" && echo yes || echo no)" \
+  "yes/no"
 check_eq "attach.sock is 0600" \
   "$(stat -c '%a' "$HOLDFAST_RUNTIME_DIR/attach.sock" 2>/dev/null)" "600"
-check_eq "http.sock is not bound (0.0.10)" \
-  "$(test -e "$HOLDFAST_RUNTIME_DIR/http.sock" && echo yes || echo no)" "no"
 
 # A real session, created the only way this binary can create one, attached
 # by the real client and detached by the real key sequence. The session is
@@ -670,8 +695,36 @@ check_eq "the session outlives the shim that created it" \
 # `attach` needs a tty for raw mode, so `script` gives it one: without it
 # the client exits non-zero and the session-count check below would still
 # pass, which is why both checks are here.
-printf '\002d' | timeout 5 script -qefc "$BIN attach smokeattach" /dev/null >/dev/null 2>&1
-check_eq "holdfast attach exits 0 on the detach key" "$?" "0"
+#
+# **The keystrokes are a round trip and not just the detach key, because
+# `"$?" = "0"` on its own is a degenerate assertion.** `$BIN` is what the
+# negative control replaces, and `/bin/true attach smokeattach` exits 0 --
+# so this row stayed green against a binary that does nothing, which is the
+# same defect as the unwitnessed absence above and gets the same repair.
+# The witness is output that only a real client attached to a real session
+# can have rendered. `SMOKE''ATTACH` reads differently typed and printed,
+# so matching `SMOKEATTACH` proves the *shell* produced it rather than the
+# tty echoing the request back -- the `SMOKE_$((6*7))` idiom from the main
+# transcript, in the one place a shell quote survives to the pty.
+#
+# `\r` and not `\n`: this goes through `script`'s pty into a client in raw
+# mode, so it is the byte a human's Enter key produces, and the session's
+# own line discipline is what turns it into a newline.
+ATTACH_OUT="$(
+  {
+    printf "echo SMOKE''ATTACH\r"
+    sleep 2
+    printf '\002d'
+    sleep 1
+  } | timeout 20 script -qefc "$BIN attach smokeattach" /dev/null 2>/dev/null
+)"
+ATTACH_STATUS=$?
+# `case` and not `grep -q`: under `pipefail` a `grep -q` that matches early
+# can leave the pipeline reporting its producer's SIGPIPE (141), which this
+# file already documents as a way to fail for the wrong reason.
+case "$ATTACH_OUT" in *SMOKEATTACH*) ATTACH_SAW=yes ;; *) ATTACH_SAW=no ;; esac
+check_eq "holdfast attach renders live output and exits 0 on the detach key" \
+  "$ATTACH_SAW/$ATTACH_STATUS" "yes/0"
 check_eq "the session survives the detach" \
   "$("$BIN" list | grep -c 'smokeattach')" "1"
 
@@ -686,12 +739,34 @@ check_eq "the session survives the detach" \
 # and `wait`ing reports the child's own status, which is the thing under
 # test: `0` for a clean detach, `130` (128 + SIGINT) for a client that
 # never installed a handler and died of the default disposition.
-"$BIN" watch smokeattach >/dev/null 2>&1 &
+#
+# **And, for the same reason as `attach` above, the exit status is not
+# asserted alone.** `/bin/true watch smokeattach` exits 0 and `wait`
+# reports that 0, so the status by itself is green against a binary that
+# does nothing. The witness is the session's output arriving at the
+# watcher: `watch` does no replay (§4.3), so something has to happen
+# *while it is attached*, and a third short `holdfast mcp` transcript
+# supplies it the same way the session was created above. That also makes
+# this the only place the broadcast reaches a second, read-only CLI client.
+WATCH_LOG="$HOLDFAST_RUNTIME_DIR/watch.out"
+"$BIN" watch smokeattach >"$WATCH_LOG" 2>/dev/null &
 WATCH_PID=$!
 sleep 1
+{
+  req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-watch","version":"0"}}}'
+  req '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  req '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_input","arguments":{"session":"smokeattach","data":"echo WATCHMARK"}}}'
+  sleep 2
+} | "$BIN" mcp >/dev/null 2>&1
 kill -INT "$WATCH_PID" 2>/dev/null
 wait "$WATCH_PID"
-check_eq "holdfast watch exits 0 on SIGINT" "$?" "0"
+WATCH_STATUS=$?
+case "$(cat "$WATCH_LOG" 2>/dev/null)" in
+  *WATCHMARK*) WATCH_SAW=yes ;;
+  *) WATCH_SAW=no ;;
+esac
+check_eq "holdfast watch renders the session and exits 0 on SIGINT" \
+  "$WATCH_SAW/$WATCH_STATUS" "yes/0"
 check_eq "the session survives the watcher" \
   "$("$BIN" list | grep -c 'smokeattach')" "1"
 

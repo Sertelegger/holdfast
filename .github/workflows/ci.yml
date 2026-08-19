@@ -310,6 +310,33 @@ jobs:
       # The same smoke script, against the binary that will actually be
       # installed. `jq` is preinstalled on ubuntu-24.04 (1.7.1).
       - run: ./scripts/mcp-smoke.sh ./target/release/holdfast
+      # And the negative control, which is what makes the run above mean
+      # something. CONTRIBUTING.md has claimed since 0.0.1 that every
+      # counted check fails against a binary that does nothing, and
+      # nothing ever ran it: 0.0.6 shipped four checks that stayed green
+      # against `/bin/true` and all four gates were still green, because
+      # "a check you can run" is not a check.
+      #
+      # Inverted on purpose -- here a PASSING smoke run is the failure --
+      # and `F == N` rather than a literal, so adding a check cannot make
+      # this step stale. Needs no build: `/bin/true` is the binary.
+      - name: mcp-smoke negative control (every counted check must fail)
+        run: |
+          if ./scripts/mcp-smoke.sh /bin/true > negative-control.txt 2>&1; then
+            echo "the negative control PASSED: some counted check does not depend on the server" >&2
+            cat negative-control.txt >&2
+            exit 1
+          fi
+          line="$(grep '^SMOKE FAILED:' negative-control.txt || true)"
+          f="$(printf '%s\n' "$line" | sed -n 's/^SMOKE FAILED: \([0-9]*\) of [0-9]* .*/\1/p')"
+          n="$(printf '%s\n' "$line" | sed -n 's/^SMOKE FAILED: [0-9]* of \([0-9]*\) .*/\1/p')"
+          if [ -z "$f" ] || [ "$f" != "$n" ]; then
+            echo "expected every counted check to fail against /bin/true, got: ${line:-<no SMOKE FAILED line>}" >&2
+            grep '^  ok ' negative-control.txt >&2 || true
+            exit 1
+          fi
+          echo "negative control: $f of $n checks failed, as required"
+          rm -f negative-control.txt
       - run: sha256sum target/release/holdfast | tee holdfast-linux-x86_64.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

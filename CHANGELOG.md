@@ -49,6 +49,25 @@ upcoming work live in [ROADMAP.md](./ROADMAP.md).
   `sess_` session-id prefix, every MCP tool name, and the GitHub repository
   slug.
 
+### Fixed
+
+- **Four smoke checks passed against a server that never started, and 0.0.5's
+  fix for the same class did not hold.** 0.0.5 recorded that "the script now
+  reports its own check count, so the number in the documentation cannot drift
+  away from it again". It drifted again immediately: reporting the total does
+  nothing about the *transcribed* copies, and the attach phase shipped 47
+  checks while the script's own header and `CONTRIBUTING.md` both still said
+  38. The four survivors were three different defects — one row asserted the
+  script's own setup and could not fail under any server; one asserted the
+  *absence* of `http.sock`, which an empty directory satisfies; and two
+  asserted only that `holdfast attach` / `holdfast watch` exited 0, which
+  `/bin/true` also does. Each is repaired in kind: a precondition became an
+  `exit`, the absence gained the positive that witnesses it, and the two client
+  rows now assert output only a live session can have produced. The durable
+  part is that **the invariant no longer carries a number** — it is `F == N`,
+  which no added check can make stale — and that CI now runs the negative
+  control instead of a sentence claiming someone could.
+
 ## [0.0.5] — 2026-08-19
 
 **The first tagged release.** Until now the workspace version sat at `0.0.2`
