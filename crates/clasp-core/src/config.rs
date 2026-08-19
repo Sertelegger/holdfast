@@ -44,6 +44,19 @@ use serde::Deserialize;
 use crate::detect::{PromptPattern, MAX_EXTRA_PATTERNS};
 
 /// Everything that can go wrong turning a file into a [`Config`].
+///
+/// **Every message in here has already been through the redactor.** A
+/// config file is a place credentials live, and every one of these
+/// errors is on a path that ends in `daemon.log`: `config::load()?` →
+/// `server::run`'s `Err` → `clasp daemon run`'s `eprintln!` → the child
+/// stderr `spawn.rs` redirects into the log, where it sits for the
+/// §19.1 retention window. §9.2 lists *"daemon.log error contexts (when
+/// they include byte excerpts)"* among the boundaries that route through
+/// the redactor, and this module is one of the producers that owes it.
+///
+/// Construct through [`ConfigError::invalid`] and [`ConfigError::parse`]
+/// rather than by naming the variants — those are where [`redacted`]
+/// runs, and a message assembled anywhere else is one nothing redacts.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("config file {path} could not be read: {source}")]
@@ -54,16 +67,59 @@ pub enum ConfigError {
     },
     /// Includes the unknown-key case: `toml`'s `deny_unknown_fields`
     /// message names the offending key, which is §10.1's contract.
-    #[error("config file {path} is not valid: {source}")]
-    Parse {
-        path: PathBuf,
-        #[source]
-        source: toml::de::Error,
-    },
+    ///
+    /// **The `toml::de::Error` is rendered, redacted, and then dropped
+    /// — deliberately, and it must stay dropped.** Its `Display` is a
+    /// caret diagram containing the offending *line*, so
+    /// `api_token = "ghp_…"` under `[security]` — an unmodelled key,
+    /// which `deny_unknown_fields` makes an error by construction —
+    /// renders the credential verbatim. Keeping the error as a
+    /// `#[source]` beside a redacted `Display` would not help: a caller
+    /// that walks the chain, or one `{:#}` in a future logging crate,
+    /// puts the raw rendering back on the same path. There is no second
+    /// copy to walk to.
+    ///
+    /// The carets are counted against the *unredacted* line and so no
+    /// longer line up under a redacted one. That is cosmetic; the line
+    /// number, the key and the expected-key list all survive, which is
+    /// what §10.1 asks the message to carry.
+    #[error("config file {path} is not valid: {message}")]
+    Parse { path: PathBuf, message: String },
     /// A file that parsed and then failed a semantic rule. The message
-    /// always names the key and the value (§10.1, REQ-CFG-003).
+    /// always names the key and the value (§10.1, REQ-CFG-003) — and the
+    /// value is operator-supplied, so it is redacted like any other.
     #[error("invalid configuration: {0}")]
     Invalid(String),
+}
+
+impl ConfigError {
+    /// A validation failure, with the operator's value redacted.
+    fn invalid(message: impl AsRef<str>) -> Self {
+        ConfigError::Invalid(redacted(message.as_ref()))
+    }
+
+    /// A parse failure, with the offending source line redacted.
+    fn parse(path: &Path, source: &toml::de::Error) -> Self {
+        ConfigError::Parse {
+            path: path.to_path_buf(),
+            message: redacted(&source.to_string()),
+        }
+    }
+}
+
+/// Put a diagnostic through the §9.2 redactor before it can become a
+/// [`ConfigError`].
+///
+/// The same built-in rule set every other output boundary uses, taken
+/// from the same process-wide table rather than compiled per error, so a
+/// rule that redacts a token in `read_output` redacts it here too. A
+/// secret whose shape no rule matches still gets through — that is the
+/// standing limit of pattern redaction and it is not specific to this
+/// module — but the vendor tokens and the `…token = "…"` /
+/// `…password = "…"` assignment shapes that dominate a config file do
+/// not.
+fn redacted(message: &str) -> String {
+    crate::output::redact::redact_str(&crate::output::rules::builtin_shared(), message)
 }
 
 // ------------------------------------------------------------ discovery
@@ -127,10 +183,8 @@ pub fn parse_str(text: &str) -> Result<Config, ConfigError> {
 }
 
 fn parse_named(text: &str, path: &Path) -> Result<Config, ConfigError> {
-    let config: Config = toml::from_str(text).map_err(|source| ConfigError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let config: Config =
+        toml::from_str(text).map_err(|source| ConfigError::parse(path, &source))?;
     config.validate()?;
     Ok(config)
 }
@@ -724,7 +778,7 @@ impl Config {
         )?;
 
         if l.read_output_default_max_bytes > l.read_output_hard_max_bytes {
-            return Err(ConfigError::Invalid(format!(
+            return Err(ConfigError::invalid(format!(
                 "limits.read_output_default_max_bytes = {} exceeds \
                  limits.read_output_hard_max_bytes = {}",
                 l.read_output_default_max_bytes, l.read_output_hard_max_bytes
@@ -737,7 +791,7 @@ impl Config {
         // a named config fault rather than an error the operator has to
         // trace back to a key.
         if self.prompts.extra_patterns.len() > MAX_EXTRA_PATTERNS {
-            return Err(ConfigError::Invalid(format!(
+            return Err(ConfigError::invalid(format!(
                 "prompts.extra_patterns has {} entries; at most {MAX_EXTRA_PATTERNS} are accepted",
                 self.prompts.extra_patterns.len()
             )));
@@ -789,7 +843,7 @@ impl Config {
         let known: BTreeSet<&str> = NOTIFICATION_EVENT_KINDS.iter().copied().collect();
         for kind in &self.notifications.events {
             if !known.contains(kind.as_str()) {
-                return Err(ConfigError::Invalid(format!(
+                return Err(ConfigError::invalid(format!(
                     "notifications.events contains `{kind}`, which is not one of {}",
                     NOTIFICATION_EVENT_KINDS.join(", ")
                 )));
@@ -815,15 +869,13 @@ impl Config {
 
         for adapter in &self.adapters {
             if adapter.name.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "adapters[].name must not be empty".into(),
-                ));
+                return Err(ConfigError::invalid("adapters[].name must not be empty"));
             }
         }
         for binding in &self.security.secret_bindings {
             if binding.name.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "security.secret_bindings[].name must not be empty".into(),
+                return Err(ConfigError::invalid(
+                    "security.secret_bindings[].name must not be empty",
                 ));
             }
         }
@@ -866,7 +918,7 @@ impl Config {
 
 fn nonzero(key: &str, value: usize) -> Result<(), ConfigError> {
     if value == 0 {
-        return Err(ConfigError::Invalid(format!(
+        return Err(ConfigError::invalid(format!(
             "{key} = 0, but zero is meaningless for this limit"
         )));
     }
@@ -875,7 +927,7 @@ fn nonzero(key: &str, value: usize) -> Result<(), ConfigError> {
 
 fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<(), ConfigError> {
     if !allowed.contains(&value) {
-        return Err(ConfigError::Invalid(format!(
+        return Err(ConfigError::invalid(format!(
             "{key} = \"{value}\", which is not one of {}",
             allowed.join(", ")
         )));
@@ -1395,5 +1447,69 @@ require_confirm = false
             Config::default().processing_limits().lookbehind_bytes,
             crate::output::ProcessingLimits::default().lookbehind_bytes
         );
+    }
+
+    // -------------------------------------------- §9.2 on the error path
+
+    /// A credential in the shape `data/redaction_default.toml`'s own
+    /// `github-token` positive example uses. Not a live token.
+    const CREDENTIAL: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+
+    /// Nothing an operator typed into `config.toml` reaches a diagnostic
+    /// unredacted — on **either** path a bad config can take.
+    ///
+    /// The shape rather than the finding. I-1 was reported against the
+    /// parse path, where `toml`'s caret diagram renders the whole
+    /// offending line; the validation path is the same disclosure with a
+    /// different producer, because §10.1 has those messages name the
+    /// value on purpose. A row asserting only that the error is
+    /// non-empty, or only that it names the key, passes against exactly
+    /// the `eprintln!` chain that put a token in `daemon.log`.
+    #[test]
+    fn no_operator_supplied_value_survives_into_an_error_message() {
+        for (what, src, still_named) in [
+            // `deny_unknown_fields` makes *any* unmodelled key an error,
+            // so an operator who invents `api_token` — the shape the
+            // review names — takes this path by construction.
+            (
+                "an unknown key on the parse path",
+                format!("[security]\napi_token = \"{CREDENTIAL}\"\n"),
+                "api_token",
+            ),
+            (
+                "a rejected enum value on the validation path",
+                format!("[notifications]\nsink = \"{CREDENTIAL}\"\n"),
+                "notifications.sink",
+            ),
+        ] {
+            let e = parse_str(&src).expect_err(what);
+            let msg = e.to_string();
+            assert!(
+                !msg.contains(CREDENTIAL),
+                "{what}: the credential is in the diagnostic verbatim, and this \
+                 diagnostic is `daemon.log`-bound: {msg}"
+            );
+            assert!(
+                msg.contains("[REDACTED:"),
+                "{what}: the value must be *replaced*, not merely dropped — a \
+                 message that silently loses it tells the operator nothing: {msg}"
+            );
+            assert!(
+                msg.contains(still_named),
+                "{what}: §10.1 still requires the error to name the key, and a \
+                 redactor that ate the diagnostic is not a fix: {msg}"
+            );
+            // And the chain, which a logger may walk rather than print.
+            // A redacted `Display` over a raw `#[source]` is the same
+            // disclosure one `{:#}` away.
+            let mut cursor = std::error::Error::source(&e);
+            while let Some(err) = cursor {
+                assert!(
+                    !err.to_string().contains(CREDENTIAL),
+                    "{what}: `Display` is redacted but the source chain is not: {err}"
+                );
+                cursor = err.source();
+            }
+        }
     }
 }
