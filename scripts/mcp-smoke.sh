@@ -606,6 +606,95 @@ jcheck "status answers about the named session" \
 
 check "terminate reports ok" '"already_exited":false'
 
+# --------------------------------------------------- 0.0.6: the attach socket
+#
+# Everything above drives one stdio `holdfast mcp` session and asserts on the
+# transcript after it exits. The attach socket is a *process*-level fact, so
+# it needs a daemon that is still running while the assertion is made. That
+# daemon already exists: from 0.0.5 on, `holdfast mcp` auto-spawns one into
+# $HOLDFAST_RUNTIME_DIR and it outlives the shim.
+#
+# NO `trap` HERE. 0.0.5's Task 13 Step 4b installs the one EXIT trap this
+# script has -- `daemon stop` plus `rm -rf "$HOLDFAST_RUNTIME_DIR"` -- and bash
+# keeps only one. A second `trap ... EXIT` replaces it and leaks both.
+#
+# `check_eq` and not `jcheck`: these are shell strings and a file mode, not
+# JSON-RPC responses. `jcheck` remains the right tool for anything in $OUT.
+check_eq() { # check_eq <description> <actual> <expected>
+  total=$((total + 1))
+  if [ "$2" = "$3" ]; then
+    echo "  ok    $1"
+  else
+    echo "  FAIL  $1"
+    echo "        (expected: $3, got: $2)"
+    fails=$((fails + 1))
+  fi
+}
+
+echo
+echo "-- 0.0.6 attach socket"
+
+# Fail loudly rather than silently skipping: if 0.0.5 Task 13 Step 4b did not
+# land, this whole phase would otherwise assert against the invoking user's
+# real daemon.
+total=$((total + 1))
+if [ -z "${HOLDFAST_RUNTIME_DIR:-}" ]; then
+  echo "  FAIL  HOLDFAST_RUNTIME_DIR is unset -- 0.0.5 Task 13 Step 4b did not land"
+  fails=$((fails + 1))
+else
+  echo "  ok    HOLDFAST_RUNTIME_DIR is set, so this phase is isolated"
+fi
+
+check_eq "attach.sock is bound" \
+  "$(test -S "$HOLDFAST_RUNTIME_DIR/attach.sock" && echo yes || echo no)" "yes"
+check_eq "attach.sock is 0600" \
+  "$(stat -c '%a' "$HOLDFAST_RUNTIME_DIR/attach.sock" 2>/dev/null)" "600"
+check_eq "http.sock is not bound (0.0.10)" \
+  "$(test -e "$HOLDFAST_RUNTIME_DIR/http.sock" && echo yes || echo no)" "no"
+
+# A real session, created the only way this binary can create one, attached
+# by the real client and detached by the real key sequence. The session is
+# made through a second short `holdfast mcp` transcript against the SAME
+# runtime dir: in hybrid mode the shim hands `start_session` to the running
+# daemon, so the session outlives the shim -- which is itself the property
+# under test on the line after next.
+{
+  req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-attach","version":"0"}}}'
+  req '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  req '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_session","arguments":{"command":"bash","args":["--norc","--noprofile"],"name":"smokeattach"}}}'
+  sleep 1
+} | "$BIN" mcp >/dev/null 2>&1
+check_eq "the session outlives the shim that created it" \
+  "$("$BIN" list | grep -c 'smokeattach')" "1"
+
+# `attach` needs a tty for raw mode, so `script` gives it one: without it
+# the client exits non-zero and the session-count check below would still
+# pass, which is why both checks are here.
+printf '\002d' | timeout 5 script -qefc "$BIN attach smokeattach" /dev/null >/dev/null 2>&1
+check_eq "holdfast attach exits 0 on the detach key" "$?" "0"
+check_eq "the session survives the detach" \
+  "$("$BIN" list | grep -c 'smokeattach')" "1"
+
+# `watch` needs no tty and detaches on SIGINT, so it is signalled
+# directly -- the same event a human's Ctrl+C delivers through the line
+# discipline.
+#
+# **Not `timeout --signal=INT`**, which was tried and is wrong: GNU
+# `timeout` reports **124 whenever its deadline fired**, whatever the
+# command then did, so that check reads 124 for a `watch` that handled
+# the signal and exited 0 and 124 for one that ignored it. Backgrounding
+# and `wait`ing reports the child's own status, which is the thing under
+# test: `0` for a clean detach, `130` (128 + SIGINT) for a client that
+# never installed a handler and died of the default disposition.
+"$BIN" watch smokeattach >/dev/null 2>&1 &
+WATCH_PID=$!
+sleep 1
+kill -INT "$WATCH_PID" 2>/dev/null
+wait "$WATCH_PID"
+check_eq "holdfast watch exits 0 on SIGINT" "$?" "0"
+check_eq "the session survives the watcher" \
+  "$("$BIN" list | grep -c 'smokeattach')" "1"
+
 echo
 if [ "$fails" -ne 0 ]; then
   echo "SMOKE FAILED: $fails of $total check(s) did not pass" >&2

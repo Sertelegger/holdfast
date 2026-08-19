@@ -360,7 +360,13 @@ struct StubDaemon {
 impl StubDaemon {
     /// Serve exactly one connection, sending `replies` in order after the
     /// handshake and then keeping the socket open until `hold` elapses.
-    async fn start(tag: &str, replies: Vec<ServerFrame>, hold: Duration) -> Self {
+    ///
+    /// **`replies` are whole encoded frames, not `ServerFrame` values**,
+    /// so a test can put a frame on the wire that this build has no
+    /// variant for — which is the only way to drive §7.8's
+    /// forward-compatibility rule against a client that was compiled
+    /// before the frame existed. [`enc`] is the ordinary case.
+    async fn start(tag: &str, replies: Vec<Vec<u8>>, hold: Duration) -> Self {
         let paths = RuntimePaths::with_dir(scratch_dir(tag));
         paths.ensure_dir().expect("ensure the runtime dir");
         let listener =
@@ -379,7 +385,8 @@ impl StubDaemon {
                 sink.lock().unwrap().push(f);
             }
             for reply in &replies {
-                if frame::write_frame(&mut stream, reply).await.is_err() {
+                use tokio::io::AsyncWriteExt;
+                if stream.write_all(reply).await.is_err() || stream.flush().await.is_err() {
                     return;
                 }
             }
@@ -410,6 +417,11 @@ impl StubDaemon {
     fn frames(&self) -> Vec<ClientFrame> {
         self.got.lock().unwrap().clone()
     }
+}
+
+/// One `ServerFrame`, encoded as it goes on the wire.
+fn enc(f: &ServerFrame) -> Vec<u8> {
+    frame::encode(f).expect("encode a server frame")
 }
 
 impl Drop for StubDaemon {
@@ -561,7 +573,7 @@ async fn the_local_terminal_is_restored_when_the_daemon_dies() {
     // moment it happens the test's rather than a scheduler's.
     let stub = StubDaemon::start(
         "daemondies",
-        vec![ServerFrame::Attached {
+        vec![enc(&ServerFrame::Attached {
             session_id: "sess_stub01".into(),
             name: None,
             cols: 80,
@@ -570,7 +582,7 @@ async fn the_local_terminal_is_restored_when_the_daemon_dies() {
             exit_code: None,
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,
-        }],
+        })],
         Duration::from_millis(400),
     )
     .await;
@@ -734,10 +746,10 @@ async fn attach_reports_protocol_too_old_distinctly_from_session_not_found() {
     );
     let stub = StubDaemon::start(
         "tooold",
-        vec![ServerFrame::AttachReject {
+        vec![enc(&ServerFrame::AttachReject {
             reason: "protocol_too_old".into(),
             message: sentence.clone(),
-        }],
+        })],
         Duration::from_secs(2),
     )
     .await;
@@ -764,7 +776,7 @@ async fn attach_refuses_a_daemon_that_leniently_accepted_it() {
     // client is the peer that can still tell.
     let stub = StubDaemon::start(
         "lenient",
-        vec![ServerFrame::Attached {
+        vec![enc(&ServerFrame::Attached {
             session_id: "sess_stub01".into(),
             name: None,
             cols: 80,
@@ -773,7 +785,7 @@ async fn attach_refuses_a_daemon_that_leniently_accepted_it() {
             exit_code: None,
             protocol_major: PROTOCOL_MAJOR + 1,
             protocol_minor: 0,
-        }],
+        })],
         Duration::from_secs(2),
     )
     .await;
@@ -961,7 +973,7 @@ async fn watch_never_sends_a_write_frame() {
     let stub = StubDaemon::start(
         "watchnowrite",
         vec![
-            ServerFrame::Attached {
+            enc(&ServerFrame::Attached {
                 session_id: "sess_stub01".into(),
                 name: None,
                 cols: 80,
@@ -970,13 +982,13 @@ async fn watch_never_sends_a_write_frame() {
                 exit_code: None,
                 protocol_major: PROTOCOL_MAJOR,
                 protocol_minor: PROTOCOL_MINOR,
-            },
+            }),
             // Output, so the client is driven through its render path and
             // not merely through its handshake.
-            ServerFrame::Output {
+            enc(&ServerFrame::Output {
                 session: "sess_stub01".into(),
                 bytes: b"WATCHING\r\n".to_vec(),
-            },
+            }),
         ],
         Duration::from_secs(10),
     )
@@ -1055,5 +1067,98 @@ async fn ctrl_c_detaches_watch_and_leaves_the_session_running() {
         entry["state"].as_str(),
         Some("Running"),
         "detaching a watcher must not end the session:\n{text}"
+    );
+}
+
+// ----------------------- Task 13: §7.8's forward-compatibility guard
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_future_attention_frame_does_not_disturb_a_v0_1_0_client() {
+    // REQ-SURF-002's verification: *"v0.1.0 clients that ignore the
+    // envelope still function unchanged."* Written now, against a frame
+    // that does not exist yet, because it is a property of the **client**
+    // and the client is built here.
+    //
+    // The frame is §7.8.2's exact shape, hand-built as a CBOR map rather
+    // than as a `ServerFrame` variant — there is no such variant, and
+    // adding one to get a test to compile would be shipping §7.8 by
+    // accident. Note `expires_at_unix_secs`: rev. 47 renamed it from
+    // `expires_at` under REQ-T-018 and the value is an **integer**, never
+    // an RFC-3339 string.
+    //
+    // Three claims, and the third is the one that matters: a client that
+    // "did not error" by silently stopping would satisfy the first two.
+    let attention = frame::encode(&serde_json::json!({
+        "type": "AttentionRequired",
+        "attention_id": "att_01",
+        "kind": "secret",
+        "session": "sess_stub01",
+        "session_name": "smoke",
+        "summary": "a program is asking for a password",
+        "expires_at_unix_secs": 1_893_456_000i64,
+        "escalation_deadline_ms": 1500u64,
+        "answerable_here": true,
+    }))
+    .expect("encode the future frame");
+
+    let stub = StubDaemon::start(
+        "futureframe",
+        vec![
+            enc(&ServerFrame::Attached {
+                session_id: "sess_stub01".into(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                state: "Running".into(),
+                exit_code: None,
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+            }),
+            enc(&ServerFrame::Output {
+                session: "sess_stub01".into(),
+                bytes: b"BEFORE\r\n".to_vec(),
+            }),
+            attention,
+            enc(&ServerFrame::Output {
+                session: "sess_stub01".into(),
+                bytes: b"AFTER\r\n".to_vec(),
+            }),
+        ],
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_stub01"], 80, 24);
+
+    // (c) the **next** `Output` arrives intact. A client that treated the
+    // unknown frame as a framing error would desynchronise here and this
+    // would never appear — which is why the assertion is on the frame
+    // *after* it and not merely on the absence of a complaint.
+    let seen = term.wait_for(b"AFTER", 10);
+    assert!(contains(&seen, b"BEFORE"), "the stream started correctly");
+
+    // (b) it is still attached and still speaking the protocol: the
+    // detach key works, which needs the connection to be live.
+    term.type_keys(&[0x02, 0x64]);
+    assert_eq!(
+        term.wait_exit(10),
+        0,
+        "the client did not survive an unknown frame"
+    );
+
+    // (a) it did not report an error about the frame it skipped. §7.5's
+    // rule is *skip silently* — a diagnostic per unknown frame would fill
+    // an operator's terminal the day §7.8 ships.
+    let text = String::from_utf8_lossy(&term.snapshot()).to_string();
+    assert!(
+        !text.contains("AttentionRequired") && !text.contains("undecodable"),
+        "the client complained about a frame it is supposed to skip:\n{text}"
+    );
+    // And it really did send exactly what a healthy client sends.
+    let sent = stub.frames();
+    assert!(matches!(sent[0], ClientFrame::Attach { .. }), "{sent:?}");
+    assert!(
+        sent.iter().any(|f| matches!(f, ClientFrame::Detach)),
+        "{sent:?}"
     );
 }

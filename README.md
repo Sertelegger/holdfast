@@ -2,19 +2,19 @@
 
 An MCP server that gives AI agents persistent, PTY-backed shell sessions.
 
-The **Human-Observable** in that name is the design intent, not a shipped
-property: as of 0.0.5 there is no `holdfast attach`, no `holdfast watch` and
-no web UI, so a human cannot yet look at a live session. See
+The **Human-Observable** in that name is a shipped property from 0.0.6:
+`holdfast attach` and `holdfast watch` let a human look at — and take
+over — a live session from any terminal. The web UI is still to come; see
 [ROADMAP.md](./ROADMAP.md).
 
-> **Status: milestone 0.0.5 — early development.** Eleven tools, hybrid
+> **Status: milestone 0.0.6 — early development.** Eleven tools, hybrid
 > mode on Linux/macOS/WSL, Unix only. Sessions live in a background
 > daemon and survive the MCP client, so a Claude Code restart no longer
 > takes them with it. Output is ANSI-stripped and secret-redacted by
 > default. Not yet suitable for real use; see [ROADMAP.md](./ROADMAP.md)
 > for what is and is not there.
 
-## What works today (0.0.5)
+## What works today (0.0.6)
 
 - `start_session` — spawn a shell or program on a real PTY
 - `send_input` — type into it
@@ -41,6 +41,17 @@ no web UI, so a human cannot yet look at a live session. See
 - `holdfast daemon start|stop|status|run` — manage the background daemon
 - `holdfast list` / `holdfast logs <session> [--tail N] [--raw]` — inspect
   sessions from any terminal
+- `holdfast attach <session>` — your terminal *becomes* the session. Full
+  colour, full TUIs, full keyboard. Detach with **Ctrl-B then d**; the
+  session keeps running.
+- `holdfast watch <session>` — the same view, read-only and **redacted**.
+  Detach with Ctrl+C.
+
+Multiple clients can attach at once: output goes to all of them, and input from
+any of them reaches the PTY. When a program asks for a password, every attached
+client is told and any of them can answer — without the value ever reaching the
+agent. `request_secret_input`, the tool an agent calls to *ask* for that
+password, arrives in 0.0.7.
 
 Sessions outlive the MCP client: `holdfast mcp` auto-spawns a daemon on
 first use and reconnects to it afterwards. `holdfast mcp --no-daemon` runs

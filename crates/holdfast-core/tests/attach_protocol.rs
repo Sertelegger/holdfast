@@ -18,7 +18,9 @@
 //!   fresh, well-formed attach that must still succeed.
 
 use holdfast_core::attach::frames::{decode_server_frame, ClientFrame, ServerFrame};
-use holdfast_core::attach::{AttachMode, AttachRole, SignalName};
+use holdfast_core::attach::{
+    AttachMode, AttachRole, ClientFrameKind, SignalName, KNOWN_SERVER_TYPES,
+};
 use holdfast_core::clock::Clock;
 use holdfast_core::daemon::attach_server;
 use holdfast_core::daemon::paths::RuntimePaths;
@@ -3127,4 +3129,178 @@ async fn a_pre_handshake_close_never_sends_detached() {
     }
 
     assert_daemon_survives(&d, &s.id).await;
+}
+
+// ------------------------------- Task 13: the §11.2 acceptance scenarios
+//
+// The rows above test one rule each. These are §11's *scenarios* — the
+// end-to-end shapes a user would recognise — and each is written as one
+// run rather than as a citation of the rules it happens to compose,
+// because a scenario that is only a list of cross-references is a
+// scenario nothing runs.
+
+#[tokio::test]
+async fn attach_detach_round_trip_leaves_the_session_running() {
+    // §11.2: *"start session, attach, send keystrokes, verify echo,
+    // detach without killing."* Every clause, in order, on a real PTY —
+    // the echo has to come from the tty, so a mock cannot stand in for
+    // the middle of this one.
+    let d = TestDaemon::start("roundtrip").await;
+    let s = d.real_session();
+
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    // Keystrokes in, echo out. `ROUND''TRIP` reads differently typed and
+    // printed, so matching it proves the *shell* produced it rather than
+    // the terminal echoing the request back.
+    send(
+        &mut c,
+        &ClientFrame::Input {
+            bytes: b"echo ROUND''TRIP\n".to_vec(),
+        },
+    )
+    .await;
+    let seen = stream_until(&mut c, b"ROUNDTRIP", 15).await;
+    assert!(contains(&seen, b"ROUNDTRIP"), "the keystrokes never ran");
+
+    // Detach. §6.1: *"cleanly disconnects without killing the session."*
+    send(&mut c, &ClientFrame::Detach).await;
+    expect_eof(&mut c, "after Detach").await;
+
+    // Still running, and still *usable* — a second attach that works is a
+    // stronger claim than `is_alive()`, which would also be true of a
+    // session whose write path had been torn down with the connection.
+    assert!(s.is_alive(), "the detach killed the session");
+    let mut again = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    send(
+        &mut again,
+        &ClientFrame::Input {
+            bytes: b"echo SECOND''PASS\n".to_vec(),
+        },
+    )
+    .await;
+    let seen = stream_until(&mut again, b"SECONDPASS", 15).await;
+    assert!(
+        contains(&seen, b"SECONDPASS"),
+        "the session survived but stopped accepting input"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+#[tokio::test]
+async fn two_clients_share_one_session_in_both_directions() {
+    // §11.2: *"two concurrent attaches; output broadcasts to both, input
+    // from either reaches PTY."* **Both directions in one run**, which is
+    // what makes it a scenario rather than two rules: a daemon that
+    // broadcast output but serialised the two clients onto separate write
+    // paths would satisfy each half separately.
+    let d = TestDaemon::start("twoclients").await;
+    let s = d.real_session();
+
+    let mut a = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut b = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    // Input from A. Both must see it come back.
+    send(
+        &mut a,
+        &ClientFrame::Input {
+            bytes: b"echo FROM''A\n".to_vec(),
+        },
+    )
+    .await;
+    assert!(contains(
+        &stream_until(&mut a, b"FROMA", 15).await,
+        b"FROMA"
+    ));
+    assert!(
+        contains(&stream_until(&mut b, b"FROMA", 15).await, b"FROMA"),
+        "the second client did not see what the first typed"
+    );
+
+    // Input from B. Both must see that too — the direction is not a
+    // property of whichever client attached first.
+    send(
+        &mut b,
+        &ClientFrame::Input {
+            bytes: b"echo FROM''B\n".to_vec(),
+        },
+    )
+    .await;
+    assert!(contains(
+        &stream_until(&mut b, b"FROMB", 15).await,
+        b"FROMB"
+    ));
+    assert!(
+        contains(&stream_until(&mut a, b"FROMB", 15).await, b"FROMB"),
+        "input from the second client never reached the PTY"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+#[test]
+fn the_attach_protocol_carries_no_confirmation_frame() {
+    // §11.2's regression test, and §7.5's reason: confirmations are
+    // **not session-scoped**, so redeeming one over a session-scoped
+    // attach connection is ill-defined. Spec rev. 4 removed the frames
+    // deliberately and §7.8.2 re-confirms the reasoning.
+    //
+    // **A structural absence test is the only kind that can catch them
+    // coming back.** Nothing else fails when a variant is added: it
+    // serialises, it decodes, and no behavioural row goes red — which is
+    // exactly how a removed-by-decision frame gets re-added by somebody
+    // reading §6.4 and assuming the omission was an oversight.
+    for banned in ["Confirm", "ConfirmationRequired"] {
+        assert!(
+            !KNOWN_SERVER_TYPES.contains(&banned),
+            "{banned} is back in the server frame catalogue"
+        );
+    }
+    // The client half: no redemption kind. Asserted over the whole of
+    // `ALL` rather than by naming absent variants, so a differently
+    // spelled one (`Approve`, `Redeem`, `ConfirmCode`) fails too.
+    for kind in ClientFrameKind::ALL {
+        let name = kind.as_str();
+        assert!(
+            !name.to_ascii_lowercase().contains("confirm")
+                && !name.to_ascii_lowercase().contains("approve")
+                && !name.to_ascii_lowercase().contains("redeem"),
+            "{name} looks like a confirmation-redemption frame; §7.5 has none"
+        );
+    }
+    // And the catalogue really is the one this build serialises — without
+    // this the loop above passes against an empty array.
+    assert_eq!(ClientFrameKind::ALL.len(), 6);
+    assert_eq!(KNOWN_SERVER_TYPES.len(), 9);
+}
+
+#[tokio::test]
+async fn an_unknown_server_frame_is_skipped_and_the_stream_continues() {
+    // The daemon-side half of REQ-SURF-002, and the decode seam the CLI
+    // row leans on. §7.8's frames land additively **only** if a client
+    // built today skips a `type` it has never heard of rather than
+    // treating it as a framing error.
+    let attention = frame::encode(&serde_json::json!({
+        "type": "AttentionRequired",
+        "attention_id": "att_01",
+        "kind": "secret",
+        "session": "sess_x",
+        "session_name": "smoke",
+        "summary": "a program is asking for a password",
+        // rev. 47's name, and an **integer** — never an RFC-3339 string.
+        "expires_at_unix_secs": 1_893_456_000i64,
+        "escalation_deadline_ms": 1500u64,
+        "answerable_here": true,
+    }))
+    .expect("encode");
+
+    match decode_server_frame(&attention[4..]) {
+        Ok(ServerFrame::Unknown { type_name }) => assert_eq!(type_name, "AttentionRequired"),
+        other => panic!("a future frame must decode as Unknown, got {other:?}"),
+    }
+    // The negative that separates "skips a future frame" from "skips
+    // everything": a corrupt body is still an error, not an `Unknown`.
+    assert!(
+        decode_server_frame(&[0xff, 0xff, 0xff]).is_err(),
+        "corrupt bytes must not be mistaken for a future frame"
+    );
 }
