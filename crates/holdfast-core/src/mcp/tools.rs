@@ -1442,14 +1442,24 @@ impl HoldfastServer {
         tokio::pin!(sleep);
         tokio::pin!(rx);
 
-        let early = tokio::select! {
-            r = &mut rx => Some(r),
+        // §5.1's third way out, and it is subscribed **before** the first
+        // poll so an exit landing in between is still queued for us.
+        let mut events = session.subscribe_events();
+        let exit = session_exit(session, &mut events);
+        tokio::pin!(exit);
+
+        let woke = tokio::select! {
+            r = &mut rx => match r {
+                Ok(resolution) => return resolution,
+                // The answering half went away without answering. Fall
+                // through to the close, which reports what really
+                // happened rather than inventing a reason here.
+                Err(_) => Woke::Deadline,
+            },
             // `&mut sleep`, so the receiver is still ours afterwards.
-            _ = &mut sleep => None,
+            _ = &mut sleep => Woke::Deadline,
+            code = &mut exit => Woke::Exited(code),
         };
-        if let Some(Ok(resolution)) = early {
-            return resolution;
-        }
 
         let hub = self.attach_hub();
         match hub
@@ -1461,24 +1471,43 @@ impl HoldfastServer {
             // answer — the value is returned below.
             Some(raised) => {
                 drop(raised);
-                hub.broadcast_secret_closed(&session.id, request_id, "timeout");
-                // **Q1: a call-driven timeout re-raises if the child is
-                // still asking.** §5.2 makes the deadline close the
-                // *request*, not merely the call — but the raise is
-                // edge-triggered on the transition *into* `AwaitingSecret`,
-                // so closing it while the child sits at its echo-off
-                // prompt removes the human's affordance and nothing will
-                // ever put it back. New id, new broadcast, `echo_drop`,
-                // no waiter. §5.2's invariant holds: the ids are
-                // sequential, never concurrent.
-                if session.is_awaiting_secret() {
-                    let (re, first) =
-                        hub.raise_secret(&session.id, &session.prompt_last_line_redacted());
-                    if first {
-                        hub.broadcast_awaiting_secret(&session.id, &re.request_id, &re.prompt_text);
+                match woke {
+                    // §5.1: the code, not `timeout` a window later. **No
+                    // re-raise**: a child that has exited is not sitting
+                    // at a prompt, and a request raised against a dead
+                    // session is an affordance pointing at nothing.
+                    Woke::Exited(code) => {
+                        hub.broadcast_secret_closed(&session.id, request_id, "cancelled");
+                        Resolution::SessionDied {
+                            exit_code: code.or_else(|| session.exit_code()),
+                        }
+                    }
+                    Woke::Deadline => {
+                        hub.broadcast_secret_closed(&session.id, request_id, "timeout");
+                        // **Q1: a call-driven timeout re-raises if the
+                        // child is still asking.** §5.2 makes the deadline
+                        // close the *request*, not merely the call — but
+                        // the raise is edge-triggered on the transition
+                        // *into* `AwaitingSecret`, so closing it while the
+                        // child sits at its echo-off prompt removes the
+                        // human's affordance and nothing will ever put it
+                        // back. New id, new broadcast, `echo_drop`, no
+                        // waiter. §5.2's invariant holds: the ids are
+                        // sequential, never concurrent.
+                        if session.is_awaiting_secret() {
+                            let (re, first) =
+                                hub.raise_secret(&session.id, &session.prompt_last_line_redacted());
+                            if first {
+                                hub.broadcast_awaiting_secret(
+                                    &session.id,
+                                    &re.request_id,
+                                    &re.prompt_text,
+                                );
+                            }
+                        }
+                        Resolution::Cancelled(CancelReason::Timeout)
                     }
                 }
-                Resolution::Cancelled(CancelReason::Timeout)
             }
             // Somebody took the slot between the timer firing and this
             // lock. Their answer is on our receiver, or is about to be —
@@ -1873,6 +1902,59 @@ pub const DEFAULT_MAX_SECRET_BYTES: u32 = 4096;
 /// wait in this position turns a wedged writer into a hung CI job rather
 /// than a red row.
 const SECRET_HANDOVER_GRACE: Duration = Duration::from_secs(10);
+
+/// Why [`HoldfastServer::await_secret`] stopped waiting on its receiver.
+///
+/// Only the two that need a close. A receiver that answered returns
+/// straight out of the `select!` and never reaches here.
+enum Woke {
+    /// The call's own `timeout_secs` elapsed — or the answering half was
+    /// dropped without answering, which the close then reports truthfully
+    /// rather than guessing at.
+    Deadline,
+    /// §5.1: the child ended while the call was waiting.
+    Exited(Option<i32>),
+}
+
+/// Resolve when this session's child ends, with the code it ended with.
+///
+/// **The session's own event stream, and not an attached client's.**
+/// `SessionEvent` is consumed only in `attach::conn`, once per connection,
+/// so a `request_secret_input` call on a session nobody has attached to
+/// has no consumer at all — and an unattended session is precisely the
+/// shape §9.5's buffer notice exists for. Worse, the consumer that *does*
+/// exist loses to the event it handles: `attach::conn::run` ends its
+/// `select!` the moment the forwarder reports `SessionExit` and then calls
+/// `events.abort()`, so the arm that answers `session_died` is aborted by
+/// the very exit that would have triggered it. Measured: a call on a
+/// session killed under it returned `timeout` after its **full** window.
+async fn session_exit(
+    session: &Session,
+    events: &mut tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
+) -> Option<i32> {
+    use crate::session::SessionEvent;
+    use tokio::sync::broadcast::error::RecvError;
+
+    // Subscribe-then-recheck. An exit landing between the caller's
+    // liveness test and this subscription is in neither, and this call
+    // would then wait out a window for a child that was already gone —
+    // which is the defect, one race narrower.
+    if !session.is_alive() {
+        return session.exit_code();
+    }
+    loop {
+        match events.recv().await {
+            Ok(SessionEvent::Exited { code }) => return Some(code),
+            // Every sender is gone, so the session is.
+            Err(RecvError::Closed) => return session.exit_code(),
+            // A lagged receiver may have skipped the exit. The session is
+            // the authority and it does not lag; anything else is an edge
+            // this call does not care about.
+            Err(RecvError::Lagged(_)) if !session.is_alive() => return session.exit_code(),
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+        }
+    }
+}
 
 /// `Default` for the reason 0.0.2 put it on `StartSessionArgs`: every
 /// later milestone adds arguments here, and an exhaustive literal repaired
