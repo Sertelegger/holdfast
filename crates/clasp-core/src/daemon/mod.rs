@@ -7,6 +7,7 @@
 pub mod paths;
 pub mod peer;
 pub mod server;
+pub mod spawn;
 
 pub use paths::RuntimePaths;
 pub use server::{Daemon, DaemonStatus, StopOutcome, StopParams};
