@@ -157,10 +157,20 @@ pub fn start_detached(paths: &RuntimePaths, exe: &Path) -> io::Result<StartOutco
     let log = super::paths::open_log_append(&paths.daemon_log())?;
     let log_err = log.try_clone()?;
 
+    // **No `CLASP_RUNTIME_DIR` is set here, and its absence is
+    // load-bearing.** The child inherits this process's environment, so
+    // an explicit instance already crosses; setting it from
+    // `paths.dir()` *invents* one where the user chose none. On the
+    // default instance `paths.dir()` is `$XDG_RUNTIME_DIR/clasp`, so the
+    // child's `resolve` would take §7.1's relocation branch and put
+    // `audit.log` and `daemon.log` on tmpfs — cleared at logout, where
+    // §19.1's 14-day and 4-week windows cannot be met, and where neither
+    // `clasp logs` nor any operator runbook looks. The child agrees with
+    // us about the socket because it runs the same `discover` against
+    // the same environment, not because we told it.
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")
         .arg("run")
-        .env(super::paths::RUNTIME_DIR_ENV, paths.dir())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err));
@@ -235,10 +245,15 @@ pub async fn ensure_daemon(
     // MCP clients surface it as server logs, and a failed spawn's own
     // diagnostic is the most useful thing a user can be shown when the
     // error below points them at the daemon log.
+    //
+    // **No `CLASP_RUNTIME_DIR`**, for the reason `start_detached` states
+    // at its own spawn: this is the site that made every Claude Code
+    // install's daemon an explicit instance and moved §9.4's trail onto
+    // tmpfs. Inheritance carries a genuine one across; nothing needs to
+    // manufacture it.
     let status = std::process::Command::new(exe)
         .arg("daemon")
         .arg("start")
-        .env(super::paths::RUNTIME_DIR_ENV, paths.dir())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -273,6 +288,104 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(self.0.dir());
         }
+    }
+
+    /// A stand-in for the `clasp` binary that records the one thing the
+    /// two tests below are about — what the child's `CLASP_RUNTIME_DIR`
+    /// was — into a file, because one of the two spawn sites nulls the
+    /// child's stdout by protocol requirement. It ignores its argv, so
+    /// it serves as both `daemon run` and `daemon start`.
+    fn env_probe(paths: &RuntimePaths) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        paths.ensure_dir().unwrap();
+        let seen = paths.dir().join("seen");
+        let probe = paths.dir().join("probe.sh");
+        std::fs::write(
+            &probe,
+            format!(
+                "#!/bin/sh\nprintf '[%s]' \"${{{env}-}}\" > '{out}'\n",
+                env = crate::daemon::paths::RUNTIME_DIR_ENV,
+                out = seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (probe, seen)
+    }
+
+    /// This process's own `CLASP_RUNTIME_DIR` in the probe's notation.
+    ///
+    /// Read rather than assumed absent: a developer with the variable
+    /// exported would otherwise see a test that fails for a reason that
+    /// is not the defect, and the property is "the child's instance
+    /// selection is the parent's" either way.
+    fn parent_view() -> String {
+        format!(
+            "[{}]",
+            std::env::var(crate::daemon::paths::RUNTIME_DIR_ENV).unwrap_or_default()
+        )
+    }
+
+    /// §7.1 relocates `audit.log` and `daemon.log` under the runtime
+    /// directory **only** when `CLASP_RUNTIME_DIR` is explicitly set.
+    /// Passing `paths.dir()` to the child set it always, so the child of
+    /// a *default* instance saw an explicit one, took the relocation
+    /// branch, and wrote both logs to `$XDG_RUNTIME_DIR/clasp/logs` —
+    /// tmpfs, cleared at logout, where §19.1's 14-day and 4-week
+    /// retention windows cannot be met and `clasp logs` does not look.
+    ///
+    /// The opposite mutation — never letting the child see the variable
+    /// — is caught by `daemon_cli.rs`, which reads `/proc/<pid>/environ`
+    /// for `CLASP_RUNTIME_DIR=<its own dir>` and whose every daemon runs
+    /// under an explicit instance.
+    #[test]
+    fn start_detached_does_not_invent_an_explicit_instance_for_its_child() {
+        let paths = temp_paths("envrun");
+        let _scoped = Scoped(paths.clone());
+        let (probe, seen) = env_probe(&paths);
+
+        // The probe binds no socket, so this pays `SPAWN_TIMEOUT` and
+        // reports the timeout. That is the arrangement rather than the
+        // assertion — what is under test is the environment the child
+        // was handed before it exited — but it is bounded, so a
+        // regression here fails rather than hangs.
+        let outcome = start_detached(&paths, &probe);
+        assert!(
+            outcome.is_err(),
+            "a probe that binds nothing cannot be reported Started: {outcome:?}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&seen).expect("the probe ran"),
+            parent_view(),
+            "the child's instance selection must be this process's own"
+        );
+    }
+
+    /// The same property at the shim's auto-spawn site, which is the one
+    /// that matters in practice: `clasp mcp` is how every Claude Code
+    /// install starts its daemon, and it is the path the defect made
+    /// disagree with `clasp daemon start` about where the logs live.
+    #[tokio::test]
+    async fn auto_spawn_does_not_invent_an_explicit_instance_for_its_child() {
+        let paths = temp_paths("envstart");
+        let _scoped = Scoped(paths.clone());
+        let (probe, seen) = env_probe(&paths);
+
+        // The probe exits 0 without binding, so `ensure_daemon` gets a
+        // successful `daemon start` and then fails to connect.
+        let outcome = ensure_daemon(&paths, &probe, ClientKind::Shim).await;
+        assert!(
+            outcome.is_err(),
+            "nothing is listening, so the connect after the spawn must fail"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&seen).expect("the probe ran"),
+            parent_view(),
+            "the child's instance selection must be this process's own"
+        );
     }
 
     #[test]
