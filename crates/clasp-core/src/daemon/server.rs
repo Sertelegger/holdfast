@@ -950,9 +950,30 @@ fn response_closes_connection(resp: &Response) -> bool {
 /// connection's caller identity for §9.4. `None` means the connection
 /// must close.
 async fn do_handshake(stream: &mut UnixStream) -> Option<ClientKind> {
-    let req: Request = match frame::read_frame(stream).await {
-        Ok(r) => r,
-        Err(_) => return None,
+    do_handshake_within(stream, handshake::HANDSHAKE_TIMEOUT).await
+}
+
+/// [`do_handshake`] with the deadline supplied, so a test can observe
+/// the timeout without paying [`handshake::HANDSHAKE_TIMEOUT`].
+async fn do_handshake_within(
+    stream: &mut UnixStream,
+    deadline: std::time::Duration,
+) -> Option<ClientKind> {
+    // **The daemon's only deadline on this protocol.** `serve` spawns an
+    // uncapped task per accepted connection, so without this a peer that
+    // connects and sends nothing holds a task and a file descriptor
+    // until the daemon dies — and, since Imp-19, is also counted as an
+    // in-flight connection and would hold §7.3's client-less exit open
+    // for as long as it stayed silent.
+    //
+    // Scoped to the first frame. Nothing past the handshake is bounded:
+    // `wait_for_pattern` is 3600 s at its cap and a deadline that
+    // reached it would cut off a legitimate call.
+    let req: Request = match tokio::time::timeout(deadline, frame::read_frame(stream)).await {
+        Ok(Ok(r)) => r,
+        // A silent peer and a peer that hung up are the same outcome —
+        // close, say nothing. There is no one to send a diagnostic to.
+        Ok(Err(_)) | Err(_) => return None,
     };
     if req.method != method::METHOD_HANDSHAKE {
         // §7.4.1: "a connection that issues any other method first is
@@ -1393,6 +1414,53 @@ mod tests {
             !peer_is_authorized(&Err(io::Error::from(io::ErrorKind::PermissionDenied)), us),
             "an unreadable credential must fail closed, not open"
         );
+    }
+
+    /// A peer that connects and says nothing must be let go of.
+    ///
+    /// `serve` spawns an uncapped task per accepted connection and there
+    /// was no deadline anywhere in `src/protocol/` or on this path, so a
+    /// silent peer pinned a task and a file descriptor until the daemon
+    /// died. The asymmetry that makes it worth fixing rather than
+    /// accepting: `frame.rs` reasons about the analogous 16 MiB
+    /// pre-allocation hazard **and writes down that it is accepted**,
+    /// where this one was reasoned about nowhere in code, plan or spec.
+    ///
+    /// **The outer bound is a red test, not a hang.** Every failure here
+    /// is something that does not return, and there is no `nextest.toml`
+    /// in this repo to turn an unbounded wait into anything but a hung
+    /// CI job — so the elapsed arm is `expect`ed and never matched as
+    /// success.
+    #[tokio::test]
+    async fn a_peer_that_sends_no_handshake_is_let_go_of() {
+        let (mut daemon_side, client_side) = UnixStream::pair().expect("socketpair");
+        // `client_side` is held to the end on purpose. Dropping it would
+        // EOF the daemon's read, `do_handshake` would return on its own,
+        // and this row would be green against a daemon with no deadline
+        // at all — which is exactly the state it exists to catch.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            do_handshake_within(&mut daemon_side, Duration::from_millis(50)),
+        )
+        .await
+        .expect(
+            "a peer that connected and sent nothing held the connection open: \
+             one task and one descriptor pinned until the daemon dies",
+        );
+        assert!(
+            outcome.is_none(),
+            "a peer that never handshaked must not be admitted"
+        );
+        drop(client_side);
+
+        // The row above proves the mechanism at a deadline it was
+        // handed; this pins the one `do_handshake` really passes. A
+        // bound rather than an equality, so it is a claim about the
+        // value — finite, and far below `wait_for_pattern`'s 30 s
+        // default, which is the shortest call it must never be confused
+        // with — instead of a second copy of the constant.
+        assert!(handshake::HANDSHAKE_TIMEOUT >= Duration::from_secs(1));
+        assert!(handshake::HANDSHAKE_TIMEOUT <= Duration::from_secs(10));
     }
 
     /// An MCP protocol fault keeps its JSON-RPC code across the socket.

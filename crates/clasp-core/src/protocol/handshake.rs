@@ -18,6 +18,28 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// Bumped for additive changes: new methods, new optional fields.
 pub const PROTOCOL_MINOR: u32 = 0;
 
+/// How long either peer waits for the **first** frame of the handshake
+/// before giving up on the connection.
+///
+/// The one deadline on the control protocol, and it is deliberately the
+/// only one. Without it a peer that connects and sends nothing pins a
+/// daemon task and a file descriptor until the daemon dies, and a daemon
+/// that accepts and never replies wedges `clasp mcp` *before it can
+/// answer MCP `initialize`* — an agent-visible server that never starts,
+/// with no diagnostic anywhere.
+///
+/// **It does not extend past the handshake, and must not.** A blanket
+/// client deadline would truncate a legitimate `wait_for_pattern`, which
+/// is 30 s by default and 3600 s at its cap; the handshake, by contrast,
+/// is one frame each way between two local processes, so five seconds is
+/// four orders of magnitude of headroom rather than a tuning parameter.
+///
+/// The uid gate (§9.1) already establishes that any peer reaching this
+/// is the same user, so this is not a defence against an attacker. It is
+/// a defence against a wedged process, which is a state the `--force`
+/// path in `clasp daemon stop` already exists to resolve.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Build identifier reported in the handshake. Wired to a real git SHA
 /// by the release pipeline in 0.0.12; `unknown` until then.
 pub fn build_id() -> &'static str {

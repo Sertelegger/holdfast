@@ -307,10 +307,44 @@ async fn handshake_exchange(
     stream: &mut UnixStream,
     kind: ClientKind,
 ) -> Result<HandshakeData, ClientError> {
+    handshake_exchange_within(stream, kind, handshake::HANDSHAKE_TIMEOUT).await
+}
+
+/// [`handshake_exchange`] with the deadline supplied, so a test can
+/// observe the timeout without paying [`handshake::HANDSHAKE_TIMEOUT`].
+async fn handshake_exchange_within(
+    stream: &mut UnixStream,
+    kind: ClientKind,
+    deadline: std::time::Duration,
+) -> Result<HandshakeData, ClientError> {
     let params = HandshakeParams::current(kind);
     let req = Request::new(0, method::METHOD_HANDSHAKE, &params)?;
     frame::write_frame(stream, &req).await?;
-    let resp: Response = frame::read_frame(stream).await?;
+    // **The only deadline on this protocol.** A daemon that accepts the
+    // connection and never answers wedges `clasp mcp` before it can
+    // reply to MCP `initialize`, so the agent sees a server that never
+    // starts and nothing anywhere says why. Scoped to this one read on
+    // purpose: a blanket deadline on `call_raw` would truncate a
+    // legitimate 3600 s `wait_for_pattern`.
+    //
+    // The elapse is **not** `ClientError::Connect`. `Connect` is the
+    // auto-spawn signal — `spawn::ensure_daemon` starts a daemon for it
+    // and `retriable()` answers `true` — and a daemon that accepted this
+    // connection is running, so spawning a second one against a wedged
+    // first is the one response that makes things worse.
+    let resp: Response = match tokio::time::timeout(deadline, frame::read_frame(stream)).await {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(ClientError::Frame(FrameError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the daemon accepted the connection but did not answer {} within {}s",
+                    method::METHOD_HANDSHAKE,
+                    deadline.as_secs_f32()
+                ),
+            ))))
+        }
+    };
     if resp.id != 0 {
         return Err(ClientError::IdMismatch {
             expected: 0,
@@ -597,6 +631,72 @@ mod tests {
         // claim a failed connect ended a connection that never existed.
         assert!(!connect_error().closes_connection());
         assert!(!ClientError::Frame(FrameError::Eof).closes_connection());
+    }
+
+    /// A daemon that accepts the connection and never replies must not
+    /// wedge the client.
+    ///
+    /// There was no timeout anywhere in `src/protocol/`, so this hung
+    /// forever — and it hangs in the worst possible place: inside
+    /// `spawn::ensure_daemon`, which `clasp mcp` calls **before** it can
+    /// answer MCP `initialize`. The agent sees a server that never
+    /// starts, and nothing in code, plan or spec says why.
+    ///
+    /// **The outer bound is a red test, not a hang.** Every failure here
+    /// is something that does not return, and there is no `nextest.toml`
+    /// in this repo, so the elapsed arm is `expect`ed rather than
+    /// matched as success.
+    #[tokio::test]
+    async fn a_daemon_that_accepts_and_never_answers_does_not_wedge_the_client() {
+        let dir = scratch_dir("silent");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+
+        let listen_at = sock.clone();
+        let stand_in = tokio::spawn(async move {
+            let listener = tokio::net::UnixListener::bind(&listen_at).unwrap();
+            let (held, _) = listener.accept().await.unwrap();
+            // Parked forever with the connection still open. Letting it
+            // drop would EOF the client's read, the handshake would
+            // return on its own, and the row would be green against a
+            // client with no deadline at all.
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+
+        let mut stream = loop {
+            match UnixStream::connect(&sock).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            handshake_exchange_within(&mut stream, ClientKind::Shim, Duration::from_millis(50)),
+        )
+        .await
+        .expect(
+            "the handshake never returned: `clasp mcp` wedges here, before it can \
+             answer MCP `initialize`, and the agent sees a server that never starts",
+        )
+        .expect_err("a daemon that never answered must not read as one that accepted us");
+
+        // **Not `Connect`, and this is the load-bearing half.**
+        // `spawn::ensure_daemon` spawns a replacement for `Connect` and
+        // only for `Connect`, so classifying a wedged-but-listening
+        // daemon that way would start a second daemon against a first
+        // that is still holding the socket.
+        assert!(
+            matches!(err, ClientError::Frame(FrameError::Io(_))),
+            "got {err:?}"
+        );
+        assert!(
+            !err.retriable(),
+            "retrying the same wedged daemon repeats the wait"
+        );
+        stand_in.abort();
     }
 
     // ------------------------------------- one call per connection (C-3)
