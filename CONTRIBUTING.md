@@ -159,6 +159,11 @@ Grep the value, not the key. `"outputSchema"` being present says nothing.
   design specification, which is deliberately git-ignored and local to the
   author's machine. If you are working in a clone without `docs/`, say so
   rather than guessing at what a section required.
+- `scripts/orphan-req-check.py` and `scripts/artifact-deletion-check.py` are
+  author-local tools, not a CI gate: both read the `docs/` spec and plans,
+  both exit 3 with a message rather than 0 when `docs/` is absent, and
+  neither is invoked from anywhere in this repository. Run them by hand if
+  you have `docs/`; on a clone without it they cannot run at all.
 
 ## Commits and pull requests
 
