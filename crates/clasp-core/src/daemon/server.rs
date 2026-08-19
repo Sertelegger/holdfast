@@ -557,10 +557,10 @@ impl Daemon {
             LogRetention::from(self.config()),
             std::time::SystemTime::now(),
         ) {
-            crate::diag!("clasp daemon: log rotation sweep failed: {e}");
+            eprintln!("clasp daemon: log rotation sweep failed: {e}");
         }
         if let Err(e) = self.server.processor.audit.reopen() {
-            crate::diag!("clasp daemon: cannot reopen the audit log: {e}");
+            eprintln!("clasp daemon: cannot reopen the audit log: {e}");
         }
     }
 }
@@ -674,7 +674,7 @@ pub async fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
                         });
                     }
                     Err(e) => {
-                        crate::diag!("clasp daemon: accept failed: {e}");
+                        eprintln!("clasp daemon: accept failed: {e}");
                     }
                 }
             }
@@ -799,7 +799,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // that will not start because a log could not be renamed is a worse
     // outcome than one that runs and says so.
     if let Err(e) = paths.sweep_logs(LogRetention::from(&config), std::time::SystemTime::now()) {
-        crate::diag!("clasp daemon: log rotation sweep failed: {e}");
+        eprintln!("clasp daemon: log rotation sweep failed: {e}");
     }
 
     let daemon = Daemon::with_config(paths.clone(), config);
@@ -810,7 +810,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(e) => {
-                    crate::diag!("clasp daemon: cannot install SIGTERM handler: {e}");
+                    eprintln!("clasp daemon: cannot install SIGTERM handler: {e}");
                     return;
                 }
             };
@@ -916,12 +916,11 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
         // Diagnostics only, and after the verdict rather than inside it:
         // nothing below can change who is admitted.
         match &cred {
-            Ok(c) => crate::diag!(
+            Ok(c) => eprintln!(
                 "clasp daemon: refused a connection from uid {} (daemon runs as uid {})",
-                c.uid,
-                daemon.owner_uid
+                c.uid, daemon.owner_uid
             ),
-            Err(e) => crate::diag!("clasp daemon: cannot read peer credentials, refusing: {e}"),
+            Err(e) => eprintln!("clasp daemon: cannot read peer credentials, refusing: {e}"),
         }
         return;
     }
@@ -982,7 +981,7 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
         }
 
         let (resp, stop_after) = dispatch(&daemon, &req, client_kind).await;
-        if frame::write_frame(&mut stream, &resp).await.is_err() {
+        if !write_response(&mut stream, req.id, &resp).await {
             return;
         }
         if response_closes_connection(&resp) {
@@ -992,6 +991,70 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
             daemon.shutdown();
             return;
         }
+    }
+}
+
+/// Write one response, and say whether the connection may carry another.
+///
+/// **An over-cap *response* used to be indistinguishable from a dead
+/// peer.** This was `write_frame(..).is_err()`, which folded
+/// [`FrameError::TooLarge`] in with EPIPE and returned: no error frame,
+/// no log line, and no `frame_too_large` — that arm existed only on the
+/// **read** side, for an oversized request. The caller saw `Eof`, which
+/// `mcp::shim::map_client_error` reports as `daemon_unreachable` when
+/// the daemon is in perfect health, and an operator had nothing at all
+/// to go on.
+///
+/// Not reachable at shipped defaults — the worst case is a few MiB
+/// against a 16 MiB cap — but reachable **through configuration alone**:
+/// `output_buffer_bytes` and `resource_read_max_bytes` take only
+/// `nonzero()`, with no ceiling and no cross-check against
+/// [`frame::MAX_FRAME_BYTES`]. A `Config::validate` clause requiring
+/// headroom under that cap is the other half of this fix and is still
+/// owed; it turns a runtime failure into a named startup rejection.
+///
+/// **The refusal is safe to follow with a second frame**, and that is
+/// why it can be sent at all: `frame::encode` runs to completion before
+/// a single byte is written, so `TooLarge` means nothing reached the
+/// socket and the stream is still frame-aligned. A codec that wrote the
+/// prefix first could not do this.
+///
+/// The connection still closes — `frame_too_large` is one of §18.3's
+/// three `closes_connection` codes — but it closes *after* saying why,
+/// correlated to the request that provoked it, so `ControlClient` drops
+/// that connection instead of parking it and the next call dials a fresh
+/// one. The failure is one call, not the rest of the MCP session.
+///
+/// Generic over the writer so the refusal is testable without a socket:
+/// the interesting value is 16 MiB, and a `Vec<u8>` sink measures it
+/// without a kernel buffer in the way.
+async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    id: u64,
+    resp: &Response,
+) -> bool {
+    match frame::write_frame(w, resp).await {
+        Ok(()) => true,
+        Err(FrameError::TooLarge { len }) => {
+            eprintln!(
+                "clasp daemon: the response to request {id} is {len} bytes, over the \
+                 {}-byte frame limit; refusing it and closing the connection",
+                frame::MAX_FRAME_BYTES
+            );
+            let refusal = Response::error(
+                id,
+                ErrorCode::FrameTooLarge,
+                format!(
+                    "the response to this request was {len} bytes, over the {}-byte limit; \
+                     lower [limits] output_buffer_bytes or resource_read_max_bytes, or ask \
+                     for fewer bytes",
+                    frame::MAX_FRAME_BYTES
+                ),
+            );
+            let _ = frame::write_frame(w, &refusal).await;
+            false
+        }
+        Err(_) => false,
     }
 }
 
@@ -1371,6 +1434,67 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    /// An over-cap **response** must be refused by name, not by hanging
+    /// up.
+    ///
+    /// The write site folded [`FrameError::TooLarge`] in with EPIPE and
+    /// returned: no frame, no log line, no `frame_too_large` — that arm
+    /// existed only for an oversized *request*. The caller saw `Eof`,
+    /// which the shim reports as `daemon_unreachable` about a daemon in
+    /// perfect health.
+    ///
+    /// The second row is not decoration. Without it every assertion here
+    /// is satisfied by a `write_response` that refuses **everything**,
+    /// which would take the daemon down rather than one call.
+    #[tokio::test]
+    async fn an_oversized_response_is_refused_by_name_and_not_by_silence() {
+        // Built here rather than provoked through a tool: the shipped
+        // limits cannot reach 16 MiB, and the configurations that can —
+        // `output_buffer_bytes`, `resource_read_max_bytes`, neither
+        // bounded above — are exactly what this guard is for.
+        let over = Response::ok(
+            7,
+            &method::CborValue::Bytes(vec![0u8; frame::MAX_FRAME_BYTES]),
+            "a read that will not fit",
+        )
+        .expect("an oversized response still *builds*; it is the frame that refuses it");
+
+        let mut sink: Vec<u8> = Vec::new();
+        assert!(
+            !write_response(&mut sink, 7, &over).await,
+            "`frame_too_large` is one of §18.3's three closing codes"
+        );
+
+        // What the peer actually received. `read_frame` here rather than
+        // an emptiness check: the refusal has to be a *well-formed*
+        // frame, or the client desynchronises instead of being told.
+        let resp: Response = frame::read_frame(&mut sink.as_slice())
+            .await
+            .expect("a diagnostic frame, not an empty stream");
+        assert_eq!(
+            resp.id, 7,
+            "the refusal must correlate to the request that provoked it; \
+             `id: 0` is the frame-layer form, and on a fresh connection it is \
+             indistinguishable from a duplicate handshake reply"
+        );
+        let err = resp
+            .control_error()
+            .expect("a §7.4.1 error payload, not a truncated success");
+        assert_eq!(
+            err.code, "frame_too_large",
+            "§18.3's name for this, spelled as a literal: the read side has \
+             answered it since 0.0.5 and the write side answered nothing"
+        );
+
+        // And the ordinary response still goes out untouched.
+        let ok = Response::ok(8, &method::CborValue::Text("hi".into()), "ok").unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        assert!(write_response(&mut sink, 8, &ok).await);
+        let back: Response = frame::read_frame(&mut sink.as_slice()).await.unwrap();
+        assert_eq!(back.id, 8);
+        assert!(!back.is_error(), "{}", back.details);
+    }
 
     /// Every field name an agent might reach for to relabel itself.
     fn forged_read_output(kind_it_wants_to_look_like: &str) -> Request {
