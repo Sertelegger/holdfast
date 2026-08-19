@@ -666,7 +666,27 @@ pub(crate) fn bind_control_within(
 
     let path = paths.control_sock();
 
-    if path.exists() {
+    // **`symlink_metadata` and not `exists()`**, which is `fs::metadata`
+    // and therefore follows the final symlink. A *dangling* link at
+    // `control.sock` — one whose target does not exist — made `exists()`
+    // answer `false`, so the sweep below was skipped entirely; and
+    // `UnixListener::bind` does not follow the trailing component
+    // either, so it found the link, returned `EEXIST`, and the kernel
+    // mapped that to `EADDRINUSE`. The daemon then failed to start with a
+    // bare "address in use" and no remedy named, every subsequent start
+    // failed identically, and nothing self-healed: `daemon stop` had no
+    // daemon to stop, and `remove_runtime_files_we_own` is only reached
+    // by a daemon that got *past* this function. The stale-socket branch
+    // could not reach the one case that needs it most.
+    //
+    // Widening it is safe, and narrowly so. A dangling link fails
+    // `connect` with `ENOENT` and falls to the `remove_file` arm;
+    // `remove_file` is `unlink(2)`, which never follows a symlink, so a
+    // planted `control.sock -> ~/.ssh/id_rsa` loses the link and not the
+    // key. The two non-dangling cases are unchanged: a link to a live
+    // socket still connects and still refuses, and a link to a dead file
+    // was already `exists() == true` before this.
+    if std::fs::symlink_metadata(&path).is_ok() {
         // A socket file whose daemon is gone is stale and must be
         // cleared; one whose daemon is alive is not ours to take.
         match std::os::unix::net::UnixStream::connect(&path) {
@@ -2378,6 +2398,90 @@ mod tests {
         let (listener, _) =
             bind_control(&paths).expect("the lock is free once the holder drops it");
         assert!(paths.control_sock().exists());
+        drop(listener);
+    }
+
+    /// A **dangling** symlink at `control.sock` must not wedge the daemon
+    /// permanently.
+    ///
+    /// The stale-socket sweep above was gated on `Path::exists()`, which
+    /// is `fs::metadata` and follows the final symlink — so a link to a
+    /// path that does not exist answered `false` and the sweep was
+    /// skipped. `UnixListener::bind` does *not* follow that component: it
+    /// found the link, got `EEXIST`, and the kernel reported
+    /// `EADDRINUSE`. The operator was told "address in use" by a daemon
+    /// that had nothing to stop, every later start failed the same way,
+    /// and no path in the tree cleared it — `remove_runtime_files_we_own`
+    /// is reached only by a daemon that got past `bind_control`. A guard
+    /// that cannot reach its own sharp case.
+    ///
+    /// The premise rows are what make this more than "bind works": they
+    /// pin that `exists()` really does answer `false` here, so a
+    /// regression to it goes red rather than passing by accident.
+    #[tokio::test]
+    async fn a_dangling_symlink_at_the_control_socket_does_not_wedge_the_daemon() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let paths = scratch("danglinglink");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+
+        std::os::unix::fs::symlink(paths.dir().join("no-such-target"), paths.control_sock())
+            .expect("plant the dangling link");
+        assert!(
+            !paths.control_sock().exists(),
+            "the premise: `exists()` follows the link and answers false for a \
+             dangling one, which is what skipped the sweep"
+        );
+        assert!(
+            std::fs::symlink_metadata(paths.control_sock()).is_ok(),
+            "the premise: the link itself is very much there, which is what \
+             `bind` trips over"
+        );
+
+        let (listener, _) = bind_control(&paths)
+            .expect("a dangling link must be cleared, not reported as `address in use` forever");
+        assert!(
+            std::fs::symlink_metadata(paths.control_sock())
+                .expect("the socket")
+                .file_type()
+                .is_socket(),
+            "the path must name this daemon's socket now, not the link"
+        );
+        drop(listener);
+    }
+
+    /// The sweep removes the **link**, never what the link points at.
+    ///
+    /// This is the property that makes widening the branch above safe,
+    /// and it is the one that would be catastrophic to get wrong: the
+    /// runtime directory is `0700`, so only the owner can plant a link
+    /// there, but the owner is also who would lose the file. `remove_file`
+    /// is `unlink(2)` and never follows a symlink — asserted here rather
+    /// than assumed, because the widening is what starts routing
+    /// *dangling* links into it and a future "tidy this up" that reached
+    /// for `fs::canonicalize` or `metadata` first would be silent.
+    ///
+    /// A characterization row, honestly: a link with an existing target
+    /// was already `exists() == true`, so this passed before the change
+    /// too. It is the invariant, not the regression.
+    #[tokio::test]
+    async fn the_stale_socket_sweep_unlinks_the_symlink_and_not_its_target() {
+        let paths = scratch("linktarget");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+
+        let precious = paths.dir().join("id_rsa");
+        std::fs::write(&precious, b"not a socket\n").expect("the link target");
+        std::os::unix::fs::symlink(&precious, paths.control_sock()).expect("plant the link");
+
+        let (listener, _) = bind_control(&paths).expect("bind over the link");
+
+        assert_eq!(
+            std::fs::read(&precious).expect("the target must still be there"),
+            b"not a socket\n",
+            "the sweep followed the link and unlinked its target instead"
+        );
         drop(listener);
     }
 
