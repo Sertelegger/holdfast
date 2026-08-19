@@ -45,7 +45,7 @@ set -uo pipefail
 # Only on the default path. An explicit argument names a binary the
 # caller has already produced -- CI passes `./target/release/clasp` after
 # its own `cargo build --release`, and `./scripts/mcp-smoke.sh /bin/true`
-# is the negative control that must fail all 37 checks -- so building in
+# is the negative control that must fail all 38 checks -- so building in
 # that case would either be wrong or a no-op.
 if [ "$#" -eq 0 ]; then
   if ! cargo build --workspace >&2; then
@@ -204,6 +204,14 @@ echo
 echo "--- checks ---"
 
 fails=0
+# Counted rather than transcribed: the total below is what `check`,
+# `absent` and `jcheck` actually ran, printed at the end of every run in
+# both directions. `CONTRIBUTING.md`'s "N checks" is a copy of this
+# number as last measured -- if the two disagree, this one is right,
+# because it comes from the run that just happened rather than from
+# memory. Two stale-count reviews in one milestone is why this is here
+# instead of a comment asking a future editor to remember.
+total=0
 
 # `check <description> <literal substring>` -- a byte-level assertion on
 # the transcript. `-F` on purpose: every pattern here is a literal, and
@@ -219,6 +227,7 @@ fails=0
 # object is the first thing the server writes) because that is when grep exits
 # earliest. Without `-q`, grep reads to EOF and the race does not exist.
 check() {
+  total=$((total + 1))
   if printf '%s' "$OUT" | grep -F -- "$2" >/dev/null; then
     echo "  ok    $1"
   else
@@ -246,6 +255,7 @@ check() {
 # session content, so the pair says "the secret is gone AND something
 # removed it" rather than "nothing came back".
 absent() {
+  total=$((total + 1))
   if printf '%s' "$OUT" | grep -F -- "$2" >/dev/null; then
     echo "  FAIL  $1"
     echo "        (the transcript contains: $2)"
@@ -276,6 +286,7 @@ def tool($n): tools | map(select(.name == $n)) | first;
 # filter that addresses nothing (`null`), a response that never arrived,
 # or a jq syntax error all fail rather than quietly agreeing.
 jcheck() {
+  total=$((total + 1))
   local got
   got="$(printf '%s\n' "$OUT" | jq -c -s "$JQ_HELPERS $2" 2>&1)"
   if [ "$got" = "$3" ]; then
@@ -288,6 +299,7 @@ jcheck() {
   fi
 }
 
+total=$((total + 1))
 if [ "$SERVER_STATUS" -ne 0 ]; then
   echo "  FAIL  server exited $SERVER_STATUS"
   fails=$((fails + 1))
@@ -303,26 +315,38 @@ fi
 # rmcp chooses, which is not a contract this project owns.
 jcheck "initialize advertises the tools capability" \
   'resp(1).result.capabilities.tools != null' 'true'
-# §5.5's `resources` capability, which this transport does serve.
-jcheck "initialize advertises the resources capability" \
-  'resp(1).result.capabilities.resources != null' 'true'
-# ...and **without** `listChanged`, which it cannot deliver. This check
-# read `.listChanged == true` and was green for the wrong reason: it
-# asserted the advertisement, and nothing anywhere asserted the delivery.
-# The forwarder that turns a `resource_list_changed` pulse into an MCP
-# notification is `ClaspServer::on_initialized`, which needs the MCP
-# peer; this script runs the DEFAULT transport, where that object lives
-# in the daemon and the pulse goes into a broadcast channel with zero
-# receivers. §7.4.1's streaming frames are reserved and unused in
-# v0.1.0, so nothing carries it across. Deferred to the milestone that
-# adds a server->client frame; see `mcp::shim_capabilities`.
+# §5.5's `resources` capability, present on this transport and
+# **without** `listChanged`, which it cannot deliver -- one `jcheck` over
+# both clauses, not two. It used to be two: presence, then
+# absence-of-listChanged. Splitting them was itself a bug, found by
+# running the negative control rather than by reading the diff:
+# `.capabilities.resources.listChanged` on a wholly *absent*
+# `capabilities.resources` is also `null` in jq, so the listChanged half
+# passed against a server that never started -- against `/bin/true` it
+# was the one check in this file (of 39) that stayed green. Anding
+# `resources != null` back in closes it, because that clause is false in
+# exactly the case that let the other one through, and the pair also
+# collapses two `jcheck`s into one, which is why the total below is 38.
 #
-# `null`, not `false`: `ResourcesCapability` is `#[non_exhaustive]`, so
-# an explicit `false` cannot be built from outside `rmcp`, and the field
-# is `skip_serializing_if = "Option::is_none"`. Asserting `!= true`
-# would also pass against the capability object vanishing entirely.
-jcheck "initialize does not advertise listChanged on the daemon transport" \
-  'resp(1).result.capabilities.resources.listChanged' 'null'
+# This check read `.listChanged == true` at one point and was green for
+# the wrong reason: it asserted the advertisement, and nothing anywhere
+# asserted the delivery. The forwarder that turns a
+# `resource_list_changed` pulse into an MCP notification is
+# `ClaspServer::on_initialized`, which needs the MCP peer; this script
+# runs the DEFAULT transport, where that object lives in the daemon and
+# the pulse goes into a broadcast channel with zero receivers. §7.4.1's
+# streaming frames are reserved and unused in v0.1.0, so nothing carries
+# it across. Deferred to the milestone that adds a server->client frame;
+# see `mcp::shim_capabilities`.
+#
+# `null`, not `false`, for the second clause: `ResourcesCapability` is
+# `#[non_exhaustive]`, so an explicit `false` cannot be built from
+# outside `rmcp`, and the field is `skip_serializing_if =
+# "Option::is_none"`.
+jcheck "initialize advertises resources without listChanged on the daemon transport" \
+  '[resp(1).result.capabilities.resources != null,
+    resp(1).result.capabilities.resources.listChanged]' \
+  '[true,null]'
 # The `instructions` string is the first thing an agent reads about this
 # server, and it described a four-tool 0.0.1 surface for the whole of
 # 0.0.2. Asserting the names rather than the prose keeps it honest
@@ -584,7 +608,7 @@ check "terminate reports ok" '"already_exited":false'
 
 echo
 if [ "$fails" -ne 0 ]; then
-  echo "SMOKE FAILED: $fails check(s) did not pass" >&2
+  echo "SMOKE FAILED: $fails of $total check(s) did not pass" >&2
   exit 1
 fi
-echo "SMOKE OK"
+echo "SMOKE OK ($total checks)"

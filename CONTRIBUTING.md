@@ -72,8 +72,11 @@ suites are *supposed* to be slow. `tests/screen.rs` and
 window and a 3 s stress run), so a materially faster result there means the
 scenario did not happen, not that the machine is quick.
 
-`scripts/mcp-smoke.sh` (37 checks) is **the only thing that drives the real
-JSON-RPC surface**. Every Rust test asserts against in-process objects, so a
+`scripts/mcp-smoke.sh` (38 checks — the script counts and prints its own
+total at the end of every run, `SMOKE OK (N checks)` or `SMOKE FAILED: F of N
+check(s) did not pass`, so this number is easy to re-verify and does not have
+to be taken on trust) is **the only thing that drives the real JSON-RPC
+surface**. Every Rust test asserts against in-process objects, so a
 bug that lives in serialisation — a tool whose `outputSchema` never reaches the
 wire, a doc comment the router drops, an enum serialised outside its declared
 vocabulary — is invisible to all of them and visible only here. Run it after
@@ -103,11 +106,12 @@ matched the PTY's echo of their own command line, and so passed against a
 session running `sleep 300` instead of a shell. The recurring class has a name
 here: **a test whose assertion is weaker than its name.**
 
-The smoke script is held to the same standard: it fails all 37 of its checks
+The smoke script is held to the same standard: it fails all 38 of its checks
 when pointed at `/bin/true`, so the script itself is known to be capable of
 failing. That is a check you can run, not a claim to take on trust —
-`./scripts/mcp-smoke.sh /bin/true` must report `SMOKE FAILED: 37 check(s) did
-not pass`, and a number lower than the passing run's is a check that went
+`./scripts/mcp-smoke.sh /bin/true` must report `SMOKE FAILED: 38 of 38
+check(s) did not pass`, and an `F of N` where `F` is less than `N`, or an `N`
+lower than the passing run's `SMOKE OK (N checks)`, is a check that went
 green against a server that never started.
 
 ### 2. Pair every positive assertion with the negative that separates it from the degenerate case
