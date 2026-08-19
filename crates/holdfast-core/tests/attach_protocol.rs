@@ -97,6 +97,25 @@ impl TestDaemon {
         (s, pty)
     }
 
+    /// A session on an arbitrary backend, for the one row that needs a
+    /// child which does not die the instant it is signalled.
+    fn session_on(&self, backend: Arc<dyn PtyBackend>) -> Arc<Session> {
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            backend,
+            SessionConfig::with_buffer_capacity(256 * 1024),
+        );
+        self.daemon
+            .server
+            .registry
+            .insert(Arc::clone(&s))
+            .expect("register");
+        s
+    }
+
     /// A session on a **real** PTY running a real shell.
     ///
     /// Three of Task 9's rows are not writable against `MockPty`: an echo
@@ -2607,28 +2626,53 @@ async fn both_attach_audit_rows_carry_the_role() {
     .await;
     assert!(matches!(recv(&mut obs).await, ServerFrame::Attached { .. }));
 
+    // **A third client, crossed: `ReadWrite` + `observer`.** Measured —
+    // without it, a row that derived `role` from `mode` produced the
+    // identical audit trail, because the first two clients use the two
+    // *conventional* pairings and nothing distinguished a field that was
+    // read from one that was inferred. §7.5's orthogonality paragraph is
+    // about exactly this, and Task 7 asserts it for the stream; this is
+    // the same claim for the trail.
+    let mut crossed = d.dial().await;
+    send(
+        &mut crossed,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Observer),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut crossed).await,
+        ServerFrame::Attached { .. }
+    ));
+
     send(&mut raw, &ClientFrame::Detach).await;
     send(&mut obs, &ClientFrame::Detach).await;
+    send(&mut crossed, &ClientFrame::Detach).await;
     expect_eof(&mut raw, "after Detach").await;
     expect_eof(&mut obs, "after Detach").await;
+    expect_eof(&mut crossed, "after Detach").await;
 
-    let connects = audit_entries(&d, "attach_connect", 2).await;
-    let disconnects = audit_entries(&d, "attach_disconnect", 2).await;
-    assert_eq!(connects.len(), 2, "attach_connect rows: {connects:?}");
+    let connects = audit_entries(&d, "attach_connect", 3).await;
+    let disconnects = audit_entries(&d, "attach_disconnect", 3).await;
+    assert_eq!(connects.len(), 3, "attach_connect rows: {connects:?}");
     assert_eq!(
         disconnects.len(),
-        2,
+        3,
         "attach_disconnect rows: {disconnects:?}"
     );
 
+    let expected = vec![
+        "interactive".to_string(),
+        "observer".to_string(),
+        "observer".to_string(),
+    ];
     assert_eq!(
         roles_of(&connects),
-        vec!["interactive".to_string(), "observer".to_string()],
+        expected,
         "attach_connect: {connects:?}"
     );
     assert_eq!(
         roles_of(&disconnects),
-        vec!["interactive".to_string(), "observer".to_string()],
+        expected,
         "attach_disconnect is the half a connect-only assertion cannot \
          see, and rev. 33's normative paragraph exists to prevent exactly \
          its omission: {disconnects:?}"
@@ -2650,8 +2694,27 @@ async fn both_attach_audit_rows_carry_the_role() {
     modes.sort();
     assert_eq!(
         modes,
-        vec!["ReadOnly".to_string(), "ReadWrite".to_string()],
+        vec![
+            "ReadOnly".to_string(),
+            "ReadWrite".to_string(),
+            "ReadWrite".to_string()
+        ],
         "§9.4's `mode` column is CamelCase, the wire spelling: {connects:?}"
+    );
+    // And the crossed client is really crossed on the wire: one row is
+    // `ReadWrite` **and** `observer`, which is the pairing a derived
+    // `role` cannot produce.
+    assert!(
+        connects
+            .iter()
+            .any(|e| e["mode"] == "ReadWrite" && e["role"] == "observer"),
+        "the crossed pairing did not survive into the trail: {connects:?}"
+    );
+    assert!(
+        disconnects
+            .iter()
+            .any(|e| e["mode"] == "ReadWrite" && e["role"] == "observer"),
+        "the crossed pairing did not survive into the disconnect row: {disconnects:?}"
     );
 }
 
@@ -2932,21 +2995,91 @@ async fn daemon_shutdown_outranks_session_exit() {
     // session, and §7.5 fixes which one the wire carries. Picking
     // whichever fires first is a race — and the wrong answer tells a
     // reconnecting client a child died when the daemon went away.
+    //
+    // **The fixture is the whole row, and the obvious one cannot fail.**
+    // Measured: with `Daemon::shutdown()` and a `MockPty` — which dies
+    // inside `signal()` — the flag and the kill happen microseconds
+    // apart while the reader thread needs a `READER_IDLE_POLL` to notice,
+    // so the shutdown is *always* visible first and the ordering rule is
+    // never exercised. A mutation that deleted the tie-break **and**
+    // inverted the `select!`'s bias left that version of this row green.
+    //
+    // `SlowTerminatePty` creates the window the rule exists for: SIGTERM
+    // starts a timer, the child dies ~120 ms later, the reader thread
+    // sees it within 5 ms, and `shutdown_graceful`'s 50 ms poll has not
+    // yet reached its "all dead" break — so the exit is observed *first*
+    // and only `shutdown_requested()`, raised at the method's first
+    // statement, can still tell the connection why.
     let d = TestDaemon::start("shutdownwins").await;
-    let (s, _pty) = d.session(None);
+    let inner = Arc::new(MockPty::new());
+    let s =
+        d.session_on(Arc::new(SlowTerminatePty::new(Arc::clone(&inner))) as Arc<dyn PtyBackend>);
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
-    // `shutdown` SIGKILLs every live session **and then** signals, so the
-    // session really does end here; this is not a shutdown with nothing
-    // to race against.
-    d.daemon.shutdown();
+    d.daemon.shutdown_graceful(Duration::from_secs(10)).await;
 
     assert_eq!(
         next_detached(&mut c, 10).await,
         "daemon_shutdown",
         "the session ended because the daemon was stopping, and §7.5 says \
-         so on the wire"
+         so on the wire — picking whichever event fired first answers \
+         `session_exit` here"
     );
+    // The fixture really did produce the ordering the row needs: the
+    // child was signalled and did end. Without this the row could pass
+    // against a daemon that reported `daemon_shutdown` for a session that
+    // was never touched.
+    assert!(!s.is_alive(), "the fixture's child never died");
+}
+
+/// A backend whose child takes its time dying.
+///
+/// `MockPty::signal` marks the child dead **inside the call**, so with it
+/// every shutdown is observed before the death it caused and
+/// `daemon_shutdown_outranks_session_exit` has no race to adjudicate.
+/// Here `Terminate` starts a timer instead, which is what a real child
+/// does.
+#[derive(Debug)]
+struct SlowTerminatePty {
+    inner: Arc<MockPty>,
+}
+
+impl SlowTerminatePty {
+    fn new(inner: Arc<MockPty>) -> Self {
+        Self { inner }
+    }
+}
+
+impl PtyBackend for SlowTerminatePty {
+    fn write(&self, data: &[u8]) -> holdfast_core::Result<()> {
+        self.inner.write(data)
+    }
+    fn read(&self, buf: &mut [u8]) -> holdfast_core::Result<usize> {
+        self.inner.read(buf)
+    }
+    fn signal(&self, sig: Signal) -> holdfast_core::Result<()> {
+        if matches!(sig, Signal::Terminate) {
+            let inner = Arc::clone(&self.inner);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                inner.exit(0);
+            });
+            return Ok(());
+        }
+        self.inner.signal(sig)
+    }
+    fn resize(&self, cols: u16, rows: u16) -> holdfast_core::Result<()> {
+        self.inner.resize(cols, rows)
+    }
+    fn is_alive(&self) -> bool {
+        self.inner.is_alive()
+    }
+    fn exit_code(&self) -> Option<i32> {
+        self.inner.exit_code()
+    }
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
 }
 
 #[tokio::test]
