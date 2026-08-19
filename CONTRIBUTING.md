@@ -5,9 +5,10 @@ have to pass, and the two testing standards this project actually enforces —
 they are unusual enough that they trip people up, and they are the reason the
 suite is worth anything.
 
-CLASP is **early**. Milestones 0.0.1 through 0.0.4 are merged, nothing is
-released, and the surface moves. [ROADMAP.md](./ROADMAP.md) shows what is being built
-next; opening an issue before a large change is appreciated.
+CLASP is **early**. Milestones 0.0.1 through 0.0.5 have landed on `main`,
+nothing is released, and the surface moves. [ROADMAP.md](./ROADMAP.md) shows
+what is being built next; opening an issue before a large change is
+appreciated.
 
 ## Development setup
 
@@ -27,9 +28,13 @@ To point Claude Code at your build:
 claude mcp add --scope user clasp -- "$(pwd)/target/debug/clasp" mcp
 ```
 
-`clasp mcp` speaks MCP over stdio and is the only subcommand that does anything
-(`clasp version` prints the version). The daemon, `attach`, and the rest of the
-CLI are later milestones.
+`clasp mcp [--no-daemon]` speaks MCP over stdio. By default it runs in
+**hybrid mode**: it auto-spawns a background `clasp daemon` that owns the
+sessions, so they outlive the MCP client that started them. `clasp daemon
+run|start|stop [--force]|status [--json]`, `clasp list [--json]`, `clasp logs
+<session> [--tail N] [--raw]`, and `clasp version` are all live subcommands.
+`clasp attach`, `watch`, `ui`, `confirm`, and the dangerous-command preflight
+are later milestones — see [ROADMAP.md](./ROADMAP.md).
 
 ## The checks
 
