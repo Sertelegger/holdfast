@@ -14,6 +14,136 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+const SECS_PER_DAY: u64 = 86_400;
+
+/// The two §19.1 retention windows, in §19.1's own units — days for the
+/// audit log, **weeks** for the daemon log. The asymmetry is deliberate:
+/// the two rotation periods differ, and `deny_unknown_fields` makes a
+/// renamed knob a daemon that rejects the spec's own config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogRetention {
+    pub audit_days: u32,
+    pub daemon_log_weeks: u32,
+}
+
+impl Default for LogRetention {
+    fn default() -> Self {
+        Self {
+            audit_days: 14,
+            daemon_log_weeks: 4,
+        }
+    }
+}
+
+impl From<&crate::config::Config> for LogRetention {
+    fn from(c: &crate::config::Config) -> Self {
+        Self {
+            audit_days: c.daemon.audit_retention_days,
+            daemon_log_weeks: c.daemon.daemon_log_retention_weeks,
+        }
+    }
+}
+
+/// What one sweep did, so a caller can log it and a test can assert it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LogSweep {
+    /// Files that were created by a rotation on this pass.
+    pub rotated: Vec<PathBuf>,
+    /// Rotated files removed because they aged past their window.
+    pub removed: Vec<PathBuf>,
+}
+
+/// Which boundary a log rolls on (§19.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Period {
+    Daily,
+    Weekly,
+}
+
+impl Period {
+    /// The stamp that names the period a timestamp falls in. Two
+    /// timestamps in the same period produce the same stamp, which is
+    /// the whole of the roll predicate.
+    fn stamp(self, at: SystemTime) -> String {
+        let at: chrono::DateTime<chrono::Utc> = at.into();
+        match self {
+            // ISO year-week for the weekly log, so the last days of
+            // December do not roll into the next January's stamp.
+            Self::Weekly => at.format("%G-W%V").to_string(),
+            Self::Daily => at.format("%Y-%m-%d").to_string(),
+        }
+    }
+}
+
+/// Roll `log` if its newest byte was written in an earlier period.
+///
+/// Returns the path the old content now lives at, or `None` when the
+/// file is absent, empty, or still inside its period.
+fn rotate(log: &Path, period: Period, now: SystemTime) -> io::Result<Option<PathBuf>> {
+    let meta = match std::fs::metadata(log) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // An empty log has nothing to preserve, and rotating it would
+    // produce a directory of empty files on a daemon nobody used.
+    if meta.len() == 0 {
+        return Ok(None);
+    }
+    let written = meta.modified()?;
+    if period.stamp(written) == period.stamp(now) {
+        return Ok(None);
+    }
+    let name = log
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = log.parent().unwrap_or(Path::new("."));
+    let base = period.stamp(written);
+    // A second roll into the same stamp is possible when a daemon is
+    // restarted after a long gap; suffix rather than overwrite, because
+    // overwriting destroys the trail the rotation exists to preserve.
+    let mut target = dir.join(format!("{name}.{base}"));
+    let mut n = 1;
+    while target.exists() {
+        target = dir.join(format!("{name}.{base}.{n}"));
+        n += 1;
+    }
+    std::fs::rename(log, &target)?;
+    Ok(Some(target))
+}
+
+/// Delete every `<prefix>*` file in `dir` last written more than
+/// `window` ago. The **current** log never matches, because `prefix`
+/// carries the trailing dot a rotated name has and a live one does not.
+fn retire(dir: &Path, prefix: &str, window: Duration, now: SystemTime) -> io::Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        if !meta.is_file() {
+            continue;
+        }
+        let age = match now.duration_since(meta.modified()?) {
+            Ok(a) => a,
+            // A file stamped in the future is not old.
+            Err(_) => continue,
+        };
+        if age > window {
+            let path = entry.path();
+            std::fs::remove_file(&path)?;
+            removed.push(path);
+        }
+    }
+    removed.sort();
+    Ok(removed)
+}
 
 /// Selects a CLASP *instance* (§7.1). Overrides discovery entirely and
 /// relocates the sockets, the pid file, the lock file and the daemon log.
@@ -244,6 +374,56 @@ impl RuntimePaths {
         Ok(())
     }
 
+    /// Rotate the two §19.1 logs and delete what has aged out
+    /// (REQ-SEC-009).
+    ///
+    /// §19.1 specifies **two** mechanisms per log and neither works
+    /// alone: with nothing rotating there is only ever one `audit.log`
+    /// and one `daemon.log`, and the retention sweep has nothing to
+    /// choose between.
+    ///
+    /// | Log | Rotate | Retain | Knob |
+    /// |---|---|---|---|
+    /// | `audit.log` | daily | 14 days | `[daemon] audit_retention_days` |
+    /// | `daemon.log` | weekly | 4 weeks | `[daemon] daemon_log_retention_weeks` |
+    ///
+    /// Rolls on the **period boundary** rather than on a size threshold:
+    /// the retention windows are expressed in time, so a size-triggered
+    /// roll makes "14 days" mean "14 files of unknown age".
+    ///
+    /// **Do not call this with an open handle on `audit.log`.** The
+    /// daemon holds one for the process's lifetime, so the sweep either
+    /// runs before that handle is taken — which is what `server::run`
+    /// does at startup — or is followed by [`crate::audit::AuditLog::reopen`],
+    /// which is what the periodic sweep does. A rename that leaves the
+    /// daemon appending to an unlinked inode silently discards §9.4's
+    /// trail while every file on disk looks correct.
+    pub fn sweep_logs(&self, retention: LogRetention, now: SystemTime) -> io::Result<LogSweep> {
+        let mut sweep = LogSweep::default();
+        if !self.log_dir.exists() {
+            return Ok(sweep);
+        }
+        if let Some(to) = rotate(&self.audit_log(), Period::Daily, now)? {
+            sweep.rotated.push(to);
+        }
+        if let Some(to) = rotate(&self.daemon_log(), Period::Weekly, now)? {
+            sweep.rotated.push(to);
+        }
+        sweep.removed.extend(retire(
+            &self.log_dir,
+            "audit.log.",
+            Duration::from_secs(u64::from(retention.audit_days) * SECS_PER_DAY),
+            now,
+        )?);
+        sweep.removed.extend(retire(
+            &self.log_dir,
+            "daemon.log.",
+            Duration::from_secs(u64::from(retention.daemon_log_weeks) * 7 * SECS_PER_DAY),
+            now,
+        )?);
+        Ok(sweep)
+    }
+
     fn check_socket_path_length(&self) -> io::Result<()> {
         let path = self.control_sock();
         let len = path.as_os_str().len();
@@ -287,6 +467,308 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    // ------------------------------------------- §19.1 rotation/retention
+
+    fn days(n: u64) -> Duration {
+        Duration::from_secs(n * SECS_PER_DAY)
+    }
+
+    /// Backdate a file's mtime, which is how the rotation predicate and
+    /// the retention window are driven without waiting a fortnight.
+    fn backdate(path: &Path, by: Duration) {
+        let f = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for set_times");
+        let when = SystemTime::now() - by;
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("set mtime");
+    }
+
+    fn write(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn rotation_starts_a_new_file_and_leaves_the_old_one_readable() {
+        let dir = temp_dir("rot");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+
+        write(&paths.audit_log(), "{\"kind\":\"before\"}\n");
+        backdate(&paths.audit_log(), days(1));
+
+        let now = SystemTime::now();
+        let sweep = paths.sweep_logs(LogRetention::default(), now).unwrap();
+        assert_eq!(sweep.rotated.len(), 1, "the daily boundary was crossed");
+        let rolled = &sweep.rotated[0];
+
+        // Rotation by truncation satisfies "a new file started" and
+        // destroys the trail it was supposed to preserve. The old
+        // content must still be readable from the rotated file.
+        assert_eq!(
+            std::fs::read_to_string(rolled).unwrap(),
+            "{\"kind\":\"before\"}\n",
+            "the rotated file lost the entries it was rotated to keep"
+        );
+        assert!(
+            !paths.audit_log().exists(),
+            "the live path is free for a fresh file"
+        );
+        write(&paths.audit_log(), "{\"kind\":\"after\"}\n");
+        assert_eq!(
+            std::fs::read_to_string(paths.audit_log()).unwrap(),
+            "{\"kind\":\"after\"}\n"
+        );
+    }
+
+    #[test]
+    fn a_log_written_inside_its_period_is_not_rotated() {
+        // The pairing: a sweep that rotates unconditionally passes the
+        // row above perfectly and shreds a busy daemon's log every 24 h.
+        let dir = temp_dir("norot");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+        write(&paths.audit_log(), "{\"kind\":\"today\"}\n");
+        write(&paths.daemon_log(), "INFO up\n");
+
+        let sweep = paths
+            .sweep_logs(LogRetention::default(), SystemTime::now())
+            .unwrap();
+        assert!(sweep.rotated.is_empty(), "rotated inside the period");
+        assert!(paths.audit_log().exists());
+        assert!(paths.daemon_log().exists());
+    }
+
+    #[test]
+    fn the_daemon_log_rolls_weekly_and_the_audit_log_daily() {
+        // The two periods are different, and a sweep that used one for
+        // both is invisible to every single-log test.
+        let dir = temp_dir("period");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+        write(&paths.audit_log(), "a\n");
+        write(&paths.daemon_log(), "d\n");
+        // Two days back: past the daily boundary, and — because the
+        // stamp is an ISO year-week — not necessarily past the weekly
+        // one. Assert the audit log rolled; say nothing about the daemon
+        // log, whose answer depends on which weekday the suite runs.
+        backdate(&paths.audit_log(), days(2));
+        backdate(&paths.daemon_log(), days(2));
+        let sweep = paths
+            .sweep_logs(LogRetention::default(), SystemTime::now())
+            .unwrap();
+        assert!(
+            sweep.rotated.iter().any(|p| p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("audit.log.")),
+            "a two-day-old audit log is past its daily boundary"
+        );
+
+        // Now push the daemon log far enough back that no ISO week
+        // ambiguity remains, and assert it rolls on *its* boundary.
+        write(&paths.daemon_log(), "d2\n");
+        backdate(&paths.daemon_log(), days(10));
+        let sweep = paths
+            .sweep_logs(LogRetention::default(), SystemTime::now())
+            .unwrap();
+        assert!(
+            sweep.rotated.iter().any(|p| p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("daemon.log.")),
+            "a ten-day-old daemon log is past its weekly boundary"
+        );
+    }
+
+    #[test]
+    fn retention_deletes_only_what_is_older_than_the_window() {
+        let dir = temp_dir("retain");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+
+        let keep = paths.log_dir().join("audit.log.2026-08-05");
+        let drop = paths.log_dir().join("audit.log.2026-08-03");
+        write(&keep, "kept\n");
+        write(&drop, "dropped\n");
+        backdate(&keep, days(13));
+        backdate(&drop, days(15));
+
+        let sweep = paths
+            .sweep_logs(
+                LogRetention {
+                    audit_days: 14,
+                    daemon_log_weeks: 4,
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        // The surviving file is the half that catches a sweep which
+        // deletes everything; the removed one catches an off-by-one that
+        // keeps forever.
+        assert!(keep.exists(), "a 13-day-old file is inside a 14-day window");
+        assert!(!drop.exists(), "a 15-day-old file is outside it");
+        assert_eq!(sweep.removed, vec![drop]);
+    }
+
+    #[test]
+    fn retention_never_deletes_the_live_log() {
+        // The discriminator is the trailing dot: `audit.log.` matches a
+        // rotated file and not the live one. A sweep written as
+        // `starts_with("audit.log")` deletes the file the daemon is
+        // appending to the first time the daemon outlives its window,
+        // and every rotated-file test above passes against it.
+        let dir = temp_dir("retain-live");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+
+        let live = paths.audit_log();
+        let rolled = paths.log_dir().join("audit.log.2026-01-01");
+        write(&live, "live\n");
+        write(&rolled, "rolled\n");
+        backdate(&live, days(400));
+        backdate(&rolled, days(400));
+
+        let removed = retire(&paths.log_dir(), "audit.log.", days(14), SystemTime::now()).unwrap();
+        assert_eq!(removed, vec![rolled.clone()]);
+        assert!(!rolled.exists());
+        assert!(
+            live.exists(),
+            "the live log was retired — a daemon older than its own retention window \
+             loses the file it is writing to"
+        );
+    }
+
+    #[test]
+    fn a_second_roll_into_one_stamp_does_not_overwrite_the_first() {
+        let dir = temp_dir("twice");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+
+        write(&paths.audit_log(), "first\n");
+        backdate(&paths.audit_log(), days(1));
+        let a = paths
+            .sweep_logs(LogRetention::default(), SystemTime::now())
+            .unwrap()
+            .rotated
+            .remove(0);
+        write(&paths.audit_log(), "second\n");
+        backdate(&paths.audit_log(), days(1));
+        let b = paths
+            .sweep_logs(LogRetention::default(), SystemTime::now())
+            .unwrap()
+            .rotated
+            .remove(0);
+
+        assert_ne!(a, b, "the second roll overwrote the first day's trail");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "first\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "second\n");
+    }
+
+    #[test]
+    fn an_empty_log_is_not_rotated() {
+        let dir = temp_dir("empty");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+        write(&paths.audit_log(), "");
+        backdate(&paths.audit_log(), days(30));
+        let sweep = paths
+            .sweep_logs(LogRetention::default(), SystemTime::now())
+            .unwrap();
+        assert!(
+            sweep.rotated.is_empty(),
+            "a daemon nobody used would accrue a directory of empty files"
+        );
+    }
+
+    #[test]
+    fn the_retention_window_comes_from_the_config_file() {
+        let cfg = crate::config::parse_str(
+            "[daemon]\naudit_retention_days = 3\ndaemon_log_retention_weeks = 1\n",
+        )
+        .expect("loads");
+        assert_eq!(
+            LogRetention::from(&cfg),
+            LogRetention {
+                audit_days: 3,
+                daemon_log_weeks: 1
+            }
+        );
+        // Paired with the default, so a conversion that ignored the
+        // config and returned `Default::default()` is red above.
+        assert_eq!(
+            LogRetention::from(&crate::config::Config::default()),
+            LogRetention::default()
+        );
+        // And the window it produces actually bites: a 4-day-old file is
+        // outside a 3-day window and inside the 14-day default.
+        let dir = temp_dir("window");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+        let f = paths.log_dir().join("audit.log.2026-08-14");
+        write(&f, "x\n");
+        backdate(&f, days(4));
+        paths
+            .sweep_logs(LogRetention::default(), SystemTime::now())
+            .unwrap();
+        assert!(f.exists(), "4 days is inside the 14-day default");
+        paths
+            .sweep_logs(LogRetention::from(&cfg), SystemTime::now())
+            .unwrap();
+        assert!(!f.exists(), "4 days is outside the configured 3-day window");
+    }
+
+    #[test]
+    fn the_daemon_keeps_writing_across_a_rotation() {
+        use crate::audit::AuditLog;
+        use crate::output::rules::builtin_shared;
+
+        let dir = temp_dir("across");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+
+        let log = AuditLog::to_path(paths.audit_log(), builtin_shared()).expect("open audit log");
+        log.record("before", None, serde_json::json!({}));
+        backdate(&paths.audit_log(), days(1));
+
+        let sweep = paths
+            .sweep_logs(LogRetention::default(), SystemTime::now())
+            .unwrap();
+        assert_eq!(sweep.rotated.len(), 1);
+        // The reopen is the whole point: without it the next `record`
+        // lands in an unlinked inode, every file on disk looks correct,
+        // and §9.4's trail stops.
+        log.reopen().expect("reopen after rotation");
+        log.record("after", None, serde_json::json!({}));
+
+        let current = std::fs::read_to_string(paths.audit_log()).expect("the live log exists");
+        assert!(
+            current.contains("\"after\""),
+            "the entry landed somewhere other than the current file: {current:?}"
+        );
+        assert!(
+            !current.contains("\"before\""),
+            "the pre-rotation entry is in the rotated file, not this one"
+        );
+        assert!(std::fs::read_to_string(&sweep.rotated[0])
+            .unwrap()
+            .contains("\"before\""));
     }
 
     #[test]

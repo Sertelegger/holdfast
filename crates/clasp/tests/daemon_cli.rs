@@ -74,7 +74,36 @@ impl TestEnv {
     fn cmd(&self) -> Command {
         let mut c = Command::new(BIN);
         c.env("CLASP_RUNTIME_DIR", &self.dir);
+        // §10.1's discovery is `$XDG_CONFIG_HOME/clasp/config.toml`, and
+        // `CLASP_RUNTIME_DIR` deliberately does **not** move it
+        // (REQ-CFG-005 is instance selection, not a configuration knob).
+        // So a test that did not set this would run the daemon against
+        // the *developer's* `~/.config/clasp/config.toml` — the same
+        // class of leak `audit_log()` closes for `~/.clasp/logs`, and
+        // the reason a config assertion here could otherwise mean
+        // nothing. Absent by default, which resolves to `Config::default`.
+        c.env("XDG_CONFIG_HOME", self.dir.join("xdg-config"));
         c
+    }
+
+    /// Write this instance's `config.toml` at the path §10.1 discovers.
+    fn write_config(&self, body: &str) {
+        // The runtime directory itself must be created `0700` here,
+        // because writing the config is what brings it into existence
+        // and `ensure_dir` **refuses** a group- or world-writable
+        // directory rather than tightening it. A plain `create_dir_all`
+        // takes the umask, and on a machine with a `0002` umask the
+        // daemon then declines to start for a reason that has nothing to
+        // do with the config under test.
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.dir)
+            .expect("create runtime dir 0700");
+        let dir = self.dir.join("xdg-config").join("clasp");
+        std::fs::create_dir_all(&dir).expect("create config dir");
+        std::fs::write(dir.join("config.toml"), body).expect("write config.toml");
     }
 
     fn run(&self, args: &[&str]) -> (i32, String, String) {
@@ -982,4 +1011,80 @@ fn an_unknown_subcommand_is_a_usage_error() {
     let (code, _, err) = env.run(&["nonsense"]);
     assert_eq!(code, 64, "§18.8: usage errors are exit 64");
     assert!(err.contains("USAGE"), "{err}");
+}
+
+#[test]
+fn an_invalid_config_stops_the_daemon_before_it_binds() {
+    // REQ-CFG-003's normative consequence, and the reason 0.0.5 owns the
+    // config file at all: an invalid config rejects daemon *startup*.
+    let env = TestEnv::new("badcfg");
+    env.write_config("[limits]\nmax_concurrent_sessions = 0\n");
+
+    let (code, _, err) = env.run(&["daemon", "run"]);
+    assert_ne!(code, 0, "an invalid config must not start a daemon");
+    assert!(
+        err.contains("max_concurrent_sessions"),
+        "the error names the offending key; got: {err}"
+    );
+    // **This is the assertion that separates rejecting from warning.**
+    // Both print something; only one leaves no socket behind.
+    assert!(
+        !env.dir.join("control.sock").exists(),
+        "a daemon that logged a warning and started anyway is the failure \
+         mode REQ-CFG-003 exists to prevent"
+    );
+}
+
+#[test]
+fn an_unknown_key_in_the_config_stops_the_daemon_and_names_it() {
+    let env = TestEnv::new("unkcfg");
+    env.write_config("[limits]\nmax_concurent_sessions = 4\n");
+    let (code, _, err) = env.run(&["daemon", "run"]);
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("max_concurent_sessions"),
+        "§10.1: an unknown key is a load error and the error names the key; got: {err}"
+    );
+    assert!(!env.dir.join("control.sock").exists());
+}
+
+#[test]
+fn a_valid_config_starts_the_daemon_and_reaches_it() {
+    // **The pairing, and it is what makes the two rows above mean
+    // anything.** Without it they pass against a `daemon run` that
+    // refuses every config, or against one that cannot start at all.
+    let env = TestEnv::new("okcfg");
+    env.write_config("[limits]\nmax_concurrent_sessions = 3\n");
+
+    let (code, _, err) = env.run(&["daemon", "start"]);
+    assert_eq!(code, 0, "a valid config must start: {err}");
+    assert!(env.dir.join("control.sock").exists(), "the socket is bound");
+
+    // Non-vacuous: the daemon answers, so "started" is not just a file.
+    let (code, out, _) = env.run(&["daemon", "status", "--json"]);
+    assert_eq!(code, 0);
+    let status: Value = serde_json::from_str(&out).expect("status --json");
+    assert_eq!(status["sessions_live"], 0);
+
+    env.run(&["daemon", "stop"]);
+}
+
+#[test]
+fn the_published_example_config_starts_a_real_daemon() {
+    // §10.2 is a fixture, not an illustration: the operator's copy-paste
+    // has to *start a daemon*, not merely deserialise. This is the one
+    // arm the in-process loader test cannot carry — it proves the whole
+    // startup path accepts the published example, validation included.
+    let env = TestEnv::new("examplecfg");
+    let example = include_str!("../../clasp-core/tests/fixtures/example_config.toml");
+    env.write_config(example);
+
+    let (code, _, err) = env.run(&["daemon", "start"]);
+    assert_eq!(
+        code, 0,
+        "a config rejected for being correct is worse than one accepted \
+         for being wrong: {err}"
+    );
+    assert!(env.dir.join("control.sock").exists());
+    env.run(&["daemon", "stop"]);
 }

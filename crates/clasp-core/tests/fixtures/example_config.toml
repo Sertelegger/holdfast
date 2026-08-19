@@ -1,0 +1,214 @@
+[limits]
+max_concurrent_sessions = 8
+default_idle_timeout_secs = 1800
+output_buffer_bytes = 1048576
+read_output_default_max_bytes = 32768
+read_output_hard_max_bytes = 262144
+resource_read_max_bytes = 4194304
+output_broadcast_capacity = 256
+# v0.1.0 ships with one outstanding secret request per session
+# hardcoded; this knob is reserved and ignored (will become
+# configurable when multi-prompt UX is properly designed in v0.2+).
+max_outstanding_secret_requests_per_session = 1
+redaction_lookbehind_bytes = 512
+redaction_lookahead_bytes = 8192
+# Targeted holdback (§4.1): trailing region scanned for a secret prefix
+# that is still arriving. The read stops at the partial, not at a fixed
+# byte count -- so ordinary output is never held back at all.
+partial_secret_scan_bytes = 512
+prefilter_prefix_expansion_limit = 64
+# How long an unfinished trailing ANSI escape may withhold the tail of a
+# read before it is treated as malformed and dropped (§4.1).
+ansi_incomplete_max_bytes = 64
+# Hard cap on wait_for_pattern timeout. timeout_secs=0 means "no
+# caller deadline" but the daemon still bounds the wait here.
+wait_for_pattern_max_timeout_secs = 3600
+# File transfer (§5.7)
+file_transfer_chunk_bytes = 65536
+file_transfer_max_bytes = 104857600
+# Command history ring (§5.2 get_command_history)
+command_history_max_entries = 1000
+
+[terminal]
+# Full VT100 emulation (cursor grid, screen diffing) is expensive on the
+# write path -- ~86 MB/s measured. "adaptive" turns it on only when the
+# agent asks for screen state, when a TUI enters the alternate screen,
+# or when no deterministic prompt signal appears (non-readline program).
+# See §4.5.
+screen_tracking_default = "adaptive"
+screen_tracking_idle_disable_secs = 300
+# Answer the closed terminal-query set of §4.5.1 (Primary DA only).
+# Measured: fish 4.8.1 reaches its first prompt in 0.02 s with this on
+# and 10.04 s with it off. Replies are written into the child's input,
+# so a session that must be byte-exact about that can disable it.
+terminal_queries = true
+terminal_query_replies_per_min = 60
+
+# Inject OSC 133 semantic markers so command boundaries and exit codes
+# are exact rather than inferred (§8.5). Silently no-ops on shells that
+# don't support it.
+shell_integration = true
+
+[prompts]
+# Only used as the tier-3 fallback (§8.6); tiers 1 and 2 are deterministic.
+settle_threshold_ms = 250
+# Cursor sub-signal (§8.6). Trailing characters that suggest a prompt when
+# the cursor sits just after them, and how many stable samples are required
+# before the signal is trusted.
+cursor_prompt_chars = "$%#>):❯"
+cursor_stable_samples = 3
+extra_patterns = [
+    { regex = '\(myapp\)\s*$', score = 0.9 },
+]
+
+[security]
+redaction_enabled = true
+# A user rule joins the built-in set (§9.2) and is compiled with it, so
+# it carries the same fields. `name` is the override key; `kind` is the
+# marker text, since redacted output reads [REDACTED:<kind>]; and `kind`
+# may not be "unresolved", which is reserved for a match the redactor
+# could not resolve (REQ-O-011a). The example below carried no `kind`
+# and could therefore not have produced a marker at all.
+# §15.1 records the one part of this schema the spec does not settle:
+# whether a user rule must supply the positive and negative examples the
+# shipped compiler requires of every built-in rule.
+extra_redaction_patterns = [
+    { name = "internal-token", kind = "internal-token", regex = 'INT_[A-Z0-9]{32}' },
+]
+# No preflight kill switch. dangerous_commands_enabled stood here and no
+# section defined its `false` branch: §9.3 specifies the preflight and
+# names no way to turn it off, and §14.4 defers operator-configurable
+# command policy to §14.3's policy.toml. A `false` that worked would make
+# REQ-T-002, REQ-SEC-001, REQ-SEC-001a and REQ-SEC-002 falsifiable from a
+# config file, which is the http_socket_path shape; and unlike the kill
+# switch this file does carry, it would leave no trace --
+# redaction_enabled is auditable because §9.4's session_start row carries
+# it on every session, with redaction_disabled recording each per-call
+# opt-out beside it, and nothing at all records that preflight was off. Withdrawn on that rubric: no
+# normative owner, published here, honoured by nothing. If it returns it
+# returns through policy.toml, with an audit kind of its own.
+# Secret resolution (§9.6): "prompt" (ask a human), "keychain" (resolve
+# from the OS credential store via an operator-configured binding), or
+# "both" (try keychain, fall back to prompting).
+secret_provider = "prompt"
+# When true, a detected echo-off prompt (§8.3 AwaitingSecret) with a
+# matching binding is filled automatically with no agent tool call.
+# Off by default: silent credential injection is opt-in per deployment.
+autofill_on_echo_off = false
+# When true, dangerous-command confirmation requires a code (shown only
+# via trusted UI surfaces -- web UI dashboard or `clasp confirm` CLI) in
+# addition to the agent-held token. Agent never receives the code.
+# Default false: relies on the MCP client's tool-call permission UI.
+# See §9.3.1 for the trust model and the residual-risk note (§9.3 itself
+# is four lines of preamble and carries neither).
+strict_confirmation = false
+
+# Operator-configured secret bindings (§9.6). The agent supplies only
+# the session id and the prompt text -- it cannot name a secret. CLASP
+# matches the session's own command line AND the observed prompt, so
+# there is no "fetch me arbitrary credential" API.
+#
+# This array-of-tables is LAST in [security] deliberately. Uncommenting
+# it opens a sub-table, and every bare key that followed would belong to
+# that sub-table instead of to [security]. strict_confirmation used to
+# sit below it: an operator who uncommented the example and set it true
+# got security.secret_bindings[0].strict_confirmation -- valid TOML, a
+# daemon not in strict mode, and no error at any layer.
+# [[security.secret_bindings]]
+# `name` is the override key and the only part of a binding any surface
+# shows: BindingApprovalRequired (§7.5), GET /api/binding-approvals
+# (§7.6.3), and the binding_resolved / binding_approval audit kinds
+# (§18.7) all carry `binding_name` and nothing else identifying. Four
+# consumers, and until rev. 48 no block defined the field they read.
+# name            = "prod-ssh"
+# match_command   = "^ssh\\s+(\\S+@)?prod-0[12]\\b"
+# match_prompt    = "(?i)password"
+# provider        = "secret-service"
+# reference       = "service=clasp,account=prod-ssh"
+# max_uses        = 20
+# require_confirm = false
+
+[ui]
+# No socket-path knob. All three sockets live in the runtime directory
+# §7.1 discovers, and none of them is individually relocatable: a knob
+# that moved one socket out of that directory would put it outside the
+# 0700 verification §7.1 performs on the directory, and would let two
+# daemons under different CLASP_RUNTIME_DIRs share an http.sock while
+# disagreeing about which instance they are — which is the property
+# REQ-CFG-005's integration test asserts. http_socket_path was the only
+# such knob and is withdrawn; it had no use case §7.1 does not serve.
+# By default, clasp ui picks a free ephemeral port. Setting a value here
+# pins the port (useful when an SSH port-forward expects a known port).
+# 0 = ephemeral (default); any other value = pinned port.
+ui_bridge_pinned_port = 0
+# Bearer-token TTLs for the web UI bridge:
+ui_token_idle_ttl_secs = 3600     # refresh on activity, default 60 min
+ui_token_absolute_ttl_secs = 14400 # hard cap regardless of activity, default 4h
+# Cap on live bridge registrations; a bridge/register beyond it is
+# refused with limit_reached (§7.6.1, §18.3).
+max_bridge_sessions = 16
+
+[notifications]
+# Sinks, in §5.8.3's order: "desktop", "webhook", "command", "none"
+# (default).
+sink = "none"
+# webhook_url = "https://example.internal/clasp-events"
+# command = ["/usr/local/bin/notify-me"]
+# Which of §5.8.3's kinds reach the sink. §5.8.3 is the canonical
+# enumeration; this list is complete rather than a subset because an
+# omitted kind is a suppressed one -- and the three-of-six list that
+# stood here dropped `coalesced`, which is the rate limiter's own
+# overflow summary and the thing REQ-AF-008 asserts arrives.
+events = ["session_exited", "awaiting_secret", "awaiting_confirmation",
+          "session_reaped", "transfer_complete", "coalesced"]
+# Per-session cap; excess collapses into one `coalesced` event per
+# window, which does not itself count against the cap (§5.8.3).
+notification_rate_limit_per_min = 10
+
+# Built-in program adapters (§5.8.2) are compiled in. Entries here merge
+# with them and override by name. Adapters enrich the tier-3 fallback
+# only -- they never override a deterministic signal.
+#
+# NOTE: this is an ARRAY OF TABLES, so there is no [adapters] header --
+# §5.8.2 owns the spelling and says `[[adapters]]`. A [adapters] table
+# and a [[adapters]] array cannot both exist, and an example that opened
+# one while the normative section required the other could not be copied
+# into a working config either way.
+# [[adapters]]
+# name = "myapp"
+# match_command = "^myapp$"
+# prompt_patterns = [ { regex = "myapp> $", score = 0.9 } ]
+
+[daemon]
+idle_shutdown_after_secs = 86400
+# Opt EVERY session into recording (§5.8.1); off by default, as the
+# value below says. Recordings are REDACTED --
+# the header carries clasp_redacted: true -- unless the caller opts out
+# with start_session(record_redacted: false) or clasp record --raw, and
+# that opt-out is written to the audit trail on recording_started.
+# Files are 0600 either way; a --raw .cast is as sensitive as the
+# session itself and the replay player announces which it is.
+record_all_sessions = false
+# Approval window for keychain bindings with require_confirm (§9.6).
+# This is the window only when NO call is waiting. With a caller it is
+# min(this, half the caller's remaining deadline), so REQ-SEC-017's
+# fall-through to the human-prompt path stays reachable -- §17.5 has the
+# invariant and §25 indexes the surprise, which is that an operator can
+# measure a window far shorter than the number they set here.
+binding_approval_timeout_secs = 120
+# No log-directory knob. The three log paths are §19.1's, and the one thing
+# that relocates any of them is CLASP_RUNTIME_DIR, which moves daemon.log
+# to $CLASP_RUNTIME_DIR/logs/ and is instance selection rather than a knob
+# (§7.1, REQ-CFG-005). log_dir stood here with nothing reading it: §19.1,
+# §9.4, §7.1 and §7.3 each state the path outright, and §10.1's own list of
+# what this file configures says "daemon retention", not daemon paths. A
+# second spelling of the location leaves REQ-CFG-005's own rule -- which
+# names the daemon log among the things CLASP_RUNTIME_DIR relocates -- with
+# no answer when both are set, and gives audit.log a location no section
+# states. It was the last path knob after http_socket_path and is
+# withdrawn on the same rubric. The two retention knobs below stay: they
+# are §19.1's, which is the difference.
+# Audit log retention (days); rotated daily.
+audit_retention_days = 14
+# Daemon log retention (weeks); rotated weekly.
+daemon_log_retention_weeks = 4

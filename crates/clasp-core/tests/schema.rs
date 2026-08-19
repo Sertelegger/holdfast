@@ -2632,6 +2632,10 @@ async fn every_declared_status_is_returned_by_a_real_response() {
         let server_one = ClaspServer {
             registry: std::sync::Arc::new(one),
             processor: std::sync::Arc::clone(&small.processor),
+            // 0.0.5 gave `ClaspServer` the operator config; this literal
+            // keeps the default one rather than the registry it just
+            // replaced, because the point here is the *registry* limit.
+            config: std::sync::Arc::clone(&small.config),
         };
         let (_first, _) = start_bash(&server_one).await;
         note(&body(

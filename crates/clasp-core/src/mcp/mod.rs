@@ -10,7 +10,7 @@ pub mod tools;
 
 use crate::audit::AuditLog;
 use crate::output::rules::builtin_shared;
-use crate::output::{OutputProcessor, ProcessingLimits};
+use crate::output::OutputProcessor;
 use crate::session::SessionRegistry;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool_handler, ServerHandler, ServiceExt};
@@ -69,6 +69,14 @@ pub struct ClaspServer {
     /// field beside it — two handles to one log is two things that can
     /// be initialised differently.
     pub processor: Arc<OutputProcessor>,
+    /// The operator's `config.toml`, resolved and validated (§10.1).
+    ///
+    /// Held whole rather than exploded into the knobs 0.0.5 happens to
+    /// read, because REQ-CFG-004's second clause makes the *unread*
+    /// knobs part of the contract: a later milestone wires a value that
+    /// is already parsed and validated instead of adding a field and a
+    /// second place for the operator's file to be misread.
+    pub config: Arc<crate::config::Config>,
 }
 
 impl ClaspServer {
@@ -86,6 +94,21 @@ impl ClaspServer {
     /// outcome than one that runs and says so. (`AuditLog::record`
     /// redacts either way, so the degraded mode cannot leak.)
     pub fn with_audit_path(path: Option<PathBuf>) -> Self {
+        Self::with_audit_path_and_config(path, &crate::config::Config::default())
+    }
+
+    /// The constructor the daemon uses: the same audit-path handling,
+    /// plus the §4.2 knobs the operator's `config.toml` set (REQ-CFG-004).
+    ///
+    /// Only the knobs whose consumers already take them as parameters
+    /// are wired here — `max_concurrent_sessions` on the registry and the
+    /// four [`ProcessingLimits`] fields on the processor. The rest are
+    /// parsed, validated and reachable through [`ClaspServer::config`];
+    /// see `config.rs` for which milestone owns each.
+    pub fn with_audit_path_and_config(
+        path: Option<PathBuf>,
+        config: &crate::config::Config,
+    ) -> Self {
         let rules = builtin_shared();
         let audit = match path {
             Some(p) => match AuditLog::to_path(&p, Arc::clone(&rules)) {
@@ -98,13 +121,19 @@ impl ClaspServer {
             None => Arc::new(AuditLog::disabled(Arc::clone(&rules))),
         };
         Self {
-            registry: Arc::new(SessionRegistry::with_defaults()),
+            registry: Arc::new(SessionRegistry::new(config.limits.max_concurrent_sessions)),
             processor: Arc::new(OutputProcessor::new(
                 rules,
                 audit,
-                ProcessingLimits::default(),
+                config.processing_limits(),
             )),
+            config: Arc::new(config.clone()),
         }
+    }
+
+    /// The operator configuration this server was built with.
+    pub fn config(&self) -> &crate::config::Config {
+        &self.config
     }
 }
 

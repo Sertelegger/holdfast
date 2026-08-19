@@ -68,6 +68,27 @@ impl AuditLog {
         self.path.as_deref()
     }
 
+    /// Re-open the log at its configured path, replacing the handle.
+    ///
+    /// This exists for one caller: the §19.1 rotation sweep, which
+    /// renames `audit.log` out from under a daemon that has held it open
+    /// since start-up. Without a reopen, every subsequent `record` lands
+    /// in an **unlinked inode** — every file on disk looks correct and
+    /// §9.4's trail silently stops. A disabled log stays disabled: there
+    /// is no path to reopen and inventing one would turn the
+    /// audit-disabled test constructor into a writer.
+    pub fn reopen(&self) -> std::io::Result<()> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        *self.sink.lock() = Sink::File(file);
+        Ok(())
+    }
+
     pub fn write_errors(&self) -> u64 {
         self.write_errors.load(Ordering::Relaxed)
     }

@@ -38,7 +38,11 @@ use regex::{Regex, RegexBuilder};
 /// real caller needs and keeps the whole set comfortably under a tenth of
 /// a millisecond. Exceeding it is the caller's mistake, so it takes the
 /// same channel as an uncompilable regex (§5.1).
-const MAX_EXTRA_PATTERNS: usize = 64;
+/// `pub` because `config.rs` validates `[prompts] extra_patterns`
+/// against it and names the count in the error (§10.1). A second `64`
+/// spelled in the loader is two spellings of one number with nothing
+/// that fails when they diverge.
+pub const MAX_EXTRA_PATTERNS: usize = 64;
 
 /// Cap on the compiled size of one caller-supplied pattern.
 ///
@@ -63,7 +67,8 @@ const ECHOED_PATTERN_MAX: usize = 120;
 
 /// A caller-supplied pattern: `start_session(prompt_patterns: [...])` and
 /// the global config both deserialise into this.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PromptPattern {
     pub regex: String,
     pub score: f32,

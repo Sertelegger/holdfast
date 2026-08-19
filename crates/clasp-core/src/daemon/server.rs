@@ -6,13 +6,16 @@
 //! TCP exposure is a separate, user-invoked bridge process that arrives
 //! in 0.0.10 and binds loopback in *its own* address space.
 
-use super::paths::{RuntimePaths, SOCKET_MODE};
+use super::paths::{LogRetention, RuntimePaths, SOCKET_MODE};
 use super::peer;
+use crate::clock::Clock;
+use crate::config::Config;
 use crate::mcp::caller::{self, Caller};
 use crate::mcp::{passthrough, ClaspServer};
 use crate::protocol::frame::{self, FrameError};
 use crate::protocol::handshake::{self, ClientKind, HandshakeParams};
 use crate::protocol::method::{self, ErrorCode, Request, Response};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,6 +108,17 @@ pub struct Daemon {
     /// local connection a foreign one — see
     /// `a_connection_from_a_foreign_uid_is_closed_before_the_handshake`.
     owner_uid: u32,
+    /// Every deadline this daemon owns reads this, and nothing calls
+    /// `Instant::now()` or `tokio::time::sleep` directly.
+    ///
+    /// `unix_secs_now()` is the deliberate exception and must stay one:
+    /// `stopped_at_unix_secs` is a wall-clock fact reported to a caller,
+    /// not a deadline, and a manual clock must not be able to stamp it.
+    clock: Clock,
+    /// When a client last completed the §9.1 gate, for §7.3's client-less
+    /// exit. `None` means "never", which is what the window measures from
+    /// on a daemon nobody has connected to.
+    last_client_connect: Mutex<Option<Instant>>,
 }
 
 impl Daemon {
@@ -134,6 +148,26 @@ impl Daemon {
         Self::with_owner_uid(paths, peer::current_uid())
     }
 
+    /// A daemon holding an operator configuration (§10.1).
+    pub fn with_config(paths: RuntimePaths, config: Config) -> Arc<Self> {
+        Self::build(paths, config, Clock::system(), peer::current_uid())
+    }
+
+    /// A daemon whose deadlines run on `clock`.
+    ///
+    /// **This is the seam two later milestones name.** 0.0.6's
+    /// over-`attach.sock` reaper test and 0.0.7's decision not to build a
+    /// second clock both depend on the daemon's timers being drivable
+    /// from outside `session::reaper`.
+    pub fn with_clock(paths: RuntimePaths, clock: Clock) -> Arc<Self> {
+        Self::build(paths, Config::default(), clock, peer::current_uid())
+    }
+
+    /// Both seams at once, for a test that drives a configured deadline.
+    pub fn with_config_and_clock(paths: RuntimePaths, config: Config, clock: Clock) -> Arc<Self> {
+        Self::build(paths, config, clock, peer::current_uid())
+    }
+
     /// [`Daemon::new`] with the owning uid supplied rather than read from
     /// the process.
     ///
@@ -141,20 +175,52 @@ impl Daemon {
     /// answer for this and `new` supplies it. It exists because the
     /// §9.1 gate is otherwise unprovable in-process — see `owner_uid`.
     fn with_owner_uid(paths: RuntimePaths, owner_uid: u32) -> Arc<Self> {
+        Self::build(paths, Config::default(), Clock::system(), owner_uid)
+    }
+
+    fn build(paths: RuntimePaths, config: Config, clock: Clock, owner_uid: u32) -> Arc<Self> {
         let (shutdown_tx, _) = watch::channel(false);
         let audit_path = paths.audit_log();
         Arc::new(Self {
-            server: ClaspServer::with_audit_path(Some(audit_path)),
+            server: ClaspServer::with_audit_path_and_config(Some(audit_path), &config),
             paths,
             started_at: Instant::now(),
             shutdown_tx,
             connections: AtomicU64::new(0),
             owner_uid,
+            clock,
+            last_client_connect: Mutex::new(None),
         })
     }
 
     pub fn paths(&self) -> &RuntimePaths {
         &self.paths
+    }
+
+    /// The operator configuration this daemon was built with.
+    pub fn config(&self) -> &Config {
+        &self.server.config
+    }
+
+    /// The daemon's time source. Every deadline this milestone
+    /// introduces reads it, and 0.0.6 takes this handle to drive them.
+    pub fn clock(&self) -> Clock {
+        self.clock.clone()
+    }
+
+    /// When a client last completed the §9.1 gate, on the daemon's own
+    /// clock. `None` when none ever has.
+    pub fn last_client_connect(&self) -> Option<Instant> {
+        *self.last_client_connect.lock()
+    }
+
+    /// Record a client connection for §7.3's window.
+    ///
+    /// Called **after** the uid gate and the handshake, so a peer that
+    /// was refused does not hold the daemon open: the window is "no
+    /// clients have connected", and a rejected connection is not one.
+    fn note_client_connect(&self) {
+        *self.last_client_connect.lock() = Some(self.clock.now());
     }
 
     /// Total connections accepted by the listener since start.
@@ -266,6 +332,14 @@ pub async fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
 
 /// Run a daemon to completion: bind, write the pid file, serve, clean up.
 pub async fn run(paths: RuntimePaths) -> anyhow::Result<()> {
+    // **Config first, and before `bind_control`** (REQ-CFG-003). An
+    // invalid config must reject daemon *startup*: the daemon exits
+    // non-zero with the offending key on stderr and binds no socket. A
+    // daemon that starts with a bad config and logs a warning is the
+    // failure mode that requirement exists to prevent — the operator
+    // believes a limit is in force and it is not.
+    let config = crate::config::load()?;
+
     // `bind_control` runs `paths.ensure_dir()`, which creates the log
     // directory `0700`. That ordering is load-bearing rather than
     // incidental: `Daemon::new` opens the audit log from `paths`, and
@@ -276,7 +350,19 @@ pub async fn run(paths: RuntimePaths) -> anyhow::Result<()> {
     // reason.
     let listener = bind_control(&paths)?;
     write_pid_file(&paths)?;
-    let daemon = Daemon::new(paths.clone());
+
+    // The startup half of §19.1's sweep, run **before** `Daemon::new`
+    // takes its audit-log handle. Rotating after that point renames the
+    // file out from under an open descriptor; the periodic sweep the
+    // reaper owns handles that case with `AuditLog::reopen`, and this
+    // one avoids it by ordering. A sweep failure is not fatal — a daemon
+    // that will not start because a log could not be renamed is a worse
+    // outcome than one that runs and says so.
+    if let Err(e) = paths.sweep_logs(LogRetention::from(&config), std::time::SystemTime::now()) {
+        eprintln!("clasp daemon: log rotation sweep failed: {e}");
+    }
+
+    let daemon = Daemon::with_config(paths.clone(), config);
 
     let sig_daemon = Arc::clone(&daemon);
     tokio::spawn(async move {
@@ -355,6 +441,11 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
     let Some(client_kind) = do_handshake(&mut stream).await else {
         return;
     };
+
+    // §7.3's window is "no clients have connected", and it is recorded
+    // here — after the uid gate and after a handshake that was accepted
+    // — so a refused peer cannot hold a daemon open indefinitely.
+    daemon.note_client_connect();
 
     loop {
         let req: Request = match frame::read_frame(&mut stream).await {
