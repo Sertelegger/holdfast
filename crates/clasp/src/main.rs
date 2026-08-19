@@ -1,5 +1,18 @@
+// Every diagnostic this binary writes goes through `clasp_core::diag!`,
+// which redacts. `clasp daemon run`'s stderr *is* `daemon.log` (§9.2
+// lists it as a redacted boundary), and `clasp mcp`'s stderr is what an
+// MCP client surfaces as server logs, so both are output boundaries in
+// §9.2's sense. `print_stdout` is deliberately **not** denied: `clasp
+// list`, `clasp logs` and `clasp daemon status` write their real answers
+// there, and `clasp logs --raw` is specified to be unredacted.
+#![deny(clippy::print_stderr)]
+
 mod commands;
 
+// Imports the module *and* the `diag!` macro — a `#[macro_export]` macro
+// and a module of the same name live in different namespaces, and one
+// `use` brings both.
+use clasp_core::diag;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -38,18 +51,26 @@ ENVIRONMENT:
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 fn usage_error(msg: &str) -> ExitCode {
-    eprintln!("clasp: {msg}\n\n{USAGE}");
+    diag!("clasp: {msg}\n\n{USAGE}");
     ExitCode::from(commands::EXIT_USAGE)
 }
 
 fn main() -> ExitCode {
+    // First statement in the process, and before the runtime exists: a
+    // panic in the runtime builder, in a tokio worker, or in a blocking
+    // pool thread all reach the same hook, and on `clasp daemon run`
+    // that hook's output is `daemon.log`. Installing it per-subcommand
+    // would leave the two failures above it uncovered for no gain — see
+    // `clasp_core::diag::install_panic_hook` for why one site.
+    diag::install_panic_hook();
+
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("clasp: could not start the async runtime: {e}");
+            diag!("clasp: could not start the async runtime: {e}");
             return ExitCode::from(commands::EXIT_UNREACHABLE);
         }
     };
@@ -89,7 +110,7 @@ async fn run() -> ExitCode {
         Some("version") => commands::version(),
         Some(other) => usage_error(&format!("unknown subcommand `{other}`")),
         None => {
-            eprintln!("{USAGE}");
+            diag!("{USAGE}");
             ExitCode::from(commands::EXIT_USAGE)
         }
     }

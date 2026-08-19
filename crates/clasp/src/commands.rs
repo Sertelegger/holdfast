@@ -3,6 +3,12 @@
 
 use clasp_core::daemon::paths::RuntimePaths;
 use clasp_core::daemon::{server, spawn};
+// The `diag!` macro, not the module — every diagnostic below goes to
+// stderr, and on `clasp daemon run` stderr is `daemon.log`, which §9.2
+// lists as a redacted boundary. `println!` is left alone throughout:
+// that is the subcommands' actual answer, and `clasp logs --raw` is
+// specified to be unredacted.
+use clasp_core::diag;
 use clasp_core::mcp::shim::ShimServer;
 use clasp_core::protocol::client::{ClientError, ControlClient};
 use clasp_core::protocol::handshake::ClientKind;
@@ -56,7 +62,7 @@ pub async fn mcp(no_daemon: bool) -> ExitCode {
         return match clasp_core::mcp::serve_stdio().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("clasp mcp: {e}");
+                diag!("clasp mcp: {e}");
                 ExitCode::from(EXIT_UNREACHABLE)
             }
         };
@@ -65,14 +71,14 @@ pub async fn mcp(no_daemon: bool) -> ExitCode {
     let paths = match paths() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("clasp mcp: {e}");
+            diag!("clasp mcp: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("clasp mcp: cannot locate my own binary: {e}");
+            diag!("clasp mcp: cannot locate my own binary: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
@@ -80,7 +86,7 @@ pub async fn mcp(no_daemon: bool) -> ExitCode {
     let client = match spawn::ensure_daemon(&paths, &exe, ClientKind::Shim).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("clasp mcp: daemon_unreachable: {e}");
+            diag!("clasp mcp: daemon_unreachable: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
@@ -91,12 +97,12 @@ pub async fn mcp(no_daemon: bool) -> ExitCode {
     {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("clasp mcp: {e}");
+            diag!("clasp mcp: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     if let Err(e) = service.waiting().await {
-        eprintln!("clasp mcp: {e}");
+        diag!("clasp mcp: {e}");
         return ExitCode::from(EXIT_UNREACHABLE);
     }
     ExitCode::SUCCESS
@@ -108,14 +114,14 @@ pub async fn daemon_run() -> ExitCode {
     let paths = match paths() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("clasp daemon run: {e}");
+            diag!("clasp daemon run: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
     match server::run(paths).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("clasp daemon run: {e}");
+            diag!("clasp daemon run: {e}");
             ExitCode::from(EXIT_FAILED)
         }
     }
@@ -126,14 +132,14 @@ pub fn daemon_start() -> ExitCode {
     let paths = match paths() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("clasp daemon start: {e}");
+            diag!("clasp daemon start: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("clasp daemon start: cannot locate my own binary: {e}");
+            diag!("clasp daemon start: cannot locate my own binary: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
@@ -150,7 +156,7 @@ pub fn daemon_start() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("clasp daemon start: {e}");
+            diag!("clasp daemon start: {e}");
             ExitCode::from(EXIT_FAILED)
         }
     }
@@ -297,7 +303,7 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
             // `confirm_daemon_pid` refuses to do — so the elapse is the
             // verdict and the operator is told to reach for `--force`.
             StopRpc::Failed(e) => {
-                eprintln!("clasp daemon stop: {e}");
+                diag!("clasp daemon stop: {e}");
                 EXIT_FAILED
             }
         };
@@ -341,12 +347,12 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
             }
             Escalation::NotSignalled { pid, why } => {
                 println!("no daemon running");
-                eprintln!("clasp daemon stop: clasp.pid names pid {pid}, not signalled: {why}");
+                diag!("clasp daemon stop: clasp.pid names pid {pid}, not signalled: {why}");
                 0
             }
         },
         StopRpc::Failed(e) => {
-            eprintln!("clasp daemon stop: {e}");
+            diag!("clasp daemon stop: {e}");
             match escalation {
                 Escalation::Killed(pid) => {
                     println!("daemon killed (pid {pid})");
@@ -354,7 +360,7 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
                 }
                 Escalation::Nothing => EXIT_FAILED,
                 Escalation::NotSignalled { pid, why } => {
-                    eprintln!("clasp daemon stop: clasp.pid names pid {pid}, not signalled: {why}");
+                    diag!("clasp daemon stop: clasp.pid names pid {pid}, not signalled: {why}");
                     EXIT_FAILED
                 }
             }
@@ -564,7 +570,7 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
             return ExitCode::from(EXIT_UNREACHABLE);
         }
         Err(e) => {
-            eprintln!("clasp daemon status: {e}");
+            diag!("clasp daemon status: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
@@ -572,7 +578,7 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
         match client.call(method::METHOD_DAEMON_STATUS, &json!({})).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("clasp daemon status: {e}");
+                diag!("clasp daemon status: {e}");
                 return ExitCode::from(EXIT_UNREACHABLE);
             }
         };
@@ -599,21 +605,21 @@ pub async fn list(as_json: bool) -> ExitCode {
     let client = match connect(ClientKind::Cli).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("clasp list: {e}");
+            diag!("clasp list: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     let resp = match client.call_raw("tool/list_sessions", empty()).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("clasp list: {e}");
+            diag!("clasp list: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     let data: Value = match method::from_cbor(&resp.data) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("clasp list: malformed response: {e}");
+            diag!("clasp list: malformed response: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
@@ -659,7 +665,7 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
     let client = match connect(ClientKind::Cli).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("clasp logs: {e}");
+            diag!("clasp logs: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
@@ -683,25 +689,25 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
     let params = match method::to_cbor(&args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("clasp logs: {e}");
+            diag!("clasp logs: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
     let resp = match client.call_raw("tool/read_output", params).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("clasp logs: {e}");
+            diag!("clasp logs: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     if resp.status != "ok" {
-        eprintln!("clasp logs: {} — {}", resp.status, resp.details);
+        diag!("clasp logs: {} — {}", resp.status, resp.details);
         return ExitCode::from(EXIT_FAILED);
     }
     let data: Value = match method::from_cbor(&resp.data) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("clasp logs: malformed response: {e}");
+            diag!("clasp logs: malformed response: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };

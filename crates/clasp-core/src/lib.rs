@@ -6,6 +6,7 @@ pub mod clock;
 pub mod config;
 pub mod daemon;
 pub mod detect;
+pub mod diag;
 pub mod error;
 pub mod mcp;
 pub mod output;
