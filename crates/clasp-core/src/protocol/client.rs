@@ -272,6 +272,16 @@ async fn exchange(
 /// answers and then hangs up on (`handle_connection`), so parking that
 /// stream would hand a later call a socket already at EOF.
 ///
+/// **The unknown code fails closed, and here that is not theoretical.**
+/// This is the one side of the protocol that parses a code it did not
+/// write: §7.4.1 permits shim/daemon *minor* skew explicitly, so a
+/// daemon one minor ahead can answer a §18.3 row this build has never
+/// heard of, and [`ErrorCode::from_wire`] rightly refuses to guess at
+/// it. Reading that `None` as "not closing" parks a socket the daemon
+/// has already hung up on, and the cost lands on the *next* call, which
+/// meets an EOF it has no explanation for. Not parking a connection that
+/// was in fact still good costs one reconnect.
+///
 /// The remaining case is `daemon/stop`, which the daemon answers `ok`
 /// and then closes. It is deliberately not special-cased here: teaching
 /// this function one method's semantics would put the daemon's shutdown
@@ -280,10 +290,10 @@ async fn exchange(
 fn reusable(outcome: &Result<Response, ClientError>) -> bool {
     match outcome {
         Err(_) => false,
-        Ok(resp) => !resp
-            .control_error()
-            .and_then(|e| ErrorCode::from_wire(&e.code))
-            .is_some_and(|code| code.closes_connection()),
+        Ok(resp) => match resp.control_error() {
+            None => true,
+            Some(e) => ErrorCode::from_wire(&e.code).is_some_and(|code| !code.closes_connection()),
+        },
     }
 }
 
@@ -348,6 +358,30 @@ impl ClientError {
         match self {
             Self::Connect { .. } => true,
             Self::Method { retriable, .. } => *retriable,
+            _ => false,
+        }
+    }
+
+    /// Whether the daemon closed the connection when it answered this
+    /// (§18.3's closing column, via [`ErrorCode::closes_connection`]).
+    ///
+    /// The caller-facing half of the rule [`reusable`] enforces inside
+    /// this module. `ClientError::Method` carries `code` as a raw
+    /// `String`, so without this a caller told `protocol_violation` has
+    /// no way to distinguish "that request was wrong" from "that
+    /// connection is over" — which is exactly the guessing
+    /// [`ErrorCode::from_wire`]'s doc comment says a client must not be
+    /// left to do.
+    ///
+    /// **Fails closed on an unknown code, for the same reason
+    /// [`reusable`] does**: §7.4.1 permits minor skew, so a code this
+    /// build does not know may well be a closing one, and answering
+    /// `false` there would tell a caller a dead connection is live.
+    pub fn closes_connection(&self) -> bool {
+        match self {
+            Self::Method { code, .. } => {
+                ErrorCode::from_wire(code).is_none_or(ErrorCode::closes_connection)
+            }
             _ => false,
         }
     }
@@ -462,6 +496,106 @@ mod tests {
         assert!(!ClientError::Refused("attach session is read-only".into()).is_version_mismatch());
         assert!(!connect_error().is_version_mismatch());
         assert!(!method_error(true).is_version_mismatch());
+    }
+
+    /// A `ControlError` payload this build cannot classify, on the wire
+    /// as a `Response`. `Response::error` cannot build one — it takes an
+    /// `ErrorCode` — which is exactly why this arm had no coverage.
+    fn response_with_wire_code(code: &str) -> Response {
+        let payload = crate::protocol::method::ControlError {
+            code: code.into(),
+            message: "m".into(),
+            retriable: false,
+        };
+        Response {
+            id: 1,
+            status: "error".into(),
+            data: method::to_cbor(&payload).unwrap(),
+            details: "m".into(),
+        }
+    }
+
+    /// The one place in the protocol where a code arrives that this
+    /// build did not write, so the one place `from_wire`'s `None` is
+    /// reachable in production.
+    ///
+    /// §7.4.1 permits shim/daemon **minor** skew explicitly, so a daemon
+    /// one minor ahead can answer a §18.3 row this build has never heard
+    /// of. Read as "not closing", that parks a socket the daemon has
+    /// already hung up on and the next call meets an EOF with no
+    /// explanation. Fail closed: the cost of being wrong the other way
+    /// is one reconnect.
+    #[test]
+    fn a_connection_is_not_parked_after_a_code_this_build_cannot_classify() {
+        // The positives, or a `reusable` that answered `false` to
+        // everything would pass every closing case and open a fresh
+        // connection per call.
+        assert!(reusable(&Ok(Response::ok(1, &json!({}), "ok").unwrap())));
+        for code in [
+            ErrorCode::UnknownMethod,
+            ErrorCode::BadParams,
+            ErrorCode::LimitReached,
+            ErrorCode::DaemonShuttingDown,
+        ] {
+            assert!(
+                reusable(&Ok(Response::error(1, code, "m"))),
+                "{} is a per-request fault; §18.3 keeps the connection",
+                code.as_str()
+            );
+        }
+        // §18.3's three closing rows, named rather than filtered through
+        // `closes_connection()` — deriving the expectation from the
+        // predicate under test would make this vacuous.
+        for code in [
+            ErrorCode::FrameTooLarge,
+            ErrorCode::NoHandshake,
+            ErrorCode::ProtocolViolation,
+        ] {
+            assert!(
+                !reusable(&Ok(Response::error(1, code, "m"))),
+                "{} means the daemon hung up",
+                code.as_str()
+            );
+        }
+        assert!(
+            !reusable(&Ok(response_with_wire_code("a_code_from_the_future"))),
+            "an unrecognised code must fail closed"
+        );
+        // A transport fault leaves the stream at an unknown offset.
+        assert!(!reusable(&Err(ClientError::Frame(FrameError::Eof))));
+    }
+
+    /// The caller-facing half. `ClientError::Method` carries `code` as a
+    /// raw `String`, so without a classifier a caller told
+    /// `protocol_violation` cannot tell "that request was wrong" from
+    /// "that connection is over" — the guessing `from_wire`'s doc
+    /// comment says a client must never be left to do.
+    #[test]
+    fn a_method_error_says_whether_it_ended_the_connection() {
+        let with = |code: &str| ClientError::Method {
+            method: "daemon/status".into(),
+            code: code.into(),
+            message: "m".into(),
+            retriable: false,
+        };
+        assert!(with("protocol_violation").closes_connection());
+        assert!(with("frame_too_large").closes_connection());
+        assert!(with("no_handshake").closes_connection());
+        assert!(!with("bad_params").closes_connection());
+        assert!(!with("unknown_method").closes_connection());
+        assert!(!with("limit_reached").closes_connection());
+        // `daemon_shutting_down` answers `false` deliberately: the daemon
+        // does close that connection, but on its own schedule and not on
+        // this code's account (§18.3).
+        assert!(!with("daemon_shutting_down").closes_connection());
+        assert!(
+            with("a_code_from_the_future").closes_connection(),
+            "fail closed on a code from a newer daemon"
+        );
+        // Not every error is a method error, and the classifier must not
+        // claim a failed connect ended a connection that never existed.
+        assert!(!connect_error().closes_connection());
+        assert!(!ClientError::Frame(FrameError::Eof).closes_connection());
     }
 
     // ------------------------------------- one call per connection (C-3)

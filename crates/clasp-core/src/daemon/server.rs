@@ -910,18 +910,37 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
         if frame::write_frame(&mut stream, &resp).await.is_err() {
             return;
         }
-        if let Some(code) = resp
-            .control_error()
-            .and_then(|e| ErrorCode::from_wire(&e.code))
-        {
-            if code.closes_connection() {
-                return;
-            }
+        if response_closes_connection(&resp) {
+            return;
         }
         if stop_after {
             daemon.shutdown();
             return;
         }
+    }
+}
+
+/// Whether the response just written must be the last one on this
+/// connection (§7.4, §18.3).
+///
+/// **Fails closed, and that is the whole reason it is a function.** The
+/// decision has to come off the wire — a `Response` is four serialised
+/// fields and carries no `ErrorCode` — so it goes back through
+/// [`ErrorCode::from_wire`], which answers `None` for any code this
+/// build does not know. Inline, that `None` was skipped by an
+/// `if let Some(code)` and the connection **stayed open after a protocol
+/// violation**: the one direction §7.4 does not permit.
+///
+/// `None` is unreachable from this build's own dispatcher — every
+/// producer selects from `ErrorCode` — so treating it as closing costs
+/// nothing today and is the only safe reading if a response is ever
+/// built outside that enum. The asymmetry decides it: keeping a
+/// connection open one frame too long after a mis-framing peer is a
+/// protocol break, and closing one frame too early is a reconnect.
+fn response_closes_connection(resp: &Response) -> bool {
+    match resp.control_error() {
+        None => false,
+        Some(e) => ErrorCode::from_wire(&e.code).is_none_or(ErrorCode::closes_connection),
     }
 }
 
@@ -1340,6 +1359,73 @@ mod tests {
         assert!(
             !peer_is_authorized(&Err(io::Error::from(io::ErrorKind::PermissionDenied)), us),
             "an unreadable credential must fail closed, not open"
+        );
+    }
+
+    /// §7.4's "the caller must close the connection", including for a
+    /// code this build cannot classify.
+    ///
+    /// The decision has to be recovered from the wire — `Response` is
+    /// four serialised fields — and `ErrorCode::from_wire` answers
+    /// `None` for anything outside §18.3, by design. The inline
+    /// `if let Some(code)` this replaces **skipped** that `None` and
+    /// left the connection open after a protocol violation, which is
+    /// the one direction §7.4 does not permit. Nothing else in the
+    /// workspace can see that arm: every response the dispatcher builds
+    /// selects from `ErrorCode`, so the daemon round-trips its own
+    /// strings and always resolves them.
+    #[test]
+    fn a_response_the_daemon_cannot_classify_closes_the_connection() {
+        // The negatives first, or a function answering `true` to
+        // everything would pass the closing cases and hang up on every
+        // successful call.
+        assert!(!response_closes_connection(
+            &Response::ok(1, &json!({ "ok": true }), "ok").unwrap()
+        ));
+        for code in [
+            ErrorCode::UnknownMethod,
+            ErrorCode::BadParams,
+            ErrorCode::LimitReached,
+            ErrorCode::DaemonShuttingDown,
+        ] {
+            assert!(
+                !response_closes_connection(&Response::error(1, code, "m")),
+                "{} is a per-request fault and leaves the connection usable",
+                code.as_str()
+            );
+        }
+        // §18.3's three closing rows, named rather than filtered
+        // through `closes_connection()` — deriving the expectation from
+        // the predicate under test would make this vacuous.
+        for code in [
+            ErrorCode::FrameTooLarge,
+            ErrorCode::NoHandshake,
+            ErrorCode::ProtocolViolation,
+        ] {
+            assert!(
+                response_closes_connection(&Response::error(1, code, "m")),
+                "{} must be the last frame on this connection",
+                code.as_str()
+            );
+        }
+        // And the arm that had no coverage at all: a code outside
+        // §18.3. Hand-built, because `Response::error` cannot produce
+        // one.
+        let payload = method::ControlError {
+            code: "a_code_from_the_future".into(),
+            message: "m".into(),
+            retriable: false,
+        };
+        let unknown = Response {
+            id: 1,
+            status: "error".into(),
+            data: method::to_cbor(&payload).unwrap(),
+            details: "m".into(),
+        };
+        assert!(
+            response_closes_connection(&unknown),
+            "an unclassifiable error code must fail closed: staying open after a \
+             protocol violation is the one outcome §7.4 forbids"
         );
     }
 
