@@ -1221,7 +1221,27 @@ fn fish_time_to_first_prompt(terminal_queries: bool, fixture: bool) -> FishArm {
 /// everything, and by a fish that simply got faster.
 #[test]
 fn only_answering_da1_takes_fish_to_its_first_prompt() {
+    // REQ-TS-008 is host-dependent and lives in a **different test binary**
+    // from `tests/detection.rs`, whose `have()` is the only thing in the
+    // workspace that reads this variable — and whose own opening assertion
+    // requires the `Need` to appear in *that* file's `HOST_DEPENDENT_ROWS`
+    // table, which lists `detection.rs` rows only. So the escape hatch the
+    // skip census's failure text tells an operator to pull did not reach
+    // this row at all: `HOLDFAST_REQUIRE_ALL_SHELLS=1` on a fish-less host
+    // left REQ-TS-008 unmeasured and reported it as `ok`. Honoured here
+    // rather than by importing `have()`, because the two binaries share no
+    // code and the table is `detection.rs`'s own.
+    const REQUIRE_ALL: &str = "HOLDFAST_REQUIRE_ALL_SHELLS";
     let Some(version) = fish_version() else {
+        assert!(
+            std::env::var(REQUIRE_ALL).as_deref() != Ok("1"),
+            "{REQUIRE_ALL}=1 is set and no fish is on PATH. REQ-TS-008 \
+             would otherwise be skipped and reported as `ok`. Install \
+             fish >= 4.1 from ppa:fish-shell/release-4 — noble's 3.7.0 is \
+             too old for this row's guard and 4.2.1 clears the guard but \
+             fails the row — or unset {REQUIRE_ALL} and accept that this \
+             file's green does not cover REQ-TS-008."
+        );
         eprintln!(
             "skipping: fish not installed — REQ-TS-008's three arms need \
              fish >= 4.0 (REQ-TST-007)"
@@ -1229,6 +1249,13 @@ fn only_answering_da1_takes_fish_to_its_first_prompt() {
         return;
     };
     if fish_major(&version).is_none_or(|major| major < 4) {
+        assert!(
+            std::env::var(REQUIRE_ALL).as_deref() != Ok("1"),
+            "{REQUIRE_ALL}=1 is set and the fish on PATH is {version:?}, \
+             which is below the >= 4.0 this row measures. REQ-TS-008 would \
+             otherwise be skipped and reported as `ok`. Install fish >= 4.1 \
+             from ppa:fish-shell/release-4, or unset {REQUIRE_ALL}."
+        );
         eprintln!(
             "skipping: fish not installed at a version this row measures — \
              found {version:?}, need >= 4.0 (REQ-TST-007)"
