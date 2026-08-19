@@ -441,10 +441,15 @@ fn escalate_to_sigkill(paths: &RuntimePaths) -> Escalation {
 /// Both read `/proc`, so **off Linux this confirms nothing** and
 /// `--force` stays what it was before this function existed: the RPC and
 /// no escalation. macOS can get the same answer from
-/// `sysctl(KERN_PROC_PID)`, and that is a later milestone's work — not a
-/// silent fallback to "kill whatever holds that pid", which is the one
-/// behaviour that would open the pid-reuse hazard this exists to keep
-/// closed.
+/// `sysctl(KERN_PROC_PID)` — **0.0.11's**, the platform milestone — and
+/// not a silent fallback to "kill whatever holds that pid", which is the
+/// one behaviour that would open the pid-reuse hazard this exists to
+/// keep closed.
+///
+/// **This is a live divergence from §3.2 on a supported target**, and it
+/// is now written down on both sides rather than only here: §3.2 carries
+/// the platform qualifier and the 0.0.5 plan's *Decisions taken* carries
+/// the row. It stands on the asymmetry above, not on convenience.
 ///
 /// The residual false negative: a daemon that has dropped its listener
 /// but has not yet exited reads as unconfirmed. That is the tail of a
