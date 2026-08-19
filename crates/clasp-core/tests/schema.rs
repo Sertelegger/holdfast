@@ -2655,6 +2655,10 @@ async fn every_declared_status_is_returned_by_a_real_response() {
             config: std::sync::Arc::clone(&small.config),
             resource_list_changed: small.resource_list_changed.clone(),
             clock: small.clock.clone(),
+            // `small` took no audit path, so it had none to fail to
+            // open. Copied rather than written as `None` so this literal
+            // cannot disagree with the constructor it borrows from.
+            audit_open_error: small.audit_open_error.clone(),
         };
         let (_first, _) = start_bash(&server_one).await;
         note(&body(

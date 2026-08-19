@@ -783,11 +783,12 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // `bind_control` runs `paths.ensure_dir()`, which creates the log
     // directory `0700`. That ordering is load-bearing rather than
     // incidental: `Daemon::new` opens the audit log from `paths`, and
-    // `with_audit_path` degrades a log it cannot open to a *disabled*
-    // one with a line on stderr. Construct the daemon before the
-    // directory exists and the trail is silently off. The same ordering
-    // holds in `TestDaemon::start`, which binds first for the same
-    // reason.
+    // `with_audit_path` leaves a log it cannot open *disabled*.
+    // Construct the daemon before the directory exists and the trail is
+    // off for a reason that is nobody's fault — which is also why the
+    // audit refusal below sits after this line and not before it. The
+    // same ordering holds in `TestDaemon::start`, which binds first for
+    // the same reason.
     let listener = bind_control(&paths)?;
     write_pid_file(&paths)?;
 
@@ -803,6 +804,44 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     }
 
     let daemon = Daemon::with_config(paths.clone(), config);
+
+    // **The §9.4 trail fails closed on this host.** `with_audit_path`
+    // leaves the log disabled and records why; on every other host that
+    // is the right answer, and on the daemon it is not. A root-owned
+    // `audit.log` from one `sudo clasp`, or a full disk, otherwise gave
+    // a daemon that served every client on the box with no
+    // `session_start`, no `redaction_disabled` — nothing — while
+    // reporting perfect health, and the only trace was a line on stderr
+    // that under `daemon run` goes wherever the launcher pointed it.
+    //
+    // REQ-CFG-003 is the precedent and the comparison that settles it:
+    // an invalid *config* already refuses startup, on the reasoning that
+    // an operator must not believe a limit is in force when it is not.
+    // A trail that is silently not being written is the same failure
+    // with more at stake, and it was getting the weaker treatment.
+    //
+    // **After `bind_control`, and it has to be.** `bind_control` runs
+    // `ensure_dir`, which creates `logs/` `0700`; checking before that
+    // would refuse every first run. So the socket and pid file exist by
+    // now and are removed here — the same teardown the ordinary exit
+    // path runs, because a refusal that leaves a bound socket behind is
+    // a daemon every later `ensure_daemon` has to probe and clear.
+    if let Some(why) = daemon.server.audit_open_error() {
+        let why = why.to_string();
+        // **Drop the listener first.** `remove_runtime_files_we_own`
+        // skips the socket while `socket_is_live` says something is
+        // serving it — Imp C-5's guard against unlinking a successor's
+        // — and until this drop the something is *us*. The ordinary exit
+        // path gets this for free because `serve_daemon` consumes the
+        // listener before the teardown runs; this path has to say it.
+        drop(listener);
+        remove_runtime_files_we_own(&paths);
+        anyhow::bail!(
+            "clasp daemon: refusing to start without the §9.4 audit trail: {why}. \
+             Fix the ownership or permissions of that file, or point \
+             CLASP_RUNTIME_DIR at a directory this user owns."
+        );
+    }
 
     let sig_daemon = Arc::clone(&daemon);
     tokio::spawn(async move {
@@ -1855,6 +1894,62 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(self.0.dir());
         }
+    }
+
+    /// The daemon must not serve without its §9.4 trail.
+    ///
+    /// `with_audit_path` leaves an unopenable log *disabled* and says so
+    /// on stderr; that used to be the whole response, so a root-owned
+    /// `audit.log` from one `sudo clasp` — or a full disk — produced a
+    /// daemon serving every client on the box while recording nothing,
+    /// and reporting perfect health. REQ-CFG-003 already refuses startup
+    /// for an invalid config knob; the trail was getting weaker
+    /// treatment than a timeout.
+    ///
+    /// The obstruction is a **directory** at `audit.log`: it fails the
+    /// same way for root, and it fails at the `open`, not at some
+    /// earlier step that would make this a test of `ensure_dir`.
+    ///
+    /// **The pairing lives in
+    /// `a_daemon_that_exits_removes_the_socket_and_pid_file_it_owns`**,
+    /// which drives this same function to a serving daemon and a clean
+    /// stop. A mutation that refused unconditionally passes everything
+    /// below and goes red there, so it is not repeated here.
+    ///
+    /// Timeout on the call for this repo's usual reason: with no
+    /// `nextest.toml`, a refusal that instead sat in `serve` would be a
+    /// hung CI job rather than a red test.
+    #[tokio::test]
+    async fn the_daemon_refuses_to_serve_without_its_audit_trail() {
+        let paths = scratch("auditclosed");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        std::fs::create_dir(paths.audit_log()).expect("the obstruction");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_with_config(paths.clone(), Config::default()),
+        )
+        .await
+        .expect("`run_with_config` never returned; it served instead of refusing")
+        .expect_err("a daemon with no §9.4 trail must not serve");
+        let text = err.to_string();
+        assert!(
+            text.contains("audit"),
+            "the operator has to be told which of the startup checks refused: {text}"
+        );
+
+        // A refusal that leaves its socket bound is a daemon every later
+        // `ensure_daemon` has to probe and clear, and a pid file naming
+        // a process that has exited.
+        assert!(
+            !paths.control_sock().exists(),
+            "the refusal left a bound socket behind"
+        );
+        assert!(
+            !paths.pid_file().exists(),
+            "the refusal left a pid file naming a process that is gone"
+        );
     }
 
     fn configured(window: u64) -> Config {
