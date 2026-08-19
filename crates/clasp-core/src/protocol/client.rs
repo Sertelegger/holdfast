@@ -253,13 +253,40 @@ async fn exchange(
     // Belt and braces now that correlation is also structural: a reply
     // arrives on the socket its request left on, and it must still carry
     // the id that request had.
-    if resp.id != id {
+    //
+    // **Except for a connection-scoped refusal, which cannot carry one.**
+    // `handle_connection` builds `frame_too_large` and
+    // `protocol_violation` from the frame layer, *before* the body was
+    // decoded, so it has no id to answer and necessarily sends `id: 0`.
+    // Checking the id first turned "your frame was too big" into "daemon
+    // replied to request 0, expected 7" and **discarded the
+    // `ControlError` unread** — and on a fresh connection `id: 0` is
+    // indistinguishable from a duplicate handshake reply. Those codes
+    // are about the connection rather than about a request, so id
+    // correlation is meaningless for them.
+    if !connection_scoped_refusal(&resp) && resp.id != id {
         return Err(ClientError::IdMismatch {
             expected: id,
             got: resp.id,
         });
     }
     Ok(resp)
+}
+
+/// Whether this response is a refusal the daemon issued about the
+/// **connection** rather than about a request (§18.3's closing column).
+///
+/// **`is_some_and`, not `is_none_or`, and the difference from
+/// [`reusable`] is deliberate.** Both read a code this build may not
+/// know; they fail closed in opposite directions because the cost of
+/// being wrong is different. Declining to park a connection costs one
+/// reconnect. Waiving *id correlation* costs the caller another call's
+/// payload typed as its own — so an unrecognised code keeps the id
+/// check, which is the conservative reading in that direction.
+fn connection_scoped_refusal(resp: &Response) -> bool {
+    resp.control_error()
+        .and_then(|e| ErrorCode::from_wire(&e.code))
+        .is_some_and(ErrorCode::closes_connection)
 }
 
 /// Whether the connection that produced this outcome can carry another

@@ -508,6 +508,86 @@ async fn the_client_refuses_a_daemon_that_rejects_it_on_a_matching_major() {
     assert!(err.is_version_mismatch(), "got {err}");
 }
 
+/// A refusal about the **connection** reaches the caller, even though it
+/// cannot carry the request's id.
+///
+/// `handle_connection` builds `frame_too_large` and `protocol_violation`
+/// from the frame layer, *before* the body has been decoded, so there is
+/// no id to answer with and it necessarily sends `id: 0`. The client
+/// checked the id first, so the operator was told "daemon replied to
+/// request 1, expected 1"-shaped nonsense — "daemon replied to request 0"
+/// — for "your frame was too big", and the `ControlError` explaining it
+/// was **discarded unread**. On a fresh connection `id: 0` is also
+/// indistinguishable from a duplicate handshake reply.
+///
+/// The negative below is what makes this a rule about *those codes*
+/// rather than the removal of id correlation.
+#[tokio::test]
+async fn a_connection_scoped_refusal_reaches_the_caller_despite_carrying_id_zero() {
+    let stand_in = StandInDaemon::start("framelevel", |req| {
+        if req.method == method::METHOD_HANDSHAKE {
+            Response::ok(req.id, &acceptable_handshake_data(), "welcome").unwrap()
+        } else {
+            // Exactly what `handle_connection`'s `FrameError::TooLarge`
+            // arm sends: the frame layer had no decoded body to take an
+            // id from.
+            Response::error(0, ErrorCode::FrameTooLarge, "frame of 99 bytes exceeds 42")
+        }
+    });
+
+    let client = ControlClient::connect(&stand_in.sock(), ClientKind::Cli)
+        .await
+        .unwrap();
+    let resp = client
+        .call_raw(method::METHOD_DAEMON_STATUS, CborValue::Map(Vec::new()))
+        .await
+        .expect("a connection-scoped refusal is an answer, not a correlation fault");
+    let e = resp
+        .control_error()
+        .expect("and the payload must survive to the caller");
+    assert_eq!(e.code, "frame_too_large");
+    assert!(e.message.contains("exceeds"), "{}", e.message);
+    // The whole point: `id: 0` was not treated as a mis-correlation.
+    assert_eq!(resp.id, 0);
+}
+
+/// The negative for the row above. Waiving the id check for §18.3's
+/// three closing codes must not waive it for anything else: a
+/// mis-correlated reply hands the caller another call's payload typed as
+/// its own, which is the hazard
+/// `a_response_for_another_request_id_is_refused_rather_than_returned`
+/// exists for.
+#[tokio::test]
+async fn a_per_request_error_on_the_wrong_id_is_still_a_correlation_fault() {
+    let stand_in = StandInDaemon::start("idskewerr", |req| {
+        if req.method == method::METHOD_HANDSHAKE {
+            Response::ok(req.id, &acceptable_handshake_data(), "welcome").unwrap()
+        } else {
+            // `bad_params` is a per-request fault — §18.3 keeps the
+            // connection — so this one really is mis-correlated.
+            Response::error(req.id + 1, ErrorCode::BadParams, "nope")
+        }
+    });
+
+    let client = ControlClient::connect(&stand_in.sock(), ClientKind::Cli)
+        .await
+        .unwrap();
+    let err = client
+        .call_raw(method::METHOD_DAEMON_STATUS, CborValue::Map(Vec::new()))
+        .await
+        .expect_err("a per-request error for another id is not this call's answer");
+    assert!(
+        matches!(
+            err,
+            ClientError::IdMismatch {
+                expected: 1,
+                got: 2
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_response_for_another_request_id_is_refused_rather_than_returned() {
     // §7.4's `id` is what correlates a reply with its request. Nothing in
