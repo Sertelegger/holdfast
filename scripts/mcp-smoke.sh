@@ -648,10 +648,10 @@ echo
 echo "-- 0.0.6 attach socket"
 
 # A PRECONDITION, and deliberately not a counted check. It asserts this
-# script's own setup -- line 106 exports the variable unconditionally, before
-# anything has run -- so no server, stub or real, can make it fail. Counted, it
-# was a row that could not go red, which is the one thing rule 2 above forbids
-# and the defect class this whole file exists to stop.
+# script's own setup -- the `export HOLDFAST_RUNTIME_DIR=` above runs
+# unconditionally, before the transcript does -- so no server, stub or real,
+# can make it fail. Counted, it was a row that could not go red, which is the
+# one thing rule 2 above forbids and the defect class this file exists to stop.
 #
 # Exiting is also the stronger response. With the variable unset, every
 # assertion below would silently retarget the invoking user's real daemon, and
@@ -704,8 +704,9 @@ check_eq "the session outlives the shim that created it" \
 # The witness is output that only a real client attached to a real session
 # can have rendered. `SMOKE''ATTACH` reads differently typed and printed,
 # so matching `SMOKEATTACH` proves the *shell* produced it rather than the
-# tty echoing the request back -- the `SMOKE_$((6*7))` idiom from the main
-# transcript, in the one place a shell quote survives to the pty.
+# tty echoing the request back -- the same separation the main transcript
+# gets from `SMOKE_$((6*7))`, spelled the way a shell quote can be here
+# because these bytes reach a pty rather than a JSON string.
 #
 # `\r` and not `\n`: this goes through `script`'s pty into a client in raw
 # mode, so it is the byte a human's Enter key produces, and the session's
