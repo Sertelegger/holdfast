@@ -77,11 +77,49 @@ impl Period {
     }
 }
 
+/// How a roll moves the old bytes aside.
+///
+/// The choice is decided by **who opened the file**, not by taste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Roll {
+    /// `rename(2)`: atomic, and it loses nothing to a concurrent write.
+    /// Correct wherever the writer can *reopen* — `audit.log`, which
+    /// `sweep_and_reopen` reopens through
+    /// [`crate::audit::AuditLog::reopen`] immediately after the sweep.
+    Rename,
+    /// Copy the bytes to the stamped name, then truncate the original in
+    /// place, so **every** descriptor already open on it stays valid and
+    /// keeps writing to the live file.
+    ///
+    /// This is `daemon.log`'s, and it is the only shape that works for
+    /// it. `daemon.log` is opened by the process that **spawns** the
+    /// daemon (`spawn.rs`) and handed to it as fd 1 and fd 2; the daemon
+    /// never opens it, so there is nothing for `run` to reopen and no
+    /// ordering inside `run` that repairs a rename. After a rename the
+    /// inherited descriptor writes to a file no path reaches, `retire`
+    /// unlinks that file a retention window later, and the harm
+    /// concentrates in *quiet* daemons — the ones whose log you only
+    /// open once something has gone wrong.
+    ///
+    /// A `dup2` onto fd 1/2 is not the alternative it looks like: under
+    /// systemd `clasp daemon run` is started directly and fd 2 is the
+    /// journal, so a `dup2` would redirect the journal's stream into a
+    /// file, which is worse than the bug. Copy-truncate is correct
+    /// whatever the inherited descriptor points at, including when it
+    /// points at something that is not this file at all.
+    ///
+    /// The cost is a window between the copy and the truncate in which a
+    /// concurrently-written line is lost, and briefly two copies of the
+    /// bytes on disk. Both are bounded by one period of a diagnostic
+    /// log, and neither is a reason to take it for `audit.log`.
+    CopyTruncate,
+}
+
 /// Roll `log` if its newest byte was written in an earlier period.
 ///
 /// Returns the path the old content now lives at, or `None` when the
 /// file is absent, empty, or still inside its period.
-fn rotate(log: &Path, period: Period, now: SystemTime) -> io::Result<Option<PathBuf>> {
+fn rotate(log: &Path, period: Period, roll: Roll, now: SystemTime) -> io::Result<Option<PathBuf>> {
     let meta = match std::fs::metadata(log) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -111,7 +149,30 @@ fn rotate(log: &Path, period: Period, now: SystemTime) -> io::Result<Option<Path
         target = dir.join(format!("{name}.{base}.{n}"));
         n += 1;
     }
-    std::fs::rename(log, &target)?;
+    match roll {
+        Roll::Rename => std::fs::rename(log, &target)?,
+        Roll::CopyTruncate => {
+            // `fs::copy` carries the source's permission bits, so the
+            // stamped file is `0600` like the log it came from.
+            std::fs::copy(log, &target)?;
+            // It does **not** carry the mtime, and `retire` measures the
+            // retention window from the last byte written — which for
+            // the rename half is what `rename` preserves for free.
+            // Without this, `daemon.log.<stamp>` would be born *now* and
+            // age out a full period late, on a clock `audit.log.<stamp>`
+            // does not use.
+            std::fs::File::options()
+                .write(true)
+                .open(&target)?
+                .set_times(std::fs::FileTimes::new().set_modified(written))?;
+            // Truncate rather than unlink-and-recreate: the whole point
+            // is that the descriptor the daemon was handed still refers
+            // to this inode afterwards. `O_APPEND` — which
+            // `open_log_append` sets and the child inherits — makes the
+            // next write land at the new end of file, offset zero.
+            std::fs::File::options().write(true).open(log)?.set_len(0)?;
+        }
+    }
     Ok(Some(target))
 }
 
@@ -126,6 +187,10 @@ fn retire(dir: &Path, prefix: &str, window: Duration, now: SystemTime) -> io::Re
         if !name.starts_with(prefix) {
             continue;
         }
+        // `DirEntry::metadata` is `lstat`-based. Not a safety property:
+        // `remove_file` is `unlink(2)` and never follows a symlink, so
+        // `std::fs::metadata` here would only take the age decision from
+        // a file other than the one being unlinked.
         let meta = entry.metadata()?;
         if !meta.is_file() {
             continue;
@@ -462,15 +527,21 @@ impl RuntimePaths {
     /// which is what the periodic sweep does. A rename that leaves the
     /// daemon appending to an unlinked inode silently discards §9.4's
     /// trail while every file on disk looks correct.
+    ///
+    /// **`daemon.log` gets no such requirement, because it could not
+    /// meet one.** Its writer is the daemon's inherited fd 1/2, opened by
+    /// `spawn.rs` in the *parent*; no call the daemon can make reopens
+    /// it. It rolls by copy-truncate instead, which keeps that
+    /// descriptor valid — see [`Roll::CopyTruncate`].
     pub fn sweep_logs(&self, retention: LogRetention, now: SystemTime) -> io::Result<LogSweep> {
         let mut sweep = LogSweep::default();
         if !self.log_dir.exists() {
             return Ok(sweep);
         }
-        if let Some(to) = rotate(&self.audit_log(), Period::Daily, now)? {
+        if let Some(to) = rotate(&self.audit_log(), Period::Daily, Roll::Rename, now)? {
             sweep.rotated.push(to);
         }
-        if let Some(to) = rotate(&self.daemon_log(), Period::Weekly, now)? {
+        if let Some(to) = rotate(&self.daemon_log(), Period::Weekly, Roll::CopyTruncate, now)? {
             sweep.rotated.push(to);
         }
         sweep.removed.extend(retire(
@@ -909,6 +980,86 @@ mod tests {
         assert!(std::fs::read_to_string(&sweep.rotated[0])
             .unwrap()
             .contains("\"before\""));
+    }
+
+    /// The same property for the *other* log, which cannot be reached
+    /// the same way.
+    ///
+    /// `daemon.log` is opened by the process that **spawns** the daemon
+    /// (`spawn.rs`) and handed to it as fd 1 and fd 2; the daemon never
+    /// opens it. So unlike `audit.log` there is nothing inside `run` to
+    /// reopen and **no ordering can repair a rename** — after one, the
+    /// descriptor the daemon was handed points at a file that has been
+    /// renamed away, `retire("daemon.log.", …)` unlinks it a retention
+    /// window later, and every diagnostic that daemon emits for the rest
+    /// of its life lands in an unlinked inode while `spawn.rs` tells the
+    /// user to "see daemon.log". A `dup2` cannot stand in: under systemd
+    /// `clasp daemon run` is started directly and fd 2 is the journal.
+    /// Copy-truncate is what keeps the inherited descriptor valid
+    /// whatever it points at.
+    ///
+    /// `rotation_starts_a_new_file_and_leaves_the_old_one_readable` is
+    /// the pairing: `audit.log` keeps the rename, because its writer
+    /// *can* reopen and a rename cannot lose a concurrently-written line
+    /// the way the copy→truncate window can.
+    #[test]
+    fn the_daemon_log_survives_a_rotation_through_the_fd_it_was_handed() {
+        use std::io::Write;
+
+        let dir = temp_dir("dlogfd");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+
+        // The stand-in for fd 1 and fd 2: opened once, by somebody else,
+        // and never reopened.
+        let mut inherited = open_log_append(&paths.daemon_log()).unwrap();
+        inherited.write_all(b"before\n").unwrap();
+        backdate(&paths.daemon_log(), days(10));
+
+        let sweep = paths
+            .sweep_logs(LogRetention::default(), SystemTime::now())
+            .unwrap();
+        let rolled = sweep
+            .rotated
+            .first()
+            .expect("a ten-day-old daemon log is past its weekly boundary")
+            .clone();
+        assert!(rolled
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("daemon.log."));
+        assert_eq!(
+            std::fs::read_to_string(&rolled).unwrap(),
+            "before\n",
+            "the rotated file lost the bytes it was rotated to keep"
+        );
+
+        inherited.write_all(b"after\n").unwrap();
+        let live = std::fs::read_to_string(paths.daemon_log()).expect(
+            "daemon.log is gone, so the descriptor the daemon was handed now writes \
+             where no path can reach and `clasp daemon start`'s own advice is a dead end",
+        );
+        assert_eq!(
+            live, "after\n",
+            "the post-rotation write did not land in the live log"
+        );
+
+        // Retention parity. `retire` measures the window from the last
+        // byte written, which is the mtime `rename` carries over for
+        // free; a copy that let the stamped file be born *now* would
+        // keep `daemon.log.<stamp>` a full extra period past what §19.1
+        // specifies, on a clock the audit half does not use.
+        let stamped_age = SystemTime::now()
+            .duration_since(std::fs::metadata(&rolled).unwrap().modified().unwrap())
+            .unwrap();
+        assert!(
+            stamped_age > days(9),
+            "the rotated file was stamped at rotation time ({stamped_age:?} old), not at \
+             its last write, so it ages out of retention on a different clock than a \
+             rotated audit.log"
+        );
     }
 
     #[test]
