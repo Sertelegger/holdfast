@@ -4,7 +4,8 @@
 # Two shapes of shortfall. One census, because they are one defect:
 #
 #   1. A ROW THAT DID NOT RUN. Eight rows of
-#      crates/holdfast-core/tests/detection.rs early-`return` when their host
+#      crates/holdfast-core/tests/detection.rs, and REQ-TS-008's row in
+#      crates/holdfast-core/tests/screen.rs, early-`return` when their host
 #      requirement is unmet. libtest reports every one of them as `ok` and
 #      swallows the explanation unless `--show-output` is passed, so a
 #      suite that measured half of what its name promises still prints a
@@ -51,7 +52,14 @@
 # stops a gate rotting into a comment:
 #
 #   * A skip not on the agreed list fails. An agreed skip that stopped
-#     happening fails.
+#     happening fails. An agreed skip whose ROW is not in the log at all
+#     fails ALWAYS — same anti-vacuity rule as the gated census below, and
+#     it is there because the row half did NOT have it: until 2026-08-19
+#     the two `skipping: fish …` rows in two different test binaries shared
+#     one agreed PREFIX, one match satisfied it, and a run with
+#     tests/screen.rs's REQ-TS-008 row DELETED FROM THE SUITE censused
+#     clean. So did this file's own self-test fixture, which is what
+#     certified the arrangement. Entries are keyed on the ROW now.
 #   * A `not-asserted: ` id not on the agreed list fails. An agreed entry
 #     whose row RAN without emitting it means the assertion ran — a stale
 #     exemption — and fails where the exemption is claimed (see
@@ -85,7 +93,14 @@
 #   * `HOLDFAST_REQUIRE_ALL_SHELLS=1` turns every skip into a failure and
 #     would supersede the row half of this script entirely. It is not set
 #     yet, and the reason is measured and written down in ci.yml above the
-#     `test` job: the fish row cannot pass on any fish available today.
+#     `test` job: DETECTION.RS's fish row cannot pass on any fish
+#     available today. It would also not help REQ-TS-008 if it were set:
+#     the variable is read only by tests/detection.rs's `have()`, whose
+#     own opening assertion requires the `Need` to be in that file's
+#     HOST_DEPENDENT_ROWS table, and tests/screen.rs is a separate binary
+#     that calls neither. That is a gap in the SUITE, tracked as review
+#     finding I7(a) and not fixable from this script; the row half here is
+#     what covers REQ-TS-008 until it is closed.
 #
 # Run it locally exactly as CI does:
 #
@@ -105,13 +120,32 @@
 # Exit codes: 0 clean, 1 findings, 2 self-test failure or bad usage.
 set -uo pipefail
 
-# Every skip this pipeline tolerates, as a literal line PREFIX, one per
-# entry, each with the reason it is tolerated and the condition that
-# retires it. Adding an entry here is a deliberate, reviewable act; a row
-# that starts skipping without one turns this job red.
+# Every skip this pipeline tolerates, as one RECORD PER TEST ROW:
 #
-#   fish — measured 2026-08-13, in containers on the ubuntu-24.04 base
-#   image, at both fish versions obtainable there:
+#   <row>|<line prefix>[|<line prefix> …]
+#
+#   <row>     the libtest row name, exactly as `test <row> ... ok` prints
+#             it. This is what makes the entry non-vacuous, and it is the
+#             field whose absence was the defect: a log that never ran the
+#             row is not evidence about the row either way, so the row
+#             missing is CANNOT CERTIFY, not a silent pass.
+#   <prefix>  one or more ALTERNATIVE literal line prefixes, at least one
+#             of which must have been observed. Alternatives rather than
+#             separate obligations, because a row can have MUTUALLY
+#             EXCLUSIVE skip arms — REQ-TS-008's are "no fish at all" and
+#             "a fish too old to measure" — and only ever emits one of
+#             them, so demanding both would fail on every host there is.
+#
+# The prefixes must be long enough to tell the ROWS apart, not merely long
+# enough to look specific. `skipping: fish not installed` is a prefix of
+# all three fish skip lines in this suite; that is exactly how a run with
+# tests/screen.rs's REQ-TS-008 row deleted censused clean.
+#
+# Adding an entry here is a deliberate, reviewable act; a row that starts
+# skipping without one turns this job red.
+#
+#   detection.rs's fish row — measured 2026-08-13, in containers on the
+#   ubuntu-24.04 base image, at both fish versions obtainable there:
 #     * fish 3.7.0 (noble's own archive): the snippet installs and marks
 #       correctly, and the row still fails, because the shared assertion
 #       helper sends `(exit 42)` — a SUBSHELL in bash and zsh, a command
@@ -120,11 +154,31 @@ set -uo pipefail
 #     * fish >= 4: a marker collision the row asserts the absence of.
 #   Neither is CI's to fix and neither is a reason to stop running the
 #   other twenty rows. RETIRED BY: a fish the row can pass on — at which
-#   point `fish` goes into the apt line in ci.yml and the probe job,
-#   HOLDFAST_REQUIRE_ALL_SHELLS=1 gets set in ci.yml and nightly.yml, and
-#   this entry is deleted, in one change.
+#   point `fish` goes into the apt line in ci.yml's `test` job and the
+#   probe job, HOLDFAST_REQUIRE_ALL_SHELLS=1 gets set in ci.yml and
+#   nightly.yml, and this entry is deleted, in one change.
+#
+#   screen.rs's REQ-TS-008 row — a DIFFERENT shortfall with a different
+#   retirement, which is why it is a separate record and not a second
+#   prefix on the one above. It is exempt HERE because the `test` job
+#   installs no fish; it is not exempt from the pipeline. Measured
+#   2026-08-19, running this row's own test binary in containers:
+#     * fish 4.8.1 (`ppa:fish-shell/release-4`): the row RUNS and PASSES —
+#       silent 10.02 s, all-but-DA1 10.07 s with all four probes answered,
+#       DA1 0.054 s, against assertions of >= 5 s / >= 5 s / < 1 s.
+#     * fish 4.2.1 (Ubuntu 26.04's archive): the row RUNS and FAILS. 4.2.1
+#       emits no OSC 11 background query, so the middle arm answers three
+#       of four, and its silent arm reaches a prompt in 2.01 s rather than
+#       the >= 5 s the row asserts. "Any fish >= 4" is NOT the requirement.
+#     * fish 3.7.0: the row's second arm skips it.
+#   So the row is measured by ci.yml's `fish-req-ts-008` job, which pins
+#   the PPA, and this entry records that it is not measured by the `test`
+#   job. RETIRED BY: the `test` job itself installing a fish >= 4.1 from
+#   that PPA — which today would take detection.rs's row with it, so these
+#   two retire together or not at all.
 EXPECTED=(
-  "skipping: fish not installed"
+  "fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes|skipping: fish not installed — the fish snippet remains"
+  "only_answering_da1_takes_fish_to_its_first_prompt|skipping: fish not installed — REQ-TS-008's three arms need|skipping: fish not installed at a version this row measures"
 )
 
 # Every assertion this pipeline tolerates being gated OFF, keyed on the id
@@ -250,7 +304,8 @@ census() {
   fi
 
   local fails=0
-  local line want matched
+  local line want matched prefix skip_row
+  local -a want_alts
 
   # 1. Every observed skip must be one this pipeline has agreed to tolerate.
   # --- gate: skip-unexpected ---
@@ -258,7 +313,10 @@ census() {
     [ -z "$line" ] && continue
     matched=0
     for want in "${EXPECTED[@]}"; do
-      case "$line" in "$want"*) matched=1 ;; esac
+      IFS='|' read -r -a want_alts <<<"$want"
+      for prefix in "${want_alts[@]:1}"; do
+        case "$line" in "$prefix"*) matched=1 ;; esac
+      done
     done
     if [ "$matched" -eq 0 ]; then
       echo "  UNEXPECTED SKIP: $line" >&2
@@ -267,24 +325,54 @@ census() {
   done
   # --- /gate: skip-unexpected ---
 
-  # 2. Every tolerated skip must still be happening. An exemption for a row
-  #    that now runs is a lie in a file people read to find out what is
-  #    covered, and it is the exact state this project keeps finding.
-  # --- gate: skip-stale ---
+  # 2. Every tolerated skip must still be happening, IN THE ROW IT WAS
+  #    AGREED FOR. An exemption for a row that now runs is a lie in a file
+  #    people read to find out what is covered, and it is the exact state
+  #    this project keeps finding.
   for want in "${EXPECTED[@]}"; do
+    IFS='|' read -r -a want_alts <<<"$want"
+    skip_row="${want_alts[0]}"
+
+    # 2a. ANTI-VACUITY, per entry, and the reason this half of the census
+    #     exists at all. Matching on the message alone cannot tell "the row
+    #     ran and skipped" from "the row is gone and some OTHER row's
+    #     message happens to start the same way" — which is precisely what
+    #     happened: three fish skip lines in two binaries behind one
+    #     prefix, so deleting REQ-TS-008's row left the census green and
+    #     the fixture below certified that run as the expected one.
+    # --- gate: skip-absent-row ---
+    if ! grep -qE "^test ${skip_row} \.\.\." "$log"; then
+      echo "  CANNOT CERTIFY: a skip is exempted here for row" >&2
+      echo "  '$skip_row', which never reported in this log." >&2
+      echo "  A row that did not run cannot be certified as skipping. Either it was" >&2
+      echo "  renamed or DELETED — in which case this entry is describing coverage" >&2
+      echo "  that no longer exists and must go with it — or this log is not a run" >&2
+      echo "  of the whole workspace. Run it all, with --show-output." >&2
+      fails=$((fails + 1))
+      continue
+    fi
+    # --- /gate: skip-absent-row ---
+
+    # 2b. The row ran, so the log IS evidence about it. It must still have
+    #     skipped, by one of the arms agreed for it.
+    # --- gate: skip-stale ---
     matched=0
-    for line in "${observed[@]:-}"; do
-      case "$line" in "$want"*) matched=1 ;; esac
+    for prefix in "${want_alts[@]:1}"; do
+      for line in "${observed[@]:-}"; do
+        case "$line" in "$prefix"*) matched=1 ;; esac
+      done
     done
     if [ "$matched" -eq 0 ]; then
-      echo "  STALE EXEMPTION: nothing skipped with the prefix '$want'." >&2
+      echo "  STALE EXEMPTION: row '$skip_row' ran and skipped with none of the" >&2
+      echo "  prefixes agreed for it:" >&2
+      printf '    %s\n' "${want_alts[@]:1}" >&2
       echo "  If that row now runs, DELETE the entry — and check whether" >&2
       echo "  HOLDFAST_REQUIRE_ALL_SHELLS=1 can be set in ci.yml and nightly.yml," >&2
       echo "  which supersedes the row half of this script entirely." >&2
       fails=$((fails + 1))
     fi
+    # --- /gate: skip-stale ---
   done
-  # --- /gate: skip-stale ---
 
   # 3. Every observed non-assertion must be one this pipeline has agreed
   #    to tolerate. A malformed marker — no id, or an id nobody wrote down
@@ -502,6 +590,21 @@ self_test() {
   # ----` banner `--show-output` prints for a PASSING test, and both
   # notices inside it. The `not-asserted: ` line below is the one a real
   # 2-core run of this suite emits, copied verbatim.
+  #
+  # ROW NAMES ARE THE REAL ONES, and that is not cosmetic. Until 2026-08-19
+  # this fixture used an invented `a_fish_prompt_is_marked` and carried
+  # tests/detection.rs ALONE — no tests/screen.rs section, no REQ-TS-008
+  # row — and it was asserted CLEAN. The census keyed on a shared message
+  # prefix, so that fixture is a run in which REQ-TS-008's row had been
+  # deleted from the suite, certified green by the very file whose job is
+  # to notice. The section below is what that fixture was missing, the
+  # `rowgone.log` derived from it is the deletion asserted RED, and the
+  # entries in EXPECTED are keyed on these names.
+  #
+  # tests/screen.rs sits BEFORE tests/stress_write_path.rs deliberately:
+  # `norow.log` below truncates from the stress banner to EOF, and a screen
+  # section after it would vanish too, so `gated-absent-row`'s mutation
+  # would be caught by `skip-absent-row` instead of exonerated.
   cat > "$td/ci.log" <<'FIXTURE'
    Compiling holdfast-core v0.0.4 (/repo/crates/holdfast-core)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 41.02s
@@ -509,18 +612,35 @@ self_test() {
 
 running 21 tests
 test the_pty_matrix_runs_every_host_dependent_row_but_the_two_it_names ... ok
-test a_fish_prompt_is_marked ... ok
+test fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes ... ok
 
 successes:
 
----- a_fish_prompt_is_marked stdout ----
+---- fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes stdout ----
 skipping: fish not installed — the fish snippet remains UNVERIFIED by this suite (fish version: none)
 
 
 successes:
-    a_fish_prompt_is_marked
+    fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes
 
 test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.00s
+
+     Running tests/screen.rs (/repo/target/debug/deps/screen-0000000000000003)
+
+running 34 tests
+test the_all_but_da1_fixture_answers_every_probe_except_primary_da ... ok
+test only_answering_da1_takes_fish_to_its_first_prompt ... ok
+
+successes:
+
+---- only_answering_da1_takes_fish_to_its_first_prompt stdout ----
+skipping: fish not installed — REQ-TS-008's three arms need fish >= 4.0 (REQ-TST-007)
+
+
+successes:
+    only_answering_da1_takes_fish_to_its_first_prompt
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s
 
      Running tests/stress_write_path.rs (/repo/target/debug/deps/stress_write_path-0000000000000002)
 
@@ -554,8 +674,22 @@ FIXTURE
   sed 's/cores=2 min_cores=8/cores=16 min_cores=8/' "$td/ci.log" > "$td/incoherent.log"
   # A row that started skipping without anyone agreeing to it.
   { cat "$td/ci.log"; echo "skipping: zsh not installed"; } > "$td/unexpected.log"
-  # The fish row started passing.
+  # The fish rows started passing.
   grep -v '^skipping: fish' "$td/ci.log" > "$td/stalefish.log"
+  # THE ONE THIS FILE GOT WRONG: REQ-TS-008's row deleted from the suite
+  # outright — its `test …` line, its output banner, its success entry and
+  # its skip notice all gone, exactly as a deleted `#[test]` fn leaves the
+  # log. detection.rs's fish line survives, which is why the old
+  # single-prefix EXPECTED matched and called this clean.
+  grep -v 'only_answering_da1_takes_fish_to_its_first_prompt' "$td/ci.log" \
+    | grep -vF "REQ-TS-008's three arms" > "$td/rowgone.log"
+  # The row RENAMED while its skip message stayed the same. This is the
+  # fixture `skip-absent-row` is the ONLY thing catching — the agreed
+  # prefix is still observed, so the stale gate is satisfied and says
+  # nothing, and what is wrong is that the entry names a row that no
+  # longer exists.
+  sed 's/only_answering_da1_takes_fish_to_its_first_prompt/only_answering_da1_takes_fish_to_a_prompt/' \
+    "$td/ci.log" > "$td/renamedrow.log"
   # A log that cannot be about the rows at all.
   grep -v 'tests/detection.rs' "$td/ci.log" > "$td/nodetect.log"
   # A log no test binary summarised: a build failure, or a truncated tee.
@@ -570,7 +704,7 @@ FIXTURE
   expect "the log CI produces today is CLEAN under CI's strictness" \
     ci.log 1 0 "SKIP CENSUS OK"
   expect "...and it says what did NOT run, rather than reading as full coverage" \
-    ci.log 1 0 "1 tolerated skip(s), 1 tolerated non-assertion(s)"
+    ci.log 1 0 "2 tolerated skip(s), 1 tolerated non-assertion(s)"
   expect "...and it names the gated assertion in the listing" \
     ci.log 1 0 "not-asserted: stress_write_path::control_path_p99 cores=2 min_cores=8"
 
@@ -598,11 +732,22 @@ FIXTURE
   expect "a marker from a host that met the gate's own condition FAILS" \
     incoherent.log 0 1 "INCOHERENT MARKER"
 
-  # THE ROW CENSUS, both directions, unchanged by all of the above.
+  # THE ROW CENSUS, all three directions.
   expect "an unexpected skip still FAILS" \
     unexpected.log 0 1 "UNEXPECTED SKIP: skipping: zsh not installed"
-  expect "the fish exemption going stale still FAILS" \
-    stalefish.log 0 1 "STALE EXEMPTION: nothing skipped with the prefix"
+  expect "the fish exemptions going stale still FAILS" \
+    stalefish.log 0 1 "STALE EXEMPTION: row 'only_answering_da1_takes_fish_to_its_first_prompt'"
+  # THE FINDING. Both of these passed — green, rc 0, "0 unexpected" — under
+  # the single-prefix EXPECTED this file carried until 2026-08-19, because
+  # detection.rs's fish line satisfied the one entry on its own.
+  expect "DELETING the REQ-TS-008 row from the suite FAILS" \
+    rowgone.log 0 1 "CANNOT CERTIFY"
+  expect "...and it names the row that went missing, not just 'a skip'" \
+    rowgone.log 0 1 "'only_answering_da1_takes_fish_to_its_first_prompt', which never reported"
+  expect "RENAMING the row out from under its exemption FAILS" \
+    renamedrow.log 0 1 "CANNOT CERTIFY"
+  expect "each fish row is censused separately, not behind one shared prefix" \
+    ci.log 1 0 "skipping: fish not installed — REQ-TS-008's three arms need"
 
   expect "a strictness knob nobody can read is not a pass either" \
     ci.log yes 2 "is not 0, 1 or unset"
@@ -624,6 +769,7 @@ FIXTURE
     "vacuity-result|nosummary.log|0"
     "skip-unexpected|unexpected.log|0"
     "skip-stale|stalefish.log|0"
+    "skip-absent-row|renamedrow.log|0"
     "gated-unexpected|unknown.log|0"
     "gated-absent-row|norow.log|0"
     "gated-threshold|thresh.log|0"
