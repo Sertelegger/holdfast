@@ -195,6 +195,38 @@ impl RuntimePaths {
                     .create(&dir)?;
             }
             let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
+            // Tighten a *leak*; **refuse** a writable one. The two cases
+            // differ in what tightening can still repair.
+            //
+            // A `0755` leftover from an earlier install leaks the names
+            // of the sockets inside, and a chmod to `0700` removes that
+            // leak outright — §7.1 describes exactly this case, and
+            // tightening rather than rejecting it is this milestone's
+            // recorded divergence from REQ-CFG-005's verification column.
+            //
+            // A group- or world-**writable** directory is not the same
+            // thing, and a chmod does not repair it. Another local user
+            // could already have pre-created `logs/` inside it as a
+            // **symlink**: `dir.exists()` follows it, `metadata` follows
+            // it, `set_permissions` would chmod the *target*, and
+            // `Daemon::new` then appends §9.4 audit entries through an
+            // attacker-chosen path. `bind_control`'s stale-socket sweep
+            // defends `control.sock`; nothing defends `logs/`. Refusing
+            // the parent is what closes it, and the loop reaches
+            // `self.dir` before `self.log_dir`, so the refusal lands
+            // before any such symlink is traversed.
+            if mode & 0o022 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} is mode {mode:o}: group/world-writable, so another local user \
+                         may already have planted entries inside it. Refusing rather than \
+                         tightening — a chmod does not undo what is already there. Remove \
+                         it, or set {RUNTIME_DIR_ENV} to a directory you own.",
+                        dir.display()
+                    ),
+                ));
+            }
             if mode != DIR_MODE {
                 std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DIR_MODE))?;
                 let after = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
@@ -324,6 +356,40 @@ mod tests {
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn ensure_dir_refuses_a_pre_existing_group_or_world_writable_directory() {
+        // The residual the tighten step leaves behind. A `0755` leftover
+        // is a leak and a chmod removes it; a writable one is a foothold
+        // and a chmod does not, because `logs/` may already be somebody
+        // else's symlink by the time we look — after which every §9.4
+        // audit entry is appended to a path they chose.
+        //
+        // Both bits, separately: a mutation that checked only `0o002`
+        // would sail past `0o770` on a shared group, which is the more
+        // likely of the two in practice.
+        for loose in [0o777, 0o757, 0o770] {
+            let dir = temp_dir(&format!("wr{loose:o}"));
+            let _scoped = Scoped(dir.clone());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(loose)).unwrap();
+
+            let err = RuntimePaths::with_dir(&dir)
+                .ensure_dir()
+                .expect_err("a writable runtime directory must be refused, not tightened");
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+            assert!(
+                err.to_string().contains(RUNTIME_DIR_ENV),
+                "the error must name the escape hatch: {err}"
+            );
+            // And it refused rather than repairing: a `logs/` created
+            // under the loose mode is exactly what the refusal is for.
+            assert!(
+                !dir.join("logs").exists(),
+                "nothing may be created inside a directory that was refused"
+            );
+        }
     }
 
     #[test]
