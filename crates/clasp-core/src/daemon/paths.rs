@@ -364,8 +364,32 @@ impl RuntimePaths {
         self.dir.join("clasp.pid")
     }
 
+    /// The **start** lock (§7.3 steps 1–2): who gets to decide that no
+    /// daemon is running and spawn one.
     pub fn lock_file(&self) -> PathBuf {
         self.dir.join("clasp.lock")
+    }
+
+    /// The **bind** lock: who owns `bind_control`'s probe → unlink →
+    /// bind window.
+    ///
+    /// **A second file, and it must stay a second file.** The obvious
+    /// simplification — have `bind_control` take `clasp.lock` —
+    /// deadlocks `clasp daemon start` outright: `start_detached` holds
+    /// `clasp.lock` across the spawn *and* the 2 s poll that waits for
+    /// the socket (`spawn.rs`, `let _lock = …` living to end of
+    /// function), and the child `clasp daemon run` does not inherit it
+    /// because Rust opens `O_CLOEXEC`. The child would block on the
+    /// lock, never bind, and the parent would time out waiting for the
+    /// socket it is itself preventing.
+    ///
+    /// The two locks answer different questions and neither subsumes the
+    /// other: `clasp.lock` serialises *starters*, this one serialises
+    /// *binders*. The case that needs it is the one `clasp.lock` cannot
+    /// see — a `start_detached` that already timed out and released
+    /// while its child was still binding.
+    pub fn bind_lock_file(&self) -> PathBuf {
+        self.dir.join("bind.lock")
     }
 
     /// §19.1's log directory — `~/.clasp/logs` by default, relocated

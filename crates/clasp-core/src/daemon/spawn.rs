@@ -25,12 +25,28 @@ pub struct DaemonLock {
 }
 
 impl DaemonLock {
-    /// Acquire the lock, retrying until [`LOCK_TIMEOUT`].
+    /// Acquire the **start** lock, retrying until [`LOCK_TIMEOUT`].
     ///
     /// Non-blocking + poll rather than a blocking `LOCK_EX`: a wedged
     /// holder must not hang the MCP shim's startup forever.
     pub fn acquire(paths: &RuntimePaths) -> io::Result<Self> {
         Self::acquire_within(paths, LOCK_TIMEOUT)
+    }
+
+    /// Acquire the **bind** lock, which makes `bind_control`'s
+    /// probe → unlink → bind window atomic between two daemons.
+    ///
+    /// A different file from [`acquire`](Self::acquire) on purpose — see
+    /// [`RuntimePaths::bind_lock_file`] for why merging the two
+    /// deadlocks `clasp daemon start`.
+    pub fn acquire_bind(paths: &RuntimePaths) -> io::Result<Self> {
+        Self::acquire_at(paths, paths.bind_lock_file(), LOCK_TIMEOUT)
+    }
+
+    /// [`acquire_bind`](Self::acquire_bind) with the deadline supplied,
+    /// so a test can observe contention without paying [`LOCK_TIMEOUT`].
+    pub(crate) fn acquire_bind_within(paths: &RuntimePaths, timeout: Duration) -> io::Result<Self> {
+        Self::acquire_at(paths, paths.bind_lock_file(), timeout)
     }
 
     /// [`acquire`](Self::acquire) with the deadline supplied.
@@ -43,6 +59,14 @@ impl DaemonLock {
     /// keeps the contended probe from paying the full 5 s to learn
     /// nothing. See `a_contended_acquire_retries_until_the_holder_releases`.
     fn acquire_within(paths: &RuntimePaths, timeout: Duration) -> io::Result<Self> {
+        Self::acquire_at(paths, paths.lock_file(), timeout)
+    }
+
+    fn acquire_at(
+        paths: &RuntimePaths,
+        lock_file: std::path::PathBuf,
+        timeout: Duration,
+    ) -> io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
         paths.ensure_dir()?;
         let file = std::fs::OpenOptions::new()
@@ -51,7 +75,7 @@ impl DaemonLock {
             .write(true)
             .truncate(false)
             .mode(0o600)
-            .open(paths.lock_file())?;
+            .open(lock_file)?;
 
         let deadline = Instant::now() + timeout;
         loop {

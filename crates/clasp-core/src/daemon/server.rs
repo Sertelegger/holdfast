@@ -366,17 +366,37 @@ impl Daemon {
             let _ = session.signal(crate::pty::Signal::Terminate);
         }
 
+        // **Not on a manual clock**, and this is the one caller
+        // [`Clock::is_manual`] was written for.
+        //
+        // `Clock::sleep_until` on a hand parks until someone calls
+        // `advance`, and the only thing that can is a test — which, on
+        // this path, is blocked in this very `await`. `daemon/stop` is
+        // reachable over the wire (`dispatch`'s `METHOD_DAEMON_STOP`
+        // arm), so `{ force: false }` against a manual-clock daemon
+        // holding one live session wedges `handle_connection`, the
+        // client's `call`, and the suite. There is no `nextest.toml` in
+        // this repo, so that is a hung CI job rather than a red test.
+        //
+        // Skipping the poll is the honest answer rather than a dodge: a
+        // hand nobody is moving grants the child no grace it could
+        // actually spend, and the ordering the graceful stop promises —
+        // SIGTERM first, SIGKILL after — is preserved by the escalation
+        // below. `Clock::system()` is unaffected, which is every
+        // production daemon.
         if !live.is_empty() {
             // Poll rather than sleeping the whole grace: a well-behaved
             // child exits in milliseconds, and making every `clasp daemon
             // stop` cost ten seconds would be a tax on the common case.
-            let deadline = self.clock.now() + grace;
-            while self.clock.now() < deadline {
-                if live.iter().all(|s| !s.is_alive()) {
-                    break;
+            if !self.clock.is_manual() {
+                let deadline = self.clock.now() + grace;
+                while self.clock.now() < deadline {
+                    if live.iter().all(|s| !s.is_alive()) {
+                        break;
+                    }
+                    let next = (self.clock.now() + STOP_POLL_INTERVAL).min(deadline);
+                    self.clock.sleep_until(next).await;
                 }
-                let next = (self.clock.now() + STOP_POLL_INTERVAL).min(deadline);
-                self.clock.sleep_until(next).await;
             }
             for session in &live {
                 if session.is_alive() {
@@ -424,6 +444,40 @@ impl Daemon {
     pub fn shutdown_signalled(&self) -> watch::Receiver<bool> {
         self.shutdown_tx.subscribe()
     }
+
+    /// §19.1's periodic half: rotate, retire, and **reopen**.
+    ///
+    /// The daemon has held `audit.log` open since start-up, so a
+    /// rotation renames the file out from under a live descriptor.
+    /// Without the reopen every subsequent `record` lands in an
+    /// **unlinked inode**: every file on disk looks correct and §9.4's
+    /// trail silently stops.
+    ///
+    /// **The reopen is unconditional, and that is the fix rather than
+    /// the shape.** `sweep_logs` rotates `audit.log` *first*
+    /// (`paths.rs`) and can then fail in any of four later steps —
+    /// `daemon.log`'s own rotate, or a `read_dir`, a `metadata` or a
+    /// `remove_file` inside either `retire`. On that path the audit log
+    /// has already been renamed away and the call returns `Err`, so a
+    /// reopen gated on `Ok(sweep)` with a non-empty `rotated` is
+    /// skipped exactly when it is needed most. Gating it on `rotated`
+    /// at all buys one avoided `open` per day and costs the whole
+    /// trail; there is no version of this worth making conditional.
+    ///
+    /// Extracted from `reaper_loop` so that it has a caller a test can
+    /// reach. Neither half was reachable before: the loop is spawned
+    /// only from `run`, which nothing in the workspace calls.
+    pub(crate) fn sweep_and_reopen(&self) {
+        if let Err(e) = self.paths.sweep_logs(
+            LogRetention::from(self.config()),
+            std::time::SystemTime::now(),
+        ) {
+            eprintln!("clasp daemon: log rotation sweep failed: {e}");
+        }
+        if let Err(e) = self.server.processor.audit.reopen() {
+            eprintln!("clasp daemon: cannot reopen the audit log: {e}");
+        }
+    }
 }
 
 /// Bind `control.sock` and tighten it to `0600`.
@@ -432,9 +486,39 @@ impl Daemon {
 /// another user cannot reach the socket even during it, because they
 /// cannot traverse the parent.
 pub fn bind_control(paths: &RuntimePaths) -> io::Result<UnixListener> {
+    bind_control_within(paths, super::spawn::LOCK_TIMEOUT)
+}
+
+/// [`bind_control`] with the bind-lock deadline supplied, so a test can
+/// observe contention without paying [`spawn::LOCK_TIMEOUT`].
+///
+/// [`spawn::LOCK_TIMEOUT`]: super::spawn::LOCK_TIMEOUT
+pub(crate) fn bind_control_within(
+    paths: &RuntimePaths,
+    lock_timeout: Duration,
+) -> io::Result<UnixListener> {
     use std::os::unix::fs::PermissionsExt;
 
     paths.ensure_dir()?;
+
+    // **The probe → unlink → bind window below is not atomic**, and
+    // without a lock it is a way to unlink a *live* daemon's socket.
+    // Two `clasp daemon run` processes — or one started while another's
+    // `start_detached` had already timed out at 2 s with its child still
+    // binding — can both see "dead", after which the second's
+    // `remove_file` removes the first's just-bound socket. The first
+    // then serves live PTY sessions on an unlinked inode no client can
+    // reach again, and it never learns that it happened.
+    //
+    // The lock is taken here rather than in [`run`] so that no caller
+    // can forget it: `run` is not the only path that binds — the
+    // `TestDaemon` harness and the uid-gate test bind directly.
+    //
+    // `bind.lock` and **not** `clasp.lock`: see
+    // [`RuntimePaths::bind_lock_file`]. Held to the end of this
+    // function, which is exactly the window, and released on return.
+    let _bind_lock = super::spawn::DaemonLock::acquire_bind_within(paths, lock_timeout)?;
+
     let path = paths.control_sock();
 
     if path.exists() {
@@ -503,7 +587,15 @@ const LOG_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// All three live here because the reaper is the only periodic timer in
 /// the process, and a second one would be a second answer to "how often
 /// does the daemon look at itself".
-async fn reaper_loop(daemon: Arc<Daemon>) {
+///
+/// `pub(crate)` so the loop itself is testable. It was private and
+/// spawned only from [`run`], which nothing in the workspace calls, so
+/// deleting any single statement in the body — or the spawn — left the
+/// **whole** workspace green while disabling the idle reaper (§16.7),
+/// REQ-R-006's exit half, §7.3's client-less exit and §19.1's retention
+/// sweep in production. Every §7.3 test asserted the *predicate*
+/// `client_less_exit_due()` and none that anything acted on it.
+pub(crate) async fn reaper_loop(daemon: Arc<Daemon>) {
     let reaper = Reaper::new(Arc::clone(&daemon.server.registry), daemon.clock());
     let mut shutdown = daemon.shutdown_signalled();
     let clock = daemon.clock();
@@ -526,25 +618,7 @@ async fn reaper_loop(daemon: Arc<Daemon>) {
         }
 
         if clock.now() >= next_log_sweep {
-            let retention = LogRetention::from(daemon.config());
-            match daemon
-                .paths()
-                .sweep_logs(retention, std::time::SystemTime::now())
-            {
-                // The daemon has held `audit.log` open since start-up, so
-                // a rotation here renames the file out from under an open
-                // descriptor. Without the reopen every subsequent record
-                // lands in an unlinked inode: every file on disk looks
-                // correct and §9.4's trail silently stops.
-                Ok(sweep) => {
-                    if !sweep.rotated.is_empty() {
-                        if let Err(e) = daemon.server.processor.audit.reopen() {
-                            eprintln!("clasp daemon: cannot reopen the audit log: {e}");
-                        }
-                    }
-                }
-                Err(e) => eprintln!("clasp daemon: log rotation sweep failed: {e}"),
-            }
+            daemon.sweep_and_reopen();
             next_log_sweep = clock.now() + LOG_SWEEP_INTERVAL;
         }
 
@@ -553,6 +627,25 @@ async fn reaper_loop(daemon: Arc<Daemon>) {
             _ = reaper.wait_for_next_tick() => {}
         }
     }
+}
+
+/// The daemon's two long-lived tasks: the periodic tick, and the accept
+/// loop. Returns when the accept loop stops, which is when shutdown has
+/// been signalled — by `daemon/stop`, by SIGTERM, or by §7.3's
+/// client-less exit acting from inside [`reaper_loop`].
+///
+/// **Separate from [`run`] because the spawn was otherwise untestable.**
+/// `run` loads a config from the environment, binds a socket, writes a
+/// pid file and installs a process-wide SIGTERM handler, so nothing in
+/// the workspace calls it — and `tokio::spawn(reaper_loop(…))` sitting
+/// inside it meant deleting the one line that starts the daemon's only
+/// periodic timer left every test green while disabling four features
+/// at once. Here it has a caller a test can drive over a real socket,
+/// and `the_daemon_starts_its_periodic_tick_and_the_client_less_window_
+/// stops_the_accept_loop` is the row that goes red without it.
+pub async fn serve_daemon(daemon: Arc<Daemon>, listener: UnixListener) {
+    tokio::spawn(reaper_loop(Arc::clone(&daemon)));
+    serve(daemon, listener).await;
 }
 
 /// Run a daemon to completion: bind, write the pid file, serve, clean up.
@@ -603,9 +696,7 @@ pub async fn run(paths: RuntimePaths) -> anyhow::Result<()> {
         sig_daemon.shutdown();
     });
 
-    tokio::spawn(reaper_loop(Arc::clone(&daemon)));
-
-    serve(Arc::clone(&daemon), listener).await;
+    serve_daemon(Arc::clone(&daemon), listener).await;
 
     // Anything still alive after `shutdown()` (or after a shutdown that
     // never ran, e.g. a bind error unwinding) dies here.
@@ -1212,6 +1303,14 @@ mod tests {
     }
 
     fn mock_session(id: &str, clock: &Clock) -> Arc<crate::session::Session> {
+        mock_session_idle(id, clock, 0)
+    }
+
+    fn mock_session_idle(
+        id: &str,
+        clock: &Clock,
+        idle_timeout_secs: u64,
+    ) -> Arc<crate::session::Session> {
         crate::session::Session::new(
             id.to_string(),
             None,
@@ -1219,11 +1318,36 @@ mod tests {
             vec![],
             Arc::new(crate::pty::MockPty::new()),
             crate::session::SessionConfig {
-                idle_timeout_secs: 0,
+                idle_timeout_secs,
                 clock: clock.clone(),
                 ..crate::session::SessionConfig::default()
             },
         )
+    }
+
+    /// Yield until `cond` holds, and give up rather than park.
+    ///
+    /// The loops below are woken by a hand, not by wall time, so there
+    /// is nothing to sleep on — but a loop that never acts must be a
+    /// **red** test rather than a hung one, and there is no
+    /// `nextest.toml` in this repo to make that distinction for us.
+    async fn yield_until(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..500 {
+            if cond() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        cond()
+    }
+
+    fn backdate(path: &std::path::Path, by: Duration) {
+        let f = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for set_times");
+        f.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now() - by))
+            .expect("set mtime");
     }
 
     #[test]
@@ -1405,6 +1529,106 @@ mod tests {
         assert!(!s.is_alive());
     }
 
+    /// **A hang, not a red.** `shutdown_graceful` polled
+    /// `Clock::sleep_until` on whatever clock the daemon holds, and on a
+    /// hand that parks until someone calls `advance` — which, here,
+    /// only the caller blocked in this `await` could do. It is reachable
+    /// over the wire from `dispatch`'s `METHOD_DAEMON_STOP` arm, so
+    /// `daemon/stop { force: false }` against a manual-clock daemon with
+    /// one live session wedged `handle_connection`, the client's `call`
+    /// and the suite. With no `nextest.toml` in this repo that is a hung
+    /// CI job.
+    ///
+    /// The timeout **is** the evidence here, deliberately, because the
+    /// defect being killed is a hang: elapsing means `shutdown_graceful`
+    /// never returned. The signal assertion is what stops the fix being
+    /// "just call `shutdown()`" — the SIGTERM-then-SIGKILL ordering a
+    /// graceful stop promises has to survive the skipped poll.
+    #[tokio::test]
+    async fn a_graceful_stop_on_a_manual_clock_returns_instead_of_parking() {
+        let paths = scratch("manualstop");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        let daemon = Daemon::with_config_and_clock(paths, Config::default(), clock.clone());
+
+        let mock = Arc::new(crate::pty::MockPty::ignoring_terminate());
+        let s = crate::session::Session::new(
+            "sess_manualstop".into(),
+            None,
+            "mock".into(),
+            vec![],
+            Arc::clone(&mock) as Arc<dyn crate::pty::PtyBackend>,
+            crate::session::SessionConfig {
+                clock: clock.clone(),
+                ..crate::session::SessionConfig::default()
+            },
+        );
+        daemon.server.registry.insert(Arc::clone(&s)).unwrap();
+
+        let terminated = tokio::time::timeout(
+            Duration::from_secs(2),
+            daemon.shutdown_graceful(Duration::from_secs(10)),
+        )
+        .await
+        .expect("shutdown_graceful parked on a hand that nothing was moving");
+
+        assert_eq!(terminated, 1);
+        assert_eq!(
+            mock.signals(),
+            vec![crate::pty::Signal::Terminate, crate::pty::Signal::Kill],
+            "skipping the poll must not skip the SIGTERM: a graceful stop that \
+             goes straight to SIGKILL is `force: true` under another name"
+        );
+        assert!(!s.is_alive());
+    }
+
+    /// §7.2's bind is not atomic, and without a lock it unlinks a
+    /// **live** daemon's socket.
+    ///
+    /// `bind_control` probes, removes and binds, and `server.rs` held no
+    /// lock of any kind. Two `clasp daemon run` processes — or one
+    /// started while another's `start_detached` had timed out at 2 s
+    /// with its child still binding — can both read "dead", after which
+    /// the second's `remove_file` takes out the first's just-bound
+    /// socket. The first goes on serving live PTY sessions on an
+    /// unlinked inode that no client can reach again.
+    ///
+    /// Driven by holding the lock from outside rather than by racing two
+    /// threads: a race test that passes whenever the bad interleaving
+    /// happens not to occur is not a test. The `!exists` assertion is
+    /// what says the refusal landed *before* the window rather than
+    /// inside it.
+    // `tokio::net::UnixListener::bind` needs a reactor, so the
+    // succeeding half below has to run inside one.
+    #[tokio::test]
+    async fn binding_the_control_socket_takes_the_bind_lock() {
+        let paths = scratch("bindlock");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+
+        let held = super::super::spawn::DaemonLock::acquire_bind(&paths)
+            .expect("take the bind lock as the other daemon would");
+        let refused = bind_control_within(&paths, Duration::from_millis(150))
+            .expect_err("a second daemon entered the stale-socket window while the first held it");
+        assert!(
+            refused.raw_os_error().is_some(),
+            "expected the contended flock's errno, got {refused:?}"
+        );
+        assert!(
+            !paths.control_sock().exists(),
+            "the refusal must land before the probe-and-unlink, not inside it"
+        );
+
+        // The pairing: a `bind_control` that answered `Err` for some
+        // unrelated reason would satisfy the row above and never bind at
+        // all. Once the holder is gone the same call must succeed.
+        drop(held);
+        let listener = bind_control(&paths).expect("the lock is free once the holder drops it");
+        assert!(paths.control_sock().exists());
+        drop(listener);
+    }
+
     #[tokio::test]
     async fn a_graceful_stop_escalates_a_child_that_ignores_sigterm() {
         // A trapping child is the case §4.4 names, and without the
@@ -1435,5 +1659,220 @@ mod tests {
             "SIGTERM alone leaves a trapping child running forever"
         );
         assert!(!s.is_alive());
+    }
+
+    // ------------------------------- the periodic tick, actuated (Task 16)
+    //
+    // Everything above this line asserts a **predicate**. `reaper_loop`
+    // was private and spawned from `run` alone, which no test in the
+    // workspace calls, so deleting the spawn — or any single statement
+    // inside the loop — left the entire workspace green while disabling
+    // the idle reaper (§16.7), REQ-R-006's exit half, §7.3's client-less
+    // exit and §19.1's retention sweep in production. These four rows
+    // are the actuation.
+
+    /// The spawn site itself, over a real socket.
+    ///
+    /// This is the row that goes red when `tokio::spawn(reaper_loop(…))`
+    /// is deleted from [`serve_daemon`]: with no tick running, nothing
+    /// ever evaluates §7.3's conjunction, the accept loop is never told
+    /// to stop, and the `timeout` elapses. Every other §7.3 test asserts
+    /// `client_less_exit_due()` and would stay green.
+    ///
+    /// The timeout is the evidence, because the failure mode is a daemon
+    /// that runs forever.
+    #[tokio::test]
+    async fn the_daemon_starts_its_periodic_tick_and_the_client_less_window_stops_it() {
+        let paths = scratch("tickexit");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        let listener = bind_control(&paths).expect("bind control.sock");
+        let daemon = Daemon::with_config_and_clock(paths, configured(3600), clock.clone());
+
+        let served = tokio::spawn(serve_daemon(Arc::clone(&daemon), listener));
+        // Let the tick reach its first park before the hand moves.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !served.is_finished(),
+            "the daemon stopped before its window had expired"
+        );
+
+        clock.advance(Duration::from_secs(3601));
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the accept loop never stopped: nothing acted on §7.3's window")
+            .expect("the serve task panicked");
+        assert!(
+            *daemon.shutdown_signalled().borrow(),
+            "the accept loop returned without shutdown having been signalled"
+        );
+    }
+
+    /// The idle reaper and REQ-R-006's exit half, both on the one tick.
+    ///
+    /// The two statements fail this row **distinguishably**, which is
+    /// why the liveness assertion comes first: deleting
+    /// `reaper.scan_once()` leaves the session alive and trips
+    /// `yield_until`, while deleting the in-loop
+    /// `poll_resource_list_changed()` leaves the session correctly
+    /// reaped and times the `recv` out instead. Ordered the other way
+    /// round, both mutations would land on the same assertion and the
+    /// message would name the wrong cause for one of them.
+    #[tokio::test]
+    async fn the_periodic_tick_reaps_an_idle_session_and_announces_its_exit() {
+        let paths = scratch("tickreap");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        // `0` disables §7.3's exit, so the loop stays up long enough to
+        // be observed rather than shutting down on the same tick.
+        let daemon = Daemon::with_config_and_clock(paths, configured(0), clock.clone());
+
+        let s = mock_session_idle("sess_tickreap", &clock, 60);
+        daemon.server.registry.insert(Arc::clone(&s)).unwrap();
+        let mut events = daemon.server.resource_list_changed.subscribe();
+
+        tokio::spawn(reaper_loop(Arc::clone(&daemon)));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // The loop seeds its known set on entry, and seeding a registry
+        // that already holds a session announces it. Drained here so the
+        // assertion below is about the **exit** edge and cannot be
+        // satisfied by that first pulse.
+        while events.try_recv().is_ok() {}
+
+        clock.advance(Duration::from_secs(61));
+        assert!(
+            yield_until(|| !s.is_alive()).await,
+            "the tick never swept: an idle session outlived its timeout"
+        );
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the session exited and no list_changed pulse announced it")
+            .expect("the resource-event channel closed");
+        // §5.5.1's ruling survives the loop as well as the bare sweep.
+        assert!(daemon.server.registry.get("sess_tickreap").is_ok());
+    }
+
+    /// §19.1's periodic half, and the `AuditLog::reopen` inside it.
+    ///
+    /// The only test in the tree that touched the reopen
+    /// (`paths.rs`'s `the_daemon_keeps_writing_across_a_rotation`) calls
+    /// `log.reopen()` **itself** — the repair path running before the
+    /// assertion — so deleting the call site left it green. This one
+    /// never calls it: the loop must, or `after` lands in an unlinked
+    /// inode and the live file is not there to read.
+    #[tokio::test]
+    async fn the_periodic_tick_rotates_the_audit_log_and_keeps_writing_to_the_live_file() {
+        let paths = scratch("ticksweep");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        let daemon = Daemon::with_config_and_clock(paths.clone(), configured(0), clock.clone());
+
+        daemon
+            .server
+            .processor
+            .audit
+            .record("before", None, json!({}));
+        backdate(&paths.audit_log(), Duration::from_secs(86_400));
+
+        tokio::spawn(reaper_loop(Arc::clone(&daemon)));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(LOG_SWEEP_INTERVAL + Duration::from_secs(1));
+
+        let rolled = || {
+            std::fs::read_dir(paths.log_dir())
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .any(|e| e.file_name().to_string_lossy().starts_with("audit.log."))
+                })
+                .unwrap_or(false)
+        };
+        assert!(
+            yield_until(rolled).await,
+            "the tick never ran §19.1's sweep: a daemon that outlives a day \
+             never rotates and never retires anything"
+        );
+
+        daemon
+            .server
+            .processor
+            .audit
+            .record("after", None, json!({}));
+        let live = std::fs::read_to_string(paths.audit_log())
+            .expect("the live audit log is gone: the rotation was never followed by a reopen");
+        assert!(
+            live.contains("\"after\""),
+            "the entry landed somewhere other than the current file: {live:?}"
+        );
+        assert!(
+            !live.contains("\"before\""),
+            "the pre-rotation entry belongs in the rotated file"
+        );
+    }
+
+    /// Imp-5: the reopen must not be conditional on the sweep succeeding.
+    ///
+    /// `sweep_logs` rotates `audit.log` **first** and can then fail in
+    /// any of four later steps. On that path the file has already been
+    /// renamed out from under the daemon's descriptor, so a reopen gated
+    /// on `Ok(sweep)` is skipped precisely when it is needed — and the
+    /// daemon appends to an unlinked inode for the rest of its life
+    /// while every file on disk looks correct.
+    ///
+    /// The premise is asserted rather than assumed: without the `Err`
+    /// this row would exercise the ordinary success path and prove
+    /// nothing about the error arm.
+    #[test]
+    fn a_sweep_that_fails_after_rotating_still_reopens_the_audit_log() {
+        let paths = scratch("sweeperr");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = Daemon::new(paths.clone());
+
+        daemon
+            .server
+            .processor
+            .audit
+            .record("before", None, json!({}));
+        backdate(&paths.audit_log(), Duration::from_secs(86_400));
+
+        // A self-referential symlink: `rotate` reaches it through
+        // `std::fs::metadata`, which follows links, so it answers ELOOP
+        // — not `NotFound`, so it propagates as `Err` rather than being
+        // absorbed as "no such log".
+        std::os::unix::fs::symlink("daemon.log", paths.daemon_log()).unwrap();
+
+        let failed = paths.sweep_logs(LogRetention::default(), std::time::SystemTime::now());
+        assert!(
+            failed.is_err(),
+            "the premise: this sweep has to fail, or the error arm is untested"
+        );
+        assert!(
+            !paths.audit_log().exists(),
+            "the premise: the audit log has to have been rotated away *before* \
+             the failure, or there is no unlinked inode to be stranded on"
+        );
+
+        daemon.sweep_and_reopen();
+        daemon
+            .server
+            .processor
+            .audit
+            .record("after", None, json!({}));
+
+        let live = std::fs::read_to_string(paths.audit_log()).expect(
+            "the audit log was never reopened after a sweep that failed \
+             downstream of the rotation: §9.4's trail has silently stopped",
+        );
+        assert!(live.contains("\"after\""), "got {live:?}");
+        assert!(!live.contains("\"before\""));
     }
 }
