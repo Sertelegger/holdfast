@@ -6,10 +6,13 @@ pub mod wait;
 pub use reaper::Reaper;
 pub use registry::SessionRegistry;
 
+use crate::attach::secret::SecretBytes;
 use crate::buffer::{BufferRead, OutputBuffer};
 use crate::clock::Clock;
 use crate::detect::history::{CommandEntry, CommandHistory, DEFAULT_MAX_ENTRIES};
-use crate::detect::{Detection, DetectionConfig, Osc133Source, PromptDetector, Shell};
+use crate::detect::{
+    Detection, DetectionConfig, InteractionMode, Osc133Source, PromptDetector, Shell,
+};
 use crate::output::rules::RuleSet;
 use crate::output::{
     OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
@@ -206,6 +209,15 @@ pub struct Session {
     /// it snapshots the buffer, which is the ordering that stops a fast
     /// command's output from landing in the gap between the two.
     output_tx: broadcast::Sender<OutputFrame>,
+    /// §7.5's non-output edges, on the same shape as `output_tx` and for
+    /// the same reason: a connection converts them into frames, and the
+    /// session never names one.
+    events_tx: broadcast::Sender<SessionEvent>,
+    /// The last `interaction_mode == AwaitingSecret` the reader saw. Held
+    /// beside the detector rather than in it, because 0.0.2's
+    /// `PromptDetector` is a pure classifier with no previous mode and an
+    /// edge is not computable from its state.
+    awaiting_secret: Arc<std::sync::atomic::AtomicBool>,
     /// §4.3's write queue — the *push* half of the same fan-out
     /// `output_tx` is the pull half of.
     ///
@@ -259,11 +271,13 @@ pub const WRITE_QUEUE_FRAMES: usize = 64;
 
 /// One item on §4.3's write queue.
 ///
-/// **An `enum` from the first variant, deliberately.** 0.0.7's
-/// `SecretInput` adds a second (`Secret`, carrying a `SecretBytes` as
-/// itself so its zeroing `Drop` runs in the writer thread *after* the
-/// PTY write); declaring this as a struct today would make that
-/// addition a rewrite instead of an addition.
+/// **An `enum` from the first variant, deliberately** — and the second
+/// variant has now arrived exactly as predicted. `Secret` carries a
+/// [`SecretBytes`] *as itself* rather than the bytes inside one, so the
+/// zeroing `Drop` runs in the writer thread **after** the PTY has the
+/// value and no unzeroed copy ever exists. A variant carrying a
+/// `Vec<u8>` would have undone the whole design at the one call site
+/// that matters.
 ///
 /// **The ack is `Result<usize>` and not the shipped [`WriteAck`], and
 /// the narrowing is deliberate.** §4.3's normative writer ack is
@@ -281,6 +295,15 @@ pub enum WriteRequest {
         /// care; the send then fails and is ignored.
         ack: tokio::sync::oneshot::Sender<Result<usize>>,
     },
+    /// §7.5's `SecretInput`, already normalised (§5.2).
+    ///
+    /// The writer calls `secret.with_bytes(|b| …)` and then drops the
+    /// `SecretBytes`, so the zeroing happens in the writer after the PTY
+    /// has the bytes.
+    Secret {
+        secret: SecretBytes,
+        ack: tokio::sync::oneshot::Sender<Result<usize>>,
+    },
 }
 
 impl WriteRequest {
@@ -289,7 +312,40 @@ impl WriteRequest {
         let (ack, rx) = tokio::sync::oneshot::channel();
         (Self::Input { bytes, ack }, rx)
     }
+
+    /// A `Secret` request. Takes ownership of the `SecretBytes`, which is
+    /// the point: there is no way to build one of these from a `Vec<u8>`
+    /// that escaped the type.
+    pub fn secret(secret: SecretBytes) -> (Self, tokio::sync::oneshot::Receiver<Result<usize>>) {
+        let (ack, rx) = tokio::sync::oneshot::channel();
+        (Self::Secret { secret, ack }, rx)
+    }
 }
+
+/// What a session tells its attached clients beyond raw output (§7.5).
+///
+/// **Not `ServerFrame`.** `Session` knows nothing about the attach
+/// protocol and must not: the frames are a §23.3 wire surface that the
+/// web UI mirrors in 0.0.10, and a session that built them would be the
+/// second place they are constructed. What travels here is the *event*;
+/// `attach::conn` turns it into a frame, which is the same shape
+/// `OutputFrame` already has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// The child's line discipline dropped `ECHO` and the detector
+    /// classified the session as `AwaitingSecret` (REQ-SEC-010). Carries
+    /// the redacted prompt line the child had just drawn, which may
+    /// legitimately be empty (REQ-O-013).
+    AwaitingSecretEntered { prompt_text: String },
+    /// Echo came back without a submission — §5.2's supersede case.
+    AwaitingSecretLeft,
+}
+
+/// How many session events a slow attach connection may fall behind
+/// before it loses the oldest. Small on purpose: these are edges, not a
+/// stream, and a connection that has missed 16 of them has bigger
+/// problems than the one it lost.
+pub const SESSION_EVENT_FRAMES: usize = 16;
 
 /// What a write reports back: how much went, and where the buffer stood
 /// the instant before it did.
@@ -360,7 +416,9 @@ impl Session {
         let idle_timeout_ms = (config.idle_timeout_secs as i64).saturating_mul(1000);
         let idle_deadline_ms = Arc::new(AtomicI64::new(deadline_from(started_ms, idle_timeout_ms)));
         let (output_tx, _) = broadcast::channel(OUTPUT_BROADCAST_FRAMES);
+        let (events_tx, _) = broadcast::channel(SESSION_EVENT_FRAMES);
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_FRAMES);
+        let awaiting_secret = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Geometry and mode are applied by `set_screen_config` right
         // after construction; the default matches `PtySpawnConfig::new`
@@ -394,6 +452,8 @@ impl Session {
             state: Mutex::new(SessionState::Running),
             redaction_stats: Mutex::new(BTreeMap::new()),
             output_tx: output_tx.clone(),
+            events_tx: events_tx.clone(),
+            awaiting_secret: Arc::clone(&awaiting_secret),
             write_tx,
             last_activity_ms: Arc::clone(&last_activity_ms),
             exited_at_secs: Arc::new(AtomicI64::new(0)),
@@ -418,6 +478,7 @@ impl Session {
         let deadline = Arc::clone(&idle_deadline_ms);
         let reader_clock = clock.clone();
         let reader_backend = Arc::clone(&backend);
+        let reader_rules = Arc::clone(&session.rules);
         // §4.5.1's responder is used from the reader thread alone, so it
         // needs no `Mutex` and no `Weak` — it is moved into the closure
         // and owned there for the life of the session.
@@ -526,10 +587,76 @@ impl Session {
                 // recording the owner only at classification would
                 // discard the markers that had just re-armed the licence,
                 // at every prompt.
+                // Sampled **before** the detector lock, exactly as
+                // `Session::detection()` does. The cursor signal is not
+                // sampled here at all, and that is not an economy: it
+                // takes `screen` then `buffer`, so reading it under the
+                // detector guard would be `detector → screen → buffer`
+                // against the reader's own `screen → buffer` … `detector`
+                // order. It is also unnecessary — the `AwaitingSecret`
+                // rung is `echo == Some(false) && canonical != Some(false)
+                // && !bracketed_paste`, and no cursor score can move it.
+                let alive_now = reader_backend.is_alive();
+
                 let mut detector_guard = detector.lock();
                 let foreground = reader_backend.foreground_group();
                 let events = detector_guard.feed(&buf[..n], base, foreground);
+
+                // **REQ-SEC-010's edge, computed where the previous mode
+                // can be held.** 0.0.2 ships a *sample* — `PromptDetector`
+                // holds no previous mode and `detection()` is a pull-only
+                // poll — so the transition is not computable from the
+                // detector's state and the detector must stay a pure
+                // classifier rather than grow one.
+                //
+                // The `ECHO` read is inside this critical section because
+                // REQ-PD-019 requires it: sampling it outside is what
+                // produced 267 spurious `AwaitingSecret` classifications
+                // at 0.95 under load, by pairing a fresh echo-off with a
+                // stale bracketed-paste-off. `line_discipline()` is one
+                // `tcgetattr` yielding both flags.
+                //
+                // **Budgeted:** this adds one `is_alive` (a `WNOHANG`
+                // wait), one `tcgetattr` and one classification per read
+                // chunk, where there were none. It does not add a cursor
+                // read. The classification is pure — `snapshot_at` reads
+                // the scanner and writes nothing — so running it here
+                // cannot perturb what `detection()` answers.
+                //
+                // **The residual of putting the edge here, measured:** a
+                // child that drops `ECHO` and writes *nothing* raises no
+                // request until its next byte of output, because this
+                // loop only runs when a chunk arrives.
+                // `sh -c 'stty -echo; read x'` is exactly that case and
+                // produces no output at all. Every real secret prompt
+                // draws one — which is what makes this the right place
+                // for the edge rather than a poll — but a fixture that
+                // does not print will look like a broken detector.
+                let line = reader_backend.line_discipline();
+                let snap = detector_guard.snapshot(alive_now, line, foreground, None);
+                let now_awaiting = snap.interaction_mode == InteractionMode::AwaitingSecret;
+                let prompt_line = snap.last_line.clone();
                 drop(detector_guard);
+
+                if awaiting_secret.swap(now_awaiting, Ordering::Relaxed) != now_awaiting {
+                    // Fired **after** the guard is released: a subscriber
+                    // that reacted by calling back into the session would
+                    // otherwise re-enter the detector lock from inside it.
+                    let _ = events_tx.send(if now_awaiting {
+                        // Redacted on the way out, like every other string
+                        // that leaves this process (§9.2). The prompt line
+                        // is the child's own bytes and a password prompt
+                        // is not the only thing that turns echo off.
+                        SessionEvent::AwaitingSecretEntered {
+                            prompt_text: crate::output::redact::redact_str(
+                                &reader_rules,
+                                &prompt_line,
+                            ),
+                        }
+                    } else {
+                        SessionEvent::AwaitingSecretLeft
+                    });
+                }
                 if !events.is_empty() {
                     let at = now_ms();
                     let mut h = history.lock();
@@ -598,6 +725,17 @@ impl Session {
                         // dropped its receiver, which is the ordinary
                         // fire-and-forget case.
                         let _ = ack.send(session.write_input(&bytes));
+                    }
+                    // **The zeroing runs here, in the writer, after the
+                    // PTY has the bytes.** `secret` is owned by this arm
+                    // and dropped at its end, so no unzeroed copy of the
+                    // value exists at any point: `with_bytes` lends the
+                    // slice for the duration of the write and nothing
+                    // else ever holds it.
+                    WriteRequest::Secret { secret, ack } => {
+                        let result = secret.with_bytes(|b| session.write_input(b));
+                        drop(secret);
+                        let _ = ack.send(result);
                     }
                 }
             }
@@ -784,6 +922,31 @@ impl Session {
 
     pub fn last_activity_ms(&self) -> i64 {
         self.last_activity_ms.load(Ordering::Relaxed)
+    }
+
+    /// §7.5's non-output edges. Each attach connection takes one, exactly
+    /// as it takes an output receiver.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<SessionEvent> {
+        self.events_tx.subscribe()
+    }
+
+    /// Whether the reader's most recent classification was
+    /// `AwaitingSecret`.
+    ///
+    /// **This is the state, not the edge**, and it exists for the one
+    /// case the edge cannot serve: a client that attaches while a secret
+    /// prompt is already up missed the transition, and §7.5 requires it
+    /// to be told anyway.
+    pub fn is_awaiting_secret(&self) -> bool {
+        self.awaiting_secret.load(Ordering::Relaxed)
+    }
+
+    /// The prompt line the child has drawn, redacted (§9.2).
+    ///
+    /// Used by the replay path, which needs the text at *attach* time
+    /// rather than at the edge. May legitimately be empty (REQ-O-013).
+    pub fn prompt_last_line_redacted(&self) -> String {
+        crate::output::redact::redact_str(&self.rules, &self.detection().last_line)
     }
 
     pub fn buffer_head(&self) -> u64 {

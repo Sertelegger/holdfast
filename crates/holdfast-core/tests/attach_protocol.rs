@@ -105,14 +105,18 @@ impl TestDaemon {
     /// group is a property of a real process tree. Everything else here
     /// stays on the mock, where the assertions are deterministic.
     fn real_session(&self) -> Arc<Session> {
-        let mut cfg = PtySpawnConfig::new("bash");
-        cfg.args = vec!["--norc".into(), "--noprofile".into()];
+        self.real_session_running("bash", &["--norc", "--noprofile"])
+    }
+
+    fn real_session_running(&self, command: &str, args: &[&str]) -> Arc<Session> {
+        let mut cfg = PtySpawnConfig::new(command);
+        cfg.args = args.iter().map(|a| (*a).to_string()).collect();
         let pty = InProcessPty::spawn(&cfg).expect("spawn a real shell");
         let s = Session::new(
             new_session_id(),
             None,
-            "bash".into(),
-            vec!["--norc".into(), "--noprofile".into()],
+            command.into(),
+            cfg.args.clone(),
             Arc::new(pty) as Arc<dyn PtyBackend>,
             SessionConfig::with_buffer_capacity(256 * 1024),
         );
@@ -952,6 +956,13 @@ async fn stream_until(c: &mut UnixStream, needle: &[u8], secs: u64) -> Vec<u8> {
         };
         match decode_server_frame(&body).expect("a decodable server frame") {
             ServerFrame::Output { bytes, .. } => acc.extend_from_slice(&bytes),
+            // The two secret-request edges are out of band and may
+            // interleave with output on any connection; the tests that
+            // care about *them* read them with `recv` and assert their
+            // order there. Everything else is still a failure, because a
+            // `Resize` or a `ProtocolError` arriving mid-stream is a
+            // defect in whatever row is running.
+            ServerFrame::AwaitingSecret { .. } | ServerFrame::SecretRequestClosed { .. } => {}
             other => panic!("expected Output, got {other:?}"),
         }
         if acc.windows(needle.len()).any(|w| w == needle) {
@@ -2068,6 +2079,371 @@ async fn a_rejected_readonly_frame_does_not_extend_the_idle_deadline() {
         "an applied Resize did not count as activity — which is the half \
          that stops 'nothing ever bumps activity' passing"
     );
+}
+
+// ------------------------------------- SecretInput (§5.2, §9.5, §9.6)
+
+/// The probe value.
+///
+/// **Chosen against 0.0.3's defaults, not 0.0.1's.** `read_output` at
+/// `HEAD` is ANSI-stripped and secret-redacted by default, so a probe
+/// matching a built-in rule would be redacted out of every read surface
+/// and the "absent from `read_output`" clause would pass for the wrong
+/// reason. `hunter2`-class, deliberately not `ghp_`- or `AKIA`-class.
+const PROBE: &str = "hunter2";
+
+/// The next `AwaitingSecret` on this connection, skipping output.
+async fn next_awaiting_secret(c: &mut UnixStream, secs: u64) -> (String, String) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        match recv(c).await {
+            ServerFrame::AwaitingSecret {
+                request_id,
+                prompt_text,
+            } => return (request_id, prompt_text),
+            ServerFrame::Output { .. } | ServerFrame::Resize { .. } => {}
+            other => panic!("expected AwaitingSecret, got {other:?}"),
+        }
+    }
+    panic!("no AwaitingSecret arrived");
+}
+
+#[tokio::test]
+async fn awaiting_secret_is_broadcast_when_echo_drops_with_no_agent_call() {
+    // REQ-SEC-010: the trigger is the **termios `ECHO` drop**, through
+    // 0.0.2's detector, and not a pattern list over output. That is what
+    // makes a genuine secret prompt distinguishable from ordinary output
+    // that happens to end in `Password:` — and no MCP call is involved,
+    // so the agent never learns a secret was solicited.
+    let d = TestDaemon::start("awaiting").await;
+    let (secret_sess, spty) = d.session(None);
+    let (ordinary, opty) = d.session(None);
+
+    let mut a = attach_ok(&d, &secret_sess.id, AttachMode::ReadWrite).await;
+    let mut b = attach_ok(&d, &secret_sess.id, AttachMode::ReadOnly).await;
+    let mut plain = attach_ok(&d, &ordinary.id, AttachMode::ReadWrite).await;
+
+    // The edge is computed per read chunk, so the prompt bytes are what
+    // makes the daemon look.
+    spty.set_echo(Some(false));
+    spty.queue_output(b"[sudo] password for ada: ");
+
+    let (id_a, prompt) = next_awaiting_secret(&mut a, 5).await;
+    let (id_b, _) = next_awaiting_secret(&mut b, 5).await;
+    assert!(id_a.starts_with("secreq_"), "{id_a}");
+    assert_eq!(
+        id_a, id_b,
+        "two clients on one session were told two different request ids"
+    );
+    assert!(prompt.contains("password for ada"), "{prompt:?}");
+
+    // **The negative half**, without which "broadcast always" passes: an
+    // echo-on session's clients hear nothing.
+    opty.queue_output(b"Password: this is just output\n");
+    let seen = stream_until(&mut plain, b"just output", 5).await;
+    assert!(
+        contains(&seen, b"just output"),
+        "the ordinary session's output never arrived"
+    );
+}
+
+#[tokio::test]
+async fn a_client_attaching_mid_request_receives_the_replay() {
+    // §7.5: *"Clients that arrive after the request is in flight receive
+    // a replay of the most recent un-fulfilled `AwaitingSecret` frame."*
+    // Frame order is `Attached`, then `AwaitingSecret`, then output — and
+    // it is structural, because both are queued on the connection's own
+    // FIFO before the forwarder exists.
+    let d = TestDaemon::start("replay").await;
+    let (s, pty) = d.session(None);
+
+    // The echo drops with **nobody** attached, which is also the case
+    // where nobody was there to raise the request.
+    pty.set_echo(Some(false));
+    pty.queue_output(b"Passphrase: ");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !s.is_awaiting_secret() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(s.is_awaiting_secret(), "the fixture never dropped echo");
+
+    let mut c = d.dial().await;
+    send(
+        &mut c,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Interactive),
+    )
+    .await;
+    match recv(&mut c).await {
+        ServerFrame::Attached { .. } => {}
+        other => panic!("frame 1 must be Attached, got {other:?}"),
+    }
+    match recv(&mut c).await {
+        ServerFrame::AwaitingSecret { request_id, .. } => {
+            assert!(request_id.starts_with("secreq_"), "{request_id}")
+        }
+        other => panic!("frame 2 must be the replayed AwaitingSecret, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_mismatched_request_id_is_rejected_and_writes_nothing() {
+    // §18.4's `unknown_request_id`. The connection stays open and the
+    // child is still blocked — proved by a later *correct* submission
+    // succeeding, which is what stops "reject everything" passing.
+    let d = TestDaemon::start("wrongid").await;
+    let (s, pty) = d.session(None);
+
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    pty.set_echo(Some(false));
+    pty.queue_output(b"Password: ");
+    let (real_id, _) = next_awaiting_secret(&mut c, 5).await;
+
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id: "secreq_wrong".into(),
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    match recv(&mut c).await {
+        ServerFrame::ProtocolError { reason, frame_kind } => {
+            assert_eq!(reason, "unknown_request_id");
+            assert_eq!(frame_kind.as_deref(), Some("SecretInput"));
+        }
+        other => panic!("expected ProtocolError, got {other:?}"),
+    }
+    assert!(
+        pty.written().is_empty(),
+        "a secret was written for a request nobody raised: {:?}",
+        String::from_utf8_lossy(&pty.written())
+    );
+
+    // The right id still works, so the refusal was about the id and not
+    // about the frame.
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id: real_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    wait_for_written(&pty, b"hunter2\n").await;
+}
+
+#[tokio::test]
+async fn fulfilling_the_request_closes_it_for_every_other_client() {
+    // §7.5: a `SecretInput` closes the request immediately, and every
+    // client is told — including the ones that were also showing a prompt
+    // and must now stop.
+    let d = TestDaemon::start("closeall").await;
+    let (s, pty) = d.session(None);
+
+    let mut a = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut b = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+
+    pty.set_echo(Some(false));
+    pty.queue_output(b"Password: ");
+    let (id, _) = next_awaiting_secret(&mut a, 5).await;
+    let (id_b, _) = next_awaiting_secret(&mut b, 5).await;
+    assert_eq!(id, id_b);
+
+    send(
+        &mut a,
+        &ClientFrame::SecretInput {
+            request_id: id.clone(),
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+
+    // **B**, which did not submit, is told — and told nothing about the
+    // value.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut closed = None;
+    while tokio::time::Instant::now() < deadline && closed.is_none() {
+        match recv(&mut b).await {
+            ServerFrame::SecretRequestClosed {
+                request_id,
+                outcome,
+            } => closed = Some((request_id, outcome)),
+            ServerFrame::Output { bytes, .. } => assert!(
+                !contains(&bytes, PROBE.as_bytes()),
+                "the value was broadcast to another client"
+            ),
+            other => panic!("expected SecretRequestClosed, got {other:?}"),
+        }
+    }
+    assert_eq!(closed, Some((id, "fulfilled".to_string())));
+}
+
+#[tokio::test]
+async fn a_secret_input_from_a_readonly_client_is_rejected() {
+    // Also in Task 8's table, and asserted here against a **real
+    // outstanding request**, so the refusal cannot be an artefact of
+    // there being nothing to fulfil.
+    let d = TestDaemon::start("rosecret").await;
+    let (s, pty) = d.session(None);
+
+    let mut rw = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut ro = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+    pty.set_echo(Some(false));
+    pty.queue_output(b"Password: ");
+    let (id, _) = next_awaiting_secret(&mut rw, 5).await;
+    let (id_ro, _) = next_awaiting_secret(&mut ro, 5).await;
+    assert_eq!(id, id_ro, "the ReadOnly client sees the same request");
+
+    send(
+        &mut ro,
+        &ClientFrame::SecretInput {
+            request_id: id.clone(),
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    match recv(&mut ro).await {
+        ServerFrame::ProtocolError { reason, frame_kind } => {
+            assert_eq!(reason, "read_only_attach");
+            assert_eq!(frame_kind.as_deref(), Some("SecretInput"));
+        }
+        other => panic!("expected ProtocolError, got {other:?}"),
+    }
+    assert!(
+        pty.written().is_empty(),
+        "a ReadOnly client's secret reached the child"
+    );
+
+    // The request is still open: the refusal did not consume it.
+    send(
+        &mut rw,
+        &ClientFrame::SecretInput {
+            request_id: id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    wait_for_written(&pty, b"hunter2\n").await;
+}
+
+#[tokio::test]
+async fn an_ordinary_input_frame_does_leak_the_same_bytes() {
+    // **The control, and it runs first.** Every absence assertion in the
+    // row below is worthless unless this one passes: it proves the
+    // detector is looking in places where bytes really do show up.
+    let d = TestDaemon::start("leakctl").await;
+    let s = d.real_session();
+
+    let mut a = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut b = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    send(
+        &mut a,
+        &ClientFrame::Input {
+            bytes: format!("echo {PROBE}\n").into_bytes(),
+        },
+    )
+    .await;
+
+    // (a) the second attached client's stream…
+    let seen = stream_until(&mut b, PROBE.as_bytes(), 10).await;
+    assert!(contains(&seen, PROBE.as_bytes()));
+    // (b) …and the ring buffer.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut buffered = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        buffered = s.buffer_slice(s.buffer_tail(), s.buffer_head());
+        if contains(&buffered, PROBE.as_bytes()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        contains(&buffered, PROBE.as_bytes()),
+        "an ordinary Input did not reach the ring buffer, so the absence \
+         assertions in the secret row would mean nothing"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+#[tokio::test]
+async fn a_secret_submitted_over_attach_reaches_the_child_and_none_of_the_surfaces() {
+    // **Layer 2 and Layer 3 in one session, because the arrival proof is
+    // what makes the absence proof mean anything.** The child transforms
+    // the value it read and prints the transform, so "it arrived" is
+    // asserted on the child's own output rather than on our having sent
+    // it — an implementation that threw the value away satisfies every
+    // absence assertion below.
+    let d = TestDaemon::start("secretleak").await;
+    // **The fixture prints its prompt, and that is not decoration.** The
+    // `AwaitingSecret` edge is computed per read chunk, so a child that
+    // drops `ECHO` and writes *nothing* raises no request until its next
+    // byte of output — measured, `sh -c 'stty -echo; read x'` produces no
+    // output at all and the request never fires. Every real secret prompt
+    // draws one, which is why the reader loop is where §8.7's edge
+    // belongs; the residual is recorded beside the edge in `session`.
+    //
+    // `stty -echo` and not `read -s`: rev. 36's ICANON rung means a
+    // fixture whose shell also clears ICANON does not classify as
+    // `AwaitingSecret`, and would fail for a reason that looks like the
+    // edge detector being broken.
+    let s = d.real_session_running(
+        "sh",
+        &[
+            "-c",
+            "stty -echo; printf 'Password: '; read x; stty echo; \
+             printf 'got=%s\\n' \"$(printf %s \"$x\" | tr a-z A-Z)\"",
+        ],
+    );
+
+    let mut a = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut watcher = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+
+    let (id, _) = next_awaiting_secret(&mut a, 10).await;
+    send(
+        &mut a,
+        &ClientFrame::SecretInput {
+            request_id: id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+
+    // Layer 2: it arrived, exactly.
+    let seen = stream_until(&mut a, b"got=HUNTER2", 10).await;
+    assert!(contains(&seen, b"got=HUNTER2"));
+
+    // Layer 3, surface 1: the submitting client's own stream never
+    // carried the value back (the child had echo off, and we do not echo
+    // it either).
+    assert!(
+        !contains(&seen, PROBE.as_bytes()),
+        "the value came back on the submitting client's stream"
+    );
+    // Surface 2: the second attached client. §9.2: *"no broadcast to
+    // other attached clients."*
+    let watched = stream_until(&mut watcher, b"got=HUNTER2", 10).await;
+    assert!(
+        !contains(&watched, PROBE.as_bytes()),
+        "the value was broadcast to another attached client"
+    );
+    // Surface 3: the ring buffer, which `read_output` and `holdfast logs`
+    // both read from. Asserted on the raw bytes rather than through
+    // `read_output`, which redacts — a redacted read would pass whether
+    // or not the value was there.
+    let buffered = s.buffer_slice(s.buffer_tail(), s.buffer_head());
+    assert!(
+        !contains(&buffered, PROBE.as_bytes()),
+        "the value reached the ring buffer: {:?}",
+        String::from_utf8_lossy(&buffered)
+    );
+    // Surface 4: the audit log, every line.
+    let audit = std::fs::read_to_string(d.paths.audit_log()).unwrap_or_default();
+    assert!(
+        !audit.contains(PROBE),
+        "the value reached the audit log:\n{audit}"
+    );
+    let _ = s.signal(Signal::Kill);
 }
 
 // ------------------------------------------------------------ helpers

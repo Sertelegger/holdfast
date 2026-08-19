@@ -59,6 +59,15 @@ pub struct AttachConn {
 #[derive(Default)]
 pub struct AttachHub {
     clients: Mutex<HashMap<String, Vec<Arc<AttachConn>>>>,
+    /// §5.2's outstanding secret request, **one per session and not
+    /// configurable** in v0.1.0.
+    ///
+    /// It lives here rather than on the `Session` because the request is
+    /// an attach-protocol object: its `request_id` is answered by a
+    /// `SecretInput` frame, and a session with no attached client has
+    /// nobody who could answer. What the session owns is the *edge* that
+    /// raises it.
+    secrets: Mutex<HashMap<String, super::secret::SecretRequest>>,
     /// Monotonic, process-wide. **Never reused**, so an `unregister`
     /// arriving after the slot was refilled cannot remove somebody
     /// else's connection — the same reasoning that puts an `O_PATH` pin
@@ -115,5 +124,60 @@ impl AttachHub {
             .get(session_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Raise a secret request on this session, or return the one already
+    /// outstanding.
+    ///
+    /// **Idempotent, and that is what makes one `request_id` reach every
+    /// client.** Every connection sees the same `AwaitingSecretEntered`
+    /// event and every one of them calls this; the first allocates and
+    /// the rest get the same request back, so the frames they send agree
+    /// without any of them coordinating. It is also what lets a client
+    /// attaching *after* the drop raise the request nobody was there to
+    /// raise (§7.5's replay).
+    ///
+    /// The `bool` is `true` for the caller that allocated, which is how
+    /// exactly one of them takes responsibility for a fan-out.
+    pub fn raise_secret(
+        &self,
+        session_id: &str,
+        prompt_text: &str,
+    ) -> (super::secret::SecretRequest, bool) {
+        let mut secrets = self.secrets.lock();
+        match secrets.get(session_id) {
+            Some(existing) => (existing.clone(), false),
+            None => {
+                let req = super::secret::SecretRequest::new(prompt_text.to_string());
+                secrets.insert(session_id.to_string(), req.clone());
+                (req, true)
+            }
+        }
+    }
+
+    pub fn outstanding_secret(&self, session_id: &str) -> Option<super::secret::SecretRequest> {
+        self.secrets.lock().get(session_id).cloned()
+    }
+
+    /// Clear the outstanding request, returning it **only** to the caller
+    /// that actually cleared it.
+    ///
+    /// `expect_id` is `Some` for a fulfilment, which must not close a
+    /// request that has already been replaced by a later one, and `None`
+    /// for the supersede path. Either way exactly one caller gets a
+    /// `Some`, so exactly one `SecretRequestClosed` fan-out happens even
+    /// though every connection tries.
+    pub fn close_secret(
+        &self,
+        session_id: &str,
+        expect_id: Option<&str>,
+    ) -> Option<super::secret::SecretRequest> {
+        let mut secrets = self.secrets.lock();
+        match secrets.get(session_id) {
+            Some(req) if expect_id.is_none_or(|id| id == req.request_id) => {
+                secrets.remove(session_id)
+            }
+            _ => None,
+        }
     }
 }

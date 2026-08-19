@@ -32,8 +32,12 @@ pub mod hub;
 /// it is the `observer` half of §9.2 and 0.0.10's WebSocket mirror needs
 /// exactly the same one.
 pub mod redact_stream;
+/// **Not gated.** `SecretBytes` names no platform type, and the web UI's
+/// masked input in 0.0.10 submits through the same frame.
+pub mod secret;
 
 pub use redact_stream::{StreamRedactor, STREAM_CARRY_BYTES, UNRESOLVED_KIND};
+pub use secret::{SecretBytes, SecretRequest};
 
 pub use frames::{
     decode_client_frame, decode_server_frame, AttachMode, AttachRole, ClientDecode, ClientFrame,

@@ -139,6 +139,32 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
         return;
     }
 
+    // §7.5's replay: *"Clients that arrive after the request is in flight
+    // receive a replay of the most recent un-fulfilled `AwaitingSecret`
+    // frame."* Queued on the same FIFO immediately behind `Attached`, so
+    // the ordering is structural rather than a race between two tasks.
+    //
+    // `raise_secret` rather than a plain read, because the request may
+    // not exist yet: the echo can drop while **nobody** is attached, and
+    // then the first client to arrive is the first that could have raised
+    // it. Idempotent, so an existing request is returned unchanged and
+    // every client sees one `request_id`.
+    if session.is_awaiting_secret() {
+        let (req, _first) = daemon
+            .attach_hub()
+            .raise_secret(&session.id, &session.prompt_last_line_redacted());
+        if tx
+            .send(ServerFrame::AwaitingSecret {
+                request_id: req.request_id,
+                prompt_text: req.prompt_text,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
     // **Registered only now**, after the handshake was accepted — never
     // at `accept`. A connection that opened the socket and said nothing
     // is not an attached client, and `daemon/status` counting it would
@@ -167,6 +193,12 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
         tx.clone(),
         redactor,
     ));
+    let events = tokio::spawn(forward_events(
+        Arc::clone(&daemon),
+        conn.session_id.clone(),
+        session.subscribe_events(),
+        tx.clone(),
+    ));
 
     // Either half can end the connection. The forwarder ends it when
     // this client stopped draining (§4.3's slow consumer) or when the
@@ -188,6 +220,7 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
     // written on the way out reaches the client before the EOF that
     // follows it.
     forwarder.abort();
+    events.abort();
     drop(tx);
     drop(conn);
     let _ = writer.await;
@@ -272,7 +305,7 @@ async fn read_loop(
     tx: &mpsc::Sender<ServerFrame>,
 ) {
     loop {
-        let body = match frame::read_frame_body(rd).await {
+        let mut body = match frame::read_frame_body(rd).await {
             Ok(b) => b,
             Err(FrameError::TooLarge { .. }) => {
                 // **Closes, and with no `Detached` before it.** A
@@ -408,12 +441,65 @@ async fn read_loop(
                         );
                 }
             }
-            // Task 10's frame. Not answered `protocol_violation` — it is
-            // a valid §7.5 frame and saying otherwise would be a
-            // wire-level lie a client cannot recover from — and not
-            // applied here either, because there is no request slot to
-            // match a `request_id` against yet.
-            ClientDecode::Frame(ClientFrame::SecretInput { .. }) => {}
+            ClientDecode::Frame(ClientFrame::SecretInput { request_id, bytes }) => {
+                // The request is closed **before** the write is queued and
+                // by the same atomic step that decides whether this
+                // client is the one fulfilling it: two clients answering
+                // the same prompt must produce one write, not two, and a
+                // check-then-clear would let both through.
+                match daemon
+                    .attach_hub()
+                    .close_secret(&conn.session_id, Some(&request_id))
+                {
+                    Some(req) => {
+                        // §5.2's normalisation is applied here, by the
+                        // daemon, so the behaviour does not depend on
+                        // which client submitted. `append_newline` is
+                        // `true`: 0.0.6 raises from an echo drop with no
+                        // tool call behind it, and an echo-off prompt is
+                        // waiting for a line.
+                        let (write, _ack) = WriteRequest::secret(
+                            super::secret::SecretBytes::normalise(bytes, true),
+                        );
+                        if session.write_queue().send(write).await.is_err() {
+                            return;
+                        }
+                        // The frame body still holds the value in
+                        // cleartext and is about to be reused for the
+                        // next frame; `SecretBytes` owns only the decoded
+                        // copy.
+                        super::secret::zero_bytes(&mut body);
+                        // §4.1 lists a `SecretInput` from a ReadWrite
+                        // client as activity — and it must be, or a
+                        // session idle-reaps while a human is typing a
+                        // password.
+                        session.note_activity();
+                        broadcast_secret_closed(
+                            daemon,
+                            &conn.session_id,
+                            &req.request_id,
+                            "fulfilled",
+                        );
+                    }
+                    // §18.4: the connection stays open and nothing is
+                    // written. A client whose request was superseded
+                    // between the prompt and the keystrokes must not have
+                    // its password typed into whatever came next.
+                    None => {
+                        super::secret::zero_bytes(&mut body);
+                        if tx
+                            .send(protocol_error(
+                                "unknown_request_id",
+                                Some(ClientFrameKind::SecretInput.as_str().to_string()),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
             // A `type` this build implements whose fields did not fit:
             // §18.4c's `sig: "stop"` case, and the reason `BadFields`
             // exists as its own variant. The kind **is** nameable here,
@@ -570,6 +656,73 @@ async fn forward_output(
                 return;
             }
         }
+    }
+}
+
+/// Turn this session's non-output edges into §7.5 frames for one
+/// connection.
+///
+/// **Every connection runs one of these and they do not coordinate.** The
+/// hub's `raise_secret`/`close_secret` are idempotent, so the first
+/// connection to see an edge allocates the `request_id` and the rest get
+/// the same one back — which is what makes one request reach every
+/// client without a designated leader, and what lets a client that
+/// attached *after* the drop raise the request nobody was there to raise.
+async fn forward_events(
+    daemon: Arc<Daemon>,
+    session_id: String,
+    mut events: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
+    tx: mpsc::Sender<ServerFrame>,
+) {
+    use crate::session::SessionEvent;
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match events.recv().await {
+            Ok(SessionEvent::AwaitingSecretEntered { prompt_text }) => {
+                let (req, _first) = daemon.attach_hub().raise_secret(&session_id, &prompt_text);
+                if tx
+                    .send(ServerFrame::AwaitingSecret {
+                        request_id: req.request_id,
+                        prompt_text: req.prompt_text,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            // §5.2's supersede: echo came back with no submission. Exactly
+            // one connection's `close_secret` returns `Some`, so exactly
+            // one fan-out happens even though every one of them tries.
+            Ok(SessionEvent::AwaitingSecretLeft) => {
+                if let Some(req) = daemon.attach_hub().close_secret(&session_id, None) {
+                    broadcast_secret_closed(&daemon, &session_id, &req.request_id, "cancelled");
+                }
+            }
+            // An edge is not a stream: a connection that fell behind has
+            // already been re-synchronised by the next edge, and the slot
+            // it would have read is still in the hub.
+            Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Tell every client on this session that the request is over.
+///
+/// `try_send`, like the output path: a client that stopped draining is on
+/// its way out, and a closure notice is not worth parking the sender.
+fn broadcast_secret_closed(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+    request_id: &str,
+    outcome: &str,
+) {
+    for c in daemon.attach_hub().clients_of(session_id) {
+        let _ = c.tx.try_send(ServerFrame::SecretRequestClosed {
+            request_id: request_id.to_string(),
+            outcome: outcome.to_string(),
+        });
     }
 }
 

@@ -145,3 +145,65 @@ fn no_module_in_this_crate_can_print_around_the_redactor() {
          is back to the scope that produced I-2"
     );
 }
+
+/// §9.6: a submitted secret is *"zeroed immediately after write"*, and
+/// the destructor is what guarantees it.
+///
+/// **Here rather than in a `#[test]` beside the type, because from inside
+/// the program there is no vantage point.** The obvious unit test — drop
+/// the value, then read the buffer back through a raw pointer — reads
+/// freed memory, and the allocator has already written its own freelist
+/// bookkeeping there: measured, `hunter2` came back as
+/// `[34, 249, 249, 179, 76, 101, 0]`, neither the secret nor zeros. That
+/// test would have gone red or green depending on the allocator, which
+/// is worse than no test. What *is* checkable is that `SecretBytes` has a
+/// `Drop` and that the `Drop` runs the zeroing; the zeroing itself is
+/// asserted deterministically by `attach::secret`'s own unit tests.
+#[test]
+fn secret_bytes_still_zeroes_itself_in_drop() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let text =
+        std::fs::read_to_string(src.join("attach/secret.rs")).expect("read attach/secret.rs");
+
+    let (_, after_impl) = text
+        .split_once("impl Drop for SecretBytes {")
+        .expect("SecretBytes has no Drop impl at all — §9.6's zeroing is gone");
+    let body = after_impl
+        .split_once("\n}")
+        .expect("the Drop impl does not close")
+        .0;
+    assert!(
+        body.contains("zeroize()"),
+        "SecretBytes::drop no longer zeroes; §9.6 requires the value gone the \
+         instant the write is done, and nothing else in this tree does it:\n{body}"
+    );
+
+    // The other half: a `Serialize` on the type would put the value on a
+    // wire. The guard for that is a compile error (`E0119` against the
+    // blanket impl in `secret_is_not_serializable`), so all this has to
+    // check is that the guard is still there to fire — an implementer who
+    // deleted the module to "fix a confusing error" removes the only
+    // thing standing between REQ-SEC-004 and a derive.
+    assert!(
+        text.contains("impl<T: ?Sized + serde::Serialize> NotSerialize for T {}"),
+        "the conflicting-impl guard on SecretBytes is gone; a #[derive(Serialize)] \
+         would now compile, and §9.2 requires the value to be *absent* from every \
+         surface rather than redacted on it — there is no downstream redactor to \
+         catch it"
+    );
+    // **Code lines only.** The doc comment above that impl quotes the
+    // unbounded form verbatim, to explain why it is wrong — and a scanner
+    // that flagged the explanation would be deleted within a day, which
+    // is the same lesson `calls_a_print_macro` above is written around.
+    let unbounded = text
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("//"))
+        .any(|l| l.contains("impl<T: ?Sized> NotSerialize for T {}"));
+    assert!(
+        !unbounded,
+        "the guard lost its `+ serde::Serialize` bound, which makes it fire on every \
+         build whether or not anything derives Serialize — a crate that does not \
+         compile, not a guard"
+    );
+}
