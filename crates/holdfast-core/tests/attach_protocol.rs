@@ -2138,13 +2138,46 @@ async fn awaiting_secret_is_broadcast_when_echo_drops_with_no_agent_call() {
     assert!(prompt.contains("password for ada"), "{prompt:?}");
 
     // **The negative half**, without which "broadcast always" passes: an
-    // echo-on session's clients hear nothing.
+    // echo-on session's clients hear nothing. Read with `recv` rather
+    // than `stream_until`, which *skips* `AwaitingSecret` — measured, a
+    // `stream_until` version of this assertion is vacuous and stayed
+    // green under "classify every live session as AwaitingSecret".
     opty.queue_output(b"Password: this is just output\n");
-    let seen = stream_until(&mut plain, b"just output", 5).await;
-    assert!(
-        contains(&seen, b"just output"),
-        "the ordinary session's output never arrived"
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut got_output = false;
+    while tokio::time::Instant::now() < deadline && !got_output {
+        match recv(&mut plain).await {
+            ServerFrame::Output { bytes, .. } => {
+                got_output = contains(&bytes, b"just output");
+            }
+            ServerFrame::AwaitingSecret { .. } => {
+                panic!("a session whose child never dropped ECHO raised a secret request")
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+    }
+    assert!(got_output, "the ordinary session's output never arrived");
+
+    // **And exactly one request while the prompt stays up.** The raise is
+    // an *edge*, not a level: more output arriving with echo still off
+    // must not re-prompt. A per-chunk raise re-sends the same
+    // `request_id` forever, and a client that renders a masked field on
+    // each one is unusable — measured, nothing else in this file can see
+    // it, because every other row reads one frame and moves on.
+    spty.queue_output(b"still waiting");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(400), frame::read_frame_body(&mut a)).await
+        {
+            Ok(Ok(body)) => match decode_server_frame(&body).expect("decodable") {
+                ServerFrame::AwaitingSecret { .. } => {
+                    panic!("the request was raised again while it was still outstanding")
+                }
+                _ => continue,
+            },
+            _ => break,
+        }
+    }
 }
 
 #[tokio::test]

@@ -146,6 +146,47 @@ fn no_module_in_this_crate_can_print_around_the_redactor() {
     );
 }
 
+/// §9.5: the value crosses the write channel **as a `SecretBytes`**, not
+/// as the bytes inside one.
+///
+/// **Asserted here because no runtime test can see it.** The mutation is
+/// the writer copying the value out (`secret.with_bytes(|b| b.to_vec())`)
+/// and writing the copy: the child still receives exactly the right
+/// bytes, every absence assertion still holds, and the whole leak-detector
+/// layer stays green — measured. What went wrong is invisible from
+/// outside: a plain `Vec<u8>` whose `Drop` does not zero now holds the
+/// password until the allocator reuses the page. The design's own note
+/// says a leak sanctioned by the type's API is worse than one bolted on
+/// beside it, and this is the assertion behind that sentence.
+#[test]
+fn the_write_channel_carries_the_secret_as_itself() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let text = std::fs::read_to_string(src.join("session/mod.rs")).expect("read session/mod.rs");
+
+    assert!(
+        text.contains("secret: SecretBytes,"),
+        "WriteRequest::Secret no longer owns a SecretBytes; if it carries a Vec, \
+         the zeroing Drop no longer owns every copy of the value (§9.6)"
+    );
+
+    let (_, arm) = text
+        .split_once("WriteRequest::Secret { secret, ack } => {")
+        .expect("the writer no longer has a Secret arm at all");
+    let body = arm
+        .split_once("\n                    }")
+        .expect("arm ends")
+        .0;
+    assert!(
+        body.contains("with_bytes"),
+        "the writer no longer lends the bytes through the scoped accessor:\n{body}"
+    );
+    assert!(
+        !body.contains("to_vec()") && !body.contains("to_owned()") && !body.contains("clone()"),
+        "the writer copies the value out of the SecretBytes before writing it, which \
+         puts the password in a buffer whose Drop does not zero:\n{body}"
+    );
+}
+
 /// §9.6: a submitted secret is *"zeroed immediately after write"*, and
 /// the destructor is what guarantees it.
 ///
