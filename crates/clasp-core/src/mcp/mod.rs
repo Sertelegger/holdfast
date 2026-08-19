@@ -5,6 +5,7 @@ pub mod detection;
 pub mod envelope;
 pub mod passthrough;
 pub mod schema;
+pub mod shim;
 pub mod tools;
 
 use crate::audit::AuditLog;
@@ -15,6 +16,45 @@ use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool_handler, ServerHandler, ServiceExt};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// What an agent is told about this server, on either transport.
+///
+/// Both `ClaspServer` (in-process) and `shim::ShimServer`
+/// (daemon-backed) build their `instructions` from this. The shim
+/// appends one sentence about where sessions live and changes nothing
+/// else, so a milestone that revises what the agent is told — 0.0.3's
+/// redaction sentence was the first — revises it once.
+// The first thing an agent reads about this server, and the one
+// piece of documentation that ships *inside* the protocol. It
+// described a four-tool surface for the whole of 0.0.2, so an
+// agent that trusted it never learned that `status`,
+// `list_sessions` or `get_command_history` existed.
+// `scripts/mcp-smoke.sh` asserts every tool name appears here.
+pub const INSTRUCTIONS: &str = "CLASP gives you PTY-backed shell sessions. start_session spawns a \
+     shell or program; send_input types into it; read_output reads what \
+     it printed using a cursor you carry between calls; \
+     wait_for_pattern blocks until a regex matches new output, which \
+     is how you wait for a command to finish or for a prompt to \
+     appear; interrupt sends Ctrl+C to the foreground process group, \
+     which stops the running command without killing the shell, and \
+     terminate stops the session and its whole process group. \
+     get_screen_state returns the rendered terminal grid rather than \
+     the byte stream, which is the right read for a full-screen \
+     program; pass diff_from with the screen_revision from your \
+     previous call to get only the changed regions. screen_tracking on \
+     a session's responses says whether that emulation is already \
+     running. resize changes the terminal's dimensions and raises \
+     SIGWINCH in the child, so a TUI redraws at the new size. status and list_sessions report what each \
+     session is doing: interaction_mode is one of AtPrompt, Executing, \
+     AwaitingSecret, Fullscreen, Exited, and detection_tier says whether \
+     that was measured from OSC 133 shell integration (semantic), from a \
+     terminal mode such as bracketed paste or termios ECHO \
+     (terminal_mode), or guessed from output quiescence and prompt \
+     patterns (heuristic). For bash, zsh and fish, CLASP injects OSC 133 \
+     markers at start-up, and get_command_history then reports each \
+     command's exit code and output span. Output is ANSI-stripped \
+     and secret-redacted by default; secrets are replaced with \
+     [REDACTED:<kind>] markers.";
 
 #[derive(Clone)]
 pub struct ClaspServer {
@@ -82,40 +122,7 @@ impl ServerHandler for ClaspServer {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = Implementation::new("clasp", env!("CARGO_PKG_VERSION"));
-        // The first thing an agent reads about this server, and the one
-        // piece of documentation that ships *inside* the protocol. It
-        // described a four-tool surface for the whole of 0.0.2, so an
-        // agent that trusted it never learned that `status`,
-        // `list_sessions` or `get_command_history` existed.
-        // `scripts/mcp-smoke.sh` asserts every tool name appears here.
-        info.instructions = Some(
-            "CLASP gives you PTY-backed shell sessions. start_session spawns a \
-             shell or program; send_input types into it; read_output reads what \
-             it printed using a cursor you carry between calls; \
-             wait_for_pattern blocks until a regex matches new output, which \
-             is how you wait for a command to finish or for a prompt to \
-             appear; interrupt sends Ctrl+C to the foreground process group, \
-             which stops the running command without killing the shell, and \
-             terminate stops the session and its whole process group. \
-             get_screen_state returns the rendered terminal grid rather than \
-             the byte stream, which is the right read for a full-screen \
-             program; pass diff_from with the screen_revision from your \
-             previous call to get only the changed regions. screen_tracking on \
-             a session's responses says whether that emulation is already \
-             running. resize changes the terminal's dimensions and raises \
-             SIGWINCH in the child, so a TUI redraws at the new size. status and list_sessions report what each \
-             session is doing: interaction_mode is one of AtPrompt, Executing, \
-             AwaitingSecret, Fullscreen, Exited, and detection_tier says whether \
-             that was measured from OSC 133 shell integration (semantic), from a \
-             terminal mode such as bracketed paste or termios ECHO \
-             (terminal_mode), or guessed from output quiescence and prompt \
-             patterns (heuristic). For bash, zsh and fish, CLASP injects OSC 133 \
-             markers at start-up, and get_command_history then reports each \
-             command's exit code and output span. Output is ANSI-stripped \
-             and secret-redacted by default; secrets are replaced with \
-             [REDACTED:<kind>] markers."
-                .into(),
-        );
+        info.instructions = Some(INSTRUCTIONS.into());
         info
     }
 }
