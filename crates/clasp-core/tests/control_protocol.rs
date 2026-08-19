@@ -8,10 +8,29 @@
 //! do to still pass this?" in hand**, and one failure mode above all:
 //! both peers are built from this crate, so a test that encodes with the
 //! same derived `serde` impl it decodes with round-trips perfectly
-//! against a wire format §7.4.1 does not describe. The three
-//! `..._on_the_wire` tests below are the ones that read raw CBOR maps
-//! and hand-build request bodies from literals; everything else here is
-//! blind to a `#[serde(rename_all = ...)]` by construction.
+//! against a wire format §7.4.1 does not describe. Everything here is
+//! blind to a `#[serde(rename_all = ...)]` by construction *except* the
+//! five assertions that step outside the derived impl, and it is worth
+//! knowing which side each of them covers:
+//!
+//! * `the_handshake_frames_carry_the_7_4_1_field_names_on_the_wire` —
+//!   the only one that escapes in **both** directions. It hand-builds
+//!   its request as a `CborValue::Map` of literal keys and reads the
+//!   response back as a raw map.
+//! * `daemon_status_data_carries_the_7_4_1_field_names_on_the_wire` —
+//!   response only; `daemon/status` takes no params, so there is nothing
+//!   else to pin.
+//! * `daemon_stop_data_names_its_timestamp_with_its_unit_on_the_wire` —
+//!   response only. It **sends a typed `StopParams`**, so it says
+//!   nothing about the request half.
+//! * `an_unknown_method_is_an_error_that_keeps_the_connection_open` —
+//!   §7.4.1's common error payload, as a raw map. That payload is on
+//!   every failure path here and every other test reads it typed.
+//! * `daemon_stop_params_are_parsed_under_their_7_4_1_names` — the
+//!   request half `daemon_stop_data_…` leaves open, pinned the one way a
+//!   rename cannot survive: a correctly named field carrying an
+//!   ill-typed value must come back `bad_params`, where a renamed field
+//!   is an unknown key and is dropped in silence.
 
 use clasp_core::daemon::paths::RuntimePaths;
 use clasp_core::daemon::server::{self, Daemon, DaemonStatus, StopOutcome, StopParams};
