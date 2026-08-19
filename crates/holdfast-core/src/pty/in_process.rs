@@ -157,12 +157,20 @@ impl InProcessPty {
     ///
     /// The caching instruction did not survive its own premise. §4.1 caches
     /// `is_alive` because "the PromptDetector calls `is_alive()` per output
-    /// chunk"; **nothing calls `line_discipline` per chunk** — the read path
-    /// never samples it, `Session::detection` does, once per tool call. And
-    /// `is_alive` itself is not cached in this backend while the child
-    /// lives (see below): `waitpid(WNOHANG)` runs on every call. So the
-    /// cache was the only one of its kind, and it was buying a call
-    /// frequency that does not exist.
+    /// chunk"; `line_discipline` was called once per **tool call**, by
+    /// `Session::detection`, and by nothing else. And `is_alive` itself is
+    /// not cached in this backend while the child lives (see below):
+    /// `waitpid(WNOHANG)` runs on every call. So the cache was the only one
+    /// of its kind, and it was buying a call frequency that did not exist.
+    ///
+    /// **0.0.6 made that last clause false and the decision survives it.**
+    /// REQ-SEC-010's edge needs the modes sampled under the detector lock
+    /// on the read path, so `session/mod.rs`'s reader loop now samples
+    /// `line_discipline()` once per chunk as well. The measured cost below
+    /// is what makes this still the right call at the new frequency: 524 ns
+    /// against a `read()` that has just returned kilobytes. A cache would
+    /// re-introduce the stale-`ECHO` pairing at exactly the site that
+    /// cannot tolerate it.
     ///
     /// Measured cost of what it saved: **524 ns** per sample (200k samples,
     /// debug build, including the master mutex) — against an MCP tool call

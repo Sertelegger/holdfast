@@ -643,12 +643,18 @@ impl Session {
                 // stale bracketed-paste-off. `line_discipline()` is one
                 // `tcgetattr` yielding both flags.
                 //
-                // **Budgeted:** this adds one `is_alive` (a `WNOHANG`
-                // wait), one `tcgetattr` and one classification per read
-                // chunk, where there were none. It does not add a cursor
-                // read. The classification is pure — `snapshot_at` reads
-                // the scanner and writes nothing — so running it here
-                // cannot perturb what `detection()` answers.
+                // **Budgeted:** this adds **two** `WNOHANG` waits, one
+                // `tcgetattr` and one classification per read chunk,
+                // where there were none. Two and not one: `is_alive()` is
+                // called directly above, and `line_discipline()` calls it
+                // again internally (`pty/in_process.rs`). Harmless — the
+                // only site that takes `child.lock()` holds it across
+                // `try_wait()` and nothing else — but the budget is the
+                // claim, so it says the number it costs. It does not add
+                // a cursor read. The classification is pure —
+                // `snapshot_at` reads the scanner and writes nothing — so
+                // running it here cannot perturb what `detection()`
+                // answers.
                 //
                 // **The residual of putting the edge here, measured:** a
                 // child that drops `ECHO` and writes *nothing* raises no
@@ -2317,9 +2323,33 @@ mod tests {
 
         let weak = Arc::downgrade(&s);
         let queue = Arc::clone(&pty);
+        // **A one-shot latch, and not `command_count() > 0`.** The guard
+        // this replaces was written when `Session::detection` was the
+        // only caller of `line_discipline`. 0.0.6's reader loop samples
+        // it once per chunk too (`:662`), *strictly before* the reader
+        // applies its history events a few lines below — so at the
+        // reader's firing site `command_count()` is guaranteed still 0
+        // and the payload was queued a second time in **every** run.
+        // Whether the row failed was only whether the reader had
+        // consumed the duplicate before the final assertion, which is
+        // where the ~18% flake came from (164 pass / 36 fail in 200
+        // isolated runs; `hook_queued=2` in 57 of 57 instrumented runs).
+        //
+        // The race was the hook's, not the product's: `feed()` runs once
+        // per chunk, `PromptDetector::snapshot_at` writes nothing to
+        // `self`, and `history.apply` runs once per event, so the
+        // history can neither lose nor double-count a chunk that arrives
+        // from the PTY. Only an injecting hook can put the same bytes in
+        // twice. A latch is the whole fix: it is not a timeout, and the
+        // defect this row exists to catch still kills it (measured —
+        // sampling `line_discipline` outside the detector lock in
+        // `Session::detection` gives 0 passes in 10 with the latch in
+        // place).
+        let queued_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let latch = Arc::clone(&queued_once);
         pty.on_line_discipline_sample(move || {
             let Some(s) = weak.upgrade() else { return };
-            if s.command_count() > 0 {
+            if latch.swap(true, Ordering::SeqCst) {
                 return; // already delivered; this is a later sample
             }
             queue.queue_output(b"\x1b[?2004l\x1b]133;C\x07");
@@ -2355,7 +2385,22 @@ mod tests {
         wait_until("the submitted command to be classified", || {
             s.detection().interaction_mode == InteractionMode::Executing
         });
-        assert_eq!(s.command_count(), 1, "the chunk never reached the history");
+        // **Both directions, because the message used to name only one
+        // of them and it was the one that never happened.** This row's
+        // every observed failure was `left: 2, right: 1` — a duplicate
+        // injected by the hook, not a chunk lost by the reader — while
+        // the message said "the chunk never reached the history". A
+        // failure message that describes the opposite of the failure
+        // sends the next reader to look at the reader thread, which is
+        // exactly where the time went.
+        assert_eq!(
+            s.command_count(),
+            1,
+            "the hook queues one `\\x1b]133;C` and the history must hold \
+             exactly one command for it: 0 means the deferred chunk never \
+             reached the history, and more than 1 means this test's own \
+             hook fired twice — a defect in the hook, not in the reader"
+        );
     }
 
     #[test]
