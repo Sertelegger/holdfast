@@ -154,11 +154,24 @@ mod tests {
 
     #[tokio::test]
     async fn a_pre_existing_world_readable_runtime_dir_is_tightened_before_attach_binds() {
-        // The mutation this kills is `bind_attach` skipping `ensure_dir`
-        // — which passes every functional test, because a `0755`
-        // directory binds and serves perfectly well. The directory has
-        // to exist *and be wrong* before the bind, or the assertion is
-        // about `create_dir_all`'s default rather than about the guard.
+        // The harm: `attach.sock` reachable through a directory another
+        // user can traverse. The directory has to exist *and be wrong*
+        // before the bind, or the assertion is about `create_dir_all`'s
+        // default rather than about the guard.
+        //
+        // **Measured, and it corrects the plan's ladder:** deleting
+        // `paths.ensure_dir()?` from `bind_socket_within` does **not**
+        // turn this red, because `DaemonLock::acquire_bind_within` calls
+        // `ensure_dir` too, three lines later and inside the same
+        // function. The tightening therefore has two call sites and the
+        // single-site mutation the plan names is survivable. That is not
+        // a hole in this row — it asserts the *harm*, which is the
+        // directory's mode after the bind, and the harm is genuinely
+        // prevented either way. Reachability is proven by removing the
+        // tightening itself (`ensure_owner_only` → `create_dir_all` in
+        // `RuntimePaths::ensure_dir`), which turns this row and
+        // `the_attach_socket_and_its_directory_are_owner_only` red and
+        // nothing else here.
         let s = Scratch::new("wide");
         std::fs::create_dir_all(s.0.dir()).expect("mkdir");
         std::fs::set_permissions(s.0.dir(), std::fs::Permissions::from_mode(0o755))
