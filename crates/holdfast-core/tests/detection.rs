@@ -2389,11 +2389,32 @@ async fn printed_number(server: &HoldfastServer, id: &str, marker: &str) -> Stri
 /// silently_to_the_heuristic_tier` asserts the real-prompt half's absolute
 /// values; this asserts that the forgery cannot be told from it.
 ///
-/// **`confidence` is deliberately an inequality.** It is
-/// `quiescent_score * max(pattern_score, cursor_score)` (REQ-PD-008), so
-/// pinning the product would make this row fail whenever the settle window
-/// is retuned. `pattern_score` is the fact the requirement is about and is
-/// pinned exactly; `confidence >= 0.5` is how §20.10 words the consequence.
+/// **`confidence` is pinned, and it was not.** It is
+/// `quiescent_score * max(pattern_score, cursor_score)` (REQ-PD-008), and
+/// this row used to leave the forgery's copy of it at `>= 0.5` on the
+/// argument that pinning a product is brittle across a retune of the settle
+/// window. That argument does not survive contact with the two halves:
+/// **both are sampled at `quiescent_score == 1.0`**, so the product is
+/// exactly `max(pattern, cursor)` and there is no window left in it to
+/// retune — and the genuine half has been pinned at `0.9` by
+/// `assert_classified` the whole time, so the brittleness was accepted on
+/// one half and declined on the other for no stated reason.
+///
+/// What the inequality cost is the record: §8.8's residual is denominated
+/// in `0.9`, and `>= 0.5` cannot see it fall to `0.6` — the value a
+/// narrowed `$` head guard produces, and the value this row's own prose
+/// says the residual *used* to have. The forgery's number is now pinned by
+/// the pairing assertion below rather than by a second literal, so the
+/// pairing is load-bearing instead of ornamental.
+///
+/// **Both halves are sampled the same way**, through
+/// `await_settled_with_cursor`. They always had the same signals available
+/// — `dash` drives neither bracketed paste nor OSC 133, and
+/// `TrackingPolicy::should_disable` requires `saw_deterministic_signal`, so
+/// Tier B stays on for half 2 once half 1 has waited it up — but half 2
+/// used plain `await_settled`, which would accept a sample taken with
+/// `cursor_score == 0.0` and read `confidence` at `0.6` for a reason that
+/// has nothing to do with the residual.
 #[tokio::test]
 async fn a_single_leaked_dollar_byte_is_indistinguishable_from_a_dash_prompt() {
     if !have(Need::Program("dash")) {
@@ -2446,23 +2467,41 @@ async fn a_single_leaked_dollar_byte_is_indistinguishable_from_a_dash_prompt() {
         // *prints* without them, so the line cannot come from the PTY
         // echoing the command back.
         send(&server, &id, command).await;
-        let forged = await_settled(&server, &id, forged_line).await;
+        let forged = await_settled_with_cursor(&server, &id, forged_line).await;
         assert_eq!(forged["prompt"]["pattern_score"], 0.6, "{what}: {forged}");
         assert_eq!(forged["interaction_mode"], "AtPrompt", "{what}: {forged}");
         assert_eq!(forged["detection_tier"], "heuristic", "{what}: {forged}");
-        assert!(
-            forged["prompt"]["confidence"].as_f64().unwrap_or(0.0) >= 0.5,
-            "{what}: one leaked byte no longer reaches the AtPrompt \
-             threshold — the accepted residual moved: {forged}"
-        );
 
-        // The pairing, and the claim the row is actually making.
+        // **The pairing, and the only assertion in this row that is not a
+        // pin.** The two `pattern_score` pins above are what actually fail
+        // when the T3b rung moves; an `assert_eq!` between them was
+        // constant-true, because both operands were pinned to the literal
+        // `0.6` four lines earlier. It read as the row's central claim and
+        // asserted nothing, so it is gone.
+        //
+        // `confidence` is where the claim lives instead, and here the
+        // equality is load-bearing rather than decorative: the forgery's
+        // `confidence` is pinned by nothing else in this row, and the
+        // genuine half's is pinned at `0.9` by `assert_classified` above.
+        // Delete this line and the forgery's number is unconstrained; keep
+        // it and §8.8's recorded residual — "both halves reach 0.9, which
+        // clears §8.4's 0.85 act threshold" — cannot go stale without this
+        // row going red.
+        //
+        // **The direction that fails is not the one it looks like.** A
+        // forgery scoring *lower* than a real prompt would be §8.6 getting
+        // better at discrimination, and that is a welcome change, not a
+        // regression — but it is one that retires an accepted-risk record,
+        // and §8.8 has to be rewritten rather than silently outlived. That
+        // is what this line is for, in both directions.
         assert_eq!(
-            forged["prompt"]["pattern_score"], genuine["prompt"]["pattern_score"],
-            "{what}: the forgery and a real `dash` prompt must score the \
-             same — they are not distinguished, and a row asserting \
-             otherwise would be asserting a discrimination §8.6 does not \
-             have"
+            forged["prompt"]["confidence"], genuine["prompt"]["confidence"],
+            "{what}: the forgery reached {} and a real `dash` prompt {}. \
+             §8.8 records these as equal — they are not distinguished, and \
+             a row asserting otherwise would be asserting a discrimination \
+             §8.6 does not have. If §8.6 now has it, §8.8's accepted \
+             residual is the thing that has to change.",
+            forged["prompt"]["confidence"], genuine["prompt"]["confidence"]
         );
         kill(&server, &id).await;
     }
