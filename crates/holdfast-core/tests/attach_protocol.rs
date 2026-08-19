@@ -190,14 +190,59 @@ fn attach_at(session: &str, protocol_major: u32) -> ClientFrame {
 /// inference the protocol forbids, and every ReadOnly/observer test below
 /// would then be asserting the helper's opinion rather than the daemon's.
 fn attach_as(session: &str, mode: AttachMode, role: AttachRole) -> ClientFrame {
+    attach_as_kind(session, mode, role, ClientKind::Cli)
+}
+
+/// The handshake with `client_kind` chosen too.
+///
+/// **Separate from [`attach_as`] on purpose, and the default above is
+/// what made a hole.** Every redaction row in this file went through the
+/// hardcoded `ClientKind::Cli`, so a redaction gate carved out by
+/// `client_kind` — redaction *off for the agent* — passed all 1025 tests
+/// in the workspace. Measured, not inferred. `client_kind` is audit
+/// attribution and nothing else (§7.4.1, §9.4); the row that now holds
+/// that rule to account is
+/// `client_kind_cannot_move_the_redaction_decision`.
+fn attach_as_kind(
+    session: &str,
+    mode: AttachMode,
+    role: AttachRole,
+    client_kind: ClientKind,
+) -> ClientFrame {
     ClientFrame::Attach {
         session: session.to_string(),
         mode,
         role,
-        client_kind: ClientKind::Cli,
+        client_kind,
         client_version: "test".into(),
         protocol_major: PROTOCOL_MAJOR,
         protocol_minor: PROTOCOL_MINOR,
+    }
+}
+
+/// Every `ClientKind` §7.4.1 defines.
+///
+/// A *list*, because the rule under test is universally quantified: it is
+/// not "the agent still gets redacted output", it is "no value of this
+/// field moves the decision", and a row that named one value could be
+/// passed by a carve-out on another.
+const EVERY_CLIENT_KIND: [ClientKind; 3] =
+    [ClientKind::Shim, ClientKind::Cli, ClientKind::UiBridge];
+
+/// A **total** function from `ClientKind` to its slot in
+/// [`EVERY_CLIENT_KIND`], with no `_` arm.
+///
+/// This is the `SignalName` catalogue trick, applied to the field that
+/// needed it most: a fourth `ClientKind` does not compile until somebody
+/// edits this match, and the comment they will be standing in front of
+/// when they do says *add it to `EVERY_CLIENT_KIND` as well*. Without it
+/// a new peer kind would be born outside the matrix below, which is
+/// precisely how the original gap arose.
+fn client_kind_slot(k: ClientKind) -> usize {
+    match k {
+        ClientKind::Shim => 0,
+        ClientKind::Cli => 1,
+        ClientKind::UiBridge => 2,
     }
 }
 
@@ -1112,6 +1157,99 @@ async fn the_same_bytes_reach_an_interactive_client_raw_and_an_observer_redacted
         !contains(&watched, GH_TOKEN.as_bytes()),
         "the token reached an observer"
     );
+}
+
+#[tokio::test]
+async fn client_kind_cannot_move_the_redaction_decision() {
+    // **The project's binding rule, made executable.** §7.4.1 and §9.4
+    // both say `client_kind` is audit attribution and must never become a
+    // behaviour switch, and `mcp/caller.rs`'s header says it in capitals.
+    // It was true in the code and enforced by nothing: replacing
+    // `attach/conn.rs`'s role gate with
+    //
+    //     if conn.client_kind == ClientKind::Shim { None } else { … }
+    //
+    // — redaction silently **off for the agent**, the single worst thing
+    // this field could be made to do — left the whole workspace green.
+    // Every redaction row reached the daemon through a helper that
+    // hardcoded `ClientKind::Cli`, so no test ever constructed a `Shim`
+    // attach client at all.
+    //
+    // The shape is a *matrix*, not one extra assertion, because the harm
+    // is a carve-out and a carve-out can be written for any value. Six
+    // connections to one session, one token printed once: three kinds ×
+    // two roles, with `role` the only thing allowed to move the answer.
+    // "Redact everybody" fails the interactive half,
+    // "redact nobody" fails the observer half, and any `client_kind`
+    // carve-out in either direction fails one cell.
+    let d = TestDaemon::start("kindredact").await;
+    let (s, pty) = d.session(None);
+
+    for (i, k) in EVERY_CLIENT_KIND.iter().enumerate() {
+        assert_eq!(
+            client_kind_slot(*k),
+            i,
+            "the catalogue and the exhaustive match disagree: a `ClientKind` \
+             is missing from the matrix"
+        );
+    }
+
+    let mut clients = Vec::new();
+    for kind in EVERY_CLIENT_KIND {
+        for role in [AttachRole::Observer, AttachRole::Interactive] {
+            let mut c = d.dial().await;
+            // `ReadWrite` for both roles deliberately: §7.5 makes `mode`
+            // and `role` orthogonal, so a cell that varied both could not
+            // say which one carried the decision.
+            send(
+                &mut c,
+                &attach_as_kind(&s.id, AttachMode::ReadWrite, role, kind),
+            )
+            .await;
+            assert!(
+                matches!(recv(&mut c).await, ServerFrame::Attached { .. }),
+                "a {kind:?}/{role:?} client was not accepted"
+            );
+            clients.push((kind, role, c));
+        }
+    }
+
+    pty.queue_output(format!("token={GH_TOKEN}\nEOM\n").as_bytes());
+
+    for (kind, role, c) in clients.iter_mut() {
+        let seen = stream_until(c, b"EOM", 5).await;
+        match role {
+            AttachRole::Observer => {
+                assert!(
+                    !contains(&seen, GH_TOKEN.as_bytes()),
+                    "the token reached a {kind:?} observer in cleartext — \
+                     `client_kind` has become a redaction switch: {:?}",
+                    String::from_utf8_lossy(&seen)
+                );
+                assert!(
+                    contains(&seen, b"[REDACTED:github]"),
+                    "a {kind:?} observer got no marker: {:?}",
+                    String::from_utf8_lossy(&seen)
+                );
+            }
+            // The other direction, and it is not decoration: a gate that
+            // redacted *because of* `client_kind` rather than `role`
+            // would corrupt what an interactive human types back at a
+            // password prompt (REQ-SEC-008).
+            AttachRole::Interactive => {
+                assert!(
+                    contains(&seen, GH_TOKEN.as_bytes()),
+                    "a {kind:?} interactive client lost raw fidelity: {:?}",
+                    String::from_utf8_lossy(&seen)
+                );
+                assert!(
+                    !contains(&seen, b"[REDACTED:"),
+                    "a {kind:?} interactive client was redacted: {:?}",
+                    String::from_utf8_lossy(&seen)
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
