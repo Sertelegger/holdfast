@@ -72,27 +72,27 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 ///
 /// Array `PROMPT_COMMAND` (bash ≥ 5.1) survives intact. Assigning a
 /// scalar to an existing array writes index 0, and `${PROMPT_COMMAND:+…}`
-/// reads index 0, so index 0 becomes `__clasp_d "$?"; <user index 0>` and
+/// reads index 0, so index 0 becomes `__holdfast_d "$?"; <user index 0>` and
 /// every later element is untouched and still runs. Measured on bash 5.3:
 /// `PROMPT_COMMAND=('echo PC_ONE' 'echo PC_TWO')` becomes
-/// `declare -a PROMPT_COMMAND=([0]="__clasp_d \"\$?\"; echo PC_ONE" [1]="echo PC_TWO")`,
+/// `declare -a PROMPT_COMMAND=([0]="__holdfast_d \"\$?\"; echo PC_ONE" [1]="echo PC_TWO")`,
 /// both elements still execute, and the markers are correct. Array
 /// `PROMPT_COMMAND` semantics have shifted across bash versions and 5.3 is
 /// the only version measured, so treat older releases as untested.
 ///
-/// **Every marker carries `;clasp=1` (§8.5.1 rule 1)**, which is what lets
+/// **Every marker carries `;holdfast=1` (§8.5.1 rule 1)**, which is what lets
 /// the detector tell its own markers from another emitter's. The exit code
 /// **stays the first parameter after `D`**: parameters are order-free to a
 /// consumer that looks them up by name, but CLASP's own parser reads the
-/// exit code *positionally* (`scanner::osc133`), so `D;clasp=1;42` parses
+/// exit code *positionally* (`scanner::osc133`), so `D;holdfast=1;42` parses
 /// to `None` and every command's exit code silently becomes "finished,
 /// status unknown". That is the one ordering constraint in the scheme and
-/// it is invisible to a test that greps for `clasp=1` alone.
+/// it is invisible to a test that greps for `holdfast=1` alone.
 ///
 /// **`return "${1:-0}"` is not decoration — it is the repair of a measured
 /// data-corruption defect (§8.5, REQ-PD-027).** CLASP *prepends* itself
 /// to `PROMPT_COMMAND`, which bash evaluates as a command list, so `$?` as
-/// seen by the next element was `__clasp_d`'s `printf` — 0, always.
+/// seen by the next element was `__holdfast_d`'s `printf` — 0, always.
 /// Measured on bash 5.3.9: for a command that exited 42, a starship-shaped
 /// third-party emitter reported `D;0`, so **every command a user's own
 /// shell integration reports came back successful**, and a terminal
@@ -115,10 +115,10 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 const BASH_INTEGRATION: &str = concat!(
     r#"if [ -z "${CLASP_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"CLASP_SHELL_INTEGRATION=1; "#,
-    r#"PS0='\e]133;C;clasp=1\a'"${PS0-}"; "#,
-    r#"PS1='\[\e]133;A;clasp=1\a\]'"${PS1-}"'\[\e]133;B;clasp=1\a\]'; "#,
-    r#"__clasp_d() { printf '\033]133;D;%s;clasp=1\007' "${1:-0}"; return "${1:-0}"; }; "#,
-    r#"PROMPT_COMMAND='__clasp_d "$?"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; "#,
+    r#"PS0='\e]133;C;holdfast=1\a'"${PS0-}"; "#,
+    r#"PS1='\[\e]133;A;holdfast=1\a\]'"${PS1-}"'\[\e]133;B;holdfast=1\a\]'; "#,
+    r#"__holdfast_d() { printf '\033]133;D;%s;holdfast=1\007' "${1:-0}"; return "${1:-0}"; }; "#,
+    r#"PROMPT_COMMAND='__holdfast_d "$?"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; "#,
     r#"fi"#,
 );
 
@@ -158,12 +158,12 @@ const BASH_INTEGRATION: &str = concat!(
 const ZSH_INTEGRATION: &str = concat!(
     r#"if [ -z "${CLASP_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"CLASP_SHELL_INTEGRATION=1; "#,
-    r#"__clasp_preexec() { printf '\033]133;C;clasp=1\007' }; "#,
-    r#"__clasp_precmd() { local s=$?; printf '\033]133;D;%s;clasp=1\007' "$s"; return $s }; "#,
-    "PS1=$'%{\\e]133;A;clasp=1\\a%}'\"${PS1-}\"$'%{\\e]133;B;clasp=1\\a%}'; ",
+    r#"__holdfast_preexec() { printf '\033]133;C;holdfast=1\007' }; "#,
+    r#"__holdfast_precmd() { local s=$?; printf '\033]133;D;%s;holdfast=1\007' "$s"; return $s }; "#,
+    "PS1=$'%{\\e]133;A;holdfast=1\\a%}'\"${PS1-}\"$'%{\\e]133;B;holdfast=1\\a%}'; ",
     r#"autoload -Uz add-zsh-hook; "#,
-    r#"add-zsh-hook precmd __clasp_precmd; "#,
-    r#"add-zsh-hook preexec __clasp_preexec; "#,
+    r#"add-zsh-hook precmd __holdfast_precmd; "#,
+    r#"add-zsh-hook preexec __holdfast_preexec; "#,
     r#"fi"#,
 );
 
@@ -229,13 +229,13 @@ const ZSH_INTEGRATION: &str = concat!(
 const FISH_INTEGRATION: &str = concat!(
     r#"if not set -q CLASP_SHELL_INTEGRATION; "#,
     r#"set -g CLASP_SHELL_INTEGRATION 1; "#,
-    r#"functions -q __clasp_orig_fish_prompt; "#,
-    r#"or functions -c fish_prompt __clasp_orig_fish_prompt; "#,
-    r#"function fish_prompt; printf '\033]133;A;clasp=1\007'; __clasp_orig_fish_prompt; "#,
-    r#"printf '\033]133;B;clasp=1\007'; end; "#,
-    r#"function __clasp_preexec --on-event fish_preexec; printf '\033]133;C;clasp=1\007'; end; "#,
-    r#"function __clasp_postexec --on-event fish_postexec; "#,
-    r#"printf '\033]133;D;%s;clasp=1\007' $status; end; "#,
+    r#"functions -q __holdfast_orig_fish_prompt; "#,
+    r#"or functions -c fish_prompt __holdfast_orig_fish_prompt; "#,
+    r#"function fish_prompt; printf '\033]133;A;holdfast=1\007'; __holdfast_orig_fish_prompt; "#,
+    r#"printf '\033]133;B;holdfast=1\007'; end; "#,
+    r#"function __holdfast_preexec --on-event fish_preexec; printf '\033]133;C;holdfast=1\007'; end; "#,
+    r#"function __holdfast_postexec --on-event fish_postexec; "#,
+    r#"printf '\033]133;D;%s;holdfast=1\007' $status; end; "#,
     r#"end"#,
 );
 
@@ -329,14 +329,14 @@ mod tests {
         }
     }
 
-    /// §8.5.1 rule 1: every marker CLASP emits carries `clasp=1`, and the
+    /// §8.5.1 rule 1: every marker CLASP emits carries `holdfast=1`, and the
     /// exit code stays **first** after `D`.
     ///
     /// The order half is not cosmetic. CLASP's parser reads the exit code
-    /// positionally (`scanner::osc133`), so `D;clasp=1;42` parses to
+    /// positionally (`scanner::osc133`), so `D;holdfast=1;42` parses to
     /// `None` — every exit code silently becomes "status unknown", which
     /// `get_command_history` renders as null and no count assertion can
-    /// see. A test that greps for `clasp=1` alone cannot separate the two
+    /// see. A test that greps for `holdfast=1` alone cannot separate the two
     /// spellings, which is why the negative below is asserted as well as
     /// the positive.
     ///
@@ -349,22 +349,22 @@ mod tests {
         for s in [Shell::Bash, Shell::Zsh, Shell::Fish] {
             let snippet = s.integration_snippet();
             for letter in ['A', 'B', 'C'] {
-                let escape = format!(r"\e]133;{letter};clasp=1");
-                let octal = format!(r"\033]133;{letter};clasp=1");
+                let escape = format!(r"\e]133;{letter};holdfast=1");
+                let octal = format!(r"\033]133;{letter};holdfast=1");
                 assert!(
                     snippet.contains(&escape) || snippet.contains(&octal),
-                    "{} emits {letter} without the clasp=1 tag",
+                    "{} emits {letter} without the holdfast=1 tag",
                     s.as_str()
                 );
             }
             assert!(
-                snippet.contains(r"\033]133;D;%s;clasp=1"),
+                snippet.contains(r"\033]133;D;%s;holdfast=1"),
                 "{}: D must carry the exit code first, then the tag",
                 s.as_str()
             );
             assert!(
-                !snippet.contains(r"\033]133;D;clasp=1"),
-                "{}: `D;clasp=1;<code>` does not parse — the code is positional",
+                !snippet.contains(r"\033]133;D;holdfast=1"),
+                "{}: `D;holdfast=1;<code>` does not parse — the code is positional",
                 s.as_str()
             );
         }
@@ -386,10 +386,10 @@ mod tests {
         let s = Shell::Bash.integration_snippet();
         assert!(
             s.contains(r#"return "${1:-0}""#),
-            "__clasp_d must hand $? on to the rest of PROMPT_COMMAND: {s}"
+            "__holdfast_d must hand $? on to the rest of PROMPT_COMMAND: {s}"
         );
         // After the printf, or it never runs.
-        let printf = s.find(r"\033]133;D;%s;clasp=1").expect("emitter");
+        let printf = s.find(r"\033]133;D;%s;holdfast=1").expect("emitter");
         let ret = s.find(r#"return "${1:-0}""#).expect("return");
         assert!(printf < ret, "the return precedes the emitter: {s}");
     }

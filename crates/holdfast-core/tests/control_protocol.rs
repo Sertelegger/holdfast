@@ -1707,7 +1707,11 @@ async fn a_malformed_parameter_is_an_invalid_params_error() {
     let client = d.client().await.unwrap();
     let id = start_bash(&client, "bad").await;
 
-    let resp = resource_read(&client, &format!("holdfast://session/{id}/buffer?ansi=purple")).await;
+    let resp = resource_read(
+        &client,
+        &format!("holdfast://session/{id}/buffer?ansi=purple"),
+    )
+    .await;
     assert!(resp.is_error(), "a bad enum must not default-and-continue");
     let err = resp.control_error().expect("a §7.4.1 error payload");
     assert_eq!(err.code, ErrorCode::BadParams.as_str());

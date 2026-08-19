@@ -372,7 +372,7 @@ mod tests {
     /// the capture is worth 800 bytes of source. fish 4.0.2 emits
     /// `A;special_key=1`, `C;cmdline_url=…` and `D;<code>` — and, measured
     /// here, **never `B`**. So `A`, `C` and `D` go foreign and CLASP's
-    /// tagged copies of them are discarded, while CLASP's `B;clasp=1` is
+    /// tagged copies of them are discarded, while CLASP's `B;holdfast=1` is
     /// **kept**, because fish supplies none to yield to. That kept `B` is
     /// the only thing that arms the echo capture, so it is what gives
     /// `command` its `B..C` span. A whole-*source* rule would have
@@ -393,26 +393,26 @@ mod tests {
     /// and `B` and is therefore never captured.
     const FISH_402_COLLISION: &[u8] =
     b"\x1b]0;/\x07\x1b[30m\x1b(B\x1b[m\x1b]133;A;special_key=1\x07\
-     \x1b]133;A;clasp=1\x07root\x1b(B\x1b[m@75952eda0e7a\x1b(B\x1b\
-     [m /\x1b(B\x1b[m\x1b(B\x1b[m# \x1b]133;B;clasp=1\x07\x1b[K\
+     \x1b]133;A;holdfast=1\x07root\x1b(B\x1b[m@75952eda0e7a\x1b(B\x1b\
+     [m /\x1b(B\x1b[m\x1b(B\x1b[m# \x1b]133;B;holdfast=1\x07\x1b[K\
      \x0d\x1b[21C\x1b[?2004h\x1b[>4;1m\x1b[=5u\x1b=echo \x0d\x1b\
      [26Chello\x0d\x1b[31C\x1b[10Decho hello\x0d\x1b[31C\x0d\x0a\
      \x1b[30m\x1b(B\x1b[m\x1b]133;C;cmdline_url=echo%20hello\x07\
-     \x1b[?2004l\x1b[>4;0m\x1b[=0u\x1b>\x1b]133;C;clasp=1\x07\x1b\
+     \x1b[?2004l\x1b[>4;0m\x1b[=0u\x1b>\x1b]133;C;holdfast=1\x07\x1b\
      ]0;echo hello /\x07\x1b[30m\x1b(B\x1b[m\x0dhello\x0d\x0a\x1b\
-     ]133;D;0\x07\x1b]133;D;0;clasp=1\x07\x1b[?25h\x1b[2m\xe2\x8f\
+     ]133;D;0\x07\x1b]133;D;0;holdfast=1\x07\x1b[?25h\x1b[2m\xe2\x8f\
      \x8e\x1b(B\x1b[m                                          \
      \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x0d\xe2\x8f\x8e \x0d\
      \x1b[K\x1b]0;/\x07\x1b[30m\x1b(B\x1b[m\x1b]133;A;special_k\
-     ey=1\x07\x1b]133;A;clasp=1\x07root\x1b(B\x1b[m@75952eda0e7\
-     a\x1b(B\x1b[m /\x1b(B\x1b[m\x1b(B\x1b[m# \x1b]133;B;clasp=\
-     1\x07\x1b[K\x0d\x1b[21C\x1b[?2004h\x1b[>4;1m\x1b[=5u\x1b=s\
+     ey=1\x07\x1b]133;A;holdfast=1\x07root\x1b(B\x1b[m@75952eda0e7\
+     a\x1b(B\x1b[m /\x1b(B\x1b[m\x1b(B\x1b[m# \x1b]133;B;\
+     holdfast=1\x07\x1b[K\x0d\x1b[21C\x1b[?2004h\x1b[>4;1m\x1b[=5u\x1b=s\
      h \x0d\x1b[24C-c \x0d\x1b[27C\"exit \x0d\x1b[33C42\"\x0d\x1b\
      [36C\x1b[15Dsh -c \"exit 42\"\x0d\x1b[36C\x0d\x0a\x1b[30m\x1b\
      (B\x1b[m\x1b]133;C;cmdline_url=sh%20-c%20%22exit%2042%22\x07\
-     \x1b[?2004l\x1b[>4;0m\x1b[=0u\x1b>\x1b]133;C;clasp=1\x07\x1b\
+     \x1b[?2004l\x1b[>4;0m\x1b[=0u\x1b>\x1b]133;C;holdfast=1\x07\x1b\
      ]0;sh -c \"exit 42\" /\x07\x1b[30m\x1b(B\x1b[m\x0d\x1b]133\
-     ;D;42\x07\x1b]133;D;42;clasp=1\x07";
+     ;D;42\x07\x1b]133;D;42;holdfast=1\x07";
 
     #[test]
     fn a_real_fish_4_0_2_collision_cycle_reports_command_exit_code_and_span_together() {
@@ -449,7 +449,7 @@ mod tests {
         );
         // **A measured consequence of yielding, asserted rather than
         // asserted away.** The span opens just past the *foreign* `C` and
-        // closes at the *foreign* `D`, so CLASP's own `C;clasp=1` — which
+        // closes at the *foreign* `D`, so CLASP's own `C;holdfast=1` — which
         // the yielding rule discarded as an **event** — is still inside it
         // as **bytes**. Discarding a marker keeps it out of the detector
         // and the ring; it cannot take it out of the session's raw buffer,
@@ -483,24 +483,24 @@ mod tests {
     /// REQ-DM-010 is pinned from both sides. zsh's `%`-padding row and its
     /// trailing `\r` are kept verbatim rather than trimmed, since trimming
     /// is what would remove the very bytes the rule acts on.
-    const BASH_53_CYCLES: &[u8] = b"\x1b[?2004h\x1b]133;A;clasp=1\x07bash-5.3$ \x1b]133;B;clas\
-        p=1\x07echo hello\x0d\x0a\x1b[?2004l\x0d\x1b]133;C;clasp=1\
-        \x07hello\x0d\x0a\x1b]133;D;0;clasp=1\x07\x1b[?2004h\x1b]1\
-        33;A;clasp=1\x07bash-5.3$ \x1b]133;B;clasp=1\x07(exit 42)\x0d\
-        \x0a\x1b[?2004l\x0d\x1b]133;C;clasp=1\x07\x1b]133;D;42;cla\
-        sp=1\x07";
+    const BASH_53_CYCLES: &[u8] = b"\x1b[?2004h\x1b]133;A;holdfast=1\x07bash-5.3$ \x1b]133;B;\
+        holdfast=1\x07echo hello\x0d\x0a\x1b[?2004l\x0d\x1b]133;C;holdfast=1\
+        \x07hello\x0d\x0a\x1b]133;D;0;holdfast=1\x07\x1b[?2004h\x1b]1\
+        33;A;holdfast=1\x07bash-5.3$ \x1b]133;B;holdfast=1\x07(exit 42)\x0d\
+        \x0a\x1b[?2004l\x0d\x1b]133;C;holdfast=1\x07\x1b]133;D;42;\
+        holdfast=1\x07";
     const ZSH_59_CYCLES: &[u8] =
-        b"\x0d\x1b[0m\x1b[27m\x1b[24m\x1b[J\x1b]133;A;clasp=1\x07dev\
-        % \x1b]133;B;clasp=1\x07\x1b[K\x1b[?2004he\x08echo hello\x1b\
-        [?2004l\x0d\x0d\x0a\x1b]133;C;clasp=1\x07hello\x0d\x0a\x1b\
+        b"\x0d\x1b[0m\x1b[27m\x1b[24m\x1b[J\x1b]133;A;holdfast=1\x07dev\
+        % \x1b]133;B;holdfast=1\x07\x1b[K\x1b[?2004he\x08echo hello\x1b\
+        [?2004l\x0d\x0d\x0a\x1b]133;C;holdfast=1\x07hello\x0d\x0a\x1b\
         [1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m                         \
         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x0d\
-        \x20\x0d\x1b]133;D;0;clasp=1\x07\x0d\x1b[0m\x1b[27m\x1b[24m\x1b\
-        [J\x1b]133;A;clasp=1\x07dev% \x1b]133;B;clasp=1\x07\x1b[K\x1b\
-        [?2004h(\x08(exit 42)\x1b[?2004l\x0d\x0d\x0a\x1b]133;C;cla\
-        sp=1\x07\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m             \
+        \x20\x0d\x1b]133;D;0;holdfast=1\x07\x0d\x1b[0m\x1b[27m\x1b[24m\x1b\
+        [J\x1b]133;A;holdfast=1\x07dev% \x1b]133;B;holdfast=1\x07\x1b[K\x1b\
+        [?2004h(\x08(exit 42)\x1b[?2004l\x0d\x0d\x0a\x1b]133;C;\
+        holdfast=1\x07\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m             \
         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\
-        \x20\x20\x20\x20\x20\x20\x20\x20\x0d \x0d\x1b]133;D;42;clasp=1\x07";
+        \x20\x20\x20\x20\x20\x20\x20\x20\x0d \x0d\x1b]133;D;42;holdfast=1\x07";
 
     #[test]
     fn real_bash_and_zsh_cycles_replay_unchanged_under_the_carriage_return_rule() {
@@ -713,8 +713,8 @@ mod tests {
         raw.extend_from_slice(b"\x1b]133;D;0\x1b\\");
         // Now the snippet is installed, so CLASP's tagged `B` arrives and
         // gives the next command its span.
-        raw.extend_from_slice(b"\x1b]133;A;special_key=1\x07\x1b]133;A;clasp=1\x07$ ");
-        raw.extend_from_slice(b"\x1b]133;B;clasp=1\x07echo hi\r\n");
+        raw.extend_from_slice(b"\x1b]133;A;special_key=1\x07\x1b]133;A;holdfast=1\x07$ ");
+        raw.extend_from_slice(b"\x1b]133;B;holdfast=1\x07echo hi\r\n");
         raw.extend_from_slice(b"\x1b]133;C;cmdline_url=echo%20hi\x1b\\hi\r\n");
         raw.extend_from_slice(b"\x1b]133;D;0\x1b\\");
         let mut t = 1_000i64;
@@ -750,8 +750,8 @@ mod tests {
         let mut sc = ModeScanner::new();
         let mut h = CommandHistory::new(100);
         h.set_injection_line("some snippet text".to_string());
-        let raw = b"\x1b]133;A;clasp=1\x07$ \x1b]133;B;clasp=1\x07\x1b]133;C;clasp=1\x07\
-                    out\r\n\x1b]133;D;7;clasp=1\x07";
+        let raw = b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07\x1b]133;C;holdfast=1\x07\
+                    out\r\n\x1b]133;D;7;holdfast=1\x07";
         let mut t = 1_000i64;
         for ev in sc.feed(raw, 0, None) {
             h.apply(&ev, t);

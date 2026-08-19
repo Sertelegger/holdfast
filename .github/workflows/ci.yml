@@ -200,7 +200,7 @@ jobs:
     #     obtainable on it:
     #
     #     fish 3.7.0, noble's own archive. The snippet installs and marks
-    #     correctly — `functions -c fish_prompt __clasp_orig_fish_prompt`,
+    #     correctly — `functions -c fish_prompt __holdfast_orig_fish_prompt`,
     #     the open question the row was written for, WORKS on a built-in
     #     default prompt — and the row still fails, on its last command.
     #     `(exit 42)` is a subshell in bash and zsh and a command

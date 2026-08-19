@@ -238,7 +238,7 @@ runner image, at both fish versions obtainable on it:
   4.0 onward, and CLASP's snippet now injects unconditionally: the guard that
   used to decline was deleted, because declining left a session with **no `B`
   marker at all** on 4.0–4.2 (which emit none of their own), so `command` was
-  empty forever. CLASP tags its markers `clasp=1` and yields **per letter**,
+  empty forever. CLASP tags its markers `holdfast=1` and yields **per letter**,
   which is the correct behaviour and is verified — a live fish 4.0.2 session
   driven through the MCP surface reports three commands, exit codes
   `[0, 1, 42]`, `osc133_source: "mixed"`, and no entry for the install line.

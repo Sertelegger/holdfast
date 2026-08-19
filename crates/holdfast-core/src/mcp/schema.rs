@@ -157,7 +157,7 @@ pub enum ShellIntegration {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Osc133Source {
-    Clasp,
+    Holdfast,
     External,
     Mixed,
 }

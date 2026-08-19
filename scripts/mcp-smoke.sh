@@ -425,7 +425,7 @@ jcheck "the §18.2a vocabularies reach the wire" \
       .ScreenTracking.enum, .SessionState.enum]
    + [tool("status").outputSchema["$defs"].ShellIntegration.enum,
       tool("status").outputSchema["$defs"].Osc133Source.enum]' \
-  '[["ok","timeout","session_died","session_not_found","name_taken","limit_reached","spawn_failed","unavailable"],["AtPrompt","Executing","AwaitingSecret","Fullscreen","Exited"],["semantic","terminal_mode","heuristic"],["off","on"],["Starting","Running","Exited","Dead"],["bash","zsh","fish"],["clasp","external","mixed"]]'
+  '[["ok","timeout","session_died","session_not_found","name_taken","limit_reached","spawn_failed","unavailable"],["AtPrompt","Executing","AwaitingSecret","Fullscreen","Exited"],["semantic","terminal_mode","heuristic"],["off","on"],["Starting","Running","Exited","Dead"],["bash","zsh","fish"],["holdfast","external","mixed"]]'
 
 # The caveats have to be in the text the AGENT reads, and scoped to the
 # tool that carries them rather than to the transcript. `80 columns` and
@@ -593,7 +593,7 @@ jcheck "list_sessions returns the session start_session created" \
    | data(13).sessions | [length, (.[0] | [.id == $id, .name, .state])]' \
   '[1,[true,"smoke","Running"]]'
 # `osc133_source` rides here rather than in its own check: the smoke shell
-# is a CLASP-integrated bash with no foreign emitter, so `clasp` is the
+# is a CLASP-integrated bash with no foreign emitter, so `holdfast` is the
 # only correct answer and it is only reachable if the snippet ran, was
 # tagged, and was not discarded. `null` means no marker ever arrived --
 # which the tier-1 check above already contradicts, so a disagreement
@@ -602,7 +602,7 @@ jcheck "status answers about the named session" \
   'data(3).session_id as $id
    | data(8) | [.id == $id, .name, .command, .state, .shell_integration,
                 .osc133_source, .command_count]' \
-  '[true,"smoke","bash","Running","bash","clasp",4]'
+  '[true,"smoke","bash","Running","bash","holdfast",4]'
 
 check "terminate reports ok" '"already_exited":false'
 

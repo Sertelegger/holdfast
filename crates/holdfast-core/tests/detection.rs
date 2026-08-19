@@ -1718,27 +1718,27 @@ async fn the_heuristic_decides_at_exactly_the_threshold_on_a_real_ps2_prompt() {
 /// existed, which is also why it leaves no history entry.
 ///
 /// **These are wire payloads, not letters.** Every marker CLASP emits
-/// carries `;clasp=1` (§8.5.1 rule 1), and `markers()` returns the whole
+/// carries `;holdfast=1` (§8.5.1 rule 1), and `markers()` returns the whole
 /// OSC payload after `\x1b]133;`. §8.5's documented *letter* stream is
 /// unchanged and is asserted separately below: a test pinning only the
 /// letters would not notice the tag being dropped, and one pinning only
 /// these payloads would not notice the letters being reordered.
 const MEASURED_MARKER_STREAM: [&str; 15] = [
-    "D;0;clasp=1",
-    "A;clasp=1",
-    "B;clasp=1", //
-    "C;clasp=1",
-    "D;0;clasp=1",
-    "A;clasp=1",
-    "B;clasp=1", //
-    "C;clasp=1",
-    "D;1;clasp=1",
-    "A;clasp=1",
-    "B;clasp=1", //
-    "C;clasp=1",
-    "D;42;clasp=1",
-    "A;clasp=1",
-    "B;clasp=1",
+    "D;0;holdfast=1",
+    "A;holdfast=1",
+    "B;holdfast=1", //
+    "C;holdfast=1",
+    "D;0;holdfast=1",
+    "A;holdfast=1",
+    "B;holdfast=1", //
+    "C;holdfast=1",
+    "D;1;holdfast=1",
+    "A;holdfast=1",
+    "B;holdfast=1", //
+    "C;holdfast=1",
+    "D;42;holdfast=1",
+    "A;holdfast=1",
+    "B;holdfast=1",
 ];
 
 /// §8.5's marker *letter* stream, which §8.5.1's tag leaves unchanged.
@@ -1830,7 +1830,7 @@ async fn assert_marker_stream_and_exit_codes(server: &HoldfastServer, id: &str, 
     // that one would not separate "yielded correctly" from "discards
     // everything".
     let s = status(server, id).await;
-    assert_eq!(s["osc133_source"], "clasp", "{shell} status: {s}");
+    assert_eq!(s["osc133_source"], "holdfast", "{shell} status: {s}");
 }
 
 #[tokio::test]
@@ -1983,8 +1983,8 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     // prompt that is already marking, and both emitters run from then on.
     // Since §8.5.1's tag, CLASP's markers are distinguishable from the
     // fixture's on the wire, which is what makes the interleaving below
-    // readable at all: `A;clasp=1`, `A` is CLASP's `PS1` wrapper around the
-    // user's, and `D;42;clasp=1`, `D;42` is CLASP's `PROMPT_COMMAND`
+    // readable at all: `A;holdfast=1`, `A` is CLASP's `PS1` wrapper around the
+    // user's, and `D;42;holdfast=1`, `D;42` is CLASP's `PROMPT_COMMAND`
     // running ahead of the user's.
     // The collision itself, before any command is typed into it.
     const COLLIDING_PROMPT: [&str; 10] = [
@@ -1992,12 +1992,12 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         "A",
         "B", // the shell's own first prompt, before the snippet
         "C", // the snippet's command, marked by the user's PS0 alone
-        "D;0;clasp=1",
+        "D;0;holdfast=1",
         "D;0", // ... and completed by both PROMPT_COMMANDs
-        "A;clasp=1",
+        "A;holdfast=1",
         "A",
         "B",
-        "B;clasp=1", // ... and prompted by both PS1s
+        "B;holdfast=1", // ... and prompted by both PS1s
     ];
     // One command's worth, derived rather than transcribed: `PS0` marks the
     // start twice, both `PROMPT_COMMAND`s report the completion — CLASP's
@@ -2006,14 +2006,14 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     // user's.
     fn cycle(code: i32) -> Vec<String> {
         vec![
-            "C;clasp=1".to_string(),
+            "C;holdfast=1".to_string(),
             "C".to_string(),
-            format!("D;{code};clasp=1"),
+            format!("D;{code};holdfast=1"),
             format!("D;{code}"),
-            "A;clasp=1".to_string(),
+            "A;holdfast=1".to_string(),
             "A".to_string(),
             "B".to_string(),
-            "B;clasp=1".to_string(),
+            "B;holdfast=1".to_string(),
         ]
     }
 
@@ -2047,7 +2047,7 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     );
     // **REQ-PD-027's `$?` repair, asserted as the property rather than as
     // a count.**
-    // `PROMPT_COMMAND` becomes `__clasp_d "$?"; <the user's emitter>`, and
+    // `PROMPT_COMMAND` becomes `__holdfast_d "$?"; <the user's emitter>`, and
     // bash evaluates that as a command list — so before the fix `$?` had
     // already been overwritten by CLASP's own `printf` (exit 0) by the time
     // the user's emitter read it, and every command a starship-style
@@ -2065,7 +2065,7 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     // `return "${1:-0}"` turns the final `D;42` back into `D;0`.
     let foreign: Vec<&str> = both
         .iter()
-        .filter(|m| !m.contains("clasp=1"))
+        .filter(|m| !m.contains("holdfast=1"))
         .map(String::as_str)
         .collect();
     assert_eq!(
@@ -2263,25 +2263,25 @@ async fn osc133_markers_survive_shell_nesting() {
     assert_eq!(
         m,
         vec![
-            "D;0;clasp=1",
-            "A;clasp=1",
-            "B;clasp=1", // outer: the snippet
-            "C;clasp=1",
-            "D;0;clasp=1",
-            "A;clasp=1",
-            "B;clasp=1", // outer: echo CLASP_PID_A
-            "C;clasp=1", // outer: `bash --norc --noprofile` starts
-            "D;0;clasp=1",
-            "A;clasp=1",
-            "B;clasp=1", // INNER: its own snippet, through the outer shell
-            "C;clasp=1",
-            "D;0;clasp=1",
-            "A;clasp=1",
-            "B;clasp=1", // inner: echo CLASP_PID_B
-            "C;clasp=1",
-            "D;7;clasp=1",
-            "A;clasp=1",
-            "B;clasp=1", // inner: (exit 7)
+            "D;0;holdfast=1",
+            "A;holdfast=1",
+            "B;holdfast=1", // outer: the snippet
+            "C;holdfast=1",
+            "D;0;holdfast=1",
+            "A;holdfast=1",
+            "B;holdfast=1", // outer: echo CLASP_PID_A
+            "C;holdfast=1", // outer: `bash --norc --noprofile` starts
+            "D;0;holdfast=1",
+            "A;holdfast=1",
+            "B;holdfast=1", // INNER: its own snippet, through the outer shell
+            "C;holdfast=1",
+            "D;0;holdfast=1",
+            "A;holdfast=1",
+            "B;holdfast=1", // inner: echo CLASP_PID_B
+            "C;holdfast=1",
+            "D;7;holdfast=1",
+            "A;holdfast=1",
+            "B;holdfast=1", // inner: (exit 7)
         ],
         "the nested shell's markers did not reach the detector intact"
     );

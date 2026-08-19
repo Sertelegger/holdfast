@@ -863,12 +863,12 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
     use holdfast_core::detect::Osc133Source as Src;
     fn next_source(s: Src) -> Option<Src> {
         match s {
-            Src::Clasp => Some(Src::External),
+            Src::Holdfast => Some(Src::External),
             Src::External => Some(Src::Mixed),
             Src::Mixed => None,
         }
     }
-    let mut sources = vec![Src::Clasp];
+    let mut sources = vec![Src::Holdfast];
     while let Some(next) = next_source(*sources.last().expect("non-empty")) {
         assert!(
             !sources.contains(&next),
@@ -1466,17 +1466,17 @@ async fn status_reports_each_field_from_the_session_it_names() {
         "untagged markers are a foreign emitter's"
     );
 
-    // The other value, on a second mock fed a `clasp=1`-tagged copy of the
+    // The other value, on a second mock fed a `holdfast=1`-tagged copy of the
     // same stream — cheaper than a real shell and enough to keep both
     // values exercised, so a `session_record` that hardcoded either one
     // fails here. (`mixed` is measured on a verbatim fish 4.0.2 capture in
     // `detect::history`, where a real partial emitter produces it.)
     let tagged: Vec<u8> = String::from_utf8_lossy(TWO_COMMANDS)
-        .replace("\u{1b}]133;A\u{7}", "\u{1b}]133;A;clasp=1\u{7}")
-        .replace("\u{1b}]133;B\u{7}", "\u{1b}]133;B;clasp=1\u{7}")
-        .replace("\u{1b}]133;C\u{7}", "\u{1b}]133;C;clasp=1\u{7}")
-        .replace("\u{1b}]133;D;3\u{7}", "\u{1b}]133;D;3;clasp=1\u{7}")
-        .replace("\u{1b}]133;D;4\u{7}", "\u{1b}]133;D;4;clasp=1\u{7}")
+        .replace("\u{1b}]133;A\u{7}", "\u{1b}]133;A;holdfast=1\u{7}")
+        .replace("\u{1b}]133;B\u{7}", "\u{1b}]133;B;holdfast=1\u{7}")
+        .replace("\u{1b}]133;C\u{7}", "\u{1b}]133;C;holdfast=1\u{7}")
+        .replace("\u{1b}]133;D;3\u{7}", "\u{1b}]133;D;3;holdfast=1\u{7}")
+        .replace("\u{1b}]133;D;4\u{7}", "\u{1b}]133;D;4;holdfast=1\u{7}")
         .into_bytes();
     let pty2 = Arc::new(MockPty::new());
     pty2.queue_output(&tagged);
@@ -1505,7 +1505,7 @@ async fn status_reports_each_field_from_the_session_it_names() {
             .expect("status"),
     );
     assert_eq!(
-        d2["data"]["osc133_source"], "clasp",
+        d2["data"]["osc133_source"], "holdfast",
         "tagged markers are CLASP's own"
     );
 

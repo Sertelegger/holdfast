@@ -88,8 +88,8 @@ pub enum Osc133 {
 /// and its markers are being dropped on arrival (§8.5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Osc133Source {
-    /// Every marker seen so far carries `clasp=1`. The ordinary case.
-    Clasp,
+    /// Every marker seen so far carries `holdfast=1`. The ordinary case.
+    Holdfast,
     /// Every letter seen so far has arrived from a foreign source; all of
     /// CLASP's are being discarded.
     External,
@@ -102,7 +102,7 @@ pub enum Osc133Source {
 impl Osc133Source {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Clasp => "clasp",
+            Self::Holdfast => "holdfast",
             Self::External => "external",
             Self::Mixed => "mixed",
         }
@@ -278,7 +278,7 @@ pub struct ModeScanner {
     /// Per marker letter, whether one of CLASP's own tagged markers of that
     /// letter has been *used* — i.e. arrived before the letter went
     /// foreign. This is what distinguishes `mixed` from `external`.
-    clasp_letters: [bool; 4],
+    holdfast_letters: [bool; 4],
     /// A `\r` was seen and we do not yet know whether it is the first half
     /// of a `\r\n` line terminator or a bare column-0 return.
     pending_cr: bool,
@@ -315,7 +315,7 @@ impl ModeScanner {
             capture_return_pending: false,
             last_marker: None,
             foreign_letters: [false; 4],
-            clasp_letters: [false; 4],
+            holdfast_letters: [false; 4],
             pending_cr: false,
             foreground: None,
         }
@@ -343,10 +343,10 @@ impl ModeScanner {
         // A letter counts toward `clasp` only while it is still CLASP's:
         // once foreign, CLASP's markers of that letter are discarded, so
         // the letter's effective source is the foreign one.
-        let any_clasp = (0..4).any(|i| self.clasp_letters[i] && !self.foreign_letters[i]);
-        match (any_clasp, any_foreign) {
+        let any_holdfast = (0..4).any(|i| self.holdfast_letters[i] && !self.foreign_letters[i]);
+        match (any_holdfast, any_foreign) {
             (false, false) => None,
-            (true, false) => Some(Osc133Source::Clasp),
+            (true, false) => Some(Osc133Source::Holdfast),
             (false, true) => Some(Osc133Source::External),
             (true, true) => Some(Osc133Source::Mixed),
         }
@@ -797,9 +797,9 @@ impl ModeScanner {
     /// CLASP is not the only writer of OSC 133: fish 4.x emits its own from
     /// the shell core, and Kitty's, WezTerm's and starship-shaped
     /// integrations emit into bash and zsh. Every marker CLASP's snippet
-    /// emits carries `clasp=1` (rule 1); a marker without it is *foreign*
+    /// emits carries `holdfast=1` (rule 1); a marker without it is *foreign*
     /// (rule 2); and once a foreign marker of a letter has been seen, every
-    /// later `clasp=1` marker of **that letter** is discarded for the rest
+    /// later `holdfast=1` marker of **that letter** is discarded for the rest
     /// of the session (rule 3).
     ///
     /// **Per letter, not per source, and that is the substantive half.** A
@@ -835,12 +835,12 @@ impl ModeScanner {
             b'D' => 3,
             _ => return None,
         };
-        // §8.5.1 rule 2: a marker without `clasp=1` is foreign. Matched as
+        // §8.5.1 rule 2: a marker without `holdfast=1` is foreign. Matched as
         // a whole `;`-separated field, never as a substring — a foreign
-        // `C;cmdline_url=…clasp=1…` carries user-controlled text and a
+        // `C;cmdline_url=…holdfast=1…` carries user-controlled text and a
         // `contains` would read it as CLASP's own.
-        let is_clasp = rest[1..].split(';').any(|param| param == "clasp=1");
-        if is_clasp {
+        let is_holdfast = rest[1..].split(';').any(|param| param == "holdfast=1");
+        if is_holdfast {
             if self.foreign_letters[slot] {
                 // Dropped *here*, so `capture`, `saw_osc133`, the owner
                 // record and `last_marker` never see it, and neither the
@@ -848,7 +848,7 @@ impl ModeScanner {
                 // "before it reaches the detector or the history ring").
                 return None;
             }
-            self.clasp_letters[slot] = true;
+            self.holdfast_letters[slot] = true;
         } else {
             self.foreign_letters[slot] = true;
         }
@@ -1564,10 +1564,10 @@ mod tests {
     mod osc133_collision {
         use super::*;
 
-        const CLASP_A: &[u8] = b"\x1b]133;A;clasp=1\x07";
-        const CLASP_B: &[u8] = b"\x1b]133;B;clasp=1\x07";
-        const CLASP_C: &[u8] = b"\x1b]133;C;clasp=1\x07";
-        const CLASP_D42: &[u8] = b"\x1b]133;D;42;clasp=1\x07";
+        const CLASP_A: &[u8] = b"\x1b]133;A;holdfast=1\x07";
+        const CLASP_B: &[u8] = b"\x1b]133;B;holdfast=1\x07";
+        const CLASP_C: &[u8] = b"\x1b]133;C;holdfast=1\x07";
+        const CLASP_D42: &[u8] = b"\x1b]133;D;42;holdfast=1\x07";
         // Foreign markers in the shapes measured on fish 4.8.1 —
         // parameterised and ST-terminated, which also exercises the
         // parser's tolerance of both terminators.
@@ -1576,9 +1576,9 @@ mod tests {
         const FISH_C: &[u8] = b"\x1b]133;C;cmdline_url=echo%20hi\x1b\\";
         const FISH_D0: &[u8] = b"\x1b]133;D;0\x1b\\";
         // A foreign marker whose user-controlled parameter text contains
-        // the tag as a substring. A `contains("clasp=1")` test reads this
+        // the tag as a substring. A `contains("holdfast=1")` test reads this
         // as CLASP's own and then yields to nothing.
-        const FOREIGN_C_SPOOF: &[u8] = b"\x1b]133;C;cmdline_url=echo%20clasp=1\x1b\\";
+        const FOREIGN_C_SPOOF: &[u8] = b"\x1b]133;C;cmdline_url=echo%20holdfast=1\x1b\\";
 
         #[test]
         fn yielding_one_letter_does_not_yield_another() {
@@ -1644,7 +1644,7 @@ mod tests {
             for m in [CLASP_A, CLASP_B, CLASP_C, CLASP_D42] {
                 assert_eq!(s.feed(m, 0, None).len(), 1);
             }
-            assert_eq!(s.osc133_source(), Some(Osc133Source::Clasp));
+            assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));
         }
 
         /// The bounded residual, asserted rather than described — and the
@@ -1682,7 +1682,7 @@ mod tests {
             s.feed(b"ordinary output with no markers at all\r\n", 0, None);
             assert_eq!(s.osc133_source(), None);
             s.feed(CLASP_A, 0, None);
-            assert_eq!(s.osc133_source(), Some(Osc133Source::Clasp));
+            assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));
         }
 
         /// Nesting is unaffected **by construction**: an inner CLASP shell
@@ -1694,7 +1694,7 @@ mod tests {
             for m in [CLASP_A, CLASP_B, CLASP_C, CLASP_A, CLASP_B] {
                 assert_eq!(s.feed(m, 0, None).len(), 1);
             }
-            assert_eq!(s.osc133_source(), Some(Osc133Source::Clasp));
+            assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));
         }
     }
 
