@@ -353,6 +353,22 @@ impl SecretSlots {
     /// `the_two_renderings_of_the_id_check_agree` pins the two to the
     /// same answer. 0.0.10's HTTP path has no atomic action to fuse —
     /// it validates, then forwards — so it calls this one.
+    /// Whether this session's request already has a tool call waiting on
+    /// it — the exact condition that makes a further call collide.
+    ///
+    /// **Read-only, and that is the whole point.** The obvious way to ask
+    /// this from outside is to try `raise_or_adopt` and look at the
+    /// result, and that *adopts*: a poller written that way registers a
+    /// waiter of its own, steals the slot from the call it was waiting
+    /// for, and turns the thing it was observing into something else.
+    /// Measured — it took two tests down on their first run.
+    pub fn has_waiter(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .get(session_id)
+            .is_some_and(|r| r.has_waiter())
+    }
+
     pub fn matches_outstanding(&self, session_id: &str, request_id: &str) -> bool {
         self.inner
             .lock()
