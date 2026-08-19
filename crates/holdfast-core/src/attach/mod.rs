@@ -14,3 +14,10 @@
 //! The submodule list below grows one entry per task of this milestone;
 //! each `pub mod` line lands in the commit that creates the file it
 //! names, so every commit on the branch compiles on its own.
+
+pub mod frames;
+
+pub use frames::{
+    decode_server_frame, AttachMode, AttachRole, ClientFrame, ClientFrameKind, ServerFrame,
+    SignalName, KNOWN_SERVER_TYPES,
+};
