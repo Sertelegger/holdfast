@@ -69,7 +69,7 @@ const MAX_IDLE_CONNECTIONS: usize = 8;
 /// It was, and holding that mutex across **both** the write and the read
 /// made the whole MCP tool surface serialise behind whichever call was
 /// outstanding. The shim holds one `Arc<ControlClient>` for the process
-/// (`clasp mcp`), so a `wait_for_pattern` — 30 s by default,
+/// (`holdfast mcp`), so a `wait_for_pattern` — 30 s by default,
 /// [3600 s at the cap](crate::mcp::tools::WAIT_FOR_PATTERN_MAX_TIMEOUT_SECS)
 /// — blocked `interrupt`, `terminate`, `read_output`, `status` and
 /// `list_sessions`, **on every other session**, for its entire duration.
@@ -335,7 +335,7 @@ fn connection_scoped_refusal(resp: &Response) -> bool {
 /// and then closes. It is deliberately not special-cased here: teaching
 /// this function one method's semantics would put the daemon's shutdown
 /// rule in two places, and the only caller that issues it —
-/// `clasp daemon stop` — drops the client immediately afterwards.
+/// `holdfast daemon stop` — drops the client immediately afterwards.
 fn reusable(outcome: &Result<Response, ClientError>) -> bool {
     match outcome {
         Err(_) => false,
@@ -370,7 +370,7 @@ async fn handshake_exchange_within(
     let req = Request::new(0, method::METHOD_HANDSHAKE, &params)?;
     frame::write_frame(stream, &req).await?;
     // **The only deadline on this protocol.** A daemon that accepts the
-    // connection and never answers wedges `clasp mcp` before it can
+    // connection and never answers wedges `holdfast mcp` before it can
     // reply to MCP `initialize`, so the agent sees a server that never
     // starts and nothing anywhere says why. Scoped to this one read on
     // purpose: a blanket deadline on `call_raw` would truncate a
@@ -694,7 +694,7 @@ mod tests {
     ///
     /// There was no timeout anywhere in `src/protocol/`, so this hung
     /// forever — and it hangs in the worst possible place: inside
-    /// `spawn::ensure_daemon`, which `clasp mcp` calls **before** it can
+    /// `spawn::ensure_daemon`, which `holdfast mcp` calls **before** it can
     /// answer MCP `initialize`. The agent sees a server that never
     /// starts, and nothing in code, plan or spec says why.
     ///
@@ -734,7 +734,7 @@ mod tests {
         )
         .await
         .expect(
-            "the handshake never returned: `clasp mcp` wedges here, before it can \
+            "the handshake never returned: `holdfast mcp` wedges here, before it can \
              answer MCP `initialize`, and the agent sees a server that never starts",
         )
         .expect_err("a daemon that never answered must not read as one that accepted us");
@@ -793,7 +793,7 @@ mod tests {
     /// the same client.
     ///
     /// The shim holds one `Arc<ControlClient>` for the whole process
-    /// (`clasp mcp`), so while `call_raw` held one mutex across both the
+    /// (`holdfast mcp`), so while `call_raw` held one mutex across both the
     /// write and the read, a `wait_for_pattern` — 30 s by default, 3600 s
     /// at the cap — blocked `interrupt`, `terminate`, `read_output`,
     /// `status` and `list_sessions`, **on every other session**, for its

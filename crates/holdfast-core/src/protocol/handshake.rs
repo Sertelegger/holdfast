@@ -24,7 +24,7 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// The one deadline on the control protocol, and it is deliberately the
 /// only one. Without it a peer that connects and sends nothing pins a
 /// daemon task and a file descriptor until the daemon dies, and a daemon
-/// that accepts and never replies wedges `clasp mcp` *before it can
+/// that accepts and never replies wedges `holdfast mcp` *before it can
 /// answer MCP `initialize`* — an agent-visible server that never starts,
 /// with no diagnostic anywhere.
 ///
@@ -37,7 +37,7 @@ pub const PROTOCOL_MINOR: u32 = 0;
 /// The uid gate (§9.1) already establishes that any peer reaching this
 /// is the same user, so this is not a defence against an attacker. It is
 /// a defence against a wedged process, which is a state the `--force`
-/// path in `clasp daemon stop` already exists to resolve.
+/// path in `holdfast daemon stop` already exists to resolve.
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Build identifier reported in the handshake. Wired to a real git SHA

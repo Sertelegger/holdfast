@@ -1,4 +1,4 @@
-//! Process-level tests: real `clasp` processes, real sockets, real
+//! Process-level tests: real `holdfast` processes, real sockets, real
 //! auto-spawn (spec §7.3, §3.2, §3.4).
 //!
 //! Everything here runs against `CARGO_BIN_EXE_holdfast`, so it exercises
@@ -11,7 +11,7 @@
 //! Every wait here is bounded, and that is a property of the suite
 //! rather than defensive habit. These tests drive processes that can
 //! stop answering without dying — a shim whose daemon accepted the
-//! connection and never replied, a `clasp logs` parked in `call_raw`,
+//! connection and never replied, a `holdfast logs` parked in `call_raw`,
 //! which has no timeout of its own. The workspace has no `nextest.toml`
 //! and no per-test harness timeout, so a mutation that turns a reply
 //! into silence would hang CI rather than redden it, and a hung job
@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_holdfast");
 
-/// How long a `clasp` subcommand may take before it is treated as hung.
+/// How long a `holdfast` subcommand may take before it is treated as hung.
 ///
 /// Generous on purpose: `daemon start` can legitimately spend
 /// `LOCK_TIMEOUT` (5 s) waiting for a contended `holdfast.lock` and then
@@ -114,11 +114,11 @@ impl TestEnv {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("run clasp");
+            .expect("run holdfast");
         match wait_bounded(child, CLI_TIMEOUT) {
             Some(result) => result,
             None => panic!(
-                "`clasp {}` did not exit within {CLI_TIMEOUT:?} and was killed",
+                "`holdfast {}` did not exit within {CLI_TIMEOUT:?} and was killed",
                 args.join(" ")
             ),
         }
@@ -208,7 +208,7 @@ impl Drop for TestEnv {
 ///
 /// `None` means it had to be killed, which is a hang; no caller treats
 /// that as success. Both pipes are drained on their own threads before
-/// the wait, because `clasp logs` can print a quarter of a megabyte and
+/// the wait, because `holdfast logs` can print a quarter of a megabyte and
 /// a child blocked on a full pipe would otherwise never reach the exit
 /// this polls for — a deadlock produced by the very code meant to bound
 /// one.
@@ -228,7 +228,7 @@ fn wait_bounded(mut child: Child, limit: Duration) -> Option<(i32, String, Strin
 
     let deadline = Instant::now() + limit;
     let status = loop {
-        match child.try_wait().expect("wait for clasp") {
+        match child.try_wait().expect("wait for holdfast") {
             Some(status) => break Some(status),
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
@@ -281,7 +281,7 @@ fn ended(pid: u32) -> bool {
     !matches!(proc_state(pid), Some(state) if state != 'Z')
 }
 
-/// A `clasp mcp` process driven over stdio with raw JSON-RPC.
+/// A `holdfast mcp` process driven over stdio with raw JSON-RPC.
 struct Shim {
     child: Child,
     /// Lines of the shim's stdout, delivered by a reader thread.
@@ -315,7 +315,7 @@ impl Shim {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn clasp mcp");
+            .expect("spawn holdfast mcp");
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, lines) = mpsc::channel();
         std::thread::spawn(move || {
@@ -381,7 +381,7 @@ impl Shim {
                 "params": {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {},
-                    "clientInfo": { "name": "clasp-test", "version": "0" }
+                    "clientInfo": { "name": "holdfast-test", "version": "0" }
                 }
             })
             .to_string(),
@@ -570,8 +570,8 @@ fn two_daemons_under_different_runtime_dirs_do_not_see_each_others_sessions() {
         "instance A lost the session it created: {listing_a}"
     );
 
-    // The negative. `clasp list` does **not** auto-spawn — only
-    // `clasp mcp` does (§7.3) — so B's daemon is started explicitly.
+    // The negative. `holdfast list` does **not** auto-spawn — only
+    // `holdfast mcp` does (§7.3) — so B's daemon is started explicitly.
     // That matters: without it `list` would exit 2 on an unreachable
     // socket and the emptiness below would be a connection failure
     // wearing the costume of isolation.
@@ -669,7 +669,7 @@ fn daemon_stop_force_does_not_signal_a_pid_that_is_not_this_daemon() {
     // exist. `holdfast.pid` is written once at startup and removed only on
     // a clean exit, so a daemon that was killed leaves it behind naming
     // a pid the kernel is free to hand to anything — and the version
-    // string the file also carries says only which clasp *wrote* it, not
+    // string the file also carries says only which holdfast *wrote* it, not
     // who owns the pid now. A `--force` that trusted the file would
     // SIGKILL a stranger.
     let env = TestEnv::new("forcestale");
@@ -722,11 +722,11 @@ fn daemon_stop_force_does_not_signal_a_pid_that_is_not_this_daemon() {
 #[test]
 fn daemon_stop_force_does_not_kill_another_instances_daemon() {
     // The recycled pid that actually costs something. A stranger at the
-    // pid is caught by any check at all; a *second clasp daemon* at the
+    // pid is caught by any check at all; a *second holdfast daemon* at the
     // pid is caught only by one that is specific to this instance, and
     // it is the case with real sessions to lose. `--force` must confirm
     // the pid against this runtime directory's own control socket, not
-    // merely against "looks like a clasp daemon".
+    // merely against "looks like a holdfast daemon".
     if !have_proc() {
         return; // The pid confirmation is `/proc`-based; see `commands.rs`.
     }
@@ -1028,7 +1028,7 @@ fn a_session_survives_the_shim_process_that_created_it() {
 #[test]
 fn holdfast_list_and_logs_see_sessions_created_through_the_shim() {
     // §7.2: CLI commands and MCP tool handlers share one control socket,
-    // so a separate `clasp` invocation sees the shim's sessions.
+    // so a separate `holdfast` invocation sees the shim's sessions.
     let env = TestEnv::new("listlogs");
     let mut shim = Shim::start(&env);
     let started = shim.call_tool(
@@ -1048,20 +1048,20 @@ fn holdfast_list_and_logs_see_sessions_created_through_the_shim() {
 
     let (code, out, err) = env.run(&["list"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains(&session_id), "`clasp list` output: {out}");
-    assert!(out.contains("visible"), "`clasp list` output: {out}");
+    assert!(out.contains(&session_id), "`holdfast list` output: {out}");
+    assert!(out.contains("visible"), "`holdfast list` output: {out}");
 
     let (code, out, err) = env.run(&["list", "--json"]);
     assert_eq!(code, 0, "stderr: {err}");
     let listed: Value = serde_json::from_str(out.trim()).expect("json");
     assert_eq!(listed["sessions"][0]["name"], "visible");
 
-    // `clasp logs` reads the same buffer the agent reads. The marker was
+    // `holdfast logs` reads the same buffer the agent reads. The marker was
     // produced by the shell, so it can only appear if the CLI reached
     // the real session rather than printing something of its own.
     let (code, out, err) = env.run(&["logs", "visible"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("CLI_MARK"), "`clasp logs` output: {out}");
+    assert!(out.contains("CLI_MARK"), "`holdfast logs` output: {out}");
 
     // `--raw` (§3.2) reaches the same read path with redaction disabled.
     // This arm proves the flag is *plumbed* — accepted, forwarded, and
@@ -1071,11 +1071,14 @@ fn holdfast_list_and_logs_see_sessions_created_through_the_shim() {
     // later suite's.
     let (code, out, err) = env.run(&["logs", "visible", "--raw"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(out.contains("CLI_MARK"), "`clasp logs --raw` output: {out}");
+    assert!(
+        out.contains("CLI_MARK"),
+        "`holdfast logs --raw` output: {out}"
+    );
 
     let (code, out, err) = env.run(&["logs", "visible", "--tail", "5"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(!out.is_empty(), "`clasp logs --tail` printed nothing");
+    assert!(!out.is_empty(), "`holdfast logs --tail` printed nothing");
 
     let (code, _, err) = env.run(&["logs", "sess_does_not_exist"]);
     assert_eq!(code, 1, "an unknown session is a failure; stderr: {err}");
@@ -1100,11 +1103,11 @@ fn holdfast_logs_redacts_by_default() {
     assert_eq!(code, 0, "stderr: {err}");
     assert!(
         !out.contains(AWS_KEY),
-        "`clasp logs` printed a secret with redaction on: {out}"
+        "`holdfast logs` printed a secret with redaction on: {out}"
     );
     assert!(
         out.contains(AWS_MARK),
-        "nothing in `clasp logs` output shows the redactor ran: {out}"
+        "nothing in `holdfast logs` output shows the redactor ran: {out}"
     );
 
     shim.call_tool("terminate", json!({ "session": session_id, "force": true }));

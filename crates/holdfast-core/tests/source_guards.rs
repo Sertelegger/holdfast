@@ -58,7 +58,7 @@ fn calls_a_print_macro(line: &str) -> bool {
 
 /// The denial's scope, and the exemptions that would silently shrink it.
 ///
-/// `holdfast-core` is scanned and `clasp` is not: the binary crate's denial
+/// `holdfast-core` is scanned and `holdfast` is not: the binary crate's denial
 /// is in `main.rs`, which *is* its crate root, so its scope is complete
 /// by construction. This crate's was not, and a library has no single
 /// entry point a reader can check at a glance.
@@ -94,7 +94,7 @@ fn no_module_in_this_crate_can_print_around_the_redactor() {
     // And the detector itself, or a `calls_a_print_macro` that answered
     // `false` to everything would report a clean tree forever.
     assert!(
-        calls_a_print_macro("        eprintln!(\"clasp: {why}\");"),
+        calls_a_print_macro("        eprintln!(\"holdfast: {why}\");"),
         "the detector does not recognise the exact line this finding was about"
     );
     assert!(
@@ -131,7 +131,7 @@ fn no_module_in_this_crate_can_print_around_the_redactor() {
         offences.is_empty(),
         "every diagnostic in this crate goes through `holdfast_core::diag!`, which redacts; \
          the daemon's stderr is `daemon.log` (§9.2, a redacted boundary) and under \
-         `clasp mcp` its stdout is the JSON-RPC wire:\n{}",
+         `holdfast mcp` its stdout is the JSON-RPC wire:\n{}",
         offences.join("\n")
     );
 

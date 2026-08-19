@@ -1,6 +1,6 @@
-# CLASP built-in secret-redaction rules (spec §9.2).
+# Holdfast built-in secret-redaction rules (spec §9.2).
 #
-# Derived from the gitleaks default rule set (MIT) plus CLASP additions
+# Derived from the gitleaks default rule set (MIT) plus Holdfast additions
 # for AI provider keys. Refreshed quarterly; `source_version` records the
 # upstream snapshot this file was derived from.
 #

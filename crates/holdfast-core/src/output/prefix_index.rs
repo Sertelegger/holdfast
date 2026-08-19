@@ -534,7 +534,7 @@ mod tests {
         let rules = RuleSet::builtin().unwrap();
         let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
         let lines = [
-            "   Compiling holdfast-core v0.0.1 (/home/user/src/clasp)",
+            "   Compiling holdfast-core v0.0.1 (/home/user/src/holdfast)",
             "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.72s",
             "test output::rules::tests::the_prefilter_reports_matching_rule_indices ... ok",
             "warning: unused variable: `n` --> src/lib.rs:42:9",

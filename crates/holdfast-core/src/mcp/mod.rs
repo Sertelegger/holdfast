@@ -123,7 +123,7 @@ pub struct HoldfastServer {
     /// Why the §9.4 trail is off when a path for it *was* supplied.
     ///
     /// **The audit log used to fail open with nothing but a line on
-    /// stderr.** A root-owned `audit.log` left by one `sudo clasp`
+    /// stderr.** A root-owned `audit.log` left by one `sudo holdfast`
     /// produced a server that ran normally and recorded
     /// nothing — every `session_start`, every `redaction_disabled`,
     /// gone, with the daemon reporting perfect health. The comparison
@@ -213,7 +213,7 @@ impl HoldfastServer {
                     // operator chose; the redactor is what makes that
                     // safe to persist rather than the shape of the
                     // message.
-                    crate::diag!("clasp: {why}");
+                    crate::diag!("holdfast: {why}");
                     (Arc::new(AuditLog::disabled(Arc::clone(&rules))), Some(why))
                 }
             },
@@ -409,7 +409,7 @@ impl ServerHandler for HoldfastServer {
 /// run the whole tool surface on `Config::default()`: an operator who
 /// set `max_concurrent_sessions`, `default_idle_timeout_secs`,
 /// `resource_read_max_bytes` or anything else, and then ran
-/// `clasp mcp --no-daemon`, got the built-in value on every one of them
+/// `holdfast mcp --no-daemon`, got the built-in value on every one of them
 /// with no warning on any channel. The hybrid transport was configured
 /// only because the *daemon* loads the file (`server::run`), not because
 /// the MCP server does — so the knob was in force or not depending on a
@@ -449,8 +449,8 @@ mod tests {
     /// can act on.
     ///
     /// It used to leave only a line on stderr, which under
-    /// `clasp daemon run` goes wherever the launcher pointed it — so a
-    /// root-owned `audit.log` from one `sudo clasp` gave
+    /// `holdfast daemon run` goes wherever the launcher pointed it — so a
+    /// root-owned `audit.log` from one `sudo holdfast` gave
     /// a server that ran normally and wrote no §9.4 trail at all, with
     /// nothing in the process able to tell. `server::run_with_config`
     /// refuses to serve on this, and it can only refuse on something it

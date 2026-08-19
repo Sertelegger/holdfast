@@ -458,7 +458,7 @@ mod tests {
             hits.iter().any(|i| set.rules[*i].name == "github-token"),
             "github-token must be among the prefilter hits"
         );
-        let clean = b"   Compiling holdfast-core v0.0.1 (/home/user/src/clasp)";
+        let clean = b"   Compiling holdfast-core v0.0.1 (/home/user/src/holdfast)";
         assert!(
             set.prefilter.matches(clean).into_iter().next().is_none(),
             "ordinary build output must not trip any rule"

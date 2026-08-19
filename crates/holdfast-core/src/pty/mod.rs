@@ -10,7 +10,7 @@ pub use mock::MockPty;
 
 use crate::Result;
 
-/// Signals CLASP delivers to a session's process group.
+/// Signals Holdfast delivers to a session's process group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Interrupt,
@@ -42,10 +42,10 @@ impl PtySpawnConfig {
     }
 }
 
-/// The narrowest terminal CLASP will drive.
+/// The narrowest terminal Holdfast will drive.
 ///
 /// **Two, not one, and it is measured rather than chosen.** A terminal
-/// with zero columns is not a terminal, and nothing below CLASP says so:
+/// with zero columns is not a terminal, and nothing below Holdfast says so:
 /// `TIOCSWINSZ` accepts a zero `winsize`, the backend answers `Ok`, and
 /// the value reaches the tracker verbatim — where `vt100` 0.16.2 treats
 /// it as a programming error rather than as input. At **zero**,
@@ -67,18 +67,18 @@ impl PtySpawnConfig {
 /// makes it panic rather than quietly pass.
 pub const MIN_COLS: u16 = 2;
 
-/// The shortest terminal CLASP will drive. Two for the same reason as
+/// The shortest terminal Holdfast will drive. Two for the same reason as
 /// [`MIN_COLS`] and by the same measurement, but a different subtraction:
 /// at **one row**, any wrap, scroll region, reverse index or off-screen
 /// cursor move reaches `Grid::col_wrap`'s `prev_pos.row -= scrolled`
 /// with `prev_pos.row == 0` and `scrolled == 1`.
 pub const MIN_ROWS: u16 = 2;
 
-/// The widest terminal CLASP will drive. See [`MAX_ROWS`] for the
+/// The widest terminal Holdfast will drive. See [`MAX_ROWS`] for the
 /// reasoning — it is a memory bound, not a display one.
 pub const MAX_COLS: u16 = 1000;
 
-/// The tallest terminal CLASP will drive.
+/// The tallest terminal Holdfast will drive.
 ///
 /// **A memory bound rather than a display one.** `vt100::Cell` is
 /// statically asserted to be exactly 32 bytes and a grid allocates every

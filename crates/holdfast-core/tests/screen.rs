@@ -237,7 +237,7 @@ impl PtyBackend for ResizeRefusingPty {
 #[tokio::test]
 async fn resize_is_visible_to_the_child() {
     // REQ-T-009: the tool's whole point is `SIGWINCH` reaching the child,
-    // and `stty size` is the child's own answer rather than CLASP's.
+    // and `stty size` is the child's own answer rather than Holdfast's.
     let server = HoldfastServer::new();
     let id = start_bash(&server, None).await;
     read_until(&server, &id, "$").await;
@@ -1050,7 +1050,7 @@ const FIXTURE_QUERIES: [DeclinedQuery; 4] = [
         "XTVERSION",
         b"\x1b[>0q",
         None,
-        b"\x1bP>|clasp-fixture\x1b\\",
+        b"\x1bP>|holdfast-fixture\x1b\\",
     ),
     (
         "OSC 11 background",
@@ -1165,7 +1165,7 @@ fn fish_time_to_first_prompt(terminal_queries: bool, fixture: bool) -> FishArm {
             terminal_queries,
             // No OSC 133 snippet: an injected line is a write into the
             // child's input, and this row is measuring what happens when
-            // CLASP writes exactly one thing or nothing at all.
+            // Holdfast writes exactly one thing or nothing at all.
             shell_integration: None,
             ..SessionConfig::with_buffer_capacity(1 << 20)
         },
@@ -1216,7 +1216,7 @@ fn fish_time_to_first_prompt(terminal_queries: bool, fixture: bool) -> FishArm {
 /// threshold at the measurement is a flake, and one in the middle of that
 /// gap cannot be reached by noise.
 ///
-/// Without the middle arm, the third asserts only "fish is fast when CLASP
+/// Without the middle arm, the third asserts only "fish is fast when Holdfast
 /// answers queries" — satisfied equally by an implementation that answers
 /// everything, and by a fish that simply got faster.
 #[test]
@@ -1273,7 +1273,7 @@ fn only_answering_da1_takes_fish_to_its_first_prompt() {
     assert!(
         da1.answered.is_empty(),
         "the DA1 arm answered {:?} through the test's own fixture; its speed \
-         has to come from CLASP's reply, not from this file's",
+         has to come from Holdfast's reply, not from this file's",
         da1.answered
     );
 
@@ -1383,7 +1383,7 @@ fn the_fixture_records_exactly_the_queries_it_answered() {
 
     // The negative: a stream that is nothing but Primary DA. If this came
     // back non-empty the middle arm would be answering the one query
-    // §4.5.1 reserves for CLASP, and the fence measurement would be gone —
+    // §4.5.1 reserves for Holdfast, and the fence measurement would be gone —
     // and if the recorder simply reported everything, this is where it
     // shows.
     let mut upto = 0usize;

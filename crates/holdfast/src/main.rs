@@ -1,10 +1,10 @@
 // Every diagnostic this binary writes goes through `holdfast_core::diag!`,
-// which redacts. `clasp daemon run`'s stderr *is* `daemon.log` (§9.2
-// lists it as a redacted boundary), and `clasp mcp`'s stderr is what an
+// which redacts. `holdfast daemon run`'s stderr *is* `daemon.log` (§9.2
+// lists it as a redacted boundary), and `holdfast mcp`'s stderr is what an
 // MCP client surfaces as server logs, so both are output boundaries in
-// §9.2's sense. `print_stdout` is deliberately **not** denied: `clasp
-// list`, `clasp logs` and `clasp daemon status` write their real answers
-// there, and `clasp logs --raw` is specified to be unredacted.
+// §9.2's sense. `print_stdout` is deliberately **not** denied: `holdfast
+// list`, `holdfast logs` and `holdfast daemon status` write their real answers
+// there, and `holdfast logs --raw` is specified to be unredacted.
 #![deny(clippy::print_stderr)]
 
 mod commands;
@@ -17,32 +17,32 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 const USAGE: &str = "\
-clasp — Claude's Live Agent Shell Proxy
+HOLDFAST — Human-Observable Long-lived Daemon For Agent Shell Terminals
 
 USAGE:
-    clasp mcp [--no-daemon]        Run the MCP server on stdio
-    clasp daemon run               Run the daemon in the foreground
-    clasp daemon start             Start a detached daemon (idempotent)
-    clasp daemon stop [--force]    Stop the daemon (idempotent)
-    clasp daemon status [--json]   Report daemon health
-    clasp list [--json]            List sessions
-    clasp logs <session> [--tail N] [--raw]
-                                   Print a session's output
-    clasp version                  Print version information
+    holdfast mcp [--no-daemon]        Run the MCP server on stdio
+    holdfast daemon run               Run the daemon in the foreground
+    holdfast daemon start             Start a detached daemon (idempotent)
+    holdfast daemon stop [--force]    Stop the daemon (idempotent)
+    holdfast daemon status [--json]   Report daemon health
+    holdfast list [--json]            List sessions
+    holdfast logs <session> [--tail N] [--raw]
+                                      Print a session's output
+    holdfast version                  Print version information
 
 ENVIRONMENT:
-    HOLDFAST_RUNTIME_DIR              Select a CLASP instance: relocates the
-                                   sockets, pid file, lock file and the
-                                   daemon log
+    HOLDFAST_RUNTIME_DIR              Select a Holdfast instance: relocates the
+                                      sockets, pid file, lock file and the
+                                      daemon log
 
 FILES:
     $XDG_CONFIG_HOME/holdfast/config.toml, else ~/.config/holdfast/config.toml
-                                   Read by both transports, `mcp
-                                   --no-daemon` included. Absent is the
-                                   defaults; present and invalid refuses
-                                   to start rather than starting on
-                                   them. HOLDFAST_RUNTIME_DIR does not move
-                                   it.
+                                      Read by both transports, `mcp
+                                      --no-daemon` included. Absent is the
+                                      defaults; present and invalid refuses
+                                      to start rather than starting on
+                                      them. HOLDFAST_RUNTIME_DIR does not move
+                                      it.
 ";
 
 /// How long to wait for the blocking pool at exit.
@@ -60,14 +60,14 @@ FILES:
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 fn usage_error(msg: &str) -> ExitCode {
-    diag!("clasp: {msg}\n\n{USAGE}");
+    diag!("holdfast: {msg}\n\n{USAGE}");
     ExitCode::from(commands::EXIT_USAGE)
 }
 
 fn main() -> ExitCode {
     // First statement in the process, and before the runtime exists: a
     // panic in the runtime builder, in a tokio worker, or in a blocking
-    // pool thread all reach the same hook, and on `clasp daemon run`
+    // pool thread all reach the same hook, and on `holdfast daemon run`
     // that hook's output is `daemon.log`. Installing it per-subcommand
     // would leave the two failures above it uncovered for no gain — see
     // `holdfast_core::diag::install_panic_hook` for why one site.
@@ -79,7 +79,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            diag!("clasp: could not start the async runtime: {e}");
+            diag!("holdfast: could not start the async runtime: {e}");
             return ExitCode::from(commands::EXIT_UNREACHABLE);
         }
     };

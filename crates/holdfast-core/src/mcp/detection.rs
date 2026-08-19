@@ -125,7 +125,7 @@ fn safe_last_line(processor: &OutputProcessor, session: &Session, d: &Detection)
 /// leave the other four leaking — and the last line of output is where a
 /// secret the child just echoed lands.
 ///
-/// `reason` is deliberately **not** redacted: it is CLASP's own
+/// `reason` is deliberately **not** redacted: it is Holdfast's own
 /// branch-name vocabulary from §8.3's ladder (`"bracketed paste off"` and
 /// friends), never child output, so it cannot carry a secret. Running the
 /// redactor over a fixed vocabulary only creates a way for a rule change
@@ -673,10 +673,10 @@ mod tests {
 
     #[test]
     fn an_ordinary_window_title_is_reported_byte_identical() {
-        let (s, _pty) = session_with_output(b"\x1b]0;~/src/clasp\x07$ ", "$ ");
+        let (s, _pty) = session_with_output(b"\x1b]0;~/src/holdfast\x07$ ", "$ ");
         assert_eq!(
             with_detection(json!({}), &s, &rules())["title"],
-            "~/src/clasp"
+            "~/src/holdfast"
         );
     }
 

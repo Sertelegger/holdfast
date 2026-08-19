@@ -85,7 +85,7 @@ pub struct PromptPattern {
 /// lowers a real prompt's score, because T3 is the only tier a
 /// `dash`-shaped session has and lost recall there is unrecoverable.
 ///
-/// Changing any score or anchor here changes what CLASP reports about a
+/// Changing any score or anchor here changes what Holdfast reports about a
 /// live session on the tier with no corroborating signal, so each row is
 /// pinned from **both** sides of the boundary it draws (REQ-PD-017): a
 /// positive that only it can satisfy, a near-miss that pins its anchors,

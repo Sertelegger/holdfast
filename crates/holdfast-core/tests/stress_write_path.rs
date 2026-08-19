@@ -30,7 +30,7 @@ const P99_BUDGET: Duration = Duration::from_millis(500);
 /// what stops it passing vacuously and is comfortable on every machine
 /// measured — 1.9 GB against a 157 MB floor on the 2-vCPU runner — so it
 /// stays unconditional too. The p99 is the only one of the three that is a
-/// statement about *speed*, and it is only a statement about CLASP on a
+/// statement about *speed*, and it is only a statement about Holdfast on a
 /// machine that can carry the scenario §11.4 describes.
 ///
 /// **Measured, which is why the number is 8 and not a guess.** On
@@ -103,7 +103,7 @@ struct StreamPty {
 
 impl StreamPty {
     fn new(start: Instant) -> Self {
-        let line = b"\x1b[2m[12:04:57]\x1b[0m \x1b[32m   Compiling\x1b[0m holdfast-core v0.0.1 (/w/clasp)\r\n";
+        let line = b"\x1b[2m[12:04:57]\x1b[0m \x1b[32m   Compiling\x1b[0m holdfast-core v0.0.1 (/w/holdfast)\r\n";
         let mut pattern = Vec::with_capacity(CHUNK * 2);
         while pattern.len() < CHUNK * 2 {
             pattern.extend_from_slice(line);
@@ -314,7 +314,7 @@ fn tier_b_stays_off_and_the_control_path_stays_responsive_under_load() {
         eprintln!(
             "not-asserted: stress_write_path::control_path_p99 cores={cores} \
              min_cores={P99_MIN_CORES} — §11.4's p99 needs >= \
-             {P99_MIN_CORES} cores to be a statement about CLASP rather than \
+             {P99_MIN_CORES} cores to be a statement about Holdfast rather than \
              about the scheduler; this box has {cores}. Measured anyway: p99 \
              {p99:?}, max {:?}, {} samples, {produced} bytes streamed. The \
              `not-asserted: ` prefix, the id and the two `k=v` fields are the \

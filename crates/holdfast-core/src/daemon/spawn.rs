@@ -38,7 +38,7 @@ impl DaemonLock {
     ///
     /// A different file from [`acquire`](Self::acquire) on purpose — see
     /// [`RuntimePaths::bind_lock_file`] for why merging the two
-    /// deadlocks `clasp daemon start`.
+    /// deadlocks `holdfast daemon start`.
     pub fn acquire_bind(paths: &RuntimePaths) -> io::Result<Self> {
         Self::acquire_at(paths, paths.bind_lock_file(), LOCK_TIMEOUT)
     }
@@ -132,9 +132,9 @@ pub enum StartOutcome {
     Started { pid: u32 },
 }
 
-/// Start a detached `clasp daemon run` and wait for it to answer.
+/// Start a detached `holdfast daemon run` and wait for it to answer.
 ///
-/// This is the body of `clasp daemon start`. The detach is a genuine
+/// This is the body of `holdfast daemon start`. The detach is a genuine
 /// double fork: this process `setsid`s and spawns the daemon, then
 /// exits, so the daemon is re-parented to init and no zombie survives.
 pub fn start_detached(paths: &RuntimePaths, exe: &Path) -> io::Result<StartOutcome> {
@@ -165,7 +165,7 @@ pub fn start_detached(paths: &RuntimePaths, exe: &Path) -> io::Result<StartOutco
     // child's `resolve` would take §7.1's relocation branch and put
     // `audit.log` and `daemon.log` on tmpfs — cleared at logout, where
     // §19.1's 14-day and 4-week windows cannot be met, and where neither
-    // `clasp logs` nor any operator runbook looks. The child agrees with
+    // `holdfast logs` nor any operator runbook looks. The child agrees with
     // us about the socket because it runs the same `discover` against
     // the same environment, not because we told it.
     let mut cmd = std::process::Command::new(exe);
@@ -212,7 +212,7 @@ pub fn start_detached(paths: &RuntimePaths, exe: &Path) -> io::Result<StartOutco
 
 /// The shim's startup path (§3.4): connect, or spawn and connect.
 ///
-/// The spawn goes through `clasp daemon start` rather than forking here,
+/// The spawn goes through `holdfast daemon start` rather than forking here,
 /// so this process's direct child is short-lived and reaped by `status()`
 /// — the second fork of the double fork. `daemon start` holds the lock
 /// and does the re-check.
@@ -232,9 +232,9 @@ pub async fn ensure_daemon(
     }
 
     // **`stdout` is nulled, and that is a protocol requirement rather than
-    // tidiness.** The overwhelmingly common caller is `clasp mcp`, whose
+    // tidiness.** The overwhelmingly common caller is `holdfast mcp`, whose
     // stdout *is* the MCP JSON-RPC transport; a child that inherits it
-    // writes onto the wire. `clasp daemon start` prints `daemon started
+    // writes onto the wire. `holdfast daemon start` prints `daemon started
     // (pid N)` on success by §3.2, so before this line the first thing an
     // auto-spawning shim sent its client was a bare line of English. It
     // parsed as nothing, and `scripts/mcp-smoke.sh` measured 20 of its
@@ -265,7 +265,7 @@ pub async fn ensure_daemon(
         return Err(ClientError::Connect {
             path: sock.display().to_string(),
             source: io::Error::other(format!(
-                "`clasp daemon start` exited with {status}; see {}",
+                "`holdfast daemon start` exited with {status}; see {}",
                 paths.daemon_log().display()
             )),
         });
@@ -290,7 +290,7 @@ mod tests {
         }
     }
 
-    /// A stand-in for the `clasp` binary that records the one thing the
+    /// A stand-in for the `holdfast` binary that records the one thing the
     /// two tests below are about — what the child's `HOLDFAST_RUNTIME_DIR`
     /// was — into a file, because one of the two spawn sites nulls the
     /// child's stdout by protocol requirement. It ignores its argv, so
@@ -333,7 +333,7 @@ mod tests {
     /// a *default* instance saw an explicit one, took the relocation
     /// branch, and wrote both logs to `$XDG_RUNTIME_DIR/holdfast/logs` —
     /// tmpfs, cleared at logout, where §19.1's 14-day and 4-week
-    /// retention windows cannot be met and `clasp logs` does not look.
+    /// retention windows cannot be met and `holdfast logs` does not look.
     ///
     /// The opposite mutation — never letting the child see the variable
     /// — is caught by `daemon_cli.rs`, which reads `/proc/<pid>/environ`
@@ -374,9 +374,9 @@ mod tests {
     }
 
     /// The same property at the shim's auto-spawn site, which is the one
-    /// that matters in practice: `clasp mcp` is how every Claude Code
+    /// that matters in practice: `holdfast mcp` is how every Claude Code
     /// install starts its daemon, and it is the path the defect made
-    /// disagree with `clasp daemon start` about where the logs live.
+    /// disagree with `holdfast daemon start` about where the logs live.
     #[tokio::test]
     async fn auto_spawn_does_not_invent_an_explicit_instance_for_its_child() {
         let paths = temp_paths("envstart");

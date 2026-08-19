@@ -4,9 +4,9 @@
 use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::{server, spawn};
 // The `diag!` macro, not the module — every diagnostic below goes to
-// stderr, and on `clasp daemon run` stderr is `daemon.log`, which §9.2
+// stderr, and on `holdfast daemon run` stderr is `daemon.log`, which §9.2
 // lists as a redacted boundary. `println!` is left alone throughout:
-// that is the subcommands' actual answer, and `clasp logs --raw` is
+// that is the subcommands' actual answer, and `holdfast logs --raw` is
 // specified to be unredacted.
 use holdfast_core::diag;
 use holdfast_core::mcp::shim::ShimServer;
@@ -53,7 +53,7 @@ async fn connect(kind: ClientKind) -> Result<ControlClient, ClientError> {
     ControlClient::connect(&paths.control_sock(), kind).await
 }
 
-/// `clasp mcp [--no-daemon]`
+/// `holdfast mcp [--no-daemon]`
 pub async fn mcp(no_daemon: bool) -> ExitCode {
     // Windows has no daemon at all (§3.3, §3.6); that arm lands in
     // 0.0.11. On Unix, `--no-daemon` is the documented escape hatch and
@@ -62,7 +62,7 @@ pub async fn mcp(no_daemon: bool) -> ExitCode {
         return match holdfast_core::mcp::serve_stdio().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                diag!("clasp mcp: {e}");
+                diag!("holdfast mcp: {e}");
                 ExitCode::from(no_daemon_exit_code(&e))
             }
         };
@@ -71,14 +71,14 @@ pub async fn mcp(no_daemon: bool) -> ExitCode {
     let paths = match paths() {
         Ok(p) => p,
         Err(e) => {
-            diag!("clasp mcp: {e}");
+            diag!("holdfast mcp: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            diag!("clasp mcp: cannot locate my own binary: {e}");
+            diag!("holdfast mcp: cannot locate my own binary: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
@@ -86,7 +86,7 @@ pub async fn mcp(no_daemon: bool) -> ExitCode {
     let client = match spawn::ensure_daemon(&paths, &exe, ClientKind::Shim).await {
         Ok(c) => c,
         Err(e) => {
-            diag!("clasp mcp: daemon_unreachable: {e}");
+            diag!("holdfast mcp: daemon_unreachable: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
@@ -97,18 +97,18 @@ pub async fn mcp(no_daemon: bool) -> ExitCode {
     {
         Ok(s) => s,
         Err(e) => {
-            diag!("clasp mcp: {e}");
+            diag!("holdfast mcp: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     if let Err(e) = service.waiting().await {
-        diag!("clasp mcp: {e}");
+        diag!("holdfast mcp: {e}");
         return ExitCode::from(EXIT_UNREACHABLE);
     }
     ExitCode::SUCCESS
 }
 
-/// §18.8's code for a `clasp mcp --no-daemon` that stopped serving.
+/// §18.8's code for a `holdfast mcp --no-daemon` that stopped serving.
 ///
 /// **A refused `config.toml` is "operation failed" (1), not "daemon
 /// unreachable" (2).** `serve_stdio` now loads the same file the daemon
@@ -132,38 +132,38 @@ fn no_daemon_exit_code(e: &anyhow::Error) -> u8 {
     }
 }
 
-/// `clasp daemon run` — foreground, for systemd/launchd and for the
+/// `holdfast daemon run` — foreground, for systemd/launchd and for the
 /// process `daemon start` detaches.
 pub async fn daemon_run() -> ExitCode {
     let paths = match paths() {
         Ok(p) => p,
         Err(e) => {
-            diag!("clasp daemon run: {e}");
+            diag!("holdfast daemon run: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
     match server::run(paths).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            diag!("clasp daemon run: {e}");
+            diag!("holdfast daemon run: {e}");
             ExitCode::from(EXIT_FAILED)
         }
     }
 }
 
-/// `clasp daemon start` — fork-and-detach, idempotent (§3.2).
+/// `holdfast daemon start` — fork-and-detach, idempotent (§3.2).
 pub fn daemon_start() -> ExitCode {
     let paths = match paths() {
         Ok(p) => p,
         Err(e) => {
-            diag!("clasp daemon start: {e}");
+            diag!("holdfast daemon start: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            diag!("clasp daemon start: cannot locate my own binary: {e}");
+            diag!("holdfast daemon start: cannot locate my own binary: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
@@ -180,7 +180,7 @@ pub fn daemon_start() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            diag!("clasp daemon start: {e}");
+            diag!("holdfast daemon start: {e}");
             ExitCode::from(EXIT_FAILED)
         }
     }
@@ -194,12 +194,12 @@ pub fn daemon_start() -> ExitCode {
 /// which nothing else knows — but it is bounded, because the case
 /// `--force` exists for is a daemon that accepts the connection and then
 /// never replies. `ControlClient` has no timeout of its own (deliberate:
-/// `clasp logs` may legitimately take a while), so an unbounded call
+/// `holdfast logs` may legitimately take a while), so an unbounded call
 /// here would park `--force` in exactly the situation it is meant to
 /// resolve. That is what `TestEnv::drop` was paying `CLI_TIMEOUT` for.
 const FORCE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long `clasp daemon stop` **without** `--force` waits for the
+/// How long `holdfast daemon stop` **without** `--force` waits for the
 /// graceful `daemon/stop` to answer before it gives up.
 ///
 /// §3.2 bounds this call in as many words — *"`SIGTERM` to the daemon,
@@ -265,7 +265,7 @@ async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
     }
 }
 
-/// `clasp daemon stop [--force]` — idempotent; exit 0 when nothing was
+/// `holdfast daemon stop [--force]` — idempotent; exit 0 when nothing was
 /// running.
 ///
 /// §3.2: *"`--force` makes the wait 0 and immediately escalates to
@@ -327,7 +327,7 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
             // `confirm_daemon_pid` refuses to do — so the elapse is the
             // verdict and the operator is told to reach for `--force`.
             StopRpc::Failed(e) => {
-                diag!("clasp daemon stop: {e}");
+                diag!("holdfast daemon stop: {e}");
                 EXIT_FAILED
             }
         };
@@ -371,12 +371,12 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
             }
             Escalation::NotSignalled { pid, why } => {
                 println!("no daemon running");
-                diag!("clasp daemon stop: holdfast.pid names pid {pid}, not signalled: {why}");
+                diag!("holdfast daemon stop: holdfast.pid names pid {pid}, not signalled: {why}");
                 0
             }
         },
         StopRpc::Failed(e) => {
-            diag!("clasp daemon stop: {e}");
+            diag!("holdfast daemon stop: {e}");
             match escalation {
                 Escalation::Killed(pid) => {
                     println!("daemon killed (pid {pid})");
@@ -384,7 +384,9 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
                 }
                 Escalation::Nothing => EXIT_FAILED,
                 Escalation::NotSignalled { pid, why } => {
-                    diag!("clasp daemon stop: holdfast.pid names pid {pid}, not signalled: {why}");
+                    diag!(
+                        "holdfast daemon stop: holdfast.pid names pid {pid}, not signalled: {why}"
+                    );
                     EXIT_FAILED
                 }
             }
@@ -452,7 +454,7 @@ fn escalate_to_sigkill(paths: &RuntimePaths) -> Escalation {
 /// startup and removed only on a clean exit, so a daemon that was
 /// killed, panicked, or lost its machine leaves the file behind naming a
 /// pid the kernel is then free to hand to anything. The version string
-/// the file also carries does not close that: it records which clasp
+/// the file also carries does not close that: it records which holdfast
 /// *wrote* the file, which says nothing about who owns the pid now. What
 /// the file does give is that the runtime directory is `0700`, so no
 /// other user planted it — the hazard is recycling, not forgery.
@@ -462,7 +464,7 @@ fn escalate_to_sigkill(paths: &RuntimePaths) -> Escalation {
 /// 1. It holds an open fd for a socket bound at *this* runtime
 ///    directory's `control.sock`. This is the instance-specific half:
 ///    a recycled pid does not hold our socket, and neither does a second
-///    clasp daemon running under a different `HOLDFAST_RUNTIME_DIR` — which
+///    holdfast daemon running under a different `HOLDFAST_RUNTIME_DIR` — which
 ///    is the recycling case that would otherwise cost a live daemon its
 ///    sessions.
 /// 2. Its argv contains `daemon run`. Corroboration; (1) is the
@@ -581,7 +583,7 @@ fn unix_socket_row(line: &str) -> Option<(&str, &str)> {
     (!rest.is_empty()).then_some((inode, rest))
 }
 
-/// `clasp daemon status [--json]`
+/// `holdfast daemon status [--json]`
 pub async fn daemon_status(as_json: bool) -> ExitCode {
     let client = match connect(ClientKind::Cli).await {
         Ok(c) => c,
@@ -589,12 +591,12 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
             if as_json {
                 println!("{}", json!({ "running": false }));
             } else {
-                println!("clasp daemon down");
+                println!("holdfast daemon down");
             }
             return ExitCode::from(EXIT_UNREACHABLE);
         }
         Err(e) => {
-            diag!("clasp daemon status: {e}");
+            diag!("holdfast daemon status: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
@@ -602,7 +604,7 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
         match client.call(method::METHOD_DAEMON_STATUS, &json!({})).await {
             Ok(s) => s,
             Err(e) => {
-                diag!("clasp daemon status: {e}");
+                diag!("holdfast daemon status: {e}");
                 return ExitCode::from(EXIT_UNREACHABLE);
             }
         };
@@ -611,7 +613,7 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
     } else {
         let s = status.uptime_secs;
         println!(
-            "clasp daemon up — pid {}, uptime {}:{:02}:{:02}, sessions {} live + {} exited-retained, attach clients {}",
+            "holdfast daemon up — pid {}, uptime {}:{:02}:{:02}, sessions {} live + {} exited-retained, attach clients {}",
             status.pid,
             s / 3600,
             (s % 3600) / 60,
@@ -624,26 +626,26 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `clasp list [--json]`
+/// `holdfast list [--json]`
 pub async fn list(as_json: bool) -> ExitCode {
     let client = match connect(ClientKind::Cli).await {
         Ok(c) => c,
         Err(e) => {
-            diag!("clasp list: {e}");
+            diag!("holdfast list: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     let resp = match client.call_raw("tool/list_sessions", empty()).await {
         Ok(r) => r,
         Err(e) => {
-            diag!("clasp list: {e}");
+            diag!("holdfast list: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     let data: Value = match method::from_cbor(&resp.data) {
         Ok(v) => v,
         Err(e) => {
-            diag!("clasp list: malformed response: {e}");
+            diag!("holdfast list: malformed response: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
@@ -659,7 +661,7 @@ pub async fn list(as_json: bool) -> ExitCode {
     // Newest first, then by id so the order is total and stable. The sort
     // lives here rather than in the tool because it is presentation:
     // `list_sessions` reports a registry backed by a `HashMap`, whose
-    // iteration order would otherwise vary between two `clasp list` runs
+    // iteration order would otherwise vary between two `holdfast list` runs
     // that saw the same sessions (§3.5 puts formatting in this crate).
     sessions.sort_by(|a, b| {
         b["started_at_unix_secs"]
@@ -684,17 +686,17 @@ pub async fn list(as_json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `clasp logs <session> [--tail N] [--raw]`
+/// `holdfast logs <session> [--tail N] [--raw]`
 pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCode {
     let client = match connect(ClientKind::Cli).await {
         Ok(c) => c,
         Err(e) => {
-            diag!("clasp logs: {e}");
+            diag!("holdfast logs: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     // §7.2: CLI commands ride the same control socket as the MCP tool
-    // handlers. `clasp logs` is `read_output` with a human on the other
+    // handlers. `holdfast logs` is `read_output` with a human on the other
     // end, so it goes through `tool/read_output` rather than growing a
     // parallel method with its own bugs.
     let mut args = match tail_lines {
@@ -713,25 +715,25 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
     let params = match method::to_cbor(&args) {
         Ok(p) => p,
         Err(e) => {
-            diag!("clasp logs: {e}");
+            diag!("holdfast logs: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
     let resp = match client.call_raw("tool/read_output", params).await {
         Ok(r) => r,
         Err(e) => {
-            diag!("clasp logs: {e}");
+            diag!("holdfast logs: {e}");
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
     if resp.status != "ok" {
-        diag!("clasp logs: {} — {}", resp.status, resp.details);
+        diag!("holdfast logs: {} — {}", resp.status, resp.details);
         return ExitCode::from(EXIT_FAILED);
     }
     let data: Value = match method::from_cbor(&resp.data) {
         Ok(v) => v,
         Err(e) => {
-            diag!("clasp logs: malformed response: {e}");
+            diag!("holdfast logs: malformed response: {e}");
             return ExitCode::from(EXIT_FAILED);
         }
     };
@@ -739,10 +741,10 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
     ExitCode::SUCCESS
 }
 
-/// `clasp version`
+/// `holdfast version`
 pub fn version() -> ExitCode {
     println!(
-        "clasp {} (build {}) protocol {}.{}",
+        "holdfast {} (build {}) protocol {}.{}",
         env!("CARGO_PKG_VERSION"),
         holdfast_core::protocol::handshake::build_id(),
         holdfast_core::protocol::PROTOCOL_MAJOR,
@@ -822,7 +824,7 @@ mod tests {
         })
     }
 
-    /// §3.2 bounds `clasp daemon stop`, and nothing bounded it.
+    /// §3.2 bounds `holdfast daemon stop`, and nothing bounded it.
     ///
     /// `--force`'s RPC was already capped by `FORCE_RPC_TIMEOUT`,
     /// precisely because "the daemon accepts the connection and then
@@ -850,7 +852,7 @@ mod tests {
         )
         .await
         .expect(
-            "`clasp daemon stop` never returned: §3.2 bounds the wait and §18.8 gives \
+            "`holdfast daemon stop` never returned: §3.2 bounds the wait and §18.8 gives \
              it an exit code, so a hang is a divergence from normative prose",
         );
         assert_eq!(

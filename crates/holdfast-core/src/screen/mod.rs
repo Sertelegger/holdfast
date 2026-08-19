@@ -1467,9 +1467,9 @@ mod tests {
         let t0 = Instant::now();
         let mut log = ByteLog::default();
         let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
-        feed(&mut t, &mut log, t0, b"\x1b]0;clasp: build\x07ready");
+        feed(&mut t, &mut log, t0, b"\x1b]0;holdfast: build\x07ready");
         let g = full(t.capture(None, true, t0, &log, None));
-        assert_eq!(g.title.as_deref(), Some("clasp: build"));
+        assert_eq!(g.title.as_deref(), Some("holdfast: build"));
     }
 
     #[test]
@@ -2281,7 +2281,7 @@ negative = ["MARK"]
         assert_eq!(
             g.lines[1].trim_end(),
             WIDE,
-            "the emulator's own col_wrap, not CLASP, is what keeps a wide \
+            "the emulator's own col_wrap, not Holdfast, is what keeps a wide \
              glyph off the last column"
         );
     }

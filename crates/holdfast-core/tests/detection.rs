@@ -349,7 +349,7 @@ fn pyrepl_python() -> Option<String> {
 /// It used to gate `--features=no-mark-prompt` behind `major >= 4`, and
 /// that predicate is measured wrong: the flag is inert on fish 4.0–4.2,
 /// where the feature does not exist, so the row silently measured fish's
-/// own stream against an expectation written for CLASP's (§8.5.1,
+/// own stream against an expectation written for Holdfast's (§8.5.1,
 /// REQ-TST-007). **The flag's existence does not track the major version.**
 fn fish_version() -> Option<String> {
     let out = std::process::Command::new("fish")
@@ -463,7 +463,7 @@ fn bash_c(command: &str) -> StartSessionArgs {
     }
 }
 
-/// A `bash` whose **own** prompt emits OSC 133 before CLASP types
+/// A `bash` whose **own** prompt emits OSC 133 before Holdfast types
 /// anything.
 ///
 /// The markers come from a command substitution rather than from `PS1`'s
@@ -482,7 +482,7 @@ fn already_marking_bash() -> StartSessionArgs {
         ("HOLDFAST_MARK_D", r"\033]133;D;%s\007"),
         (
             "PS1",
-            r#"$(printf "$HOLDFAST_MARK_A")clasp$ $(printf "$HOLDFAST_MARK_B")"#,
+            r#"$(printf "$HOLDFAST_MARK_A")holdfast$ $(printf "$HOLDFAST_MARK_B")"#,
         ),
         ("PS0", r#"$(printf "$HOLDFAST_MARK_C")"#),
         ("PROMPT_COMMAND", r#"printf "$HOLDFAST_MARK_D" "$?""#),
@@ -1113,7 +1113,7 @@ struct EchoOffRow {
     seen_bracketed_paste: bool,
 }
 
-/// The `ECHO off` states a real PTY reaches, and what CLASP answers for
+/// The `ECHO off` states a real PTY reaches, and what Holdfast answers for
 /// each of them.
 ///
 /// **Why this exists.** CI ran §8.7's Python REPL row on `ubuntu-24.04`
@@ -1123,7 +1123,7 @@ struct EchoOffRow {
 /// nothing else. Row 1 below drives the same state with `stty`, so the
 /// mechanism is pinned where no host's Python can hide it again.
 ///
-/// **`ICANON` is what separates the rows, and CLASP is not given it.**
+/// **`ICANON` is what separates the rows, and Holdfast is not given it.**
 /// Measured here with one `tcgetattr` per scenario on the master fd:
 ///
 /// ```text
@@ -1294,7 +1294,7 @@ async fn matrix_row_the_python_repl_is_at_prompt_with_no_repl_specific_config() 
     // off at its prompt (§8.2 finding 1) — and answers `AwaitingSecret` /
     // `terminal_mode` / 0.95 at an ordinary REPL prompt, which §8.4 tells
     // the agent to answer by calling `request_secret_input`. That answer
-    // is CLASP's, not this row's, and it is pinned as its own row in
+    // is Holdfast's, not this row's, and it is pinned as its own row in
     // `echo_off_prompts_with_and_without_canonical_mode`; what belongs
     // here is the refusal to run on a host where this row's premise does
     // not hold. `Need::PyreplPython` is that refusal, and
@@ -1652,11 +1652,11 @@ async fn an_osc133_prompt_start_marker_alone_answers_at_prompt_via_t1() {
     let server = HoldfastServer::new();
     let id = start(
         &server,
-        bash_c(r"stty -echo; printf '\033]133;A\007clasp$ '; sleep 30"),
+        bash_c(r"stty -echo; printf '\033]133;A\007holdfast$ '; sleep 30"),
     )
     .await;
 
-    let s = await_settled(&server, &id, "clasp$ ").await;
+    let s = await_settled(&server, &id, "holdfast$ ").await;
     assert_classified(&s, "AtPrompt", "semantic", 1.0);
     assert_eq!(markers(&raw(&server, &id).await), vec!["A"]);
     kill(&server, &id).await;
@@ -1717,7 +1717,7 @@ async fn the_heuristic_decides_at_exactly_the_threshold_on_a_real_ps2_prompt() {
 /// The snippet's command emits no `C` because it ran before `PS0`/`preexec`
 /// existed, which is also why it leaves no history entry.
 ///
-/// **These are wire payloads, not letters.** Every marker CLASP emits
+/// **These are wire payloads, not letters.** Every marker Holdfast emits
 /// carries `;holdfast=1` (§8.5.1 rule 1), and `markers()` returns the whole
 /// OSC payload after `\x1b]133;`. §8.5's documented *letter* stream is
 /// unchanged and is asserted separately below: a test pinning only the
@@ -1750,7 +1750,7 @@ const MEASURED_MARKER_LETTERS: [&str; 15] = [
 ];
 
 /// Drive the three §8.5 commands and assert both what the shell *emitted*
-/// and what CLASP *derived* from it.
+/// and what Holdfast *derived* from it.
 ///
 /// The marker half is the one no other test in the workspace can do. Eight
 /// unit tests inspect the snippet as a string, and seven separate mutations
@@ -1823,7 +1823,7 @@ async fn assert_marker_stream_and_exit_codes(server: &HoldfastServer, id: &str, 
     }
 
     // **The negative half of `osc133_source`, at a real shell.** No foreign
-    // emitter is present here, so every marker above is CLASP's own and was
+    // emitter is present here, so every marker above is Holdfast's own and was
     // used — `external` is what
     // `a_prompt_that_already_emits_osc_133_meets_the_injected_snippet`
     // asserts for the same field on the same kind of shell, and having only
@@ -1876,10 +1876,10 @@ async fn fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes(
     // **Since REQ-PD-028 the arrangement is "no arrangement".** The
     // snippet's native-marking guard is gone, so it runs on every fish and
     // `fish_args` passes no `--features=` flag: on 3.7.0 fish emits
-    // nothing of its own and this measures CLASP's stream directly; on
+    // nothing of its own and this measures Holdfast's stream directly; on
     // 4.8.1 the two collide and §8.5.1's per-letter yielding decides which
     // markers reach the detector, which is the behaviour worth measuring
-    // rather than suppressing. The expectation below is CLASP's stream and
+    // rather than suppressing. The expectation below is Holdfast's stream and
     // is therefore **known to be wrong for a colliding fish**; that arm is
     // §11.2's collision scenario, and it is named in §25 as an expected
     // failure on a fish ≥ 4 runner until it is written.
@@ -1979,12 +1979,12 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     );
     kill(&server, &declined).await;
 
-    // The same shell, integration left on. CLASP types its snippet at a
+    // The same shell, integration left on. Holdfast types its snippet at a
     // prompt that is already marking, and both emitters run from then on.
-    // Since §8.5.1's tag, CLASP's markers are distinguishable from the
+    // Since §8.5.1's tag, Holdfast's markers are distinguishable from the
     // fixture's on the wire, which is what makes the interleaving below
-    // readable at all: `A;holdfast=1`, `A` is CLASP's `PS1` wrapper around the
-    // user's, and `D;42;holdfast=1`, `D;42` is CLASP's `PROMPT_COMMAND`
+    // readable at all: `A;holdfast=1`, `A` is Holdfast's `PS1` wrapper around the
+    // user's, and `D;42;holdfast=1`, `D;42` is Holdfast's `PROMPT_COMMAND`
     // running ahead of the user's.
     // The collision itself, before any command is typed into it.
     const COLLIDING_PROMPT: [&str; 10] = [
@@ -2000,9 +2000,9 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         "B;holdfast=1", // ... and prompted by both PS1s
     ];
     // One command's worth, derived rather than transcribed: `PS0` marks the
-    // start twice, both `PROMPT_COMMAND`s report the completion — CLASP's
+    // start twice, both `PROMPT_COMMAND`s report the completion — Holdfast's
     // first, then the user's, which since the `$?` repair carries the same
-    // code — and both `PS1`s draw the next prompt, CLASP's wrapping the
+    // code — and both `PS1`s draw the next prompt, Holdfast's wrapping the
     // user's.
     fn cycle(code: i32) -> Vec<String> {
         vec![
@@ -2049,18 +2049,18 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     // a count.**
     // `PROMPT_COMMAND` becomes `__holdfast_d "$?"; <the user's emitter>`, and
     // bash evaluates that as a command list — so before the fix `$?` had
-    // already been overwritten by CLASP's own `printf` (exit 0) by the time
+    // already been overwritten by Holdfast's own `printf` (exit 0) by the time
     // the user's emitter read it, and every command a starship-style
-    // integration reported came back successful while CLASP's own `D;42`
+    // integration reported came back successful while Holdfast's own `D;42`
     // sat two bytes away saying otherwise. A terminal consuming the stream
     // reads the last `D` it saw.
     //
     // A count of `D;42` cannot see this repair: it was 1 before the fix
-    // (CLASP's) and is 1 after it (the user's, now that CLASP's is
+    // (Holdfast's) and is 1 after it (the user's, now that Holdfast's is
     // tagged). So what is asserted is the third party's *whole* stream,
-    // filtered to the markers CLASP did not emit — it must be exactly what
-    // that shell emits with no CLASP present, which is `ALONE` with the
-    // snippet's own command line in the middle. That is what "CLASP did not
+    // filtered to the markers Holdfast did not emit — it must be exactly what
+    // that shell emits with no Holdfast present, which is `ALONE` with the
+    // snippet's own command line in the middle. That is what "Holdfast did not
     // perturb state anything else can read" means here, and dropping
     // `return "${1:-0}"` turns the final `D;42` back into `D;0`.
     let foreign: Vec<&str> = both
@@ -2072,7 +2072,7 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         foreign,
         vec![
             "D;0", "A", "B", // its own first prompt
-            "C", "D;0", "A", "B", // CLASP's injection line, which it marks
+            "C", "D;0", "A", "B", // Holdfast's injection line, which it marks
             "C", "D;0", "A", "B", // `echo hello`
             "C", "D;1", "A", "B", // `false`
             "C", "D;42", "A", "B", // `(exit 42)` — every code reported truthfully
@@ -2122,10 +2122,10 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         "the install line became a history entry: {h}"
     );
 
-    // Every letter has a foreign writer here, so none of CLASP's markers
-    // reach the detector: `mixed` would mean a letter was still CLASP's and
-    // `clasp` would mean the fixture had stopped emitting. The pair with
-    // `shell_integration` is the point of having two fields — CLASP
+    // Every letter has a foreign writer here, so none of Holdfast's markers
+    // reach the detector: `mixed` would mean a letter was still Holdfast's and
+    // `holdfast` would mean the fixture had stopped emitting. The pair with
+    // `shell_integration` is the point of having two fields — Holdfast
     // injected for bash, and none of what it injected is being used.
     let s = status(&server, &id).await;
     assert_eq!(s["osc133_source"], "external", "status: {s}");
@@ -2195,7 +2195,7 @@ async fn command_history_cursors_bound_exactly_one_commands_output() {
 #[tokio::test]
 async fn osc133_markers_survive_shell_nesting() {
     // REQ-PD-007: the remote-over-ssh case without needing a remote host.
-    // The inner shell's markers must reach CLASP through the outer one.
+    // The inner shell's markers must reach Holdfast through the outer one.
     let server = HoldfastServer::new();
     let id = start(&server, bash()).await;
     await_markers(&server, &id, 3).await;
@@ -2255,9 +2255,9 @@ async fn osc133_markers_survive_shell_nesting() {
     // The inner shell's markers arrive through the outer one, unaltered
     // and in order. Group four is the inner shell's *first* prompt cycle,
     // which is where the documented limitation below comes from.
-    // Every marker here is CLASP's, inner shell included — which is
+    // Every marker here is Holdfast's, inner shell included — which is
     // §8.5.1's nesting property holding by construction rather than by
-    // exception: an inner CLASP-integrated shell tags its markers too, so
+    // exception: an inner Holdfast-integrated shell tags its markers too, so
     // it is not *foreign* to the outer session and nothing yields to
     // anything.
     assert_eq!(
@@ -2473,7 +2473,7 @@ async fn a_program_that_fakes_bracketed_paste_fools_tier_2() {
     // §8.8 / REQ-PD-010, asserted so the limitation cannot change
     // silently. `printf` is not a prompt by any measure — the pattern
     // score below is 0.0, i.e. tier 3 correctly sees nothing prompt-shaped
-    // at all — yet the mode it *prints* is believed at 0.95. CLASP does
+    // at all — yet the mode it *prints* is believed at 0.95. Holdfast does
     // not defend against a hostile child; that is the agent permission
     // system's job (§9.1).
     let server = HoldfastServer::new();

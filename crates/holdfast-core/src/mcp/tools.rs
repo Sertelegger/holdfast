@@ -140,7 +140,7 @@ pub struct StartSessionArgs {
     #[serde(default)]
     pub name: Option<String>,
     /// Working directory for the spawned process. Must already exist.
-    /// Defaults to the directory the CLASP server itself was started in.
+    /// Defaults to the directory the Holdfast server itself was started in.
     #[serde(default)]
     pub cwd: Option<String>,
     /// Extra environment variables for the spawned process. Do not pass
@@ -199,7 +199,7 @@ pub struct PromptPatternArg {
 #[tool_router(vis = "pub(crate)")]
 impl HoldfastServer {
     /// Start a PTY-backed shell or program and return its session id.
-    /// Runs in `cwd` if given, otherwise in the directory the CLASP
+    /// Runs in `cwd` if given, otherwise in the directory the Holdfast
     /// server was started in.
     #[tool(
         annotations(
@@ -666,7 +666,7 @@ impl HoldfastServer {
         // Enabling Tier B costs one buffer re-seed (§4.5); the call
         // succeeds either way, so this is never an error path — which is
         // also why §5.3 classifies the tool `readOnlyHint: true` despite
-        // it: the change is to CLASP's bookkeeping, not to the session.
+        // it: the change is to Holdfast's bookkeeping, not to the session.
         let capture = session.screen_state(args.diff_from, redact, &self.processor);
         let tracking = session.screen_tracking();
 
@@ -750,7 +750,7 @@ impl HoldfastServer {
                 "session has exited",
             ));
         }
-        // A failing `ioctl` is CLASP failing to do its job, not a session
+        // A failing `ioctl` is Holdfast failing to do its job, not a session
         // outcome, so it takes the protocol channel (§5.1) — and it
         // matters that it does: the alternative is an `ok` reporting
         // dimensions the terminal never reached.
@@ -769,7 +769,7 @@ impl HoldfastServer {
     /// hosting it.
     ///
     /// `delivered` reports that the signal was **written**, not that the
-    /// child reacted — nothing in CLASP can observe the latter. The
+    /// child reacted — nothing in Holdfast can observe the latter. The
     /// session-state block beside it is what tells you whether it landed:
     /// a session that was `Executing` and is now `AtPrompt` is an
     /// interrupt that worked.
@@ -965,7 +965,7 @@ impl HoldfastServer {
                     format!("session exited during the write: {e}"),
                 ));
             }
-            // The blocking task panicked. That is a CLASP bug, not a
+            // The blocking task panicked. That is a Holdfast bug, not a
             // session outcome, so it takes the protocol channel (§5.1).
             Ok(Err(join)) => {
                 return Err(ErrorData::internal_error(
@@ -980,7 +980,7 @@ impl HoldfastServer {
             // the slave closes. It is detached rather than leaked into the
             // request path: it holds only the writer lock, which is what
             // makes the bounded-acquisition branch above fire for every
-            // later write instead of queueing behind it. `clasp mcp` bounds
+            // later write instead of queueing behind it. `holdfast mcp` bounds
             // its runtime shutdown for the same reason.
             Err(_elapsed) => {
                 return Ok(write_timed_out(
@@ -991,7 +991,7 @@ impl HoldfastServer {
         };
 
         // REQ-SEC-011: the write still happens — the agent may know
-        // something CLASP does not — but the event is made visible.
+        // something Holdfast does not — but the event is made visible.
         let warning = awaiting.then_some("session_awaiting_secret");
         let written = ack.bytes_written;
 
@@ -1440,7 +1440,7 @@ fn session_record(session: &Session, rules: &RuleSet) -> serde_json::Value {
         // so the wire format cannot silently claim to be RFC 3339.
         "exited_at_unix_secs": session.exited_at_secs(),
         "shell_integration": session.shell_integration.map(|s| s.as_str()),
-        // What CLASP *injected* is the line above; this is what has since
+        // What Holdfast *injected* is the line above; this is what has since
         // been observed on the wire (§18.2a, §8.5.1). The two answer
         // different questions and a session can carry `"fish"` here with
         // `"external"` below. `start_session`'s response deliberately gets
@@ -1574,7 +1574,7 @@ pub struct GetScreenStateArgs {
     /// Session id or live session name.
     pub session: String,
     /// A `screen_revision` returned by an earlier call. When it names a
-    /// revision CLASP still retains, the response carries only the
+    /// revision Holdfast still retains, the response carries only the
     /// changed regions; otherwise a full grid comes back.
     #[serde(default)]
     pub diff_from: Option<u64>,
@@ -2610,7 +2610,7 @@ mod tests {
     /// exemption narrows to `read_output`'s `tail_lines`/`tail_bytes`
     /// *arguments* — the licence is the per-call opt-in, not the tail
     /// *shape* — and `get_screen_state` is named a non-member beside
-    /// `clasp logs --tail` and the `observer` stream. Cells the holdback is
+    /// `holdfast logs --tail` and the `observer` stream. Cells the holdback is
     /// withholding carry `[REDACTED:unresolved]`, and `held_back` says so
     /// on the response, the way `read_output` already did.
     ///

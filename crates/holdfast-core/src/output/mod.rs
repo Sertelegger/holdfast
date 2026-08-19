@@ -824,7 +824,7 @@ mod tests {
         let mut cursor = 0u64;
         let mut reads = 0usize;
         let lines = [
-            "   Compiling holdfast-core v0.0.1 (/home/user/src/clasp)\n",
+            "   Compiling holdfast-core v0.0.1 (/home/user/src/holdfast)\n",
             "\x1b[32m    Finished\x1b[0m `dev` profile in 13.72s\n",
             "test output::redact::tests::merge ... ok\n",
             "warning: unused variable `n` --> src/lib.rs:42:9\n",

@@ -49,7 +49,7 @@ use crate::protocol::MAX_FRAME_BYTES;
 /// **Every message in here has already been through the redactor.** A
 /// config file is a place credentials live, and every one of these
 /// errors is on a path that ends in `daemon.log`: `config::load()?` →
-/// `server::run`'s `Err` → `clasp daemon run`'s `eprintln!` → the child
+/// `server::run`'s `Err` → `holdfast daemon run`'s `eprintln!` → the child
 /// stderr `spawn.rs` redirects into the log, where it sits for the
 /// §19.1 retention window. §9.2 lists *"daemon.log error contexts (when
 /// they include byte excerpts)"* among the boundaries that route through
@@ -1180,7 +1180,7 @@ mod tests {
 
     #[test]
     fn an_absent_config_file_is_not_an_error() {
-        let missing = std::path::Path::new("/nonexistent/clasp-does-not-exist/config.toml");
+        let missing = std::path::Path::new("/nonexistent/holdfast-does-not-exist/config.toml");
         let cfg = load_from(missing).expect("a missing config file is Config::default(), not Err");
         assert_eq!(cfg, Config::default());
     }
@@ -1314,7 +1314,7 @@ name = \"prod-ssh\"
 match_command = \"^ssh\\\\s+(\\\\S+@)?prod-0[12]\\\\b\"
 match_prompt = \"(?i)password\"
 provider = \"secret-service\"
-reference = \"service=clasp,account=prod-ssh\"
+reference = \"service=holdfast,account=prod-ssh\"
 max_uses = 20
 require_confirm = false
 ";

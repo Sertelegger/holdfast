@@ -1,11 +1,11 @@
-//! CLASP core: PTY-backed session management and the MCP tool surface.
+//! Holdfast core: PTY-backed session management and the MCP tool surface.
 
 // **Nothing in this crate has an unmediated way to print**, and the
 // denial is at the crate root because that is the only scope that
 // matches the hazard. Whatever links this library can be the daemon,
 // whose stderr *is* `daemon.log` — §9.2 lists it as a redacted boundary
 // — and whose stdout, on the `start_detached` path, is the same file;
-// under `clasp mcp` a stray `println!` lands on the MCP JSON-RPC wire
+// under `holdfast mcp` a stray `println!` lands on the MCP JSON-RPC wire
 // instead (see `spawn::ensure_daemon`, which measured 20 smoke
 // assertions failing at once from one unparseable line). `crate::diag!`
 // is the only sanctioned producer.

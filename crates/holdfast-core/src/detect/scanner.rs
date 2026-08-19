@@ -82,7 +82,7 @@ pub enum Osc133 {
 
 /// Whose OSC 133 markers this session is actually **using** (§18.2a).
 ///
-/// Distinct from `shell_integration`, which records only what CLASP
+/// Distinct from `shell_integration`, which records only what Holdfast
 /// *injected* — a session can carry `shell_integration: Some(Fish)` with
 /// `Osc133Source::External`, meaning the snippet is installed and firing
 /// and its markers are being dropped on arrival (§8.5.1).
@@ -91,9 +91,9 @@ pub enum Osc133Source {
     /// Every marker seen so far carries `holdfast=1`. The ordinary case.
     Holdfast,
     /// Every letter seen so far has arrived from a foreign source; all of
-    /// CLASP's are being discarded.
+    /// Holdfast's are being discarded.
     External,
-    /// Some letters come from a foreign source and some from CLASP — a
+    /// Some letters come from a foreign source and some from Holdfast — a
     /// *partial* foreign integration. Reachable only because §8.5.1's rule
     /// yields per letter rather than per source.
     Mixed,
@@ -272,10 +272,10 @@ pub struct ModeScanner {
     last_marker: Option<u8>,
     /// Per marker letter (`A`, `B`, `C`, `D`), whether a **foreign** marker
     /// of that letter has been observed. Sticky for the session: once a
-    /// letter has a foreign writer, CLASP's markers of that letter are
+    /// letter has a foreign writer, Holdfast's markers of that letter are
     /// discarded for the rest of the session (§8.5.1 rule 3).
     foreign_letters: [bool; 4],
-    /// Per marker letter, whether one of CLASP's own tagged markers of that
+    /// Per marker letter, whether one of Holdfast's own tagged markers of that
     /// letter has been *used* — i.e. arrived before the letter went
     /// foreign. This is what distinguishes `mixed` from `external`.
     holdfast_letters: [bool; 4],
@@ -336,12 +336,12 @@ impl ModeScanner {
     /// Whose markers this session is using (§18.2a, §8.5.1 rule 4).
     ///
     /// **`None` until the first marker arrives**, because that is genuinely
-    /// all CLASP knows before the first prompt cycle — reporting a value
+    /// all Holdfast knows before the first prompt cycle — reporting a value
     /// then would be a guess dressed as a measurement.
     pub fn osc133_source(&self) -> Option<Osc133Source> {
         let any_foreign = self.foreign_letters.iter().any(|f| *f);
-        // A letter counts toward `clasp` only while it is still CLASP's:
-        // once foreign, CLASP's markers of that letter are discarded, so
+        // A letter counts toward `holdfast` only while it is still Holdfast's:
+        // once foreign, Holdfast's markers of that letter are discarded, so
         // the letter's effective source is the foreign one.
         let any_holdfast = (0..4).any(|i| self.holdfast_letters[i] && !self.foreign_letters[i]);
         match (any_holdfast, any_foreign) {
@@ -794,9 +794,9 @@ impl ModeScanner {
 
     /// §8.5.1's tag-and-yield rule, applied per marker **letter**.
     ///
-    /// CLASP is not the only writer of OSC 133: fish 4.x emits its own from
+    /// Holdfast is not the only writer of OSC 133: fish 4.x emits its own from
     /// the shell core, and Kitty's, WezTerm's and starship-shaped
-    /// integrations emit into bash and zsh. Every marker CLASP's snippet
+    /// integrations emit into bash and zsh. Every marker Holdfast's snippet
     /// emits carries `holdfast=1` (rule 1); a marker without it is *foreign*
     /// (rule 2); and once a foreign marker of a letter has been seen, every
     /// later `holdfast=1` marker of **that letter** is discarded for the rest
@@ -805,28 +805,28 @@ impl ModeScanner {
     /// **Per letter, not per source, and that is the substantive half.** A
     /// foreign integration may be partial — measured, fish 4.0.2 emits `A`,
     /// `C` and `D` and never `B` — and whole-source suppression would then
-    /// discard CLASP's `B` along with the rest, leaving the echo capture no
+    /// discard Holdfast's `B` along with the rest, leaving the echo capture no
     /// `B..C` span and `get_command_history` reporting `command: ""` for
     /// every entry. Yielding per letter keeps exactly the letters the
     /// foreign emitter does not supply, which is why `osc133_source` needs
     /// a `mixed` value at all.
     ///
     /// **Nesting survives by construction, not by exception:** an inner
-    /// CLASP-integrated shell tags its markers too, so it is not foreign to
+    /// Holdfast-integrated shell tags its markers too, so it is not foreign to
     /// the outer session and §8.5's nesting property is unchanged.
     ///
     /// **The residual, bounded and stated.** At most one command may still
-    /// be double-counted per letter per session — when CLASP's marker of a
+    /// be double-counted per letter per session — when Holdfast's marker of a
     /// letter arrives *before* the first foreign one and there is nothing
     /// yet to yield to. Measured on fish 4.8.1 the cost is zero, because
     /// fish emits its own `A` before calling `fish_prompt` and its own `C`
-    /// before CLASP's; that ordering is a property of one emitter and is
+    /// before Holdfast's; that ordering is a property of one emitter and is
     /// not guaranteed.
     fn osc133(&mut self, rest: &str) -> Option<Osc133> {
         let kind = rest.as_bytes().first().copied()?;
-        // Letters CLASP models. `P`, `L` and anything else stay inert:
+        // Letters Holdfast models. `P`, `L` and anything else stay inert:
         // they are not evidence about whether a command is running and
-        // CLASP never emits them, so they take part in neither the
+        // Holdfast never emits them, so they take part in neither the
         // yielding rule nor `osc133_source`.
         let slot = match kind {
             b'A' => 0,
@@ -838,7 +838,7 @@ impl ModeScanner {
         // §8.5.1 rule 2: a marker without `holdfast=1` is foreign. Matched as
         // a whole `;`-separated field, never as a substring — a foreign
         // `C;cmdline_url=…holdfast=1…` carries user-controlled text and a
-        // `contains` would read it as CLASP's own.
+        // `contains` would read it as Holdfast's own.
         let is_holdfast = rest[1..].split(';').any(|param| param == "holdfast=1");
         if is_holdfast {
             if self.foreign_letters[slot] {
@@ -1483,7 +1483,7 @@ mod tests {
     #[test]
     fn osc133_accepts_the_st_terminator_with_the_same_span_as_bel() {
         // The offsets, not just the marker. Every other span assertion in
-        // this module uses the BEL terminator, which is what CLASP's own
+        // this module uses the BEL terminator, which is what Holdfast's own
         // rc snippets emit — but §8.5 nesting and every user-installed
         // integration (Kitty, WezTerm, starship) use ST, and ST is two
         // bytes. `end` becomes `output_start_cursor`, so an `end` one byte
@@ -1577,7 +1577,7 @@ mod tests {
         const FISH_D0: &[u8] = b"\x1b]133;D;0\x1b\\";
         // A foreign marker whose user-controlled parameter text contains
         // the tag as a substring. A `contains("holdfast=1")` test reads this
-        // as CLASP's own and then yields to nothing.
+        // as Holdfast's own and then yields to nothing.
         const FOREIGN_C_SPOOF: &[u8] = b"\x1b]133;C;cmdline_url=echo%20holdfast=1\x1b\\";
 
         #[test]
@@ -1586,10 +1586,14 @@ mod tests {
             assert_eq!(s.feed(FISH_A, 0, None).len(), 1);
             assert!(
                 s.feed(HOLDFAST_A, 0, None).is_empty(),
-                "CLASP's A must be discarded"
+                "Holdfast's A must be discarded"
             );
             let ev = s.feed(HOLDFAST_C, 0, None);
-            assert_eq!(ev.len(), 1, "CLASP's C must survive: A went foreign, not C");
+            assert_eq!(
+                ev.len(),
+                1,
+                "Holdfast's C must survive: A went foreign, not C"
+            );
             assert_eq!(s.osc133_source(), Some(Osc133Source::Mixed));
         }
 
@@ -1605,10 +1609,10 @@ mod tests {
 
         /// **The two streams are ordered, and the order is what makes the
         /// `last_marker` assertion able to fail.** The foreign emitter runs
-        /// a whole cycle first, arming all four letters; CLASP's own then
+        /// a whole cycle first, arming all four letters; Holdfast's own then
         /// arrive in the order its snippet emits them within one prompt
         /// cycle — `PS0`'s `C`, `PROMPT_COMMAND`'s `D`, then `PS1`'s `A`
-        /// and `B`. So CLASP's last discarded letter is `B` while the
+        /// and `B`. So Holdfast's last discarded letter is `B` while the
         /// foreign one is `D`, and a discard performed *after*
         /// `last_marker` is written reads `B` here. Written the other way
         /// round — both streams ending on `D` — the assertion holds
@@ -1623,7 +1627,7 @@ mod tests {
             for m in [HOLDFAST_C, HOLDFAST_D42, HOLDFAST_A, HOLDFAST_B] {
                 assert!(
                     s.feed(m, 0, None).is_empty(),
-                    "CLASP's marker must be discarded"
+                    "Holdfast's marker must be discarded"
                 );
             }
             // A discarded marker must not move the T1 prompt state either:
@@ -1648,10 +1652,10 @@ mod tests {
         }
 
         /// The bounded residual, asserted rather than described — and the
-        /// one arrangement in which a letter is CLASP's *before* it goes
+        /// one arrangement in which a letter is Holdfast's *before* it goes
         /// foreign, which is what makes `osc133_source`'s "only while it is
-        /// still CLASP's" clause able to fail. Everywhere else a discarded
-        /// marker never records itself as CLASP's, so dropping that clause
+        /// still Holdfast's" clause able to fail. Everywhere else a discarded
+        /// marker never records itself as Holdfast's, so dropping that clause
         /// changes no answer.
         #[test]
         fn at_most_one_marker_per_letter_precedes_the_yield() {
@@ -1672,8 +1676,8 @@ mod tests {
             );
             // `A` is the only letter this session has seen and it is now
             // foreign, so the session's markers are the foreign ones —
-            // `mixed` would mean some letter was still CLASP's, and the one
-            // CLASP marker that *was* used before the yield does not make
+            // `mixed` would mean some letter was still Holdfast's, and the one
+            // Holdfast marker that *was* used before the yield does not make
             // it one.
             assert_eq!(s.osc133_source(), Some(Osc133Source::External));
         }
@@ -1689,7 +1693,7 @@ mod tests {
             assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));
         }
 
-        /// Nesting is unaffected **by construction**: an inner CLASP shell
+        /// Nesting is unaffected **by construction**: an inner Holdfast shell
         /// tags its markers too. The integration-level assertion is
         /// `osc133_markers_survive_shell_nesting`.
         #[test]

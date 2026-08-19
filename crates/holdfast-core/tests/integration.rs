@@ -324,7 +324,7 @@ async fn start_session_reports_spawn_failed_without_leaking_the_path() {
     let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "clasp_definitely_not_a_real_program".into(),
+            command: "holdfast_definitely_not_a_real_program".into(),
             args: vec![],
             name: None,
             cwd: None,
@@ -1263,8 +1263,8 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
     // joined the argument onto the process cwd would also satisfy: only a
     // canonicalising implementation resolves a symlink.
     let base = std::env::temp_dir().canonicalize().unwrap();
-    let target = base.join(format!("clasp-cwd-target-{}", std::process::id()));
-    let link = base.join(format!("clasp-cwd-link-{}", std::process::id()));
+    let target = base.join(format!("holdfast-cwd-target-{}", std::process::id()));
+    let link = base.join(format!("holdfast-cwd-link-{}", std::process::id()));
     let _ = std::fs::remove_file(&link);
     let _ = std::fs::remove_dir_all(&target);
     std::fs::create_dir(&target).unwrap();
@@ -2769,7 +2769,7 @@ async fn the_advertised_enum_values_are_all_accepted() {
 //
 // **These two tests assert a LIMITATION, not a feature.** §20 records it
 // as "documented, not fixed in v0.1.0": `portable-pty` maps signal death
-// to `code: 1`, so a child CLASP killed and a child that ran `exit 1`
+// to `code: 1`, so a child Holdfast killed and a child that ran `exit 1`
 // are indistinguishable in `terminate`'s response. REQ-P-007's
 // Verification column asks for exactly this — assert the documented
 // behaviour so it cannot drift silently — and the REQ was written after

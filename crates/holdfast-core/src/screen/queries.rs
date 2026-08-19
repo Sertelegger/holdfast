@@ -1,4 +1,4 @@
-//! §4.5.1 — CLASP answers Primary Device Attributes and no other
+//! §4.5.1 — Holdfast answers Primary Device Attributes and no other
 //! terminal query.
 //!
 //! A PTY master is not a terminal, so a program that *waits* on a query
@@ -40,7 +40,7 @@ struct Query {
     spellings: &'static [&'static [u8]],
     /// The reply, byte-exact. `\x1b[?6c` claims VT102 and **nothing
     /// else**: every optional parameter is a capability claim a shell
-    /// will then use, and CLASP has no sixel, no ReGIS, no DEC locator.
+    /// will then use, and Holdfast has no sixel, no ReGIS, no DEC locator.
     reply: &'static [u8],
 }
 
@@ -54,7 +54,7 @@ const ANSWERED: [Query; 1] = [Query {
 /// — `cat` of a binary file will do it — gets a reply typed into its own
 /// input. Real terminals behave identically and §4.5.1 declines to invent
 /// a guard; what it requires is that the damage be **bounded**, so past
-/// the limit CLASP is silent rather than amplifying a file into megabytes
+/// the limit Holdfast is silent rather than amplifying a file into megabytes
 /// of injected input.
 pub const DEFAULT_TERMINAL_QUERY_REPLIES_PER_MIN: u32 = 60;
 
@@ -175,7 +175,7 @@ mod tests {
     fn both_da1_spellings_are_answered_byte_exactly() {
         // `assert_eq!` on the whole vector, never `contains`: a reply
         // carrying optional parameters (`\x1b[?6;4c`) is a capability
-        // claim CLASP cannot honour, and `contains` would accept it.
+        // claim Holdfast cannot honour, and `contains` would accept it.
         assert_eq!(responder().feed(b"\x1b[c", Instant::now()), vec![DA1_REPLY]);
         assert_eq!(
             responder().feed(b"\x1b[0c", Instant::now()),

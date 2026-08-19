@@ -14,9 +14,9 @@ pub const TOOL_METHOD_PREFIX: &str = "tool/";
 
 /// The connect handshake. Must be the first method on every connection.
 pub const METHOD_HANDSHAKE: &str = "holdfast/handshake";
-/// Daemon introspection, behind `clasp daemon status`.
+/// Daemon introspection, behind `holdfast daemon status`.
 pub const METHOD_DAEMON_STATUS: &str = "daemon/status";
-/// Graceful daemon shutdown, behind `clasp daemon stop`.
+/// Graceful daemon shutdown, behind `holdfast daemon stop`.
 pub const METHOD_DAEMON_STOP: &str = "daemon/stop";
 
 // §7.4.1's MCP-resource methods (§5.5). Note the spelling: the control
@@ -63,7 +63,7 @@ pub struct ControlError {
     /// no row for most of them: `envelope::from_error` maps
     /// `HoldfastError::Pty | HoldfastError::Io` to `internal_error` and
     /// `tools.rs` maps a panicked write task to `internal_error` with
-    /// the comment *"a CLASP bug, not a session outcome"*. The daemon's
+    /// the comment *"a Holdfast bug, not a session outcome"*. The daemon's
     /// nearest catalogued code for all of them is `bad_params`, so
     /// without this field `openpty failed` reached the agent as
     /// `invalid_params` in hybrid mode — its own malformed argument —

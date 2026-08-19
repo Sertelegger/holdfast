@@ -321,7 +321,7 @@ async fn the_daemon_binds_only_the_control_socket() {
         // opened in `server::run`, which only the real binary calls — and
         // it can only see listeners that are already bound when it runs.
         // `the_running_daemon_holds_no_listening_tcp_socket` in
-        // `crates/clasp/tests/daemon_cli.rs` will be the authoritative
+        // `crates/holdfast/tests/daemon_cli.rs` will be the authoritative
         // check — it reads the fd table of a real, separately-spawned
         // daemon process and covers every path in it — but that file
         // arrives with Task 14 and is **not in the tree yet**. Until it
@@ -919,7 +919,7 @@ async fn daemon_status_reports_real_session_counts() {
 #[tokio::test]
 async fn daemon_status_data_carries_the_7_4_1_field_names_on_the_wire() {
     // `call::<_, DaemonStatus>()` above cannot see a rename: it decodes
-    // through the impl the daemon encoded with. `clasp daemon status`
+    // through the impl the daemon encoded with. `holdfast daemon status`
     // and the web UI are both built from this crate today, so nothing
     // else in the tree would notice either.
     let d = TestDaemon::start("statuskeys").await;
@@ -947,7 +947,7 @@ async fn daemon_status_data_carries_the_7_4_1_field_names_on_the_wire() {
 #[tokio::test]
 async fn daemon_stop_data_names_its_timestamp_with_its_unit_on_the_wire() {
     // REQ-T-018 binds the control protocol directly since rev. 47: every
-    // timestamp on a CLASP-defined wire surface is an integer since the
+    // timestamp on a Holdfast-defined wire surface is an integer since the
     // epoch under a name that states its unit, and a bare `stopped_at`
     // is prohibited outright rather than merely unused. §7.4.1's table
     // showed the pre-rev-38 bare `stopped_at` until rev. 48 brought it
@@ -1145,7 +1145,7 @@ async fn start_script(client: &ControlClient, name: &str, script: &str) -> Strin
 /// kernel forever — Linux does not wake a blocked pty-master writer when
 /// the slave closes — and dropping a runtime waits for the blocking pool
 /// unconditionally. The manual runtime bounds that wait, exactly as
-/// `clasp mcp` and `clasp daemon run` do at exit.
+/// `holdfast mcp` and `holdfast daemon run` do at exit.
 #[test]
 fn the_send_input_write_deadline_crosses_the_wire_as_a_non_error_timeout() {
     let rt = tokio::runtime::Builder::new_multi_thread()

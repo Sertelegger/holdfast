@@ -1,6 +1,6 @@
 //! Runtime directory and socket discovery (spec §7.1, §7.2, §19.1).
 //!
-//! Every path CLASP binds lives under one `0700` directory owned by the
+//! Every path Holdfast binds lives under one `0700` directory owned by the
 //! invoking user. That directory permission — not any in-band credential
 //! — is the first half of the daemon's trust boundary (§9.1); the
 //! peer-credential check in `daemon::peer` is the second.
@@ -102,7 +102,7 @@ enum Roll {
     /// open once something has gone wrong.
     ///
     /// A `dup2` onto fd 1/2 is not the alternative it looks like: under
-    /// systemd `clasp daemon run` is started directly and fd 2 is the
+    /// systemd `holdfast daemon run` is started directly and fd 2 is the
     /// journal, so a `dup2` would redirect the journal's stream into a
     /// file, which is worse than the bug. Copy-truncate is correct
     /// whatever the inherited descriptor points at, including when it
@@ -210,7 +210,7 @@ fn retire(dir: &Path, prefix: &str, window: Duration, now: SystemTime) -> io::Re
     Ok(removed)
 }
 
-/// Selects a CLASP *instance* (§7.1). Overrides discovery entirely and
+/// Selects a Holdfast *instance* (§7.1). Overrides discovery entirely and
 /// relocates the sockets, the pid file, the lock file and the daemon log.
 pub const RUNTIME_DIR_ENV: &str = "HOLDFAST_RUNTIME_DIR";
 
@@ -218,7 +218,7 @@ pub const RUNTIME_DIR_ENV: &str = "HOLDFAST_RUNTIME_DIR";
 pub const DIR_MODE: u32 = 0o700;
 /// Mode for every socket in it (spec §7.1: `0600` on each socket).
 pub const SOCKET_MODE: u32 = 0o600;
-/// Mode for every log file CLASP creates — the same `0600` as the
+/// Mode for every log file Holdfast creates — the same `0600` as the
 /// sockets, and for a stronger reason.
 ///
 /// §9.4's audit trail records the command line, the argv, the cwd and
@@ -232,7 +232,7 @@ pub const SOCKET_MODE: u32 = 0o600;
 /// mainstream distribution (`022`) yields `0644`.
 pub const LOG_MODE: u32 = 0o600;
 
-/// Open a CLASP log for appending, creating it — and the directory that
+/// Open a Holdfast log for appending, creating it — and the directory that
 /// holds it — owner-only.
 ///
 /// **Every log this codebase creates goes through here**, and the mode
@@ -440,10 +440,10 @@ impl RuntimePaths {
     ///
     /// **A second file, and it must stay a second file.** The obvious
     /// simplification — have `bind_control` take `holdfast.lock` —
-    /// deadlocks `clasp daemon start` outright: `start_detached` holds
+    /// deadlocks `holdfast daemon start` outright: `start_detached` holds
     /// `holdfast.lock` across the spawn *and* the 2 s poll that waits for
     /// the socket (`spawn.rs`, `let _lock = …` living to end of
-    /// function), and the child `clasp daemon run` does not inherit it
+    /// function), and the child `holdfast daemon run` does not inherit it
     /// because Rust opens `O_CLOEXEC`. The child would block on the
     /// lock, never bind, and the parent would time out waiting for the
     /// socket it is itself preventing.
@@ -598,9 +598,9 @@ impl RuntimePaths {
 /// install predating 0.0.5 created through `audit::default_path()`'s
 /// plain `create_dir_all` under the ambient umask — `0775` under the
 /// `002` that Debian, Ubuntu, RHEL and most corporate images ship. It
-/// holds no socket. Refusing it made `clasp daemon start` and the
-/// systemd/launchd `clasp daemon run` path (§7.3) fail on an untouched
-/// install while `clasp mcp` — which had relocated its log directory —
+/// holds no socket. Refusing it made `holdfast daemon start` and the
+/// systemd/launchd `holdfast daemon run` path (§7.3) fail on an untouched
+/// install while `holdfast mcp` — which had relocated its log directory —
 /// started fine: two entry points to one daemon disagreeing about
 /// whether the install was startable. It gets the same tighten-or-fail a
 /// `0755` leftover gets.
@@ -1032,7 +1032,7 @@ mod tests {
     /// window later, and every diagnostic that daemon emits for the rest
     /// of its life lands in an unlinked inode while `spawn.rs` tells the
     /// user to "see daemon.log". A `dup2` cannot stand in: under systemd
-    /// `clasp daemon run` is started directly and fd 2 is the journal.
+    /// `holdfast daemon run` is started directly and fd 2 is the journal.
     /// Copy-truncate is what keeps the inherited descriptor valid
     /// whatever it points at.
     ///
@@ -1077,7 +1077,7 @@ mod tests {
         inherited.write_all(b"after\n").unwrap();
         let live = std::fs::read_to_string(paths.daemon_log()).expect(
             "daemon.log is gone, so the descriptor the daemon was handed now writes \
-             where no path can reach and `clasp daemon start`'s own advice is a dead end",
+             where no path can reach and `holdfast daemon start`'s own advice is a dead end",
         );
         assert_eq!(
             live, "after\n",
@@ -1268,7 +1268,7 @@ mod tests {
     ///
     /// Both halves are here because either alone is passed by a wrong
     /// fix. Without the first, a pre-0.0.5 install cannot start
-    /// (`clasp daemon start` refuses while `clasp mcp` — resolving a
+    /// (`holdfast daemon start` refuses while `holdfast mcp` — resolving a
     /// different log directory — does not, so the two entry points to one
     /// daemon disagree about whether the install is startable). Without
     /// the second, deleting the refusal outright is green.
@@ -1456,7 +1456,7 @@ mod tests {
         // The pairing that makes `Daemon::new`'s audit path safe to take
         // from here: on the *default* instance it must be byte-identical
         // to `audit::default_path()`, or the daemon would write §9.4's
-        // trail somewhere `clasp logs` and every operator runbook would
+        // trail somewhere `holdfast logs` and every operator runbook would
         // not look. This is the negative for the instance-relocation
         // assertion above — relocation must not leak into the default.
         assert_eq!(

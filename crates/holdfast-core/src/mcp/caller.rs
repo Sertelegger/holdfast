@@ -8,14 +8,14 @@
 //!
 //! The alternative, an agent-supplied `surface` argument, is worse than
 //! no field at all: an agent that can label its own
-//! `read_output(redact: false)` as a human running `clasp logs --raw`
+//! `read_output(redact: false)` as a human running `holdfast logs --raw`
 //! can disguise the one event the log exists to capture, and the
 //! disguise reads as authoritative. There is deliberately no code path
 //! from a `Request`'s params to a [`Caller`].
 //!
 //! Two facts, not one. The **tool** answers "what mechanism performed
 //! the read"; the **caller** answers "who asked for it". A human running
-//! `clasp logs --raw` and an agent calling `read_output(redact: false)`
+//! `holdfast logs --raw` and an agent calling `read_output(redact: false)`
 //! both run `read_output`, and collapsing them into one string would
 //! make the log unable to tell them apart.
 //!
@@ -53,8 +53,8 @@ use crate::protocol::handshake::ClientKind;
 /// not the same. Do not "fix" the mismatch by renaming either side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
-    /// No control-protocol connection: `clasp mcp --no-daemon`, and
-    /// Windows in 0.0.11. Only `clasp mcp` runs in this mode, so it is an
+    /// No control-protocol connection: `holdfast mcp --no-daemon`, and
+    /// Windows in 0.0.11. Only `holdfast mcp` runs in this mode, so it is an
     /// agent — but it is recorded distinctly rather than as `shim`, so
     /// that a *missing* scope in daemon mode shows up as an anomaly
     /// instead of quietly impersonating one of the real callers.
@@ -62,7 +62,7 @@ pub enum Caller {
     /// The MCP shim — the agent. Recorded as `"shim"`: the handshake's
     /// own token, not this variant's name.
     Agent,
-    /// A `clasp` CLI subcommand, run by a human at a terminal.
+    /// A `holdfast` CLI subcommand, run by a human at a terminal.
     Cli,
     /// The web-UI bridge (0.0.10). Recorded as `"ui-bridge"`, hyphen
     /// included — the handshake's spelling, not snake_case.

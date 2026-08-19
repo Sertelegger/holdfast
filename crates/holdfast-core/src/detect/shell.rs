@@ -1,6 +1,6 @@
 //! OSC 133 shell-integration injection (spec §8.5).
 //!
-//! CLASP types a one-line snippet into the session at start-up so the
+//! Holdfast types a one-line snippet into the session at start-up so the
 //! shell emits semantic markers. §8.5 mandates *typing* it rather than
 //! setting environment variables, and that is the only mechanism that
 //! works: rc files run after the environment is read and would clobber an
@@ -10,7 +10,7 @@
 //! Consequence, accepted for 0.0.2: the snippet is echoed by the shell and
 //! therefore appears once in the session's output buffer.
 
-/// Shells CLASP knows how to integrate.
+/// Shells Holdfast knows how to integrate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
     Bash,
@@ -83,14 +83,14 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 /// **Every marker carries `;holdfast=1` (§8.5.1 rule 1)**, which is what lets
 /// the detector tell its own markers from another emitter's. The exit code
 /// **stays the first parameter after `D`**: parameters are order-free to a
-/// consumer that looks them up by name, but CLASP's own parser reads the
+/// consumer that looks them up by name, but Holdfast's own parser reads the
 /// exit code *positionally* (`scanner::osc133`), so `D;holdfast=1;42` parses
 /// to `None` and every command's exit code silently becomes "finished,
 /// status unknown". That is the one ordering constraint in the scheme and
 /// it is invisible to a test that greps for `holdfast=1` alone.
 ///
 /// **`return "${1:-0}"` is not decoration — it is the repair of a measured
-/// data-corruption defect (§8.5, REQ-PD-027).** CLASP *prepends* itself
+/// data-corruption defect (§8.5, REQ-PD-027).** Holdfast *prepends* itself
 /// to `PROMPT_COMMAND`, which bash evaluates as a command list, so `$?` as
 /// seen by the next element was `__holdfast_d`'s `printf` — 0, always.
 /// Measured on bash 5.3.9: for a command that exited 42, a starship-shaped
@@ -131,14 +131,14 @@ const BASH_INTEGRATION: &str = concat!(
 /// the fact that `add-zsh-hook` appends:**
 ///
 /// ```text
-/// arrangement                        USER_SAW   CLASP's D
-/// bare `precmd` defined before CLASP    42         42
-/// add-zsh-hook user before CLASP        42         42
-/// add-zsh-hook user after CLASP         42         42
-/// ground truth, no CLASP at all         42         —
+/// arrangement                           USER_SAW   Holdfast's D
+/// bare `precmd` defined before Holdfast    42         42
+/// add-zsh-hook user before Holdfast        42         42
+/// add-zsh-hook user after Holdfast         42         42
+/// ground truth, no Holdfast at all         42         —
 /// ```
 ///
-/// `add-zsh-hook precmd` appends, which invites the reading that CLASP's
+/// `add-zsh-hook precmd` appends, which invites the reading that Holdfast's
 /// hook reads a preceding user hook's `$?`. It does not: zsh restores `$?`
 /// before each `precmd_functions` entry independently. **So nobody should
 /// "repair" zsh by reordering `precmd_functions` — it would change
@@ -152,7 +152,7 @@ const BASH_INTEGRATION: &str = concat!(
 /// bash's, where the same line is load-bearing, and because a shell that
 /// did *not* restore independently would need it. Also measured: zsh runs
 /// `precmd_functions` entries **before** the bare `precmd` function, so a
-/// user hook typed into a live session always lands after CLASP's — the
+/// user hook typed into a live session always lands after Holdfast's — the
 /// arrangement in which the `return` would matter is not reachable from
 /// inside a session at all.
 const ZSH_INTEGRATION: &str = concat!(
@@ -199,7 +199,7 @@ const ZSH_INTEGRATION: &str = concat!(
 ///   for every entry — permanently, and not disableable by the user
 ///   because the flag is not there. That is precisely the partial-foreign
 ///   -integration case §8.5.1's per-letter yielding exists for, reached
-///   through the decline path instead: unguarded, CLASP's tagged `B` is
+///   through the decline path instead: unguarded, Holdfast's tagged `B` is
 ///   never yielded because fish supplies none to yield to.
 ///
 /// The hazard that blocked removal is discharged by measurement, not
@@ -209,7 +209,7 @@ const ZSH_INTEGRATION: &str = concat!(
 /// prompt between the markers.
 ///
 /// The separate `set -q HOLDFAST_SHELL_INTEGRATION` self-guard against a
-/// **second CLASP injection** is a different guard against a different
+/// **second Holdfast injection** is a different guard against a different
 /// thing (REQ-PD-005) and is untouched.
 ///
 /// **What remains unverified, stated rather than implied.** fish is not
@@ -329,10 +329,10 @@ mod tests {
         }
     }
 
-    /// §8.5.1 rule 1: every marker CLASP emits carries `holdfast=1`, and the
+    /// §8.5.1 rule 1: every marker Holdfast emits carries `holdfast=1`, and the
     /// exit code stays **first** after `D`.
     ///
-    /// The order half is not cosmetic. CLASP's parser reads the exit code
+    /// The order half is not cosmetic. Holdfast's parser reads the exit code
     /// positionally (`scanner::osc133`), so `D;holdfast=1;42` parses to
     /// `None` — every exit code silently becomes "status unknown", which
     /// `get_command_history` renders as null and no count assertion can
@@ -373,7 +373,7 @@ mod tests {
     /// The `$?` fix, at the string level. The runtime assertion is
     /// `a_prompt_that_already_emits_osc_133_meets_the_injected_snippet`,
     /// which drives a shell whose own `PROMPT_COMMAND` reads `$?` after
-    /// CLASP's has run.
+    /// Holdfast's has run.
     ///
     /// **bash only, and that is a measurement rather than an omission.**
     /// zsh restores `$?` before each `precmd_functions` entry

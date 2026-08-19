@@ -230,7 +230,7 @@ async fn wait_for(server: &HoldfastServer, session: &str, needle: &str) {
 ///
 /// Waiting for `AtPrompt` alone is not enough, and the difference is a
 /// measured flake rather than a theoretical one. bash reaches its first
-/// prompt (bracketed paste, `terminal_mode`) *before* CLASP has finished
+/// prompt (bracketed paste, `terminal_mode`) *before* Holdfast has finished
 /// typing the §8.5 integration snippet; the snippet then runs, and while
 /// it does, readline has ECHO off with bracketed paste momentarily
 /// disabled — which the §8.3 ladder classifies as `AwaitingSecret`. A
@@ -639,7 +639,7 @@ fn every_tool_declares_the_annotations_5_3_assigns_it() {
             Some(false),
         ),
         // §5.3: read-only even though the call can enable Tier B, because
-        // that changes CLASP's bookkeeping and not the session.
+        // that changes Holdfast's bookkeeping and not the session.
         (
             "get_screen_state",
             "Read the rendered terminal screen",
@@ -859,7 +859,7 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
     // vocabulary rather than a fourth `ShellIntegration` value because
     // §12.3's append-only rule is written over fields, not over enum value
     // sets — and because `mixed` is a state no answer to "which shell did
-    // CLASP inject for" could carry.
+    // Holdfast inject for" could carry.
     use holdfast_core::detect::Osc133Source as Src;
     fn next_source(s: Src) -> Option<Src> {
         match s {
@@ -942,7 +942,7 @@ async fn start_session_spawn_failed_response_matches_its_schema() {
     let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "clasp-no-such-program-9f2a".into(),
+            command: "holdfast-no-such-program-9f2a".into(),
             ..Default::default()
         }))
         .await
@@ -1460,7 +1460,7 @@ async fn status_reports_each_field_from_the_session_it_names() {
     // different question from `shell_integration` two assertions up — which
     // reads `"fish"` here while no fish is involved at all. `TWO_COMMANDS`
     // carries **untagged** markers, so under §8.5.1 every letter is foreign
-    // and every one of CLASP's would be discarded.
+    // and every one of Holdfast's would be discarded.
     assert_eq!(
         data["osc133_source"], "external",
         "untagged markers are a foreign emitter's"
@@ -1506,7 +1506,7 @@ async fn status_reports_each_field_from_the_session_it_names() {
     );
     assert_eq!(
         d2["data"]["osc133_source"], "holdfast",
-        "tagged markers are CLASP's own"
+        "tagged markers are Holdfast's own"
     );
 
     // A resolvable session that is nonetheless *not* this one must not
@@ -1810,7 +1810,7 @@ async fn get_command_history_unavailable_response_matches_its_schema() {
 async fn get_command_history_session_not_found_response_matches_its_schema() {
     // The one error envelope whose `data: {}` is a different shape again.
     // `CommandHistory` declares `entries`, and a schema that required it
-    // would reject CLASP's own `session_not_found` response — in
+    // would reject Holdfast's own `session_not_found` response — in
     // production, on a path no positive test above reaches.
     let server = HoldfastServer::new();
     let r = server
@@ -2179,7 +2179,7 @@ async fn get_screen_state_full_response_matches_its_schema() {
     let session = server.registry.get(&id).expect("the session");
     session
         .write_input(
-            b"printf '\\033[?1049h\\033[H\\033[2J\\033]0;clasp-grid\\007\\033[3;5HGRID''_ROW'\n",
+            b"printf '\\033[?1049h\\033[H\\033[2J\\033]0;holdfast-grid\\007\\033[3;5HGRID''_ROW'\n",
         )
         .expect("write");
     wait_for(&server, &id, "GRID_ROW").await;
@@ -2225,7 +2225,7 @@ async fn get_screen_state_full_response_matches_its_schema() {
     // The four fields the fixture exists to populate. Without these the
     // key set above is satisfied by a grid of nulls.
     let data = &payload["data"];
-    assert_eq!(data["title"], "clasp-grid", "{data}");
+    assert_eq!(data["title"], "holdfast-grid", "{data}");
     assert_eq!(data["alt_screen"], true, "{data}");
     assert_ne!(
         (
@@ -2633,7 +2633,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
     note(&body(
         &server
             .start_session(Parameters(StartSessionArgs {
-                command: "clasp-no-such-binary-anywhere".into(),
+                command: "holdfast-no-such-binary-anywhere".into(),
                 ..Default::default()
             }))
             .await

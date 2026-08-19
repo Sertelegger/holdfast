@@ -1119,7 +1119,7 @@ mod tests {
     #[test]
     fn a_settled_but_unrecognised_tail_scores_zero_confidence() {
         let (mut d, start, now) = detector();
-        feed(&mut d, start, b"linking target/debug/clasp");
+        feed(&mut d, start, b"linking target/debug/holdfast");
         let s = d.snapshot_at(true, ld(true, true), None, None, now);
         assert_eq!(s.quiescent_score, 1.0);
         assert_eq!(s.pattern_score, 0.0);
@@ -1472,7 +1472,7 @@ mod tests {
 
     #[test]
     fn a_faked_bracketed_paste_fools_tier_2_as_documented() {
-        // Spec §8.8: CLASP does not defend against a hostile child. This
+        // Spec §8.8: Holdfast does not defend against a hostile child. This
         // asserts the limitation so it cannot change silently.
         let (mut d, start, now) = detector();
         feed(&mut d, start, b"\x1b[?2004h");
@@ -1861,7 +1861,7 @@ mod tests {
                 &b"$ "[..],
                 &b"Enter a value: "[..],
                 &b">>> "[..],
-                &b"linking target/debug/clasp"[..],
+                &b"linking target/debug/holdfast"[..],
             ] {
                 let (mut clean, start, now) = detector();
                 feed(&mut clean, start, tail);

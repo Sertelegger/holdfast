@@ -89,7 +89,7 @@ pub struct SessionConfig {
     pub buffer_capacity: usize,
     pub detection: DetectionConfig,
     pub history_max_entries: usize,
-    /// When set, CLASP types the shell's OSC 133 integration snippet into
+    /// When set, Holdfast types the shell's OSC 133 integration snippet into
     /// the session at start-up (spec §8.5).
     pub shell_integration: Option<Shell>,
     /// §4.2 `terminal_queries`, default **true**. `false` accepts the
@@ -498,7 +498,7 @@ impl Session {
         if let Some(shell) = config.shell_integration {
             let snippet = shell.integration_snippet();
             // §8.5.1 rule 5 (REQ-DM-009): the ring needs to know which line
-            // CLASP typed, because "it emits no `C`" stops being true the
+            // Holdfast typed, because "it emits no `C`" stops being true the
             // moment a foreign emitter is already installed — the user's
             // `PS0` marks the snippet's own command line and the snippet
             // becomes the session's first history entry.
@@ -582,7 +582,7 @@ impl Session {
     /// Whose OSC 133 markers this session is **using** (§18.2a, §8.5.1).
     ///
     /// Not the same question as `shell_integration`, which records only
-    /// what CLASP injected and is fixed at spawn: a session can report
+    /// what Holdfast injected and is fixed at spawn: a session can report
     /// `shell_integration: Some(Fish)` with `Osc133Source::External`, the
     /// snippet installed and firing and every one of its markers dropped
     /// on arrival. `None` until the first marker arrives.
@@ -915,7 +915,7 @@ impl Session {
     }
 
     /// Resize the terminal (spec §5.2 `resize`, REQ-T-009): `SIGWINCH` to
-    /// the child, then the two pieces of CLASP-side state that describe the
+    /// the child, then the two pieces of Holdfast-side state that describe the
     /// same geometry.
     ///
     /// **Backend first, and the ordering is the contract.** The stored size
@@ -2073,7 +2073,7 @@ mod tests {
         }
         // A tail that the bundled table scores 0.0 on, so a session-supplied
         // pattern is the only thing that can produce a non-zero score.
-        bytes.extend_from_slice(b"clasp~ ");
+        bytes.extend_from_slice(b"holdfast~ ");
 
         let pty = Arc::new(MockPty::new());
         let s = Session::new(
@@ -2089,7 +2089,7 @@ mod tests {
                 detection: DetectionConfig {
                     patterns: PatternSet::build(
                         &[PromptPattern {
-                            regex: r"clasp~\s*$".into(),
+                            regex: r"holdfast~\s*$".into(),
                             score: 0.9,
                         }],
                         false,
@@ -2310,7 +2310,7 @@ mod tests {
         }
     }
 
-    /// REQ-TS-009: a reply is CLASP's own answer, not agent input, and it
+    /// REQ-TS-009: a reply is Holdfast's own answer, not agent input, and it
     /// stamps nothing.
     ///
     /// **Why the probe rather than a stamp read after the fact.** The
@@ -2372,7 +2372,7 @@ mod tests {
     /// this pins is that the deadline runs from the **child's own output**
     /// and the replies add nothing after it — a reply path that stamped
     /// would leave a queried session's deadline running from whenever
-    /// CLASP last answered rather than from when the child last spoke.
+    /// Holdfast last answered rather than from when the child last spoke.
     #[test]
     fn a_session_whose_only_traffic_is_queries_still_reaps_on_schedule() {
         const IDLE_MS: i64 = 60;

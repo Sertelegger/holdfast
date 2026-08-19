@@ -96,7 +96,7 @@ secret_provider = "prompt"
 # Off by default: silent credential injection is opt-in per deployment.
 autofill_on_echo_off = false
 # When true, dangerous-command confirmation requires a code (shown only
-# via trusted UI surfaces -- web UI dashboard or `clasp confirm` CLI) in
+# via trusted UI surfaces -- web UI dashboard or `holdfast confirm` CLI) in
 # addition to the agent-held token. Agent never receives the code.
 # Default false: relies on the MCP client's tool-call permission UI.
 # See §9.3.1 for the trust model and the residual-risk note (§9.3 itself
@@ -104,7 +104,7 @@ autofill_on_echo_off = false
 strict_confirmation = false
 
 # Operator-configured secret bindings (§9.6). The agent supplies only
-# the session id and the prompt text -- it cannot name a secret. CLASP
+# the session id and the prompt text -- it cannot name a secret. Holdfast
 # matches the session's own command line AND the observed prompt, so
 # there is no "fetch me arbitrary credential" API.
 #
@@ -124,7 +124,7 @@ strict_confirmation = false
 # match_command   = "^ssh\\s+(\\S+@)?prod-0[12]\\b"
 # match_prompt    = "(?i)password"
 # provider        = "secret-service"
-# reference       = "service=clasp,account=prod-ssh"
+# reference       = "service=holdfast,account=prod-ssh"
 # max_uses        = 20
 # require_confirm = false
 
@@ -137,7 +137,7 @@ strict_confirmation = false
 # disagreeing about which instance they are — which is the property
 # REQ-CFG-005's integration test asserts. http_socket_path was the only
 # such knob and is withdrawn; it had no use case §7.1 does not serve.
-# By default, clasp ui picks a free ephemeral port. Setting a value here
+# By default, holdfast ui picks a free ephemeral port. Setting a value here
 # pins the port (useful when an SSH port-forward expects a known port).
 # 0 = ephemeral (default); any other value = pinned port.
 ui_bridge_pinned_port = 0
@@ -152,7 +152,7 @@ max_bridge_sessions = 16
 # Sinks, in §5.8.3's order: "desktop", "webhook", "command", "none"
 # (default).
 sink = "none"
-# webhook_url = "https://example.internal/clasp-events"
+# webhook_url = "https://example.internal/holdfast-events"
 # command = ["/usr/local/bin/notify-me"]
 # Which of §5.8.3's kinds reach the sink. §5.8.3 is the canonical
 # enumeration; this list is complete rather than a subset because an
@@ -183,8 +183,8 @@ notification_rate_limit_per_min = 10
 idle_shutdown_after_secs = 86400
 # Opt EVERY session into recording (§5.8.1); off by default, as the
 # value below says. Recordings are REDACTED --
-# the header carries clasp_redacted: true -- unless the caller opts out
-# with start_session(record_redacted: false) or clasp record --raw, and
+# the header carries holdfast_redacted: true -- unless the caller opts out
+# with start_session(record_redacted: false) or holdfast record --raw, and
 # that opt-out is written to the audit trail on recording_started.
 # Files are 0600 either way; a --raw .cast is as sensitive as the
 # session itself and the replay player announces which it is.

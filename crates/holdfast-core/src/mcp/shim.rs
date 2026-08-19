@@ -1076,7 +1076,7 @@ mod tests {
         assert_eq!(
             err.code,
             rmcp::model::ErrorCode::INTERNAL_ERROR,
-            "a CLASP bug must reach the agent as one, not as its own bad argument"
+            "a Holdfast bug must reach the agent as one, not as its own bad argument"
         );
         assert!(err.message.contains("write task failed"), "{}", err.message);
     }

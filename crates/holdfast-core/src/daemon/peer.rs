@@ -37,7 +37,7 @@ pub fn current_uid() -> u32 {
 /// Strict equality, deliberately. Root is *not* granted an exception:
 /// the daemon holds PTYs and buffers belonging to one user, and "root
 /// may as well have shell access anyway" is an argument about the host,
-/// not a reason for CLASP to hand over another user's session.
+/// not a reason for Holdfast to hand over another user's session.
 pub fn is_authorized(peer_uid: u32, our_uid: u32) -> bool {
     peer_uid == our_uid
 }

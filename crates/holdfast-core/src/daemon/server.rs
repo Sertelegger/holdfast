@@ -101,7 +101,7 @@ impl StopParams {
 /// **This stopped being an argument by analogy at rev. 47.** REQ-T-018
 /// used to reach the MCP tool surface and this field had to borrow the
 /// rule from §5.4; rev. 47 widened it to *"every timestamp on a
-/// CLASP-defined wire surface — the MCP tool surface, the control
+/// Holdfast-defined wire surface — the MCP tool surface, the control
 /// protocol (§7.4.1), the attach protocol (§7.5) and the HTTP API"*, and
 /// names bare `started_at` as its own example. So the requirement now
 /// binds this response directly, in the section the field lives in, and
@@ -440,7 +440,7 @@ impl Daemon {
         // production daemon.
         if !live.is_empty() {
             // Poll rather than sleeping the whole grace: a well-behaved
-            // child exits in milliseconds, and making every `clasp daemon
+            // child exits in milliseconds, and making every `holdfast daemon
             // stop` cost ten seconds would be a tax on the common case.
             if !self.clock.is_manual() {
                 let deadline = self.clock.now() + grace;
@@ -499,7 +499,7 @@ impl Daemon {
         // underneath it, and the client-side EOF surfaces as
         // `FrameError::Eof` rather than `ClientError::Connect`, which is
         // the one classification `spawn::ensure_daemon` will not start a
-        // replacement for. `clasp mcp` then fails with
+        // replacement for. `holdfast mcp` then fails with
         // `daemon_unreachable` against a daemon that was alive moments
         // earlier.
         //
@@ -574,10 +574,10 @@ impl Daemon {
             LogRetention::from(self.config()),
             std::time::SystemTime::now(),
         ) {
-            crate::diag!("clasp daemon: log rotation sweep failed: {e}");
+            crate::diag!("holdfast daemon: log rotation sweep failed: {e}");
         }
         if let Err(e) = self.server.processor.audit.reopen() {
-            crate::diag!("clasp daemon: cannot reopen the audit log: {e}");
+            crate::diag!("holdfast daemon: cannot reopen the audit log: {e}");
         }
     }
 }
@@ -766,7 +766,7 @@ pub(crate) fn bind_control_within(
 
     // **The probe → unlink → bind window below is not atomic**, and
     // without a lock it is a way to unlink a *live* daemon's socket.
-    // Two `clasp daemon run` processes — or one started while another's
+    // Two `holdfast daemon run` processes — or one started while another's
     // `start_detached` had already timed out at 2 s with its child still
     // binding — can both see "dead", after which the second's
     // `remove_file` removes the first's just-bound socket. The first
@@ -887,7 +887,7 @@ pub async fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
                         });
                     }
                     Err(e) => {
-                        crate::diag!("clasp daemon: accept failed: {e}");
+                        crate::diag!("holdfast daemon: accept failed: {e}");
                     }
                 }
             }
@@ -1013,7 +1013,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // that will not start because a log could not be renamed is a worse
     // outcome than one that runs and says so.
     if let Err(e) = paths.sweep_logs(LogRetention::from(&config), std::time::SystemTime::now()) {
-        crate::diag!("clasp daemon: log rotation sweep failed: {e}");
+        crate::diag!("holdfast daemon: log rotation sweep failed: {e}");
     }
 
     let daemon = Daemon::with_config(paths.clone(), config);
@@ -1021,7 +1021,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // **The §9.4 trail fails closed on this host.** `with_audit_path`
     // leaves the log disabled and records why; on every other host that
     // is the right answer, and on the daemon it is not. A root-owned
-    // `audit.log` from one `sudo clasp` otherwise gave
+    // `audit.log` from one `sudo holdfast` otherwise gave
     // a daemon that served every client on the box with no
     // `session_start`, no `redaction_disabled` — nothing — while
     // reporting perfect health, and the only trace was a line on stderr
@@ -1051,7 +1051,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
         drop(listener);
         remove_runtime_files_we_own(&paths, &our_socket);
         anyhow::bail!(
-            "clasp daemon: refusing to start without the §9.4 audit trail: {why}. \
+            "holdfast daemon: refusing to start without the §9.4 audit trail: {why}. \
              Fix the ownership or permissions of that file, or point \
              HOLDFAST_RUNTIME_DIR at a directory this user owns."
         );
@@ -1063,7 +1063,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(e) => {
-                    crate::diag!("clasp daemon: cannot install SIGTERM handler: {e}");
+                    crate::diag!("holdfast daemon: cannot install SIGTERM handler: {e}");
                     return;
                 }
             };
@@ -1104,7 +1104,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
 ///
 /// The window is not instantaneous — the `shutdown()` above walks the
 /// registry SIGKILLing sessions first — and the trigger, a
-/// `clasp daemon stop` followed by anything that auto-spawns, is a
+/// `holdfast daemon stop` followed by anything that auto-spawns, is a
 /// normal operator action.
 ///
 /// So: take the binder's lock, and ask twice whether these files are
@@ -1173,7 +1173,7 @@ pub(crate) fn remove_runtime_files_we_own(paths: &RuntimePaths, ours: &OwnedSock
 /// created `0600` (`spawn.rs`), `control.sock` is chmodded `0600` and
 /// then re-read and verified, and this one alone took the ambient umask.
 /// Its contents are a pid and a version string — both of which `/proc`
-/// and `clasp version` publish anyway — and it sits in a directory whose
+/// and `holdfast version` publish anyway — and it sits in a directory whose
 /// `0700` is re-asserted by `ensure_owner_only(…, Writable::Refuse)` on
 /// every `ensure_dir`, so the mode only matters in a world where the
 /// directory guard has already failed. It is not verified afterwards for
@@ -1235,11 +1235,11 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
         // nothing below can change who is admitted.
         match &cred {
             Ok(c) => crate::diag!(
-                "clasp daemon: refused a connection from uid {} (daemon runs as uid {})",
+                "holdfast daemon: refused a connection from uid {} (daemon runs as uid {})",
                 c.uid,
                 daemon.owner_uid
             ),
-            Err(e) => crate::diag!("clasp daemon: cannot read peer credentials, refusing: {e}"),
+            Err(e) => crate::diag!("holdfast daemon: cannot read peer credentials, refusing: {e}"),
         }
         return;
     }
@@ -1366,7 +1366,7 @@ async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
         Ok(()) => true,
         Err(FrameError::TooLarge { len }) => {
             crate::diag!(
-                "clasp daemon: the response to request {id} is {len} bytes, over the \
+                "holdfast daemon: the response to request {id} is {len} bytes, over the \
                  {}-byte frame limit; refusing it and closing the connection",
                 frame::MAX_FRAME_BYTES
             );
@@ -1682,7 +1682,7 @@ async fn dispatch_resource(
 /// really the caller's fault; `envelope::from_error` maps
 /// `HoldfastError::Pty | HoldfastError::Io` to `internal_error` from about a
 /// dozen sites in `tools.rs`, and `tools.rs` maps a panicked write task
-/// to `internal_error` with the comment *"a CLASP bug, not a session
+/// to `internal_error` with the comment *"a Holdfast bug, not a session
 /// outcome"*. Discarding `e.code` told the agent that `openpty failed`
 /// was its own malformed argument — and told it something different
 /// under `--no-daemon`, where the same fault stays `internal_error`.
@@ -1836,7 +1836,7 @@ mod tests {
                 "redact": false,
                 // None of these are read. If any ever were, the audit log
                 // would be attacker-controlled where it matters most.
-                "surface": "clasp_logs",
+                "surface": "holdfast_logs",
                 "client_kind": kind_it_wants_to_look_like,
                 "caller": kind_it_wants_to_look_like,
                 "audit": { "client_kind": kind_it_wants_to_look_like },
@@ -1848,7 +1848,7 @@ mod tests {
     #[test]
     fn an_agent_cannot_influence_the_recorded_caller() {
         // The agent connects as `Shim` and asks to be recorded as a human
-        // running `clasp logs --raw`. §9.4's whole value is that it
+        // running `holdfast logs --raw`. §9.4's whole value is that it
         // cannot: the answer comes from the authenticated connection.
         let req = forged_read_output("cli");
         assert_eq!(
@@ -2195,7 +2195,7 @@ mod tests {
     ///
     /// `with_audit_path` leaves an unopenable log *disabled* and says so
     /// on stderr; that used to be the whole response, so a root-owned
-    /// `audit.log` from one `sudo clasp` produced a
+    /// `audit.log` from one `sudo holdfast` produced a
     /// daemon serving every client on the box while recording nothing,
     /// and reporting perfect health. REQ-CFG-003 already refuses startup
     /// for an invalid config knob; the trail was getting weaker
@@ -2537,7 +2537,7 @@ mod tests {
     /// **live** daemon's socket.
     ///
     /// `bind_control` probes, removes and binds, and `server.rs` held no
-    /// lock of any kind. Two `clasp daemon run` processes — or one
+    /// lock of any kind. Two `holdfast daemon run` processes — or one
     /// started while another's `start_detached` had timed out at 2 s
     /// with its child still binding — can both read "dead", after which
     /// the second's `remove_file` takes out the first's just-bound
@@ -2759,7 +2759,7 @@ mod tests {
     /// cleanup".** Its pair below asserts that a *successor's* files
     /// survive the teardown, and that assertion is satisfied perfectly by
     /// a teardown that removes nothing at all — which would leave every
-    /// `clasp daemon stop` behind a stale socket and a pid file naming a
+    /// `holdfast daemon stop` behind a stale socket and a pid file naming a
     /// dead process, i.e. the state `confirm_daemon_pid` exists to
     /// survive. It also pins the *wiring*: `run_with_config` is what
     /// production runs, so deleting the call from it goes red here rather
@@ -3142,7 +3142,7 @@ mod tests {
     /// The client-side consequence is what makes it more than a lost
     /// connection: the EOF surfaces as `FrameError::Eof` and **not**
     /// `ClientError::Connect`, and `spawn::ensure_daemon` starts a
-    /// replacement only for `Connect` — so `clasp mcp` reports
+    /// replacement only for `Connect` — so `holdfast mcp` reports
     /// `daemon_unreachable` against a daemon that was alive moments
     /// earlier, and starts nothing.
     ///

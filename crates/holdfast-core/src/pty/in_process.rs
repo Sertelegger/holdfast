@@ -179,7 +179,7 @@ impl InProcessPty {
     /// were readable from the master, because seeing the bytes costs a
     /// `read` wakeup and seeing the flag costs one ioctl. To read echo-off
     /// there now, the child would have to be descheduled between its own
-    /// `fflush` and its `tcsetattr` for longer than CLASP takes to read and
+    /// `fflush` and its `tcsetattr` for longer than Holdfast takes to read and
     /// classify the bytes it just wrote — and throughout such a window the
     /// terminal genuinely *does* have echo off, which is the case §8.8
     /// already documents.
@@ -294,7 +294,7 @@ impl InProcessPty {
     #[cfg(unix)]
     fn fallback_pgids(&self) -> Vec<i32> {
         let mut v = Vec::new();
-        // The `> 0` guard matters: kill(-0, sig) signals CLASP's OWN
+        // The `> 0` guard matters: kill(-0, sig) signals Holdfast's OWN
         // process group. Unreachable today (process_id() is >= 1), but
         // the foreground entry below guards it and asymmetry invites a
         // regression.
@@ -590,7 +590,7 @@ mod foreground_scope {
     /// `tcgetpgrp`'s non-positive answers are **unknown**, not groups.
     ///
     /// The reaped-child test below cannot reach this rule: `portable-pty`
-    /// filters `pid > 0` before CLASP sees the value, so `Some(0)` never
+    /// filters `pid > 0` before Holdfast sees the value, so `Some(0)` never
     /// arrives through that backend and a widened guard passes the whole
     /// workspace. Asserting the rule directly is what makes it a rule
     /// rather than a comment — and `Some(-1)` is here too, because

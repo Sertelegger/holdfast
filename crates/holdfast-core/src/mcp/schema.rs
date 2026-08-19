@@ -17,7 +17,7 @@
 //! `session_not_found`; `start_session` returns `{command}` on
 //! `spawn_failed`; `get_command_history` returns `{reason, entries,
 //! truncated_at_tail}` on `unavailable`. Marking the `ok` fields
-//! `required` would make CLASP's own error envelopes fail validation.
+//! `required` would make Holdfast's own error envelopes fail validation.
 //! Optional-but-declared is the honest encoding: the agent learns every
 //! field name and type the tool can produce, and every status validates.
 //! `status` and `details` are present on every response and stay required.
@@ -141,11 +141,11 @@ pub enum ShellIntegration {
 
 /// Whose OSC 133 markers the session is **using** (§18.2a, §8.5.1).
 ///
-/// Distinct from `shell_integration`, which records only what CLASP
+/// Distinct from `shell_integration`, which records only what Holdfast
 /// *injected* and is fixed at spawn. `external` and `mixed` do **not** mean
-/// CLASP declined to inject: the snippet is installed and firing, and its
+/// Holdfast declined to inject: the snippet is installed and firing, and its
 /// markers are being dropped on arrival. Null until the first marker
-/// arrives, which is genuinely all CLASP knows before the first prompt
+/// arrives, which is genuinely all Holdfast knows before the first prompt
 /// cycle.
 ///
 /// A new **field** rather than a fourth value on `ShellIntegration`, and
@@ -153,7 +153,7 @@ pub enum ShellIntegration {
 /// "existing fields stay; new optional fields can be added" — and says
 /// nothing that makes widening a closed enum's value set free. It is also
 /// the more honest shape, since `mixed` is a state no value of "which shell
-/// CLASP injected for" could express.
+/// Holdfast injected for" could express.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Osc133Source {
@@ -474,7 +474,7 @@ pub struct CommandHistory {
     /// Optional for the reason the module header gives, and this is the
     /// field that proved it: `get_command_history` answers a missing
     /// session through `envelope::from_error`, whose `data` is `{}`.
-    /// Declared as a bare `Vec` this was `required`, so CLASP's own
+    /// Declared as a bare `Vec` this was `required`, so Holdfast's own
     /// `session_not_found` response failed its own advertised schema —
     /// caught by `get_command_history_session_not_found_response_matches_
     /// its_schema`, which is the only path that reaches it.

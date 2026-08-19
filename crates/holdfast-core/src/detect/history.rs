@@ -73,7 +73,7 @@ pub struct CommandHistory {
     next_index: u64,
     evicted: bool,
     active: bool,
-    /// The integration line CLASP typed at session start, armed until the
+    /// The integration line Holdfast typed at session start, armed until the
     /// first `OutputStart` is processed (§8.5.1 rule 5, REQ-DM-009).
     ///
     /// Before rev. 36 the injection line stayed out of the history because
@@ -127,7 +127,7 @@ impl CommandHistory {
         }
     }
 
-    /// Tell the ring which line CLASP itself typed (§8.5.1 rule 5).
+    /// Tell the ring which line Holdfast itself typed (§8.5.1 rule 5).
     ///
     /// Set before the line is written, never after: the reader thread is
     /// already running, so a snippet that produced its `C` first would be
@@ -170,7 +170,7 @@ impl CommandHistory {
         match &event.marker {
             Osc133::OutputStart { command } => {
                 if let Some(line) = self.injection_line.take() {
-                    // Matched against the line CLASP itself typed, never
+                    // Matched against the line Holdfast itself typed, never
                     // against incidental content. The capture is a *suffix*
                     // of what was typed — §5.2 documents the echo capture
                     // truncating to its tail at the terminal width — so
@@ -189,7 +189,7 @@ impl CommandHistory {
                     // is REQ-DM-009's "never an entry" failing in the one
                     // arrangement the requirement was written for.
                     //
-                    // The second clause identifies the line CLASP typed
+                    // The second clause identifies the line Holdfast typed
                     // from the session's *structure* rather than from its
                     // content, which is what §8.5.1 rule 5 permits: the
                     // injection line is the first thing written to the PTY
@@ -197,7 +197,7 @@ impl CommandHistory {
                     // it, so nothing of the user's can precede it — and a
                     // `B`-less first `C` is the structural absence a
                     // partial foreign emitter creates, not a capture that
-                    // was lost. With no foreign emitter CLASP's own `PS1`
+                    // was lost. With no foreign emitter Holdfast's own `PS1`
                     // has already emitted `B` by the first `C`, so this
                     // cannot reach a user command there.
                     //
@@ -225,7 +225,7 @@ impl CommandHistory {
             }
             Osc133::CommandDone { exit_code } => {
                 if self.suppress_next_done {
-                    // The `C` this `D` belongs to was CLASP's own install
+                    // The `C` this `D` belongs to was Holdfast's own install
                     // line and was suppressed, so there is no entry for it
                     // to close — and without this it would close whatever
                     // entry happened to be open instead.
@@ -235,7 +235,7 @@ impl CommandHistory {
                 // A `D` with no open entry is normal exactly once: the
                 // command that *installed* the integration ran before
                 // `PS0`/`preexec` existed, so it emitted no `C`. Ignoring
-                // it is what keeps CLASP's own injection out of the
+                // it is what keeps Holdfast's own injection out of the
                 // agent's history.
                 //
                 // Known limitation, measured and asserted in
@@ -363,7 +363,7 @@ mod tests {
     }
 
     /// Two whole prompt-command-done cycles, byte for byte off a real PTY
-    /// (**fish 4.0.2**, `debian:trixie`, 2026-08-14), with CLASP's shipped
+    /// (**fish 4.0.2**, `debian:trixie`, 2026-08-14), with Holdfast's shipped
     /// snippet installed and fish's own OSC 133 marking left on. This is
     /// §8.5.1's collision at a real shell, and the only place in the
     /// workspace where the yielding rule meets one.
@@ -371,8 +371,8 @@ mod tests {
     /// **The letters divide the way §8.5.1 says they must**, which is why
     /// the capture is worth 800 bytes of source. fish 4.0.2 emits
     /// `A;special_key=1`, `C;cmdline_url=…` and `D;<code>` — and, measured
-    /// here, **never `B`**. So `A`, `C` and `D` go foreign and CLASP's
-    /// tagged copies of them are discarded, while CLASP's `B;holdfast=1` is
+    /// here, **never `B`**. So `A`, `C` and `D` go foreign and Holdfast's
+    /// tagged copies of them are discarded, while Holdfast's `B;holdfast=1` is
     /// **kept**, because fish supplies none to yield to. That kept `B` is
     /// the only thing that arms the echo capture, so it is what gives
     /// `command` its `B..C` span. A whole-*source* rule would have
@@ -420,7 +420,7 @@ mod tests {
         let e = h.entries(0, 50);
         // One entry per command, not two. Under the shipped ring this
         // capture produced four — each command opening one entry on the
-        // foreign `C` and another on CLASP's, the first orphaned with the
+        // foreign `C` and another on Holdfast's, the first orphaned with the
         // text and the second closed with the code.
         assert_eq!(e.len(), 2, "one entry per command: {e:?}");
 
@@ -449,7 +449,7 @@ mod tests {
         );
         // **A measured consequence of yielding, asserted rather than
         // asserted away.** The span opens just past the *foreign* `C` and
-        // closes at the *foreign* `D`, so CLASP's own `C;holdfast=1` — which
+        // closes at the *foreign* `D`, so Holdfast's own `C;holdfast=1` — which
         // the yielding rule discarded as an **event** — is still inside it
         // as **bytes**. Discarding a marker keeps it out of the detector
         // and the ring; it cannot take it out of the session's raw buffer,
@@ -462,7 +462,7 @@ mod tests {
         // is a recorded fact rather than a surprise.
         assert!(
             span.windows(6).any(|w| w == b"\x1b]133;"),
-            "expected CLASP's discarded marker bytes inside the span: {text:?}"
+            "expected Holdfast's discarded marker bytes inside the span: {text:?}"
         );
         for x in &e {
             assert!(x.duration_ms.is_some(), "unfinished entry: {x:?}");
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(
             sc.osc133_source(),
             Some(crate::detect::Osc133Source::Mixed),
-            "fish supplied no `B`, so `B` is still CLASP's"
+            "fish supplied no `B`, so `B` is still Holdfast's"
         );
     }
 
@@ -638,7 +638,7 @@ mod tests {
     ///
     /// The rule is written over a *suffix* because §5.2 documents the echo
     /// capture truncating to its tail at the terminal width: 125 characters
-    /// typed at 80 columns are captured as the last 47. CLASP's snippets
+    /// typed at 80 columns are captured as the last 47. Holdfast's snippets
     /// are 300-500 characters, so at any real width the capture is **always**
     /// a tail and never the whole line — which means an implementation
     /// spelled `line.trim_end() == command` suppresses the injection line
@@ -685,7 +685,7 @@ mod tests {
     /// `D;<code>` and never `B` (measured on a live PTY; the marker shapes
     /// here are that capture's, and `FISH_402_COLLISION` above is the
     /// verbatim proof that `B` is missing — `mixed` is only reachable
-    /// because CLASP's `B` had nothing to yield to). Nothing arms the echo
+    /// because Holdfast's `B` had nothing to yield to). Nothing arms the echo
     /// capture before the snippet installs itself, so the injection line's
     /// `C` carries an **empty** command and the suffix test in §8.5.1 rule
     /// 5 has no text to compare.
@@ -711,7 +711,7 @@ mod tests {
         raw.extend_from_slice(snippet.as_bytes());
         raw.extend_from_slice(b"\r\n\x1b]133;C;cmdline_url=if%20not\x1b\\");
         raw.extend_from_slice(b"\x1b]133;D;0\x1b\\");
-        // Now the snippet is installed, so CLASP's tagged `B` arrives and
+        // Now the snippet is installed, so Holdfast's tagged `B` arrives and
         // gives the next command its span.
         raw.extend_from_slice(b"\x1b]133;A;special_key=1\x07\x1b]133;A;holdfast=1\x07$ ");
         raw.extend_from_slice(b"\x1b]133;B;holdfast=1\x07echo hi\r\n");
@@ -741,7 +741,7 @@ mod tests {
     ///
     /// Same empty capture, same first `OutputStart` — and a `B` in front of
     /// it, which is what a session with no foreign emitter always has by
-    /// the time its first command runs, because CLASP's own `PS1` emits
+    /// the time its first command runs, because Holdfast's own `PS1` emits
     /// one. This entry must survive with its empty text: `command` is
     /// documented best-effort and an empty one is a *lossy capture*, not a
     /// reason to hide that a command ran at all.
@@ -767,7 +767,7 @@ mod tests {
     /// one `OutputStart`, so it can never become an open-ended filter on
     /// the user's own commands.
     ///
-    /// `fi` is deliberately a suffix of every POSIX snippet CLASP types.
+    /// `fi` is deliberately a suffix of every POSIX snippet Holdfast types.
     /// Without the one-shot bound, a session in which the user later runs
     /// anything ending in `fi` silently loses that command from the
     /// history — and the entry that vanishes is a real one.

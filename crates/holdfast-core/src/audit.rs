@@ -123,7 +123,7 @@ impl AuditLog {
     /// on whether the file was already there, which is why citing it as
     /// the thing the startup refusal catches was wrong. What that
     /// refusal does catch is the root-owned `audit.log` left by one
-    /// `sudo clasp`, and those comments now say only that.
+    /// `sudo holdfast`, and those comments now say only that.
     ///
     /// **Once, not per entry.** A full disk fails every subsequent write
     /// too, and a line per dropped entry would bury the first one — the
@@ -134,7 +134,7 @@ impl AuditLog {
     /// the magnitude.
     fn note_write_failure(&self, why: &str) {
         if self.write_errors.fetch_add(1, Ordering::Relaxed) == 0 {
-            crate::diag!("clasp: the audit trail has stopped recording: {why}");
+            crate::diag!("holdfast: the audit trail has stopped recording: {why}");
         }
     }
 
@@ -194,7 +194,7 @@ impl AuditLog {
     /// `client_kind` is the accountable party (`shim`, `cli`,
     /// `ui-bridge`, `in_process` — the three handshake values verbatim,
     /// hyphen included, so the log joins across event kinds).
-    /// A human running `clasp logs --raw` and an agent calling
+    /// A human running `holdfast logs --raw` and an agent calling
     /// `read_output(redact: false)` both go through `read_output`, so
     /// one string cannot tell them apart — and the whole value of this
     /// entry is telling them apart.
@@ -398,7 +398,7 @@ mod tests {
     }
 
     /// §9.4 records the mechanism and the accountable party separately.
-    /// `clasp logs --raw` is not a third mechanism: it is `read_output`
+    /// `holdfast logs --raw` is not a third mechanism: it is `read_output`
     /// performed on behalf of a `cli` client, which is exactly the
     /// distinction a single `surface` string could not make.
     ///
@@ -456,7 +456,7 @@ mod tests {
 
     /// A full disk must not take the daemon down, and a silent failure is
     /// worse than a loud one — so the write error is swallowed and
-    /// *counted*, and `clasp doctor` (0.0.12) reads the count.
+    /// *counted*, and `holdfast doctor` (0.0.12) reads the count.
     ///
     /// `/dev/full` is the only portable way to make `write_all` fail on
     /// demand; it is Linux-only, and this is the one arm of `record` that

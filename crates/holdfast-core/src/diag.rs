@@ -2,7 +2,7 @@
 //! daemon, stderr *is* `daemon.log` (spec §9.2; review I-1, I-2).
 //!
 //! `spawn::start_detached` opens `daemon.log` and hands it to the child
-//! as fd 1 and fd 2, so every byte `clasp daemon run` writes to stderr is
+//! as fd 1 and fd 2, so every byte `holdfast daemon run` writes to stderr is
 //! persisted for §19.1's retention window. §9.2's table lists
 //! `daemon.log` as a **redacted** boundary — *"daemon.log error contexts
 //! (when they include byte excerpts) … routes byte excerpts through the
@@ -104,7 +104,7 @@ pub fn emit(message: &str) {
 /// `eprintln!`, redacted. The only sanctioned diagnostic producer.
 ///
 /// ```ignore
-/// holdfast_core::diag!("clasp daemon: accept failed: {e}");
+/// holdfast_core::diag!("holdfast daemon: accept failed: {e}");
 /// ```
 #[macro_export]
 macro_rules! diag {
@@ -141,12 +141,12 @@ pub(crate) fn panic_record(
 /// Replace the default panic hook with one that redacts.
 ///
 /// Idempotent, and installed from `main` so it covers **every**
-/// subcommand rather than the two the review named. `clasp daemon run`
-/// needs it because its stderr is literally `daemon.log`; `clasp mcp`
+/// subcommand rather than the two the review named. `holdfast daemon run`
+/// needs it because its stderr is literally `daemon.log`; `holdfast mcp`
 /// needs it because its stderr is what an MCP client surfaces as server
 /// logs, and because under `--no-daemon` the shim *is* the process
 /// holding the sessions. The remaining subcommands are short-lived, but
-/// a panic in `clasp logs` would print a session's bytes just as
+/// a panic in `holdfast logs` would print a session's bytes just as
 /// happily, and one install site is one thing to get right.
 pub fn install_panic_hook() {
     static ONCE: Once = Once::new();
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn a_credential_in_a_diagnostic_does_not_survive_rendering() {
         let rendered = render(&format!(
-            "clasp daemon: cannot read the config: token = {DIAG_SECRET}"
+            "holdfast daemon: cannot read the config: token = {DIAG_SECRET}"
         ));
         assert!(
             !rendered.contains(DIAG_SECRET),
@@ -299,7 +299,7 @@ mod tests {
         // `start_detached` does, because in the child that fd carries
         // *libtest's* report — including a repeat of the panic — and
         // that is the harness talking, not the daemon. Every producer
-        // `clasp daemon run` has is on stderr.
+        // `holdfast daemon run` has is on stderr.
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("diag::tests::the_child_that_writes_a_credential_to_daemon_log")
@@ -367,7 +367,7 @@ mod tests {
             return;
         }
         install_panic_hook();
-        crate::diag!("clasp daemon: cannot read the config: token = {DIAG_SECRET}");
+        crate::diag!("holdfast daemon: cannot read the config: token = {DIAG_SECRET}");
         panic!("the reaper died holding {PANIC_SECRET}");
     }
 }
