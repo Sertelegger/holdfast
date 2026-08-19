@@ -16,8 +16,13 @@
 //! names, so every commit on the branch compiles on its own.
 
 pub mod frames;
+pub mod handshake;
 
 pub use frames::{
     decode_server_frame, AttachMode, AttachRole, ClientFrame, ClientFrameKind, ServerFrame,
     SignalName, KNOWN_SERVER_TYPES,
+};
+pub use handshake::{
+    client_accepts_daemon, evaluate_attach, REJECT_LIMIT_REACHED, REJECT_PROTOCOL_TOO_NEW,
+    REJECT_PROTOCOL_TOO_OLD, REJECT_SESSION_NOT_FOUND,
 };
