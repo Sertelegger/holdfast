@@ -161,7 +161,9 @@ impl ClaspServer {
     /// indication is the outcome REQ-CFG-003 refuses for a config knob.
     ///
     /// The line on stderr stays, and is now the *diagnostic* rather than
-    /// the whole response to the failure.
+    /// the whole response to the failure. It goes out through
+    /// [`crate::diag!`]: the daemon builds its server here too, and the
+    /// daemon's stderr is `daemon.log`.
     pub fn with_audit_path(path: Option<PathBuf>) -> Self {
         Self::with_audit_path_and_config(path, &crate::config::Config::default())
     }
@@ -203,7 +205,15 @@ impl ClaspServer {
                 Ok(log) => (Arc::new(log), None),
                 Err(e) => {
                     let why = format!("cannot open audit log {}: {e}", p.display());
-                    eprintln!("clasp: {why}");
+                    // `diag!`, not `eprintln!`. The daemon builds its
+                    // server through this exact constructor, and the
+                    // daemon's stderr *is* `daemon.log` — a §9.2
+                    // redacted boundary — so this line lands in the log
+                    // file. `{e}` is an `io::Error` over a path the
+                    // operator chose; the redactor is what makes that
+                    // safe to persist rather than the shape of the
+                    // message.
+                    crate::diag!("clasp: {why}");
                     (Arc::new(AuditLog::disabled(Arc::clone(&rules))), Some(why))
                 }
             },

@@ -14,8 +14,12 @@
 //!
 //! - [`emit`], reached through the [`diag!`](crate::diag!) macro, is the
 //!   only sanctioned way to write a diagnostic. `clippy::print_stderr` is
-//!   **denied** across `daemon/` (see `daemon::mod`) so a re-introduced
-//!   `eprintln!` there is a build failure, not a review finding.
+//!   **denied at this crate's root** (see `lib.rs`) so a re-introduced
+//!   `eprintln!` anywhere in it is a build failure, not a review finding.
+//!   It was denied across `daemon/` alone, and that scope is what let
+//!   `mcp::` write a bare `eprintln!` into `daemon.log` for a whole
+//!   milestone with this sentence claiming otherwise — so the scope is
+//!   now asserted by a test in this module rather than by a sentence.
 //! - [`install_panic_hook`] replaces the default panic hook with one that
 //!   renders the same record and puts it through the same redactor.
 //!
