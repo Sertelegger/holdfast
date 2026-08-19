@@ -40,6 +40,8 @@ USAGE:
                                       Print a session's output
     holdfast attach <session>         Take over the session's terminal
                                       (detach with Ctrl-B then d)
+    holdfast watch <session>          Follow a session read-only and
+                                      redacted (detach with Ctrl+C)
     holdfast version                  Print version information
 
 ENVIRONMENT:
@@ -133,6 +135,12 @@ async fn run() -> ExitCode {
                 return usage_error("`attach` needs a session id or name");
             };
             commands::attach(session).await
+        }
+        Some("watch") => {
+            let Some(session) = args.get(1).filter(|a| !a.starts_with("--")) else {
+                return usage_error("`watch` needs a session id or name");
+            };
+            commands::watch(session).await
         }
         Some("version") => commands::version(),
         Some(other) => usage_error(&format!("unknown subcommand `{other}`")),

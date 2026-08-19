@@ -41,6 +41,13 @@
 //! same reading would suppress. Adding a fourth `Detached.reason` is
 //! equally wrong: it is a wire-shape change on a §23.3 surface the web
 //! UI mirrors verbatim.
+//!
+//! **The two reason sets are different sizes, deliberately.** §9.4's
+//! `attach_disconnect.reason` carries **four** values and §7.5's
+//! `Detached.reason` carries **three**: `client_detach` is audited and
+//! never put on the wire, because *"the client sent `Detach`; there is
+//! nobody left to tell."* [`Ending`] holds both derivations so they
+//! cannot be reconciled by accident in either direction.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -74,7 +81,7 @@ struct Handshake {
 /// The peer's credentials were checked by the accept loop **before this
 /// is reached and before a byte was parsed** (`daemon::attach_server`),
 /// which is the same ordering `control.sock` uses.
-pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
+pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>, peer_uid: u32) {
     let (mut rd, mut wr) = stream.into_split();
 
     let Some(hs) = read_handshake(&mut rd, &mut wr).await else {
@@ -133,6 +140,29 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
     // and it loses it *silently*: the frames still arrive in the right
     // order, so an ordering-only assertion cannot see it.
     let output = session.subscribe();
+    // **The event subscriptions are taken here too, and this is a fix
+    // rather than tidiness.** They used to be taken where the tasks are
+    // spawned, which is *after* the `is_awaiting_secret()` replay check
+    // below — so an `AwaitingSecretEntered` edge that fired between the
+    // check and the subscription was lost by this connection entirely:
+    // the check saw `false`, and the subscription arrived too late for a
+    // broadcast that keeps nothing for receivers that do not yet exist.
+    //
+    // The window was a few instructions wide and the suite never lost
+    // it, until §9.4's `attach_connect` write landed between the two and
+    // made it ~1.5 ms — at which point
+    // `a_secret_submitted_over_attach_reaches_the_child_and_none_of_the_surfaces`
+    // failed 3/3 in isolation, having passed 5/5 the commit before.
+    // Measured by bisection, not inferred: removing the audit write
+    // restored it, and moving the subscription above the check fixes it
+    // with the write still there.
+    //
+    // Taken **before** the check, so the ordering is now the safe one:
+    // an edge before the check is caught by the check, an edge after it
+    // is caught by the subscription, and an edge *between* them is
+    // caught by both — which is what `replayed` below de-duplicates.
+    let exit_events = session.subscribe_events();
+    let secret_events = session.subscribe_events();
 
     let (tx, rx) = mpsc::channel::<ServerFrame>(ATTACH_QUEUE_FRAMES);
     let conn = Arc::new(AttachConn {
@@ -142,6 +172,8 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
         role: hs.role,
         client_kind: hs.client_kind,
         client_version: hs.client_version,
+        peer_pid,
+        peer_uid,
         tx: tx.clone(),
         connected_at: Instant::now(),
     });
@@ -162,10 +194,12 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
     // then the first client to arrive is the first that could have raised
     // it. Idempotent, so an existing request is returned unchanged and
     // every client sees one `request_id`.
+    let mut replayed: Option<String> = None;
     if session.is_awaiting_secret() {
         let (req, _first) = daemon
             .attach_hub()
             .raise_secret(&session.id, &session.prompt_last_line_redacted());
+        replayed = Some(req.request_id.clone());
         if tx
             .send(ServerFrame::AwaitingSecret {
                 request_id: req.request_id,
@@ -183,6 +217,22 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
     // is not an attached client, and `daemon/status` counting it would
     // report clients on a session nobody is watching.
     daemon.attach_hub().register(Arc::clone(&conn));
+
+    // §9.4's `attach_connect`, **after** a successful `Attached` and
+    // never for a rejected attach: every refusal above returned before
+    // reaching this line, so "a reject is not a connection" is structural
+    // rather than a condition somebody has to remember. The surface is
+    // derived server-side — `client_kind` off the uid-checked handshake,
+    // the uid from `SO_PEERCRED` — the same rule `mcp::caller` follows
+    // for the control socket.
+    daemon.server.processor.audit.record_attach_connect(
+        &conn.session_id,
+        conn.client_kind.as_str(),
+        conn.mode.as_str(),
+        conn.role.as_str(),
+        conn.peer_pid,
+        conn.peer_uid,
+    );
 
     // **§9.2's split is by role, and the role is read off the frame.**
     // Not from `client_kind` (which is attribution only, derived
@@ -203,40 +253,146 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
     let mut forwarder = tokio::spawn(forward_output(
         conn.session_id.clone(),
         output,
+        exit_events,
         tx.clone(),
         redactor,
     ));
     let events = tokio::spawn(forward_events(
         Arc::clone(&daemon),
         conn.session_id.clone(),
-        session.subscribe_events(),
+        secret_events,
         tx.clone(),
+        replayed,
     ));
+    let mut shutdown = daemon.shutdown_signalled();
 
-    // Either half can end the connection. The forwarder ends it when
-    // this client stopped draining (§4.3's slow consumer) or when the
-    // socket died under the writer; without the `select!` a detached
-    // slow consumer would keep its read half open forever, because the
-    // read loop holds a `Sender` and the writer only stops when every
-    // `Sender` is gone.
-    tokio::select! {
-        () = read_loop(&daemon, &session, &conn, &mut rd, &tx) => {}
-        _ = &mut forwarder => {}
-    }
+    // Any of four things can end the connection, and §9.4 names all four
+    // while §7.5 puts only three of them on the wire.
+    //
+    // **`biased`, and the order is the tie-break.** A `daemon/stop` that
+    // kills a session makes `daemon_shutdown` and `session_exit` both
+    // true; §7.5 says the shutdown wins, and picking whichever future
+    // happened to be polled first is exactly the race REQ-D-009 forbids.
+    // The `shutdown_requested()` re-check below closes the other half of
+    // it — the watch flips only after the graceful stop's grace, so an
+    // exit observed *during* that grace reaches the forwarder first.
+    let ending = tokio::select! {
+        biased;
+        _ = shutdown.changed() => Ending::DaemonShutdown,
+        forwarded = &mut forwarder => match forwarded {
+            Ok(Forwarded::SessionExit) => Ending::SessionExit,
+            // A forwarder that ended any other way ended because this
+            // client stopped draining (§4.3) or because the socket died
+            // under the writer. Either way the attachment is over.
+            _ => Ending::SlowConsumer,
+        },
+        // Last, and only because the two above are cheap channel waits
+        // that park immediately. Without the `select!` at all, a detached
+        // slow consumer would keep its read half open forever: the read
+        // loop holds a `Sender` and the writer only stops when every
+        // `Sender` is gone.
+        () = read_loop(&daemon, &session, &conn, &mut rd, &tx) => Ending::ClientDetach,
+    };
+    let ending = match ending {
+        Ending::SessionExit if daemon.shutdown_requested() => Ending::DaemonShutdown,
+        other => other,
+    };
 
     daemon
         .attach_hub()
         .unregister(&conn.session_id, conn.client_id);
 
+    // **The one place `Detached` is emitted**, for all three of its wire
+    // reasons. `client_detach` is deliberately absent — §7.5: *"The
+    // client sent `Detach`; there is nobody left to tell."* Adding it
+    // would turn a closed set of three into four on a §23.3 surface the
+    // web UI mirrors verbatim, and it is exactly the change that looks
+    // like completing a set.
+    //
+    // `try_send` and not `send().await`: on the `slow_consumer` path the
+    // queue only filled because the *socket* is full, so the writer is
+    // already parked and a frame appended behind it has nowhere to go.
+    // The frame is best effort and genuinely may not arrive there; what
+    // that client observes is the close. On the other two paths the
+    // queue is empty and it arrives.
+    if let Some(reason) = ending.wire_reason() {
+        let _ = tx.try_send(ServerFrame::Detached {
+            reason: reason.to_string(),
+        });
+    }
+
+    // §9.4's `attach_disconnect`, paired with the `attach_connect` above
+    // and carrying `role` for the reason REQ-SEC-008a gives: the two
+    // entries share no connection identifier, so the role is what makes
+    // "did this client receive raw output, and for how long?" answerable.
+    daemon.server.processor.audit.record_attach_disconnect(
+        &conn.session_id,
+        conn.client_kind.as_str(),
+        conn.mode.as_str(),
+        conn.role.as_str(),
+        ending.audit_reason(),
+        conn.connected_at.elapsed().as_secs_f64(),
+    );
+
     // Dropping every `Sender` ends the write loop, which drains what is
-    // still queued and *then* closes the socket — so a `ProtocolError`
-    // written on the way out reaches the client before the EOF that
-    // follows it.
+    // still queued and *then* closes the socket — so the `Detached` above
+    // (and a `ProtocolError` written on the way out) reaches the client
+    // before the EOF that follows it.
     forwarder.abort();
     events.abort();
     drop(tx);
     drop(conn);
     let _ = writer.await;
+}
+
+/// Why one attachment ended.
+///
+/// **The two reason sets are different sizes and that is the point.**
+/// §9.4's `attach_disconnect.reason` has four values; §7.5's
+/// `Detached.reason` has three. `client_detach` is in the audit set and
+/// deliberately not on the wire. Keeping both derivations on one enum is
+/// what stops the sets being reconciled by accident in either direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// The client sent `Detach`, or its socket went away.
+    ClientDetach,
+    /// §4.3: this client stopped draining its bounded queue.
+    SlowConsumer,
+    /// The child ended (REQ-D-009).
+    SessionExit,
+    /// A shutdown was asked for. **Outranks `SessionExit`** when both are
+    /// true, per §7.5.
+    DaemonShutdown,
+}
+
+impl Ending {
+    /// §9.4's `attach_disconnect.reason` — all four.
+    fn audit_reason(self) -> &'static str {
+        match self {
+            Self::ClientDetach => "client_detach",
+            Self::SlowConsumer => "slow_consumer",
+            Self::SessionExit => "session_exit",
+            Self::DaemonShutdown => "daemon_shutdown",
+        }
+    }
+
+    /// §7.5's `Detached.reason` — three, and `None` for the fourth.
+    fn wire_reason(self) -> Option<&'static str> {
+        match self {
+            Self::ClientDetach => None,
+            Self::SlowConsumer => Some("slow_consumer"),
+            Self::SessionExit => Some("session_exit"),
+            Self::DaemonShutdown => Some("daemon_shutdown"),
+        }
+    }
+}
+
+/// How [`forward_output`] stopped.
+enum Forwarded {
+    /// The child ended, and `SessionExited { code }` has been queued.
+    SessionExit,
+    /// This client stopped draining, or the queue went away with it.
+    Stopped,
 }
 
 /// Read the mandatory first frame, answering §7.5's two pre-handshake
@@ -596,13 +752,60 @@ async fn write_loop(mut wr: tokio::net::unix::OwnedWriteHalf, mut rx: mpsc::Rece
 async fn forward_output(
     session_id: String,
     mut output: tokio::sync::broadcast::Receiver<crate::session::OutputFrame>,
+    mut exits: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
     tx: mpsc::Sender<ServerFrame>,
     mut redactor: Option<super::redact_stream::StreamRedactor>,
-) {
+) -> Forwarded {
     use tokio::sync::broadcast::error::RecvError;
     use tokio::sync::mpsc::error::TrySendError;
     loop {
-        match output.recv().await {
+        // **`biased`, output first, and it is what orders the two
+        // channels against each other.** The child's last bytes and its
+        // death arrive on different broadcasts, published in that order
+        // by the same reader thread — so by the time `Exited` is
+        // readable the final `Output` is already queued behind it here.
+        // Polling output first drains it before the exit is acted on,
+        // which is what makes §7.5's *"`SessionExited` before the view is
+        // torn down"* an ordering of the child's own bytes and not just
+        // of two frames.
+        let next = tokio::select! {
+            biased;
+            r = output.recv() => Either::Output(r),
+            r = exits.recv() => Either::Event(r),
+        };
+        let next = match next {
+            Either::Output(r) => r,
+            // §7.5's exit sequence starts here. Everything the redactor
+            // is still carrying is flushed **first** — a session that
+            // died mid-token must not silently swallow its last line —
+            // and `flush` emits nothing while withholding, which is the
+            // half that keeps this path from becoming the leak the carry
+            // bound exists to stop.
+            Either::Event(Ok(crate::session::SessionEvent::Exited { code })) => {
+                if let Some(tail) = redactor.as_mut().map(|r| r.flush()) {
+                    if !tail.is_empty() {
+                        let _ = tx.try_send(ServerFrame::Output {
+                            session: session_id.clone(),
+                            bytes: tail,
+                        });
+                    }
+                }
+                let _ = tx.try_send(ServerFrame::SessionExited { code });
+                return Forwarded::SessionExit;
+            }
+            // The secret edges belong to `forward_events`, which is the
+            // task that can reach the hub. Ignored rather than matched
+            // exhaustively-by-accident: a future event variant must not
+            // silently become an exit.
+            Either::Event(Ok(_)) => continue,
+            // An edge is not a stream; a lag on this channel loses an
+            // edge that a later one re-synchronises. `Closed` cannot
+            // happen while the `Session` lives, and if it does there is
+            // no exit to report.
+            Either::Event(Err(RecvError::Lagged(_))) => continue,
+            Either::Event(Err(RecvError::Closed)) => return Forwarded::Stopped,
+        };
+        match next {
             Ok(f) => {
                 // **The single conversion point to the wire `Output`
                 // frame is also the single redaction point**, for the
@@ -626,15 +829,16 @@ async fn forward_output(
                 match tx.try_send(frame) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
+                        // The `Detached { reason: "slow_consumer" }` is
+                        // **not** written here. `run` writes all three
+                        // wire reasons at one place, so the closed set of
+                        // three cannot grow a fourth in a corner.
                         crate::diag!(
                             "holdfast daemon: detaching a slow attach client on {session_id}"
                         );
-                        let _ = tx.try_send(ServerFrame::Detached {
-                            reason: "slow_consumer".to_string(),
-                        });
-                        return;
+                        return Forwarded::Stopped;
                     }
-                    Err(TrySendError::Closed(_)) => return,
+                    Err(TrySendError::Closed(_)) => return Forwarded::Stopped,
                 }
             }
             // §4.3: *"Attach clients that are only rendering live bytes
@@ -645,19 +849,14 @@ async fn forward_output(
             Err(RecvError::Lagged(n)) => {
                 crate::diag!("holdfast daemon: attach client on {session_id} lagged {n} frames");
             }
+            // **The second flush trigger, and the one that hardly ever
+            // fires.** The output broadcast is closed only when the
+            // `Session` itself is dropped — the `Session` keeps its own
+            // `Sender`, so a child that merely exits does not close it —
+            // which is why `SessionEvent::Exited` above is the trigger
+            // that matters and this one is the backstop for a session
+            // torn out from under a live connection.
             Err(RecvError::Closed) => {
-                // End of stream: whatever the redactor is still carrying
-                // is emitted here, redacted as far as it can be, so a
-                // session that dies mid-token does not silently swallow
-                // its last line. `flush` emits nothing while withholding,
-                // which is the half that keeps the exit path from
-                // becoming the leak the carry bound exists to stop.
-                //
-                // **This is the only trigger that exists**: §7.5's
-                // `SessionExited { code }` has no producer anywhere in
-                // the tree at this commit, so there is no "on
-                // `SessionExited`" to hang the flush off yet. Whichever
-                // task adds that frame owns calling `flush` before it.
                 if let Some(tail) = redactor.as_mut().map(|r| r.flush()) {
                     if !tail.is_empty() {
                         let _ = tx.try_send(ServerFrame::Output {
@@ -666,10 +865,20 @@ async fn forward_output(
                         });
                     }
                 }
-                return;
+                return Forwarded::Stopped;
             }
         }
     }
+}
+
+/// Which of [`forward_output`]'s two channels produced the next item.
+///
+/// A named type rather than a tuple of `Option`s, so the `match` below
+/// is exhaustive over the *sources* and adding a third channel is a
+/// compile error rather than a silently unhandled arm.
+enum Either {
+    Output(Result<crate::session::OutputFrame, tokio::sync::broadcast::error::RecvError>),
+    Event(Result<crate::session::SessionEvent, tokio::sync::broadcast::error::RecvError>),
 }
 
 /// Turn this session's non-output edges into §7.5 frames for one
@@ -681,11 +890,17 @@ async fn forward_output(
 /// the same one back — which is what makes one request reach every
 /// client without a designated leader, and what lets a client that
 /// attached *after* the drop raise the request nobody was there to raise.
+/// `replayed` is the `request_id` [`run`] already sent as §7.5's replay,
+/// if it sent one. The subscription is taken *before* that check, so an
+/// edge landing between the two reaches both — and this is what stops the
+/// client seeing the same `request_id` twice and re-prompting for a
+/// password it has already been asked for.
 async fn forward_events(
     daemon: Arc<Daemon>,
     session_id: String,
     mut events: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
     tx: mpsc::Sender<ServerFrame>,
+    mut replayed: Option<String>,
 ) {
     use crate::session::SessionEvent;
     use tokio::sync::broadcast::error::RecvError;
@@ -693,6 +908,13 @@ async fn forward_events(
         match events.recv().await {
             Ok(SessionEvent::AwaitingSecretEntered { prompt_text }) => {
                 let (req, _first) = daemon.attach_hub().raise_secret(&session_id, &prompt_text);
+                // Exactly one suppression, and only of the id `run`
+                // already sent. A *superseded* request gets a fresh id
+                // from `SecretRequest::new`, so this cannot swallow a
+                // later prompt.
+                if replayed.take().is_some_and(|id| id == req.request_id) {
+                    continue;
+                }
                 if tx
                     .send(ServerFrame::AwaitingSecret {
                         request_id: req.request_id,
@@ -712,6 +934,12 @@ async fn forward_events(
                     broadcast_secret_closed(&daemon, &session_id, &req.request_id, "cancelled");
                 }
             }
+            // **The exit is `forward_output`'s, not this task's**, and
+            // the reason is the redactor: it lives in that task, one per
+            // connection, and §7.5's `SessionExited` must come after its
+            // flush. Two tasks queueing on the same FIFO could not order
+            // a flush against a frame without a rendezvous neither needs.
+            Ok(SessionEvent::Exited { .. }) => {}
             // An edge is not a stream: a connection that fell behind has
             // already been re-synchronised by the next edge, and the slot
             // it would have read is still in the hub.
@@ -890,7 +1118,13 @@ mod tests {
         );
 
         let (tx, mut out) = mpsc::channel::<ServerFrame>(4096);
-        let forwarder = tokio::spawn(forward_output("sess_x".to_string(), rx, tx, None));
+        let forwarder = tokio::spawn(forward_output(
+            "sess_x".to_string(),
+            rx,
+            session.subscribe_events(),
+            tx,
+            None,
+        ));
         inner.queue_output(b"Z");
 
         let mut delivered = 0usize;

@@ -60,6 +60,18 @@ pub struct OutputFrame {
 /// real PTY blocks in `read`, so this never costs anything in production.
 const READER_IDLE_POLL: Duration = Duration::from_millis(5);
 
+/// How long the reader thread waits, **after** its read loop has ended,
+/// for the child to be reaped before it gives up on naming an exit code.
+///
+/// The master's `EIO` and the `WNOHANG` wait that produces the code are
+/// two different observations of the same death, and on Linux the first
+/// routinely precedes the second. `SessionEvent::Exited` is emitted once
+/// and a client believes the number, so the wait buys the difference
+/// between a correct code and `-1`. It is bounded because a read that
+/// failed for some *other* reason must not park this thread against a
+/// child that is still running.
+const EXIT_REAP_GRACE: Duration = Duration::from_millis(250);
+
 pub fn new_session_id() -> SessionId {
     let u = uuid::Uuid::new_v4().simple().to_string();
     format!("sess_{}", &u[..12])
@@ -339,6 +351,21 @@ pub enum SessionEvent {
     AwaitingSecretEntered { prompt_text: String },
     /// Echo came back without a submission — §5.2's supersede case.
     AwaitingSecretLeft,
+    /// The child ended. **The only place in the tree where a session's
+    /// exit is an *event* rather than a poll.**
+    ///
+    /// Everything else observes death by asking — `Session::state()`
+    /// latches `Exited(code)` lazily when somebody looks, the idle reaper
+    /// sweeps every 30 s, `daemon/status` compares a set on its own tick.
+    /// §7.5's `SessionExited { code }` is not a poll: it is one frame,
+    /// once, before the `Detached { reason: "session_exit" }` that tears
+    /// the view down, and REQ-D-009 fixes that order because it is what
+    /// lets a renderer show the exit code before the pane closes.
+    ///
+    /// Raised from the reader thread, which is the one place that finds
+    /// out promptly: it is parked in a blocking `read` on the master, and
+    /// the master reports the child's end by failing that read.
+    Exited { code: i32 },
 }
 
 /// How many session events a slow attach connection may fall behind
@@ -673,6 +700,50 @@ impl Session {
                 // Two atomics rather than one derived read, because the
                 // reaper's sweep must not have to hold anything.
                 deadline.store(deadline_from(at, idle_timeout_ms), Ordering::Relaxed);
+            }
+
+            // **§7.5's `SessionExited { code }`, at the one place a
+            // session's end is observed rather than asked about.**
+            //
+            // The loop above leaves for three reasons and only one of
+            // them is an exit: the `Session` was dropped while we idled,
+            // a `Weak` failed to upgrade for the same reason, or the
+            // child ended. A reader that stopped because the session went
+            // away has no exit to announce and nobody left to hear it, so
+            // that case is separated out first and costs nothing.
+            //
+            // **The loop ending is not the same event as the child being
+            // reaped, and the difference is the whole of this block.** On
+            // Linux the master reports the slave's last close as `EIO`,
+            // which ends the `while let Ok(n)` immediately — while
+            // `exit_code` comes from a `WNOHANG` wait that may not have
+            // seen the child yet. Emitting on the read failure alone
+            // would report `-1` for a child that exited `7`, and a client
+            // believes an exit code. So the wait is given a bounded
+            // moment, the same concession `mcp::tools`'s terminate path
+            // already makes for the same reason. Bounded, because a
+            // `read` that failed for some other cause must not park this
+            // thread for the life of a live session.
+            if weak_buffer.strong_count() > 0 {
+                let reap_by = std::time::Instant::now() + EXIT_REAP_GRACE;
+                while reader_backend.is_alive() && std::time::Instant::now() < reap_by {
+                    std::thread::sleep(READER_IDLE_POLL);
+                }
+                if !reader_backend.is_alive() {
+                    // **The same derivation `Session::state()` uses**, in
+                    // the same order: `backend.exit_code()`, else `-1`.
+                    // Two surfaces report this child's end — this frame
+                    // and `Attached.exit_code` — and a second expression
+                    // here is how they would come to disagree about the
+                    // same child. `-1` is reachable only when the OS
+                    // could not give a status at all, and it is what
+                    // `SessionState::Exited` already carries in that case.
+                    let code = reader_backend.exit_code().unwrap_or(-1);
+                    // A `broadcast::Sender` with no live receivers returns
+                    // `Err`, which here means "nobody was attached" and is
+                    // not a failure.
+                    let _ = events_tx.send(SessionEvent::Exited { code });
+                }
             }
         });
 

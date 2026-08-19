@@ -35,6 +35,23 @@ pub enum AttachMode {
     ReadOnly,
 }
 
+impl AttachMode {
+    /// The wire spelling, and therefore §9.4's `mode` column.
+    ///
+    /// Beside the type rather than at the audit call site, so the token
+    /// the log records and the token the wire carries cannot drift: this
+    /// enum has no `rename_all`, so CamelCase **is** the serialisation.
+    /// §7.5 notes that the CamelCase is inherited from §4.3 and *"is not
+    /// a pattern to copy"* — which is exactly why it needs writing down
+    /// once rather than retyping at every site.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadWrite => "ReadWrite",
+            Self::ReadOnly => "ReadOnly",
+        }
+    }
+}
+
 /// Whether a connection receives raw or redacted bytes (§7.5, §9.2,
 /// REQ-SEC-008a).
 ///
@@ -65,6 +82,20 @@ pub enum AttachRole {
     /// Task 13 Step 5's `-D warnings` makes fatal.
     #[default]
     Observer,
+}
+
+impl AttachRole {
+    /// The wire spelling, and therefore §9.4's `role` column — which is
+    /// on **both** attach rows (REQ-SEC-008a), because the two entries
+    /// share no connection identifier and "did this client receive raw
+    /// output, and for how long?" would otherwise mean pairing connects
+    /// to disconnects by ordering and hoping.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Observer => "observer",
+        }
+    }
 }
 
 /// Client → server (§7.5).

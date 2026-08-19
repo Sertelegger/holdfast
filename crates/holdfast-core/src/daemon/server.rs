@@ -139,6 +139,28 @@ pub struct Daemon {
     paths: RuntimePaths,
     started_at: Instant,
     shutdown_tx: watch::Sender<bool>,
+    /// **Raised the instant a shutdown is *asked for*, which is strictly
+    /// earlier than `shutdown_tx` flips.**
+    ///
+    /// Not a second opinion about whether the daemon is stopping — it is
+    /// the same fact at a different moment, and the two moments are both
+    /// load-bearing:
+    ///
+    /// * `shutdown_tx` flipping is what ends the accept loops, and
+    ///   `serve_daemon` returning is what ends the **process**
+    ///   ([`run_with_config`]). It therefore cannot move earlier:
+    ///   `shutdown_graceful` is `await`ed from inside a `daemon/stop`
+    ///   dispatch, so flipping the watch at entry would let the process
+    ///   tear down during the ten-second grace and the caller would get
+    ///   an `Eof` where §7.4.1 promises a `StopOutcome`. Measured against
+    ///   this file's own structure, not assumed.
+    /// * REQ-D-009 needs the earlier moment. A `daemon/stop` SIGTERMs
+    ///   every session first; a child that dies of it is an exit **and** a
+    ///   shutdown, §7.5 says `daemon_shutdown` outranks `session_exit`,
+    ///   and an attach connection deciding from `shutdown_tx` would report
+    ///   `session_exit` for the whole of the grace. Picking whichever
+    ///   fired first is exactly the race REQ-D-009 exists to forbid.
+    shutdown_requested: std::sync::atomic::AtomicBool,
     connections: AtomicU64,
     /// Connections accepted and not yet finished with.
     ///
@@ -282,6 +304,7 @@ impl Daemon {
             // rather than the window.
             started_at: clock.now(),
             shutdown_tx,
+            shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             connections: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
             owner_uid,
@@ -428,6 +451,8 @@ impl Daemon {
     /// belt-and-braces call at the end of [`run`]. The graceful form is
     /// [`Daemon::shutdown_graceful`].
     pub fn shutdown(&self) -> u64 {
+        self.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut terminated = 0;
         for session in self.server.registry.all() {
             if session.is_alive() {
@@ -451,6 +476,11 @@ impl Daemon {
     /// ignore SIGTERM (§4.4) and always reach the escalation; the
     /// reaper's grace covers one session at a time.
     pub async fn shutdown_graceful(&self, grace: Duration) -> u64 {
+        // **Before the first SIGTERM**, so a child that dies of it is
+        // already known to be dying *because* of a shutdown. See the
+        // field's own note for why the `watch` cannot move here too.
+        self.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let live: Vec<_> = self
             .server
             .registry
@@ -587,6 +617,23 @@ impl Daemon {
     /// [`shutdown_signalled`]: Daemon::shutdown_signalled
     pub fn is_shutting_down(&self) -> bool {
         *self.shutdown_tx.borrow()
+    }
+
+    /// Has a shutdown been **asked for**? True from the first statement
+    /// of [`Daemon::shutdown`] and [`Daemon::shutdown_graceful`], which
+    /// is before either has signalled or killed anything.
+    ///
+    /// REQ-D-009's tie-break reads this and not [`is_shutting_down`]:
+    /// when a `daemon/stop` ends a session, both `daemon_shutdown` and
+    /// `session_exit` are true and §7.5 fixes which one the wire carries.
+    /// The `watch` flips only *after* the grace, so deciding from it
+    /// would answer `session_exit` for every child that died of the
+    /// SIGTERM the shutdown itself sent.
+    ///
+    /// [`is_shutting_down`]: Daemon::is_shutting_down
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// §19.1's periodic half: rotate, retire, and **reopen**.

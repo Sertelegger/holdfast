@@ -2532,3 +2532,466 @@ async fn wait_for_written(pty: &Arc<MockPty>, needle: &[u8]) {
         String::from_utf8_lossy(&pty.written())
     );
 }
+
+// ------------------------------------ Task 12: §9.4's two attach rows
+//
+// The audit trail is the only record that an attachment happened at all:
+// `Attached` and `Detached` are frames on a socket nobody keeps, and
+// `daemon/status`'s `attach_clients` is an instantaneous count. §9.4's
+// pair is what makes "who watched this session, in which mode, seeing raw
+// or redacted bytes, and for how long" answerable after the fact.
+
+/// Every audit line of one `kind`, parsed, polled until `want` of them
+/// exist or a deadline elapses.
+///
+/// The write happens on the daemon's own task, so a single read taken
+/// straight after the frame that caused it is a race. Returning what it
+/// found rather than panicking lets a caller assert **fewer** rows than
+/// it asked for, which is what the negative rows below need.
+async fn audit_entries(d: &TestDaemon, kind: &str, want: usize) -> Vec<serde_json::Value> {
+    let path = d.paths.audit_log();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        // `unwrap_or_default`: the file does not exist until something
+        // has been recorded, which for a negative row is the point.
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let found: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["kind"] == kind)
+            .collect();
+        if found.len() >= want || tokio::time::Instant::now() >= deadline {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The `role` of each row, sorted, so two clients can be compared without
+/// depending on which of them the daemon logged first.
+fn roles_of(rows: &[serde_json::Value]) -> Vec<String> {
+    let mut r: Vec<String> = rows
+        .iter()
+        .map(|e| e["role"].as_str().unwrap_or("<no role field>").to_string())
+        .collect();
+    r.sort();
+    r
+}
+
+#[tokio::test]
+async fn both_attach_audit_rows_carry_the_role() {
+    // REQ-SEC-008a's audit clause. §9.4 carries `role` on **both** rows
+    // and a normative paragraph beneath the table says so in as many
+    // words, because the two entries share no connection identifier:
+    // without it, "did this client receive raw output, and for how long?"
+    // means pairing connects to disconnects by ordering and hoping.
+    //
+    // Two clients whose roles **differ** while their `client_kind`
+    // agrees, which is what stops a hardcoded `"observer"` passing.
+    let d = TestDaemon::start("auditrole").await;
+    let (s, _pty) = d.session(None);
+
+    let mut raw = d.dial().await;
+    send(
+        &mut raw,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Interactive),
+    )
+    .await;
+    assert!(matches!(recv(&mut raw).await, ServerFrame::Attached { .. }));
+
+    let mut obs = d.dial().await;
+    send(
+        &mut obs,
+        &attach_as(&s.id, AttachMode::ReadOnly, AttachRole::Observer),
+    )
+    .await;
+    assert!(matches!(recv(&mut obs).await, ServerFrame::Attached { .. }));
+
+    send(&mut raw, &ClientFrame::Detach).await;
+    send(&mut obs, &ClientFrame::Detach).await;
+    expect_eof(&mut raw, "after Detach").await;
+    expect_eof(&mut obs, "after Detach").await;
+
+    let connects = audit_entries(&d, "attach_connect", 2).await;
+    let disconnects = audit_entries(&d, "attach_disconnect", 2).await;
+    assert_eq!(connects.len(), 2, "attach_connect rows: {connects:?}");
+    assert_eq!(
+        disconnects.len(),
+        2,
+        "attach_disconnect rows: {disconnects:?}"
+    );
+
+    assert_eq!(
+        roles_of(&connects),
+        vec!["interactive".to_string(), "observer".to_string()],
+        "attach_connect: {connects:?}"
+    );
+    assert_eq!(
+        roles_of(&disconnects),
+        vec!["interactive".to_string(), "observer".to_string()],
+        "attach_disconnect is the half a connect-only assertion cannot \
+         see, and rev. 33's normative paragraph exists to prevent exactly \
+         its omission: {disconnects:?}"
+    );
+    // The other half of the pairing: the two clients agree about
+    // `client_kind`, so a row that reported `role` by copying
+    // `client_kind` would have produced two identical values above.
+    for row in connects.iter().chain(disconnects.iter()) {
+        assert_eq!(row["client_kind"].as_str(), Some("cli"), "{row:?}");
+    }
+    // And `mode` is recorded independently of `role` (§7.5's
+    // orthogonality): one client is ReadWrite/interactive, the other
+    // ReadOnly/observer, so a `mode` derived from `role` would still
+    // agree here — but a `mode` that was dropped entirely would not.
+    let mut modes: Vec<String> = connects
+        .iter()
+        .map(|e| e["mode"].as_str().unwrap_or("<no mode>").to_string())
+        .collect();
+    modes.sort();
+    assert_eq!(
+        modes,
+        vec!["ReadOnly".to_string(), "ReadWrite".to_string()],
+        "§9.4's `mode` column is CamelCase, the wire spelling: {connects:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_attach_writes_no_audit_entry() {
+    // §9.4: the row is written **after** a successful `Attached`. Logging
+    // at accept time would make the trail count probes as connections.
+    //
+    // **With a positive control on the same daemon**, because "no
+    // `attach_connect` line" is also what a daemon that never writes one
+    // produces.
+    let d = TestDaemon::start("auditreject").await;
+    let (s, _pty) = d.session(None);
+
+    let mut bad = d.dial().await;
+    send(&mut bad, &attach_to("no-such-session")).await;
+    assert!(matches!(
+        recv(&mut bad).await,
+        ServerFrame::AttachReject { .. }
+    ));
+    expect_eof(&mut bad, "a rejected attach").await;
+
+    let mut good = d.dial().await;
+    send(&mut good, &attach_to(&s.id)).await;
+    assert!(matches!(
+        recv(&mut good).await,
+        ServerFrame::Attached { .. }
+    ));
+
+    let rows = audit_entries(&d, "attach_connect", 1).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly the accepted attach is a connection: {rows:?}"
+    );
+    assert_eq!(
+        rows[0]["session_id"].as_str(),
+        Some(s.id.as_str()),
+        "the one row must be the accepted one: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_audit_entry_names_the_client_kind_from_the_handshake() {
+    // §9.4: `client_kind` comes from the handshake on a uid-checked
+    // connection — attribution, never authorisation, and *"must never
+    // become a redaction switch"*. The **uid** beside it is the checked
+    // one, whatever the client said about itself.
+    //
+    // Also the `ClientKind::Shim` decision: §9.4's column enumerates
+    // `"cli" | "ui-bridge"` and the third variant exists. It is
+    // **accepted and recorded verbatim** — refusing a connection over an
+    // attribution field would make the log's honesty a connectivity
+    // requirement, and the column is the expected set rather than a
+    // validator.
+    let d = TestDaemon::start("auditkind").await;
+    let (s, _pty) = d.session(None);
+
+    for kind in [ClientKind::UiBridge, ClientKind::Shim] {
+        let mut c = d.dial().await;
+        send(
+            &mut c,
+            &ClientFrame::Attach {
+                session: s.id.clone(),
+                mode: AttachMode::ReadOnly,
+                role: AttachRole::Observer,
+                client_kind: kind,
+                client_version: "test".into(),
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+            },
+        )
+        .await;
+        assert!(
+            matches!(recv(&mut c).await, ServerFrame::Attached { .. }),
+            "{kind:?} must be accepted: the field is attribution, not \
+             authorisation"
+        );
+        send(&mut c, &ClientFrame::Detach).await;
+        expect_eof(&mut c, "after Detach").await;
+    }
+
+    let rows = audit_entries(&d, "attach_connect", 2).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let mut kinds: Vec<String> = rows
+        .iter()
+        .map(|e| e["client_kind"].as_str().unwrap_or("<none>").to_string())
+        .collect();
+    kinds.sort();
+    assert_eq!(
+        kinds,
+        vec!["shim".to_string(), "ui-bridge".to_string()],
+        "recorded verbatim, as declared: {rows:?}"
+    );
+
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    for row in &rows {
+        assert_eq!(
+            row["peer_uid"].as_u64(),
+            Some(u64::from(me)),
+            "the uid is the kernel's, not the client's: {row:?}"
+        );
+    }
+}
+
+/// The next `Detached` on this connection, skipping whatever legitimately
+/// precedes it.
+///
+/// `SessionExited` *does* precede it on the exit path, and an `Output`
+/// may. Fails on a deadline rather than hanging.
+async fn next_detached(c: &mut UnixStream, secs: u64) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        match recv(c).await {
+            ServerFrame::Detached { reason } => return reason,
+            ServerFrame::Output { .. }
+            | ServerFrame::SessionExited { .. }
+            | ServerFrame::Resize { .. } => {}
+            other => panic!("expected Detached, got {other:?}"),
+        }
+    }
+    panic!("no Detached arrived within {secs}s");
+}
+
+#[tokio::test]
+async fn each_disconnect_reason_is_recorded_once() {
+    // All four §9.4 values, each reachable and each producing exactly one
+    // row. Four daemons, because two of the four end the daemon or the
+    // session and a shared audit file could not tell whose row was whose.
+
+    // 1. client_detach — audited, and deliberately **not** a wire value.
+    {
+        let d = TestDaemon::start("reasondetach").await;
+        let (s, _pty) = d.session(None);
+        let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+        send(&mut c, &ClientFrame::Detach).await;
+        expect_eof(&mut c, "client detach").await;
+        let rows = audit_entries(&d, "attach_disconnect", 1).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reason"].as_str(), Some("client_detach"));
+        assert!(
+            rows[0]["duration_secs"].as_f64().unwrap_or(0.0) > 0.0,
+            "a zero duration means the connect time was never recorded: {:?}",
+            rows[0]
+        );
+    }
+
+    // 2. session_exit.
+    {
+        let d = TestDaemon::start("reasonexit").await;
+        let (_s, pty) = d.session(None);
+        let mut c = attach_ok(&d, &_s.id, AttachMode::ReadWrite).await;
+        pty.exit(7);
+        assert_eq!(next_detached(&mut c, 10).await, "session_exit");
+        let rows = audit_entries(&d, "attach_disconnect", 1).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reason"].as_str(), Some("session_exit"));
+        assert!(rows[0]["duration_secs"].as_f64().unwrap_or(0.0) > 0.0);
+    }
+
+    // 3. daemon_shutdown.
+    {
+        let d = TestDaemon::start("reasonshutdown").await;
+        let (s, _pty) = d.session(None);
+        let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+        d.daemon.shutdown();
+        assert_eq!(next_detached(&mut c, 10).await, "daemon_shutdown");
+        let rows = audit_entries(&d, "attach_disconnect", 1).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reason"].as_str(), Some("daemon_shutdown"));
+        assert!(rows[0]["duration_secs"].as_f64().unwrap_or(0.0) > 0.0);
+    }
+
+    // 4. slow_consumer — Task 6's teardown, which had no audit row at
+    // all until this task.
+    {
+        let d = TestDaemon::start("reasonslow").await;
+        let (_s, pty) = d.session(None);
+        let mut slow = d.dial().await;
+        send(&mut slow, &attach_to(&_s.id)).await;
+        // Deliberately never reads, not even its own `Attached`.
+        for _ in 0..400 {
+            pty.queue_output(&vec![b'z'; 16 * 1024]);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let rows = audit_entries(&d, "attach_disconnect", 1).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reason"].as_str(), Some("slow_consumer"));
+        assert!(rows[0]["duration_secs"].as_f64().unwrap_or(0.0) > 0.0);
+        drop(slow);
+    }
+}
+
+// ------------------------- Task 12 Step 3b: REQ-D-009 on the wire
+//
+// `each_disconnect_reason_is_recorded_once` above drives all four *audit*
+// reasons and asserts nothing about the wire, so it passes whatever the
+// wire does. §7.5's *Connection teardown* makes four claims the audit
+// table cannot see.
+
+#[tokio::test]
+async fn a_client_initiated_detach_sends_no_detached_frame() {
+    // §11.2, verbatim: *"a client-initiated `Detach` produces no
+    // `Detached` at all."* §7.5's reason: *"The client sent `Detach`;
+    // there is nobody left to tell."*
+    //
+    // This is the §23.3 two-products item 0.0.6 introduces: the audit set
+    // has four reasons and the wire set has three, which reads as a
+    // missing wire value and is exactly the shape a reviewer "fixes" by
+    // emitting `Detached { reason: "client_detach" }` before closing. It
+    // compiles, breaks nothing visibly, and turns a closed set of three
+    // into four on a surface the web UI mirrors verbatim (§7.6.3).
+    //
+    // **Paired with a daemon-initiated close on the same session that
+    // does deliver one**, so "this client never receives anything" cannot
+    // pass.
+    let d = TestDaemon::start("nodetached").await;
+    let (s, pty) = d.session(None);
+
+    let mut leaver = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut stayer = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    send(&mut leaver, &ClientFrame::Detach).await;
+    // The very next read. `expect_eof` accepts `Ok(Err(Eof))` only, so a
+    // `Detached` arriving here is `Ok(Ok(body))` and the row is red.
+    expect_eof(
+        &mut leaver,
+        "a client-initiated Detach must produce no Detached frame at all",
+    )
+    .await;
+
+    // The pairing: the same session, a daemon-initiated close, and one
+    // does arrive.
+    pty.exit(0);
+    assert_eq!(
+        next_detached(&mut stayer, 10).await,
+        "session_exit",
+        "the daemon-initiated half must still deliver a Detached, or the \
+         assertion above is satisfied by a daemon that never sends one"
+    );
+}
+
+#[tokio::test]
+async fn a_session_exit_sends_session_exited_then_detached_then_closes() {
+    // REQ-D-009's order, on both attached clients. §7.5 fixes it because
+    // it is what lets a renderer show the exit code **before** it tears
+    // the view down; sending only one of the two frames, or sending them
+    // the other way round, are the two mutations.
+    let d = TestDaemon::start("exitorder").await;
+    let (s, pty) = d.session(None);
+
+    let mut a = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut b = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+
+    pty.exit(7);
+
+    for (who, c) in [("a", &mut a), ("b", &mut b)] {
+        // Frame one: the code. `7`, not a truthy "it ended" — a client
+        // believes this number.
+        match recv(c).await {
+            ServerFrame::SessionExited { code } => assert_eq!(code, 7, "{who}"),
+            other => panic!("{who}: expected SessionExited first, got {other:?}"),
+        }
+        // Frame two: the teardown, and *why*.
+        match recv(c).await {
+            ServerFrame::Detached { reason } => assert_eq!(reason, "session_exit", "{who}"),
+            other => panic!("{who}: expected Detached after SessionExited, got {other:?}"),
+        }
+        // Frame three: nothing. The socket closes.
+        expect_eof(c, "after Detached").await;
+    }
+}
+
+#[tokio::test]
+async fn daemon_shutdown_outranks_session_exit() {
+    // Both reasons are technically true when a `daemon/stop` kills a live
+    // session, and §7.5 fixes which one the wire carries. Picking
+    // whichever fires first is a race — and the wrong answer tells a
+    // reconnecting client a child died when the daemon went away.
+    let d = TestDaemon::start("shutdownwins").await;
+    let (s, _pty) = d.session(None);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    // `shutdown` SIGKILLs every live session **and then** signals, so the
+    // session really does end here; this is not a shutdown with nothing
+    // to race against.
+    d.daemon.shutdown();
+
+    assert_eq!(
+        next_detached(&mut c, 10).await,
+        "daemon_shutdown",
+        "the session ended because the daemon was stopping, and §7.5 says \
+         so on the wire"
+    );
+}
+
+#[tokio::test]
+async fn a_pre_handshake_close_never_sends_detached() {
+    // §7.5: *"`Detached` says this attachment ended, and a rejected
+    // connection never had one."* Three refusals, each of which closes,
+    // and none of which may be preceded or followed by a `Detached`.
+    let d = TestDaemon::start("prehandshake").await;
+    let (s, _pty) = d.session(None);
+
+    // 1. An unknown session.
+    {
+        let mut c = d.dial().await;
+        send(&mut c, &attach_to("no-such-session")).await;
+        match recv(&mut c).await {
+            ServerFrame::AttachReject { reason, .. } => assert_eq!(reason, "session_not_found"),
+            other => panic!("expected AttachReject, got {other:?}"),
+        }
+        expect_eof(&mut c, "an unknown session").await;
+    }
+
+    // 2. A non-`Attach` first frame.
+    {
+        let mut c = d.dial().await;
+        send(&mut c, &ClientFrame::Detach).await;
+        match recv(&mut c).await {
+            ServerFrame::ProtocolError { reason, .. } => assert_eq!(reason, "no_handshake"),
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
+        expect_eof(&mut c, "a non-Attach first frame").await;
+    }
+
+    // 3. An oversized frame. Only the prefix goes on the wire.
+    {
+        let mut c = d.dial().await;
+        let prefix = ((MAX_FRAME_BYTES + 1) as u32).to_be_bytes();
+        use tokio::io::AsyncWriteExt;
+        c.write_all(&prefix).await.expect("write prefix");
+        c.flush().await.expect("flush");
+        match recv(&mut c).await {
+            ServerFrame::ProtocolError { reason, .. } => assert_eq!(reason, "frame_too_large"),
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
+        expect_eof(&mut c, "an oversized pre-handshake frame").await;
+    }
+
+    assert_daemon_survives(&d, &s.id).await;
+}

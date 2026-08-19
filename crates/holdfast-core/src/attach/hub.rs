@@ -47,6 +47,16 @@ pub struct AttachConn {
     /// argument (§9.4, `mcp::caller`'s precedent).
     pub client_kind: ClientKind,
     pub client_version: String,
+    /// The peer's pid from `SO_PEERCRED`, when the platform gives one.
+    ///
+    /// §9.4's `attach_connect.peer_pid` is `int?` precisely because it is
+    /// not universally available. **Kernel-supplied, never declared** —
+    /// the whole point of the two `peer_*` fields is that they are the
+    /// only identity on this connection a client cannot choose.
+    pub peer_pid: Option<i32>,
+    /// The peer's uid from `SO_PEERCRED`, checked against the daemon's
+    /// owner **before a byte of this connection was parsed**.
+    pub peer_uid: u32,
     /// Bounded per-connection queue (§4.3: *"their own bounded mpsc,
     /// default 64 frames"*). Overflow detaches this client and never
     /// blocks the reader task.

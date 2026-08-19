@@ -54,8 +54,12 @@ pub async fn serve_attach(daemon: Arc<Daemon>, listener: UnixListener) {
                     // whether it was served, which is what separates a
                     // refusal from a dead daemon.
                     daemon.note_accept();
-                    match peer::peer_cred(&stream) {
-                        Ok(cred) if peer::is_authorized(cred.uid, daemon.owner_uid()) => {}
+                    // The credentials are **kept**, not merely checked:
+                    // §9.4's two attach rows carry `peer_pid` and
+                    // `peer_uid`, and this is the only place they exist.
+                    // A connection cannot be asked for them later.
+                    let peer = match peer::peer_cred(&stream) {
+                        Ok(cred) if peer::is_authorized(cred.uid, daemon.owner_uid()) => cred,
                         Ok(cred) => {
                             crate::diag!(
                                 "holdfast daemon: refused an attach connection from uid {} \
@@ -71,9 +75,9 @@ pub async fn serve_attach(daemon: Arc<Daemon>, listener: UnixListener) {
                             );
                             continue;
                         }
-                    }
+                    };
                     let d = Arc::clone(&daemon);
-                    tokio::spawn(async move { handle_attach(d, stream).await });
+                    tokio::spawn(async move { handle_attach(d, stream, peer).await });
                 }
                 Err(e) => crate::diag!("holdfast daemon: attach accept failed: {e}"),
             },
@@ -86,8 +90,8 @@ pub async fn serve_attach(daemon: Arc<Daemon>, listener: UnixListener) {
 /// The §7.5 protocol itself is `crate::attach::conn`; this is the seam
 /// the accept loop spawns onto, kept here so the accept path and the
 /// protocol path stay in different files.
-async fn handle_attach(daemon: Arc<Daemon>, stream: UnixStream) {
-    crate::attach::conn::run(daemon, stream).await;
+async fn handle_attach(daemon: Arc<Daemon>, stream: UnixStream, peer: peer::PeerCred) {
+    crate::attach::conn::run(daemon, stream, peer.pid, peer.uid).await;
 }
 
 #[cfg(test)]

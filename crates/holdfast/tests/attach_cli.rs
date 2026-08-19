@@ -358,9 +358,9 @@ struct StubDaemon {
 }
 
 impl StubDaemon {
-    /// Serve exactly one connection, replying with `reply` after the
+    /// Serve exactly one connection, sending `replies` in order after the
     /// handshake and then keeping the socket open until `hold` elapses.
-    async fn start(tag: &str, reply: Option<ServerFrame>, hold: Duration) -> Self {
+    async fn start(tag: &str, replies: Vec<ServerFrame>, hold: Duration) -> Self {
         let paths = RuntimePaths::with_dir(scratch_dir(tag));
         paths.ensure_dir().expect("ensure the runtime dir");
         let listener =
@@ -378,8 +378,8 @@ impl StubDaemon {
             if let ClientDecode::Frame(f) = decode_client_frame(&body) {
                 sink.lock().unwrap().push(f);
             }
-            if let Some(reply) = reply {
-                if frame::write_frame(&mut stream, &reply).await.is_err() {
+            for reply in &replies {
+                if frame::write_frame(&mut stream, reply).await.is_err() {
                     return;
                 }
             }
@@ -561,7 +561,7 @@ async fn the_local_terminal_is_restored_when_the_daemon_dies() {
     // moment it happens the test's rather than a scheduler's.
     let stub = StubDaemon::start(
         "daemondies",
-        Some(ServerFrame::Attached {
+        vec![ServerFrame::Attached {
             session_id: "sess_stub01".into(),
             name: None,
             cols: 80,
@@ -570,7 +570,7 @@ async fn the_local_terminal_is_restored_when_the_daemon_dies() {
             exit_code: None,
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,
-        }),
+        }],
         Duration::from_millis(400),
     )
     .await;
@@ -734,10 +734,10 @@ async fn attach_reports_protocol_too_old_distinctly_from_session_not_found() {
     );
     let stub = StubDaemon::start(
         "tooold",
-        Some(ServerFrame::AttachReject {
+        vec![ServerFrame::AttachReject {
             reason: "protocol_too_old".into(),
             message: sentence.clone(),
-        }),
+        }],
         Duration::from_secs(2),
     )
     .await;
@@ -764,7 +764,7 @@ async fn attach_refuses_a_daemon_that_leniently_accepted_it() {
     // client is the peer that can still tell.
     let stub = StubDaemon::start(
         "lenient",
-        Some(ServerFrame::Attached {
+        vec![ServerFrame::Attached {
             session_id: "sess_stub01".into(),
             name: None,
             cols: 80,
@@ -773,7 +773,7 @@ async fn attach_refuses_a_daemon_that_leniently_accepted_it() {
             exit_code: None,
             protocol_major: PROTOCOL_MAJOR + 1,
             protocol_minor: 0,
-        }),
+        }],
         Duration::from_secs(2),
     )
     .await;
@@ -816,7 +816,7 @@ async fn the_attach_handshake_carries_every_non_optional_field() {
     // handshake is a client that cannot attach at all — and the four
     // fields below are exactly the ones a reader is most likely to think
     // are optional, because the spec's example omits them.
-    let stub = StubDaemon::start("fullhs", None, Duration::from_millis(300)).await;
+    let stub = StubDaemon::start("fullhs", Vec::new(), Duration::from_millis(300)).await;
     let _ = run_plain(stub.paths.dir(), &["attach", "sess_x"]);
 
     let sent = stub.frames();
@@ -911,5 +911,149 @@ async fn holdfast_version_prints_the_protocol_the_sockets_speak() {
         ),
         (protocol_major, protocol_minor),
         "`holdfast version` prints a protocol the sockets do not speak"
+    );
+}
+
+// ------------------------------------------------- `holdfast watch`
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_redacts_by_default() {
+    // REQ-SEC-008's second half, and it only means anything **paired**
+    // with `attach_does_not_redact`: the two clients see the same bytes
+    // and must render them differently, so a suite that asserted only one
+    // of them would pass against a daemon that redacts everybody or one
+    // that redacts nobody.
+    //
+    // The marker carries the rule's **kind**, not its name —
+    // `[REDACTED:github]` — which is also why it is shorter than the
+    // token it replaced.
+    const GH_TOKEN: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+    let d = TestDaemon::start("watchredact").await;
+    let (s, pty) = d.session(None);
+
+    let term = Term::spawn(d.paths.dir(), &["watch", &s.id], 80, 24);
+    wait_until_attached(&term, &pty);
+
+    pty.queue_output(format!("token={GH_TOKEN}\r\n").as_bytes());
+    let seen = term.wait_for(b"[REDACTED:github]", 10);
+    assert!(
+        !contains(&seen, GH_TOKEN.as_bytes()),
+        "the token reached a `watch` client:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_never_sends_a_write_frame() {
+    // §7.5's ReadOnly half seen from the client. The mutation this exists
+    // for is a watch client that sends `Resize` on `SIGWINCH`: harmless
+    // looking, refused `read_only_attach` server-side anyway, and
+    // therefore invisible to anything but a record of what actually left
+    // the client.
+    //
+    // **Asserted against a recording peer, not a rejection counter.** The
+    // plan's row names "the daemon's per-session `read_only_attach`
+    // rejection counter"; no such counter exists anywhere in the tree —
+    // measured, not assumed. Recording the frames is a direct observation
+    // of the harm rather than of a diagnosis, and it also catches the
+    // frames a counter could not: one that the daemon would have
+    // *accepted*.
+    let stub = StubDaemon::start(
+        "watchnowrite",
+        vec![
+            ServerFrame::Attached {
+                session_id: "sess_stub01".into(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                state: "Running".into(),
+                exit_code: None,
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+            },
+            // Output, so the client is driven through its render path and
+            // not merely through its handshake.
+            ServerFrame::Output {
+                session: "sess_stub01".into(),
+                bytes: b"WATCHING\r\n".to_vec(),
+            },
+        ],
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let mut term = Term::spawn(stub.paths.dir(), &["watch", "sess_stub01"], 80, 24);
+    term.wait_for(b"WATCHING", 10);
+
+    // A local resize. Nothing may leave the client because of it.
+    term.resize(132, 43);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Ctrl+C, through the line discipline, exactly as a human sends it.
+    term.type_keys(&[0x03]);
+    assert_eq!(term.wait_exit(10), 0);
+
+    let sent = stub.frames();
+    assert_eq!(
+        sent.len(),
+        2,
+        "a watch client puts exactly `Attach` then `Detach` on the wire: {sent:?}"
+    );
+    assert!(
+        matches!(sent[0], ClientFrame::Attach { .. }),
+        "frame one must be the handshake: {sent:?}"
+    );
+    assert!(
+        matches!(sent[1], ClientFrame::Detach),
+        "frame two must be `Detach` — not `Input`, not `Resize`, not \
+         `Signal`: {sent:?}"
+    );
+    // And the handshake declares the safe pairing explicitly rather than
+    // relying on `role`'s wire default: a client that got the redacted
+    // stream by omission cannot be told from one that forgot the field.
+    match &sent[0] {
+        ClientFrame::Attach { mode, role, .. } => {
+            assert_eq!(*mode, AttachMode::ReadOnly);
+            assert_eq!(*role, AttachRole::Observer);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_detaches_watch_and_leaves_the_session_running() {
+    // §6.1 Layer 2. The two clients differ on the detach key deliberately
+    // — a read-only viewer has no reason to reserve a prefix key — and
+    // `Ctrl+C` must reach the *client* rather than the session, which is
+    // also why `watch` never puts the terminal into raw mode.
+    //
+    // The session-still-running half asserts `state`, not the name:
+    // §5.5.1 retains exited sessions, so a listing that merely still
+    // mentions it proves nothing.
+    let d = TestDaemon::start("watchctrlc").await;
+    let (_s, pty) = d.session(Some("watchkeep"));
+
+    let mut term = Term::spawn(d.paths.dir(), &["watch", "watchkeep"], 80, 24);
+    wait_until_attached(&term, &pty);
+
+    term.type_keys(&[0x03]);
+    assert_eq!(term.wait_exit(10), 0, "Ctrl+C must exit 0");
+
+    let listed = run_plain(d.paths.dir(), &["list", "--json"]);
+    let text = String::from_utf8_lossy(&listed.stdout).to_string();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("`list --json` gave {text:?}: {e}"));
+    let entry = parsed["sessions"]
+        .as_array()
+        .and_then(|v| {
+            v.iter()
+                .find(|s| s["name"].as_str() == Some("watchkeep"))
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("the session is gone entirely:\n{text}"));
+    assert_eq!(
+        entry["state"].as_str(),
+        Some("Running"),
+        "detaching a watcher must not end the session:\n{text}"
     );
 }

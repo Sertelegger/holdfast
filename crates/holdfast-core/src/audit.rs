@@ -292,6 +292,85 @@ impl AuditLog {
         );
     }
 
+    /// §9.4's `attach_connect`.
+    ///
+    /// **Written after a successful `Attached`, never for a rejected
+    /// attach** — a reject is not a connection, and logging at accept
+    /// time would make the trail count probes.
+    ///
+    /// `client_kind` is the handshake token from a **uid-checked**
+    /// connection, recorded verbatim; a client does not get to name
+    /// itself into a different privilege, because there is no privilege
+    /// attached to the field at all. §9.4 is explicit that it *"must
+    /// never become a redaction switch"* — what decides whether this
+    /// connection saw raw bytes is `role`, which is why `role` is on this
+    /// row and on the disconnect row beside it.
+    ///
+    /// **`ClientKind::Shim` is accepted and recorded as `"shim"`** even
+    /// though §9.4's column enumerates only `"cli" | "ui-bridge"`. The
+    /// column is the *expected* set, not a validator, and refusing a
+    /// connection over an attribution field would make the log's honesty
+    /// a connectivity requirement.
+    pub fn record_attach_connect(
+        &self,
+        session_id: &str,
+        client_kind: &str,
+        mode: &str,
+        role: &str,
+        peer_pid: Option<i32>,
+        peer_uid: u32,
+    ) {
+        self.record(
+            "attach_connect",
+            Some(session_id),
+            serde_json::json!({
+                "client_kind": client_kind,
+                "mode": mode,
+                "role": role,
+                "peer_pid": peer_pid,
+                "peer_uid": peer_uid,
+            }),
+        );
+    }
+
+    /// §9.4's `attach_disconnect`.
+    ///
+    /// **`role` is on this row too, and that is spec text.** The two
+    /// entries share no connection identifier, so without it *"did this
+    /// client receive raw output, and for how long?"* means pairing
+    /// connects to disconnects by ordering and hoping. REQ-SEC-008a's
+    /// verification ends *"both audit rows carry the role"*.
+    ///
+    /// `reason` is one of the **four** §9.4 values — `client_detach`,
+    /// `slow_consumer`, `daemon_shutdown`, `session_exit`. Note that
+    /// `Detached.reason` on the wire carries only **three**:
+    /// `client_detach` is deliberately not a wire value, because §7.5's
+    /// answer to "who is told?" is *"the client sent `Detach`; there is
+    /// nobody left to tell."* The two sets differ on purpose and
+    /// `a_client_initiated_detach_sends_no_detached_frame` is what keeps
+    /// them apart.
+    pub fn record_attach_disconnect(
+        &self,
+        session_id: &str,
+        client_kind: &str,
+        mode: &str,
+        role: &str,
+        reason: &str,
+        duration_secs: f64,
+    ) {
+        self.record(
+            "attach_disconnect",
+            Some(session_id),
+            serde_json::json!({
+                "client_kind": client_kind,
+                "mode": mode,
+                "role": role,
+                "reason": reason,
+                "duration_secs": duration_secs,
+            }),
+        );
+    }
+
     pub fn redact_false_count(&self) -> u64 {
         self.redact_false_count.load(Ordering::Relaxed)
     }

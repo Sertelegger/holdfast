@@ -1144,6 +1144,129 @@ pub async fn attach(session: &str) -> ExitCode {
     }
 }
 
+/// Everything `holdfast watch` is able to put on the wire.
+///
+/// **One variant, by construction.** A watch client that sent a write
+/// frame would not compile, which is a stronger statement than a test
+/// that observes it not doing so today — and the frame it would most
+/// plausibly grow is `Resize` on `SIGWINCH`, which looks harmless,
+/// would be rejected `read_only_attach` anyway, and would therefore
+/// leave no trace a client-side assertion could see.
+#[cfg(unix)]
+enum WatchOut {
+    Detach,
+}
+
+#[cfg(unix)]
+impl WatchOut {
+    fn frame(self) -> holdfast_core::attach::ClientFrame {
+        match self {
+            Self::Detach => holdfast_core::attach::ClientFrame::Detach,
+        }
+    }
+}
+
+/// `holdfast watch <session>` — §6.1 Layer 2.
+///
+/// The same view as `holdfast attach`, **read-only and redacted**
+/// (`mode: ReadOnly`, `role: Observer` — REQ-SEC-008's second half).
+/// Detach with `Ctrl+C`.
+///
+/// **The two clients differ on the detach key deliberately.** A
+/// read-only viewer has no reason to reserve a prefix key, because every
+/// keystroke it could forward is one it is not allowed to send.
+///
+/// **And it takes no terminal.** No raw mode, no `termios` to restore, no
+/// stdin: `Ctrl+C` arrives as `SIGINT`, which works from a pipe as well
+/// as from a tty. The bytes it renders are a PTY's, already carrying
+/// `\r\n`, so a cooked terminal displays them correctly.
+#[cfg(unix)]
+pub async fn watch(session: &str) -> ExitCode {
+    use holdfast_core::attach::{AttachMode, AttachRole, ServerFrame};
+    use holdfast_core::protocol::frame;
+
+    let (rd, mut wr) =
+        match dial_attach(session, AttachMode::ReadOnly, AttachRole::Observer, "watch").await {
+            Dialled::Ok(rd, wr) => (rd, wr),
+            Dialled::Refused(code) => return ExitCode::from(code),
+        };
+
+    let mut frames = spawn_frame_reader(rd);
+
+    loop {
+        tokio::select! {
+            body = frames.recv() => {
+                let Some(body) = body else {
+                    diag!("holdfast watch: the daemon closed the connection");
+                    return ExitCode::from(EXIT_UNREACHABLE);
+                };
+                let f = match holdfast_core::attach::decode_server_frame(&body) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        diag!("holdfast watch: undecodable frame: {e}");
+                        return ExitCode::from(EXIT_FAILED);
+                    }
+                };
+                match f {
+                    ServerFrame::Output { bytes, .. } => render(&bytes),
+                    ServerFrame::SessionExited { code } => {
+                        diag!("holdfast watch: the session exited ({code})");
+                    }
+                    ServerFrame::Detached { reason } => {
+                        diag!("holdfast watch: detached ({reason})");
+                        return ExitCode::SUCCESS;
+                    }
+                    // A watcher is told a secret is being asked for and
+                    // **cannot answer it**: `SecretInput` is a write
+                    // frame, refused `read_only_attach` by §7.5's table.
+                    // Reported so the human knows why the session has
+                    // stopped drawing, and nothing more.
+                    ServerFrame::AwaitingSecret { .. } => {
+                        diag!("holdfast watch: the session is waiting for a secret");
+                    }
+                    ServerFrame::SecretRequestClosed { .. } => {}
+                    ServerFrame::Resize { cols, rows } => {
+                        diag!("holdfast watch: the session is now {cols}x{rows}");
+                    }
+                    ServerFrame::ProtocolError { reason, frame_kind } => {
+                        match frame_kind {
+                            Some(k) => diag!("holdfast watch: protocol error: {reason} ({k})"),
+                            None => diag!("holdfast watch: protocol error: {reason}"),
+                        }
+                    }
+                    ServerFrame::Unknown { .. } => {}
+                    ServerFrame::Attached { .. } | ServerFrame::AttachReject { .. } => {
+                        diag!("holdfast watch: a second handshake frame arrived; ignoring it");
+                    }
+                }
+            }
+            r = tokio::signal::ctrl_c() => {
+                if let Err(e) = r {
+                    diag!("holdfast watch: cannot watch for Ctrl+C: {e}");
+                    return ExitCode::from(EXIT_FAILED);
+                }
+                // `Detach` and **not** the `0x03` byte. Forwarding it as
+                // `Input` is the tempting reading of "Ctrl+C detaches",
+                // and it is a write frame: §7.5 would refuse it
+                // `read_only_attach` and the client would sit there.
+                let _ = frame::write_frame(&mut wr, &WatchOut::Detach.frame()).await;
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
+}
+
+/// §3.6 marks `holdfast watch` `✗` on Windows native **permanently**,
+/// for the same reason as `holdfast attach`.
+#[cfg(windows)]
+pub async fn watch(_session: &str) -> ExitCode {
+    diag!(
+        "holdfast watch is not supported on Windows native (§3.6): there is \
+         no daemon to attach to. Use WSL."
+    );
+    ExitCode::from(EXIT_USAGE)
+}
+
 /// §3.6 marks `holdfast attach` `✗` on Windows native **permanently** —
 /// there is no daemon there to attach to.
 ///
