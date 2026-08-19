@@ -1611,6 +1611,27 @@ async fn a_resize_from_one_client_is_broadcast_to_the_other() {
     let mut a = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
     let mut b = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
+    // **Out of range first, and that ordering is the point.** §7.5 says
+    // the broadcast carries the *canonical* PTY size. `Session::resize`
+    // clamps to §4.2's bounds, so a request nobody can satisfy is the
+    // only input that tells "re-read the size from the session" apart
+    // from "echo the request back" — every in-range pair, including the
+    // 100×30 below, makes the two indistinguishable.
+    send(
+        &mut a,
+        &ClientFrame::Resize {
+            cols: 5000,
+            rows: 30,
+        },
+    )
+    .await;
+    assert_eq!(
+        next_resize(&mut b).await,
+        (1000, 30),
+        "the other client was told the geometry that was asked for rather \
+         than the one the terminal got"
+    );
+
     send(
         &mut a,
         &ClientFrame::Resize {
@@ -1619,18 +1640,11 @@ async fn a_resize_from_one_client_is_broadcast_to_the_other() {
         },
     )
     .await;
-
-    // B is told, with the canonical geometry.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut told = None;
-    while tokio::time::Instant::now() < deadline && told.is_none() {
-        match recv(&mut b).await {
-            ServerFrame::Resize { cols, rows } => told = Some((cols, rows)),
-            ServerFrame::Output { .. } => {}
-            other => panic!("expected Resize, got {other:?}"),
-        }
-    }
-    assert_eq!(told, Some((100, 30)), "the other client was never told");
+    assert_eq!(
+        next_resize(&mut b).await,
+        (100, 30),
+        "the other client was never told"
+    );
 
     // And the **child** sees it, which is the half a frame-only assertion
     // cannot reach: `stty size` reads the kernel's idea of the window,
@@ -1737,6 +1751,19 @@ async fn a_signal_frame_reaches_the_foreground_process_group() {
         "the interrupt took the session's shell down with the job"
     );
     let _ = s.signal(Signal::Kill);
+}
+
+/// The next `Resize` frame on this connection, skipping output.
+async fn next_resize(c: &mut UnixStream) -> (u16, u16) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match recv(c).await {
+            ServerFrame::Resize { cols, rows } => return (cols, rows),
+            ServerFrame::Output { .. } => {}
+            other => panic!("expected Resize, got {other:?}"),
+        }
+    }
+    panic!("no Resize arrived within 5s");
 }
 
 /// Write a `Signal` frame by hand so `sig` can be something the enum
@@ -1899,6 +1926,7 @@ async fn a_session_ended_by_a_signal_frame_is_audited_as_attach_signal() {
     let d = TestDaemon::start("auditsig").await;
     let (killed, _kpty) = d.session(None);
     let (natural, npty) = d.session(None);
+    let (interrupted, ipty) = d.session(None);
 
     let mut c = attach_ok(&d, &killed.id, AttachMode::ReadWrite).await;
     send(
@@ -1908,6 +1936,24 @@ async fn a_session_ended_by_a_signal_frame_is_audited_as_attach_signal() {
         },
     )
     .await;
+
+    // A signal that does **not** end a session, which is what stops "log
+    // every Signal frame as a session_terminate" passing: §9.4's entry is
+    // written when a session *ends* because of one.
+    let mut i = attach_ok(&d, &interrupted.id, AttachMode::ReadWrite).await;
+    send(
+        &mut i,
+        &ClientFrame::Signal {
+            sig: SignalName::Int,
+        },
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while ipty.signals().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(ipty.signals(), vec![Signal::Interrupt]);
+    assert!(interrupted.is_alive());
 
     // The other session ends by itself, with nobody attached.
     npty.exit(3);
@@ -1951,6 +1997,10 @@ async fn a_session_ended_by_a_signal_frame_is_audited_as_attach_signal() {
     assert!(
         !lines[0].contains(natural.id.as_str()),
         "a session that ended on its own was logged as attach_signal"
+    );
+    assert!(
+        !lines[0].contains(interrupted.id.as_str()),
+        "a signal that did not end a session was logged as a termination"
     );
 }
 
