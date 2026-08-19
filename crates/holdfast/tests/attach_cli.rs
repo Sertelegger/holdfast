@@ -225,6 +225,13 @@ impl Term {
         );
     }
 
+    /// The client's own pid, for the rows that signal it.
+    fn pid(&self) -> i32 {
+        self.child
+            .process_id()
+            .expect("a spawned client has a process id") as i32
+    }
+
     fn master_fd(&self) -> RawFd {
         self.master
             .as_raw_fd()
@@ -608,6 +615,76 @@ async fn the_local_terminal_is_restored_when_the_daemon_dies() {
     let after = termios_of(fd);
     assert!(echo_on(&after) && icanon_on(&after));
     assert_eq!(termios_fields(&before), termios_fields(&after));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_local_terminal_is_restored_when_the_client_is_signalled() {
+    // The third restore path, and the one a `Drop` guard alone does not
+    // reach: a process killed by a signal's default disposition runs no
+    // destructors at all. The two rows above cover the normal exit and
+    // the unhappy socket exit; this covers `pkill holdfast`, which is
+    // what an operator reaches for when a client will not respond — and
+    // what a user reached for at a `sudo` prompt before C-1 was fixed.
+    //
+    // **Both signals in one row, in a loop.** Covering only `SIGTERM`
+    // would let the `SIGHUP` arm be deleted with nothing going red, and
+    // `SIGHUP` is the likelier of the two in practice: it is what a
+    // closing terminal emulator sends.
+    for (signo, expected) in [(libc::SIGTERM, 143), (libc::SIGHUP, 129)] {
+        let d = TestDaemon::start("signalled").await;
+        let (_s, pty) = d.session(Some("signalsess"));
+
+        let mut term = Term::spawn(d.paths.dir(), &["attach", "signalsess"], 80, 24);
+        let fd = term.master_fd();
+        let before = termios_of(fd);
+        assert!(
+            echo_on(&before) && icanon_on(&before),
+            "fixture: cooked pty"
+        );
+
+        wait_until_attached(&term, &pty);
+        // Without this the "restored" assertion is indistinguishable
+        // from "never changed" — the same trap the sibling rows name.
+        assert!(
+            !echo_on(&termios_of(fd)) && !icanon_on(&termios_of(fd)),
+            "signal {signo}: the client never put the terminal into raw mode"
+        );
+
+        // SAFETY: `kill(2)` with a pid this test spawned and a constant
+        // signal number; it reads and writes nothing through a pointer.
+        assert_eq!(
+            unsafe { libc::kill(term.pid(), signo) },
+            0,
+            "signal {signo}: kill failed"
+        );
+
+        let code = term.wait_exit(10);
+
+        // **The terminal first, the status second, and the order is the
+        // point.** The harm is a mute shell; the exit code is the
+        // diagnosis. `portable-pty` reports a signal-killed child as
+        // exit code 1, so a status assertion placed first fails on every
+        // broken client too — and would have reported "wrong exit
+        // status" for a defect that is really "the user's terminal is
+        // ruined". Measured: at fb7f620 that is exactly what it said.
+        let after = termios_of(fd);
+        assert!(
+            echo_on(&after) && icanon_on(&after),
+            "signal {signo}: ECHO/ICANON were not restored — the user's \
+             shell is left mute and only a blind `stty sane` recovers it"
+        );
+        assert_eq!(
+            termios_fields(&before),
+            termios_fields(&after),
+            "signal {signo}: the terminal was not restored byte for byte"
+        );
+
+        // `128 + signo`, so a script can still tell this from a detach
+        // (0) and from an unreachable daemon (2). A client that let the
+        // default disposition run would not have got here to report
+        // anything, and `portable-pty` would have said 1.
+        assert_eq!(code, expected, "signal {signo}: wrong exit status");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

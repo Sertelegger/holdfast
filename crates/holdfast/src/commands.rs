@@ -36,6 +36,15 @@ use std::time::Duration;
 pub const EXIT_FAILED: u8 = 1;
 pub const EXIT_UNREACHABLE: u8 = 2;
 pub const EXIT_USAGE: u8 = 64;
+/// `128 + signo`, the status a shell reports for a signalled child.
+///
+/// `holdfast attach` **catches** `SIGTERM` and `SIGHUP` rather than
+/// dying of them, because dying of them runs no destructors and leaves
+/// the user's terminal in raw mode. Having caught them it reports what
+/// a shell would have reported had it not, so nothing downstream loses
+/// the distinction the catch was buying back.
+pub const EXIT_SIGHUP: u8 = 128 + 1;
+pub const EXIT_SIGTERM: u8 = 128 + 15;
 
 fn paths() -> anyhow::Result<RuntimePaths> {
     Ok(RuntimePaths::discover()?)
@@ -1018,6 +1027,35 @@ pub async fn attach(session: &str) -> ExitCode {
                 return ExitCode::from(EXIT_FAILED);
             }
         };
+    // **The two signals that would otherwise skip the restore.**
+    // `TermiosGuard`'s `Drop` covers the normal path, `?` and a panic
+    // unwinding — but a process terminated by a signal's *default*
+    // disposition runs no destructors, and the user is left holding a
+    // shell with `ECHO` and `ICANON` off, recoverable only by typing
+    // `stty sane` blind. `pkill holdfast` is exactly what an operator
+    // reaches for, and a keyboard `Ctrl-C` cannot get here at all —
+    // raw mode clears `ISIG` — so an external kill is the whole of this
+    // hazard.
+    //
+    // Created **once, above the loop**, like `winch` and not like
+    // `watch`'s `ctrl_c()`: tokio's `register_listener` marks the
+    // current version seen, so a listener constructed inside the loop
+    // can be created after the broadcast and never see it.
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            diag!("holdfast attach: cannot install a SIGTERM handler: {e}");
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
+    let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            diag!("holdfast attach: cannot install a SIGHUP handler: {e}");
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
 
     // One at startup, so the session reflows to *this* terminal
     // immediately rather than at the first time the user drags a window.
@@ -1164,6 +1202,28 @@ pub async fn attach(session: &str) -> ExitCode {
                     render(b"\r\n");
                     return ExitCode::SUCCESS;
                 }
+            }
+            // Returning, not re-raising: the `return` is what runs
+            // `TermiosGuard::drop`, and the status is the shell's own
+            // `128 + signo`, so a script can still tell a signalled
+            // client (143/129) from a detach (0) from an unreachable
+            // daemon (2). The session is left running, exactly as the
+            // detach key leaves it — a signal to the *viewer* is not a
+            // signal to the child.
+            _ = sigterm.recv() => {
+                let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
+                render(b"\r\n");
+                diag!("holdfast attach: SIGTERM — detaching; the session keeps running");
+                return ExitCode::from(EXIT_SIGTERM);
+            }
+            _ = sighup.recv() => {
+                // No `render`: `SIGHUP` says this terminal has already
+                // gone away, so the only thing left worth doing is
+                // telling the daemon and putting the termios back for
+                // whoever inherits the fd.
+                let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
+                diag!("holdfast attach: SIGHUP — detaching; the session keeps running");
+                return ExitCode::from(EXIT_SIGHUP);
             }
             _ = winch.recv() => {
                 if let Ok((cols, rows)) = crate::attach_tty::window_size(tty) {
