@@ -446,11 +446,29 @@ async fn ctrl_b_then_d_detaches_and_leaves_the_session_running() {
     term.type_keys(&[0x02, 0x64]);
     assert_eq!(term.wait_exit(10), 0, "the detach key must exit 0");
 
-    let listed = run_plain(d.paths.dir(), &["list"]);
+    // **`state == "Running"`, not merely "the name is still listed".**
+    // §5.5.1 *retains* exited sessions, so a client that killed the
+    // session on the way out leaves it in `holdfast list` with
+    // `state: "Exited"` — measured: a mutation that sent
+    // `Signal { sig: kill }` ahead of `Detach` was invisible to a
+    // `contains("keepalive")` assertion.
+    let listed = run_plain(d.paths.dir(), &["list", "--json"]);
     let text = String::from_utf8_lossy(&listed.stdout).to_string();
-    assert!(
-        text.contains("keepalive"),
-        "the session did not survive the detach:\n{text}"
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("`list --json` gave {text:?}: {e}"));
+    let entry = parsed["sessions"]
+        .as_array()
+        .and_then(|v| {
+            v.iter()
+                .find(|s| s["name"].as_str() == Some("keepalive"))
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("the session is gone entirely:\n{text}"));
+    assert_eq!(
+        entry["state"].as_str(),
+        Some("Running"),
+        "§6.1: a detach *cleanly disconnects without killing the session*, \
+         and this one is no longer running:\n{text}"
     );
 }
 
@@ -588,11 +606,28 @@ async fn a_local_resize_reaches_the_child() {
     let d = TestDaemon::start("resize").await;
     let s = d.real_session("bash", &["--norc", "--noprofile"]);
 
-    let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 80, 24);
-    // The shell has to be up before the resize, or `stty` runs against
-    // whatever geometry the spawn used.
-    term.type_keys(b"echo SHELL-UP\n");
+    // **100x30, not 80x24**, so the *startup* `Resize` is load-bearing:
+    // the session was spawned at the `PtySpawnConfig` default and only
+    // the client's opening frame can move it here. Unequal on both axes,
+    // like the resize below.
+    let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 100, 30);
+
+    // **`SHELL''-UP` and not `SHELL-UP`.** The command is typed into a
+    // terminal that is still cooked until the client takes it, so the
+    // kernel echoes the *typed* bytes back to the master. A marker that
+    // reads the same typed and printed matches that echo, and the row
+    // then continues before the client has attached at all — measured:
+    // it made both `Resize` mutations below survive, because the resize
+    // landed before the client's opening frame and the *startup* frame
+    // carried the new size.
+    term.type_keys(b"echo SHELL''-UP\n");
     term.wait_for(b"SHELL-UP", 15);
+
+    // The opening `Resize` reached the child. Nothing else asserts that,
+    // and without it "a local resize reaches the child" is satisfied by a
+    // client that only sends the `SIGWINCH` one.
+    term.type_keys(b"stty size\n");
+    term.wait_for(b"30 100", 15);
 
     term.resize(132, 43);
     term.type_keys(b"stty size\n");
