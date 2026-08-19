@@ -206,6 +206,19 @@ pub struct Session {
     /// it snapshots the buffer, which is the ordering that stops a fast
     /// command's output from landing in the gap between the two.
     output_tx: broadcast::Sender<OutputFrame>,
+    /// §4.3's write queue — the *push* half of the same fan-out
+    /// `output_tx` is the pull half of.
+    ///
+    /// **A second door to the same PTY, not a replacement for the
+    /// first.** `write_input`/`write_input_acked` stay exactly as they
+    /// are and the MCP `send_input` path keeps calling them
+    /// synchronously; this exists because 0.0.6 is the first milestone
+    /// with a *second* writer, and two attach clients typing at once
+    /// have to be serialised somewhere. This channel is that somewhere,
+    /// and §7.5's last-writer-wins is FIFO through it and nothing more:
+    /// no arbitration, no lock, and no ordering guarantee between two
+    /// clients beyond the order their frames arrived.
+    write_tx: tokio::sync::mpsc::Sender<WriteRequest>,
     last_activity_ms: Arc<AtomicI64>,
     /// Unix seconds at which the exit was *first observed*, 0 while alive.
     /// Observation time, not the child's true death instant: nothing in
@@ -234,6 +247,48 @@ pub struct Session {
     /// `touch` and the reaper cannot disagree about what time it is.
     clock: Clock,
     pub created_at: std::time::SystemTime,
+}
+
+/// How many writes §4.3's queue holds before a producer has to wait.
+///
+/// §4.3's per-connection bound, and **not configurable in v0.1.0**. A
+/// full queue is backpressure on the attach connection that filled it
+/// and never on the reader — the two directions share nothing but the
+/// PTY.
+pub const WRITE_QUEUE_FRAMES: usize = 64;
+
+/// One item on §4.3's write queue.
+///
+/// **An `enum` from the first variant, deliberately.** 0.0.7's
+/// `SecretInput` adds a second (`Secret`, carrying a `SecretBytes` as
+/// itself so its zeroing `Drop` runs in the writer thread *after* the
+/// PTY write); declaring this as a struct today would make that
+/// addition a rewrite instead of an addition.
+///
+/// **The ack is `Result<usize>` and not the shipped [`WriteAck`], and
+/// the narrowing is deliberate.** §4.3's normative writer ack is
+/// `{ result, pre_write_head }`, which is exactly `WriteAck`. The attach
+/// path has no use for `pre_write_head`: it exists so `send_input` can
+/// hand the agent a cursor to read from, and an attach client renders a
+/// live broadcast rather than reading from a cursor. Said here rather
+/// than silently dropped — if a later surface needs it, the variant
+/// carries a `WriteAck` and nothing else changes.
+#[derive(Debug)]
+pub enum WriteRequest {
+    Input {
+        bytes: Vec<u8>,
+        /// Dropping the receiving half is how a caller says it does not
+        /// care; the send then fails and is ignored.
+        ack: tokio::sync::oneshot::Sender<Result<usize>>,
+    },
+}
+
+impl WriteRequest {
+    /// An `Input` request and the handle its result arrives on.
+    pub fn input(bytes: Vec<u8>) -> (Self, tokio::sync::oneshot::Receiver<Result<usize>>) {
+        let (ack, rx) = tokio::sync::oneshot::channel();
+        (Self::Input { bytes, ack }, rx)
+    }
 }
 
 /// What a write reports back: how much went, and where the buffer stood
@@ -305,6 +360,7 @@ impl Session {
         let idle_timeout_ms = (config.idle_timeout_secs as i64).saturating_mul(1000);
         let idle_deadline_ms = Arc::new(AtomicI64::new(deadline_from(started_ms, idle_timeout_ms)));
         let (output_tx, _) = broadcast::channel(OUTPUT_BROADCAST_FRAMES);
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_FRAMES);
 
         // Geometry and mode are applied by `set_screen_config` right
         // after construction; the default matches `PtySpawnConfig::new`
@@ -338,6 +394,7 @@ impl Session {
             state: Mutex::new(SessionState::Running),
             redaction_stats: Mutex::new(BTreeMap::new()),
             output_tx: output_tx.clone(),
+            write_tx,
             last_activity_ms: Arc::clone(&last_activity_ms),
             exited_at_secs: Arc::new(AtomicI64::new(0)),
             idle_deadline_ms: Arc::clone(&idle_deadline_ms),
@@ -489,6 +546,60 @@ impl Session {
                 // Two atomics rather than one derived read, because the
                 // reaper's sweep must not have to hold anything.
                 deadline.store(deadline_from(at, idle_timeout_ms), Ordering::Relaxed);
+            }
+        });
+
+        // §4.3's writer: **one `std::thread` per session, draining the
+        // queue in arrival order.** Decided, not defaulted, for three
+        // reasons that all point the same way:
+        //
+        // 1. `Session::new` is synchronous and has no runtime handle in
+        //    scope. A `tokio::spawn` here panics with *"must be called
+        //    from the context of a Tokio 1.x runtime"* in every `#[test]`
+        //    in this file, all of which build a session through
+        //    `mock_session()`.
+        // 2. **A blocking PTY write must not sit on a tokio worker.** The
+        //    master is a blocking fd; if a child stopped reading its
+        //    terminal the write parks in the kernel, and Linux does not
+        //    wake it when the child dies. On a runtime worker that parks
+        //    the worker forever. `send_input` hands its write to the
+        //    blocking pool for exactly this reason.
+        // 3. The reader half beside it is already a `std::thread`, so
+        //    both halves of §4.3's fan-out sit on the same kind of
+        //    thread rather than split across two execution models.
+        //
+        // §4.3's pseudocode says `writer_task (one tokio task per
+        // session)` and this does not contradict it: the pseudocode names
+        // the *concurrency* — one serialising writer per session, FIFO —
+        // not the executor. `tokio::sync::mpsc` is still the channel, and
+        // `blocking_recv` is the documented way to drain one from outside
+        // the runtime.
+        //
+        // **`Weak`, not `Arc`.** A strong reference would be a cycle: the
+        // `Session` owns the `Sender` whose drop is this thread's exit
+        // condition. Two exits, both correct — the channel closing
+        // (`None`), and a `Session` that is already gone (`upgrade`
+        // fails), which is what stops a `Sender` clone outliving its
+        // session from parking this thread forever.
+        let weak_session = Arc::downgrade(&session);
+        std::thread::spawn(move || {
+            while let Some(req) = write_rx.blocking_recv() {
+                let Some(session) = weak_session.upgrade() else {
+                    break;
+                };
+                match req {
+                    WriteRequest::Input { bytes, ack } => {
+                        // `write_input`, not a second write path. The
+                        // liveness check, the `pre_write_head` sample and
+                        // the activity stamp are all one statement away
+                        // from the backend call there, and a queue that
+                        // re-implemented them would be a second answer to
+                        // each. The ack send fails when the caller
+                        // dropped its receiver, which is the ordinary
+                        // fire-and-forget case.
+                        let _ = ack.send(session.write_input(&bytes));
+                    }
+                }
             }
         });
 
@@ -717,6 +828,17 @@ impl Session {
     /// requires.
     pub fn subscribe(&self) -> broadcast::Receiver<OutputFrame> {
         self.output_tx.subscribe()
+    }
+
+    /// A handle on §4.3's write queue.
+    ///
+    /// Cloned per producer, so every attach connection on a session
+    /// pushes into the same FIFO and the writer thread is the only thing
+    /// that touches the PTY's input side. A full queue backs the
+    /// *producer* up — `send().await` on a bounded `mpsc` — and never the
+    /// reader.
+    pub fn write_queue(&self) -> tokio::sync::mpsc::Sender<WriteRequest> {
+        self.write_tx.clone()
     }
 
     /// Where a read of this session must stop right now (§4.1):
@@ -2798,5 +2920,281 @@ mod tests {
                 "{name} rendered the wrong number of rows"
             );
         }
+    }
+
+    // ------------------------------------------ 0.0.6 §4.3 write queue
+
+    /// A backend that hands the reader **one byte per `read`**.
+    ///
+    /// `MockPty::read` drains its whole queue into a single call, so a
+    /// hundred `queue_output(b"x")` calls can arrive as one
+    /// `OutputFrame`. That is fine for every test that cares about
+    /// *bytes*, and useless for the one test that cares about *frames*:
+    /// the broadcast's bound is 256 **frames**, so a burst that has to
+    /// overrun it needs the frame count to be something the test
+    /// controls rather than something the scheduler decides.
+    ///
+    /// 0.0.3 measured the alternative and recorded it: flooding a slow
+    /// consumer through `MockPty` never produced a `Lagged` at all,
+    /// proven by planting a `panic!` in the `Lagged` arm and watching it
+    /// never fire.
+    #[derive(Debug)]
+    struct DribblePty {
+        inner: Arc<MockPty>,
+    }
+
+    impl crate::pty::PtyBackend for DribblePty {
+        fn write(&self, data: &[u8]) -> Result<()> {
+            self.inner.write(data)
+        }
+        fn read(&self, buf: &mut [u8]) -> Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.inner.read(&mut buf[..1])
+        }
+        fn signal(&self, sig: crate::pty::Signal) -> Result<()> {
+            self.inner.signal(sig)
+        }
+        fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+            self.inner.resize(cols, rows)
+        }
+        fn is_alive(&self) -> bool {
+            self.inner.is_alive()
+        }
+        fn exit_code(&self) -> Option<i32> {
+            self.inner.exit_code()
+        }
+        fn pid(&self) -> Option<u32> {
+            self.inner.pid()
+        }
+    }
+
+    /// A backend whose writes come back as output, the way a PTY in echo
+    /// mode does.
+    ///
+    /// The write-queue tests need to see input **arrive at the child** by
+    /// the same route a real session would show it — through the ring
+    /// buffer and through the broadcast — and `MockPty` swallows writes
+    /// into `written()` without echoing. Wrapping rather than changing
+    /// `MockPty`, because every other test in the tree depends on writes
+    /// *not* appearing in the output stream.
+    #[derive(Debug)]
+    struct EchoPty {
+        inner: Arc<MockPty>,
+    }
+
+    impl crate::pty::PtyBackend for EchoPty {
+        fn write(&self, data: &[u8]) -> Result<()> {
+            self.inner.write(data)?;
+            self.inner.queue_output(data);
+            Ok(())
+        }
+        fn read(&self, buf: &mut [u8]) -> Result<usize> {
+            self.inner.read(buf)
+        }
+        fn signal(&self, sig: crate::pty::Signal) -> Result<()> {
+            self.inner.signal(sig)
+        }
+        fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+            self.inner.resize(cols, rows)
+        }
+        fn is_alive(&self) -> bool {
+            self.inner.is_alive()
+        }
+        fn exit_code(&self) -> Option<i32> {
+            self.inner.exit_code()
+        }
+        fn pid(&self) -> Option<u32> {
+            self.inner.pid()
+        }
+    }
+
+    fn session_on(backend: Arc<dyn PtyBackend>) -> Arc<Session> {
+        Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            backend,
+            SessionConfig::with_buffer_capacity(64 * 1024),
+        )
+    }
+
+    /// `recv` with a deadline, so a stalled fan-out fails the test
+    /// instead of hanging the run.
+    ///
+    /// `broadcast::Receiver` has no timeout of its own and there is no
+    /// runtime here to borrow one from. A bare `blocking_recv()` against
+    /// a reader that has stopped publishing waits forever, and an
+    /// unbounded wait in CI is a hung job rather than a red row — which
+    /// is the failure this whole section is most exposed to.
+    fn recv_within(
+        rx: &mut broadcast::Receiver<OutputFrame>,
+        what: &str,
+    ) -> std::result::Result<OutputFrame, broadcast::error::TryRecvError> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match rx.try_recv() {
+                Err(broadcast::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                other => {
+                    if matches!(other, Err(broadcast::error::TryRecvError::Empty)) {
+                        panic!("timed out waiting for {what}");
+                    }
+                    return other;
+                }
+            }
+        }
+    }
+
+    fn drain_bytes_within(rx: &mut broadcast::Receiver<OutputFrame>, needle: &[u8], what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut seen: Vec<u8> = Vec::new();
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(f) => {
+                    seen.extend_from_slice(&f.bytes);
+                    if seen.windows(needle.len()).any(|w| w == needle) {
+                        return;
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => panic!("{what}: {e:?}"),
+            }
+        }
+        panic!(
+            "timed out waiting for {what}; saw {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    #[test]
+    fn two_subscribers_both_receive_the_same_chunk() {
+        // The fan-out property, which nothing shipped pins:
+        // `wait::for_pattern` is the only caller of `subscribe()` at HEAD
+        // and it creates exactly one receiver, so "two receivers both see
+        // one chunk" has never been asserted. 0.0.6 is the first
+        // milestone with more than one subscriber alive at once — the
+        // waiter plus every attach client — so this is the milestone that
+        // has to pin it.
+        let (s, pty) = mock_session();
+        let mut a = s.subscribe();
+        let mut b = s.subscribe();
+
+        pty.queue_output(b"MARK");
+        wait_for_bytes(&s, 4);
+
+        let fa = recv_within(&mut a, "subscriber A's frame").expect("A received nothing");
+        let fb = recv_within(&mut b, "subscriber B's frame").expect("B received nothing");
+        assert_eq!(&*fa.bytes, b"MARK");
+        assert_eq!(
+            &*fb.bytes, b"MARK",
+            "the second subscriber missed the chunk"
+        );
+        assert_eq!(
+            (fa.start, fa.end),
+            (fb.start, fb.end),
+            "the two subscribers were told different offsets for one chunk"
+        );
+    }
+
+    #[test]
+    fn a_never_polled_subscriber_does_not_stall_the_reader() {
+        // REQ-C-003's *reader never blocks* clause.
+        //
+        // **Not asserted as `Err(Lagged(n))`**, which is the shape 0.0.3
+        // measured as unfalsifiable here. This asserts what the
+        // requirement actually names: the reader kept running with a
+        // full, unread channel, and a subscriber that arrives afterwards
+        // still sees current output.
+        let inner = Arc::new(MockPty::new());
+        let s = session_on(Arc::new(DribblePty {
+            inner: Arc::clone(&inner),
+        }) as Arc<dyn PtyBackend>);
+
+        // Held and never polled, for the whole test.
+        let _never_polled = s.subscribe();
+
+        // One frame per byte, so the count is the test's and not the
+        // scheduler's. Comfortably past OUTPUT_BROADCAST_FRAMES.
+        let burst = OUTPUT_BROADCAST_FRAMES * 2;
+        inner.queue_output(&vec![b'x'; burst]);
+
+        // (a) The reader kept going. A bounded channel that blocked its
+        // sender parks the reader thread at frame 256 and the head stops
+        // there — `wait_for_bytes` then fails on its own deadline rather
+        // than hanging the run.
+        wait_for_bytes(&s, burst as u64);
+
+        // (b) A subscriber that arrives after the burst still sees
+        // current output — the channel is usable, not merely unblocked.
+        let mut fresh = s.subscribe();
+        inner.queue_output(b"Z");
+        drain_bytes_within(&mut fresh, b"Z", "a fresh subscriber's first frame");
+    }
+
+    #[test]
+    fn input_queued_on_write_tx_reaches_the_pty() {
+        let inner = Arc::new(MockPty::new());
+        let s = session_on(Arc::new(EchoPty {
+            inner: Arc::clone(&inner),
+        }) as Arc<dyn PtyBackend>);
+        let mut sub = s.subscribe();
+
+        let (req, ack) = WriteRequest::input(b"echo QQ\n".to_vec());
+        s.write_queue().blocking_send(req).expect("queue accepted");
+
+        let wrote = ack
+            .blocking_recv()
+            .expect("the writer thread answered")
+            .expect("the write succeeded");
+        assert_eq!(wrote, 8);
+
+        // Both routes, because a queue that is drained and discarded
+        // fails neither on its own: `written()` alone would pass against
+        // a writer that never let the bytes reach the session's own
+        // record of them.
+        wait_for_bytes(&s, 8);
+        let read = s.read_from(0, 4096);
+        assert!(
+            String::from_utf8_lossy(&read.bytes).contains("QQ"),
+            "queued input never reached the buffer: {:?}",
+            String::from_utf8_lossy(&read.bytes)
+        );
+        drain_bytes_within(&mut sub, b"QQ", "the queued input on the broadcast");
+        assert_eq!(inner.written(), b"echo QQ\n");
+    }
+
+    #[test]
+    fn two_queued_writes_arrive_in_order() {
+        // §7.5's last-writer-wins is FIFO through this channel and
+        // nothing more. The mutation is a drain that spawns per message,
+        // which reorders under load and is the bug that claim depends on
+        // not existing.
+        let inner = Arc::new(MockPty::new());
+        let s = session_on(Arc::new(EchoPty {
+            inner: Arc::clone(&inner),
+        }) as Arc<dyn PtyBackend>);
+        let q = s.write_queue();
+
+        let (first, ack_a) = WriteRequest::input(b"AAAA".to_vec());
+        let (second, ack_b) = WriteRequest::input(b"BBBB".to_vec());
+        q.blocking_send(first).expect("queued A");
+        q.blocking_send(second).expect("queued B");
+        ack_a.blocking_recv().expect("A answered").expect("A wrote");
+        ack_b.blocking_recv().expect("B answered").expect("B wrote");
+
+        wait_for_bytes(&s, 8);
+        let read = s.read_from(0, 4096);
+        assert_eq!(
+            String::from_utf8_lossy(&read.bytes),
+            "AAAABBBB",
+            "the queue did not preserve arrival order"
+        );
+        assert_eq!(inner.written(), b"AAAABBBB");
     }
 }
