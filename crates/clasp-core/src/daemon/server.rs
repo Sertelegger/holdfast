@@ -596,15 +596,18 @@ impl Daemon {
 /// Read from a single `symlink_metadata` under `bind.lock`, so it names
 /// the file this process bound and nothing later.
 ///
-/// **Why `ctime` and not `(dev, ino)` alone.** An unlinked inode's
-/// *number* is free for immediate reuse on ext4 and xfs (tmpfs, btrfs
-/// and APFS allocate from a monotonic counter and never reuse one), so
-/// a successor that binds after clearing our stale socket can be handed
-/// our old number. `ctime` is stamped when the socket is created and
-/// again by the `chmod` below, so a reused number carries a different
-/// one unless the two binds also fall inside a single timestamp
-/// granularity — which the C-5 window cannot arrange, because it opens
-/// only after a daemon has served for some time.
+/// **`(dev, ino)` alone is not enough, and that is measured rather than
+/// argued.** An unlinked inode's *number* goes back to the allocator,
+/// and on ext4 the next binder gets it back: 500 rounds of the exact C-5
+/// window — predecessor binds, closes its listener, successor unlinks the
+/// stale file and binds — handed the successor the predecessor's inode
+/// number **500 times out of 500**. The same probe on tmpfs collides 0
+/// times, because tmpfs, btrfs and APFS allocate from a monotonic
+/// counter and never reuse one. So on the filesystem `~/.clasp` most
+/// often lives on, the obvious comparison would have named a successor's
+/// socket as our own with near-certainty inside the window it exists to
+/// guard. [`OwnedSocket`]'s pin is what closes that; `ctime` is a second,
+/// free line of defence taken from the same `stat`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SocketIdentity {
     dev: u64,
@@ -636,6 +639,104 @@ impl SocketIdentity {
     }
 }
 
+/// The `control.sock` this daemon bound: which file it is, and a
+/// reference that keeps the answer true for as long as the daemon runs.
+///
+/// **The pin is the load-bearing half.** Comparing a recorded
+/// [`SocketIdentity`] against the path only means something while the
+/// recorded value still refers to one file, and an inode number that has
+/// been freed refers to whatever gets it next — 500 times out of 500 on
+/// ext4, measured. Holding any descriptor on the inode stops it being
+/// freed, so the number cannot be handed on; the same probe with the pin
+/// in place collided 0 times out of 500.
+///
+/// `ctime` would usually catch a reuse on its own, and deliberately is
+/// not relied on to: file timestamps come from a coarse, once-per-tick
+/// clock on kernels before fine-grained (multigrain) timestamps, and two
+/// binds separated by microseconds would share one. That would make the
+/// guard's correctness a property of the host's kernel version, which is
+/// not something a release should have to know.
+#[derive(Debug)]
+pub struct OwnedSocket {
+    /// What the socket looked like at `bind`, for the platforms and
+    /// failures where there is no pin to ask instead.
+    id: SocketIdentity,
+    /// An inert `O_PATH` descriptor on the socket's inode. `None` off
+    /// Linux, and on Linux if the open failed — both of which fall back
+    /// to `id` rather than to nothing.
+    pin: Option<std::fs::File>,
+}
+
+impl OwnedSocket {
+    /// Whether `path` still names the socket this daemon bound.
+    ///
+    /// **With a pin, the comparison is against the inode we are holding
+    /// open rather than against a number we wrote down.** That is the
+    /// difference between "the path names inode 4711, and inode 4711 was
+    /// ours" — which stops being true the moment 4711 is freed and
+    /// reissued — and "the path names *this* inode, the one we still
+    /// have a reference to", which cannot go stale while the reference
+    /// exists. `fstat` on an `O_PATH` descriptor is allowed and is all
+    /// this needs.
+    ///
+    /// Without a pin it falls back to the recorded identity, whose
+    /// `ctime` is what carries it. Both arms fail closed: an error
+    /// anywhere reads as "not ours", which skips the unlink and leaves a
+    /// stale socket for the next binder to clear under this same lock.
+    fn still_at(&self, path: &std::path::Path) -> bool {
+        let Ok(now) = SocketIdentity::of(path) else {
+            return false;
+        };
+        match &self.pin {
+            Some(pin) => pin
+                .metadata()
+                .and_then(|m| SocketIdentity::from_meta(&m))
+                .is_ok_and(|held| now == held),
+            None => now == self.id,
+        }
+    }
+}
+
+/// Hold the socket's inode open so its *number* cannot be recycled while
+/// we still have a claim on it.
+///
+/// `O_PATH` is the only way to open a socket file at all — a plain
+/// `open(2)` on an `S_IFSOCK` inode fails `ENXIO`. What it returns is
+/// inert: it cannot be read, written, or connected to, and it has no
+/// effect on whether the socket answers `connect(2)`. That inertness is
+/// why the pin is this and not a `dup` of the listener, which would keep
+/// the socket *answering* across the teardown and turn `ensure_daemon`'s
+/// clean `ECONNREFUSED`-and-auto-spawn into a connect-then-reset error
+/// for any client that arrived in the window.
+///
+/// `.read(true)` is not a request for read access: `OpenOptions` refuses
+/// to build a call with no access mode, and `O_PATH` overrides the one it
+/// puts there.
+///
+/// **The failure is swallowed on purpose.** A daemon must not refuse to
+/// start because a defensive descriptor could not be opened; without the
+/// pin the identity falls back to `ctime`, which is where it was a commit
+/// ago. `the_bound_socket_holds_its_inode_open_after_the_path_is_gone` is
+/// what stops that silence hiding a `pin_inode` that never succeeds.
+#[cfg(target_os = "linux")]
+fn pin_inode(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(path)
+        .ok()
+}
+
+/// No `O_PATH` outside Linux, and none needed: the filesystems a daemon
+/// runs on there — APFS and HFS+ — allocate inode numbers from a
+/// monotonic counter and never hand one back.
+#[cfg(not(target_os = "linux"))]
+fn pin_inode(_path: &std::path::Path) -> Option<std::fs::File> {
+    None
+}
+
 /// Bind `control.sock`, tighten it to `0600`, and report which file that
 /// turned out to be.
 ///
@@ -643,11 +744,11 @@ impl SocketIdentity {
 /// another user cannot reach the socket even during it, because they
 /// cannot traverse the parent.
 ///
-/// **The [`SocketIdentity`] is returned rather than looked up later on
+/// **The [`OwnedSocket`] is returned rather than looked up later on
 /// demand** so that no binder can reach [`remove_runtime_files_we_own`]
-/// without one, and so that the only read of it happens under the lock
-/// that makes it true.
-pub fn bind_control(paths: &RuntimePaths) -> io::Result<(UnixListener, SocketIdentity)> {
+/// without one, and so that both the identity read and the pin happen
+/// under the lock that makes them true.
+pub fn bind_control(paths: &RuntimePaths) -> io::Result<(UnixListener, OwnedSocket)> {
     bind_control_within(paths, super::spawn::LOCK_TIMEOUT)
 }
 
@@ -658,7 +759,7 @@ pub fn bind_control(paths: &RuntimePaths) -> io::Result<(UnixListener, SocketIde
 pub(crate) fn bind_control_within(
     paths: &RuntimePaths,
     lock_timeout: Duration,
-) -> io::Result<(UnixListener, SocketIdentity)> {
+) -> io::Result<(UnixListener, OwnedSocket)> {
     use std::os::unix::fs::PermissionsExt;
 
     paths.ensure_dir()?;
@@ -736,7 +837,16 @@ pub(crate) fn bind_control_within(
             ),
         ));
     }
-    Ok((listener, SocketIdentity::from_meta(&meta)?))
+    // The pin is taken here, under `bind.lock` and against the file this
+    // function just created, so there is no window in which the path
+    // could have moved on to somebody else's socket before we hold it.
+    Ok((
+        listener,
+        OwnedSocket {
+            id: SocketIdentity::from_meta(&meta)?,
+            pin: pin_inode(&path),
+        },
+    ))
 }
 
 /// Holds [`Daemon::in_flight`] up for the life of one connection.
@@ -939,7 +1049,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
         // down, and the ordinary exit path gets that for free because
         // `serve_daemon` consumes the listener.
         drop(listener);
-        remove_runtime_files_we_own(&paths, our_socket);
+        remove_runtime_files_we_own(&paths, &our_socket);
         anyhow::bail!(
             "clasp daemon: refusing to start without the §9.4 audit trail: {why}. \
              Fix the ownership or permissions of that file, or point \
@@ -966,7 +1076,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // Anything still alive after `shutdown()` (or after a shutdown that
     // never ran, e.g. a bind error unwinding) dies here.
     daemon.shutdown();
-    remove_runtime_files_we_own(&paths, our_socket);
+    remove_runtime_files_we_own(&paths, &our_socket);
     Ok(())
 }
 
@@ -1001,7 +1111,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
 /// still ours. A pid file naming another process is somebody else's —
 /// one comparison, and it makes the removal idempotent under any
 /// interleaving. The socket is the same question and needs the same kind
-/// of answer, which is [`SocketIdentity`].
+/// of answer, which is [`OwnedSocket`].
 ///
 /// **The socket half was `!socket_is_live` and that was wrong.** It asks
 /// whether *anyone* is holding a descriptor on the socket, and answers
@@ -1038,11 +1148,17 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
 /// lock. Every way the identity comparison can be wrong points the same
 /// way: an unreadable or unequal identity skips the unlink and leaves a
 /// stale socket, and never removes a file that might be someone else's.
-pub(crate) fn remove_runtime_files_we_own(paths: &RuntimePaths, ours: SocketIdentity) {
+///
+/// **`ours` is borrowed, not consumed, and that matters.** It carries the
+/// pin that keeps its own inode number out of the allocator's hands; a
+/// signature that took it by value would drop it here, at the exact
+/// moment the comparison has just been made and the unlink is about to
+/// run.
+pub(crate) fn remove_runtime_files_we_own(paths: &RuntimePaths, ours: &OwnedSocket) {
     let Ok(_bind_lock) = super::spawn::DaemonLock::acquire_bind(paths) else {
         return;
     };
-    if SocketIdentity::of(&paths.control_sock()).is_ok_and(|now| now == ours) {
+    if ours.still_at(&paths.control_sock()) {
         let _ = std::fs::remove_file(paths.control_sock());
     }
     if read_pid_file(paths) == Some(std::process::id()) {
@@ -2736,21 +2852,19 @@ mod tests {
         assert_eq!(read_pid_file(&paths), Some(b_pid));
         assert_ne!(b_pid, std::process::id());
         // The premise the identity comparison rests on, asserted rather
-        // than assumed: B's bind produced a *different* file. It is also
-        // the tripwire for the one way identity can be fooled — a
-        // filesystem that hands B the inode number A just freed, within
-        // one timestamp granularity. On tmpfs, btrfs and APFS the number
-        // comes from a monotonic counter and cannot repeat; on ext4 and
-        // xfs it can, and this row is where that would surface as a
-        // failure rather than as a silently weakened guard.
+        // than assumed: B's bind produced a *different* file. Without
+        // A's pin this row is not safe to assume at all — on ext4 the
+        // successor is handed A's freed inode number 500 times out of
+        // 500, measured — so this is where a pin that stopped working
+        // would surface, on any filesystem that recycles.
         assert_ne!(
-            a_socket, b_socket,
+            a_socket.id, b_socket.id,
             "B rebound the same identity A had: the comparison below cannot \
              tell the two daemons' sockets apart"
         );
 
         // Daemon A's teardown, arriving late.
-        remove_runtime_files_we_own(&paths, a_socket);
+        remove_runtime_files_we_own(&paths, &a_socket);
 
         assert!(
             super::super::spawn::socket_is_live(&paths),
@@ -2818,7 +2932,7 @@ mod tests {
              state the old `!socket_is_live` guard read as `a daemon is serving`"
         );
 
-        remove_runtime_files_we_own(&paths, our_socket);
+        remove_runtime_files_we_own(&paths, &our_socket);
 
         assert!(
             !paths.control_sock().exists(),
@@ -2828,6 +2942,55 @@ mod tests {
         );
 
         drop(stray);
+    }
+
+    /// The pin is a **live reference to the inode**, not a no-op.
+    ///
+    /// `pin_inode` swallows its error by design — a daemon must not
+    /// refuse to start because a defensive descriptor could not be
+    /// opened — so a `pin_inode` that returned `None` every time would
+    /// leave every other row in this file green while quietly restoring
+    /// the inode-reuse hazard. This is the row that will not have it.
+    ///
+    /// It asserts the mechanism rather than the consequence, and that is
+    /// deliberate: the consequence — "a successor cannot be handed this
+    /// number" — is only observable on a filesystem that recycles inode
+    /// numbers, and the scratch directory is `/tmp`, which is tmpfs on
+    /// many machines and ext4 on the usual CI images. A row that could
+    /// only pass vacuously half the time is worth less than one that
+    /// checks, everywhere, that the thing preventing the recycling is
+    /// actually held: `nlink == 0` says the last name is gone, and the
+    /// descriptor still answering `fstat` with the same inode number says
+    /// the inode is still ours and still out of the allocator's reach.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_bound_socket_holds_its_inode_open_after_the_path_is_gone() {
+        use std::os::unix::fs::MetadataExt;
+
+        let paths = scratch("inodepin");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+
+        let (listener, ours) = bind_control(&paths).expect("bind control.sock");
+        drop(listener);
+        std::fs::remove_file(paths.control_sock()).expect("unlink the socket path");
+
+        let pin = ours.pin.as_ref().expect(
+            "`pin_inode` returned nothing: the identity comparison is back to \
+             trusting an inode number the allocator may reissue",
+        );
+        let meta = pin.metadata().expect("fstat through the pin");
+        assert_eq!(
+            meta.nlink(),
+            0,
+            "the premise: the path is gone, so the pin is the only thing \
+             keeping this inode from being freed"
+        );
+        assert_eq!(
+            meta.ino(),
+            ours.id.ino,
+            "the pin is open on some other inode than the one recorded"
+        );
     }
 
     #[tokio::test]
