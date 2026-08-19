@@ -393,10 +393,39 @@ impl ServerHandler for ClaspServer {
 }
 
 /// Serve MCP over stdio until the client disconnects.
+///
+/// **The operator's `config.toml` is loaded here, and it is the same
+/// file the daemon loads** (§10.1, REQ-CFG-002/004). This path used to
+/// run the whole tool surface on `Config::default()`: an operator who
+/// set `max_concurrent_sessions`, `default_idle_timeout_secs`,
+/// `resource_read_max_bytes` or anything else, and then ran
+/// `clasp mcp --no-daemon`, got the built-in value on every one of them
+/// with no warning on any channel. The hybrid transport was configured
+/// only because the *daemon* loads the file (`server::run`), not because
+/// the MCP server does — so the knob was in force or not depending on a
+/// flag that says nothing about configuration. On Windows, where §3.3
+/// and §3.6 make stdio the only transport until 0.0.11, that meant
+/// `config.toml` did nothing at all.
+///
+/// **Config first, and before anything is served** — the same ordering
+/// `server::run` states for the same reason (REQ-CFG-003): an invalid or
+/// untrusted file refuses to start rather than starting on defaults,
+/// because the failure the requirement exists to prevent is an operator
+/// believing a limit is in force when it is not. That is a new refusal
+/// on this transport, and deliberately the *same* refusal the daemon
+/// already makes about the same bytes; a file that starts a daemon
+/// starts this, and a file that stops a daemon stops this. A missing
+/// file — the stock install — is [`crate::config::Config::default`] and
+/// not an error, so nothing that works today begins refusing.
+///
+/// The §9.4 audit trail still fails **open** here, unlike
+/// `run_with_config`, which refuses. That divergence is tracked
+/// separately; it is not this function's to decide quietly.
 pub async fn serve_stdio() -> anyhow::Result<()> {
+    let config = crate::config::load()?;
     // The audit path is resolved here rather than in `new()` so that only
     // the real server process ever writes to it.
-    let server = ClaspServer::with_audit_path(crate::audit::default_path());
+    let server = ClaspServer::with_audit_path_and_config(crate::audit::default_path(), &config);
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())

@@ -300,8 +300,16 @@ impl Shim {
     }
 
     fn spawn(env: &TestEnv, args: &[&str]) -> Self {
-        let mut child = env
-            .cmd()
+        Self::spawn_cmd(env.cmd(), args)
+    }
+
+    /// [`Shim::spawn`] over a command the caller has already adjusted.
+    ///
+    /// Exists for the one environment variable `TestEnv::cmd` cannot set
+    /// for everybody: `$HOME`. See
+    /// `the_no_daemon_server_honours_a_configured_session_cap`.
+    fn spawn_cmd(mut cmd: Command, args: &[&str]) -> Self {
+        let mut child = cmd
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1316,4 +1324,85 @@ fn the_published_example_config_starts_a_real_daemon() {
     );
     assert!(env.dir.join("control.sock").exists());
     env.run(&["daemon", "stop"]);
+}
+
+#[test]
+fn an_invalid_config_stops_the_no_daemon_server_before_it_serves() {
+    // The `--no-daemon` half of
+    // `an_invalid_config_stops_the_daemon_before_it_binds`, and it did
+    // not exist because the behaviour did not: `serve_stdio` built its
+    // server from `Config::default()` and never opened the file at all.
+    // So this transport served every tool on the built-in values while
+    // the operator's `config.toml` sat unread — and on Windows, where
+    // §3.3/§3.6 leave stdio the only transport until 0.0.11, that was
+    // every transport there is.
+    let env = TestEnv::new("nodaemonbadcfg");
+    env.write_config("[limits]\nmax_concurrent_sessions = 0\n");
+
+    // **`run` gives the child `/dev/null` for stdin, and that is what
+    // bounds this.** A server that starts reaches EOF on the MCP
+    // transport immediately and exits 0 of its own accord, so the
+    // pre-fix behaviour is a fast green exit rather than a wait — no
+    // timeout is standing in for the assertion.
+    let (code, _, err) = env.run(&["mcp", "--no-daemon"]);
+    assert_eq!(
+        code, 1,
+        "§18.8: a refused config is \"operation failed\" (1) — the code \
+         `daemon run` gives for these same bytes. Exit 0 is the server \
+         having started on defaults, which is the whole defect; exit 2 \
+         would send the operator hunting for a daemon this transport does \
+         not have. stderr: {err}"
+    );
+    assert!(
+        err.contains("max_concurrent_sessions"),
+        "the refusal names the offending key, as REQ-CFG-003 requires of \
+         the daemon: {err}"
+    );
+}
+
+#[test]
+fn the_no_daemon_server_honours_a_configured_session_cap() {
+    // **The pairing, and the arm that survives a fix which loads the
+    // file and then drops it.** The refusal above passes just as well
+    // against `let _ = config::load()?;` in front of a server still
+    // built from `Config::default()`; this one cannot, because the cap
+    // it asserts exists nowhere but the operator's file. It is also the
+    // non-vacuous half: a valid config still has to *serve*, or the
+    // refusal above is indistinguishable from a transport that stopped
+    // working.
+    let env = TestEnv::new("nodaemoncfg");
+    env.write_config("[limits]\nmax_concurrent_sessions = 1\n");
+
+    // `$HOME` inside the test directory. `--no-daemon`'s §9.4 trail is
+    // `audit::default_path()` — `$HOME/.clasp/logs/audit.log` — and not
+    // the runtime directory's, so without this the two `start_session`
+    // calls below append `session_start` rows to the *developer's* real
+    // audit log. Same reason `redaction_disabled_entries` reads the
+    // instance's log rather than `~/.clasp/logs`. Config discovery is
+    // unaffected: §10.1 prefers `$XDG_CONFIG_HOME`, which `cmd` sets.
+    let mut cmd = env.cmd();
+    cmd.env("HOME", &env.dir);
+    let mut shim = Shim::spawn_cmd(cmd, &["mcp", "--no-daemon"]);
+
+    let first = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "cap-1" }),
+    );
+    assert_eq!(
+        first["result"]["structuredContent"]["status"], "ok",
+        "a cap of 1 must still admit the first session: {first}"
+    );
+
+    let second = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "cap-2" }),
+    );
+    assert_eq!(
+        second["result"]["structuredContent"]["status"], "limit_reached",
+        "the built-in cap is 8, so a second session that starts is a tool \
+         surface running on `Config::default()` with the operator's file \
+         unread: {second}"
+    );
+
+    shim.kill();
 }

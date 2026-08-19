@@ -63,7 +63,7 @@ pub async fn mcp(no_daemon: bool) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 diag!("clasp mcp: {e}");
-                ExitCode::from(EXIT_UNREACHABLE)
+                ExitCode::from(no_daemon_exit_code(&e))
             }
         };
     }
@@ -106,6 +106,30 @@ pub async fn mcp(no_daemon: bool) -> ExitCode {
         return ExitCode::from(EXIT_UNREACHABLE);
     }
     ExitCode::SUCCESS
+}
+
+/// §18.8's code for a `clasp mcp --no-daemon` that stopped serving.
+///
+/// **A refused `config.toml` is "operation failed" (1), not "daemon
+/// unreachable" (2).** `serve_stdio` now loads the same file the daemon
+/// loads and refuses the same way (REQ-CFG-003), and this transport has
+/// no daemon in it to be unreachable — reporting exit 2 would send an
+/// operator looking for a process that was never meant to exist, past
+/// the diagnostic that already names the offending key. `daemon run`
+/// gives the identical refusal exit 1 ([`daemon_run`] below), and two
+/// transports must not disagree about the same bytes on disk.
+///
+/// Everything else keeps exit 2: those are the transport failing —
+/// `serve` or `waiting` on stdio — which is what §18.8's row is about
+/// for this subcommand.
+fn no_daemon_exit_code(e: &anyhow::Error) -> u8 {
+    if e.downcast_ref::<clasp_core::config::ConfigError>()
+        .is_some()
+    {
+        EXIT_FAILED
+    } else {
+        EXIT_UNREACHABLE
+    }
 }
 
 /// `clasp daemon run` — foreground, for systemd/launchd and for the

@@ -34,6 +34,15 @@ ENVIRONMENT:
     CLASP_RUNTIME_DIR              Select a CLASP instance: relocates the
                                    sockets, pid file, lock file and the
                                    daemon log
+
+FILES:
+    $XDG_CONFIG_HOME/clasp/config.toml, else ~/.config/clasp/config.toml
+                                   Read by both transports, `mcp
+                                   --no-daemon` included. Absent is the
+                                   defaults; present and invalid refuses
+                                   to start rather than starting on
+                                   them. CLASP_RUNTIME_DIR does not move
+                                   it.
 ";
 
 /// How long to wait for the blocking pool at exit.
