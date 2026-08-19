@@ -489,6 +489,23 @@ pub struct SecurityConfig {
     /// rejected config.
     #[serde(default)]
     pub secret_bindings: Vec<SecretBinding>,
+
+    // ---- 0.0.7's three. None of them appears in §4.2 or §10.2 (Q2, Q3,
+    // Q4), so they are additive: a config written against the published
+    // example still loads, because every one carries a default.
+    /// Bounds the provider subprocess so a credential store waiting on a
+    /// biometric prompt cannot hold the session's only request slot.
+    #[serde(default = "d_keychain_provider_timeout_secs")]
+    pub keychain_provider_timeout_secs: u32,
+    /// Ceiling on `request_secret_input`'s `max_secret_bytes` argument.
+    /// 65536 matches §7.6.3's 64 KiB web secret-body cap and
+    /// `send_input.data`'s 64 KiB cap, so a client that can submit it can
+    /// also carry it.
+    #[serde(default = "d_max_secret_bytes_ceiling")]
+    pub max_secret_bytes_ceiling: u32,
+    /// Ceiling on `request_secret_input`'s `timeout_secs` argument.
+    #[serde(default = "d_secret_input_max_timeout_secs")]
+    pub secret_input_max_timeout_secs: u32,
 }
 
 /// One operator-configured secret binding (§9.6). **Unread in 0.0.5.**
@@ -711,6 +728,15 @@ fn d_autofill_on_echo_off() -> bool {
 fn d_strict_confirmation() -> bool {
     false
 }
+fn d_keychain_provider_timeout_secs() -> u32 {
+    10
+}
+fn d_max_secret_bytes_ceiling() -> u32 {
+    65_536
+}
+fn d_secret_input_max_timeout_secs() -> u32 {
+    900
+}
 fn d_ui_bridge_pinned_port() -> u16 {
     0
 }
@@ -823,6 +849,9 @@ table_default!(SecurityConfig {
     secret_provider: d_secret_provider,
     autofill_on_echo_off: d_autofill_on_echo_off,
     strict_confirmation: d_strict_confirmation,
+    keychain_provider_timeout_secs: d_keychain_provider_timeout_secs,
+    max_secret_bytes_ceiling: d_max_secret_bytes_ceiling,
+    secret_input_max_timeout_secs: d_secret_input_max_timeout_secs,
 }; extra_redaction_patterns, secret_bindings);
 
 table_default!(UiConfig {
@@ -1022,6 +1051,41 @@ impl Config {
             &self.security.secret_provider,
             &SECRET_PROVIDERS,
         )?;
+        // §9.6, REQ-SEC-014. Autofill resolves from a credential store,
+        // and `prompt` is the mode that has none: the combination reads
+        // as "on" and behaves as "off", for the single most consequential
+        // switch in the file. Naming **both** keys is the point — an
+        // operator who set one of them cannot see from the other's line
+        // that the pair is the fault.
+        if self.security.autofill_on_echo_off && self.security.secret_provider == "prompt" {
+            return Err(ConfigError::invalid(
+                "security.autofill_on_echo_off = true requires \
+                 security.secret_provider = \"keychain\" or \"both\"; it is \"prompt\", \
+                 which resolves no credential and would leave autofill silently off",
+            ));
+        }
+        // A typo'd binding that never matches is indistinguishable from a
+        // credential store that is down, so an uncompilable pattern stops
+        // the daemon rather than becoming a binding that quietly does
+        // nothing. Both patterns, because either one failing to compile
+        // makes the whole binding unselectable.
+        for binding in &self.security.secret_bindings {
+            for (field, pattern) in [
+                ("match_command", &binding.match_command),
+                ("match_prompt", &binding.match_prompt),
+            ] {
+                // §9.6 reads an empty `match_prompt` as "this binding does
+                // not select on the prompt"; the empty regex compiles and
+                // matches everything, so it is not special-cased here.
+                if let Err(e) = regex::Regex::new(pattern) {
+                    return Err(ConfigError::invalid(format!(
+                        "security.secret_bindings[\"{}\"].{field} = {pattern:?} is not a \
+                         valid regex: {e}",
+                        binding.name
+                    )));
+                }
+            }
+        }
 
         nonzero(
             "ui.ui_token_idle_ttl_secs",
@@ -1448,6 +1512,187 @@ require_confirm = false
             .expect("rev. 48 uncommented both keys; a loader modelling only three [terminal] keys refuses the published example");
         assert!(!cfg.terminal.terminal_queries);
         assert_eq!(cfg.terminal.terminal_query_replies_per_min, 5);
+    }
+
+    /// §4.2 and §9.6's defaults, **as literals**.
+    ///
+    /// Every value below is written out rather than compared to its own
+    /// `d_*` function: `assert_eq!(cfg.security.autofill_on_echo_off,
+    /// d_autofill_on_echo_off())` is the default compared to itself and
+    /// stays green through any change to it, which is precisely the
+    /// mutation REQ-SEC-014 names by hand.
+    #[test]
+    fn the_security_defaults_are_the_ones_the_spec_states() {
+        // An *empty* config, not `Config::default()`: this has to be the
+        // value an operator with no `[security]` table gets, which is a
+        // property of the serde attributes rather than of the `Default`
+        // impl. The two are wired to the same `d_*` fns and can still
+        // disagree — a missing `#[serde(default = …)]` is a load error,
+        // and a missing `table_default!` row is `E0063`, but a row
+        // pointing at the *wrong* fn is neither.
+        let cfg = parse_str("").expect("an empty config is all defaults");
+        let s = &cfg.security;
+
+        assert_eq!(s.secret_provider, "prompt");
+        assert!(
+            !s.autofill_on_echo_off,
+            "REQ-SEC-014: silent credential injection is opt-in per deployment"
+        );
+        assert!(s.secret_bindings.is_empty());
+        assert!(s.redaction_enabled);
+        assert!(!s.strict_confirmation);
+        assert_eq!(s.keychain_provider_timeout_secs, 10);
+        assert_eq!(s.max_secret_bytes_ceiling, 65_536);
+        assert_eq!(s.secret_input_max_timeout_secs, 900);
+
+        // §10.2 sites this one under `[daemon]`, not `[security]` — the
+        // siting is odd and is the plan's Q14, but `deny_unknown_fields`
+        // makes the table name load-bearing, so a reader looking for it
+        // beside its siblings has to be told where it actually is.
+        assert_eq!(cfg.daemon.binding_approval_timeout_secs, 120);
+
+        // And the same values through `Default`, which is the path every
+        // in-process host takes.
+        let d = Config::default();
+        assert_eq!(d.security, cfg.security);
+        assert_eq!(
+            d.daemon.binding_approval_timeout_secs,
+            cfg.daemon.binding_approval_timeout_secs
+        );
+    }
+
+    /// The per-field fold, from the direction that actually bites.
+    ///
+    /// A section-level default rebuilds `SecurityConfig` whenever any one
+    /// of its keys is present, which is the shape a hand-written fold
+    /// reaches for — and it takes `secret_bindings` with it, silently
+    /// disarming every operator binding on the box.
+    #[test]
+    fn setting_one_security_knob_does_not_clear_the_bindings() {
+        const TWO_BINDINGS: &str = "\
+[[security.secret_bindings]]
+name = \"prod-ssh\"
+match_command = \"^ssh\\\\b\"
+match_prompt = \"(?i)password\"
+provider = \"secret-service\"
+reference = \"service=holdfast,account=prod-ssh\"
+
+[[security.secret_bindings]]
+name = \"prod-db\"
+match_command = \"^psql\\\\b\"
+match_prompt = \"\"
+provider = \"pass\"
+reference = \"db/prod\"
+";
+        // A sibling scalar set in the same table as the array.
+        let with_knob = parse_str(&format!(
+            "[security]\nsecret_provider = \"both\"\n{TWO_BINDINGS}"
+        ))
+        .expect("a sibling knob beside two bindings must load");
+        assert_eq!(with_knob.security.secret_provider, "both");
+        assert_eq!(
+            with_knob.security.secret_bindings.len(),
+            2,
+            "setting one `[security]` key cleared the bindings — the fold is per section, \
+             not per field"
+        );
+        assert_eq!(with_knob.security.secret_bindings[1].name, "prod-db");
+
+        // **The pairing.** Without it this test is satisfied by a loader
+        // that never folds at all — one that ignores `secret_provider`
+        // and leaves the bindings alone by doing nothing.
+        let without_knob =
+            parse_str(TWO_BINDINGS).expect("bindings with no sibling knob must load");
+        assert_eq!(without_knob.security.secret_bindings.len(), 2);
+        assert_eq!(
+            without_knob.security.secret_provider, "prompt",
+            "the knob-free config must still carry the default, or the assertion above \
+             is about a loader that reads no knobs"
+        );
+    }
+
+    /// REQ-CFG-003, at the value level. The socket half — that a daemon
+    /// carrying this config binds nothing — is
+    /// `autofill_without_a_keychain_provider_stops_the_daemon` in
+    /// `crates/holdfast/tests/daemon_cli.rs`, because both a rejection
+    /// and a warning print something and only one leaves no socket.
+    #[test]
+    fn autofill_without_a_keychain_provider_is_rejected() {
+        let e =
+            parse_str("[security]\nautofill_on_echo_off = true\nsecret_provider = \"prompt\"\n")
+                .expect_err(
+                    "a switch that reads as \"on\" and behaves as \"off\" is the failure \
+                 REQ-CFG-003 refuses",
+                );
+        let msg = e.to_string();
+        // **Both** keys. An operator who set one of them cannot see from
+        // the other's name alone that the *pair* is the fault.
+        assert!(
+            msg.contains("autofill_on_echo_off"),
+            "the error must name the key that was set: {msg}"
+        );
+        assert!(
+            msg.contains("secret_provider"),
+            "the error must name the key that made it invalid: {msg}"
+        );
+
+        // **The pairing, and without it the rule is \"autofill is never
+        // allowed\".** Both keychain-bearing modes must start cleanly.
+        for provider in ["keychain", "both"] {
+            let cfg = parse_str(&format!(
+                "[security]\nautofill_on_echo_off = true\nsecret_provider = \"{provider}\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("autofill with secret_provider = {provider:?}: {e}"));
+            assert!(cfg.security.autofill_on_echo_off);
+        }
+        // And the default `prompt` with autofill *off* is the shipped
+        // configuration; a rule that rejected it would reject every
+        // stock install.
+        assert!(parse_str("[security]\nsecret_provider = \"prompt\"\n").is_ok());
+    }
+
+    /// An operator's typo must not become a binding that silently never
+    /// matches — which is indistinguishable from a credential store that
+    /// is down.
+    #[test]
+    fn a_binding_whose_regex_does_not_compile_is_rejected() {
+        let bad = |field: &str, value: &str| {
+            format!(
+                "[[security.secret_bindings]]\nname = \"prod-ssh\"\n\
+                 match_command = \"{}\"\nmatch_prompt = \"{}\"\n\
+                 provider = \"secret-service\"\nreference = \"r\"\n",
+                if field == "match_command" {
+                    value
+                } else {
+                    "^ok$"
+                },
+                if field == "match_prompt" { value } else { "" },
+            )
+        };
+        // **Both** patterns, because either one failing to compile makes
+        // the whole binding unselectable, and a validator that checked
+        // only `match_command` would pass every test written against the
+        // field an example happens to use.
+        for field in ["match_command", "match_prompt"] {
+            let e = parse_str(&bad(field, "^ssh ("))
+                .expect_err("an uncompilable pattern must be a load error, not a dead binding");
+            let msg = e.to_string();
+            assert!(msg.contains(field), "the error must name the field: {msg}");
+            assert!(
+                msg.contains("prod-ssh"),
+                "the error must name the binding, or an operator with six of them \
+                 cannot find it: {msg}"
+            );
+        }
+
+        // **The pairing.** The same shapes that *do* compile must load,
+        // or the rule has become "no bindings". An empty `match_prompt`
+        // is §9.6's "this binding does not select on the prompt" and is
+        // the case a naive non-empty check would break.
+        let ok = parse_str(&bad("match_command", "^ssh\\\\s+prod-0[12]\\\\b"))
+            .expect("a valid binding must load");
+        assert_eq!(ok.security.secret_bindings.len(), 1);
+        assert_eq!(ok.security.secret_bindings[0].match_prompt, "");
     }
 
     #[test]

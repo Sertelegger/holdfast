@@ -152,6 +152,37 @@ mod secret_is_not_serializable {
 
     impl<T: ?Sized + serde::Serialize> NotSerialize for T {}
     impl NotSerialize for SecretBytes {}
+
+    // ------------------------------------------------- the `Clone` half
+    //
+    // 0.0.6 guarded "no `Serialize`" and left "no `Clone`" to the doc
+    // comment on the type. 0.0.7 gives `SecretBytes` new construction
+    // sites — a provider subprocess, an operator binding, an autofill
+    // path — and "one owner, one write, one drop" stops being a property
+    // anybody can hold in their head at the moment there is more than
+    // one producer. A second live copy is a second `Drop`, and the one
+    // that is *not* the write path is a value nothing accounts for.
+    //
+    // `#[allow(dead_code)]` is not tidiness. The trait is named nowhere
+    // outside this module and the gate is
+    // `cargo clippy --workspace --all-targets -- -D warnings`, under
+    // which `dead_code` is fatal — measured: without it the crate fails
+    // with ``error: trait `NotClone` is never used``, a guard firing for
+    // a reason unrelated to what it guards.
+    #[allow(dead_code)]
+    pub trait NotClone {}
+
+    // **The `Clone` bound IS the guard.** Without it —
+    // `impl<T> NotClone for T {}` — the blanket impl covers
+    // `SecretBytes` unconditionally, `E0119` fires whether or not
+    // anything derives `Clone`, and what you have is a crate that does
+    // not build rather than a guard: that form never mentions `Clone` at
+    // all, so it cannot be conditional on it.
+    //
+    // No `?Sized` relaxation here, unlike the `NotSerialize` pair above:
+    // `Clone: Sized`, so a `T: Clone` bound already implies `T: Sized`.
+    impl<T: Clone> NotClone for T {}
+    impl NotClone for SecretBytes {}
 }
 
 /// The one outstanding secret request on a session (§5.2: *"fixed at 1

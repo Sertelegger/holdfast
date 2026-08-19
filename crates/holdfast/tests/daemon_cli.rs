@@ -1289,6 +1289,68 @@ fn an_unknown_key_in_the_config_stops_the_daemon_and_names_it() {
 }
 
 #[test]
+fn a_binding_whose_regex_does_not_compile_stops_the_daemon() {
+    // §9.6, 0.0.7. An operator's typo'd binding must not become a
+    // binding that silently never matches — which from the outside is
+    // indistinguishable from a credential store that is down.
+    let env = TestEnv::new("badbinding");
+    env.write_config(
+        "[[security.secret_bindings]]\n\
+         name = \"prod-ssh\"\n\
+         match_command = \"^ssh (\"\n\
+         match_prompt = \"\"\n\
+         provider = \"secret-service\"\n\
+         reference = \"service=holdfast,account=prod-ssh\"\n",
+    );
+
+    let (code, _, err) = env.run(&["daemon", "run"]);
+    assert_ne!(code, 0, "an uncompilable binding must not start a daemon");
+    assert!(
+        err.contains("match_command"),
+        "the error names the offending key; got: {err}"
+    );
+    assert!(
+        err.contains("prod-ssh"),
+        "and the binding, or an operator with six of them cannot find it; got: {err}"
+    );
+    // The assertion that separates rejecting from warning: both print.
+    assert!(
+        !env.dir.join("control.sock").exists(),
+        "a daemon that logged a warning and started anyway leaves a binding \
+         that never matches in force"
+    );
+}
+
+#[test]
+fn autofill_without_a_keychain_provider_stops_the_daemon() {
+    // REQ-SEC-014 + REQ-CFG-003. `autofill_on_echo_off = true` with
+    // `secret_provider = "prompt"` is a switch that reads as "on" and
+    // behaves as "off", for the single most consequential knob in the
+    // file.
+    let env = TestEnv::new("badautofill");
+    env.write_config("[security]\nautofill_on_echo_off = true\nsecret_provider = \"prompt\"\n");
+
+    let (code, _, err) = env.run(&["daemon", "run"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("autofill_on_echo_off"), "{err}");
+    assert!(err.contains("secret_provider"), "{err}");
+    assert!(!env.dir.join("control.sock").exists());
+
+    // **The pairing.** The same switch with a provider that can resolve
+    // must start, or the rule has quietly become "autofill is never
+    // allowed" and REQ-SEC-014's opt-in is unreachable.
+    let ok = TestEnv::new("okautofill");
+    ok.write_config("[security]\nautofill_on_echo_off = true\nsecret_provider = \"both\"\n");
+    let (code, _, err) = ok.run(&["daemon", "start"]);
+    assert_eq!(
+        code, 0,
+        "autofill with a keychain provider must start: {err}"
+    );
+    assert!(ok.dir.join("control.sock").exists());
+    ok.run(&["daemon", "stop"]);
+}
+
+#[test]
 fn a_valid_config_starts_the_daemon_and_reaches_it() {
     // **The pairing, and it is what makes the two rows above mean
     // anything.** Without it they pass against a `daemon run` that

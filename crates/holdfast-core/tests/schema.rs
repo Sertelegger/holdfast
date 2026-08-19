@@ -2659,6 +2659,11 @@ async fn every_declared_status_is_returned_by_a_real_response() {
             // open. Copied rather than written as `None` so this literal
             // cannot disagree with the constructor it borrows from.
             audit_open_error: small.audit_open_error.clone(),
+            // 0.0.7's third widening of this literal. Copied for the same
+            // reason as the line above: the point here is the *registry*
+            // limit, so every other field is whatever the constructor
+            // chose.
+            capabilities: small.capabilities,
         };
         let (_first, _) = start_bash(&server_one).await;
         note(&body(

@@ -31,9 +31,11 @@ pub mod diag;
 pub mod error;
 pub mod mcp;
 pub mod output;
+pub mod platform;
 pub mod protocol;
 pub mod pty;
 pub mod screen;
+pub mod secret;
 pub mod session;
 
 pub use error::{HoldfastError, Result};

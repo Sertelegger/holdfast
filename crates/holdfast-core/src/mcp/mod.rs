@@ -141,6 +141,13 @@ pub struct HoldfastServer {
     /// was supplied at all: a deliberately disabled trail is a choice,
     /// not a failure, and that is what every test takes.
     pub audit_open_error: Option<String>,
+    /// §3.6's capability matrix, as a value (0.0.7).
+    ///
+    /// `#[cfg]` picks the default; the branch reads the value. It is a
+    /// field rather than a `cfg!` at each use site because
+    /// `not_supported_on_platform` is otherwise a status no test on any
+    /// machine CI runs on can produce — see [`crate::platform`].
+    pub capabilities: crate::platform::Capabilities,
 }
 
 impl HoldfastServer {
@@ -197,6 +204,55 @@ impl HoldfastServer {
         config: &crate::config::Config,
         clock: crate::clock::Clock,
     ) -> Self {
+        Self::with_audit_path_config_clock_and_capabilities(
+            path,
+            config,
+            clock,
+            crate::platform::Capabilities::default(),
+        )
+    }
+
+    /// A server whose §3.6 capabilities are **forced**, so a Unix test
+    /// can drive `not_supported_on_platform` (REQ-A-006, REQ-T-017).
+    ///
+    /// Two arguments deliberately: nothing that forces a capability also
+    /// wants to hand-roll a config or a clock, and a four-argument
+    /// spelling at every such call site is how a test ends up passing
+    /// `Config::default()` where it meant the operator's.
+    pub fn with_capabilities(
+        path: Option<PathBuf>,
+        capabilities: crate::platform::Capabilities,
+    ) -> Self {
+        Self::with_audit_path_config_clock_and_capabilities(
+            path,
+            &crate::config::Config::default(),
+            crate::clock::Clock::system(),
+            capabilities,
+        )
+    }
+
+    /// The one constructor that builds the struct literal.
+    ///
+    /// **It inherits 0.0.5's REQ-CFG-004 wiring verbatim.** The literal
+    /// keeps `SessionRegistry::new(config.limits.max_concurrent_sessions)`
+    /// and `OutputProcessor::new(rules, audit, config.processing_limits())`:
+    /// a constructor that reached for `SessionRegistry::with_defaults()`
+    /// or `ProcessingLimits::default()` instead would compile, pass every
+    /// test that sets no config, and revert the operator's limits with
+    /// nothing going red.
+    ///
+    /// **The plan for this milestone specified
+    /// `with_audit_path_config_and_capabilities`, dropping the clock.**
+    /// It was written against a four-field `HoldfastServer` that predates
+    /// the injectable clock; taking that signature would have put the
+    /// daemon's own construction back on `Clock::system()` and silently
+    /// undone the seam `Clock::now_ms` exists for. The clock stays.
+    pub fn with_audit_path_config_clock_and_capabilities(
+        path: Option<PathBuf>,
+        config: &crate::config::Config,
+        clock: crate::clock::Clock,
+        capabilities: crate::platform::Capabilities,
+    ) -> Self {
         let rules = builtin_shared();
         // The failure is *carried out* of this function rather than
         // swallowed inside it. See `audit_open_error`.
@@ -231,6 +287,7 @@ impl HoldfastServer {
             resource_list_changed: tokio::sync::broadcast::channel(RESOURCE_EVENT_CAPACITY).0,
             clock,
             audit_open_error,
+            capabilities,
         }
     }
 
