@@ -24,6 +24,8 @@
 pub mod conn;
 pub mod frames;
 pub mod handshake;
+#[cfg(unix)]
+pub mod hub;
 
 pub use frames::{
     decode_client_frame, decode_server_frame, AttachMode, AttachRole, ClientDecode, ClientFrame,

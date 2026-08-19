@@ -600,6 +600,263 @@ async fn no_attach_reject_is_limit_reached_in_v0_1_0() {
     assert_eq!(clients.len(), 16);
 }
 
+// -------------------------------- fan-out, slow consumer, accounting
+
+#[tokio::test]
+async fn output_broadcasts_to_every_attached_client() {
+    let d = TestDaemon::start("fanout").await;
+    let (s, pty) = d.session(None);
+
+    let mut a = d.dial().await;
+    send(&mut a, &attach_to(&s.id)).await;
+    assert!(matches!(recv(&mut a).await, ServerFrame::Attached { .. }));
+    let mut b = d.dial().await;
+    send(&mut b, &attach_to(&s.id)).await;
+    assert!(matches!(recv(&mut b).await, ServerFrame::Attached { .. }));
+
+    pty.queue_output(b"MARK");
+    // **Both**, not "at least one": sending to only the first (or only
+    // the last) registered client passes a single-client assertion.
+    for (name, c) in [("A", &mut a), ("B", &mut b)] {
+        match recv(c).await {
+            ServerFrame::Output { bytes, .. } => {
+                assert_eq!(bytes, b"MARK", "client {name} got the wrong bytes")
+            }
+            other => panic!("client {name} got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn output_does_not_reach_a_connection_that_never_handshook() {
+    // **The pairing.** Registering at `accept` rather than at `Attach`
+    // is a bug the positive test above cannot see: both attached
+    // clients still get the marker.
+    let d = TestDaemon::start("silent").await;
+    let (s, pty) = d.session(None);
+
+    let mut a = d.dial().await;
+    send(&mut a, &attach_to(&s.id)).await;
+    assert!(matches!(recv(&mut a).await, ServerFrame::Attached { .. }));
+
+    // Opened, and silent.
+    let silent = d.dial().await;
+
+    pty.queue_output(b"MARK");
+    match recv(&mut a).await {
+        ServerFrame::Output { bytes, .. } => assert_eq!(bytes, b"MARK"),
+        other => panic!("expected Output, got {other:?}"),
+    }
+
+    // `try_read`, not a timeout: `WouldBlock` is a definite "nothing is
+    // there", where a timeout that expired would be indistinguishable
+    // from a slow daemon.
+    let mut buf = [0u8; 1];
+    match silent.try_read(&mut buf) {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok(0) => panic!("the daemon closed a silent connection instead of leaving it idle"),
+        other => panic!("a connection that never handshook received data: {other:?}"),
+    }
+    assert_eq!(
+        d.daemon.status().attach_clients,
+        1,
+        "a socket that never handshook is not an attached client"
+    );
+}
+
+#[tokio::test]
+async fn output_does_not_reach_a_client_attached_to_a_different_session() {
+    // The second half of the pairing, and it fails against a *different*
+    // bug from the one above: a fan-out keyed on nothing, i.e. one
+    // global broadcast.
+    let d = TestDaemon::start("twosess").await;
+    let (a_sess, a_pty) = d.session(Some("alpha"));
+    let (b_sess, b_pty) = d.session(Some("beta"));
+
+    let mut a = d.dial().await;
+    send(&mut a, &attach_to(&a_sess.id)).await;
+    assert!(matches!(recv(&mut a).await, ServerFrame::Attached { .. }));
+    let mut b = d.dial().await;
+    send(&mut b, &attach_to(&b_sess.id)).await;
+    assert!(matches!(recv(&mut b).await, ServerFrame::Attached { .. }));
+
+    a_pty.queue_output(b"AAAA");
+    match recv(&mut a).await {
+        ServerFrame::Output { session, bytes } => {
+            assert_eq!(session, a_sess.id);
+            assert_eq!(bytes, b"AAAA");
+        }
+        other => panic!("expected Output on A, got {other:?}"),
+    }
+
+    // B's own marker, so the assertion is "B received *its* bytes and
+    // not A's" rather than "B received nothing", which a dead fan-out
+    // also satisfies.
+    b_pty.queue_output(b"BBBB");
+    match recv(&mut b).await {
+        ServerFrame::Output { session, bytes } => {
+            assert_eq!(session, b_sess.id);
+            assert_eq!(
+                bytes, b"BBBB",
+                "session A's marker crossed into session B's client"
+            );
+        }
+        other => panic!("expected Output on B, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_attach_client_receives_only_bytes_never_offsets() {
+    // REQ-D-007 / §4.1: *"raw offsets are not part of the public attach
+    // protocol in v0.1.0."* A **field-presence** assertion over the
+    // decoded map, not a value assertion — `start`/`end` leaking as two
+    // extra keys is invisible to anything that only reads `bytes`.
+    let d = TestDaemon::start("nooffsets").await;
+    let (s, pty) = d.session(None);
+
+    let mut c = d.dial().await;
+    send(&mut c, &attach_to(&s.id)).await;
+    assert!(matches!(recv(&mut c).await, ServerFrame::Attached { .. }));
+
+    pty.queue_output(b"MARK");
+    let body = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(&mut c))
+        .await
+        .expect("no Output within 5s")
+        .expect("a frame body");
+    let value: ciborium::value::Value =
+        holdfast_core::protocol::frame::decode(&body).expect("decodable");
+    let ciborium::value::Value::Map(entries) = value else {
+        panic!("a frame must encode as a CBOR map");
+    };
+    let mut keys: Vec<String> = entries
+        .iter()
+        .map(|(k, _)| k.as_text().expect("text keys").to_string())
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["bytes".to_string(), "session".into(), "type".into()],
+        "Output carries exactly type/session/bytes"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
+    // §4.3, §11.2. Three assertions, and (b) and (c) are what make this
+    // able to fail: detaching the whole *session*, or blocking the
+    // reader, both satisfy (a) on its own.
+    let d = TestDaemon::start("slow").await;
+    let (s, pty) = d.session(None);
+
+    // The client that never reads.
+    let mut slow = d.dial().await;
+    send(&mut slow, &attach_to(&s.id)).await;
+    // Deliberately does **not** read its own `Attached`.
+
+    // A second client that drains everything.
+    let mut fast = d.dial().await;
+    send(&mut fast, &attach_to(&s.id)).await;
+    assert!(matches!(
+        recv(&mut fast).await,
+        ServerFrame::Attached { .. }
+    ));
+    let fast_reader = tokio::spawn(async move {
+        let mut seen = 0usize;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), frame::read_frame_body(&mut fast))
+                .await
+            {
+                Ok(Ok(body)) => {
+                    if let Ok(ServerFrame::Output { bytes, .. }) = decode_server_frame(&body) {
+                        seen += bytes.len();
+                        if bytes.windows(4).any(|w| w == b"LAST") {
+                            return (seen, true);
+                        }
+                    }
+                }
+                _ => return (seen, false),
+            }
+        }
+    });
+
+    // Far more than 64 frames, and far more than any socket buffer.
+    let head_before = s.buffer_head();
+    for _ in 0..400 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    pty.queue_output(b"LAST");
+
+    // (a) the slow client is detached. It reads now, drains whatever the
+    // socket buffered, and must reach EOF — bounded, so a daemon that
+    // kept it attached is a red row rather than a hang.
+    let detached = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match frame::read_frame_body(&mut slow).await {
+                Ok(_) => continue,
+                Err(FrameError::Eof) => return true,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        detached,
+        Ok(true),
+        "a client that stopped draining must be detached, not tolerated"
+    );
+
+    // (b) the draining client still receives every byte afterwards.
+    let (seen, saw_last) = fast_reader.await.expect("reader task");
+    assert!(
+        saw_last,
+        "the draining client stopped receiving when the slow one was detached ({seen} bytes seen)"
+    );
+
+    // (c) the session's reader kept running: the ring buffer advanced by
+    // everything that was queued.
+    assert!(
+        s.buffer_head() >= head_before + 400 * 16 * 1024,
+        "the PTY reader stalled behind a slow attach client (head {} -> {})",
+        head_before,
+        s.buffer_head()
+    );
+}
+
+#[tokio::test]
+async fn daemon_status_counts_live_attach_clients() {
+    // The hardcoded `0` 0.0.5 shipped passes every test that only checks
+    // the empty case, so **the non-zero assertion is the load-bearing
+    // one** — and the return to zero is what stops a counter that only
+    // ever goes up.
+    let d = TestDaemon::start("count").await;
+    let (s, _pty) = d.session(None);
+    assert_eq!(d.daemon.status().attach_clients, 0);
+
+    let mut a = d.dial().await;
+    send(&mut a, &attach_to(&s.id)).await;
+    assert!(matches!(recv(&mut a).await, ServerFrame::Attached { .. }));
+    let mut b = d.dial().await;
+    send(&mut b, &attach_to(&s.id)).await;
+    assert!(matches!(recv(&mut b).await, ServerFrame::Attached { .. }));
+    assert_eq!(d.daemon.status().attach_clients, 2);
+
+    send(&mut a, &ClientFrame::Detach).await;
+    send(&mut b, &ClientFrame::Detach).await;
+    drop(a);
+    drop(b);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while d.daemon.status().attach_clients != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        d.daemon.status().attach_clients,
+        0,
+        "detached clients are still counted"
+    );
+}
+
 // ------------------------------------------------------------ helpers
 
 /// Write a CBOR map `{"type": <name>}` by hand.

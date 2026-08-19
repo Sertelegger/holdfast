@@ -49,6 +49,11 @@ pub async fn serve_attach(daemon: Arc<Daemon>, listener: UnixListener) {
             _ = shutdown.changed() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
+                    // Before the §9.1 gate, like `serve`'s: the counter
+                    // says *the daemon saw this peer* and nothing about
+                    // whether it was served, which is what separates a
+                    // refusal from a dead daemon.
+                    daemon.note_accept();
                     match peer::peer_cred(&stream) {
                         Ok(cred) if peer::is_authorized(cred.uid, daemon.owner_uid()) => {}
                         Ok(cred) => {

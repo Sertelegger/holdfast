@@ -42,7 +42,9 @@ pub struct DaemonStatus {
     pub version: String,
     pub sessions_live: u64,
     pub sessions_exited_retained: u64,
-    /// Always 0 until the attach protocol lands in 0.0.6.
+    /// Live §7.5 attach connections — clients that completed the
+    /// handshake and have not yet detached. A connection that opened
+    /// `attach.sock` and said nothing is **not** one of these.
     pub attach_clients: u64,
     /// Always 0 until the web-UI bridge lands in 0.0.10.
     pub bridge_sessions: u64,
@@ -183,6 +185,10 @@ pub struct Daemon {
     /// exit. `None` means "never", which is what the window measures from
     /// on a daemon nobody has connected to.
     last_client_connect: Mutex<Option<Instant>>,
+    /// Every live attach connection (§4.3). Empty until something
+    /// completes the §7.5 handshake; `daemon/status`'s `attach_clients`
+    /// reads it.
+    attach_hub: Arc<crate::attach::hub::AttachHub>,
     /// The live-session ids the last `resources/list` would have shown,
     /// for REQ-R-006's **exit** half.
     ///
@@ -281,6 +287,7 @@ impl Daemon {
             owner_uid,
             clock,
             last_client_connect: Mutex::new(None),
+            attach_hub: Arc::new(crate::attach::hub::AttachHub::new()),
             listed_sessions: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
@@ -355,15 +362,34 @@ impl Daemon {
         self.owner_uid
     }
 
-    /// Total connections accepted by the listener since start.
+    /// Total connections accepted by **either** listener since start.
     ///
-    /// Counted in `serve`, *before* the §9.1 credential gate runs, so it
+    /// Counted at accept, *before* the §9.1 credential gate runs, so it
     /// says "the daemon saw this peer" and nothing about whether the peer
     /// was served. That is exactly what a refusal test needs: silence on
     /// a socket is also what connecting to a dead daemon looks like, and
     /// this counter is what separates the two.
+    ///
+    /// **`attach.sock` counts here too**, which is 0.0.5's hand-off note
+    /// discharged rather than the accessor deleted: it asked 0.0.6 to
+    /// adopt this for attach-client accounting or remove it. The two
+    /// listeners share one counter because the question it answers is
+    /// about the *daemon* and not about a socket — and an attach-side
+    /// counter that had to be summed with this one to answer it would be
+    /// a second place to forget.
     pub fn accepted_connections(&self) -> u64 {
         self.connections.load(Ordering::Relaxed)
+    }
+
+    /// The set of live attach connections (§4.3).
+    pub fn attach_hub(&self) -> &Arc<crate::attach::hub::AttachHub> {
+        &self.attach_hub
+    }
+
+    /// Count one accepted connection. Called from both accept loops,
+    /// before either runs the §9.1 gate.
+    pub(crate) fn note_accept(&self) {
+        self.connections.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Connections accepted and not yet finished with — see
@@ -390,7 +416,7 @@ impl Daemon {
             version: env!("CARGO_PKG_VERSION").to_string(),
             sessions_live: live,
             sessions_exited_retained: all.len() as u64 - live,
-            attach_clients: 0,
+            attach_clients: self.attach_hub.live_client_count(),
             bridge_sessions: 0,
         }
     }

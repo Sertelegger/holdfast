@@ -62,6 +62,9 @@ pub const ATTACH_QUEUE_FRAMES: usize = 64;
 
 /// One attached client, as the hub and the audit trail see it.
 pub struct AttachConn {
+    /// Monotonic and never reused, so an `unregister` cannot remove a
+    /// connection that happened to land in the same slot.
+    pub client_id: u64,
     pub session_id: String,
     pub mode: AttachMode,
     /// **Attribution only, never a redaction switch.** §7.5's
@@ -144,7 +147,8 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
     let output = session.subscribe();
 
     let (tx, rx) = mpsc::channel::<ServerFrame>(ATTACH_QUEUE_FRAMES);
-    let conn = AttachConn {
+    let conn = Arc::new(AttachConn {
+        client_id: daemon.attach_hub().next_client_id(),
         session_id: session.id.clone(),
         mode: hs.mode,
         role: hs.role,
@@ -152,7 +156,7 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
         client_version: hs.client_version,
         tx: tx.clone(),
         connected_at: Instant::now(),
-    };
+    });
 
     // Queued first, so the FIFO is what makes it frame one rather than a
     // timing argument about two tasks.
@@ -160,18 +164,37 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
         return;
     }
 
-    let writer = tokio::spawn(write_loop(wr, rx));
-    let forwarder = tokio::spawn(forward_output(conn.session_id.clone(), output, tx.clone()));
+    // **Registered only now**, after the handshake was accepted — never
+    // at `accept`. A connection that opened the socket and said nothing
+    // is not an attached client, and `daemon/status` counting it would
+    // report clients on a session nobody is watching.
+    daemon.attach_hub().register(Arc::clone(&conn));
 
-    read_loop(&daemon, &session, &conn, &mut rd, &tx).await;
+    let writer = tokio::spawn(write_loop(wr, rx));
+    let mut forwarder = tokio::spawn(forward_output(conn.session_id.clone(), output, tx.clone()));
+
+    // Either half can end the connection. The forwarder ends it when
+    // this client stopped draining (§4.3's slow consumer) or when the
+    // socket died under the writer; without the `select!` a detached
+    // slow consumer would keep its read half open forever, because the
+    // read loop holds a `Sender` and the writer only stops when every
+    // `Sender` is gone.
+    tokio::select! {
+        () = read_loop(&daemon, &session, &conn, &mut rd, &tx) => {}
+        _ = &mut forwarder => {}
+    }
+
+    daemon
+        .attach_hub()
+        .unregister(&conn.session_id, conn.client_id);
 
     // Dropping every `Sender` ends the write loop, which drains what is
     // still queued and *then* closes the socket — so a `ProtocolError`
     // written on the way out reaches the client before the EOF that
     // follows it.
+    forwarder.abort();
     drop(tx);
     drop(conn);
-    forwarder.abort();
     let _ = writer.await;
 }
 
@@ -347,12 +370,26 @@ async fn write_loop(mut wr: tokio::net::unix::OwnedWriteHalf, mut rx: mpsc::Rece
 /// frame carries `start`/`end`; the wire carries `Output { session,
 /// bytes }` and §4.1 is explicit that *"raw offsets are not part of the
 /// public attach protocol in v0.1.0"*. The conversion is this one place.
+/// **A client that does not drain is detached, not tolerated** (§4.3,
+/// §11.2). `try_send`, never `send().await`: a queue that blocked here
+/// would hold this task, and — once the broadcast filled behind it —
+/// would be one lagging client's back-pressure on a channel every other
+/// client and `wait_for_pattern` share.
+///
+/// The `Detached { reason: "slow_consumer" }` is **best effort and
+/// genuinely may not arrive**, which is worth stating rather than
+/// hoping. The queue only fills because the *socket* is full, so the
+/// writer is already parked in `write_frame`; a frame appended behind it
+/// has nowhere to go. What the client observes is the close. §18.6
+/// reasons about the WebSocket's version of this, where the same frame
+/// *is* deliverable.
 async fn forward_output(
     session_id: String,
     mut output: tokio::sync::broadcast::Receiver<crate::session::OutputFrame>,
     tx: mpsc::Sender<ServerFrame>,
 ) {
     use tokio::sync::broadcast::error::RecvError;
+    use tokio::sync::mpsc::error::TrySendError;
     loop {
         match output.recv().await {
             Ok(f) => {
@@ -360,14 +397,25 @@ async fn forward_output(
                     session: session_id.clone(),
                     bytes: f.bytes.to_vec(),
                 };
-                if tx.send(frame).await.is_err() {
-                    return;
+                match tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        crate::diag!(
+                            "holdfast daemon: detaching a slow attach client on {session_id}"
+                        );
+                        let _ = tx.try_send(ServerFrame::Detached {
+                            reason: "slow_consumer".to_string(),
+                        });
+                        return;
+                    }
+                    Err(TrySendError::Closed(_)) => return,
                 }
             }
             // §4.3: *"Attach clients that are only rendering live bytes
-            // do not attempt replay."* Resync by continuing — a backfill
-            // from the ring buffer would interleave stale bytes into a
-            // live terminal.
+            // do not attempt replay."* Resync by **continuing** — a
+            // backfill from the ring buffer would interleave stale bytes
+            // into a live terminal, and returning here would end the
+            // stream for a client that is otherwise fine.
             Err(RecvError::Lagged(n)) => {
                 crate::diag!("holdfast daemon: attach client on {session_id} lagged {n} frames");
             }
@@ -408,5 +456,125 @@ fn attached_frame(session: &Arc<Session>) -> ServerFrame {
         },
         protocol_major: PROTOCOL_MAJOR,
         protocol_minor: PROTOCOL_MINOR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pty::{MockPty, PtyBackend};
+    use crate::session::{new_session_id, SessionConfig, OUTPUT_BROADCAST_FRAMES};
+
+    /// One byte per `read`, so the *frame* count is the test's and not
+    /// the scheduler's. `MockPty::read` drains its whole queue into a
+    /// single frame, which is exactly why 0.0.3 could never provoke a
+    /// `Lagged` at all.
+    #[derive(Debug)]
+    struct DribblePty(Arc<MockPty>);
+
+    impl PtyBackend for DribblePty {
+        fn write(&self, data: &[u8]) -> crate::Result<()> {
+            self.0.write(data)
+        }
+        fn read(&self, buf: &mut [u8]) -> crate::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.0.read(&mut buf[..1])
+        }
+        fn signal(&self, sig: crate::pty::Signal) -> crate::Result<()> {
+            self.0.signal(sig)
+        }
+        fn resize(&self, cols: u16, rows: u16) -> crate::Result<()> {
+            self.0.resize(cols, rows)
+        }
+        fn is_alive(&self) -> bool {
+            self.0.is_alive()
+        }
+        fn exit_code(&self) -> Option<i32> {
+            self.0.exit_code()
+        }
+        fn pid(&self) -> Option<u32> {
+            self.0.pid()
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_lag_does_not_replay_stale_bytes() {
+        // REQ-C-003 / §4.3: *"Attach clients that are only rendering live
+        // bytes do not attempt replay."*
+        //
+        // **Forced deterministically, at the one seam where it can be.**
+        // Over a socket the forwarder drains the broadcast with
+        // `try_send` and detaches instead of falling behind, so a
+        // `Lagged` is unreachable from a client. Here the receiver is
+        // taken, starved past the 256-frame bound, and only *then*
+        // handed to `forward_output` — which is the same code path a
+        // scheduler-starved forwarder takes.
+        let inner = Arc::new(MockPty::new());
+        let session = crate::session::Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::new(DribblePty(Arc::clone(&inner))) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(64 * 1024),
+        );
+
+        // Subscribed, then starved: one frame per byte, comfortably past
+        // the bound, with nothing reading.
+        let rx = session.subscribe();
+        let burst = OUTPUT_BROADCAST_FRAMES * 2;
+        inner.queue_output(&vec![b'x'; burst]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.buffer_head() < burst as u64 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            session.buffer_head(),
+            burst as u64,
+            "the fixture must actually overrun the channel"
+        );
+
+        let (tx, mut out) = mpsc::channel::<ServerFrame>(4096);
+        let forwarder = tokio::spawn(forward_output("sess_x".to_string(), rx, tx));
+        inner.queue_output(b"Z");
+
+        let mut delivered = 0usize;
+        let mut saw_marker = false;
+        let stop = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < stop {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), out.recv()).await {
+                Ok(Some(ServerFrame::Output { bytes, .. })) => {
+                    delivered += bytes.len();
+                    if bytes.contains(&b'Z') {
+                        saw_marker = true;
+                        break;
+                    }
+                }
+                Ok(Some(other)) => panic!("expected Output, got {other:?}"),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        forwarder.abort();
+
+        // The stream **continues** past the gap. A `Lagged` arm that
+        // returned would end it here, and the client would go silent for
+        // the life of the session with nothing said.
+        assert!(
+            saw_marker,
+            "the forwarder stopped at the lag instead of resyncing by continuing"
+        );
+        // And it does **not** backfill. The receiver lost
+        // `burst - OUTPUT_BROADCAST_FRAMES` frames while it was starved;
+        // a "helpful" replay out of the ring buffer would deliver those
+        // bytes too, so anything above the channel's own capacity is
+        // stale bytes interleaved into a live terminal.
+        assert!(
+            delivered <= OUTPUT_BROADCAST_FRAMES + 1,
+            "the forwarder replayed {delivered} bytes for a channel that can hold \
+             {OUTPUT_BROADCAST_FRAMES}: bytes lost to a lag are gone, not backfilled"
+        );
     }
 }
