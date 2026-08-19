@@ -215,21 +215,66 @@ impl Default for ClaspServer {
     }
 }
 
-/// The `resources` capability §5.5 requires, for either transport.
+/// The `resources` capability §5.5 requires, **for the in-process
+/// transport**. The daemon-backed one advertises less — see
+/// [`shim_capabilities`].
 ///
-/// `listChanged: true` because the daemon emits
-/// `notifications/resources/list_changed` when a session is created or
-/// exits. `subscribe` is deliberately **absent** rather than `false`:
-/// §5.5 writes `"subscribe": false`, `ResourcesCapability` is
-/// `#[non_exhaustive]` so an explicit `false` cannot be constructed from
-/// outside `rmcp`, and an omitted capability and a `false` one mean the
-/// same thing to a client. v0.1.0 does not implement subscriptions
-/// either way (§14.2).
+/// `listChanged: true` because [`ClaspServer::on_initialized`] holds the
+/// MCP peer and forwards every [`resource_list_changed`] pulse to it, so
+/// `notifications/resources/list_changed` really is delivered when a
+/// session is created or exits. `subscribe` is deliberately **absent**
+/// rather than `false`: §5.5 writes `"subscribe": false`,
+/// `ResourcesCapability` is `#[non_exhaustive]` so an explicit `false`
+/// cannot be constructed from outside `rmcp`, and an omitted capability
+/// and a `false` one mean the same thing to a client. v0.1.0 does not
+/// implement subscriptions either way (§14.2).
+///
+/// [`resource_list_changed`]: ClaspServer::resource_list_changed
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities::builder()
         .enable_tools()
         .enable_resources()
         .enable_resources_list_changed()
+        .build()
+}
+
+/// The same capabilities **minus `resources.listChanged`**, for
+/// `shim::ShimServer`.
+///
+/// **REQ-R-006 has no delivery path in hybrid mode, so the shim must not
+/// claim one.** The forwarder that turns a pulse into an MCP
+/// notification is [`ClaspServer::on_initialized`], and it is reachable
+/// only from a `ClaspServer` that holds an MCP peer. In hybrid mode that
+/// object lives inside the **daemon**, where there is no peer: the
+/// reaper's `poll_resource_list_changed` and `start_session` both fire
+/// the pulse into a broadcast channel with zero receivers, and §7.4.1
+/// reserves the streaming frames without using them in v0.1.0, so there
+/// is no server→client push on the control protocol by which the pulse
+/// could cross. `ShimServer` implements no `on_initialized` and holds no
+/// subscription.
+///
+/// So `listChanged: true` on this transport was a promise the build
+/// cannot keep, on the transport that is the **default**. An agent that
+/// believed it would hold a stale `resources/list` for the life of the
+/// connection and never re-list, which is strictly worse than being told
+/// to poll. Advertising nothing is honest; advertising and dropping is
+/// not.
+///
+/// **This is a deferral, not a retraction.** Delivering it needs a
+/// server→client frame on `control.sock` and a shim-side subscription
+/// task, which is a protocol addition and belongs with the milestone
+/// that adds the streaming frames §7.4.1 already reserves. The
+/// capability comes back on this transport when the pulse can reach the
+/// peer, and not before. Until then the honest surface is: an agent
+/// re-lists when it wants a current answer.
+///
+/// It is a separate function rather than a flag on
+/// [`server_capabilities`] so that the two transports' answers cannot be
+/// changed together by accident — the whole point is that they differ.
+pub fn shim_capabilities() -> ServerCapabilities {
+    ServerCapabilities::builder()
+        .enable_tools()
+        .enable_resources()
         .build()
 }
 

@@ -156,7 +156,13 @@ fn map_client_error(e: ClientError) -> ErrorData {
 impl ServerHandler for ShimServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
-        info.capabilities = super::server_capabilities();
+        // **`shim_capabilities`, not `server_capabilities`.** The
+        // difference is `resources.listChanged`, which this transport
+        // cannot deliver: the forwarder that turns a pulse into an MCP
+        // notification is `ClaspServer::on_initialized`, and in hybrid
+        // mode that object runs inside the daemon with no MCP peer to
+        // notify. See `super::shim_capabilities` for the deferral.
+        info.capabilities = super::shim_capabilities();
         info.server_info = Implementation::new("clasp", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(instructions());
         info
@@ -273,6 +279,74 @@ mod tests {
         assert!(
             !suffix.contains("unredacted"),
             "output handling is described once, in the shared text; suffix was {suffix:?}"
+        );
+    }
+
+    /// REQ-R-006 has no delivery path on this transport, so the
+    /// handshake must not claim one.
+    ///
+    /// `ClaspServer::on_initialized` is the only thing in the tree that
+    /// turns a `resource_list_changed` pulse into an MCP notification,
+    /// and it needs the MCP peer. In hybrid mode the `ClaspServer` lives
+    /// in the daemon, where there is no peer: the pulse goes into a
+    /// broadcast channel with zero receivers, and §7.4.1's streaming
+    /// frames are reserved and unused in v0.1.0, so nothing carries it
+    /// across. An agent told `listChanged: true` holds a stale
+    /// `resources/list` for the life of the connection.
+    ///
+    /// **Read through `get_info`, not off the free function.** A test
+    /// that compared `shim_capabilities()` with `server_capabilities()`
+    /// would be green while `get_info` went on returning the wrong one
+    /// — which is the defect, exactly.
+    ///
+    /// The last assertion is the pairing: without it a build that
+    /// dropped the notification from *both* transports passes, and that
+    /// would be a regression on the transport that can deliver it.
+    #[tokio::test]
+    async fn the_shim_does_not_advertise_the_notification_it_cannot_deliver() {
+        let dir = scratch_dir("caps");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+        // No request is issued, so the reply template is never used; the
+        // stand-in is here only to complete the handshake `connect`
+        // needs.
+        let _captured = stand_in_daemon(sock.clone(), CborValue::Map(vec![]));
+        let client = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        let shim = ShimServer::new(Arc::new(client));
+
+        let caps = shim.get_info().capabilities;
+        let resources = caps
+            .resources
+            .expect("§5.5's resources capability is served on both transports");
+        assert_eq!(
+            resources.list_changed, None,
+            "hybrid mode has no path from the daemon's pulse to the MCP peer, \
+             so advertising `listChanged` promises a notification that is dropped"
+        );
+        // The rest of the surface is unchanged: this is one capability
+        // withdrawn, not the resources surface retreating.
+        assert!(
+            caps.tools.is_some(),
+            "the shim still serves tools/list and tools/call"
+        );
+
+        let in_process = crate::mcp::ClaspServer::new()
+            .get_info()
+            .capabilities
+            .resources
+            .expect("§5.5's resources capability in-process");
+        assert_eq!(
+            in_process.list_changed,
+            Some(true),
+            "`--no-daemon` holds the MCP peer in `on_initialized` and does \
+             deliver the notification; withdrawing it there too would be a \
+             regression, and would satisfy the assertion above"
         );
     }
 

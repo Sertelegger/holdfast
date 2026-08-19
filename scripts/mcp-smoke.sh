@@ -303,10 +303,26 @@ fi
 # rmcp chooses, which is not a contract this project owns.
 jcheck "initialize advertises the tools capability" \
   'resp(1).result.capabilities.tools != null' 'true'
-# §5.5: `resources` with `listChanged: true`, because the daemon emits
-# `notifications/resources/list_changed` on session create and exit.
-jcheck "initialize advertises the resources capability with listChanged" \
-  'resp(1).result.capabilities.resources.listChanged' 'true'
+# §5.5's `resources` capability, which this transport does serve.
+jcheck "initialize advertises the resources capability" \
+  'resp(1).result.capabilities.resources != null' 'true'
+# ...and **without** `listChanged`, which it cannot deliver. This check
+# read `.listChanged == true` and was green for the wrong reason: it
+# asserted the advertisement, and nothing anywhere asserted the delivery.
+# The forwarder that turns a `resource_list_changed` pulse into an MCP
+# notification is `ClaspServer::on_initialized`, which needs the MCP
+# peer; this script runs the DEFAULT transport, where that object lives
+# in the daemon and the pulse goes into a broadcast channel with zero
+# receivers. §7.4.1's streaming frames are reserved and unused in
+# v0.1.0, so nothing carries it across. Deferred to the milestone that
+# adds a server->client frame; see `mcp::shim_capabilities`.
+#
+# `null`, not `false`: `ResourcesCapability` is `#[non_exhaustive]`, so
+# an explicit `false` cannot be built from outside `rmcp`, and the field
+# is `skip_serializing_if = "Option::is_none"`. Asserting `!= true`
+# would also pass against the capability object vanishing entirely.
+jcheck "initialize does not advertise listChanged on the daemon transport" \
+  'resp(1).result.capabilities.resources.listChanged' 'null'
 # The `instructions` string is the first thing an agent reads about this
 # server, and it described a four-tool 0.0.1 surface for the whole of
 # 0.0.2. Asserting the names rather than the prose keeps it honest
