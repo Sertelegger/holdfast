@@ -11,7 +11,7 @@
 // is the only sanctioned producer.
 //
 // **This was scoped to `daemon/` and that was the defect** (re-review
-// I-2): `mcp::ClaspServer::with_audit_path_config_and_clock` — the
+// I-2): `mcp::HoldfastServer::with_audit_path_config_and_clock` — the
 // constructor the daemon itself calls — wrote a bare `eprintln!` into
 // `daemon.log`, and the guard `diag.rs` advertises as making that a
 // build failure did not reach the module it happened in. A guard that
@@ -35,4 +35,4 @@ pub mod pty;
 pub mod screen;
 pub mod session;
 
-pub use error::{ClaspError, Result};
+pub use error::{HoldfastError, Result};

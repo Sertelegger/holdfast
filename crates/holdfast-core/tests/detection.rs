@@ -43,7 +43,7 @@
 use holdfast_core::mcp::tools::{
     GetCommandHistoryArgs, ReadOutputArgs, SendInputArgs, StartSessionArgs, StatusArgs,
 };
-use holdfast_core::mcp::ClaspServer;
+use holdfast_core::mcp::HoldfastServer;
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -423,7 +423,7 @@ fn term() -> Option<HashMap<String, String>> {
     )]))
 }
 
-async fn start(server: &ClaspServer, args: StartSessionArgs) -> String {
+async fn start(server: &HoldfastServer, args: StartSessionArgs) -> String {
     let r = server
         .start_session(Parameters(args))
         .await
@@ -507,7 +507,7 @@ fn program(command: &str, args: &[&str]) -> StartSessionArgs {
     }
 }
 
-async fn status(server: &ClaspServer, id: &str) -> Value {
+async fn status(server: &HoldfastServer, id: &str) -> Value {
     let r = server
         .status(Parameters(StatusArgs { session: id.into() }))
         .await
@@ -518,7 +518,7 @@ async fn status(server: &ClaspServer, id: &str) -> Value {
 /// Poll `status` until `pred` accepts a record, and return *that* record —
 /// not a fresh one — so every assertion in a row describes one sample.
 async fn await_status(
-    server: &ClaspServer,
+    server: &HoldfastServer,
     id: &str,
     what: &str,
     mut pred: impl FnMut(&Value) -> bool,
@@ -538,7 +538,7 @@ async fn await_status(
 }
 
 /// Poll until `interaction_mode` reaches `want`.
-async fn await_mode(server: &ClaspServer, id: &str, want: &str) -> Value {
+async fn await_mode(server: &HoldfastServer, id: &str, want: &str) -> Value {
     await_status(server, id, want, |s| s["interaction_mode"] == want).await
 }
 
@@ -570,7 +570,7 @@ async fn await_mode(server: &ClaspServer, id: &str, want: &str) -> Value {
 /// the detector held (`session::no_output_is_classified_between_...`), so
 /// the wait below is no longer load-bearing for that; it is kept for the
 /// PyREPL reason above, which is not going anywhere.
-async fn await_settled(server: &ClaspServer, id: &str, last_line: &str) -> Value {
+async fn await_settled(server: &HoldfastServer, id: &str, last_line: &str) -> Value {
     await_status(server, id, &format!("a settled {last_line:?}"), |s| {
         s["prompt"]["last_line"] == last_line && s["prompt"]["quiescent_score"] == 1.0
     })
@@ -593,7 +593,7 @@ async fn await_settled(server: &ClaspServer, id: &str, last_line: &str) -> Value
 /// happened to be quick enough to produce. The polling supplies the
 /// stability samples as a side effect: each `status` observes the cursor
 /// once, and `cursor_stable_samples` is 3.
-async fn await_settled_with_cursor(server: &ClaspServer, id: &str, last_line: &str) -> Value {
+async fn await_settled_with_cursor(server: &HoldfastServer, id: &str, last_line: &str) -> Value {
     await_status(
         server,
         id,
@@ -607,7 +607,7 @@ async fn await_settled_with_cursor(server: &ClaspServer, id: &str, last_line: &s
     .await
 }
 
-async fn kill(server: &ClaspServer, id: &str) {
+async fn kill(server: &HoldfastServer, id: &str) {
     if let Ok(s) = server.registry.get(id) {
         // The whole process group (§4.4): these sessions leave `sleep`s and
         // nested shells behind otherwise.
@@ -615,16 +615,16 @@ async fn kill(server: &ClaspServer, id: &str) {
     }
 }
 
-async fn send(server: &ClaspServer, id: &str, data: &str) -> Value {
+async fn send(server: &HoldfastServer, id: &str, data: &str) -> Value {
     write(server, id, data, true).await
 }
 
 /// `send_input` without the trailing newline — for keys, like `less`'s `q`.
-async fn keypress(server: &ClaspServer, id: &str, data: &str) -> Value {
+async fn keypress(server: &HoldfastServer, id: &str, data: &str) -> Value {
     write(server, id, data, false).await
 }
 
-async fn write(server: &ClaspServer, id: &str, data: &str, newline: bool) -> Value {
+async fn write(server: &HoldfastServer, id: &str, data: &str, newline: bool) -> Value {
     let r = server
         .send_input(Parameters(SendInputArgs {
             session: id.into(),
@@ -652,7 +652,7 @@ async fn write(server: &ClaspServer, id: &str, data: &str, newline: bool) -> Val
 ///
 /// Redaction stays **on**: nothing in this file emits a secret, and
 /// `redact: false` is the audited escape hatch rather than a convenience.
-async fn raw(server: &ClaspServer, id: &str) -> String {
+async fn raw(server: &HoldfastServer, id: &str) -> String {
     let r = body(
         &server
             .read_output(Parameters(ReadOutputArgs {
@@ -668,7 +668,7 @@ async fn raw(server: &ClaspServer, id: &str) -> String {
     r["data"]["output"].as_str().expect("output").to_string()
 }
 
-async fn history(server: &ClaspServer, id: &str) -> Value {
+async fn history(server: &HoldfastServer, id: &str) -> Value {
     body(
         &server
             .get_command_history(Parameters(GetCommandHistoryArgs {
@@ -703,7 +703,7 @@ async fn history(server: &ClaspServer, id: &str) -> Value {
 ///
 /// A floor, never the assertion: every caller still asserts the *exact*
 /// entry count, commands and exit codes it expects.
-async fn await_closed_history(server: &ClaspServer, id: &str, n: usize) -> Value {
+async fn await_closed_history(server: &HoldfastServer, id: &str, n: usize) -> Value {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let h = history(server, id).await;
@@ -770,7 +770,7 @@ fn markers(raw: &str) -> Vec<String> {
 /// before the command has run and the next assertion samples a
 /// half-finished history. A marker count is monotonic and says exactly how
 /// far the shell has got.
-async fn await_markers(server: &ClaspServer, id: &str, n: usize) -> Vec<String> {
+async fn await_markers(server: &HoldfastServer, id: &str, n: usize) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let m = markers(&raw(server, id).await);
@@ -821,7 +821,7 @@ async fn matrix_row_an_idle_bash_prompt_is_at_prompt_via_terminal_mode() {
     // REQ-PD-003: stock `bash --norc --noprofile` with shell integration
     // declined, so only tier 2 can answer and it must do so with no
     // configuration whatsoever.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(
         &server,
         StartSessionArgs {
@@ -934,7 +934,7 @@ async fn matrix_row_an_idle_bash_prompt_is_at_prompt_via_terminal_mode() {
 /// simply stopped observing bracketed paste would fail rather than pass.
 #[tokio::test]
 async fn matrix_row_a_running_external_command_is_executing_via_the_heuristic() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(
         &server,
         StartSessionArgs {
@@ -998,7 +998,7 @@ async fn matrix_row_bash_read_s_is_awaiting_secret_and_flags_a_write() {
     // REQ-SEC-011 rides along on the same session: the warning exists to
     // be produced by a *real* echo-off shell, and the state a real shell
     // reaches is the thing a mock cannot establish.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(
         &server,
         StartSessionArgs {
@@ -1051,7 +1051,7 @@ async fn matrix_row_getpass_is_awaiting_secret_with_no_bracketed_paste_history()
         eprintln!("skipping: python3 not installed");
         return;
     }
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(
         &server,
         program("python3", &["-c", "import getpass; getpass.getpass()"]),
@@ -1204,7 +1204,7 @@ async fn echo_off_prompts_with_and_without_canonical_mode() {
     ];
 
     for row in ROWS {
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         let id = if row.interactive {
             let id = start(
                 &server,
@@ -1304,7 +1304,7 @@ async fn matrix_row_the_python_repl_is_at_prompt_with_no_repl_specific_config() 
         eprintln!("skipping: {}", Need::PyreplPython.unmet());
         return;
     };
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, program(&python, &["-q"])).await;
 
     // Settled on the prompt, not merely `AtPrompt`: PyREPL enables
@@ -1353,7 +1353,7 @@ async fn matrix_rows_7_and_7b_a_readline_repl_answers_the_same_either_way() {
         eprintln!("skipping: python3 not installed");
         return;
     }
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let mut env = term().unwrap_or_default();
     env.insert("PYTHON_BASIC_REPL".into(), "1".into());
 
@@ -1433,7 +1433,7 @@ async fn matrix_row_a_pager_is_fullscreen() {
         eprintln!("skipping: less not installed");
         return;
     }
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, bash_c("seq 1 500 | less")).await;
 
     let s = await_mode(&server, &id, "Fullscreen").await;
@@ -1454,7 +1454,7 @@ async fn matrix_row_dash_degrades_silently_to_the_heuristic_tier() {
         eprintln!("skipping: dash not installed");
         return;
     }
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, program("dash", &[])).await;
 
     // The steady state, three seconds in, when §4.5's no-signal trigger
@@ -1488,7 +1488,7 @@ async fn matrix_row_dash_degrades_silently_to_the_heuristic_tier() {
 
 #[tokio::test]
 async fn matrix_row_an_exited_session_reports_exited() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, bash_c("exit 3")).await;
 
     let mut s = await_mode(&server, &id, "Exited").await;
@@ -1540,7 +1540,7 @@ async fn a_session_that_never_prompts_is_never_reported_at_a_prompt() {
     // nothing at all reports `Executing` at `heuristic` with every score
     // at zero and an empty last line, which is the answer no row above
     // asserts.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, program("sleep", &["300"])).await;
 
     let s = await_settled(&server, &id, "").await;
@@ -1580,7 +1580,7 @@ async fn an_alt_screen_episode_leaves_a_dash_prompt_on_the_heuristic_tier() {
         eprintln!("skipping: dash or less not installed");
         return;
     }
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, program("dash", &[])).await;
 
     // Row 1 — no mode ever seen.
@@ -1649,7 +1649,7 @@ async fn an_osc133_prompt_start_marker_alone_answers_at_prompt_via_t1() {
     //
     // A `bash -c` child, so nothing is injected and the marker below is
     // the only OSC 133 in the session.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(
         &server,
         bash_c(r"stty -echo; printf '\033]133;A\007clasp$ '; sleep 30"),
@@ -1688,7 +1688,7 @@ async fn the_heuristic_decides_at_exactly_the_threshold_on_a_real_ps2_prompt() {
     // deterministically by the unit twin
     // `detect::detector::tests::the_heuristic_decides_at_exactly_the_threshold_not_above_it`,
     // which passes `cursor: None` and therefore always sees 0.5.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, program("dash", &[])).await;
     await_settled(&server, &id, "$ ").await;
 
@@ -1762,7 +1762,7 @@ const MEASURED_MARKER_LETTERS: [&str; 15] = [
 /// cannot tell a marker that is *emitted* from one that is merely
 /// *mentioned*, and it cannot tell an emitter from an emitter nobody
 /// calls. The sequence and the `D` payloads are what separate them.
-async fn assert_marker_stream_and_exit_codes(server: &ClaspServer, id: &str, shell: &str) {
+async fn assert_marker_stream_and_exit_codes(server: &HoldfastServer, id: &str, shell: &str) {
     assert_eq!(
         status(server, id).await["shell_integration"],
         shell,
@@ -1836,7 +1836,7 @@ async fn assert_marker_stream_and_exit_codes(server: &ClaspServer, id: &str, she
 #[tokio::test]
 async fn bash_integration_emits_the_measured_marker_stream_and_exact_exit_codes() {
     // REQ-PD-005.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, bash()).await;
     assert_marker_stream_and_exit_codes(&server, &id, "bash").await;
     kill(&server, &id).await;
@@ -1851,7 +1851,7 @@ async fn zsh_integration_emits_the_measured_marker_stream_and_exact_exit_codes()
         eprintln!("skipping: zsh not installed");
         return;
     }
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, program("zsh", &["-f"])).await;
     assert_marker_stream_and_exit_codes(&server, &id, "zsh").await;
     kill(&server, &id).await;
@@ -1891,7 +1891,7 @@ async fn fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes(
         return;
     }
     eprintln!("fish row running against {:?}", fish_version());
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(
         &server,
         StartSessionArgs {
@@ -1945,7 +1945,7 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     // iteration 9 of 20 under the hunt's own documented `taskset -c 0,1`
     // invocation. A count derived from the expectation cannot drift away
     // from it again.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
 
     // The fixture's own first prompt: `D;0` from its `PROMPT_COMMAND`, `A`
     // and `B` from its `PS1`. Both halves start here, and in the declined
@@ -2139,7 +2139,7 @@ async fn command_history_cursors_bound_exactly_one_commands_output() {
     // `CLASP_SPAN`, so finding the latter inside the recorded span proves
     // the span covers real command *output* rather than the echoed command
     // line — and the two neighbours prove it stops at both ends.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, bash()).await;
     await_markers(&server, &id, 3).await;
 
@@ -2196,7 +2196,7 @@ async fn command_history_cursors_bound_exactly_one_commands_output() {
 async fn osc133_markers_survive_shell_nesting() {
     // REQ-PD-007: the remote-over-ssh case without needing a remote host.
     // The inner shell's markers must reach CLASP through the outer one.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, bash()).await;
     await_markers(&server, &id, 3).await;
 
@@ -2345,7 +2345,7 @@ async fn osc133_markers_survive_shell_nesting() {
 /// Callers write the marker with an embedded `''` in the command line
 /// (`echo CLASP''_PID_A=$$`), so the PTY's echo carries `CLASP''_PID_A=`
 /// and only a shell that *executed* the line can produce `CLASP_PID_A=`.
-async fn printed_number(server: &ClaspServer, id: &str, marker: &str) -> String {
+async fn printed_number(server: &HoldfastServer, id: &str, marker: &str) -> String {
     let out = raw(server, id).await;
     let rest = out
         .rsplit(marker)
@@ -2418,7 +2418,7 @@ async fn a_single_leaked_dollar_byte_is_indistinguishable_from_a_dash_prompt() {
             "CLASP_ESC $ ",
         ),
     ] {
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         let id = start(&server, program("dash", &[])).await;
 
         // Half 1 — the real thing. `dash` drives no terminal mode, so this
@@ -2476,7 +2476,7 @@ async fn a_program_that_fakes_bracketed_paste_fools_tier_2() {
     // at all — yet the mode it *prints* is believed at 0.95. CLASP does
     // not defend against a hostile child; that is the agent permission
     // system's job (§9.1).
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start(&server, bash_c(r"printf '\033[?2004h'; sleep 30")).await;
 
     let s = await_mode(&server, &id, "AtPrompt").await;

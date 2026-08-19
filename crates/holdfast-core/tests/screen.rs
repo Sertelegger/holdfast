@@ -3,11 +3,11 @@
 //! screen-diffing scenarios).
 
 use holdfast_core::mcp::tools::{GetScreenStateArgs, ReadOutputArgs, ResizeArgs, StartSessionArgs};
-use holdfast_core::mcp::ClaspServer;
+use holdfast_core::mcp::HoldfastServer;
 use holdfast_core::pty::{InProcessPty, LineDiscipline, PtyBackend, PtySpawnConfig, Signal};
 use holdfast_core::screen::{ScreenConfig, NO_SIGNAL_GRACE};
 use holdfast_core::session::{new_session_id, Session, SessionConfig};
-use holdfast_core::{ClaspError, Result};
+use holdfast_core::{HoldfastError, Result};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -28,7 +28,7 @@ fn body(r: &rmcp::model::CallToolResult) -> Value {
 }
 
 /// Start `bash --norc --noprofile` at a known 24x80 geometry.
-async fn start_bash(server: &ClaspServer, screen_tracking: Option<&str>) -> String {
+async fn start_bash(server: &HoldfastServer, screen_tracking: Option<&str>) -> String {
     let r = server
         // `..Default::default()` throughout this file, never an
         // exhaustive literal: `StartSessionArgs` carries eight fields
@@ -72,7 +72,7 @@ async fn start_bash(server: &ClaspServer, screen_tracking: Option<&str>) -> Stri
 ///
 /// `redact` stays at its default: no marker is secret-shaped, and leaving
 /// it on keeps this helper reading the same bytes an agent would.
-async fn read_until(server: &ClaspServer, session: &str, needle: &str) -> Value {
+async fn read_until(server: &HoldfastServer, session: &str, needle: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut cursor = 0u64;
     let mut acc = String::new();
@@ -99,7 +99,7 @@ async fn read_until(server: &ClaspServer, session: &str, needle: &str) -> Value 
 
 /// A `get_screen_state` call with §5.2's `redact` left absent, which is
 /// what every test below wants: the default is what ships.
-async fn screen_state(server: &ClaspServer, session: &str, diff_from: Option<u64>) -> Value {
+async fn screen_state(server: &HoldfastServer, session: &str, diff_from: Option<u64>) -> Value {
     let r = server
         .get_screen_state(Parameters(GetScreenStateArgs {
             session: session.into(),
@@ -119,7 +119,7 @@ async fn screen_state(server: &ClaspServer, session: &str, diff_from: Option<u64
 /// exhaustive form in a single helper means a field added in a later
 /// milestone produces one compile error, here, instead of a lint failure
 /// scattered across the callers.
-async fn screen_state_raw(server: &ClaspServer, session: &str, diff_from: Option<u64>) -> Value {
+async fn screen_state_raw(server: &HoldfastServer, session: &str, diff_from: Option<u64>) -> Value {
     let r = server
         .get_screen_state(Parameters(GetScreenStateArgs {
             session: session.into(),
@@ -131,7 +131,7 @@ async fn screen_state_raw(server: &ClaspServer, session: &str, diff_from: Option
     body(&r)
 }
 
-async fn resize(server: &ClaspServer, session: &str, cols: u16, rows: u16) -> Value {
+async fn resize(server: &HoldfastServer, session: &str, cols: u16, rows: u16) -> Value {
     let r = server
         .resize(Parameters(ResizeArgs {
             session: session.into(),
@@ -152,7 +152,7 @@ fn lines_of(data: &Value) -> Vec<String> {
         .collect()
 }
 
-fn kill_all(server: &ClaspServer) {
+fn kill_all(server: &HoldfastServer) {
     for s in server.registry.all() {
         let _ = s.signal(Signal::Kill);
     }
@@ -214,7 +214,7 @@ impl PtyBackend for ResizeRefusingPty {
     }
 
     fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
-        Err(ClaspError::Pty("TIOCSWINSZ refused".into()))
+        Err(HoldfastError::Pty("TIOCSWINSZ refused".into()))
     }
 
     fn is_alive(&self) -> bool {
@@ -238,7 +238,7 @@ impl PtyBackend for ResizeRefusingPty {
 async fn resize_is_visible_to_the_child() {
     // REQ-T-009: the tool's whole point is `SIGWINCH` reaching the child,
     // and `stty size` is the child's own answer rather than CLASP's.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server, None).await;
     read_until(&server, &id, "$").await;
 
@@ -262,7 +262,7 @@ async fn resize_reflows_the_tracked_grid() {
     // stops at the backend leaves `get_screen_state` rendering a 132x43
     // session through an 80x24 grid — silently, with no error anywhere and
     // no test able to see it.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server, Some("on")).await;
     read_until(&server, &id, "$").await;
     let session = server.registry.get(&id).unwrap();
@@ -319,7 +319,7 @@ async fn resize_reflows_the_tracked_grid() {
 
 #[tokio::test]
 async fn resize_reports_the_size_it_reached_not_the_size_requested() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server, None).await;
     read_until(&server, &id, "$").await;
     let session = server.registry.get(&id).unwrap();
@@ -386,7 +386,7 @@ async fn a_resize_to_the_current_size_changes_nothing_observable() {
     // 80 columns cannot be diffed against one at 132 — but a resize to the
     // size already in force must not, or every no-op costs the agent a
     // full grid.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server, Some("on")).await;
     read_until(&server, &id, "$").await;
 
@@ -434,7 +434,7 @@ async fn a_resize_to_the_current_size_changes_nothing_observable() {
 async fn tier_b_stays_off_for_a_plain_line_oriented_session() {
     // The default for an ordinary shell. Turning this on by accident is
     // the regression §4.2a's 86 MB/s measurement exists to prevent.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server, None).await;
 
     let session = server.registry.get(&id).unwrap();
@@ -455,7 +455,7 @@ async fn tier_b_stays_off_for_a_plain_line_oriented_session() {
 
 #[tokio::test]
 async fn get_screen_state_enables_tier_b_and_seeds_the_grid_from_the_ring_buffer() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server, None).await;
     let session = server.registry.get(&id).unwrap();
 
@@ -497,7 +497,7 @@ async fn get_screen_state_enables_tier_b_and_seeds_the_grid_from_the_ring_buffer
 
 #[tokio::test]
 async fn entering_the_alternate_screen_enables_tier_b_with_no_agent_call() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server, None).await;
     let session = server.registry.get(&id).unwrap();
 
@@ -599,7 +599,7 @@ read -r _
 
 #[tokio::test]
 async fn a_single_cell_change_diffs_small_and_replays_to_the_new_screen() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -697,7 +697,7 @@ read -r _
 #[tokio::test]
 async fn a_secret_on_screen_is_redacted_in_both_the_grid_and_the_diff() {
     const SECRET: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -788,10 +788,10 @@ async fn disabling_redaction_on_a_screen_read_returns_the_secret_and_is_audited(
     const SECRET: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
     let dir = tempfile::tempdir().unwrap();
     let audit_path = dir.path().join("audit.log");
-    // `ClaspServer::new()` builds a *disabled* audit log so tests never
+    // `HoldfastServer::new()` builds a *disabled* audit log so tests never
     // write into the invoking user's home (0.0.3). This is the one test
     // here that needs a real one.
-    let server = ClaspServer::with_audit_path(Some(audit_path.clone()));
+    let server = HoldfastServer::with_audit_path(Some(audit_path.clone()));
 
     let r = server
         .start_session(Parameters(StartSessionArgs {
@@ -874,7 +874,7 @@ async fn disabling_redaction_on_a_screen_read_returns_the_secret_and_is_audited(
 /// argument actually arrives.
 #[tokio::test]
 async fn a_diff_from_across_redaction_modes_returns_a_full_grid() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server, None).await;
 
     let first = screen_state(&server, &id, None).await;
@@ -903,7 +903,7 @@ async fn a_diff_from_across_redaction_modes_returns_a_full_grid() {
 
 #[tokio::test]
 async fn screen_tracking_off_still_answers_but_never_parses_on_the_write_path() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server, Some("off")).await;
     let session = server.registry.get(&id).unwrap();
 
@@ -928,7 +928,7 @@ async fn screen_tracking_off_still_answers_but_never_parses_on_the_write_path() 
 
 #[tokio::test]
 async fn an_unknown_screen_tracking_mode_is_a_protocol_error() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -949,7 +949,7 @@ async fn an_unknown_screen_tracking_mode_is_a_protocol_error() {
 
 #[tokio::test]
 async fn get_screen_state_on_a_missing_session_is_an_error_envelope() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .get_screen_state(Parameters(GetScreenStateArgs {
             session: "sess_nope".into(),
@@ -963,7 +963,7 @@ async fn get_screen_state_on_a_missing_session_is_an_error_envelope() {
 
 #[tokio::test]
 async fn an_exited_session_still_renders_its_final_screen() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server, None).await;
     let session = server.registry.get(&id).unwrap();
 

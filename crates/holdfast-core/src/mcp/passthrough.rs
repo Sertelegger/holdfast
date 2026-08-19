@@ -24,7 +24,7 @@ use super::tools::{
     GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ReadOutputArgs, ResizeArgs,
     SendInputArgs, StartSessionArgs, StatusArgs, TerminateArgs, WaitForPatternArgs,
 };
-use super::ClaspServer;
+use super::HoldfastServer;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Tool};
 use rmcp::ErrorData;
@@ -50,7 +50,7 @@ pub struct ToolOutcome {
 /// gains a schema or an annotation in a later milestone gets it on both
 /// transports with no edit here.
 pub fn tool_manifest() -> Vec<Tool> {
-    ClaspServer::tool_router().list_all()
+    HoldfastServer::tool_router().list_all()
 }
 
 /// The names in [`tool_manifest`], which is the *only* definition of the
@@ -85,7 +85,7 @@ pub fn is_passthrough_tool(name: &str) -> bool {
 /// `every_router_tool_is_dispatchable` fails until they have it, and
 /// names the tool that is missing.
 pub async fn call_tool(
-    server: &ClaspServer,
+    server: &HoldfastServer,
     tool: &str,
     args: Value,
 ) -> Option<Result<CallToolResult, ErrorData>> {
@@ -165,7 +165,7 @@ mod tests {
         // `Value::Null` cannot deserialise into any argument struct, so
         // an arg-taking tool answers `Some(Err(invalid_params))` without
         // running: the assertion is about reachability, not behaviour.
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         let names = passthrough_tools();
         // The vacuity guard. It was `>= 4` — 0.0.1's tool count — which
         // by the time this milestone runs is four milestones behind what
@@ -198,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_is_reported_as_such() {
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         assert!(call_tool(&server, "no_such_tool", json!({}))
             .await
             .is_none());
@@ -206,7 +206,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_params_become_an_mcp_protocol_error() {
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         // `session` is required and missing.
         let r = call_tool(&server, "read_output", json!({ "tail_lines": 1 }))
             .await
@@ -216,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_envelope_survives_the_outcome_round_trip() {
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         let r = call_tool(
             &server,
             "read_output",

@@ -1026,7 +1026,7 @@ fn a_session_survives_the_shim_process_that_created_it() {
 }
 
 #[test]
-fn clasp_list_and_logs_see_sessions_created_through_the_shim() {
+fn holdfast_list_and_logs_see_sessions_created_through_the_shim() {
     // §7.2: CLI commands and MCP tool handlers share one control socket,
     // so a separate `clasp` invocation sees the shim's sessions.
     let env = TestEnv::new("listlogs");
@@ -1089,7 +1089,7 @@ fn clasp_list_and_logs_see_sessions_created_through_the_shim() {
 }
 
 #[test]
-fn clasp_logs_redacts_by_default() {
+fn holdfast_logs_redacts_by_default() {
     // §5.2's default, on the CLI transport. The pairing test below turns
     // `--raw` off and gets the key back; this one is what says the
     // pipeline is on the path at all, rather than `--raw` being inverted.
@@ -1112,7 +1112,7 @@ fn clasp_logs_redacts_by_default() {
 }
 
 #[test]
-fn clasp_logs_raw_returns_the_unredacted_bytes() {
+fn holdfast_logs_raw_returns_the_unredacted_bytes() {
     // The mutation this kills is a `--raw` that PARSES AND IS IGNORED,
     // which every other test in this file passes against: they assert
     // the flag is accepted and that output comes back, and identical
@@ -1143,7 +1143,7 @@ fn clasp_logs_raw_returns_the_unredacted_bytes() {
 }
 
 #[test]
-fn clasp_logs_raw_writes_a_redaction_disabled_audit_entry() {
+fn holdfast_logs_raw_writes_a_redaction_disabled_audit_entry() {
     // §3.2 defines `--raw` as "disable redaction, **and audit-log that
     // you did**". The test above covers the first half; until this one
     // exists the second half is an intention.

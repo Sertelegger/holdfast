@@ -3,7 +3,7 @@
 //! sessions; an exited session releases its name).
 
 use super::{Session, SessionId};
-use crate::{ClaspError, Result};
+use crate::{HoldfastError, Result};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,11 +48,11 @@ impl SessionRegistry {
                 .values()
                 .any(|s| s.is_alive() && s.name.as_deref() == Some(name));
             if taken {
-                return Err(ClaspError::NameTaken(name.to_string()));
+                return Err(HoldfastError::NameTaken(name.to_string()));
             }
         }
         if map.values().filter(|s| s.is_alive()).count() >= self.max_sessions {
-            return Err(ClaspError::LimitReached(self.max_sessions));
+            return Err(HoldfastError::LimitReached(self.max_sessions));
         }
         map.insert(session.id.clone(), session);
         Ok(())
@@ -70,7 +70,7 @@ impl SessionRegistry {
         map.values()
             .find(|s| s.is_alive() && s.name.as_deref() == Some(id_or_name))
             .map(Arc::clone)
-            .ok_or_else(|| ClaspError::SessionNotFound(id_or_name.to_string()))
+            .ok_or_else(|| HoldfastError::SessionNotFound(id_or_name.to_string()))
     }
 
     pub fn remove(&self, id: &str) -> Option<Arc<Session>> {
@@ -139,7 +139,7 @@ mod tests {
         let (a, _pa) = mock_session(Some("build"));
         let (b, _pb) = mock_session(Some("build"));
         reg.insert(a).unwrap();
-        assert!(matches!(reg.insert(b), Err(ClaspError::NameTaken(_))));
+        assert!(matches!(reg.insert(b), Err(HoldfastError::NameTaken(_))));
     }
 
     #[test]
@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(reg.get(&id).unwrap().id, id);
         assert!(matches!(
             reg.get("build"),
-            Err(ClaspError::SessionNotFound(_))
+            Err(HoldfastError::SessionNotFound(_))
         ));
     }
 
@@ -178,7 +178,7 @@ mod tests {
         reg.insert(b).unwrap();
 
         let (c, _pc) = mock_session(None);
-        assert!(matches!(reg.insert(c), Err(ClaspError::LimitReached(2))));
+        assert!(matches!(reg.insert(c), Err(HoldfastError::LimitReached(2))));
 
         pa.exit(0);
         let (d, _pd) = mock_session(None);
@@ -190,7 +190,7 @@ mod tests {
         let reg = SessionRegistry::with_defaults();
         assert!(matches!(
             reg.get("nope"),
-            Err(ClaspError::SessionNotFound(_))
+            Err(HoldfastError::SessionNotFound(_))
         ));
     }
 }

@@ -1639,7 +1639,7 @@ mod tests {
         /// The negative that separates the three above from a scanner that
         /// discards everything.
         #[test]
-        fn clasps_own_markers_are_used_when_nothing_foreign_has_arrived() {
+        fn holdfasts_own_markers_are_used_when_nothing_foreign_has_arrived() {
             let mut s = ModeScanner::new();
             for m in [CLASP_A, CLASP_B, CLASP_C, CLASP_D42] {
                 assert_eq!(s.feed(m, 0, None).len(), 1);
@@ -1689,7 +1689,7 @@ mod tests {
         /// tags its markers too. The integration-level assertion is
         /// `osc133_markers_survive_shell_nesting`.
         #[test]
-        fn an_inner_clasp_shells_markers_are_not_foreign() {
+        fn an_inner_holdfast_shells_markers_are_not_foreign() {
             let mut s = ModeScanner::new();
             for m in [CLASP_A, CLASP_B, CLASP_C, CLASP_A, CLASP_B] {
                 assert_eq!(s.feed(m, 0, None).len(), 1);

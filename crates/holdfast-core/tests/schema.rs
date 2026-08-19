@@ -9,7 +9,7 @@
 //! it against `ReadOutput`'s own schema would pass for as long as the file
 //! compiles and would prove nothing about `read_output`. So every
 //! assertion below starts from a real `CallToolResult` returned by a real
-//! tool call, and validates it against `ClaspServer::*_tool_attr()` — the
+//! tool call, and validates it against `HoldfastServer::*_tool_attr()` — the
 //! very function `#[tool_router]` builds its routes from, so it is the
 //! object an MCP client receives from `tools/list`, not a second copy of
 //! the declaration.
@@ -27,7 +27,7 @@ use holdfast_core::mcp::tools::{
     GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ReadOutputArgs, ResizeArgs,
     SendInputArgs, StartSessionArgs, StatusArgs, TerminateArgs, WaitForPatternArgs,
 };
-use holdfast_core::mcp::ClaspServer;
+use holdfast_core::mcp::HoldfastServer;
 use holdfast_core::pty::{MockPty, PtyBackend};
 use holdfast_core::session::{new_session_id, Session, SessionConfig};
 use jsonschema::error::ValidationErrorKind;
@@ -44,17 +44,17 @@ use std::time::{Duration, Instant};
 /// The `Tool` the router advertises, by tool name.
 fn advertised(name: &str) -> Tool {
     match name {
-        "start_session" => ClaspServer::start_session_tool_attr(),
-        "read_output" => ClaspServer::read_output_tool_attr(),
-        "send_input" => ClaspServer::send_input_tool_attr(),
-        "terminate" => ClaspServer::terminate_tool_attr(),
-        "status" => ClaspServer::status_tool_attr(),
-        "list_sessions" => ClaspServer::list_sessions_tool_attr(),
-        "get_command_history" => ClaspServer::get_command_history_tool_attr(),
-        "wait_for_pattern" => ClaspServer::wait_for_pattern_tool_attr(),
-        "get_screen_state" => ClaspServer::get_screen_state_tool_attr(),
-        "resize" => ClaspServer::resize_tool_attr(),
-        "interrupt" => ClaspServer::interrupt_tool_attr(),
+        "start_session" => HoldfastServer::start_session_tool_attr(),
+        "read_output" => HoldfastServer::read_output_tool_attr(),
+        "send_input" => HoldfastServer::send_input_tool_attr(),
+        "terminate" => HoldfastServer::terminate_tool_attr(),
+        "status" => HoldfastServer::status_tool_attr(),
+        "list_sessions" => HoldfastServer::list_sessions_tool_attr(),
+        "get_command_history" => HoldfastServer::get_command_history_tool_attr(),
+        "wait_for_pattern" => HoldfastServer::wait_for_pattern_tool_attr(),
+        "get_screen_state" => HoldfastServer::get_screen_state_tool_attr(),
+        "resize" => HoldfastServer::resize_tool_attr(),
+        "interrupt" => HoldfastServer::interrupt_tool_attr(),
         other => panic!("no such tool: {other}"),
     }
 }
@@ -171,7 +171,7 @@ fn bash_args() -> Vec<String> {
     vec!["--norc".into(), "--noprofile".into()]
 }
 
-async fn start_bash(server: &ClaspServer) -> (String, CallToolResult) {
+async fn start_bash(server: &HoldfastServer) -> (String, CallToolResult) {
     let r = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -187,7 +187,7 @@ async fn start_bash(server: &ClaspServer) -> (String, CallToolResult) {
     (id, r)
 }
 
-async fn read_tail(server: &ClaspServer, session: &str) -> CallToolResult {
+async fn read_tail(server: &HoldfastServer, session: &str) -> CallToolResult {
     server
         .read_output(Parameters(ReadOutputArgs {
             session: session.into(),
@@ -206,7 +206,7 @@ async fn read_tail(server: &ClaspServer, session: &str) -> CallToolResult {
 /// assertion still fails, but it fails describing a *response*, several
 /// screens away from the fact that the session never got where the test
 /// needed it. `wait_for_at_prompt` was hardened out of the same shape.
-async fn wait_for(server: &ClaspServer, session: &str, needle: &str) {
+async fn wait_for(server: &HoldfastServer, session: &str, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let r = read_tail(server, session).await;
@@ -242,7 +242,7 @@ async fn wait_for(server: &ClaspServer, session: &str, needle: &str) {
 /// Once the snippet has run, `t1 && at_marker` answers first in the
 /// ladder and echo is never consulted, so `semantic` + `AtPrompt` is a
 /// state the session stays in until something is typed.
-async fn wait_for_at_prompt(server: &ClaspServer, session: &str) {
+async fn wait_for_at_prompt(server: &HoldfastServer, session: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let data = body(&read_tail(server, session).await)["data"].clone();
@@ -259,7 +259,7 @@ async fn wait_for_at_prompt(server: &ClaspServer, session: &str) {
     }
 }
 
-async fn kill(server: &ClaspServer, session: &str) {
+async fn kill(server: &HoldfastServer, session: &str) {
     let _ = server
         .terminate(Parameters(TerminateArgs {
             session: session.into(),
@@ -271,7 +271,7 @@ async fn kill(server: &ClaspServer, session: &str) {
 
 /// A registry-resident session backed by a mock, so states a real shell
 /// will not reliably reach (echo-off) can be driven through the real tool.
-fn mock_session(server: &ClaspServer, echo: Option<bool>) -> (String, Arc<MockPty>) {
+fn mock_session(server: &HoldfastServer, echo: Option<bool>) -> (String, Arc<MockPty>) {
     let pty = Arc::new(MockPty::new());
     pty.set_echo(echo);
     let id = register(server, None, "mock", &[], SessionConfig::default(), &pty);
@@ -286,7 +286,7 @@ fn mock_session(server: &ClaspServer, echo: Option<bool>) -> (String, Arc<MockPt
 /// `"bash"`), so the value assertions drive a mock whose every field is
 /// different from every other.
 fn register(
-    server: &ClaspServer,
+    server: &HoldfastServer,
     name: Option<&str>,
     command: &str,
     args: &[&str],
@@ -912,7 +912,7 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
 
 #[tokio::test]
 async fn start_session_ok_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, r) = start_bash(&server).await;
 
     let payload = assert_matches_schema("start_session", &r);
@@ -939,7 +939,7 @@ async fn start_session_ok_response_matches_its_schema() {
 
 #[tokio::test]
 async fn start_session_spawn_failed_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
             command: "clasp-no-such-program-9f2a".into(),
@@ -971,7 +971,7 @@ async fn start_session_spawn_failed_response_matches_its_schema() {
 /// alive on construction without a second PTY having to stay up for it.
 #[tokio::test]
 async fn start_session_name_taken_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let pty = Arc::new(MockPty::new());
     let _occupant = register(
         &server,
@@ -1014,7 +1014,7 @@ async fn start_session_name_taken_response_matches_its_schema() {
 /// `DEFAULT_MAX_SESSIONS` mocks in, one real `start_session` rejected.
 #[tokio::test]
 async fn start_session_limit_reached_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let mut ptys = Vec::new();
     for _ in 0..holdfast_core::session::registry::DEFAULT_MAX_SESSIONS {
         let pty = Arc::new(MockPty::new());
@@ -1054,7 +1054,7 @@ async fn start_session_limit_reached_response_matches_its_schema() {
 
 #[tokio::test]
 async fn read_output_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
 
@@ -1071,7 +1071,7 @@ async fn read_output_emits_every_field_5_4_promises() {
     // `data` field is optional, so `read_output` could stop reporting the
     // whole §5.4 session-state block — enums, title, prompt — and still
     // validate. This pins the exact key set instead.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
 
@@ -1128,7 +1128,7 @@ async fn read_output_emits_every_field_5_4_promises() {
 
 #[tokio::test]
 async fn read_output_session_not_found_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .read_output(Parameters(ReadOutputArgs {
             session: "sess_does_not_exist".into(),
@@ -1154,7 +1154,7 @@ async fn read_output_session_not_found_response_matches_its_schema() {
 /// the missing session would still return `session_not_found`.
 #[tokio::test]
 async fn send_input_and_terminate_session_not_found_responses_match_their_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
 
     let r = server
         .send_input(Parameters(SendInputArgs {
@@ -1192,7 +1192,7 @@ async fn send_input_and_terminate_session_not_found_responses_match_their_schema
 
 #[tokio::test]
 async fn send_input_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for_at_prompt(&server, &id).await;
 
@@ -1239,7 +1239,7 @@ async fn send_input_to_an_echo_off_session_warns_and_still_matches_its_schema() 
     // REQ-SEC-011. `warning` is the one `data` field whose *string* form
     // is only produced on this path; without it the field would only ever
     // be exercised as null, and its declared type would be untested.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _pty) = mock_session(&server, Some(false));
 
     let r = server
@@ -1260,7 +1260,7 @@ async fn send_input_to_an_echo_off_session_warns_and_still_matches_its_schema() 
 
 #[tokio::test]
 async fn send_input_session_died_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session(&server, None);
     pty.exit(7);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1286,7 +1286,7 @@ async fn send_input_session_died_response_matches_its_schema() {
 
 #[tokio::test]
 async fn terminate_responses_match_their_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
 
     let first = server
@@ -1326,7 +1326,7 @@ async fn status_response_matches_its_schema() {
     // `shell_integration` is the value `detect_shell` produced rather than
     // one the test handed in. The field *values* are pinned separately, on
     // a mock that can make every same-typed field differ.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
 
@@ -1384,7 +1384,7 @@ async fn status_reports_each_field_from_the_session_it_names() {
     // fields of a type can hold the same value — which a real `bash`
     // session cannot do, since its `command` and `shell_integration` are
     // both "bash".
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let pty = Arc::new(MockPty::new());
     pty.queue_output(TWO_COMMANDS);
     let before = std::time::SystemTime::now()
@@ -1525,7 +1525,7 @@ async fn status_reports_each_field_from_the_session_it_names() {
 
 #[tokio::test]
 async fn status_session_not_found_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .status(Parameters(StatusArgs {
             session: "sess_does_not_exist".into(),
@@ -1546,7 +1546,7 @@ async fn list_sessions_returns_every_registered_session_and_only_those() {
     // assertion is set equality on ids, plus the id→name mapping, which is
     // what separates "returned the right sessions" from "returned the
     // right ids attached to the wrong records".
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let mut expected: BTreeSet<String> = BTreeSet::new();
     let mut names: Vec<(String, String)> = Vec::new();
     let mut ptys = Vec::new();
@@ -1637,7 +1637,7 @@ async fn list_sessions_returns_every_registered_session_and_only_those() {
 
 #[tokio::test]
 async fn get_command_history_ok_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     // Read the clock *before* anything runs, so `started_at_unix_ms` can be
     // bounded below by a real epoch reading rather than by a constant.
     let before = unix_ms_now();
@@ -1749,7 +1749,7 @@ async fn get_command_history_unavailable_response_matches_its_schema() {
     // command is a `start_session` argument away from working, while a
     // recognised shell that emits nothing is not. A single case would pass
     // against an implementation that hardcoded either string.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let cases = [
         (
             SessionConfig::default(),
@@ -1812,7 +1812,7 @@ async fn get_command_history_session_not_found_response_matches_its_schema() {
     // `CommandHistory` declares `entries`, and a schema that required it
     // would reject CLASP's own `session_not_found` response — in
     // production, on a path no positive test above reaches.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .get_command_history(Parameters(GetCommandHistoryArgs {
             session: "sess_does_not_exist".into(),
@@ -1888,7 +1888,7 @@ impl PtyBackend for GatedPty {
 
 #[tokio::test]
 async fn send_input_timeout_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let pty = Arc::new(GatedPty::new());
     let session = Session::new(
         new_session_id(),
@@ -1937,7 +1937,7 @@ async fn an_undeclared_field_is_rejected() {
     // The proof that the positive tests above can fail. Take a response
     // that *does* validate, add one field nobody declared, and require the
     // validator to name it.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
     let mut payload = assert_matches_schema("read_output", &read_tail(&server, &id).await);
@@ -1960,7 +1960,7 @@ async fn an_undeclared_field_is_rejected() {
 
 #[tokio::test]
 async fn a_missing_envelope_field_is_rejected() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, started) = start_bash(&server).await;
     let mut payload = assert_matches_schema("start_session", &started);
     kill(&server, &id).await;
@@ -1983,7 +1983,7 @@ async fn a_wrongly_typed_field_is_rejected() {
     // `cursor` and `bytes_returned` are both `uint64`; `output` and
     // `state` are both strings. A schema that merely listed the field
     // names would accept any of them holding any of the others' values.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
     let payload = assert_matches_schema("read_output", &read_tail(&server, &id).await);
@@ -2024,7 +2024,7 @@ async fn a_wrongly_typed_field_is_rejected() {
 
 #[tokio::test]
 async fn the_status_field_is_constrained_to_the_declared_enum() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, started) = start_bash(&server).await;
     let mut payload = assert_matches_schema("start_session", &started);
     kill(&server, &id).await;
@@ -2044,7 +2044,7 @@ async fn the_status_field_is_constrained_to_the_declared_enum() {
 /// produces is validated against the schema the router advertises.
 #[tokio::test]
 async fn wait_for_pattern_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
 
@@ -2143,7 +2143,7 @@ async fn wait_for_pattern_response_matches_its_schema() {
 /// `exit 7` rather than a kill: `0` is what a broken exit-status read
 /// produces by default and a signalled child reports a code the caller did
 /// not choose, so neither would prove the field was read.
-async fn exited_session(server: &ClaspServer) -> String {
+async fn exited_session(server: &HoldfastServer) -> String {
     let (id, _) = start_bash(server).await;
     wait_for(server, &id, "$").await;
     let session = server.registry.get(&id).expect("the session");
@@ -2170,7 +2170,7 @@ async fn exited_session(server: &ClaspServer) -> String {
 /// four fields is then asserted by value below the key set.
 #[tokio::test]
 async fn get_screen_state_full_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
 
@@ -2259,7 +2259,7 @@ async fn get_screen_state_full_response_matches_its_schema() {
 /// must be *absent*, not merely unchecked.
 #[tokio::test]
 async fn get_screen_state_diff_response_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
 
@@ -2308,7 +2308,7 @@ async fn get_screen_state_diff_response_matches_its_schema() {
 /// error, and here it comes back with the final screen still in it.
 #[tokio::test]
 async fn get_screen_state_on_a_dead_session_matches_its_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = exited_session(&server).await;
 
     let r = server
@@ -2358,7 +2358,7 @@ async fn get_screen_state_on_a_dead_session_matches_its_schema() {
 /// `exit_code`, which `schema::Resize` declares.
 #[tokio::test]
 async fn resize_responses_match_their_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
 
@@ -2402,7 +2402,7 @@ async fn resize_responses_match_their_schema() {
 /// the top level cannot see a `prompt` that gained a field.
 #[tokio::test]
 async fn interrupt_responses_match_their_schema() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for_at_prompt(&server, &id).await;
 
@@ -2457,7 +2457,7 @@ async fn interrupt_responses_match_their_schema() {
 /// and leaves both of them green.
 #[tokio::test]
 async fn status_and_a_list_sessions_entry_are_the_same_record() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
 
@@ -2503,7 +2503,7 @@ async fn status_and_a_list_sessions_entry_are_the_same_record() {
 /// the top level only.
 #[tokio::test]
 async fn every_nested_object_a_tool_returns_has_its_key_set_pinned() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
     // A command, so `get_command_history` has an entry to enumerate.
@@ -2602,7 +2602,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
         produced.insert(payload["status"].as_str().expect("a status").to_string());
     };
 
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, started) = start_bash(&server).await;
     note(&body(&started)); // ok
 
@@ -2642,14 +2642,14 @@ async fn every_declared_status_is_returned_by_a_real_response() {
 
     // limit_reached: a registry of one, already full.
     {
-        let small = ClaspServer::new();
+        let small = HoldfastServer::new();
         // `with_capacity` is the registry's own knob; the server's
         // default registry is replaced rather than reconfigured.
         let one = holdfast_core::session::SessionRegistry::new(1);
-        let server_one = ClaspServer {
+        let server_one = HoldfastServer {
             registry: std::sync::Arc::new(one),
             processor: std::sync::Arc::clone(&small.processor),
-            // 0.0.5 gave `ClaspServer` the operator config; this literal
+            // 0.0.5 gave `HoldfastServer` the operator config; this literal
             // keeps the default one rather than the registry it just
             // replaced, because the point here is the *registry* limit.
             config: std::sync::Arc::clone(&small.config),
@@ -2808,7 +2808,7 @@ fn no_declared_timestamp_carries_a_bare_name() {
 /// under a correct name, which is why the value is asserted as well.
 #[tokio::test]
 async fn every_emitted_unix_field_is_a_number() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, started) = start_bash(&server).await;
     wait_for(&server, &id, "$").await;
     server

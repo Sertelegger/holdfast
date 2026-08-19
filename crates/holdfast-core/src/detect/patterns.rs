@@ -26,7 +26,7 @@
 //! behaviour they are, to be updated rather than deleted when the
 //! stripper is wired in *ahead of this table*.
 
-use crate::{ClaspError, Result};
+use crate::{HoldfastError, Result};
 use regex::{Regex, RegexBuilder};
 
 /// Hard cap on caller-supplied patterns.
@@ -160,7 +160,7 @@ impl PatternSet {
     /// score, never lower one (§8.6).
     pub fn build(extra: &[PromptPattern], replace: bool) -> Result<Self> {
         if extra.len() > MAX_EXTRA_PATTERNS {
-            return Err(ClaspError::InvalidPattern(format!(
+            return Err(HoldfastError::InvalidPattern(format!(
                 "{} prompt patterns supplied; at most {MAX_EXTRA_PATTERNS} are accepted",
                 extra.len()
             )));
@@ -175,7 +175,7 @@ impl PatternSet {
                 .size_limit(PATTERN_SIZE_LIMIT)
                 .build()
                 .map_err(|e| {
-                    ClaspError::InvalidPattern(format!(
+                    HoldfastError::InvalidPattern(format!(
                         "{}: {}",
                         echoed(&p.regex),
                         first_line(&e.to_string())
@@ -1080,7 +1080,7 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(matches!(e, ClaspError::InvalidPattern(_)), "got {e:?}");
+        assert!(matches!(e, HoldfastError::InvalidPattern(_)), "got {e:?}");
         // The message must stay short enough for a tool response.
         assert!(!e.to_string().contains('\n'), "{e}");
         // A caller that sent several patterns cannot act on "one of them
@@ -1136,7 +1136,7 @@ mod tests {
             true,
         )
         .unwrap_err();
-        assert!(matches!(e, ClaspError::InvalidPattern(_)), "got {e:?}");
+        assert!(matches!(e, HoldfastError::InvalidPattern(_)), "got {e:?}");
 
         // The separator: an ordinary prompt pattern is nowhere near the
         // limit, so this must not be a set that rejects everything.
@@ -1164,7 +1164,7 @@ mod tests {
                 .collect()
         };
         let e = PatternSet::build(&many(MAX_EXTRA_PATTERNS + 1), false).unwrap_err();
-        assert!(matches!(e, ClaspError::InvalidPattern(_)), "got {e:?}");
+        assert!(matches!(e, HoldfastError::InvalidPattern(_)), "got {e:?}");
 
         // The boundary itself, so the cap cannot quietly become off-by-one
         // or collapse to "reject any extras at all".

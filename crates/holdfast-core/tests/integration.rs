@@ -208,7 +208,7 @@ use holdfast_core::mcp::tools::{
     GetCommandHistoryArgs, InterruptArgs, PromptPatternArg, ReadOutputArgs, SendInputArgs,
     StartSessionArgs, StatusArgs, TerminateArgs, WaitForPatternArgs,
 };
-use holdfast_core::mcp::ClaspServer;
+use holdfast_core::mcp::HoldfastServer;
 use holdfast_core::pty::MockPty;
 use holdfast_core::session::{new_session_id, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
@@ -239,7 +239,7 @@ fn wait_for_buffer(session: &holdfast_core::session::Session, needle: &str) -> S
 
 #[tokio::test]
 async fn start_session_returns_a_session_id() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -275,7 +275,7 @@ async fn start_session_returns_a_session_id() {
 
 #[tokio::test]
 async fn duplicate_name_is_rejected() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let mk = |name: &str| StartSessionArgs {
         command: "bash".into(),
         args: bash_args(),
@@ -301,7 +301,7 @@ async fn start_session_rejects_a_nonexistent_cwd() {
     // portable-pty silently discards a cwd that isn't a directory and
     // runs in $HOME instead, so without this check the agent would be
     // told `ok` while running somewhere it did not ask for.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -321,7 +321,7 @@ async fn start_session_rejects_a_nonexistent_cwd() {
 
 #[tokio::test]
 async fn start_session_reports_spawn_failed_without_leaking_the_path() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
             command: "clasp_definitely_not_a_real_program".into(),
@@ -352,7 +352,7 @@ async fn start_session_reports_spawn_failed_without_leaking_the_path() {
 
 #[tokio::test]
 async fn start_session_runs_in_the_requested_cwd_and_passes_env() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let dir = std::env::temp_dir().canonicalize().unwrap();
     let mut env = std::collections::HashMap::new();
     // The value never appears in the command line the test types, so the
@@ -390,7 +390,7 @@ async fn start_session_runs_in_the_requested_cwd_and_passes_env() {
 
 /// Poll read_output until `needle` appears or the attempt budget runs out.
 async fn read_until_contains(
-    server: &ClaspServer,
+    server: &HoldfastServer,
     session: &str,
     needle: &str,
     attempts: usize,
@@ -420,7 +420,7 @@ async fn read_until_contains(
     acc
 }
 
-async fn start_bash(server: &ClaspServer) -> String {
+async fn start_bash(server: &HoldfastServer) -> String {
     let started = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -439,7 +439,7 @@ async fn start_bash(server: &ClaspServer) -> String {
 }
 
 /// Start `bash -c <script>` and return its session id.
-async fn start_script(server: &ClaspServer, script: &str) -> String {
+async fn start_script(server: &HoldfastServer, script: &str) -> String {
     let started = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -462,7 +462,7 @@ async fn start_script(server: &ClaspServer, script: &str) -> String {
         .to_string()
 }
 
-async fn kill_all(server: &ClaspServer) {
+async fn kill_all(server: &HoldfastServer) {
     for s in server.registry.all() {
         let _ = s.signal(holdfast_core::pty::Signal::Kill);
     }
@@ -471,7 +471,7 @@ async fn kill_all(server: &ClaspServer) {
 
 #[tokio::test]
 async fn read_output_returns_shell_output_and_advances_the_cursor() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
     let session = server.registry.get(&id).unwrap();
 
@@ -508,7 +508,7 @@ async fn read_output_returns_shell_output_and_advances_the_cursor() {
 
 #[tokio::test]
 async fn read_output_rejects_zero_or_multiple_selectors() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
 
     let none = server
@@ -558,7 +558,7 @@ async fn read_output_rejects_zero_or_multiple_selectors() {
 
 #[tokio::test]
 async fn read_output_on_unknown_session_is_an_error_envelope() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .read_output(Parameters(ReadOutputArgs {
             session: "sess_nope".into(),
@@ -579,7 +579,7 @@ async fn read_output_tail_lines_respects_max_bytes() {
     // REQ-T-006: max_bytes is a raw-byte cap on every selector. Without
     // it a tail_lines read returns the whole ring buffer — up to 1 MiB
     // in one tool response.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let started = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -735,7 +735,7 @@ async fn terminate_without_force_escalates_to_sigkill_for_a_sigterm_immune_child
     // existing SIGTERM test uses a child that traps and exits, so it never
     // reaches the escalation branch. A regression inverting that branch
     // would leave real shells alive while terminate reported ok.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
     let session = server.registry.get(&id).unwrap();
     let pid = session.pid().expect("pid") as i32;
@@ -761,7 +761,7 @@ async fn terminate_without_force_escalates_to_sigkill_for_a_sigterm_immune_child
 
 #[tokio::test]
 async fn send_input_reaches_the_shell() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
 
     // Same `''` construction as the read_output test, for the same
@@ -792,7 +792,7 @@ async fn send_input_reaches_the_shell() {
 
 #[tokio::test]
 async fn terminate_is_idempotent_and_preserves_the_output() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
 
     server
@@ -858,7 +858,7 @@ async fn terminate_without_force_delivers_sigterm_first() {
     // REQ-P-004. The child traps SIGTERM and exits 77, an exit code it
     // can only reach if the graceful signal arrived — a SIGKILL-first
     // implementation reports 1 instead.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let started = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -899,7 +899,7 @@ async fn terminate_without_force_delivers_sigterm_first() {
 
 #[tokio::test]
 async fn send_input_to_an_exited_session_reports_session_died() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let started = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -974,7 +974,7 @@ fn send_input_to_a_child_that_never_reads_returns_and_leaves_the_server_usable()
 }
 
 async fn wedged_send_input_body() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
 
     // `stty raw` is the whole point. In canonical mode the line
     // discipline *discards* input it cannot buffer, so a write to a
@@ -1076,7 +1076,7 @@ async fn wedged_send_input_body() {
 async fn send_input_rejects_an_oversized_payload() {
     // `data` was unbounded, which is what made a 256 KiB write to a
     // non-reading child possible in the first place.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
 
     let r = server
@@ -1113,7 +1113,7 @@ async fn read_output_does_not_claim_a_cap_that_returned_everything() {
     // null `next_cursor` in the same breath: "there is more, and there is
     // nothing more". The identical bug was fixed twice on the tail_bytes
     // branch and never propagated here.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
     let session = server.registry.get(&id).unwrap();
 
@@ -1179,7 +1179,7 @@ async fn read_output_rejects_a_zero_max_bytes() {
     // documented "retry at next_cursor" rule spun forever making no
     // progress. A read that cannot advance is a caller bug, and the tool
     // already treats schema violations as protocol errors (§5.1).
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
 
     let zero = server
@@ -1224,7 +1224,7 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
     // §5.2: the returned `cwd` is the directory the child was actually
     // spawned in. Echoing the caller's own argument back tells it nothing,
     // and this is on the tool surface §23.3 freezes at 0.0.1.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
 
     let relative = server
         .start_session(Parameters(StartSessionArgs {
@@ -1521,7 +1521,7 @@ fn line_discipline_is_unknown_once_the_child_has_exited() {
 ///
 /// Waiting on the *detector's* last line rather than the raw buffer: the
 /// scores are only meaningful once the detector has consumed the prompt.
-async fn prompt_block(server: &ClaspServer, id: &str) -> Value {
+async fn prompt_block(server: &HoldfastServer, id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let r = server
@@ -1552,7 +1552,7 @@ async fn prompt_block(server: &ClaspServer, id: &str) -> Value {
 
 #[tokio::test]
 async fn start_session_rejects_a_bad_prompt_pattern() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -1652,7 +1652,7 @@ async fn start_session_honours_prompt_patterns_and_replace() {
     // `prompt_patterns` is dropped (0.6 twice), if `replace` is ignored
     // (one value twice), or if the two are wired to each other's field.
     for (replace, expected) in [(true, 0.42), (false, 0.6)] {
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         let started = server
             .start_session(Parameters(StartSessionArgs {
                 command: "bash".into(),
@@ -1687,7 +1687,7 @@ async fn start_session_honours_settle_threshold_ms() {
     // cannot saturate inside a test, and the 250 ms default cannot fail
     // to. Asserting only the default would pass with the argument parsed
     // and thrown away, since the default is what it would fall back to.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let slow = server
         .start_session(Parameters(StartSessionArgs {
             command: "bash".into(),
@@ -1725,7 +1725,7 @@ async fn start_session_honours_settle_threshold_ms() {
 
 #[tokio::test]
 async fn start_session_reports_and_can_disable_shell_integration() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
 
     let on = server
         .start_session(Parameters(StartSessionArgs {
@@ -1777,7 +1777,7 @@ async fn start_session_reports_and_can_disable_shell_integration() {
 
 /// A registry-resident mock session that has already recorded `n` OSC 133
 /// commands, `cmd0`..`cmd{n-1}`, in a ring of `max_entries`.
-async fn history_session(server: &ClaspServer, n: usize, max_entries: usize) -> String {
+async fn history_session(server: &HoldfastServer, n: usize, max_entries: usize) -> String {
     let mut bytes = Vec::new();
     for i in 0..n {
         bytes.extend_from_slice(b"\x1b]133;B\x07cmd");
@@ -1817,7 +1817,7 @@ async fn history_session(server: &ClaspServer, n: usize, max_entries: usize) -> 
 
 /// `get_command_history`'s entry indices for one window.
 async fn history_indices(
-    server: &ClaspServer,
+    server: &HoldfastServer,
     id: &str,
     since_index: Option<u64>,
     limit: Option<usize>,
@@ -1843,7 +1843,7 @@ async fn history_indices(
 
 #[tokio::test]
 async fn get_command_history_limit_and_since_index_select_different_windows() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = history_session(&server, 5, 100).await;
 
     // Neither argument: every entry, and `total` agrees with the count.
@@ -1889,7 +1889,7 @@ async fn get_command_history_reports_a_truncated_ring() {
     // of two an implementation that *cleared* the ring on overflow would
     // land on the same answer as one that evicts a single entry, and
     // nothing here could tell them apart.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = history_session(&server, 5, 3).await;
 
     let (indices, payload) = history_indices(&server, &id, None, None).await;
@@ -1908,7 +1908,7 @@ async fn get_command_history_bounds_its_response_at_the_ring_default() {
     // the cap is never the binding constraint — which is exactly why it
     // has to be exercised against a ring that is deliberately larger.
     // Delete the `.min(...)` and this returns 1002 entries.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let n = holdfast_core::detect::DEFAULT_MAX_ENTRIES + 2;
     let id = history_session(&server, n, n).await;
 
@@ -1949,10 +1949,10 @@ async fn get_command_history_bounds_its_response_at_the_ring_default() {
 
 /// A server writing its audit trail into a temporary directory, plus the
 /// path to read it back from. Never the real `~/.clasp/logs/audit.log`.
-fn server_with_audit(dir: &std::path::Path) -> (ClaspServer, std::path::PathBuf) {
+fn server_with_audit(dir: &std::path::Path) -> (HoldfastServer, std::path::PathBuf) {
     let path = dir.join("audit.log");
     (
-        ClaspServer::with_audit_path(Some(path.clone())),
+        HoldfastServer::with_audit_path(Some(path.clone())),
         path.clone(),
     )
 }
@@ -1970,7 +1970,7 @@ fn audit_entries(path: &std::path::Path, kind: &str) -> Vec<Value> {
 /// terminate it — so the value has been through the child, the buffer and
 /// a tool response before the log is inspected.
 async fn env_session_lifecycle(
-    server: &ClaspServer,
+    server: &HoldfastServer,
     env: &[(&str, &str)],
 ) -> (String, std::string::String) {
     let map: std::collections::HashMap<String, String> = env
@@ -2405,7 +2405,7 @@ fn read_args(session: &str) -> ReadOutputArgs {
     }
 }
 
-async fn started_session(server: &ClaspServer) -> String {
+async fn started_session(server: &HoldfastServer) -> String {
     // `..Default::default()`, not an exhaustive literal. 0.0.2 gave
     // `StartSessionArgs` four more fields and derived `Default` for
     // exactly this reason; 0.0.4 adds `screen_tracking` and 0.0.8 adds
@@ -2435,7 +2435,7 @@ async fn started_session(server: &ClaspServer) -> String {
 
 #[tokio::test]
 async fn read_output_redacts_by_default_and_reports_the_new_flags() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = started_session(&server).await;
     let session = server.registry.get(&id).unwrap();
     session
@@ -2494,7 +2494,7 @@ async fn read_output_redacts_by_default_and_reports_the_new_flags() {
 /// must differ from both (that is the argument being read at all).
 #[tokio::test]
 async fn read_outputs_redact_argument_is_honoured_on_every_arm() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "hatch");
     let token = format!("ghp_{TOKEN_TAIL}");
     // One character short of the rule's minimum, so no rule can match it
@@ -2560,7 +2560,7 @@ async fn read_outputs_redact_argument_is_honoured_on_every_arm() {
 }
 
 /// `status.redaction_stats` as the agent sees it.
-async fn redaction_stats(server: &ClaspServer, id: &str) -> Value {
+async fn redaction_stats(server: &HoldfastServer, id: &str) -> Value {
     let r = server
         .status(Parameters(StatusArgs {
             session: id.to_string(),
@@ -2589,7 +2589,7 @@ async fn redaction_stats(server: &ClaspServer, id: &str) -> Value {
 /// reports an empty map rather than omitting the key.
 #[tokio::test]
 async fn the_per_response_and_per_session_redaction_counts_are_different_numbers() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = started_session(&server).await;
     let session = server.registry.get(&id).unwrap();
 
@@ -2654,7 +2654,7 @@ async fn the_per_response_and_per_session_redaction_counts_are_different_numbers
 
 #[tokio::test]
 async fn read_output_rejects_an_unknown_text_encoding_as_a_protocol_error() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = started_session(&server).await;
 
     let mut args = read_args(&id);
@@ -2688,7 +2688,7 @@ async fn read_output_rejects_an_unknown_text_encoding_as_a_protocol_error() {
 async fn the_advertised_enum_values_are_all_accepted() {
     use base64::Engine as _;
 
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = started_session(&server).await;
     let session = server.registry.get(&id).unwrap();
     session
@@ -2767,7 +2767,7 @@ async fn the_advertised_enum_values_are_all_accepted() {
 
 #[tokio::test]
 async fn terminate_cannot_distinguish_a_signalled_child_from_exit_1() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
 
     let r = server
@@ -2797,7 +2797,7 @@ async fn a_child_that_really_exits_1_is_reported_the_same_way() {
     // *indistinguishable*, and without this half the first test passes
     // against an implementation that reports signals correctly and
     // ordinary exits wrongly.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_script(&server, "exit 1").await;
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2839,7 +2839,7 @@ fn aws_key() -> String {
     format!("AKIA{}", "IOSFODNN7EXAMPLE")
 }
 
-async fn status_data(server: &ClaspServer, id: &str) -> Value {
+async fn status_data(server: &HoldfastServer, id: &str) -> Value {
     let r = server
         .status(Parameters(StatusArgs {
             session: id.to_string(),
@@ -2851,7 +2851,7 @@ async fn status_data(server: &ClaspServer, id: &str) -> Value {
 
 #[tokio::test]
 async fn status_redacts_the_command_that_started_the_session() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let key = aws_key();
     let started = server
         .start_session(Parameters(StartSessionArgs {
@@ -2901,7 +2901,7 @@ async fn status_leaves_an_ordinary_command_byte_identical() {
     // The negative half. Without it, replacing `redact_str` with a
     // function that returns `"[REDACTED]"` unconditionally passes the
     // test above.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
 
     let data = status_data(&server, &id).await;
@@ -2916,7 +2916,7 @@ async fn list_sessions_redacts_args_element_wise() {
     // Joining `args` before redacting would hide the secret *and* return
     // one string where the agent expects an array, so the shape assertion
     // is what separates the two implementations.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let token = format!("ghp_{TOKEN_TAIL}");
     let started = server
         .start_session(Parameters(StartSessionArgs {
@@ -2963,7 +2963,7 @@ async fn prompt_last_line_is_redacted_on_every_prompt_bearing_tool() {
     // Redacting at one call site instead of inside `with_detection`
     // passes a single-tool version of this test with three surfaces
     // still leaking, which is why all four are driven here.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = started_session(&server).await;
     let session = server.registry.get(&id).unwrap();
     let full_token = format!("ghp_{TOKEN_TAIL}");
@@ -3054,7 +3054,7 @@ async fn prompt_last_line_is_redacted_on_every_prompt_bearing_tool() {
 /// empty string passes the first.
 #[tokio::test]
 async fn status_withholds_the_last_line_while_a_key_is_still_streaming() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "streaming-key");
     let key_body = "PjLkMnBvCxZaSdFgHjKlQwErTyUiOpAsDfGhJkLzXcVbNmQwErTyUiOpAsDfGhJk";
     let head = format!("$ cat id_rsa\n-----BEGIN RSA PRIVATE KEY-----\n{key_body}");
@@ -3133,7 +3133,7 @@ async fn status_withholds_the_last_line_while_a_key_is_still_streaming() {
 /// scanner keeps, taking the `eyJ` both mechanisms anchor on with it.
 #[tokio::test]
 async fn status_withholds_a_last_line_too_long_to_carry_its_own_anchor() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "long-jwt");
     let signature = "S".repeat(202);
     let jwt = format!(
@@ -3191,7 +3191,7 @@ async fn status_withholds_a_last_line_too_long_to_carry_its_own_anchor() {
 
 #[tokio::test]
 async fn exited_at_is_absent_while_the_child_lives_and_set_once_after_it_dies() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = started_session(&server).await;
 
     let alive = status_data(&server, &id).await;
@@ -3239,7 +3239,7 @@ async fn exited_at_is_absent_while_the_child_lives_and_set_once_after_it_dies() 
 // made to stop mid-token on demand, and a test that waits for the race to
 // happen by luck is a test that fails by luck.
 
-fn mock_session_in(server: &ClaspServer, name: &str) -> (String, Arc<MockPty>) {
+fn mock_session_in(server: &HoldfastServer, name: &str) -> (String, Arc<MockPty>) {
     let pty = Arc::new(MockPty::new());
     let session = Session::new(
         new_session_id(),
@@ -3264,7 +3264,7 @@ fn wait_args(session: &str, pattern: &str) -> WaitForPatternArgs {
     }
 }
 
-async fn wait_data(server: &ClaspServer, args: WaitForPatternArgs) -> Value {
+async fn wait_data(server: &HoldfastServer, args: WaitForPatternArgs) -> Value {
     let r = server
         .wait_for_pattern(Parameters(args))
         .await
@@ -3286,7 +3286,7 @@ fn wait_until_head(session: &Session, n: u64) {
 /// withheld bytes cannot return through it.
 #[tokio::test]
 async fn a_pattern_matching_an_in_flight_secret_is_withheld_with_its_offset() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "withheld");
     // A partial token: nine bytes of line, then `ghp_` and too few
     // characters for the rule to complete. The boundary sits at 9.
@@ -3330,7 +3330,7 @@ async fn a_pattern_matching_an_in_flight_secret_is_withheld_with_its_offset() {
 /// withhold-everything implementation passes the row above completely.
 #[tokio::test]
 async fn an_ordinary_match_is_not_withheld() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "ordinary");
     pty.queue_output(b"building\nREADY\n");
     wait_until_head(&server.registry.get(&id).unwrap(), 14);
@@ -3352,7 +3352,7 @@ async fn an_ordinary_match_is_not_withheld() {
 /// "match.text is routed through the OutputProcessor" is what applies.
 #[tokio::test]
 async fn a_completed_secret_match_returns_the_redacted_text() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "complete");
     let token = format!("ghp_{TOKEN_TAIL}");
     pty.queue_output(format!("t={token}\ndone\n").as_bytes());
@@ -3389,7 +3389,7 @@ async fn a_completed_secret_match_returns_the_redacted_text() {
 /// assertion that the two fields agree is what that sentence means.
 #[tokio::test]
 async fn a_match_whose_rule_keys_on_a_label_outside_it_is_still_redacted() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "context-rule");
     let value = "0123456789abcdef0123456789abcdef";
     pty.queue_output(format!("DD_API_KEY={value}\ndone\n").as_bytes());
@@ -3414,7 +3414,7 @@ async fn a_match_whose_rule_keys_on_a_label_outside_it_is_still_redacted() {
 
 #[tokio::test]
 async fn a_pattern_that_never_matches_reports_timeout_without_a_match() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "notimeout");
     pty.queue_output(b"nothing here\n");
     wait_until_head(&server.registry.get(&id).unwrap(), 13);
@@ -3434,7 +3434,7 @@ async fn a_pattern_that_never_matches_reports_timeout_without_a_match() {
 /// the agent is told the deadline it will really get.
 #[tokio::test]
 async fn a_zero_timeout_is_clamped_to_the_hour_cap_and_says_so() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "clamped");
     pty.queue_output(b"READY\n");
     wait_until_head(&server.registry.get(&id).unwrap(), 6);
@@ -3464,7 +3464,7 @@ async fn a_zero_timeout_is_clamped_to_the_hour_cap_and_says_so() {
 /// information, which is what emitting it unconditionally would produce.
 #[tokio::test]
 async fn an_ordinary_timeout_reports_no_clamp_field() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "unclamped");
     pty.queue_output(b"READY\n");
     wait_until_head(&server.registry.get(&id).unwrap(), 6);
@@ -3483,7 +3483,7 @@ async fn an_ordinary_timeout_reports_no_clamp_field() {
 
 #[tokio::test]
 async fn an_invalid_pattern_is_a_protocol_error_and_never_reaches_the_shell() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, _pty) = mock_session_in(&server, "badregex");
     let mut args = wait_args(&id, "((((");
     args.timeout_secs = Some(1);
@@ -3520,7 +3520,7 @@ async fn an_invalid_pattern_is_a_protocol_error_and_never_reaches_the_shell() {
 /// fields must agree.
 #[tokio::test]
 async fn send_input_wait_for_returns_the_identical_shape() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (wid, wpty) = mock_session_in(&server, "shape-wait");
     let (sid, spty) = mock_session_in(&server, "shape-send");
 
@@ -3597,7 +3597,7 @@ fn send_input_wait_for_sees_the_echo_of_its_own_write() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         let id = started_session(&server).await;
 
         let sent = body(
@@ -3637,7 +3637,7 @@ fn send_input_wait_for_sees_the_echo_of_its_own_write() {
 // three are about the tool — the envelope, the statuses, and the one
 // property that separates `interrupt` from `terminate`.
 
-async fn interrupt(server: &ClaspServer, id: &str) -> Value {
+async fn interrupt(server: &HoldfastServer, id: &str) -> Value {
     let r = server
         .interrupt(Parameters(InterruptArgs {
             session: id.to_string(),
@@ -3653,7 +3653,7 @@ async fn interrupt(server: &ClaspServer, id: &str) -> Value {
 #[cfg(unix)]
 #[tokio::test]
 async fn interrupt_stops_a_running_command_and_leaves_the_shell_alive() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_bash(&server).await;
     let session = server.registry.get(&id).unwrap();
     read_until_contains(&server, &id, "$", 50).await;
@@ -3752,7 +3752,7 @@ async fn interrupt_is_not_idempotent_and_does_not_claim_to_be() {
     // backend, because the property is "a second call delivers a second
     // signal" and only a backend that records signals can say so — a real
     // shell absorbs both Ctrl+Cs at an idle prompt and looks identical.
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let (id, pty) = mock_session_in(&server, "interrupt-twice");
 
     for n in 1..=2 {
@@ -3775,10 +3775,10 @@ async fn interrupt_is_not_idempotent_and_does_not_claim_to_be() {
     // against a literal: copying `terminate`'s annotation block by reflex
     // is the mutation, and a per-tool literal cannot see that the two rows
     // became the same row.
-    let interrupt_hints = ClaspServer::interrupt_tool_attr()
+    let interrupt_hints = HoldfastServer::interrupt_tool_attr()
         .annotations
         .expect("interrupt carries annotations");
-    let terminate_hints = ClaspServer::terminate_tool_attr()
+    let terminate_hints = HoldfastServer::terminate_tool_attr()
         .annotations
         .expect("terminate carries annotations");
     assert_eq!(interrupt_hints.idempotent_hint, Some(false));
@@ -3793,7 +3793,7 @@ async fn interrupt_is_not_idempotent_and_does_not_claim_to_be() {
 
 #[tokio::test]
 async fn interrupt_on_an_exited_session_reports_session_died() {
-    let server = ClaspServer::new();
+    let server = HoldfastServer::new();
     let id = start_script(&server, "exit 7").await;
     let session = server.registry.get(&id).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);

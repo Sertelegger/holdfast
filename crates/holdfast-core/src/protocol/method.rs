@@ -61,7 +61,7 @@ pub struct ControlError {
     /// **Why §18.3's `code` is not enough.** A tool that answers
     /// `Err(ErrorData)` is reporting an MCP-level fault, and §18.3 has
     /// no row for most of them: `envelope::from_error` maps
-    /// `ClaspError::Pty | ClaspError::Io` to `internal_error` and
+    /// `HoldfastError::Pty | HoldfastError::Io` to `internal_error` and
     /// `tools.rs` maps a panicked write task to `internal_error` with
     /// the comment *"a CLASP bug, not a session outcome"*. The daemon's
     /// nearest catalogued code for all of them is `bad_params`, so

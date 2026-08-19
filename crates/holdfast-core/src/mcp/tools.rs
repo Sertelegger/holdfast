@@ -2,7 +2,7 @@
 //! status, list_sessions, get_command_history.
 
 use super::envelope::{self, Status};
-use super::{caller, detection, schema, ClaspServer};
+use super::{caller, detection, schema, HoldfastServer};
 use crate::detect::{
     detect_shell, DetectionConfig, InteractionMode, PatternSet, PromptPattern,
     DEFAULT_SETTLE_THRESHOLD_MS,
@@ -197,7 +197,7 @@ pub struct PromptPatternArg {
 }
 
 #[tool_router(vis = "pub(crate)")]
-impl ClaspServer {
+impl HoldfastServer {
     /// Start a PTY-backed shell or program and return its session id.
     /// Runs in `cwd` if given, otherwise in the directory the CLASP
     /// server was started in.
@@ -948,7 +948,7 @@ impl ClaspServer {
             Ok(Ok(Ok(ack))) => ack,
             // An earlier write is still parked on this session's writer
             // lock, so this one never even reached the fd.
-            Ok(Ok(Err(crate::ClaspError::WriteTimeout))) => {
+            Ok(Ok(Err(crate::HoldfastError::WriteTimeout))) => {
                 return Ok(write_timed_out(
                     "a previous write to this session is still blocked; the child is not \
                      reading its terminal",
@@ -1256,7 +1256,7 @@ impl ClaspServer {
     }
 }
 
-impl ClaspServer {
+impl HoldfastServer {
     /// Run one wait and render §5.2's eight shared fields.
     ///
     /// **`wait_for_pattern` and `send_input(wait_for=)` both come through
@@ -1636,7 +1636,7 @@ mod tests {
     /// and this goes red first.
     #[test]
     fn the_router_advertises_exactly_the_0_0_4_tool_set() {
-        let mut names: Vec<String> = ClaspServer::tool_router()
+        let mut names: Vec<String> = HoldfastServer::tool_router()
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
@@ -1670,7 +1670,7 @@ mod tests {
     /// `SessionConfig::clock`, and the reaper compares that stamp
     /// against `Clock::now_ms()`. But `start_session` built its config
     /// from `..SessionConfig::default()` and never set `clock`, and
-    /// `ClaspServer` had no clock to set it from — `Clock` had zero
+    /// `HoldfastServer` had no clock to set it from — `Clock` had zero
     /// occurrences anywhere under `mcp/`. So a daemon built with
     /// `Daemon::with_clock(paths, Clock::manual(..))` advanced its own
     /// hand while every session it created was stamped from
@@ -1694,7 +1694,7 @@ mod tests {
         use std::time::Duration;
 
         let clock = Clock::manual(Instant::now());
-        let server = ClaspServer::with_audit_path_config_and_clock(
+        let server = HoldfastServer::with_audit_path_config_and_clock(
             None,
             &crate::config::Config::default(),
             clock.clone(),
@@ -1761,7 +1761,7 @@ mod tests {
     async fn session_start_entry(config: &crate::config::Config) -> serde_json::Value {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("audit.log");
-        let server = ClaspServer::with_audit_path_and_config(Some(path.clone()), config);
+        let server = HoldfastServer::with_audit_path_and_config(Some(path.clone()), config);
         server
             .start_session(Parameters(StartSessionArgs {
                 // Reads its PTY and stays alive, so nothing races the
@@ -1854,7 +1854,7 @@ mod tests {
         assert_eq!(MAX_READ_MAX_BYTES, 262144, "read_output's hard limit");
         assert_eq!(MAX_SEND_INPUT_BYTES, 65536, "send_input's payload cap");
 
-        let read_output = ClaspServer::read_output_tool_attr();
+        let read_output = HoldfastServer::read_output_tool_attr();
         let max_bytes = arg_description(&read_output.input_schema, "max_bytes");
         for needle in ["32768", "262144"] {
             assert!(
@@ -1864,7 +1864,7 @@ mod tests {
             );
         }
 
-        let send_input = ClaspServer::send_input_tool_attr();
+        let send_input = HoldfastServer::send_input_tool_attr();
         let data = arg_description(&send_input.input_schema, "data");
         assert!(
             data.contains("65536"),
@@ -1881,7 +1881,7 @@ mod tests {
     /// description the router advertises.
     #[test]
     fn get_command_history_description_carries_its_caveats() {
-        let tool = ClaspServer::get_command_history_tool_attr();
+        let tool = HoldfastServer::get_command_history_tool_attr();
         let description = tool.description.as_deref().unwrap_or("");
         // `80 columns` and `Latin-1` are here because the needle set was
         // narrower than the caveat it guards: deleting the quantification
@@ -1916,7 +1916,7 @@ mod tests {
     /// live-only.
     #[test]
     fn list_sessions_description_does_not_promise_a_live_only_list() {
-        let tool = ClaspServer::list_sessions_tool_attr();
+        let tool = HoldfastServer::list_sessions_tool_attr();
         let description = tool.description.as_deref().unwrap_or("");
         for needle in ["live or exited", "state"] {
             assert!(
@@ -1984,9 +1984,9 @@ mod tests {
         for (tool, schema) in [
             (
                 "wait_for_pattern",
-                ClaspServer::wait_for_pattern_tool_attr(),
+                HoldfastServer::wait_for_pattern_tool_attr(),
             ),
-            ("send_input", ClaspServer::send_input_tool_attr()),
+            ("send_input", HoldfastServer::send_input_tool_attr()),
         ] {
             let described = arg_description(&schema.input_schema, "timeout_secs");
             for needle in ["30", "3600"] {
@@ -2073,7 +2073,7 @@ mod tests {
     }
 
     fn mock_session(
-        server: &ClaspServer,
+        server: &HoldfastServer,
         name: &str,
         args: Vec<String>,
         bytes: &[u8],
@@ -2107,7 +2107,7 @@ mod tests {
     /// because that shape carries `match.text` and the plain write does
     /// not. `terminate` runs last for the obvious reason.
     async fn every_tool(
-        server: &ClaspServer,
+        server: &HoldfastServer,
         id: &str,
         start_args: StartSessionArgs,
         pattern: &str,
@@ -2247,7 +2247,7 @@ mod tests {
         let mut covered: Vec<String> = rows.iter().map(|r| r.tool.to_string()).collect();
         covered.sort();
         covered.dedup();
-        let mut advertised: Vec<String> = ClaspServer::tool_router()
+        let mut advertised: Vec<String> = HoldfastServer::tool_router()
             .list_all()
             .into_iter()
             .map(|t| t.name.to_string())
@@ -2281,7 +2281,7 @@ mod tests {
             .data
     }
 
-    async fn kill_everything(server: &ClaspServer) {
+    async fn kill_everything(server: &HoldfastServer) {
         for s in server.registry.all() {
             let _ = s.signal(crate::pty::Signal::Kill);
         }
@@ -2300,7 +2300,7 @@ mod tests {
     /// the first element now reddens `cargo test`.
     #[tokio::test]
     async fn no_tool_returns_a_completed_secret_anywhere_in_its_response() {
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         let echoed = format!("export GH_TOKEN={GITHUB_TOKEN} DD_API_KEY={DATADOG_KEY}");
         // A different rule on the second command, so the two entries are
         // distinguishable from each other: an implementation that redacted
@@ -2480,7 +2480,7 @@ mod tests {
     /// wired to `read_output.output` alone.
     #[tokio::test]
     async fn no_tool_returns_an_in_flight_partial_secret_anywhere_in_its_response() {
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         let mut bytes = b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07".to_vec();
         bytes.extend_from_slice(b"building\r\n\x1b]133;D;0\x07");
         // The tail, and nothing after it: a partial with bytes behind it
@@ -2625,7 +2625,7 @@ mod tests {
     /// call and must come back unmasked.
     #[tokio::test]
     async fn the_screen_grid_masks_what_the_byte_stream_holdback_withholds() {
-        let server = ClaspServer::new();
+        let server = HoldfastServer::new();
         // The same 39-character partial as arrangement 2, behind a label
         // **no rule keys on** — `TOKEN=` is matched by the generic rule
         // and would hide the behaviour under a redaction.

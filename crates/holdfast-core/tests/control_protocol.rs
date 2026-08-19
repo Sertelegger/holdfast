@@ -1102,7 +1102,7 @@ async fn a_tools_schema_violation_stays_a_protocol_error_across_the_wire() {
     // because §18.3 has no JSON-RPC codes. Discarding the tool's own
     // code on the way made that flattening lossy in the one direction
     // that matters: `envelope::from_error` maps
-    // `ClaspError::Pty | ClaspError::Io` to `internal_error` from about
+    // `HoldfastError::Pty | HoldfastError::Io` to `internal_error` from about
     // a dozen sites in `tools.rs`, and every one of them then read to
     // the agent as a malformed *argument* in hybrid mode — while staying
     // a server fault under `--no-daemon`. Two transports, two diagnoses,

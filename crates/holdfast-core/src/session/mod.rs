@@ -19,7 +19,7 @@ use crate::screen::{
     CursorSignal, QueryResponder, ScreenCapture, ScreenConfig, ScreenTracker,
     DEFAULT_TERMINAL_QUERY_REPLIES_PER_MIN,
 };
-use crate::{ClaspError, Result};
+use crate::{HoldfastError, Result};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -444,7 +444,7 @@ impl Session {
                 // is also not a `send_input` audit event and never a
                 // command-history entry, both of which follow from the
                 // write never reaching `mcp::tools`: this block holds no
-                // `AuditLog`, no `ClaspServer` and no `Session`.
+                // `AuditLog`, no `HoldfastServer` and no `Session`.
                 //
                 // The placement is not free. After the buffer push and
                 // the fan-out, so the query's own bytes are in the ring
@@ -1032,7 +1032,7 @@ impl Session {
         // non-blocking test backend does not. Checking here means the
         // behaviour is the same on both.
         if !self.backend.is_alive() {
-            return Err(ClaspError::SessionDied);
+            return Err(HoldfastError::SessionDied);
         }
         let pre_write_head = self.buffer.lock().head();
         self.backend.write(data)?;
@@ -1197,7 +1197,7 @@ mod tests {
         pty.exit(0);
         assert!(matches!(
             s.write_input(b"more\n"),
-            Err(ClaspError::SessionDied)
+            Err(HoldfastError::SessionDied)
         ));
     }
 

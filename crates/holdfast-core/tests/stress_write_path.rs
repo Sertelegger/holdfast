@@ -10,7 +10,7 @@
 use holdfast_core::pty::{PtyBackend, Signal};
 use holdfast_core::screen::{ScreenConfig, ScreenTracking};
 use holdfast_core::session::{new_session_id, Session, SessionConfig, SessionRegistry};
-use holdfast_core::{ClaspError, Result};
+use holdfast_core::{HoldfastError, Result};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -142,7 +142,7 @@ impl PtyBackend for StreamPty {
 
     fn read(&self, buf: &mut [u8]) -> Result<usize> {
         if !self.alive.load(Ordering::Relaxed) {
-            return Err(ClaspError::Pty("stream ended".into()));
+            return Err(HoldfastError::Pty("stream ended".into()));
         }
         if !self.armed.load(Ordering::Relaxed) {
             // `Ok(0)` from a live backend is "nothing yet" to the reader
@@ -168,7 +168,7 @@ impl PtyBackend for StreamPty {
             std::thread::sleep(sleep_for);
         }
         if !self.alive.load(Ordering::Relaxed) {
-            return Err(ClaspError::Pty("stream ended".into()));
+            return Err(HoldfastError::Pty("stream ended".into()));
         }
 
         let n = buf.len().min(CHUNK);

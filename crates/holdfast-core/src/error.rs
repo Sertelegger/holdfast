@@ -1,9 +1,9 @@
 use thiserror::Error;
 
-pub type Result<T> = std::result::Result<T, ClaspError>;
+pub type Result<T> = std::result::Result<T, HoldfastError>;
 
 #[derive(Debug, Error)]
-pub enum ClaspError {
+pub enum HoldfastError {
     #[error("session not found: {0}")]
     SessionNotFound(String),
 

@@ -205,7 +205,7 @@ impl RuleSet {
 pub fn builtin_shared() -> Arc<RuleSet> {
     static SHARED: OnceLock<Arc<RuleSet>> = OnceLock::new();
     Arc::clone(SHARED.get_or_init(|| {
-        // Same reasoning as `ClaspServer::with_audit_path` (Task 9): a
+        // Same reasoning as `HoldfastServer::with_audit_path` (Task 9): a
         // failure here means the compiled-in rule file is malformed, which
         // `the_builtin_set_compiles_and_is_substantial` proves it is not.
         // Starting up without redaction is the one outcome we must not

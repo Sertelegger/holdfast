@@ -6,7 +6,7 @@ use super::{PtyBackend, PtySpawnConfig, Signal};
 // Windows-cross clippy gate turns into an error.
 #[cfg(unix)]
 use super::LineDiscipline;
-use crate::{ClaspError, Result};
+use crate::{HoldfastError, Result};
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
@@ -87,7 +87,7 @@ impl InProcessPty {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| ClaspError::Pty(format!("openpty: {e}")))?;
+            .map_err(|e| HoldfastError::Pty(format!("openpty: {e}")))?;
 
         let mut cmd = CommandBuilder::new(&cfg.command);
         for a in &cfg.args {
@@ -107,7 +107,7 @@ impl InProcessPty {
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| ClaspError::Pty(format!("spawn: {e}")))?;
+            .map_err(|e| HoldfastError::Pty(format!("spawn: {e}")))?;
         // Drop the slave so the master sees EOF when the child exits.
         drop(pair.slave);
 
@@ -117,11 +117,11 @@ impl InProcessPty {
         let reader = pair
             .master
             .try_clone_reader()
-            .map_err(|e| ClaspError::Pty(format!("clone reader: {e}")))?;
+            .map_err(|e| HoldfastError::Pty(format!("clone reader: {e}")))?;
         let writer = pair
             .master
             .take_writer()
-            .map_err(|e| ClaspError::Pty(format!("take writer: {e}")))?;
+            .map_err(|e| HoldfastError::Pty(format!("take writer: {e}")))?;
 
         Ok(Self {
             master: Mutex::new(pair.master),
@@ -315,7 +315,7 @@ impl InProcessPty {
     fn sweep(&self, signum: i32) -> Result<()> {
         let groups = self.session_pgids();
         if groups.is_empty() {
-            return Err(ClaspError::Pty("no process group to signal".into()));
+            return Err(HoldfastError::Pty("no process group to signal".into()));
         }
         let mut delivered = false;
         let mut last_err = None;
@@ -329,8 +329,8 @@ impl InProcessPty {
         }
         match (delivered, last_err) {
             (true, _) => Ok(()),
-            (false, Some(e)) => Err(ClaspError::Io(e)),
-            (false, None) => Err(ClaspError::Pty("no process group to signal".into())),
+            (false, Some(e)) => Err(HoldfastError::Io(e)),
+            (false, None) => Err(HoldfastError::Pty("no process group to signal".into())),
         }
     }
 }
@@ -344,7 +344,7 @@ impl PtyBackend for InProcessPty {
         // reader — so callers must additionally run this off the async
         // runtime under their own deadline.
         let Some(mut w) = self.writer.try_lock_for(WRITE_LOCK_TIMEOUT) else {
-            return Err(ClaspError::WriteTimeout);
+            return Err(HoldfastError::WriteTimeout);
         };
         w.write_all(data)?;
         w.flush()?;
@@ -367,9 +367,9 @@ impl PtyBackend for InProcessPty {
             // the session leader would signal the shell hosting it.
             Signal::Interrupt => {
                 let Some(g) = self.foreground_pgid() else {
-                    return Err(ClaspError::Pty("no process group to signal".into()));
+                    return Err(HoldfastError::Pty("no process group to signal".into()));
                 };
-                self.deliver(g, libc::SIGINT).map_err(ClaspError::Io)
+                self.deliver(g, libc::SIGINT).map_err(HoldfastError::Io)
             }
             Signal::Terminate => self.sweep(libc::SIGTERM),
             Signal::Kill => self.sweep(libc::SIGKILL),
@@ -378,7 +378,7 @@ impl PtyBackend for InProcessPty {
 
     #[cfg(not(unix))]
     fn signal(&self, _sig: Signal) -> Result<()> {
-        Err(ClaspError::Pty("signals are Unix-only in 0.0.1".into()))
+        Err(HoldfastError::Pty("signals are Unix-only in 0.0.1".into()))
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -390,7 +390,7 @@ impl PtyBackend for InProcessPty {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| ClaspError::Pty(format!("resize: {e}")))
+            .map_err(|e| HoldfastError::Pty(format!("resize: {e}")))
     }
 
     fn is_alive(&self) -> bool {

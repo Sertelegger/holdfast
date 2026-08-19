@@ -984,7 +984,7 @@ impl Config {
         )?;
 
         // `PatternSet::build` enforces this too, as a
-        // `ClaspError::InvalidPattern` from another layer. Validated here
+        // `HoldfastError::InvalidPattern` from another layer. Validated here
         // as well, with the count in the message, so an over-long list is
         // a named config fault rather than an error the operator has to
         // trace back to a key.
@@ -1095,7 +1095,7 @@ impl Config {
     /// this body with a `builtin_with_extra`-shaped call, and
     /// `a_user_redaction_pattern_is_accepted_and_not_yet_in_force`
     /// reddens on the same commit — which is the point. That test also
-    /// watches the rule set `ClaspServer` actually hands the read path,
+    /// watches the rule set `HoldfastServer` actually hands the read path,
     /// so wiring the key anywhere else reddens it too.
     pub fn redaction_rules(
         &self,
@@ -1612,11 +1612,11 @@ require_confirm = false
         //     config build its own set edits *that function*.
         //  2. the set the read path actually runs with, taken from the
         //     server this `cfg` builds. A milestone that instead wires
-        //     the key where `ClaspServer` assembles its
+        //     the key where `HoldfastServer` assembles its
         //     `OutputProcessor` never touches `redaction_rules()`, and
         //     only this second observation catches it.
         let from_config = cfg.redaction_rules().expect("built-in rules compile");
-        let server = crate::mcp::ClaspServer::with_audit_path_and_config(None, &cfg);
+        let server = crate::mcp::HoldfastServer::with_audit_path_and_config(None, &cfg);
 
         let builtin = RuleSet::builtin().expect("built-in rules compile");
         for (what, active) in [

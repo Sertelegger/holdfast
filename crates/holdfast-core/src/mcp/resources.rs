@@ -41,7 +41,7 @@ use super::caller;
 // `DEFAULT_RESOURCE_READ_MAX_BYTES = 4 MiB` stood here and is deleted.
 // It was a second, independent spelling of `[limits]
 // resource_read_max_bytes`'s default with nothing tying the two
-// together: both real call sites (`ClaspServer::read_resource` and the
+// together: both real call sites (`HoldfastServer::read_resource` and the
 // daemon's `resource_read` route) pass `config.limits.
 // resource_read_max_bytes`, so the constant's only remaining reader was
 // a test, and an operator lowering the knob would have left it stale and

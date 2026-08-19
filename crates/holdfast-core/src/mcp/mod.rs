@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 /// What an agent is told about this server, on either transport.
 ///
-/// Both `ClaspServer` (in-process) and `shim::ShimServer`
+/// Both `HoldfastServer` (in-process) and `shim::ShimServer`
 /// (daemon-backed) build their `instructions` from this. The shim
 /// appends one sentence about where sessions live and changes nothing
 /// else, so a milestone that revises what the agent is told — 0.0.3's
@@ -68,7 +68,7 @@ pub const INSTRUCTIONS: &str = "CLASP gives you PTY-backed shell sessions. start
 const RESOURCE_EVENT_CAPACITY: usize = 16;
 
 #[derive(Clone)]
-pub struct ClaspServer {
+pub struct HoldfastServer {
     pub registry: Arc<SessionRegistry>,
     /// Redaction, ANSI stripping, holdback, encoding — shared by every
     /// read path so there is exactly one place secrets are removed.
@@ -107,7 +107,7 @@ pub struct ClaspServer {
     /// `Session::last_activity_ms` — stays inside one clock. But
     /// `start_session` built its `SessionConfig` from
     /// `..SessionConfig::default()` and never set `clock`, and
-    /// `ClaspServer` had no clock to give it: `Clock` had **zero**
+    /// `HoldfastServer` had no clock to give it: `Clock` had **zero**
     /// occurrences anywhere under `mcp/`. So
     /// `Daemon::with_clock(paths, Clock::manual(..))` ran the reaper on
     /// the hand while every session created through the tool surface
@@ -143,7 +143,7 @@ pub struct ClaspServer {
     pub audit_open_error: Option<String>,
 }
 
-impl ClaspServer {
+impl HoldfastServer {
     /// A server with the audit trail disabled. This is the constructor
     /// tests use: no test should write into the invoking user's home.
     pub fn new() -> Self {
@@ -153,7 +153,7 @@ impl ClaspServer {
     /// A server whose audit trail is written to `path`, when given.
     ///
     /// A log that cannot be opened leaves the trail **disabled** and the
-    /// reason in [`audit_open_error`](ClaspServer::audit_open_error).
+    /// reason in [`audit_open_error`](HoldfastServer::audit_open_error).
     /// Construction does not fail, so that a host with no way to report
     /// (a test, an in-process embedder) is not forced to unwrap; the
     /// host decides. `run_with_config` decides *fatal*, because a daemon
@@ -174,7 +174,7 @@ impl ClaspServer {
     /// Only the knobs whose consumers already take them as parameters
     /// are wired here — `max_concurrent_sessions` on the registry and the
     /// four [`ProcessingLimits`] fields on the processor. The rest are
-    /// parsed, validated and reachable through [`ClaspServer::config`];
+    /// parsed, validated and reachable through [`HoldfastServer::config`];
     /// see `config.rs` for which milestone owns each.
     pub fn with_audit_path_and_config(
         path: Option<PathBuf>,
@@ -191,7 +191,7 @@ impl ClaspServer {
     /// and a `Clock::manual` that nothing advances would freeze their
     /// deadlines. The daemon is the one host that owns a clock, so it is
     /// the one host that has to pass it down — see
-    /// [`ClaspServer::clock`].
+    /// [`HoldfastServer::clock`].
     pub fn with_audit_path_config_and_clock(
         path: Option<PathBuf>,
         config: &crate::config::Config,
@@ -238,7 +238,7 @@ impl ClaspServer {
     /// opened, so this server is running with **no** audit log.
     ///
     /// A host that can refuse must refuse; see
-    /// [`audit_open_error`](ClaspServer::audit_open_error) on the field.
+    /// [`audit_open_error`](HoldfastServer::audit_open_error) on the field.
     pub fn audit_open_error(&self) -> Option<&str> {
         self.audit_open_error.as_deref()
     }
@@ -259,7 +259,7 @@ impl ClaspServer {
     }
 }
 
-impl Default for ClaspServer {
+impl Default for HoldfastServer {
     fn default() -> Self {
         Self::new()
     }
@@ -269,7 +269,7 @@ impl Default for ClaspServer {
 /// transport**. The daemon-backed one advertises less — see
 /// [`shim_capabilities`].
 ///
-/// `listChanged: true` because [`ClaspServer::on_initialized`] holds the
+/// `listChanged: true` because [`HoldfastServer::on_initialized`] holds the
 /// MCP peer and forwards every [`resource_list_changed`] pulse to it, so
 /// `notifications/resources/list_changed` really is delivered when a
 /// session is created or exits. `subscribe` is deliberately **absent**
@@ -279,7 +279,7 @@ impl Default for ClaspServer {
 /// and a `false` one mean the same thing to a client. v0.1.0 does not
 /// implement subscriptions either way (§14.2).
 ///
-/// [`resource_list_changed`]: ClaspServer::resource_list_changed
+/// [`resource_list_changed`]: HoldfastServer::resource_list_changed
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities::builder()
         .enable_tools()
@@ -293,8 +293,8 @@ pub fn server_capabilities() -> ServerCapabilities {
 ///
 /// **REQ-R-006 has no delivery path in hybrid mode, so the shim must not
 /// claim one.** The forwarder that turns a pulse into an MCP
-/// notification is [`ClaspServer::on_initialized`], and it is reachable
-/// only from a `ClaspServer` that holds an MCP peer. In hybrid mode that
+/// notification is [`HoldfastServer::on_initialized`], and it is reachable
+/// only from a `HoldfastServer` that holds an MCP peer. In hybrid mode that
 /// object lives inside the **daemon**, where there is no peer: the
 /// reaper's `poll_resource_list_changed` and `start_session` both fire
 /// the pulse into a broadcast channel with zero receivers, and §7.4.1
@@ -329,7 +329,7 @@ pub fn shim_capabilities() -> ServerCapabilities {
 }
 
 #[tool_handler]
-impl ServerHandler for ClaspServer {
+impl ServerHandler for HoldfastServer {
     fn get_info(&self) -> ServerInfo {
         // ServerInfo (= InitializeResult) and Implementation are
         // #[non_exhaustive]: build from Default, then assign.
@@ -435,7 +435,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let config = crate::config::load()?;
     // The audit path is resolved here rather than in `new()` so that only
     // the real server process ever writes to it.
-    let server = ClaspServer::with_audit_path_and_config(crate::audit::default_path(), &config);
+    let server = HoldfastServer::with_audit_path_and_config(crate::audit::default_path(), &config);
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -473,7 +473,7 @@ mod tests {
         // something else.
         let blocked = dir.path().join("blocked").join("audit.log");
         std::fs::create_dir_all(&blocked).expect("the obstruction");
-        let server = ClaspServer::with_audit_path(Some(blocked.clone()));
+        let server = HoldfastServer::with_audit_path(Some(blocked.clone()));
         let why = server
             .audit_open_error()
             .expect("an unopenable audit log must be reported, not swallowed");
@@ -485,13 +485,13 @@ mod tests {
 
         let opens = dir.path().join("fine").join("audit.log");
         assert_eq!(
-            ClaspServer::with_audit_path(Some(opens)).audit_open_error(),
+            HoldfastServer::with_audit_path(Some(opens)).audit_open_error(),
             None,
             "a log that opens is not a failure; this reports one on every \
              healthy machine"
         );
         assert_eq!(
-            ClaspServer::new().audit_open_error(),
+            HoldfastServer::new().audit_open_error(),
             None,
             "no trail asked for is a choice, not a failure"
         );

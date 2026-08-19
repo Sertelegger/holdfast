@@ -114,7 +114,7 @@ pub fn result_from_wire(status: &str, data: Value, details: impl Into<String>) -
     result
 }
 
-/// Map a `ClaspError` onto the envelope.
+/// Map a `HoldfastError` onto the envelope.
 ///
 /// Only the variants that have a catalogued `status` in spec §18.1 become
 /// envelopes. `Pty` and `Io` have none: they mean the server failed to do
@@ -124,7 +124,7 @@ pub fn result_from_wire(status: &str, data: Value, details: impl Into<String>) -
 /// an exited child are different problems.
 ///
 /// **Do not use this for `SessionDied` when you hold the session.** §18.1
-/// requires `session_died` to carry `data.exit_code`, and `ClaspError::
+/// requires `session_died` to carry `data.exit_code`, and `HoldfastError::
 /// SessionDied` is a unit variant with no code to extract, so the arm
 /// below can only emit `data: {}`. A caller that has the `Session` must
 /// build the envelope directly:
@@ -136,8 +136,8 @@ pub fn result_from_wire(status: &str, data: Value, details: impl Into<String>) -
 /// The arm is kept only for callers that genuinely have no session in
 /// hand. Routing a tool response through it produces a §18.1-noncompliant
 /// payload that nothing will catch at compile time.
-pub fn from_error(e: &crate::ClaspError) -> Result<CallToolResult, ErrorData> {
-    use crate::ClaspError as E;
+pub fn from_error(e: &crate::HoldfastError) -> Result<CallToolResult, ErrorData> {
+    use crate::HoldfastError as E;
     let status = match e {
         E::SessionNotFound(_) => Status::SessionNotFound,
         E::NameTaken(_) => Status::NameTaken,
@@ -257,13 +257,13 @@ mod tests {
     fn error_mapping_covers_the_registry_errors() {
         let cases = [
             (
-                crate::ClaspError::SessionNotFound("a".into()),
+                crate::HoldfastError::SessionNotFound("a".into()),
                 "session_not_found",
             ),
-            (crate::ClaspError::NameTaken("b".into()), "name_taken"),
-            (crate::ClaspError::LimitReached(8), "limit_reached"),
-            (crate::ClaspError::SessionDied, "session_died"),
-            (crate::ClaspError::WriteTimeout, "timeout"),
+            (crate::HoldfastError::NameTaken("b".into()), "name_taken"),
+            (crate::HoldfastError::LimitReached(8), "limit_reached"),
+            (crate::HoldfastError::SessionDied, "session_died"),
+            (crate::HoldfastError::WriteTimeout, "timeout"),
         ];
         for (err, expected) in cases {
             let r = from_error(&err).expect("catalogued status must be an envelope");
@@ -274,8 +274,8 @@ mod tests {
     #[test]
     fn infrastructure_errors_are_protocol_errors_not_session_died() {
         for err in [
-            crate::ClaspError::Pty("openpty failed".into()),
-            crate::ClaspError::Io(std::io::Error::other("boom")),
+            crate::HoldfastError::Pty("openpty failed".into()),
+            crate::HoldfastError::Io(std::io::Error::other("boom")),
         ] {
             assert!(
                 from_error(&err).is_err(),
@@ -295,7 +295,7 @@ mod tests {
         // would blame the server for the caller's mistake. And it must be
         // bounded — this message is built from a string the caller supplied,
         // and it lands in the MCP transcript for the rest of the session.
-        let e = crate::ClaspError::InvalidPattern("x".repeat(5000));
+        let e = crate::HoldfastError::InvalidPattern("x".repeat(5000));
         let err = from_error(&e).expect_err("a caller's bad regex is a protocol error");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(

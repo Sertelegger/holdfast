@@ -8,7 +8,7 @@
 //! **`list_tools` is answered locally, not fetched.** This said the
 //! opposite — that the manifest came from the daemon "verbatim" — and it
 //! did not: [`passthrough::tool_manifest`] is
-//! `ClaspServer::tool_router().list_all()`, a static call **in the
+//! `HoldfastServer::tool_router().list_all()`, a static call **in the
 //! shim's own process**, and §7.4.1 defines no `tool/list` method by
 //! which one could be fetched. `is_passthrough_tool`, the guard on
 //! `call_tool`, reads the same local set.
@@ -222,7 +222,7 @@ fn decode_resource_envelope(message: &str) -> Option<(String, Option<Value>)> {
 /// in-process text rather than copied from it.
 ///
 /// Both transports build `list_tools` from the same in-process
-/// `ClaspServer::tool_router()`, so every tool description, output
+/// `HoldfastServer::tool_router()`, so every tool description, output
 /// schema and annotation already has exactly one definition — *derived*
 /// on both sides rather than forwarded, which this comment used to
 /// claim. That leaves `instructions` as the one agent-visible string
@@ -261,7 +261,7 @@ impl ServerHandler for ShimServer {
         // **`shim_capabilities`, not `server_capabilities`.** The
         // difference is `resources.listChanged`, which this transport
         // cannot deliver: the forwarder that turns a pulse into an MCP
-        // notification is `ClaspServer::on_initialized`, and in hybrid
+        // notification is `HoldfastServer::on_initialized`, and in hybrid
         // mode that object runs inside the daemon with no MCP peer to
         // notify. See `super::shim_capabilities` for the deferral.
         info.capabilities = super::shim_capabilities();
@@ -387,9 +387,9 @@ mod tests {
     /// REQ-R-006 has no delivery path on this transport, so the
     /// handshake must not claim one.
     ///
-    /// `ClaspServer::on_initialized` is the only thing in the tree that
+    /// `HoldfastServer::on_initialized` is the only thing in the tree that
     /// turns a `resource_list_changed` pulse into an MCP notification,
-    /// and it needs the MCP peer. In hybrid mode the `ClaspServer` lives
+    /// and it needs the MCP peer. In hybrid mode the `HoldfastServer` lives
     /// in the daemon, where there is no peer: the pulse goes into a
     /// broadcast channel with zero receivers, and §7.4.1's streaming
     /// frames are reserved and unused in v0.1.0, so nothing carries it
@@ -438,7 +438,7 @@ mod tests {
             "the shim still serves tools/list and tools/call"
         );
 
-        let in_process = crate::mcp::ClaspServer::new()
+        let in_process = crate::mcp::HoldfastServer::new()
             .get_info()
             .capabilities
             .resources
@@ -794,7 +794,7 @@ mod tests {
     ///
     /// `list_tools` is answered from the shim's **own** process —
     /// `passthrough::tool_manifest()` is
-    /// `ClaspServer::tool_router().list_all()`, and §7.4.1 defines no
+    /// `HoldfastServer::tool_router().list_all()`, and §7.4.1 defines no
     /// method by which a manifest could be fetched — while §7.4.1
     /// explicitly permits shim/daemon minor skew. So a tool this build
     /// advertises and an older daemon lacks is reachable, and it comes

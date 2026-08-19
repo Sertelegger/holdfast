@@ -11,7 +11,7 @@ use super::peer;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::mcp::caller::{self, Caller};
-use crate::mcp::{passthrough, resources, ClaspServer};
+use crate::mcp::{passthrough, resources, HoldfastServer};
 use crate::protocol::frame::{self, FrameError};
 use crate::protocol::handshake::{self, ClientKind, HandshakeParams};
 use crate::protocol::method::{self, ErrorCode, Request, Response};
@@ -132,7 +132,7 @@ fn unix_secs_now() -> u64 {
 
 /// Shared daemon state. One per process.
 pub struct Daemon {
-    pub server: ClaspServer,
+    pub server: HoldfastServer,
     paths: RuntimePaths,
     started_at: Instant,
     shutdown_tx: watch::Sender<bool>,
@@ -195,7 +195,7 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// **`with_audit_path`, never `new()`.** `ClaspServer::new()` is
+    /// **`with_audit_path`, never `new()`.** `HoldfastServer::new()` is
     /// documented at HEAD as *"a server with the audit trail disabled …
     /// this is the constructor tests use"*, and `serve_stdio()` — the
     /// only production host before this milestone — uses
@@ -259,7 +259,7 @@ impl Daemon {
             // every `SessionConfig` `start_session` builds. Without it
             // `Daemon::with_clock` moves the reaper's hand while the
             // sessions it is deciding about are stamped from wall time.
-            server: ClaspServer::with_audit_path_config_and_clock(
+            server: HoldfastServer::with_audit_path_config_and_clock(
                 Some(audit_path),
                 &config,
                 clock.clone(),
@@ -1680,7 +1680,7 @@ async fn dispatch_resource(
 /// **`bad_params` is the control-protocol code and not the diagnosis**,
 /// and the two used to be conflated. Only `ErrorData::invalid_params` is
 /// really the caller's fault; `envelope::from_error` maps
-/// `ClaspError::Pty | ClaspError::Io` to `internal_error` from about a
+/// `HoldfastError::Pty | HoldfastError::Io` to `internal_error` from about a
 /// dozen sites in `tools.rs`, and `tools.rs` maps a panicked write task
 /// to `internal_error` with the comment *"a CLASP bug, not a session
 /// outcome"*. Discarding `e.code` told the agent that `openpty failed`
@@ -2011,7 +2011,7 @@ mod tests {
     /// hardcoded `-32602` passed every end-to-end assertion in the tree
     /// while telling the agent that `openpty failed` was its own bad
     /// argument. `internal_error` is the code the ~dozen
-    /// `ClaspError::Pty | ClaspError::Io` sites in `tools.rs` produce.
+    /// `HoldfastError::Pty | HoldfastError::Io` sites in `tools.rs` produce.
     #[test]
     fn a_tool_faults_json_rpc_code_survives_the_flattening_onto_bad_params() {
         for (built, expected) in [

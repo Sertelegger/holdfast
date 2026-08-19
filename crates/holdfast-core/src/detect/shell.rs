@@ -345,7 +345,7 @@ mod tests {
     /// runtime. `assert_marker_stream_and_exit_codes` is the one that runs
     /// them.
     #[test]
-    fn every_emitted_marker_carries_the_clasp_tag_with_the_exit_code_first() {
+    fn every_emitted_marker_carries_the_holdfast_tag_with_the_exit_code_first() {
         for s in [Shell::Bash, Shell::Zsh, Shell::Fish] {
             let snippet = s.integration_snippet();
             for letter in ['A', 'B', 'C'] {
