@@ -1162,3 +1162,210 @@ async fn a_future_attention_frame_does_not_disturb_a_v0_1_0_client() {
         "{sent:?}"
     );
 }
+
+// ------------------- the way out of a secret prompt (§6.1, REQ-SEC-019)
+
+/// The prompt as the **client** draws it when `AwaitingSecret` arrives —
+/// `\r\n`, the text, `\r\n` — and never as a child draws it.
+///
+/// A row that merely waited for `Password: ` could not tell the client's
+/// render from the child's own bytes, and would then run its keystrokes
+/// through the *ordinary input* path: it would pass on a client that
+/// never received the frame at all, which is the one thing these rows
+/// have to rule out. `printf 'Password: '` emits no line terminator on
+/// either side, so this framing is the client's signature.
+const SECRET_PROMPT_DRAWN: &[u8] = b"\r\nPassword: \r\n";
+
+/// The frames the stub has recorded, once `pred` holds — or a failure on
+/// a deadline. A bare `frames()` read races the client's own write.
+fn wait_frames(
+    stub: &StubDaemon,
+    secs: u64,
+    pred: impl Fn(&[ClientFrame]) -> bool,
+) -> Vec<ClientFrame> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        let f = stub.frames();
+        if pred(&f) {
+            return f;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "the client never sent what this row waits for within {secs}s. Sent: {:?}",
+        stub.frames()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_detach_key_works_while_a_secret_prompt_is_outstanding() {
+    // §6.1 Layer 1 does not pause for §9.5. A human who reaches a
+    // password prompt they did not expect — the wrong host, the wrong
+    // account — must be able to leave, and `Ctrl-B d` is the only way out
+    // `holdfast attach` documents (`main.rs`, `README.md`).
+    //
+    // **The harm, not the diagnosis.** The row asserts the client exits,
+    // and that nothing on the wire carries the detach sequence as a
+    // password: a client that routed `0x02`/`0x64` into the secret buffer
+    // would submit `\x02d` to the child the moment the user pressed Enter
+    // trying to escape.
+    let stub = StubDaemon::start(
+        "secretdetach",
+        vec![
+            enc(&ServerFrame::Attached {
+                session_id: "sess_stub01".into(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                state: "Running".into(),
+                exit_code: None,
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+            }),
+            enc(&ServerFrame::AwaitingSecret {
+                request_id: "req_sd01".into(),
+                prompt_text: "Password: ".into(),
+            }),
+        ],
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_stub01"], 80, 24);
+    // The stub sends no `Output`, so this text can only be the client's
+    // own render of `AwaitingSecret`: the prompt really is outstanding.
+    term.wait_for(SECRET_PROMPT_DRAWN, 10);
+
+    term.type_keys(&[0x02, 0x64]);
+    assert_eq!(
+        term.wait_exit(10),
+        0,
+        "`Ctrl-B d` at a secret prompt must detach, not be typed into the password"
+    );
+
+    let sent = stub.frames();
+    assert!(
+        sent.iter().any(|f| matches!(f, ClientFrame::Detach)),
+        "the detach never reached the daemon: {sent:?}"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|f| matches!(f, ClientFrame::SecretInput { .. })),
+        "the detach sequence was submitted as the secret: {sent:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_at_a_secret_prompt_leaves_as_ordinary_input() {
+    // REQ-SEC-019: *"a human abandoning the prompt does it by forwarding
+    // `Ctrl-C` as ordinary `Input`."* That is the spec's only named
+    // human-side cancellation, so a client that swallows `0x03` has no
+    // cancellation at all.
+    //
+    // Three claims, and each is satisfiable without the others: the
+    // `0x03` **leaves** as `Input`, the partial value typed before it
+    // **does not** leave as `SecretInput`, and the client is back in
+    // ordinary mode afterwards (the detach key works again).
+    let stub = StubDaemon::start(
+        "secretcancel",
+        vec![
+            enc(&ServerFrame::Attached {
+                session_id: "sess_stub01".into(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                state: "Running".into(),
+                exit_code: None,
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+            }),
+            enc(&ServerFrame::AwaitingSecret {
+                request_id: "req_sc01".into(),
+                prompt_text: "Password: ".into(),
+            }),
+        ],
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_stub01"], 80, 24);
+    term.wait_for(SECRET_PROMPT_DRAWN, 10);
+
+    // Half a password, then the escape. The partial value is what makes
+    // the second assertion mean something: a client that forwarded the
+    // buffer on cancel would leak it.
+    term.type_keys(b"hun");
+    term.type_keys(&[0x03]);
+
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter().any(|x| matches!(x, ClientFrame::Input { .. }))
+    });
+    let forwarded: Vec<&Vec<u8>> = sent
+        .iter()
+        .filter_map(|f| match f {
+            ClientFrame::Input { bytes } => Some(bytes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        forwarded,
+        vec![&vec![0x03u8]],
+        "exactly the interrupt byte reaches the session — not the typed \
+         value, and not nothing: {sent:?}"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|f| matches!(f, ClientFrame::SecretInput { .. })),
+        "an abandoned prompt must not submit what was typed: {sent:?}"
+    );
+    assert!(
+        !contains(&term.snapshot(), b"hun"),
+        "the partial secret was drawn on the local terminal:\n{}",
+        String::from_utf8_lossy(&term.snapshot())
+    );
+
+    // Back in ordinary mode: the keyboard belongs to the session again.
+    term.type_keys(&[0x02, 0x64]);
+    assert_eq!(term.wait_exit(10), 0, "the client did not survive a cancel");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_abandons_a_real_secret_prompt_and_reaches_the_child() {
+    // The same requirement against a **real child on a real PTY**, which
+    // is the only place the whole path is visible: the client's raw mode
+    // (`ISIG` off, so `0x03` is a byte and not a signal), the `Input`
+    // frame, the daemon's write queue, and the session PTY's own line
+    // discipline turning that byte back into a `SIGINT` for the
+    // foreground group. The child's trap is the witness — no part of it
+    // fires if any link drops the byte.
+    let d = TestDaemon::start("realcancel").await;
+    let s = d.real_session(
+        "sh",
+        &[
+            "-c",
+            "trap 'printf \"\\nABANDONED\\n\"; exit 7' INT; stty -echo; \
+             printf 'Password: '; read x; stty echo; printf 'got=%s\\n' \"$x\"",
+        ],
+    );
+
+    let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 80, 24);
+    term.wait_for(SECRET_PROMPT_DRAWN, 20);
+
+    term.type_keys(b"hun");
+    term.type_keys(&[0x03]);
+    let seen = term.wait_for(b"ABANDONED", 15);
+
+    assert!(
+        !contains(&seen, b"got="),
+        "the abandoned value was submitted to the child anyway:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !contains(&seen, b"hun"),
+        "the partial secret reached the terminal:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    let _ = s.signal(holdfast_core::pty::Signal::Kill);
+}

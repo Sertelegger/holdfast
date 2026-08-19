@@ -43,7 +43,8 @@ over — a live session from any terminal. The web UI is still to come; see
   sessions from any terminal
 - `holdfast attach <session>` — your terminal *becomes* the session. Full
   colour, full TUIs, full keyboard. Detach with **Ctrl-B then d**; the
-  session keeps running.
+  session keeps running. That works at a password prompt too, and
+  **Ctrl+C** there abandons the prompt rather than answering it.
 - `holdfast watch <session>` — the same view, read-only and **redacted**.
   Detach with Ctrl+C.
 

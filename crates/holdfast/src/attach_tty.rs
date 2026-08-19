@@ -18,6 +18,17 @@ use std::os::unix::io::RawFd;
 /// §6.1 Layer 1's prefix key, `Ctrl-B` (`0x02`).
 pub const PREFIX_KEY: u8 = 0x02;
 
+/// `Ctrl-C` (`0x03`), REQ-SEC-019's way out of a secret prompt.
+///
+/// **Not a client command anywhere else.** Raw mode clears `ISIG`
+/// deliberately, so on the ordinary input path this byte is the
+/// session's and travels to it untouched. It is named here only because
+/// §9.5's prompt is the one state in which keystrokes do *not* reach the
+/// session, and REQ-SEC-019's cancellation is *"forwarding `Ctrl-C` as
+/// ordinary `Input`"* — which a secret line that swallowed it would make
+/// unreachable.
+pub const CANCEL_KEY: u8 = 0x03;
+
 /// The second half of the detach sequence, lowercase `d` (`0x64`).
 ///
 /// §6.1 writes it as *"Ctrl-B then D"*; this is tmux's binding, and the
@@ -162,20 +173,53 @@ impl DetachKey {
 /// construction on both paths, rather than by a flag that has to be set
 /// and unset correctly around a read.
 ///
-/// The buffer is zeroed when it is taken and again when it is dropped.
+/// The buffer is zeroed when it is taken, when it is abandoned, and
+/// again when it is dropped.
 #[derive(Debug, Default)]
 pub struct SecretLine {
     buf: Vec<u8>,
 }
 
+/// What a chunk of keystrokes did to a [`SecretLine`].
+///
+/// **Three outcomes and not two**, because a prompt a human cannot leave
+/// is worse than no prompt at all: `sudo` asking on a host they did not
+/// mean to reach is the ordinary case, and REQ-SEC-019's only named
+/// affordance is the cancel below.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SecretKeys {
+    /// Still being typed. Nothing leaves this client.
+    Pending,
+    /// `Enter` arrived: the line **without** its terminator, because
+    /// §5.2's normalisation is the daemon's job and doing it twice
+    /// appends two newlines.
+    Line(Vec<u8>),
+    /// `Ctrl-C` arrived: REQ-SEC-019's abandon. Whatever had been typed
+    /// is already zeroed and is **not** in here — the payload is the
+    /// bytes to forward to the session as ordinary `Input`, `0x03`
+    /// first, so the session PTY's own line discipline raises `SIGINT`
+    /// for the foreground group exactly as it would for a human sitting
+    /// at the child directly.
+    Cancelled(Vec<u8>),
+}
+
 impl SecretLine {
-    /// Feed local keystrokes. `Some(line)` once `Enter` arrives — the
-    /// line **without** its terminator, because §5.2's normalisation is
-    /// the daemon's job and doing it twice appends two newlines.
-    pub fn feed(&mut self, input: &[u8]) -> Option<Vec<u8>> {
-        for &b in input {
+    /// Feed local keystrokes.
+    ///
+    /// The detach grammar has already run over this chunk (see
+    /// `commands::attach`), so `Ctrl-B d` never arrives here and cannot
+    /// be typed into a password.
+    pub fn feed(&mut self, input: &[u8]) -> SecretKeys {
+        for (i, &b) in input.iter().enumerate() {
             match b {
-                b'\r' | b'\n' => return Some(self.take()),
+                b'\r' | b'\n' => return SecretKeys::Line(self.take()),
+                // The partial value dies **here**, before the return, so
+                // an abandoned prompt cannot leave a password behind in
+                // this buffer for the next one to inherit.
+                CANCEL_KEY => {
+                    self.zero();
+                    return SecretKeys::Cancelled(input[i..].to_vec());
+                }
                 // Backspace and DEL. A human correcting a password they
                 // cannot see is the ordinary case, not the exotic one.
                 0x08 | 0x7f => {
@@ -184,14 +228,18 @@ impl SecretLine {
                 other => self.buf.push(other),
             }
         }
-        None
+        SecretKeys::Pending
     }
 
     fn take(&mut self) -> Vec<u8> {
         let line = self.buf.clone();
+        self.zero();
+        line
+    }
+
+    fn zero(&mut self) {
         holdfast_core::attach::secret::zero_bytes(&mut self.buf);
         self.buf.clear();
-        line
     }
 }
 
@@ -264,20 +312,66 @@ mod tests {
         // place that knows whether the prompt wants a newline. A client
         // that shipped the `\r` too would produce two.
         let mut s = SecretLine::default();
-        assert_eq!(s.feed(b"hun"), None);
-        assert_eq!(s.feed(b"ter2\r"), Some(b"hunter2".to_vec()));
+        assert_eq!(s.feed(b"hun"), SecretKeys::Pending);
+        assert_eq!(s.feed(b"ter2\r"), SecretKeys::Line(b"hunter2".to_vec()));
     }
 
     #[test]
     fn backspace_shortens_the_secret_line() {
         let mut s = SecretLine::default();
-        assert_eq!(s.feed(b"hunter3\x7f2\n"), Some(b"hunter2".to_vec()));
+        assert_eq!(
+            s.feed(b"hunter3\x7f2\n"),
+            SecretKeys::Line(b"hunter2".to_vec())
+        );
     }
 
     #[test]
     fn a_taken_line_leaves_nothing_behind_for_the_next_prompt() {
         let mut s = SecretLine::default();
-        assert_eq!(s.feed(b"first\n"), Some(b"first".to_vec()));
-        assert_eq!(s.feed(b"second\n"), Some(b"second".to_vec()));
+        assert_eq!(s.feed(b"first\n"), SecretKeys::Line(b"first".to_vec()));
+        assert_eq!(s.feed(b"second\n"), SecretKeys::Line(b"second".to_vec()));
+    }
+
+    #[test]
+    fn ctrl_c_abandons_the_line_and_forwards_only_the_interrupt() {
+        // REQ-SEC-019. Two claims, and the second is the one a naive
+        // "return the buffer so the caller can decide" would fail: the
+        // half-typed password does **not** ride out on the cancel. What
+        // leaves is the interrupt byte, which is what makes the session
+        // PTY raise `SIGINT` and the child abandon its own prompt.
+        let mut s = SecretLine::default();
+        assert_eq!(s.feed(b"hun"), SecretKeys::Pending);
+        assert_eq!(
+            s.feed(&[CANCEL_KEY]),
+            SecretKeys::Cancelled(vec![CANCEL_KEY])
+        );
+    }
+
+    #[test]
+    fn the_interrupt_carries_the_rest_of_its_chunk_with_it() {
+        // A human typing fast, or a paste: `0x03` and the keys after it
+        // arrive in one `read`. Everything from the interrupt onwards is
+        // the session's, in order — dropping the tail would silently eat
+        // keystrokes, and keeping the head would forward the secret.
+        let mut s = SecretLine::default();
+        assert_eq!(
+            s.feed(b"hun\x03ls\r"),
+            SecretKeys::Cancelled(b"\x03ls\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_cancelled_line_leaves_nothing_behind_for_the_next_prompt() {
+        // The pairing with `a_taken_line_leaves_nothing_behind…`. A
+        // `Cancelled` arm that returned without zeroing would carry the
+        // abandoned value into whatever the child asks for next — the
+        // wrong-password-to-the-wrong-prompt failure §5.2 exists to
+        // prevent.
+        let mut s = SecretLine::default();
+        assert_eq!(
+            s.feed(b"abandoned\x03"),
+            SecretKeys::Cancelled(vec![CANCEL_KEY])
+        );
+        assert_eq!(s.feed(b"second\n"), SecretKeys::Line(b"second".to_vec()));
     }
 }

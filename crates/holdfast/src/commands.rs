@@ -1105,23 +1105,58 @@ pub async fn attach(session: &str) -> ExitCode {
                     let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
                     return ExitCode::SUCCESS;
                 };
-                if let Some((id, line)) = secret.as_mut() {
-                    if let Some(bytes) = line.feed(&chunk) {
-                        let f = ClientFrame::SecretInput { request_id: id.clone(), bytes };
-                        let sent = frame::write_frame(&mut wr, &f).await;
-                        secret = None;
-                        render(b"\r\n");
-                        if sent.is_err() {
-                            return ExitCode::from(EXIT_UNREACHABLE);
-                        }
-                    }
-                    continue;
-                }
+                // **§6.1's grammar runs first, and it runs during a
+                // secret prompt too.** The order is the whole point: a
+                // client that routed the chunk into `SecretLine` while a
+                // prompt was up made `Ctrl-B d` unreachable, made
+                // REQ-SEC-019's `Ctrl-C` unreachable, and then typed
+                // `\x02d` into the child as the password when the user
+                // pressed Enter trying to escape. A password prompt is
+                // exactly where a human most needs to be able to leave.
                 let (forward, detached) = detach.feed(&chunk);
                 if !forward.is_empty() {
-                    let f = ClientFrame::Input { bytes: forward };
-                    if frame::write_frame(&mut wr, &f).await.is_err() {
-                        return ExitCode::from(EXIT_UNREACHABLE);
+                    match secret.as_mut() {
+                        // §9.5: while a prompt is outstanding the bytes
+                        // are the *answer* and do not reach the session
+                        // — which is what keeps the value off the
+                        // session's echo as well as off this terminal.
+                        Some((id, line)) => match line.feed(&forward) {
+                            crate::attach_tty::SecretKeys::Pending => {}
+                            crate::attach_tty::SecretKeys::Line(bytes) => {
+                                let f = ClientFrame::SecretInput { request_id: id.clone(), bytes };
+                                let sent = frame::write_frame(&mut wr, &f).await;
+                                secret = None;
+                                render(b"\r\n");
+                                if sent.is_err() {
+                                    return ExitCode::from(EXIT_UNREACHABLE);
+                                }
+                            }
+                            // REQ-SEC-019's abandon, spelled the way the
+                            // spec spells it: **as ordinary `Input`**,
+                            // not as a new client→server frame. The
+                            // daemon closes the request when the child
+                            // stops asking and fans out
+                            // `SecretRequestClosed`; nothing here has to
+                            // tell it. The local state is dropped now
+                            // rather than on that reply, so the keyboard
+                            // belongs to the session again immediately
+                            // and the partial value stops existing.
+                            crate::attach_tty::SecretKeys::Cancelled(bytes) => {
+                                secret = None;
+                                render(b"\r\n");
+                                diag!("holdfast attach: secret entry abandoned");
+                                let f = ClientFrame::Input { bytes };
+                                if frame::write_frame(&mut wr, &f).await.is_err() {
+                                    return ExitCode::from(EXIT_UNREACHABLE);
+                                }
+                            }
+                        },
+                        None => {
+                            let f = ClientFrame::Input { bytes: forward };
+                            if frame::write_frame(&mut wr, &f).await.is_err() {
+                                return ExitCode::from(EXIT_UNREACHABLE);
+                            }
+                        }
                     }
                 }
                 if detached {
