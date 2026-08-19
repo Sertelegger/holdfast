@@ -19,7 +19,7 @@ use crate::session::Reaper;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{UnixListener, UnixStream};
@@ -129,6 +129,28 @@ pub struct Daemon {
     started_at: Instant,
     shutdown_tx: watch::Sender<bool>,
     connections: AtomicU64,
+    /// Connections accepted and not yet finished with.
+    ///
+    /// **§7.3's exit needs this because `last_client_connect` is stamped
+    /// too late to see one.** That timestamp is written after the uid
+    /// gate *and* after an accepted handshake, deliberately, so a
+    /// refused peer cannot hold the daemon open — which leaves a
+    /// connection that has been accepted but not yet handshaken
+    /// invisible to `client_less_exit_due()`. The exit only arms after
+    /// 24 h of silence, so the connection that races it is the one
+    /// *ending* the silence, which is the only connection that can:
+    /// the probability argument runs the opposite way from the usual
+    /// one.
+    ///
+    /// Incremented in [`serve`] at accept, **before** the task is
+    /// spawned, and decremented by [`InFlight`] on every exit path
+    /// including a panic. Counting at accept rather than inside the task
+    /// is what makes it see the connection the timestamp cannot; and it
+    /// preserves the existing rule, because a refused peer holds the
+    /// daemon open only for as long as its connection lasts, which for a
+    /// uid refusal is one syscall and for a silent peer is bounded by
+    /// [`handshake::HANDSHAKE_TIMEOUT`].
+    in_flight: AtomicUsize,
     /// The uid this daemon belongs to, captured once at construction
     /// rather than re-read per connection.
     ///
@@ -243,6 +265,7 @@ impl Daemon {
             started_at: clock.now(),
             shutdown_tx,
             connections: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
             owner_uid,
             clock,
             last_client_connect: Mutex::new(None),
@@ -317,6 +340,12 @@ impl Daemon {
     /// this counter is what separates the two.
     pub fn accepted_connections(&self) -> u64 {
         self.connections.load(Ordering::Relaxed)
+    }
+
+    /// Connections accepted and not yet finished with — see
+    /// [`Daemon::in_flight`].
+    pub fn in_flight_connections(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     pub fn status(&self) -> DaemonStatus {
@@ -442,6 +471,27 @@ impl Daemon {
     pub fn client_less_exit_due(&self) -> bool {
         let window = self.config().daemon.idle_shutdown_after_secs;
         if window == 0 {
+            return false;
+        }
+        // **A client mid-connect is a client.** `last_client_connect` is
+        // stamped after the uid gate and an accepted handshake, so a
+        // connection that has been accepted and is still handshaking is
+        // invisible to the timestamp — and the connection that races
+        // this exit is precisely the one *ending* the 24 hours of
+        // silence that armed it. Without this conjunct the daemon exits
+        // underneath it, and the client-side EOF surfaces as
+        // `FrameError::Eof` rather than `ClientError::Connect`, which is
+        // the one classification `spawn::ensure_daemon` will not start a
+        // replacement for. `clasp mcp` then fails with
+        // `daemon_unreachable` against a daemon that was alive moments
+        // earlier.
+        //
+        // It is also what keeps a `start_session` arriving in that
+        // window from being SIGKILLed by a shutdown that had already
+        // concluded there were no sessions: a request can only be
+        // dispatched on a connection that was counted at accept, which
+        // is strictly earlier.
+        if self.in_flight_connections() > 0 {
             return false;
         }
         // First conjunct: every session has exited. Exited sessions keep
@@ -586,6 +636,21 @@ pub(crate) fn bind_control_within(
     Ok(listener)
 }
 
+/// Holds [`Daemon::in_flight`] up for the life of one connection.
+///
+/// A guard rather than a `fetch_sub` at the end of the task, so the
+/// count is decremented on **every** exit path — including a panic
+/// inside `handle_connection`, which would otherwise leave the counter
+/// permanently non-zero and disable §7.3's exit for the life of the
+/// process.
+struct InFlight(Arc<Daemon>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Accept connections until shutdown is signalled.
 pub async fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
     let mut shutdown = daemon.shutdown_signalled();
@@ -596,8 +661,17 @@ pub async fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
                 match accepted {
                     Ok((stream, _)) => {
                         daemon.connections.fetch_add(1, Ordering::Relaxed);
+                        // **Incremented here and not inside the task.**
+                        // The point of the counter is to see a
+                        // connection the handshake timestamp cannot, and
+                        // a task that has been spawned but not yet
+                        // polled is exactly that connection.
+                        daemon.in_flight.fetch_add(1, Ordering::SeqCst);
                         let d = Arc::clone(&daemon);
-                        tokio::spawn(async move { handle_connection(d, stream).await });
+                        tokio::spawn(async move {
+                            let _open = InFlight(Arc::clone(&d));
+                            handle_connection(d, stream).await;
+                        });
                     }
                     Err(e) => {
                         eprintln!("clasp daemon: accept failed: {e}");
@@ -2218,6 +2292,89 @@ mod tests {
             *daemon.shutdown_signalled().borrow(),
             "the accept loop returned without shutdown having been signalled"
         );
+    }
+
+    /// §7.3's exit must not fire underneath a client that is mid-connect.
+    ///
+    /// `last_client_connect` is stamped after the uid gate *and* after an
+    /// accepted handshake — deliberately, so a refused peer cannot hold
+    /// the daemon open — which leaves a connection that has been accepted
+    /// and is still handshaking invisible to the conjunction. The
+    /// probability argument runs the opposite way from the usual one:
+    /// the exit only arms after 24 h of silence, so the connection that
+    /// races it is the one *ending* the silence, which is the only
+    /// connection that can.
+    ///
+    /// The client-side consequence is what makes it more than a lost
+    /// connection: the EOF surfaces as `FrameError::Eof` and **not**
+    /// `ClientError::Connect`, and `spawn::ensure_daemon` starts a
+    /// replacement only for `Connect` — so `clasp mcp` reports
+    /// `daemon_unreachable` against a daemon that was alive moments
+    /// earlier, and starts nothing.
+    ///
+    /// The pairing at the bottom is what stops this passing against a
+    /// daemon that never exits at all.
+    #[tokio::test]
+    async fn a_connection_mid_handshake_holds_off_the_client_less_exit() {
+        let paths = scratch("inflight");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        let listener = bind_control(&paths).expect("bind control.sock");
+        let daemon = Daemon::with_config_and_clock(paths.clone(), configured(3600), clock.clone());
+        let mut served = tokio::spawn(serve_daemon(Arc::clone(&daemon), listener));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // A peer that has connected and not yet said anything. Held in
+        // scope: dropping it here would end the connection and the row
+        // would be green against a daemon that counts nothing.
+        let peer = UnixStream::connect(paths.control_sock())
+            .await
+            .expect("connect to the daemon");
+        assert!(
+            yield_until(|| daemon.accepted_connections() == 1).await,
+            "the accept loop never saw the connection, so the premise is untested"
+        );
+        assert_eq!(daemon.in_flight_connections(), 1);
+        // The state the timestamp cannot see, named explicitly: without
+        // this the row would also pass against a daemon that stamped
+        // `last_client_connect` at accept, which is a different fix with
+        // a different cost (a refused peer would hold the daemon open).
+        assert!(
+            daemon.last_client_connect().is_none(),
+            "the handshake has not run, so nothing may have been stamped yet"
+        );
+
+        clock.advance(Duration::from_secs(3601));
+        assert!(
+            !daemon.client_less_exit_due(),
+            "the connection ending 24 h of silence was invisible to §7.3's conjunction"
+        );
+        // And the actuation, not just the predicate: the tick has had the
+        // hand moved past the window and must not have acted on it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut served)
+                .await
+                .is_err(),
+            "the daemon exited underneath a client that was still handshaking"
+        );
+
+        // **The pairing.** The connection is the only thing holding this
+        // daemon open; with it gone the very next tick takes the exit.
+        // Without this the row would be satisfied by a counter that is
+        // never decremented — which would disable §7.3 outright.
+        drop(peer);
+        assert!(
+            yield_until(|| daemon.in_flight_connections() == 0).await,
+            "the count was never given back, so the exit is now disabled for good"
+        );
+        clock.advance(Duration::from_secs(3601));
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("with no connection and no session, §7.3's window must bite")
+            .expect("the serve task panicked");
     }
 
     /// The idle reaper and REQ-R-006's exit half, both on the one tick.
