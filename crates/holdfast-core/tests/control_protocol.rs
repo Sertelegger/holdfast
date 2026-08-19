@@ -82,7 +82,7 @@ impl TestDaemon {
         // **This** is the line that waits for the accept loop to be
         // polled. Until it runs, `tokio::spawn` has only *scheduled*
         // `serve`, and a test whose assertions are synchronous — the
-        // fd-table scan in `the_daemon_binds_only_the_control_socket` —
+        // fd-table scan in `the_daemon_binds_only_unix_sockets_and_not_http` —
         // can run before the daemon has executed a single line, which
         // makes it silently blind to anything `serve` does. Do not delete
         // it as redundant with the loop above: that is the regression,
@@ -297,16 +297,14 @@ async fn the_socket_and_its_directory_are_owner_only() {
 }
 
 #[tokio::test]
-async fn the_daemon_binds_only_the_control_socket() {
-    // REQ-D-001 / §7.2: the daemon never opens a TCP listener. `attach`
-    // and `http` are reserved names in 0.0.5 and must not exist yet
-    // either — a stray bind would show up as a file here.
+async fn the_daemon_binds_only_unix_sockets_and_not_http() {
+    // REQ-D-001 / §7.2: the daemon never opens a TCP listener. 0.0.6
+    // binds attach.sock (asserted in Task 4, beside the code that binds
+    // it); `http` is still 0.0.10's and a stray bind would show up as a
+    // file here. This assertion is the only guard against that milestone
+    // creeping forward, so it is kept rather than folded away.
     let d = TestDaemon::start("onlyunix").await;
     assert!(d.paths.control_sock().exists());
-    assert!(
-        !d.paths.attach_sock().exists(),
-        "attach.sock belongs to 0.0.6"
-    );
     assert!(!d.paths.http_sock().exists(), "http.sock belongs to 0.0.10");
 
     #[cfg(target_os = "linux")]

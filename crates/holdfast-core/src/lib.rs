@@ -20,6 +20,7 @@
 // so narrowing it back is a red test and not a review finding.
 #![deny(clippy::print_stderr, clippy::print_stdout)]
 
+pub mod attach;
 pub mod audit;
 pub mod buffer;
 pub mod clock;
