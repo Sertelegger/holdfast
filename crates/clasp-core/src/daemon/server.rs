@@ -64,8 +64,9 @@ pub struct StopParams {
 /// §7.4.1's `stopped_at` is a REQ-T-018 violation in the spec rather
 /// than a divergence in this plan.
 ///
-/// §7.4.1's table still shows the pre-rev-38 `stopped_at`. §5.4 wins,
-/// and says so by name: it records that this milestone re-affirmed the
+/// §7.4.1's table showed the pre-rev-38 bare `stopped_at` until rev. 48
+/// brought it into line; §5.4 had already ruled, and says so by name: it
+/// records that this milestone re-affirmed the
 /// integer form *after* the date crate the original deferral waited on
 /// had already landed in 0.0.3, and that *"the spec is the artifact that
 /// was wrong."* Do **not** "discharge the deferral" by emitting RFC 3339
@@ -483,10 +484,24 @@ async fn dispatch(
         method::METHOD_DAEMON_STOP => {
             // `force` and `timeout_secs` describe how hard to push the
             // *sessions*; 0.0.5 always sends SIGKILL to the process
-            // group, so both are accepted and recorded rather than
-            // silently ignored. The graceful path lands with the
-            // reaper's SIGTERM-then-SIGKILL escalation.
-            let _params: StopParams = req.params_as().unwrap_or_default();
+            // group, so both are **parsed and then deliberately unused**
+            // until the reaper's SIGTERM-then-SIGKILL escalation lands.
+            // Parsed, not ignored: this used to be `unwrap_or_default()`,
+            // which made `daemon/stop` the one method that answers `ok`
+            // to structurally garbage params — and, worse, left
+            // `StopParams`' wire names unpinned, because nothing could
+            // observe whether the daemon had read them. Task 16 makes
+            // these two knobs differentiate behaviour, at which point a
+            // rename would silently stop forcing with nothing red.
+            let _params: StopParams = match req.params_as() {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        Response::error(req.id, ErrorCode::BadParams, e.to_string()),
+                        false,
+                    )
+                }
+            };
             let terminated = daemon.shutdown();
             let outcome = StopOutcome {
                 stopped_at_unix_secs: unix_secs_now(),
