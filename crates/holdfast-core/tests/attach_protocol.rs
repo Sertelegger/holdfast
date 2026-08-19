@@ -242,6 +242,58 @@ async fn expect_eof(s: &mut UnixStream, what: &str) {
     );
 }
 
+/// Assert the peer closed, with only this session's still-unread output
+/// allowed to arrive first.
+///
+/// **This is not a weaker [`expect_eof`] and it must not be used where
+/// that one fits.** The exact form is asserted on a *quiet* session by
+/// `a_client_initiated_detach_sends_no_detached_frame`, whose `MockPty`
+/// produces nothing on its own: there the very next read after `Detach`
+/// is `Eof`, so a `Detached { reason: "client_detach" }` invented to
+/// complete §18.4c's set of three is red on the first frame. Nothing
+/// here relaxes that row.
+///
+/// What this exists for is the one scenario where "the next read is
+/// `Eof`" is not a property of the daemon at all. A live shell prints
+/// its next prompt the instant the echoed command finishes, so bytes the
+/// client was entitled to *while it was attached* can still be unread
+/// when it detaches — and the daemon cannot un-send them. Measured at
+/// 79e35c7 on `attach_detach_round_trip_leaves_the_session_running`: with
+/// **no `Detach` sent at all** and a 500 ms settle, 5 runs in 20 still
+/// had 1-2 `Output` frames pending, and after draining them `Detach`
+/// gave `Eof` on 20 runs of 20. The frames are the client not having
+/// caught up, not the daemon answering the detach.
+///
+/// So the guarantee is stated as the strongest thing that is true:
+/// **only `Output` for this session may follow a client-initiated
+/// `Detach`, and the close must still arrive.** A `Detached` is red, any
+/// other frame is red, an `Output` for another session is red, and a
+/// peer that never closes is red. "Some frame arrived" would pass
+/// against all four, which is why this takes the session id rather than
+/// matching `Output { .. }`.
+async fn expect_eof_after_output(s: &mut UnixStream, session: &str, what: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            deadline - tokio::time::Instant::now(),
+            frame::read_frame_body(&mut *s),
+        )
+        .await
+        {
+            Ok(Err(FrameError::Eof)) => return,
+            Ok(Ok(body)) => match decode_server_frame(&body).expect("a decodable server frame") {
+                ServerFrame::Output { session: id, .. } if id == session => {}
+                other => panic!(
+                    "{what}: only this session's in-flight Output may follow a \
+                     client-initiated Detach, and this is not that: {other:?}"
+                ),
+            },
+            other => panic!("{what}: expected the daemon to close, got {other:?}"),
+        }
+    }
+    panic!("{what}: the daemon never closed the connection");
+}
+
 /// A well-formed attach on a fresh connection must still work. Every
 /// close assertion is paired with this, because "the connection closed"
 /// and "the daemon died" are the same thing from one socket.
@@ -3164,8 +3216,17 @@ async fn attach_detach_round_trip_leaves_the_session_running() {
     assert!(contains(&seen, b"ROUNDTRIP"), "the keystrokes never ran");
 
     // Detach. §6.1: *"cleanly disconnects without killing the session."*
+    //
+    // `expect_eof_after_output` and **not** `expect_eof`, and the reason
+    // is in that helper's doc: bash prints its next prompt the moment
+    // `echo` finishes, so on this row — the only one in the file driving
+    // a real shell across a detach — an `Output` the client has not read
+    // yet is the client falling behind, not a frame the daemon sent
+    // because it was asked to close. §18.4c's "no `Detached` for a client
+    // detach" is still asserted here, and asserted in its exact form on a
+    // quiet session by `a_client_initiated_detach_sends_no_detached_frame`.
     send(&mut c, &ClientFrame::Detach).await;
-    expect_eof(&mut c, "after Detach").await;
+    expect_eof_after_output(&mut c, &s.id, "after Detach").await;
 
     // Still running, and still *usable* — a second attach that works is a
     // stronger claim than `is_alive()`, which would also be true of a
