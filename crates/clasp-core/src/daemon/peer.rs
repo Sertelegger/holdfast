@@ -2,10 +2,16 @@
 //!
 //! Filesystem permission is the primary control, but it is not the only
 //! one worth having: a `0600` socket inside a `0700` directory can still
-//! be reached by root, by a process that inherited the fd, or by any
-//! local user during the window between `bind` and `chmod`. Reading the
+//! be reached by root, or by a process that inherited the fd. Reading the
 //! peer's uid off the connected socket closes that gap, and costs one
 //! `getsockopt`.
+//!
+//! It is **not** justified by the `bind`→`chmod` window, and an earlier
+//! draft of this comment claimed it was. `server.rs::bind_control` has
+//! the right account: the enclosing `0700` directory closes that window
+//! outright, because another user cannot traverse the parent to reach
+//! the socket even while it is briefly `0755`. Overstating the case here
+//! only weakened the two reasons above it, which are real.
 
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -163,6 +169,25 @@ mod tests {
             from_server.pid,
             Some(std::process::id() as i32),
             "SO_PEERCRED must report the connecting pid"
+        );
+    }
+
+    #[test]
+    fn peer_cred_on_a_non_socket_is_an_error() {
+        // The `rc != 0` branch, which the short-read branch above it is
+        // honestly recorded as unable to reach. This one *does* have a
+        // seam and needs no fake: `peer_cred` is generic over `AsRawFd`,
+        // so an ordinary file fd yields `ENOTSOCK` from the kernel.
+        //
+        // It is the branch `handle_connection` depends on to fail closed
+        // — `peer_is_authorized(&Err(_), _)` is `false` — so "the error
+        // path is reachable at all" is worth one assertion rather than
+        // none.
+        let f = std::fs::File::open("/dev/null").expect("/dev/null");
+        let err = peer_cred(&f).expect_err("a plain file is not a socket");
+        assert!(
+            !matches!(err.kind(), std::io::ErrorKind::NotFound),
+            "the error must come from getsockopt, not from opening the fd: {err}"
         );
     }
 }

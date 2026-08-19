@@ -40,11 +40,12 @@ impl TestDaemon {
         let listener = server::bind_control(&paths).expect("bind control.sock");
         let daemon = Daemon::new(paths.clone());
         tokio::spawn(server::serve(Arc::clone(&daemon), listener));
-        // Wait until the accept loop has actually been polled. Without
-        // this, `tokio::spawn` only *schedules* `serve`, and a test whose
-        // assertions are synchronous (the fd-table scan below) can run
-        // before the daemon has executed a single line — which would make
-        // it silently blind to anything `serve` does.
+        // The connect probe below proves the socket *file* is bound, and
+        // nothing more. `bind_control` hands back an already-`listen()`ing
+        // `UnixListener`, so the kernel backlog accepts this connection
+        // on the first iteration — before `serve` has been polled once.
+        // The loop never runs twice in this build; it is kept against a
+        // future `TestDaemon` that binds asynchronously.
         let sock = paths.control_sock();
         for _ in 0..200 {
             if UnixStream::connect(&sock).await.is_ok() {
@@ -52,6 +53,14 @@ impl TestDaemon {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        // **This** is the line that waits for the accept loop to be
+        // polled. Until it runs, `tokio::spawn` has only *scheduled*
+        // `serve`, and a test whose assertions are synchronous — the
+        // fd-table scan in `the_daemon_binds_only_the_control_socket` —
+        // can run before the daemon has executed a single line, which
+        // makes it silently blind to anything `serve` does. Do not delete
+        // it as redundant with the loop above: that is the regression,
+        // and it has been observed once already.
         tokio::task::yield_now().await;
         Self { daemon, paths }
     }
@@ -181,6 +190,31 @@ fn sorted_map_keys(value: &CborValue) -> Vec<String> {
     keys
 }
 
+/// Assert the daemon closed this connection, within a deadline.
+///
+/// **A bare `frame::read_frame(&mut stream).await` cannot express this
+/// property.** If the daemon wrongly keeps the connection open the read
+/// never returns; libtest has no per-test timeout and this tree carries
+/// no `.config/nextest.toml`, so the mutation that ought to redden the
+/// test wedges the whole binary instead — a hung CI job, which reads as
+/// an infrastructure problem rather than as the finding it is.
+///
+/// `Err(Elapsed)` is deliberately **not** accepted as success. Elapsing
+/// *is* the failure here: it means the connection was still open. The
+/// only passing shape is `Ok(Err(_))` — the read completed, and what it
+/// found was EOF or a broken pipe.
+async fn assert_daemon_closed(stream: &mut UnixStream, what: &str) {
+    let after = tokio::time::timeout(
+        Duration::from_secs(5),
+        frame::read_frame::<_, Response>(stream),
+    )
+    .await;
+    assert!(
+        matches!(after, Ok(Err(_))),
+        "{what}: the daemon must close the connection, got {after:?}"
+    );
+}
+
 /// Poll a session's output through `tool/read_output` until `needle`
 /// appears. Returns everything read.
 async fn read_until(client: &ControlClient, session: &str, needle: &str) -> String {
@@ -261,9 +295,12 @@ async fn the_daemon_binds_only_the_control_socket() {
         // opened in `server::run`, which only the real binary calls — and
         // it can only see listeners that are already bound when it runs.
         // `the_running_daemon_holds_no_listening_tcp_socket` in
-        // `crates/clasp/tests/daemon_cli.rs` is the authoritative check:
-        // it reads the fd table of a real, separately-spawned daemon
-        // process and covers every path in it.
+        // `crates/clasp/tests/daemon_cli.rs` will be the authoritative
+        // check — it reads the fd table of a real, separately-spawned
+        // daemon process and covers every path in it — but that file
+        // arrives with Task 14 and is **not in the tree yet**. Until it
+        // does, this test is the only cross-check there is, and its
+        // stated scope is the whole of what is proven.
         let mut our_inodes = std::collections::HashSet::new();
         for entry in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
             if let Ok(target) = std::fs::read_link(entry.path()) {
@@ -302,10 +339,14 @@ async fn handshake_is_required_before_any_other_method() {
     assert!(!e.retriable);
 
     // §7.4.1: the connection is closed, not merely faulted.
-    let after: Result<Response, _> = frame::read_frame(&mut stream).await;
-    assert!(after.is_err(), "the daemon must close the connection");
+    assert_daemon_closed(&mut stream, "a method before the handshake").await;
 
-    // And the method genuinely did not run: no status was returned.
+    // Documentation, not an independent guard — the same annotation
+    // `paths.rs` puts on its twin. `.expect("must be an error response")`
+    // above has already proven `resp.data` is a `ControlError` map, and a
+    // `ControlError` cannot deserialise as a `DaemonStatus`, so nothing
+    // that reaches this line can fail it. It is kept because it states
+    // the consequence the two assertions above only imply.
     assert!(resp.data_as::<DaemonStatus>().is_err());
 }
 
@@ -345,8 +386,15 @@ async fn a_client_with_a_newer_major_is_refused_and_cannot_proceed() {
     );
 }
 
+/// §20.8's older-major arm, over a real socket.
+///
+/// Named `..._over_the_socket_too` rather than sharing
+/// `handshake.rs`'s `an_older_major_is_refused_too`: two tests with one
+/// name means `cargo test an_older_major_is_refused_too` runs both, and
+/// a reader tracing REQ-D-003a to its integration arm can land on the
+/// unit test and conclude the arm exists while looking at the wrong one.
 #[tokio::test]
-async fn an_older_major_is_refused_too() {
+async fn an_older_major_is_refused_over_the_socket_too() {
     let d = TestDaemon::start("tooold").await;
     let mut stream = d.raw().await;
 
@@ -582,6 +630,21 @@ async fn an_unknown_method_is_an_error_that_keeps_the_connection_open() {
     let e = resp.control_error().expect("error response");
     assert_eq!(e.code, ErrorCode::UnknownMethod.as_str());
 
+    // §7.4.1's "Common error response shape", as a raw map. This is the
+    // payload *every* failure path on the wire carries, and seven tests
+    // in this file read it — all of them through `control_error()`,
+    // which deserialises with the same derived impl the daemon
+    // serialised with. A `#[serde(rename_all)]` on `ControlError` would
+    // round-trip green through every one of them and fail only against a
+    // peer built from §7.4.1. The three `..._on_the_wire` tests pin
+    // `HandshakeParams`, `HandshakeData`, `DaemonStatus` and
+    // `StopOutcome`; this is the payload they left out.
+    assert_eq!(
+        sorted_map_keys(&resp.data),
+        ["code", "message", "retriable"],
+        "§7.4.1's common error response shape"
+    );
+
     // Same connection, real method: `unknown_method` is per-request.
     let status: DaemonStatus = client
         .call(method::METHOD_DAEMON_STATUS, &json!({}))
@@ -665,11 +728,12 @@ async fn daemon_stop_data_names_its_timestamp_with_its_unit_on_the_wire() {
     // REQ-T-018 binds the control protocol directly since rev. 47: every
     // timestamp on a CLASP-defined wire surface is an integer since the
     // epoch under a name that states its unit, and a bare `stopped_at`
-    // is prohibited outright rather than merely unused. §7.4.1's own
-    // table still shows the pre-rev-38 `stopped_at`, so this is the
-    // assertion that stops a future reader "fixing" the field back —
-    // and a typed `StopOutcome` round-trip could not: both ends would
-    // agree on whatever the name became.
+    // is prohibited outright rather than merely unused. §7.4.1's table
+    // showed the pre-rev-38 bare `stopped_at` until rev. 48 brought it
+    // into line — the code was right and the table was late — so this is
+    // the assertion that stops a future reader "fixing" the field back.
+    // A typed `StopOutcome` round-trip could not: both ends would agree
+    // on whatever the name became.
     let d = TestDaemon::start("stopkeys").await;
     let client = d.client().await.unwrap();
     let resp = client
@@ -685,6 +749,67 @@ async fn daemon_stop_data_names_its_timestamp_with_its_unit_on_the_wire() {
         ["sessions_terminated", "stopped_at_unix_secs"],
         "§7.4.1's `daemon/stop` fields, under REQ-T-018's naming rule"
     );
+}
+
+#[tokio::test]
+async fn daemon_stop_params_are_parsed_under_their_7_4_1_names() {
+    // The test above decodes the *response* raw but sends
+    // `method::to_cbor(&StopParams::default())` — the derived impl on
+    // both ends — so `StopParams` had no wire pin anywhere in the tree.
+    //
+    // A hand-built map of the right shape would not be one either: serde
+    // ignores unknown keys, so under a rename the daemon would accept
+    // `{ force: true }` and answer `ok` exactly as before. Nor can
+    // `deny_unknown_fields` supply it: §7.4.1 makes minor versions
+    // additive, and an older daemon must tolerate a newer client's extra
+    // params. What a rename **cannot** survive is a correctly named
+    // field carrying an ill-typed value — under §7.4.1's names `force: 7`
+    // cannot parse as `Option<bool>` and must come back `bad_params`;
+    // rename the field and `force` is merely an unknown key, dropped in
+    // silence, and the daemon answers `ok` and stops.
+    //
+    // This also pins the parse itself. Until this milestone's fix batch
+    // the arm read `req.params_as().unwrap_or_default()`, which made
+    // `daemon/stop` the one method that answered `ok` to structurally
+    // garbage params — and stopped the daemon on the way.
+    let d = TestDaemon::start("stopparams").await;
+    let client = d.client().await.unwrap();
+
+    for (field, ill_typed) in [("force", json!(7)), ("timeout_secs", json!("soon"))] {
+        let mut map = serde_json::Map::new();
+        map.insert(field.to_string(), ill_typed);
+        let params = method::to_cbor(&Value::Object(map)).unwrap();
+        let resp = client
+            .call_raw(method::METHOD_DAEMON_STOP, params)
+            .await
+            .unwrap();
+        let e = resp.control_error().unwrap_or_else(|| {
+            panic!(
+                "`{field}` carrying the wrong type must be refused: got status {:?}, {}",
+                resp.status, resp.details
+            )
+        });
+        assert_eq!(e.code, ErrorCode::BadParams.as_str(), "{}", e.message);
+    }
+
+    // The refusal is per-request. Were it not, each arm above would have
+    // been the last thing this connection ever did, and the second would
+    // have been measuring a dead daemon.
+    let status: DaemonStatus = client
+        .call(method::METHOD_DAEMON_STATUS, &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(status.pid, std::process::id());
+
+    // The control: the same two names, well typed, are accepted. Without
+    // it the test would also pass against a daemon that answered
+    // `bad_params` to every `daemon/stop` there is.
+    let params = method::to_cbor(&json!({ "force": true, "timeout_secs": 5 })).unwrap();
+    let resp = client
+        .call_raw(method::METHOD_DAEMON_STOP, params)
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "ok", "{}", resp.details);
 }
 
 #[tokio::test]
@@ -813,7 +938,20 @@ async fn write_deadline_body() {
     let params =
         method::to_cbor(&json!({ "session": id, "data": payload, "append_newline": false }))
             .unwrap();
-    let resp = client.call_raw("tool/send_input", params).await.unwrap();
+    // Bounded, and generously: `SEND_INPUT_TIMEOUT` is 5 s, so 30 s is
+    // slack rather than a race. The *arrival* of this response is the
+    // property under test — remove `send_input`'s write deadline and no
+    // response ever comes — so an unbounded `await` here turns the
+    // mutation into a hung binary instead of a red test.
+    // `rt.shutdown_timeout` in the caller does not help: it runs after
+    // `rt.block_on` returns, and `block_on` is what would never return.
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.call_raw("tool/send_input", params),
+    )
+    .await
+    .expect("send_input must answer: its write deadline is the property under test")
+    .unwrap();
 
     assert_eq!(
         resp.status, "timeout",
@@ -880,6 +1018,34 @@ async fn an_oversized_send_input_is_a_protocol_error_across_the_wire() {
     let e = resp.control_error().expect("error response");
     assert_eq!(e.code, ErrorCode::BadParams.as_str());
 
+    // The other side of the boundary, on the same session. Rejecting
+    // 65537 alone is also passed by a cap of zero; the *pair* is what
+    // separates `data.len() > MAX_SEND_INPUT_BYTES` from `>=`.
+    //
+    // That `>=` mutant is killed today only by accident:
+    // `write_deadline_body` happens to send exactly 64 KiB, and the plan
+    // itself calls that payload's size "incidental to what that test is
+    // about". Change it to 1 KiB in some future edit — a change nothing
+    // would flag — and the documented cap goes unguarded.
+    //
+    // `append_newline: false`, or the appended byte would push a legal
+    // payload one over. A draining `bash`, not the wedged fixture: the
+    // claim is that 65536 is accepted *by the schema*, and a wedged
+    // child would answer `timeout` — not `bad_params` either, but for a
+    // reason that has nothing to do with the cap.
+    let at_cap = "x".repeat(64 * 1024);
+    let params =
+        method::to_cbor(&json!({ "session": id, "data": at_cap, "append_newline": false }))
+            .unwrap();
+    let resp = client.call_raw("tool/send_input", params).await.unwrap();
+    assert!(
+        resp.control_error().is_none(),
+        "exactly {} bytes is the documented maximum and must be accepted, \
+         not refused: {}",
+        64 * 1024,
+        resp.details
+    );
+
     let params = method::to_cbor(&json!({ "session": id, "force": true })).unwrap();
     let _ = client.call_raw("tool/terminate", params).await;
 }
@@ -919,9 +1085,14 @@ async fn a_second_handshake_on_the_same_connection_is_a_protocol_violation() {
         second.control_error().unwrap().code,
         ErrorCode::ProtocolViolation.as_str()
     );
-    // `protocol_violation` closes the connection (§18.3).
-    let after: Result<Response, _> = frame::read_frame(&mut stream).await;
-    assert!(after.is_err());
+    // `protocol_violation` closes the connection (§18.3). Bounded: drop
+    // `ProtocolViolation` from `ErrorCode::closes_connection`'s
+    // `matches!` and the daemon returns to its read loop, so an
+    // unbounded read here would block forever. `method.rs`'s
+    // `exactly_three_codes_close_the_connection` goes red under the same
+    // mutation, but it lives in the lib test binary — this one would
+    // still wedge.
+    assert_daemon_closed(&mut stream, "a second handshake").await;
 }
 
 #[tokio::test]

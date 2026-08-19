@@ -164,6 +164,23 @@ mod tests {
     }
 
     #[test]
+    fn the_reject_reason_tokens_are_the_18_3a_spellings() {
+        // Every other assertion in the tree — here, in `client.rs`, and
+        // in `control_protocol.rs` — compares a `reject_reason` against
+        // these *constants*, and the daemon builds the reason from the
+        // same constants. A typo in either `const` therefore round-trips
+        // green through the whole suite and fails only against a peer
+        // built from §18.3a. The **literals** are the pinning: replacing
+        // them with the constants deletes the test while leaving it
+        // green. Same argument, verbatim, as
+        // `method_names_are_the_7_4_1_catalogue_strings` and
+        // `client_kind_wire_strings_match_the_spec` below — this is the
+        // one §18.3a surface the pattern had missed.
+        assert_eq!(REJECT_CLIENT_TOO_NEW, "client_protocol_too_new");
+        assert_eq!(REJECT_CLIENT_TOO_OLD, "client_protocol_too_old");
+    }
+
+    #[test]
     fn client_kind_wire_strings_match_the_spec() {
         for (kind, wire) in [
             (ClientKind::Shim, "\"shim\""),
