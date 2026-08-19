@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn the_injection_command_produces_no_entry_when_a_foreign_emitter_marks_it() {
         let snippet =
-            "if [ -z \"${CLASP_SHELL_INTEGRATION-}\" ]; then CLASP_SHELL_INTEGRATION=1; fi";
+            "if [ -z \"${HOLDFAST_SHELL_INTEGRATION-}\" ]; then HOLDFAST_SHELL_INTEGRATION=1; fi";
         let mut sc = ModeScanner::new();
         let mut h = CommandHistory::new(100);
         h.set_injection_line(snippet.to_string());
@@ -646,8 +646,8 @@ mod tests {
     /// snippet happens to be short enough to fit.
     #[test]
     fn the_injection_line_is_matched_as_a_suffix_and_not_as_an_equality() {
-        let snippet = "if [ -z \"${CLASP_SHELL_INTEGRATION-}\" ]; then \
-                       CLASP_SHELL_INTEGRATION=1; PS0='mark'; PS1='mark'; fi";
+        let snippet = "if [ -z \"${HOLDFAST_SHELL_INTEGRATION-}\" ]; then \
+                       HOLDFAST_SHELL_INTEGRATION=1; PS0='mark'; PS1='mark'; fi";
         // What an 80-column terminal leaves of it: the tail, with the front
         // of the line overwritten by the line editor's wrap redraw.
         let captured = "PS0='mark'; PS1='mark'; fi";
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn the_injection_command_produces_no_entry_when_the_foreign_emitter_supplies_no_b() {
         let snippet =
-            "if not set -q CLASP_SHELL_INTEGRATION; set -g CLASP_SHELL_INTEGRATION 1; end";
+            "if not set -q HOLDFAST_SHELL_INTEGRATION; set -g HOLDFAST_SHELL_INTEGRATION 1; end";
         let mut sc = ModeScanner::new();
         let mut h = CommandHistory::new(100);
         h.set_injection_line(snippet.to_string());

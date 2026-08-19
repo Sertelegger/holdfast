@@ -113,8 +113,8 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 /// variables between the elements of an *array* `PROMPT_COMMAND`, so a
 /// user whose hooks live at indices ≥ 1 is unaffected in both.
 const BASH_INTEGRATION: &str = concat!(
-    r#"if [ -z "${CLASP_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
-    r#"CLASP_SHELL_INTEGRATION=1; "#,
+    r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
+    r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"PS0='\e]133;C;holdfast=1\a'"${PS0-}"; "#,
     r#"PS1='\[\e]133;A;holdfast=1\a\]'"${PS1-}"'\[\e]133;B;holdfast=1\a\]'; "#,
     r#"__holdfast_d() { printf '\033]133;D;%s;holdfast=1\007' "${1:-0}"; return "${1:-0}"; }; "#,
@@ -156,8 +156,8 @@ const BASH_INTEGRATION: &str = concat!(
 /// arrangement in which the `return` would matter is not reachable from
 /// inside a session at all.
 const ZSH_INTEGRATION: &str = concat!(
-    r#"if [ -z "${CLASP_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
-    r#"CLASP_SHELL_INTEGRATION=1; "#,
+    r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
+    r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_preexec() { printf '\033]133;C;holdfast=1\007' }; "#,
     r#"__holdfast_precmd() { local s=$?; printf '\033]133;D;%s;holdfast=1\007' "$s"; return $s }; "#,
     "PS1=$'%{\\e]133;A;holdfast=1\\a%}'\"${PS1-}\"$'%{\\e]133;B;holdfast=1\\a%}'; ",
@@ -208,7 +208,7 @@ const ZSH_INTEGRATION: &str = concat!(
 /// copy exits 0, the copy exists, and the wrapped prompt renders the real
 /// prompt between the markers.
 ///
-/// The separate `set -q CLASP_SHELL_INTEGRATION` self-guard against a
+/// The separate `set -q HOLDFAST_SHELL_INTEGRATION` self-guard against a
 /// **second CLASP injection** is a different guard against a different
 /// thing (REQ-PD-005) and is untouched.
 ///
@@ -227,8 +227,8 @@ const ZSH_INTEGRATION: &str = concat!(
 /// measured repair (capture `$status` first, re-assert it immediately
 /// before the call) is not applied by this milestone.
 const FISH_INTEGRATION: &str = concat!(
-    r#"if not set -q CLASP_SHELL_INTEGRATION; "#,
-    r#"set -g CLASP_SHELL_INTEGRATION 1; "#,
+    r#"if not set -q HOLDFAST_SHELL_INTEGRATION; "#,
+    r#"set -g HOLDFAST_SHELL_INTEGRATION 1; "#,
     r#"functions -q __holdfast_orig_fish_prompt; "#,
     r#"or functions -c fish_prompt __holdfast_orig_fish_prompt; "#,
     r#"function fish_prompt; printf '\033]133;A;holdfast=1\007'; __holdfast_orig_fish_prompt; "#,
@@ -406,7 +406,7 @@ mod tests {
     /// vocabulary alive in the suite, and the next reader repairs the
     /// probe rather than reading the requirement.
     ///
-    /// `CLASP_SHELL_INTEGRATION` is asserted **present** in the same test.
+    /// `HOLDFAST_SHELL_INTEGRATION` is asserted **present** in the same test.
     /// That is REQ-PD-005's double-injection self-guard and it is not what
     /// this removes — without that arm a snippet gutted of both guards
     /// passes.
@@ -419,7 +419,7 @@ mod tests {
             "REQ-PD-028: feature probe: {s}"
         );
         assert!(
-            s.contains("CLASP_SHELL_INTEGRATION"),
+            s.contains("HOLDFAST_SHELL_INTEGRATION"),
             "REQ-PD-005's self-guard was removed too: {s}"
         );
     }
@@ -428,14 +428,14 @@ mod tests {
     fn posix_snippets_guard_against_double_injection() {
         for s in [Shell::Bash, Shell::Zsh] {
             let snippet = s.integration_snippet();
-            assert!(snippet.contains("CLASP_SHELL_INTEGRATION"));
+            assert!(snippet.contains("HOLDFAST_SHELL_INTEGRATION"));
             assert!(
                 snippet.contains(r#"*"133;A"*"#),
                 "{} must no-op when the user already emits markers",
                 s.as_str()
             );
             assert!(
-                !snippet.contains("export CLASP_SHELL_INTEGRATION"),
+                !snippet.contains("export HOLDFAST_SHELL_INTEGRATION"),
                 "{} must not export the guard: a nested shell needs its own",
                 s.as_str()
             );

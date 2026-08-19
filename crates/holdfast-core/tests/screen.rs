@@ -991,13 +991,13 @@ async fn an_exited_session_still_renders_its_final_screen() {
 /// What fish's prompt prints once it is drawn. The marker is what turns
 /// "fish started" into "fish reached its first prompt", which is the only
 /// quantity §4.5.1 measured.
-const FISH_READY: &str = "CLASP_FISH_READY";
+const FISH_READY: &str = "HOLDFAST_FISH_READY";
 
 /// Everything fish is asked to do at startup: silence the greeting and
 /// replace the prompt with the marker. `--no-config` is passed separately,
 /// so no rc file participates.
 const FISH_INIT: &str =
-    "set -g fish_greeting; function fish_prompt; printf 'CLASP_FISH_READY\\n'; end";
+    "set -g fish_greeting; function fish_prompt; printf 'HOLDFAST_FISH_READY\\n'; end";
 
 /// The stall arms wait this long before giving up. The measured stall is
 /// 10.04 s; anything past this is a hang, not a slow shell.

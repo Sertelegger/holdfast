@@ -3,7 +3,7 @@
 //!
 //! Everything here runs against `CARGO_BIN_EXE_holdfast`, so it exercises
 //! the same binary a user installs. Each test owns a private
-//! `CLASP_RUNTIME_DIR`; `TestEnv::drop` stops the daemon and removes it,
+//! `HOLDFAST_RUNTIME_DIR`; `TestEnv::drop` stops the daemon and removes it,
 //! so a failed run cannot wedge the next one.
 //!
 //! ## Nothing in this file may block without a deadline
@@ -73,9 +73,9 @@ impl TestEnv {
 
     fn cmd(&self) -> Command {
         let mut c = Command::new(BIN);
-        c.env("CLASP_RUNTIME_DIR", &self.dir);
+        c.env("HOLDFAST_RUNTIME_DIR", &self.dir);
         // §10.1's discovery is `$XDG_CONFIG_HOME/holdfast/config.toml`, and
-        // `CLASP_RUNTIME_DIR` deliberately does **not** move it
+        // `HOLDFAST_RUNTIME_DIR` deliberately does **not** move it
         // (REQ-CFG-005 is instance selection, not a configuration knob).
         // So a test that did not set this would run the daemon against
         // the *developer's* `~/.config/holdfast/config.toml` — the same
@@ -161,7 +161,7 @@ impl TestEnv {
 
     /// Every `redaction_disabled` entry in this instance's §9.4 audit log.
     ///
-    /// Read from `$CLASP_RUNTIME_DIR/logs/audit.log` rather than from
+    /// Read from `$HOLDFAST_RUNTIME_DIR/logs/audit.log` rather than from
     /// `~/.holdfast/logs`, which is what keeps a test run out of the
     /// developer's real trail — and what makes a count assertion mean
     /// anything at all.
@@ -517,7 +517,7 @@ fn daemon_start_is_idempotent_and_status_reports_the_running_daemon() {
 
 #[test]
 fn an_explicit_runtime_dir_keeps_its_daemon_log_out_of_the_home_directory() {
-    // §7.1: `CLASP_RUNTIME_DIR` relocates the daemon log too, so an
+    // §7.1: `HOLDFAST_RUNTIME_DIR` relocates the daemon log too, so an
     // isolated instance leaves nothing behind in `~`. §19.1's
     // `~/.holdfast/logs/daemon.log` is the *default* instance's path, and a
     // daemon that wrote there unconditionally would have every test run
@@ -542,7 +542,7 @@ fn two_daemons_under_different_runtime_dirs_do_not_see_each_others_sessions() {
     // actually what separates two instances.
     //
     // The failure this kills is a `RuntimePaths::discover` that reads
-    // `CLASP_RUNTIME_DIR` for the socket but not for the registry, or a
+    // `HOLDFAST_RUNTIME_DIR` for the socket but not for the registry, or a
     // process-wide singleton registry behind the daemon. Either one
     // leaks one user's sessions into a second instance's listing, which
     // is REQ-CFG-005's whole subject.
@@ -900,7 +900,7 @@ fn two_shims_racing_to_start_share_one_daemon() {
         };
         if String::from_utf8_lossy(&environ)
             .replace('\0', "\n")
-            .contains(&format!("CLASP_RUNTIME_DIR={}", env.dir.display()))
+            .contains(&format!("HOLDFAST_RUNTIME_DIR={}", env.dir.display()))
         {
             daemons += 1;
         }

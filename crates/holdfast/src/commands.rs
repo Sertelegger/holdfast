@@ -462,7 +462,7 @@ fn escalate_to_sigkill(paths: &RuntimePaths) -> Escalation {
 /// 1. It holds an open fd for a socket bound at *this* runtime
 ///    directory's `control.sock`. This is the instance-specific half:
 ///    a recycled pid does not hold our socket, and neither does a second
-///    clasp daemon running under a different `CLASP_RUNTIME_DIR` — which
+///    clasp daemon running under a different `HOLDFAST_RUNTIME_DIR` — which
 ///    is the recycling case that would otherwise cost a live daemon its
 ///    sessions.
 /// 2. Its argv contains `daemon run`. Corroboration; (1) is the

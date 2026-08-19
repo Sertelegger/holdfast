@@ -133,7 +133,7 @@ strict_confirmation = false
 # §7.1 discovers, and none of them is individually relocatable: a knob
 # that moved one socket out of that directory would put it outside the
 # 0700 verification §7.1 performs on the directory, and would let two
-# daemons under different CLASP_RUNTIME_DIRs share an http.sock while
+# daemons under different HOLDFAST_RUNTIME_DIRs share an http.sock while
 # disagreeing about which instance they are — which is the property
 # REQ-CFG-005's integration test asserts. http_socket_path was the only
 # such knob and is withdrawn; it had no use case §7.1 does not serve.
@@ -197,13 +197,13 @@ record_all_sessions = false
 # measure a window far shorter than the number they set here.
 binding_approval_timeout_secs = 120
 # No log-directory knob. The three log paths are §19.1's, and the one thing
-# that relocates any of them is CLASP_RUNTIME_DIR, which moves daemon.log
-# to $CLASP_RUNTIME_DIR/logs/ and is instance selection rather than a knob
+# that relocates any of them is HOLDFAST_RUNTIME_DIR, which moves daemon.log
+# to $HOLDFAST_RUNTIME_DIR/logs/ and is instance selection rather than a knob
 # (§7.1, REQ-CFG-005). log_dir stood here with nothing reading it: §19.1,
 # §9.4, §7.1 and §7.3 each state the path outright, and §10.1's own list of
 # what this file configures says "daemon retention", not daemon paths. A
 # second spelling of the location leaves REQ-CFG-005's own rule -- which
-# names the daemon log among the things CLASP_RUNTIME_DIR relocates -- with
+# names the daemon log among the things HOLDFAST_RUNTIME_DIR relocates -- with
 # no answer when both are set, and gives audit.log a location no section
 # states. It was the last path knob after http_socket_path and is
 # withdrawn on the same rubric. The two retention knobs below stay: they

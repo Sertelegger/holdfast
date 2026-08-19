@@ -204,7 +204,7 @@ mod tests {
 
     /// Set on the child in
     /// `nothing_reaches_daemon_log_unredacted_not_even_a_panic`.
-    const CHILD_ENV: &str = "CLASP_TEST_DAEMON_LOG_CHILD";
+    const CHILD_ENV: &str = "HOLDFAST_TEST_DAEMON_LOG_CHILD";
 
     #[test]
     fn a_credential_in_a_diagnostic_does_not_survive_rendering() {

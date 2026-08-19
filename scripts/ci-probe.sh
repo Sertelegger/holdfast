@@ -10,7 +10,7 @@
 #      requirement that is not a presence claim — a CPython >= 3.13, whose
 #      REPL drives bracketed paste — is met by something on PATH.
 #
-# (3) is what CLASP_REQUIRE_ALL_SHELLS=1 would cover from inside the suite,
+# (3) is what HOLDFAST_REQUIRE_ALL_SHELLS=1 would cover from inside the suite,
 # by turning every `have()` skip into a panic. **That variable is not set**
 # — ci.yml says why, above the `test` job, and it is a measurement about
 # fish rather than an oversight. Until it can be, this probe is the

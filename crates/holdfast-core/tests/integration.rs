@@ -63,11 +63,11 @@ fn spawns_a_shell_and_reads_output() {
     assert!(pty.is_alive());
     assert!(pty.pid().is_some());
 
-    // `CLASP''_MARKER` echoes as `CLASP''_MARKER` but prints CLASP_MARKER,
+    // `HOLDFAST''_MARKER` echoes as `HOLDFAST''_MARKER` but prints HOLDFAST_MARKER,
     // so the needle can only match real command output.
-    pty.write(b"echo CLASP''_MARKER\n").unwrap();
-    let out = read_until(&pty, "CLASP_MARKER", Duration::from_secs(5));
-    assert!(out.contains("CLASP_MARKER"), "got: {out:?}");
+    pty.write(b"echo HOLDFAST''_MARKER\n").unwrap();
+    let out = read_until(&pty, "HOLDFAST_MARKER", Duration::from_secs(5));
+    assert!(out.contains("HOLDFAST_MARKER"), "got: {out:?}");
 
     pty.signal(Signal::Kill).unwrap();
 }
@@ -357,7 +357,10 @@ async fn start_session_runs_in_the_requested_cwd_and_passes_env() {
     let mut env = std::collections::HashMap::new();
     // The value never appears in the command line the test types, so the
     // PTY's echo cannot satisfy either assertion below.
-    env.insert("CLASP_PROBE".to_string(), "env-plumbing-works".to_string());
+    env.insert(
+        "HOLDFAST_PROBE".to_string(),
+        "env-plumbing-works".to_string(),
+    );
 
     let r = server
         .start_session(Parameters(StartSessionArgs {
@@ -373,7 +376,9 @@ async fn start_session_runs_in_the_requested_cwd_and_passes_env() {
     let id = body(&r)["data"]["session_id"].as_str().unwrap().to_string();
 
     let session = server.registry.get(&id).unwrap();
-    session.write_input(b"pwd; printenv CLASP_PROBE\n").unwrap();
+    session
+        .write_input(b"pwd; printenv HOLDFAST_PROBE\n")
+        .unwrap();
     let out = wait_for_buffer(&session, "env-plumbing-works");
 
     assert!(
@@ -2231,17 +2236,17 @@ fn read_until_processed(
 fn a_secret_a_real_shell_printed_is_redacted_in_place() {
     let session = shell_session();
     let processor = OutputProcessor::builtin().unwrap();
-    // The `''` splits the marker so the echo reads `CLASP''_TOKEN=`, and
+    // The `''` splits the marker so the echo reads `HOLDFAST''_TOKEN=`, and
     // the two printf arguments keep `ghp_` and its 36 characters apart on
     // the command line. Only executing this can produce either needle.
     session
-        .write_input(format!("printf 'CLASP''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
+        .write_input(format!("printf 'HOLDFAST''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
         .unwrap();
 
     let read = read_until_processed(
         &session,
         &processor,
-        "CLASP_TOKEN=",
+        "HOLDFAST_TOKEN=",
         Duration::from_secs(10),
     );
 
@@ -2254,7 +2259,7 @@ fn a_secret_a_real_shell_printed_is_redacted_in_place() {
     // The absence check above would also pass against a read that
     // returned nothing, so require the redacted line itself.
     assert!(
-        read.output.contains("CLASP_TOKEN=[REDACTED:github]"),
+        read.output.contains("HOLDFAST_TOKEN=[REDACTED:github]"),
         "expected the line to survive with a marker; got: {:?}",
         read.output
     );
@@ -2269,19 +2274,24 @@ fn ansi_from_a_real_shell_is_stripped_but_the_text_survives() {
     let session = shell_session();
     let processor = OutputProcessor::builtin().unwrap();
     session
-        .write_input(b"printf '\\033[32mCLASP''_GREEN\\033[0m\\n'\n")
+        .write_input(b"printf '\\033[32mHOLDFAST''_GREEN\\033[0m\\n'\n")
         .unwrap();
 
-    let read = read_until_processed(&session, &processor, "CLASP_GREEN", Duration::from_secs(10));
+    let read = read_until_processed(
+        &session,
+        &processor,
+        "HOLDFAST_GREEN",
+        Duration::from_secs(10),
+    );
     assert!(
         !read.output.contains('\u{1b}'),
         "an escape byte reached the agent: {:?}",
         read.output
     );
-    // `CLASP_GREEN` is only producible by running the command — the echo
-    // shows `CLASP''_GREEN` — so this pair means stripping ran over real
+    // `HOLDFAST_GREEN` is only producible by running the command — the echo
+    // shows `HOLDFAST''_GREEN` — so this pair means stripping ran over real
     // escape bytes rather than over an empty buffer.
-    assert!(read.output.contains("CLASP_GREEN"));
+    assert!(read.output.contains("HOLDFAST_GREEN"));
 
     let _ = session.signal(Signal::Kill);
 }
@@ -2293,9 +2303,14 @@ fn base64_without_redaction_returns_the_exact_pty_bytes() {
     let session = shell_session();
     let processor = OutputProcessor::builtin().unwrap();
     session
-        .write_input(b"printf '\\033[32mCLASP''_GREEN\\033[0m\\n'\n")
+        .write_input(b"printf '\\033[32mHOLDFAST''_GREEN\\033[0m\\n'\n")
         .unwrap();
-    read_until_processed(&session, &processor, "CLASP_GREEN", Duration::from_secs(10));
+    read_until_processed(
+        &session,
+        &processor,
+        "HOLDFAST_GREEN",
+        Duration::from_secs(10),
+    );
 
     let read = session.read_processed(
         &ReadRequest {
@@ -2324,7 +2339,7 @@ fn base64_without_redaction_returns_the_exact_pty_bytes() {
         "raw mode must preserve the escape bytes the shell emitted"
     );
     assert!(
-        String::from_utf8_lossy(&decoded).contains("CLASP_GREEN"),
+        String::from_utf8_lossy(&decoded).contains("HOLDFAST_GREEN"),
         "and the text the child printed"
     );
 
@@ -2341,12 +2356,12 @@ fn a_raw_read_of_a_real_session_is_recorded_in_the_audit_log() {
 
     let session = shell_session();
     session
-        .write_input(format!("printf 'CLASP''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
+        .write_input(format!("printf 'HOLDFAST''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
         .unwrap();
     read_until_processed(
         &session,
         &processor,
-        "CLASP_TOKEN=",
+        "HOLDFAST_TOKEN=",
         Duration::from_secs(10),
     );
 
@@ -2439,7 +2454,7 @@ async fn read_output_redacts_by_default_and_reports_the_new_flags() {
     let id = started_session(&server).await;
     let session = server.registry.get(&id).unwrap();
     session
-        .write_input(format!("printf 'CLASP''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
+        .write_input(format!("printf 'HOLDFAST''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2451,13 +2466,13 @@ async fn read_output_redacts_by_default_and_reports_the_new_flags() {
             .unwrap();
         let data = body(&r)["data"].clone();
         let out = data["output"].as_str().unwrap().to_string();
-        if out.contains("CLASP_TOKEN=") {
+        if out.contains("HOLDFAST_TOKEN=") {
             assert!(
                 !out.contains(&full_token),
                 "the tool leaked the token: {out}"
             );
             assert!(
-                out.contains("CLASP_TOKEN=[REDACTED:github]"),
+                out.contains("HOLDFAST_TOKEN=[REDACTED:github]"),
                 "expected the surrounding line intact: {out}"
             );
             assert_eq!(data["held_back"], false);
@@ -2601,7 +2616,7 @@ async fn the_per_response_and_per_session_redaction_counts_are_different_numbers
     );
 
     session
-        .write_input(format!("printf 'CLASP''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
+        .write_input(format!("printf 'HOLDFAST''_TOKEN=%s%s\\n' ghp_ {TOKEN_TAIL}\n").as_bytes())
         .unwrap();
 
     // Poll on the REDACTED form, so the read that breaks the loop is
@@ -2614,7 +2629,7 @@ async fn the_per_response_and_per_session_redaction_counts_are_different_numbers
             .await
             .unwrap();
         let out = body(&r)["data"]["output"].as_str().unwrap().to_string();
-        if out.contains("CLASP_TOKEN=[REDACTED:github]") {
+        if out.contains("HOLDFAST_TOKEN=[REDACTED:github]") {
             break;
         }
         assert!(
@@ -2692,7 +2707,7 @@ async fn the_advertised_enum_values_are_all_accepted() {
     let id = started_session(&server).await;
     let session = server.registry.get(&id).unwrap();
     session
-        .write_input(b"printf '\\033[32mCLASP''_GREEN\\033[0m\\n'\n")
+        .write_input(b"printf '\\033[32mHOLDFAST''_GREEN\\033[0m\\n'\n")
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2704,7 +2719,7 @@ async fn the_advertised_enum_values_are_all_accepted() {
         if body(&r)["data"]["output"]
             .as_str()
             .unwrap()
-            .contains("CLASP_GREEN")
+            .contains("HOLDFAST_GREEN")
         {
             break;
         }
@@ -2737,7 +2752,7 @@ async fn the_advertised_enum_values_are_all_accepted() {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(out.as_bytes())
         .expect("text_encoding=base64 must produce base64");
-    assert!(String::from_utf8_lossy(&decoded).contains("CLASP_GREEN"));
+    assert!(String::from_utf8_lossy(&decoded).contains("HOLDFAST_GREEN"));
 
     let mut lossy = read_args(&id);
     lossy.text_encoding = Some("lossy_printable".into());
@@ -2745,7 +2760,7 @@ async fn the_advertised_enum_values_are_all_accepted() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(out.contains("CLASP_GREEN"));
+    assert!(out.contains("HOLDFAST_GREEN"));
 
     let _ = session.signal(Signal::Kill);
 }
@@ -2970,7 +2985,7 @@ async fn prompt_last_line_is_redacted_on_every_prompt_bearing_tool() {
 
     // Printed WITHOUT a trailing newline, so it stays the last line.
     session
-        .write_input(format!("printf 'CLASP''_LAST=%s%s' ghp_ {TOKEN_TAIL}\n").as_bytes())
+        .write_input(format!("printf 'HOLDFAST''_LAST=%s%s' ghp_ {TOKEN_TAIL}\n").as_bytes())
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2979,7 +2994,7 @@ async fn prompt_last_line_is_redacted_on_every_prompt_bearing_tool() {
             .as_str()
             .unwrap()
             .to_string();
-        if last.contains("CLASP_LAST=") {
+        if last.contains("HOLDFAST_LAST=") {
             break;
         }
         assert!(
@@ -3029,7 +3044,7 @@ async fn prompt_last_line_is_redacted_on_every_prompt_bearing_tool() {
         // Paired: the line itself must still be there, or a tool that
         // reported an empty `last_line` would pass the absence check.
         assert!(
-            line.contains("CLASP_LAST=[REDACTED:github]"),
+            line.contains("HOLDFAST_LAST=[REDACTED:github]"),
             "{tool} lost the line instead of redacting it: {line:?}"
         );
     }
@@ -3589,8 +3604,8 @@ fn send_input_wait_for_sees_the_echo_of_its_own_write() {
     // cursor in the handler instead races the echo, and the echo then
     // disappears from the context the agent is shown.
     //
-    // `CLASP''_ECHOED` can only be produced by the echo — running the
-    // command prints `CLASP_ECHOED` — so the two forms tell the echo and
+    // `HOLDFAST''_ECHOED` can only be produced by the echo — running the
+    // command prints `HOLDFAST_ECHOED` — so the two forms tell the echo and
     // the output apart.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3604,8 +3619,8 @@ fn send_input_wait_for_sees_the_echo_of_its_own_write() {
             &server
                 .send_input(Parameters(SendInputArgs {
                     session: id.clone(),
-                    data: "echo CLASP''_ECHOED".into(),
-                    wait_for: Some("CLASP_ECHOED".into()),
+                    data: "echo HOLDFAST''_ECHOED".into(),
+                    wait_for: Some("HOLDFAST_ECHOED".into()),
                     timeout_secs: Some(10),
                     ..Default::default()
                 }))
@@ -3615,14 +3630,14 @@ fn send_input_wait_for_sees_the_echo_of_its_own_write() {
         assert_eq!(sent["status"], "ok", "{sent}");
         let context = sent["data"]["output_since_start"].as_str().unwrap();
         assert!(
-            context.contains("CLASP''_ECHOED"),
+            context.contains("HOLDFAST''_ECHOED"),
             "the echo of the write is missing from output_since_start: {context:?}"
         );
         assert!(
-            context.contains("CLASP_ECHOED"),
+            context.contains("HOLDFAST_ECHOED"),
             "and the command's own output: {context:?}"
         );
-        assert_eq!(sent["data"]["bytes_written"], json!(20));
+        assert_eq!(sent["data"]["bytes_written"], json!(23));
 
         kill_all(&server).await;
     });

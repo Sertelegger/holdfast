@@ -31,7 +31,7 @@ USAGE:
     clasp version                  Print version information
 
 ENVIRONMENT:
-    CLASP_RUNTIME_DIR              Select a CLASP instance: relocates the
+    HOLDFAST_RUNTIME_DIR              Select a CLASP instance: relocates the
                                    sockets, pid file, lock file and the
                                    daemon log
 
@@ -41,7 +41,7 @@ FILES:
                                    --no-daemon` included. Absent is the
                                    defaults; present and invalid refuses
                                    to start rather than starting on
-                                   them. CLASP_RUNTIME_DIR does not move
+                                   them. HOLDFAST_RUNTIME_DIR does not move
                                    it.
 ";
 

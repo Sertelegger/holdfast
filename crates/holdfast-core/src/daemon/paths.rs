@@ -6,7 +6,7 @@
 //! peer-credential check in `daemon::peer` is the second.
 //!
 //! **Logs are not sockets.** §7.1 relocates `daemon.log` under the
-//! runtime directory only when `CLASP_RUNTIME_DIR` is explicitly set, so
+//! runtime directory only when `HOLDFAST_RUNTIME_DIR` is explicitly set, so
 //! an isolated instance leaves nothing in the user's home. With the
 //! variable unset, §19.1's `~/.holdfast/logs` applies: `$XDG_RUNTIME_DIR` is
 //! tmpfs on most Linux systems and is cleared at logout, which cannot
@@ -212,7 +212,7 @@ fn retire(dir: &Path, prefix: &str, window: Duration, now: SystemTime) -> io::Re
 
 /// Selects a CLASP *instance* (§7.1). Overrides discovery entirely and
 /// relocates the sockets, the pid file, the lock file and the daemon log.
-pub const RUNTIME_DIR_ENV: &str = "CLASP_RUNTIME_DIR";
+pub const RUNTIME_DIR_ENV: &str = "HOLDFAST_RUNTIME_DIR";
 
 /// Mode for the runtime and log directories: owner-only.
 pub const DIR_MODE: u32 = 0o700;
@@ -318,7 +318,7 @@ pub struct RuntimePaths {
 }
 
 impl RuntimePaths {
-    /// An **isolated instance** rooted at `dir` — what `CLASP_RUNTIME_DIR`
+    /// An **isolated instance** rooted at `dir` — what `HOLDFAST_RUNTIME_DIR`
     /// selects, and what every test uses. Per §7.1 the daemon log moves
     /// under it too, so the instance leaves nothing behind in `~`.
     pub fn with_dir(dir: impl Into<PathBuf>) -> Self {
@@ -383,7 +383,7 @@ impl RuntimePaths {
         })
     }
 
-    /// Spec §7.1: `$CLASP_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/holdfast`
+    /// Spec §7.1: `$HOLDFAST_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/holdfast`
     /// (Linux), else `~/Library/Application Support/holdfast` (macOS), else
     /// `~/.holdfast`.
     pub fn discover() -> io::Result<Self> {
@@ -417,7 +417,7 @@ impl RuntimePaths {
     /// it duplicated §7.1, and it could place a socket outside the
     /// directory whose `0700` mode §7.1 verifies — which would make
     /// REQ-CFG-005's own integration test falsifiable from a config
-    /// file. `CLASP_RUNTIME_DIR` relocates all three sockets together as
+    /// file. `HOLDFAST_RUNTIME_DIR` relocates all three sockets together as
     /// an *instance*, which is the only relocation §7.1 sanctions. Task
     /// 15 Step 4 rejects a config that carries the withdrawn key rather
     /// than ignoring it.
@@ -474,7 +474,7 @@ impl RuntimePaths {
     /// environment override, so on the **default** instance this returns
     /// exactly that path — the two agree by construction rather than by
     /// coincidence, because `log_dir` for the default instance *is*
-    /// `~/.holdfast/logs`. On an explicit `CLASP_RUNTIME_DIR` instance the
+    /// `~/.holdfast/logs`. On an explicit `HOLDFAST_RUNTIME_DIR` instance the
     /// audit log follows the instance, which §7.1 states only for
     /// `daemon.log`; see the decision recorded in **Decisions taken**.
     /// Without this, every `daemon_cli.rs` test with a private runtime
@@ -654,7 +654,7 @@ fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
         ));
     }
     // Refusing rather than resolving is deliberate: resolving would mean
-    // deciding whose target is acceptable, and `CLASP_RUNTIME_DIR`
+    // deciding whose target is acceptable, and `HOLDFAST_RUNTIME_DIR`
     // already expresses "put this somewhere else" without a link. A
     // residual remains — `set_permissions` below still resolves, so a
     // link swapped in after this check is not caught. Closing that needs
@@ -1314,7 +1314,7 @@ mod tests {
             "nothing may be created inside a directory that was refused"
         );
         // And it names the remedy that actually applies. "Remove it"
-        // deletes the audit trail and `CLASP_RUNTIME_DIR` is instance
+        // deletes the audit trail and `HOLDFAST_RUNTIME_DIR` is instance
         // selection, not a permissions fix; the user owns this directory
         // and can chmod it.
         assert!(
@@ -1388,7 +1388,7 @@ mod tests {
 
     #[test]
     fn an_explicit_instance_takes_its_log_directory_with_it() {
-        // §7.1: `CLASP_RUNTIME_DIR` relocates the daemon log too, so an
+        // §7.1: `HOLDFAST_RUNTIME_DIR` relocates the daemon log too, so an
         // isolated instance leaves nothing in the user's home.
         let p = RuntimePaths::resolve(
             Some("/tmp/holdfast-instance".into()),
@@ -1409,7 +1409,7 @@ mod tests {
         );
         // Both logs, not just the one §7.1 names. `audit::default_path()`
         // has no environment override, so if the audit log did not follow
-        // the instance, every test with a private `CLASP_RUNTIME_DIR`
+        // the instance, every test with a private `HOLDFAST_RUNTIME_DIR`
         // would append to the developer's real `~/.holdfast/logs/audit.log`
         // — which the `daemon_log`-only version of this assertion could
         // not see.

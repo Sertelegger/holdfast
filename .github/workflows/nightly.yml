@@ -56,7 +56,7 @@ jobs:
   flake-hunt:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    # CLASP_REQUIRE_ALL_SHELLS: "1" is STILL not set, and ci.yml's `test`
+    # HOLDFAST_REQUIRE_ALL_SHELLS: "1" is STILL not set, and ci.yml's `test`
     # job carries the measurement that says why: the fish row cannot pass
     # on either fish version obtainable on this image, so the variable
     # would make this job fail on iteration 1, every night, on a defect
@@ -67,7 +67,7 @@ jobs:
     # ci.yml both, or the coverage gate is half-applied.
     #
     # env:
-    #   CLASP_REQUIRE_ALL_SHELLS: "1"
+    #   HOLDFAST_REQUIRE_ALL_SHELLS: "1"
     #
     # ci.yml's skip census is deliberately NOT repeated here: it reads one
     # suite log and the hunt produces twenty, and every push already runs

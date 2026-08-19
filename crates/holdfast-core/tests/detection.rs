@@ -17,8 +17,8 @@
 //!    `interaction_mode`, `detection_tier`, a confidence, an exit code, a
 //!    cursor span, or an ESC-introduced escape sequence — none of which the
 //!    echo of a command line can produce. Where a text marker is
-//!    unavoidable, `echo CLASP''_SPAN` echoes as `CLASP''_SPAN` and *prints*
-//!    `CLASP_SPAN`, and the test searches for the latter.
+//!    unavoidable, `echo HOLDFAST''_SPAN` echoes as `HOLDFAST''_SPAN` and *prints*
+//!    `HOLDFAST_SPAN`, and the test searches for the latter.
 //! 2. *Assert the tier and the confidence, not just the mode.* Five modes
 //!    is low enough cardinality that a mode assertion alone is satisfied by
 //!    several different rungs of the §8.3 ladder firing — measured: a REPL
@@ -203,7 +203,7 @@ const HOST_DEPENDENT_ROWS: &[(&str, &[Need])] = &[
 /// - CPython 3.13 is newer than the system Python of a current LTS —
 ///   `ubuntu-24.04` ships 3.12.3 — so the PyREPL row is genuinely
 ///   unrunnable on mainstream hosts rather than merely inconvenient. It
-///   skips *loudly enough to be fixed*: `CLASP_REQUIRE_ALL_SHELLS=1` turns
+///   skips *loudly enough to be fixed*: `HOLDFAST_REQUIRE_ALL_SHELLS=1` turns
 ///   it into a failure that names the interpreters it scanned.
 ///
 /// Every other need here is met by an ordinary POSIX host.
@@ -217,7 +217,7 @@ const ROWS_THAT_MAY_SKIP: &[&str] = &[
 /// CI's Linux job sets it, so a runner missing `fish` — or `dash`, or
 /// `less`, or a PyREPL-era Python — fails loudly instead of reporting a
 /// green nineteen.
-const REQUIRE_ALL: &str = "CLASP_REQUIRE_ALL_SHELLS";
+const REQUIRE_ALL: &str = "HOLDFAST_REQUIRE_ALL_SHELLS";
 
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
@@ -476,16 +476,16 @@ fn bash_c(command: &str) -> StartSessionArgs {
 fn already_marking_bash() -> StartSessionArgs {
     let env: HashMap<String, String> = [
         ("TERM", "xterm-256color"),
-        ("CLASP_MARK_A", r"\033]133;A\007"),
-        ("CLASP_MARK_B", r"\033]133;B\007"),
-        ("CLASP_MARK_C", r"\033]133;C\007"),
-        ("CLASP_MARK_D", r"\033]133;D;%s\007"),
+        ("HOLDFAST_MARK_A", r"\033]133;A\007"),
+        ("HOLDFAST_MARK_B", r"\033]133;B\007"),
+        ("HOLDFAST_MARK_C", r"\033]133;C\007"),
+        ("HOLDFAST_MARK_D", r"\033]133;D;%s\007"),
         (
             "PS1",
-            r#"$(printf "$CLASP_MARK_A")clasp$ $(printf "$CLASP_MARK_B")"#,
+            r#"$(printf "$HOLDFAST_MARK_A")clasp$ $(printf "$HOLDFAST_MARK_B")"#,
         ),
-        ("PS0", r#"$(printf "$CLASP_MARK_C")"#),
-        ("PROMPT_COMMAND", r#"printf "$CLASP_MARK_D" "$?""#),
+        ("PS0", r#"$(printf "$HOLDFAST_MARK_C")"#),
+        ("PROMPT_COMMAND", r#"printf "$HOLDFAST_MARK_D" "$?""#),
     ]
     .iter()
     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -890,7 +890,7 @@ async fn matrix_row_an_idle_bash_prompt_is_at_prompt_via_terminal_mode() {
 ///    `taskset -c 0` that spelling failed on iteration 7 of 10, reporting
 ///    `terminal_mode` at `quiescent_score: 1.0` with an empty last line.
 /// 3. So the wait is on a **fact only the running child can produce**.
-///    `CLASP_RUNNING ` is printed by the child itself, after the fork and
+///    `HOLDFAST_RUNNING ` is printed by the child itself, after the fork and
 ///    after `tcsetpgrp`, and it stays the last line until the child exits
 ///    — at which point bash's prompt replaces it. All three of "before the
 ///    fork", "after the exit" and "the child never ran" are excluded by
@@ -899,8 +899,8 @@ async fn matrix_row_an_idle_bash_prompt_is_at_prompt_via_terminal_mode() {
 /// The child is an **external** `bash -c`, not a builtin, because the
 /// whole row is about a program that has its own process group; a builtin
 /// keeps the shell's and is §8.7 row 8's arrangement, not this one. And
-/// `printf "CLASP""_RUNNING "` echoes as `CLASP""_RUNNING` and *prints*
-/// `CLASP_RUNNING`, so the line the wait keys on cannot be produced by the
+/// `printf "HOLDFAST""_RUNNING "` echoes as `HOLDFAST""_RUNNING` and *prints*
+/// `HOLDFAST_RUNNING`, so the line the wait keys on cannot be produced by the
 /// PTY echoing the command back (this file's rule 1).
 ///
 /// **The leading `sleep 1` is load-bearing and is here for a product
@@ -959,13 +959,13 @@ async fn matrix_row_a_running_external_command_is_executing_via_the_heuristic() 
     send(
         &server,
         &id,
-        r#"sleep 1; bash --norc --noprofile -c 'printf "CLASP""_RUNNING "; sleep 30'"#,
+        r#"sleep 1; bash --norc --noprofile -c 'printf "HOLDFAST""_RUNNING "; sleep 30'"#,
     )
     .await;
-    let s = await_settled(&server, &id, "CLASP_RUNNING ").await;
+    let s = await_settled(&server, &id, "HOLDFAST_RUNNING ").await;
     assert_classified(&s, "Executing", "heuristic", 0.0);
     // 0.00 is the T3 combiner over this row's own tail, not a fixed T2
-    // zero: `CLASP_RUNNING ` scores nothing on the §8.6 table. Asserted so
+    // zero: `HOLDFAST_RUNNING ` scores nothing on the §8.6 table. Asserted so
     // the confidence cannot be read as the deterministic 0.00 it used to
     // be — the two are the same number reached two different ways, and the
     // tier is what says which.
@@ -1298,7 +1298,7 @@ async fn matrix_row_the_python_repl_is_at_prompt_with_no_repl_specific_config() 
     // `echo_off_prompts_with_and_without_canonical_mode`; what belongs
     // here is the refusal to run on a host where this row's premise does
     // not hold. `Need::PyreplPython` is that refusal, and
-    // `CLASP_REQUIRE_ALL_SHELLS=1` turns it back into a failure so CI
+    // `HOLDFAST_REQUIRE_ALL_SHELLS=1` turns it back into a failure so CI
     // cannot skip quietly.
     let Some(python) = pyrepl_python() else {
         eprintln!("skipping: {}", Need::PyreplPython.unmet());
@@ -2118,7 +2118,7 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     assert!(
         !commands
             .iter()
-            .any(|c| c.contains("CLASP_SHELL_INTEGRATION")),
+            .any(|c| c.contains("HOLDFAST_SHELL_INTEGRATION")),
         "the install line became a history entry: {h}"
     );
 
@@ -2135,8 +2135,8 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
 
 #[tokio::test]
 async fn command_history_cursors_bound_exactly_one_commands_output() {
-    // REQ-DM-001. `echo CLASP''_SPAN` echoes as `CLASP''_SPAN` and prints
-    // `CLASP_SPAN`, so finding the latter inside the recorded span proves
+    // REQ-DM-001. `echo HOLDFAST''_SPAN` echoes as `HOLDFAST''_SPAN` and prints
+    // `HOLDFAST_SPAN`, so finding the latter inside the recorded span proves
     // the span covers real command *output* rather than the echoed command
     // line — and the two neighbours prove it stops at both ends.
     let server = HoldfastServer::new();
@@ -2145,7 +2145,7 @@ async fn command_history_cursors_bound_exactly_one_commands_output() {
 
     for (command, total) in [
         ("echo BEFORE''_SPAN", 7),
-        ("echo CLASP''_SPAN", 11),
+        ("echo HOLDFAST''_SPAN", 11),
         ("echo AFTER''_SPAN", 15),
     ] {
         send(&server, &id, command).await;
@@ -2156,7 +2156,7 @@ async fn command_history_cursors_bound_exactly_one_commands_output() {
     let entries = h["data"]["entries"].as_array().expect("entries");
     assert_eq!(entries.len(), 3, "{h}");
     let target = &entries[1];
-    assert_eq!(target["command"], "echo CLASP''_SPAN");
+    assert_eq!(target["command"], "echo HOLDFAST''_SPAN");
 
     let start_cursor = target["output_start_cursor"].as_u64().expect("start");
     let end_cursor = target["output_end_cursor"].as_u64().expect("finished");
@@ -2173,7 +2173,7 @@ async fn command_history_cursors_bound_exactly_one_commands_output() {
     );
     let out = r["data"]["output"].as_str().expect("output");
     assert!(
-        out.contains("CLASP_SPAN"),
+        out.contains("HOLDFAST_SPAN"),
         "span missed its own output: {out:?}"
     );
     assert!(!out.contains("BEFORE_SPAN"), "span ran backwards: {out:?}");
@@ -2202,9 +2202,9 @@ async fn osc133_markers_survive_shell_nesting() {
 
     // Which process is reading input, before nesting. `$$` is the shell's
     // own pid, and only a shell that *ran* the line can print it.
-    send(&server, &id, "echo CLASP''_PID_A=$$").await;
+    send(&server, &id, "echo HOLDFAST''_PID_A=$$").await;
     await_markers(&server, &id, 7).await;
-    let outer_pid = printed_number(&server, &id, "CLASP_PID_A=").await;
+    let outer_pid = printed_number(&server, &id, "HOLDFAST_PID_A=").await;
 
     // A nested interactive bash. The guard variable is deliberately not
     // exported, so the inner shell is integrable in its own right.
@@ -2232,17 +2232,17 @@ async fn osc133_markers_survive_shell_nesting() {
     // with exit code 7 — every assertion below would pass while nothing
     // had been nested. A different pid is the proof that a *second* shell
     // process is the one reading input.
-    send(&server, &id, "echo CLASP''_PID_B=$$").await;
+    send(&server, &id, "echo HOLDFAST''_PID_B=$$").await;
     await_markers(&server, &id, 15).await;
-    let inner_pid = printed_number(&server, &id, "CLASP_PID_B=").await;
+    let inner_pid = printed_number(&server, &id, "HOLDFAST_PID_B=").await;
     assert_ne!(
         outer_pid, inner_pid,
         "no nested shell was started; everything below would run in the \
          outer shell and prove nothing"
     );
 
-    // Three entries so far — `echo CLASP_PID_A`, the nested `bash`, `echo
-    // CLASP_PID_B` — and the count is read *after* they are all recorded
+    // Three entries so far — `echo HOLDFAST_PID_A`, the nested `bash`, `echo
+    // HOLDFAST_PID_B` — and the count is read *after* they are all recorded
     // rather than while the last one is still on its way, because it is
     // the `since_index` the read below is scoped by.
     await_closed_history(&server, &id, 3).await;
@@ -2269,7 +2269,7 @@ async fn osc133_markers_survive_shell_nesting() {
             "C;holdfast=1",
             "D;0;holdfast=1",
             "A;holdfast=1",
-            "B;holdfast=1", // outer: echo CLASP_PID_A
+            "B;holdfast=1", // outer: echo HOLDFAST_PID_A
             "C;holdfast=1", // outer: `bash --norc --noprofile` starts
             "D;0;holdfast=1",
             "A;holdfast=1",
@@ -2277,7 +2277,7 @@ async fn osc133_markers_survive_shell_nesting() {
             "C;holdfast=1",
             "D;0;holdfast=1",
             "A;holdfast=1",
-            "B;holdfast=1", // inner: echo CLASP_PID_B
+            "B;holdfast=1", // inner: echo HOLDFAST_PID_B
             "C;holdfast=1",
             "D;7;holdfast=1",
             "A;holdfast=1",
@@ -2343,8 +2343,8 @@ async fn osc133_markers_survive_shell_nesting() {
 /// The digits printed immediately after `marker`.
 ///
 /// Callers write the marker with an embedded `''` in the command line
-/// (`echo CLASP''_PID_A=$$`), so the PTY's echo carries `CLASP''_PID_A=`
-/// and only a shell that *executed* the line can produce `CLASP_PID_A=`.
+/// (`echo HOLDFAST''_PID_A=$$`), so the PTY's echo carries `HOLDFAST''_PID_A=`
+/// and only a shell that *executed* the line can produce `HOLDFAST_PID_A=`.
 async fn printed_number(server: &HoldfastServer, id: &str, marker: &str) -> String {
     let out = raw(server, id).await;
     let rest = out
@@ -2404,8 +2404,8 @@ async fn a_single_leaked_dollar_byte_is_indistinguishable_from_a_dash_prompt() {
         (
             // §11.4's plain `\r$ ` — output, not a prompt.
             "a carriage return and a trailing $",
-            r"printf '\rCLASP''_OUTPUT: $ '; sleep 30",
-            "CLASP_OUTPUT: $ ",
+            r"printf '\rHOLDFAST''_OUTPUT: $ '; sleep 30",
+            "HOLDFAST_OUTPUT: $ ",
         ),
         (
             // §11.4's malformed carrier. `\030` is CAN, which abandons the
@@ -2414,8 +2414,8 @@ async fn a_single_leaked_dollar_byte_is_indistinguishable_from_a_dash_prompt() {
             // and its surviving remainder is handed back as text. §8.8:
             // "it does not require the escape to be well-formed".
             "a malformed escape whose surviving remainder ends in $",
-            r"printf 'CLASP''_ESC \033[1;32\030$ '; sleep 30",
-            "CLASP_ESC $ ",
+            r"printf 'HOLDFAST''_ESC \033[1;32\030$ '; sleep 30",
+            "HOLDFAST_ESC $ ",
         ),
     ] {
         let server = HoldfastServer::new();
@@ -2442,7 +2442,7 @@ async fn a_single_leaked_dollar_byte_is_indistinguishable_from_a_dash_prompt() {
         // Half 2 — a running command's output, ending in one `$`. The
         // `sleep 30` keeps the shell busy so `dash` cannot redraw its
         // prompt, which is what makes this sample the forgery rather than
-        // the prompt again; and `CLASP''_OUTPUT` echoes with the quotes and
+        // the prompt again; and `HOLDFAST''_OUTPUT` echoes with the quotes and
         // *prints* without them, so the line cannot come from the PTY
         // echoing the command back.
         send(&server, &id, command).await;

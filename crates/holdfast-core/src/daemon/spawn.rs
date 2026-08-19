@@ -157,7 +157,7 @@ pub fn start_detached(paths: &RuntimePaths, exe: &Path) -> io::Result<StartOutco
     let log = super::paths::open_log_append(&paths.daemon_log())?;
     let log_err = log.try_clone()?;
 
-    // **No `CLASP_RUNTIME_DIR` is set here, and its absence is
+    // **No `HOLDFAST_RUNTIME_DIR` is set here, and its absence is
     // load-bearing.** The child inherits this process's environment, so
     // an explicit instance already crosses; setting it from
     // `paths.dir()` *invents* one where the user chose none. On the
@@ -246,7 +246,7 @@ pub async fn ensure_daemon(
     // diagnostic is the most useful thing a user can be shown when the
     // error below points them at the daemon log.
     //
-    // **No `CLASP_RUNTIME_DIR`**, for the reason `start_detached` states
+    // **No `HOLDFAST_RUNTIME_DIR`**, for the reason `start_detached` states
     // at its own spawn: this is the site that made every Claude Code
     // install's daemon an explicit instance and moved §9.4's trail onto
     // tmpfs. Inheritance carries a genuine one across; nothing needs to
@@ -291,7 +291,7 @@ mod tests {
     }
 
     /// A stand-in for the `clasp` binary that records the one thing the
-    /// two tests below are about — what the child's `CLASP_RUNTIME_DIR`
+    /// two tests below are about — what the child's `HOLDFAST_RUNTIME_DIR`
     /// was — into a file, because one of the two spawn sites nulls the
     /// child's stdout by protocol requirement. It ignores its argv, so
     /// it serves as both `daemon run` and `daemon start`.
@@ -314,7 +314,7 @@ mod tests {
         (probe, seen)
     }
 
-    /// This process's own `CLASP_RUNTIME_DIR` in the probe's notation.
+    /// This process's own `HOLDFAST_RUNTIME_DIR` in the probe's notation.
     ///
     /// Read rather than assumed absent: a developer with the variable
     /// exported would otherwise see a test that fails for a reason that
@@ -328,7 +328,7 @@ mod tests {
     }
 
     /// §7.1 relocates `audit.log` and `daemon.log` under the runtime
-    /// directory **only** when `CLASP_RUNTIME_DIR` is explicitly set.
+    /// directory **only** when `HOLDFAST_RUNTIME_DIR` is explicitly set.
     /// Passing `paths.dir()` to the child set it always, so the child of
     /// a *default* instance saw an explicit one, took the relocation
     /// branch, and wrote both logs to `$XDG_RUNTIME_DIR/holdfast/logs` —
@@ -337,7 +337,7 @@ mod tests {
     ///
     /// The opposite mutation — never letting the child see the variable
     /// — is caught by `daemon_cli.rs`, which reads `/proc/<pid>/environ`
-    /// for `CLASP_RUNTIME_DIR=<its own dir>` and whose every daemon runs
+    /// for `HOLDFAST_RUNTIME_DIR=<its own dir>` and whose every daemon runs
     /// under an explicit instance.
     #[test]
     fn start_detached_does_not_invent_an_explicit_instance_for_its_child() {

@@ -98,19 +98,19 @@ fi
 # the exact milestone that makes hybrid mode the default, leaving the
 # transport most agents actually use smoked by nothing.
 #
-# `mktemp` rather than `/tmp/clasp-smoke-$$`: two runs can collide on a
+# `mktemp` rather than `/tmp/holdfast-smoke-$$`: two runs can collide on a
 # recycled pid, and the second would then adopt the first's daemon --
 # which is the bug this isolation exists to close. Short, under `/tmp`,
 # for the `sun_path` reason: a socket under the workspace `target/`
 # overruns the ~100-byte budget.
-export CLASP_RUNTIME_DIR="$(mktemp -d /tmp/clasp-smoke-XXXXXX)"
+export HOLDFAST_RUNTIME_DIR="$(mktemp -d /tmp/holdfast-smoke-XXXXXX)"
 # EXACTLY ONE `EXIT` trap, and it must stay that way: bash keeps one, so
 # a second `trap ... EXIT` anywhere in this file replaces this one
 # silently and leaks both the daemon and the directory. Installed after
 # `BIN` resolves and before the transcript runs, so a failed check still
 # tears down. `daemon stop` with no daemon exits 0 by §3.2, so the trap
 # is idempotent and its status is ignored.
-trap '"$BIN" daemon stop >/dev/null 2>&1; rm -rf "$CLASP_RUNTIME_DIR"' EXIT
+trap '"$BIN" daemon stop >/dev/null 2>&1; rm -rf "$HOLDFAST_RUNTIME_DIR"' EXIT
 
 req() { printf '%s\n' "$1"; }
 

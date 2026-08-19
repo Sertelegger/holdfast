@@ -1564,10 +1564,10 @@ mod tests {
     mod osc133_collision {
         use super::*;
 
-        const CLASP_A: &[u8] = b"\x1b]133;A;holdfast=1\x07";
-        const CLASP_B: &[u8] = b"\x1b]133;B;holdfast=1\x07";
-        const CLASP_C: &[u8] = b"\x1b]133;C;holdfast=1\x07";
-        const CLASP_D42: &[u8] = b"\x1b]133;D;42;holdfast=1\x07";
+        const HOLDFAST_A: &[u8] = b"\x1b]133;A;holdfast=1\x07";
+        const HOLDFAST_B: &[u8] = b"\x1b]133;B;holdfast=1\x07";
+        const HOLDFAST_C: &[u8] = b"\x1b]133;C;holdfast=1\x07";
+        const HOLDFAST_D42: &[u8] = b"\x1b]133;D;42;holdfast=1\x07";
         // Foreign markers in the shapes measured on fish 4.8.1 —
         // parameterised and ST-terminated, which also exercises the
         // parser's tolerance of both terminators.
@@ -1585,10 +1585,10 @@ mod tests {
             let mut s = ModeScanner::new();
             assert_eq!(s.feed(FISH_A, 0, None).len(), 1);
             assert!(
-                s.feed(CLASP_A, 0, None).is_empty(),
+                s.feed(HOLDFAST_A, 0, None).is_empty(),
                 "CLASP's A must be discarded"
             );
-            let ev = s.feed(CLASP_C, 0, None);
+            let ev = s.feed(HOLDFAST_C, 0, None);
             assert_eq!(ev.len(), 1, "CLASP's C must survive: A went foreign, not C");
             assert_eq!(s.osc133_source(), Some(Osc133Source::Mixed));
         }
@@ -1598,7 +1598,7 @@ mod tests {
             let mut s = ModeScanner::new();
             assert_eq!(s.feed(FOREIGN_C_SPOOF, 0, None).len(), 1);
             assert!(
-                s.feed(CLASP_C, 0, None).is_empty(),
+                s.feed(HOLDFAST_C, 0, None).is_empty(),
                 "the tag must be matched as a field, not as a substring"
             );
         }
@@ -1620,7 +1620,7 @@ mod tests {
             for m in [FISH_A, FISH_B, FISH_C, FISH_D0] {
                 assert_eq!(s.feed(m, 0, None).len(), 1);
             }
-            for m in [CLASP_C, CLASP_D42, CLASP_A, CLASP_B] {
+            for m in [HOLDFAST_C, HOLDFAST_D42, HOLDFAST_A, HOLDFAST_B] {
                 assert!(
                     s.feed(m, 0, None).is_empty(),
                     "CLASP's marker must be discarded"
@@ -1641,7 +1641,7 @@ mod tests {
         #[test]
         fn holdfasts_own_markers_are_used_when_nothing_foreign_has_arrived() {
             let mut s = ModeScanner::new();
-            for m in [CLASP_A, CLASP_B, CLASP_C, CLASP_D42] {
+            for m in [HOLDFAST_A, HOLDFAST_B, HOLDFAST_C, HOLDFAST_D42] {
                 assert_eq!(s.feed(m, 0, None).len(), 1);
             }
             assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));
@@ -1656,14 +1656,18 @@ mod tests {
         #[test]
         fn at_most_one_marker_per_letter_precedes_the_yield() {
             let mut s = ModeScanner::new();
-            assert_eq!(s.feed(CLASP_A, 0, None).len(), 1, "nothing to yield to yet");
+            assert_eq!(
+                s.feed(HOLDFAST_A, 0, None).len(),
+                1,
+                "nothing to yield to yet"
+            );
             assert_eq!(
                 s.feed(FISH_A, 0, None).len(),
                 1,
                 "the foreign A arms the yield"
             );
             assert!(
-                s.feed(CLASP_A, 0, None).is_empty(),
+                s.feed(HOLDFAST_A, 0, None).is_empty(),
                 "and every later one is dropped"
             );
             // `A` is the only letter this session has seen and it is now
@@ -1681,7 +1685,7 @@ mod tests {
             assert_eq!(s.osc133_source(), None);
             s.feed(b"ordinary output with no markers at all\r\n", 0, None);
             assert_eq!(s.osc133_source(), None);
-            s.feed(CLASP_A, 0, None);
+            s.feed(HOLDFAST_A, 0, None);
             assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));
         }
 
@@ -1691,7 +1695,7 @@ mod tests {
         #[test]
         fn an_inner_holdfast_shells_markers_are_not_foreign() {
             let mut s = ModeScanner::new();
-            for m in [CLASP_A, CLASP_B, CLASP_C, CLASP_A, CLASP_B] {
+            for m in [HOLDFAST_A, HOLDFAST_B, HOLDFAST_C, HOLDFAST_A, HOLDFAST_B] {
                 assert_eq!(s.feed(m, 0, None).len(), 1);
             }
             assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));

@@ -1,7 +1,7 @@
 //! The global TOML configuration file (§10.1, §10.2).
 //!
 //! Discovery is `$XDG_CONFIG_HOME/holdfast/config.toml`, falling back to
-//! `~/.config/holdfast/config.toml` (REQ-CFG-002). **`CLASP_RUNTIME_DIR`
+//! `~/.config/holdfast/config.toml` (REQ-CFG-002). **`HOLDFAST_RUNTIME_DIR`
 //! does not move it** — REQ-CFG-005 makes that variable *instance*
 //! selection, and wiring config discovery to it would turn the one
 //! environment variable this project allows into exactly the override
@@ -517,7 +517,7 @@ pub struct SecretBinding {
 /// runtime directory §7.1 discovers and none is individually
 /// relocatable: a knob that moved one out would put it outside the
 /// `0700` verification §7.1 performs, and would let two daemons under
-/// different `CLASP_RUNTIME_DIR`s share an `http.sock` while disagreeing
+/// different `HOLDFAST_RUNTIME_DIR`s share an `http.sock` while disagreeing
 /// about which instance they are. A config carrying `http_socket_path`
 /// is **rejected**.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -586,7 +586,7 @@ pub struct AdapterPromptPattern {
 /// §7.3 and §19.1's daemon knobs.
 ///
 /// **There is no log-directory knob.** The three log paths are §19.1's,
-/// and the one thing that relocates any of them is `CLASP_RUNTIME_DIR`,
+/// and the one thing that relocates any of them is `HOLDFAST_RUNTIME_DIR`,
 /// which is instance selection rather than a knob. `log_dir` is
 /// withdrawn and a config carrying it is **rejected**; the two retention
 /// knobs stay, because a retention window is behaviour this file
@@ -1680,13 +1680,13 @@ require_confirm = false
 
     #[test]
     fn config_discovery_ignores_the_runtime_dir_variable() {
-        // REQ-CFG-005 makes `CLASP_RUNTIME_DIR` instance selection, not
+        // REQ-CFG-005 makes `HOLDFAST_RUNTIME_DIR` instance selection, not
         // a configuration knob. Wiring config discovery to it would
         // recreate exactly the override REQ-CFG-001 forbids.
         let derived = config_path_from(Some("/x".into()), Some("/h".into())).unwrap();
         assert!(
             !derived.to_string_lossy().contains("runtime"),
-            "config discovery must not read CLASP_RUNTIME_DIR"
+            "config discovery must not read HOLDFAST_RUNTIME_DIR"
         );
     }
 

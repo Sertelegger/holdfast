@@ -212,7 +212,7 @@ impl Daemon {
     /// (`audit.rs`: *"There is no environment override … the config-file
     /// path arrives with the daemon in 0.0.5"*). On the default instance
     /// `paths.audit_log()` **is** `~/.holdfast/logs/audit.log`, so the two
-    /// agree; under an explicit `CLASP_RUNTIME_DIR` the audit log follows
+    /// agree; under an explicit `HOLDFAST_RUNTIME_DIR` the audit log follows
     /// the instance, which is what will stop every `daemon_cli.rs` test
     /// (Task 14) from appending to the developer's real audit log. See
     /// **Decisions taken** — §7.1 states the relocation for `daemon.log`
@@ -1053,7 +1053,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
         anyhow::bail!(
             "clasp daemon: refusing to start without the §9.4 audit trail: {why}. \
              Fix the ownership or permissions of that file, or point \
-             CLASP_RUNTIME_DIR at a directory this user owns."
+             HOLDFAST_RUNTIME_DIR at a directory this user owns."
         );
     }
 

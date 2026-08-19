@@ -183,7 +183,7 @@ jobs:
     needs: probe
     runs-on: ubuntu-24.04
     timeout-minutes: 40
-    # CLASP_REQUIRE_ALL_SHELLS: "1" is STILL not set, and as of 2026-08-13
+    # HOLDFAST_REQUIRE_ALL_SHELLS: "1" is STILL not set, and as of 2026-08-13
     # that is a measurement rather than a staging decision. The variable
     # makes tests/detection.rs's `have()` guard PANIC instead of skip and
     # tightens its row census to zero skips, so it can only be set once

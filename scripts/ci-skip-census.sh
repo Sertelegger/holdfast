@@ -69,8 +69,8 @@
 # script gets `|| true`-d. So the stale half of the gated census fails
 # where the exemption is claimed, and prints a NOTE elsewhere:
 #
-#   CLASP_CENSUS_GATED_STRICT=1   enforce it (what CI does)
-#   CLASP_CENSUS_GATED_STRICT=0   report it, do not fail
+#   HOLDFAST_CENSUS_GATED_STRICT=1   enforce it (what CI does)
+#   HOLDFAST_CENSUS_GATED_STRICT=0   report it, do not fail
 #   unset                         1 when GITHUB_ACTIONS or CI is set, else 0
 #
 # The day the runner has 8 cores, or the day someone lowers
@@ -82,7 +82,7 @@
 #   * `the_pty_matrix_runs_every_host_dependent_row_but_the_two_it_names`
 #     (in the suite) fails on any skip OUTSIDE its allowlist. The two rows
 #     INSIDE the allowlist may still skip silently, forever, on any host.
-#   * `CLASP_REQUIRE_ALL_SHELLS=1` turns every skip into a failure and
+#   * `HOLDFAST_REQUIRE_ALL_SHELLS=1` turns every skip into a failure and
 #     would supersede the row half of this script entirely. It is not set
 #     yet, and the reason is measured and written down in ci.yml above the
 #     `test` job: the fish row cannot pass on any fish available today.
@@ -121,7 +121,7 @@ set -uo pipefail
 #   Neither is CI's to fix and neither is a reason to stop running the
 #   other twenty rows. RETIRED BY: a fish the row can pass on — at which
 #   point `fish` goes into the apt line in ci.yml and the probe job,
-#   CLASP_REQUIRE_ALL_SHELLS=1 gets set in ci.yml and nightly.yml, and
+#   HOLDFAST_REQUIRE_ALL_SHELLS=1 gets set in ci.yml and nightly.yml, and
 #   this entry is deleted, in one change.
 EXPECTED=(
   "skipping: fish not installed"
@@ -188,15 +188,15 @@ census() {
   fi
 
   # Where the stale half of the gated census is enforced. See STRICTNESS.
-  local gated_strict="${CLASP_CENSUS_GATED_STRICT:-}"
-  # Validated rather than coerced. `CLASP_CENSUS_GATED_STRICT=true` reads
+  local gated_strict="${HOLDFAST_CENSUS_GATED_STRICT:-}"
+  # Validated rather than coerced. `HOLDFAST_CENSUS_GATED_STRICT=true` reads
   # as "on" to a person and would be "off" to a `= 1` test — a knob that
   # silently disables the half of this census that matters most, which is
   # the failure this whole file is about.
   case "$gated_strict" in
     "" | 0 | 1) ;;
     *)
-      echo "SKIP CENSUS FAILED: CLASP_CENSUS_GATED_STRICT='$gated_strict' is not 0, 1 or unset." >&2
+      echo "SKIP CENSUS FAILED: HOLDFAST_CENSUS_GATED_STRICT='$gated_strict' is not 0, 1 or unset." >&2
       return 2
       ;;
   esac
@@ -279,7 +279,7 @@ census() {
     if [ "$matched" -eq 0 ]; then
       echo "  STALE EXEMPTION: nothing skipped with the prefix '$want'." >&2
       echo "  If that row now runs, DELETE the entry — and check whether" >&2
-      echo "  CLASP_REQUIRE_ALL_SHELLS=1 can be set in ci.yml and nightly.yml," >&2
+      echo "  HOLDFAST_REQUIRE_ALL_SHELLS=1 can be set in ci.yml and nightly.yml," >&2
       echo "  which supersedes the row half of this script entirely." >&2
       fails=$((fails + 1))
     fi
@@ -389,7 +389,7 @@ census() {
       echo "  NOTE: '$want_id' ran here — this host meets the condition the" >&2
       echo "  exemption is written for, so its absence is expected locally." >&2
       echo "  Where the exemption IS claimed (CI, or" >&2
-      echo "  CLASP_CENSUS_GATED_STRICT=1) this is a STALE EXEMPTION and fails." >&2
+      echo "  HOLDFAST_CENSUS_GATED_STRICT=1) this is a STALE EXEMPTION and fails." >&2
     fi
   done
 
@@ -476,7 +476,7 @@ self_test() {
     # variable set in there never comes back.
     local out rc
     out="$(env -u GITHUB_ACTIONS -u GITHUB_STEP_SUMMARY -u CI \
-             CLASP_CENSUS_GATED_STRICT="$3" bash "$1" "$2" 2>&1)"
+             HOLDFAST_CENSUS_GATED_STRICT="$3" bash "$1" "$2" 2>&1)"
     rc=$?
     printf '%s' "$out"
     return "$rc"

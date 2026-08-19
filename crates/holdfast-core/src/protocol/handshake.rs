@@ -43,7 +43,7 @@ pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Build identifier reported in the handshake. Wired to a real git SHA
 /// by the release pipeline in 0.0.12; `unknown` until then.
 pub fn build_id() -> &'static str {
-    option_env!("CLASP_BUILD_SHA").unwrap_or("unknown")
+    option_env!("HOLDFAST_BUILD_SHA").unwrap_or("unknown")
 }
 
 /// Which kind of peer is connecting (§7.4.1).
