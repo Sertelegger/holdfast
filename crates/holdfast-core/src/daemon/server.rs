@@ -207,10 +207,11 @@ pub struct Daemon {
     /// exit. `None` means "never", which is what the window measures from
     /// on a daemon nobody has connected to.
     last_client_connect: Mutex<Option<Instant>>,
-    /// Every live attach connection (§4.3). Empty until something
-    /// completes the §7.5 handshake; `daemon/status`'s `attach_clients`
-    /// reads it.
-    attach_hub: Arc<crate::attach::hub::AttachHub>,
+    // The attach hub used to live here. It moved onto `HoldfastServer`
+    // in 0.0.7 so an MCP tool handler could reach it — `dispatch_tool`
+    // passes `&daemon.server` and drops the `Arc<Daemon>` at that line.
+    // `attach_hub()` below delegates, so there is still exactly one hub
+    // per process and every 0.0.6 call site is unchanged.
     /// The live-session ids the last `resources/list` would have shown,
     /// for REQ-R-006's **exit** half.
     ///
@@ -310,7 +311,6 @@ impl Daemon {
             owner_uid,
             clock,
             last_client_connect: Mutex::new(None),
-            attach_hub: Arc::new(crate::attach::hub::AttachHub::new()),
             listed_sessions: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
@@ -405,8 +405,11 @@ impl Daemon {
     }
 
     /// The set of live attach connections (§4.3).
+    ///
+    /// Delegates to [`HoldfastServer::attach_hub`], which owns it — see
+    /// the note where this field used to be declared.
     pub fn attach_hub(&self) -> &Arc<crate::attach::hub::AttachHub> {
-        &self.attach_hub
+        self.server.attach_hub()
     }
 
     /// Count one accepted connection. Called from both accept loops,
@@ -439,7 +442,7 @@ impl Daemon {
             version: env!("CARGO_PKG_VERSION").to_string(),
             sessions_live: live,
             sessions_exited_retained: all.len() as u64 - live,
-            attach_clients: self.attach_hub.live_client_count(),
+            attach_clients: self.attach_hub().live_client_count(),
             bridge_sessions: 0,
         }
     }

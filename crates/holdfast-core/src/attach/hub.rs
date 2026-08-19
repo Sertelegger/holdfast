@@ -77,7 +77,11 @@ pub struct AttachHub {
     /// `SecretInput` frame, and a session with no attached client has
     /// nobody who could answer. What the session owns is the *edge* that
     /// raises it.
-    secrets: Mutex<HashMap<String, super::secret::SecretRequest>>,
+    ///
+    /// The state machine itself is [`crate::secret::SecretSlots`]; the
+    /// hub holds it because the hub is what can *reach* the clients a
+    /// raise has to be told to.
+    secrets: crate::secret::SecretSlots,
     /// Monotonic, process-wide. **Never reused**, so an `unregister`
     /// arriving after the slot was refilled cannot remove somebody
     /// else's connection — the same reasoning that puts an `O_PATH` pin
@@ -154,19 +158,19 @@ impl AttachHub {
         session_id: &str,
         prompt_text: &str,
     ) -> (super::secret::SecretRequest, bool) {
-        let mut secrets = self.secrets.lock();
-        match secrets.get(session_id) {
-            Some(existing) => (existing.clone(), false),
-            None => {
-                let req = super::secret::SecretRequest::new(prompt_text.to_string());
-                secrets.insert(session_id.to_string(), req.clone());
-                (req, true)
-            }
-        }
+        self.secrets
+            .raise(session_id, prompt_text, crate::secret::RaisedBy::EchoDrop)
     }
 
     pub fn outstanding_secret(&self, session_id: &str) -> Option<super::secret::SecretRequest> {
-        self.secrets.lock().get(session_id).cloned()
+        self.secrets.outstanding(session_id)
+    }
+
+    /// The slot state machine, for the callers that need more of it than
+    /// the four convenience methods here expose — the waiting-caller
+    /// layer in particular (§5.2, REQ-SEC-010a).
+    pub fn secrets(&self) -> &crate::secret::SecretSlots {
+        &self.secrets
     }
 
     /// Clear the outstanding request, returning it **only** to the caller
@@ -181,13 +185,34 @@ impl AttachHub {
         &self,
         session_id: &str,
         expect_id: Option<&str>,
-    ) -> Option<super::secret::SecretRequest> {
-        let mut secrets = self.secrets.lock();
-        match secrets.get(session_id) {
-            Some(req) if expect_id.is_none_or(|id| id == req.request_id) => {
-                secrets.remove(session_id)
-            }
-            _ => None,
+    ) -> Option<crate::secret::RaisedRequest> {
+        self.secrets.take(session_id, expect_id)
+    }
+
+    /// Tell every client attached to this session that a request is
+    /// outstanding (§7.5).
+    ///
+    /// `try_send` rather than `send`: §4.3's per-connection queue is
+    /// bounded and overflow detaches that client. A fan-out that blocked
+    /// on one slow client would hold up the tool call, the write path, or
+    /// whatever else happened to be doing the raising.
+    pub fn broadcast_awaiting_secret(&self, session_id: &str, request_id: &str, prompt_text: &str) {
+        for c in self.clients_of(session_id) {
+            let _ = c.tx.try_send(ServerFrame::AwaitingSecret {
+                request_id: request_id.to_string(),
+                prompt_text: prompt_text.to_string(),
+            });
+        }
+    }
+
+    /// Tell every client attached to this session that the request is
+    /// over, and how (§7.5: `fulfilled` | `cancelled` | `timeout`).
+    pub fn broadcast_secret_closed(&self, session_id: &str, request_id: &str, outcome: &str) {
+        for c in self.clients_of(session_id) {
+            let _ = c.tx.try_send(ServerFrame::SecretRequestClosed {
+                request_id: request_id.to_string(),
+                outcome: outcome.to_string(),
+            });
         }
     }
 }

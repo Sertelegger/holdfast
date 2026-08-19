@@ -2664,6 +2664,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
             // limit, so every other field is whatever the constructor
             // chose.
             capabilities: small.capabilities,
+            attach_hub: std::sync::Arc::clone(&small.attach_hub),
         };
         let (_first, _) = start_bash(&server_one).await;
         note(&body(

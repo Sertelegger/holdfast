@@ -612,6 +612,20 @@ async fn read_loop(
                 }
             }
             ClientDecode::Frame(ClientFrame::SecretInput { request_id, bytes }) => {
+                // **The cap is measured here, on the received bytes and
+                // before anything is copied.** Normalisation strips a
+                // trailing newline and may append one, so a check made
+                // afterwards would put the boundary where the client's
+                // newline habit put it — and an implementation that
+                // normalised first has already built the short-lived type
+                // around a value it is about to throw away.
+                let over_cap = daemon
+                    .attach_hub()
+                    .secrets()
+                    .submission_bounds(&conn.session_id, &request_id)
+                    .and_then(|(cap, _)| cap)
+                    .is_some_and(|cap| bytes.len() > cap as usize);
+
                 // The request is closed **before** the write is queued and
                 // by the same atomic step that decides whether this
                 // client is the one fulfilling it: two clients answering
@@ -621,15 +635,31 @@ async fn read_loop(
                     .attach_hub()
                     .close_secret(&conn.session_id, Some(&request_id))
                 {
-                    Some(req) => {
+                    // Over the waiting call's `max_secret_bytes`. Nothing
+                    // is written, no `SecretBytes` is built, and the
+                    // request closes: the child is still blocked, and the
+                    // agent is told which of the four reasons it was.
+                    Some(raised) if over_cap => {
+                        super::secret::zero_bytes(&mut body);
+                        let id = raised.request_id().to_string();
+                        raised.answer(crate::secret::Resolution::Cancelled(
+                            crate::secret::CancelReason::TooLarge,
+                        ));
+                        daemon.attach_hub().broadcast_secret_closed(
+                            &conn.session_id,
+                            &id,
+                            "cancelled",
+                        );
+                    }
+                    Some(raised) => {
                         // §5.2's normalisation is applied here, by the
                         // daemon, so the behaviour does not depend on
-                        // which client submitted. `append_newline` is
-                        // `true`: 0.0.6 raises from an echo drop with no
-                        // tool call behind it, and an echo-off prompt is
-                        // waiting for a line.
-                        let (write, _ack) = WriteRequest::secret(
-                            super::secret::SecretBytes::normalise(bytes, true),
+                        // which client submitted. `append_newline`
+                        // defaults to `true` — an echo-off prompt is
+                        // waiting for a line — and is the waiting call's
+                        // own argument when there is one.
+                        let (write, ack) = WriteRequest::secret(
+                            super::secret::SecretBytes::normalise(bytes, raised.append_newline),
                         );
                         if session.write_queue().send(write).await.is_err() {
                             return;
@@ -644,10 +674,23 @@ async fn read_loop(
                         // session idle-reaps while a human is typing a
                         // password.
                         session.note_activity();
-                        broadcast_secret_closed(
-                            daemon,
+                        // **The count, and only the count.** The writer
+                        // thread reports how many bytes the PTY took;
+                        // that number is the whole of what a waiting tool
+                        // call learns. A dropped sender means the session
+                        // died under the write, which is not a `Provided`.
+                        let id = raised.request_id().to_string();
+                        match ack.await {
+                            Ok(Ok(n)) => raised.answer(crate::secret::Resolution::Provided {
+                                bytes_written: n as u64,
+                            }),
+                            _ => raised.answer(crate::secret::Resolution::SessionDied {
+                                exit_code: session.exit_code(),
+                            }),
+                        }
+                        daemon.attach_hub().broadcast_secret_closed(
                             &conn.session_id,
-                            &req.request_id,
+                            &id,
                             "fulfilled",
                         );
                     }
@@ -1081,8 +1124,18 @@ async fn forward_events(
             // one connection's `close_secret` returns `Some`, so exactly
             // one fan-out happens even though every one of them tries.
             Ok(SessionEvent::AwaitingSecretLeft) => {
-                if let Some(req) = daemon.attach_hub().close_secret(&session_id, None) {
-                    broadcast_secret_closed(&daemon, &session_id, &req.request_id, "cancelled");
+                if let Some(raised) = daemon.attach_hub().close_secret(&session_id, None) {
+                    let id = raised.request_id().to_string();
+                    // **`user_cancelled` has exactly one producer and it
+                    // is this line.** §7.5's client-frame catalogue has no
+                    // cancellation frame, so the only way a request ends
+                    // without a value while somebody is waiting is the
+                    // echo-off condition clearing — a human aborting at an
+                    // attached client, or the child abandoning its read.
+                    raised.answer(crate::secret::Resolution::Cancelled(
+                        crate::secret::CancelReason::UserCancelled,
+                    ));
+                    broadcast_secret_closed(&daemon, &session_id, &id, "cancelled");
                 }
             }
             // **The exit is `forward_output`'s, not this task's**, and
@@ -1090,7 +1143,28 @@ async fn forward_events(
             // connection, and §7.5's `SessionExited` must come after its
             // flush. Two tasks queueing on the same FIFO could not order
             // a flush against a frame without a rendezvous neither needs.
-            Ok(SessionEvent::Exited { .. }) => {}
+            // **The `SessionExited` *frame* is `forward_output`'s, not
+            // this task's**, and the reason is the redactor: it lives in
+            // that task, one per connection, and §7.5's `SessionExited`
+            // must come after its flush. Two tasks queueing on the same
+            // FIFO could not order a flush against a frame without a
+            // rendezvous neither needs.
+            //
+            // What *is* this task's is the secret slot. 0.0.6 left this
+            // arm empty and the slot outlived the session — a per-daemon
+            // entry keyed by a dead session id that nothing ever removed,
+            // and, once a tool call can wait on one, a call that would
+            // sit out its whole deadline for a child that is already
+            // gone. §5.1: the answer is `session_died` with the code.
+            Ok(SessionEvent::Exited { code }) => {
+                if let Some(raised) = daemon.attach_hub().close_secret(&session_id, None) {
+                    let id = raised.request_id().to_string();
+                    raised.answer(crate::secret::Resolution::SessionDied {
+                        exit_code: Some(code),
+                    });
+                    broadcast_secret_closed(&daemon, &session_id, &id, "cancelled");
+                }
+            }
             // An edge is not a stream: a connection that fell behind has
             // already been re-synchronised by the next edge, and the slot
             // it would have read is still in the hub.

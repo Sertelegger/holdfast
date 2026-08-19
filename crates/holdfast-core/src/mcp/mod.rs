@@ -148,6 +148,29 @@ pub struct HoldfastServer {
     /// `not_supported_on_platform` is otherwise a status no test on any
     /// machine CI runs on can produce — see [`crate::platform`].
     pub capabilities: crate::platform::Capabilities,
+    /// Every live attach connection, and the per-session secret slot
+    /// (§4.3, §5.2). **0.0.7 moved this here from `Daemon`.**
+    ///
+    /// It had to move. `request_secret_input` is an MCP tool, so its
+    /// handler is a method on *this* type — and `dispatch_tool` calls
+    /// `passthrough::call_tool(&daemon.server, …)`, which is the line the
+    /// `Arc<Daemon>` stops at. Measured before the move: `attach_hub` and
+    /// `AttachHub` had **zero** occurrences anywhere under `mcp/`, so the
+    /// one tool whose whole job is to ask a human at an attached client
+    /// had no way to reach one.
+    ///
+    /// Ownership rather than a back-pointer, because the alternatives are
+    /// worse: a `Weak<Daemon>` set after construction is a field that is
+    /// `None` for part of the daemon's life and always `None` under
+    /// `--no-daemon`, and a task-local (the `mcp::caller` shape) makes
+    /// the hub invisible to a signature and unavailable to any in-process
+    /// host. `Daemon::attach_hub()` now delegates here, so there is still
+    /// exactly one hub per process and 0.0.6's paths are unchanged.
+    ///
+    /// Under `--no-daemon` this hub is real and simply has no clients: a
+    /// raise fans out to nobody and the waiting call runs out its
+    /// deadline, which is the correct answer rather than a special case.
+    pub attach_hub: Arc<crate::attach::hub::AttachHub>,
 }
 
 impl HoldfastServer {
@@ -288,7 +311,13 @@ impl HoldfastServer {
             clock,
             audit_open_error,
             capabilities,
+            attach_hub: Arc::new(crate::attach::hub::AttachHub::new()),
         }
+    }
+
+    /// Every live attach connection, and the per-session secret slot.
+    pub fn attach_hub(&self) -> &Arc<crate::attach::hub::AttachHub> {
+        &self.attach_hub
     }
 
     /// `Some(reason)` when a §9.4 trail was asked for and could not be

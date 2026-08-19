@@ -15,3 +15,9 @@
 //! `redact_str` is **not** the tool for the value. It is the tool for
 //! `prompt_text`, which is an agent-supplied string and a different
 //! thing entirely.
+
+pub mod request;
+
+pub use request::{
+    Adopted, CancelReason, Collision, RaisedBy, RaisedRequest, Resolution, SecretSlots,
+};
