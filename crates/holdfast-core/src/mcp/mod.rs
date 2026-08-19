@@ -59,7 +59,12 @@ pub const INSTRUCTIONS: &str = "Holdfast gives you PTY-backed shell sessions. st
      markers at start-up, and get_command_history then reports each \
      command's exit code and output span. Output is ANSI-stripped \
      and secret-redacted by default; secrets are replaced with \
-     [REDACTED:<kind>] markers.";
+     [REDACTED:<kind>] markers. When a session's interaction_mode is \
+     AwaitingSecret it is blocked on a password prompt: use \
+     request_secret_input, NOT send_input. That tool asks a human at an \
+     attached client to type the credential straight into the session's \
+     terminal; you never receive the value, cannot name which credential \
+     you want, and get back only the number of bytes written.";
 
 /// Buffered `list_changed` pulses before a slow subscriber starts
 /// missing them. Small on purpose: the notification is idempotent — a

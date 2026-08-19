@@ -14,6 +14,7 @@ use crate::output::rules::RuleSet;
 use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{clamp_geometry, InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
+use crate::secret::{CancelReason, Resolution};
 use crate::session::{new_session_id, wait, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -1254,9 +1255,247 @@ impl HoldfastServer {
             format!("{n} command(s)"),
         ))
     }
+
+    /// Ask a human at an attached client to type a credential straight
+    /// into this session's PTY.
+    ///
+    /// **You will never see the value.** It travels client → daemon →
+    /// PTY and enters no response, no log and no broadcast; what comes
+    /// back is a byte count. You cannot name a secret either: bindings
+    /// match the session's own command line and the observed prompt, and
+    /// `prompt_text` reaches no lookup (§9.6, REQ-SEC-012).
+    #[tool(
+        annotations(
+            title = "Request a secret from the user",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema::envelope_schema::<schema::RequestSecretInput>()
+    )]
+    pub async fn request_secret_input(
+        &self,
+        Parameters(args): Parameters<RequestSecretInputArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // §3.6. The `#[cfg]` picks the default and this branch reads the
+        // value — see `crate::platform`. Written as a branch over a field
+        // rather than `#[cfg(windows)] return …` so a Unix test can reach
+        // this status; a status no test on any CI runner can produce is
+        // the REQ-T-017 defect, and it ships silently.
+        if !self.capabilities.out_of_band_secret_input {
+            return Ok(envelope::envelope(
+                Status::NotSupportedOnPlatform,
+                json!({}),
+                "out-of-band secret input needs a daemon holding the session and a client \
+                 attached to it; this platform has neither",
+            ));
+        }
+
+        // Every bound below is a **protocol error**, not a status (§5.1):
+        // an input-schema violation is `invalid_params`, the same shape
+        // `read_output`'s cursor rule already uses. `secret_cancelled`
+        // describes a request that was raised and did not complete, which
+        // none of these is.
+        //
+        // Bytes, not characters. §9.5 says bytes.
+        if args.prompt_text.len() > MAX_PROMPT_TEXT_BYTES {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "prompt_text is {} bytes; request_secret_input accepts at most \
+                     {MAX_PROMPT_TEXT_BYTES}",
+                    args.prompt_text.len()
+                ),
+                None,
+            ));
+        }
+        let security = &self.config.security;
+        let timeout_secs = args.timeout_secs.unwrap_or(DEFAULT_SECRET_TIMEOUT_SECS);
+        // Bounded in **both** directions. A one-sided check passes every
+        // test that only probes the top, and `timeout_secs: 0` here is
+        // not `wait_for_pattern`'s "no caller deadline": a request with
+        // no deadline and a caller waiting on it is a call that never
+        // returns.
+        if timeout_secs == 0 || timeout_secs > security.secret_input_max_timeout_secs {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "timeout_secs must be between 1 and {} (security.\
+                     secret_input_max_timeout_secs); got {timeout_secs}",
+                    security.secret_input_max_timeout_secs
+                ),
+                None,
+            ));
+        }
+        let max_secret_bytes = args.max_secret_bytes.unwrap_or(DEFAULT_MAX_SECRET_BYTES);
+        if max_secret_bytes == 0 || max_secret_bytes > security.max_secret_bytes_ceiling {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "max_secret_bytes must be between 1 and {} (security.\
+                     max_secret_bytes_ceiling); got {max_secret_bytes}",
+                    security.max_secret_bytes_ceiling
+                ),
+                None,
+            ));
+        }
+
+        let session = match self.registry.get(&args.session) {
+            Ok(s) => s,
+            Err(e) => return envelope::from_error(&e),
+        };
+        if !session.is_alive() {
+            return Ok(envelope::envelope(
+                Status::SessionDied,
+                json!({ "exit_code": session.exit_code() }),
+                "session has exited",
+            ));
+        }
+
+        // Redacted before it reaches anybody. §9.2 names only the audit
+        // surface, and redacting the broadcast too costs one call, keeps
+        // one rule for the string, and stops a human being shown a
+        // secret-shaped value in the modal they are about to type into.
+        let prompt_text = redact_str(&self.processor.rules, &args.prompt_text);
+        let append_newline = args.append_newline.unwrap_or(true);
+        let hub = self.attach_hub();
+
+        // REQ-SEC-010a. Raise if the slot is vacant, **adopt** if an echo
+        // drop already raised one — §16.4 steps 3–7 are an adoption end
+        // to end, so that is the ordinary case — and collide only if the
+        // request already has a call waiting on it.
+        let adopted = match hub.secrets().raise_or_adopt(
+            &session.id,
+            &prompt_text,
+            Some(max_secret_bytes),
+            append_newline,
+        ) {
+            Ok(a) => a,
+            // The first caller's request is untouched: no close
+            // broadcast, no slot change, no deadline reset.
+            Err(collision) => {
+                return Ok(envelope::envelope(
+                    Status::SecretCancelled,
+                    json!({
+                        "request_id": collision.request_id,
+                        "reason": CancelReason::ConcurrentRequestPending.as_str(),
+                    }),
+                    "this session already has a secret request with a call waiting on it",
+                ));
+            }
+        };
+        let request_id = adopted.request_id.clone();
+        // **Only the raising call broadcasts.** An adopting call must not
+        // re-announce a request a human may already be typing into, and
+        // must not replace its text.
+        if adopted.raised_here {
+            hub.broadcast_awaiting_secret(&session.id, &request_id, &adopted.prompt_text);
+        }
+
+        let resolution = self
+            .await_secret(&session, &request_id, adopted.rx, timeout_secs)
+            .await;
+
+        Ok(match resolution {
+            Resolution::Provided { bytes_written } => envelope::envelope(
+                Status::SecretProvided,
+                detection::with_detection(
+                    json!({ "bytes_written": bytes_written, "request_id": request_id }),
+                    &session,
+                    &self.processor,
+                ),
+                format!("{bytes_written} byte(s) written to the session"),
+            ),
+            Resolution::Cancelled(reason) => envelope::envelope(
+                Status::SecretCancelled,
+                json!({ "request_id": request_id, "reason": reason.as_str() }),
+                format!("the secret request ended: {}", reason.as_str()),
+            ),
+            Resolution::SessionDied { exit_code } => envelope::envelope(
+                Status::SessionDied,
+                json!({ "exit_code": exit_code }),
+                "the session exited while the request was outstanding",
+            ),
+        })
+    }
 }
 
 impl HoldfastServer {
+    /// Wait for the outstanding request to resolve, or for this call's
+    /// own deadline.
+    ///
+    /// **The timer decides nothing.** A `select!` that dropped the
+    /// receiver on expiry would lose a `SecretInput` landing in that
+    /// window: the value is written to the PTY and the agent is told
+    /// `timeout`. So on expiry the caller asks the slot, under the same
+    /// lock every other transition takes, whether it is still the waiter.
+    async fn await_secret(
+        &self,
+        session: &Arc<Session>,
+        request_id: &str,
+        rx: tokio::sync::oneshot::Receiver<Resolution>,
+        timeout_secs: u32,
+    ) -> Resolution {
+        // §5.2: the window starts at **this call**, not at the raise —
+        // which is what makes an adopting call's deadline its own rather
+        // than one that may already have elapsed.
+        let deadline = self.clock.now() + Duration::from_secs(timeout_secs as u64);
+        let sleep = self.clock.sleep_until(deadline);
+        tokio::pin!(sleep);
+        tokio::pin!(rx);
+
+        let early = tokio::select! {
+            r = &mut rx => Some(r),
+            // `&mut sleep`, so the receiver is still ours afterwards.
+            _ = &mut sleep => None,
+        };
+        if let Some(Ok(resolution)) = early {
+            return resolution;
+        }
+
+        let hub = self.attach_hub();
+        match hub
+            .secrets()
+            .close_on_caller_timeout(&session.id, request_id)
+        {
+            // The slot was still ours, so nobody resolved it and we now
+            // own the close. We *are* the waiter, so there is nobody to
+            // answer — the value is returned below.
+            Some(raised) => {
+                drop(raised);
+                hub.broadcast_secret_closed(&session.id, request_id, "timeout");
+                // **Q1: a call-driven timeout re-raises if the child is
+                // still asking.** §5.2 makes the deadline close the
+                // *request*, not merely the call — but the raise is
+                // edge-triggered on the transition *into* `AwaitingSecret`,
+                // so closing it while the child sits at its echo-off
+                // prompt removes the human's affordance and nothing will
+                // ever put it back. New id, new broadcast, `echo_drop`,
+                // no waiter. §5.2's invariant holds: the ids are
+                // sequential, never concurrent.
+                if session.is_awaiting_secret() {
+                    let (re, first) =
+                        hub.raise_secret(&session.id, &session.prompt_last_line_redacted());
+                    if first {
+                        hub.broadcast_awaiting_secret(&session.id, &re.request_id, &re.prompt_text);
+                    }
+                }
+                Resolution::Cancelled(CancelReason::Timeout)
+            }
+            // Somebody took the slot between the timer firing and this
+            // lock. Their answer is on our receiver, or is about to be —
+            // the fulfilment path takes the slot before it queues the
+            // write and only learns `bytes_written` afterwards. **Report
+            // the truth, not the timer.**
+            //
+            // The grace is real time rather than `self.clock`: a manual
+            // clock that nothing advances would park here forever, and a
+            // hand-over that has already happened is not a deadline.
+            None => match tokio::time::timeout(SECRET_HANDOVER_GRACE, rx).await {
+                Ok(Ok(resolution)) => resolution,
+                _ => Resolution::Cancelled(CancelReason::Timeout),
+            },
+        }
+    }
+
     /// Run one wait and render §5.2's eight shared fields.
     ///
     /// **`wait_for_pattern` and `send_input(wait_for=)` both come through
@@ -1566,6 +1805,75 @@ pub struct StatusArgs {
     pub session: String,
 }
 
+/// `request_secret_input`'s arguments.
+///
+/// **The only `*Args` struct in the tree that denies unknown fields, and
+/// deliberately so.** Every other one accepts an extra key silently, so
+/// without this line REQ-SEC-010a's *"the tool accepts `session` and
+/// never a `request_id`"* would rest on a schema a client is free to
+/// ignore: a smuggled `request_id` would be swallowed rather than
+/// refused, and the agent's inability to *name* a secret request would be
+/// documentation instead of a control. Two consequences, both
+/// load-bearing: the rejection surfaces as `invalid_params`, the same
+/// shape as every other input-schema violation here; and `schemars` emits
+/// `"additionalProperties": false` on this tool's input schema and no
+/// other's.
+///
+/// It is **not** extended to the other ten args structs in this
+/// milestone. Widening a deserialiser's strictness across the whole tool
+/// surface is a client-compatibility decision, and it is not a secrets
+/// decision.
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestSecretInputArgs {
+    /// Session id or live session name. **The only selector.** §5.2: the
+    /// tool takes `session`, never a `request_id` — the id is returned to
+    /// you and never accepted from you (REQ-SEC-010a).
+    pub session: String,
+    /// What is being asked for, e.g. "sudo password for deploy-user". At
+    /// most 512 bytes of UTF-8 (§9.5). This reaches no credential lookup:
+    /// bindings match the session's own command line and the observed
+    /// prompt, never this string (§9.6, REQ-SEC-012).
+    pub prompt_text: String,
+    /// Default true. §5.2's normalisation is the daemon's job, not the
+    /// client's: exactly one trailing `\r\n` or `\n` is stripped from the
+    /// received bytes, then `\n` is appended when this is true.
+    #[serde(default)]
+    pub append_newline: Option<bool>,
+    /// Default 120. Rejected when 0 or above
+    /// `security.secret_input_max_timeout_secs` (default 900).
+    #[serde(default)]
+    pub timeout_secs: Option<u32>,
+    /// Default 4096. Rejected when 0 or above
+    /// `security.max_secret_bytes_ceiling` (default 65536).
+    #[serde(default)]
+    pub max_secret_bytes: Option<u32>,
+}
+
+/// §9.5's cap on `request_secret_input.prompt_text`, in **bytes**.
+///
+/// Bytes and not characters: §9.5 says bytes, and a `chars().count()`
+/// implementation admits 512 three-byte codepoints — 1536 bytes — into a
+/// field that is broadcast to every attached client and written to the
+/// audit log.
+pub const MAX_PROMPT_TEXT_BYTES: usize = 512;
+
+/// `request_secret_input.timeout_secs` when the caller does not say.
+pub const DEFAULT_SECRET_TIMEOUT_SECS: u32 = 120;
+
+/// `request_secret_input.max_secret_bytes` when the caller does not say.
+pub const DEFAULT_MAX_SECRET_BYTES: u32 = 4096;
+
+/// How long a timed-out caller waits for an answer it has just discovered
+/// somebody else owns.
+///
+/// Not a deadline: by the time this is reached the slot has already been
+/// taken by a resolver that is committed to answering, and the only thing
+/// outstanding is a PTY write. It is bounded anyway, because an unbounded
+/// wait in this position turns a wedged writer into a hung CI job rather
+/// than a red row.
+const SECRET_HANDOVER_GRACE: Duration = Duration::from_secs(10);
+
 /// `Default` for the reason 0.0.2 put it on `StartSessionArgs`: every
 /// later milestone adds arguments here, and an exhaustive literal repaired
 /// by naming the new field breaks again next milestone.
@@ -1635,7 +1943,7 @@ mod tests {
     /// makes the enumeration complete: add a tool without listing it there
     /// and this goes red first.
     #[test]
-    fn the_router_advertises_exactly_the_0_0_4_tool_set() {
+    fn the_router_advertises_exactly_the_0_0_7_tool_set() {
         let mut names: Vec<String> = HoldfastServer::tool_router()
             .list_all()
             .into_iter()
@@ -1650,6 +1958,7 @@ mod tests {
                 "interrupt",
                 "list_sessions",
                 "read_output",
+                "request_secret_input",
                 "resize",
                 "send_input",
                 "start_session",
@@ -2226,6 +2535,23 @@ mod tests {
                 }))
                 .await
                 .expect("interrupt"),
+        ));
+        // Nobody is attached, so this raises, waits out its (shortest
+        // legal) window and answers `secret_cancelled`. That is the row
+        // this table wants: the *cancelled* shape is the one carrying a
+        // `request_id` and a `reason` next to a session whose buffer is
+        // full of the fixture's credentials.
+        rows.push(row(
+            "request_secret_input",
+            &server
+                .request_secret_input(Parameters(RequestSecretInputArgs {
+                    session: session(id),
+                    prompt_text: "a prompt".to_string(),
+                    timeout_secs: Some(1),
+                    ..Default::default()
+                }))
+                .await
+                .expect("request_secret_input"),
         ));
         rows.push(row(
             "terminate",

@@ -53,16 +53,24 @@ pub struct Envelope<T> {
 /// subset of this. Narrowing per tool would be more precise and is a
 /// candidate for the milestone that freezes the surface; it is not a
 /// correctness gap, because a status this enum omits is one no tool emits.
+/// **Declaration order is load-bearing** — `schemars` emits
+/// `$defs.Status.enum` in it and `scripts/mcp-smoke.sh` compares that
+/// array positionally. §18's preamble: a new value is *inserted at its
+/// catalogued position and never appended*. Keep this in lockstep with
+/// [`crate::mcp::envelope::Status`].
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Ok,
     Timeout,
     SessionDied,
+    SecretProvided,
+    SecretCancelled,
     SessionNotFound,
     NameTaken,
     LimitReached,
     SpawnFailed,
+    NotSupportedOnPlatform,
     Unavailable,
 }
 
@@ -294,6 +302,44 @@ pub struct SendInput {
     pub held_back: Option<bool>,
     pub next_cursor: Option<u64>,
     pub clamped_timeout_secs: Option<u64>,
+    pub interaction_mode: Option<InteractionMode>,
+    pub detection_tier: Option<DetectionTier>,
+    pub screen_tracking: Option<ScreenTracking>,
+    pub title: Option<String>,
+    pub prompt: Option<Prompt>,
+}
+
+/// `request_secret_input`.
+///
+/// **There is no field here capable of holding the value, and that is
+/// this type's job in this milestone** (REQ-SEC-004, REQ-T-015). §9.2
+/// marks the secret `n/a` for redaction rather than "redacted", because
+/// it reaches no boundary a redactor could run at: the protections are a
+/// type that cannot serialise, a write path that consumes, a `Drop` that
+/// zeroes — and this schema, which has nowhere to put it.
+/// `request_secret_input_has_no_field_that_could_carry_a_value` asserts
+/// the key set **exactly**, so a field added later fails whatever it is
+/// called.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestSecretInput {
+    /// `secret_provided`: bytes actually written to the PTY,
+    /// post-normalisation and including the appended `\n` when
+    /// `append_newline`. A **count**, which is the whole of what a
+    /// caller learns.
+    pub bytes_written: Option<u64>,
+    /// On both `secret_provided` and `secret_cancelled`.
+    pub request_id: Option<String>,
+    /// `secret_cancelled` only: `user_cancelled` | `timeout` |
+    /// `too_large` | `concurrent_request_pending`.
+    pub reason: Option<String>,
+    /// `session_died` only (§5.1).
+    pub exit_code: Option<i32>,
+    // ---- §5.4's session-state block, on `secret_provided` (REQ-T-019).
+    // Built by `mcp::detection`'s one builder. §5.4 is explicit that a
+    // tool declaring `prompt` declares the whole block, because a second
+    // variant means a second builder — which is exactly how
+    // `list_sessions[].prompt` diverged for five revisions.
     pub interaction_mode: Option<InteractionMode>,
     pub detection_tier: Option<DetectionTier>,
     pub screen_tracking: Option<ScreenTracking>,

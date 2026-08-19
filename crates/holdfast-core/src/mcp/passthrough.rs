@@ -21,8 +21,9 @@ use super::envelope;
 // `every_router_tool_is_dispatchable` names whichever tool is
 // unreachable.
 use super::tools::{
-    GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ReadOutputArgs, ResizeArgs,
-    SendInputArgs, StartSessionArgs, StatusArgs, TerminateArgs, WaitForPatternArgs,
+    GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ReadOutputArgs,
+    RequestSecretInputArgs, ResizeArgs, SendInputArgs, StartSessionArgs, StatusArgs, TerminateArgs,
+    WaitForPatternArgs,
 };
 use super::HoldfastServer;
 use rmcp::handler::server::wrapper::Parameters;
@@ -109,6 +110,13 @@ pub async fn call_tool(
         "get_screen_state" => run!(get_screen_state, GetScreenStateArgs),
         "resize" => run!(resize, ResizeArgs),
         "interrupt" => run!(interrupt, InterruptArgs),
+        // --- 0.0.7 ---
+        // **The second long-blocking passthrough tool**, after
+        // `wait_for_pattern`. §7.4's model is one request per connection,
+        // so a blocking call holds one connection and no lock — which is
+        // the shape that works — but the shim's read side must not impose
+        // a deadline shorter than the tool's.
+        "request_secret_input" => run!(request_secret_input, RequestSecretInputArgs),
         // No arguments: the router still passes an (empty) object, and
         // the macro above is arg-shaped, so this arm is written out.
         "list_sessions" => Some(server.list_sessions().await),
@@ -171,10 +179,10 @@ mod tests {
         // by the time this milestone runs is four milestones behind what
         // it guards and would stay green after seven tools vanished. The
         // exact set is pinned by name in
-        // `tools::tests::the_router_advertises_exactly_the_0_0_4_tool_set`;
+        // `tools::tests::the_router_advertises_exactly_the_0_0_7_tool_set`;
         // this floor only has to be non-vacuous, so it tracks that test's
         // count rather than restating its names.
-        assert!(names.len() >= 11, "the router lost tools; got {names:?}");
+        assert!(names.len() >= 12, "the router lost tools; got {names:?}");
         for name in names {
             assert!(
                 call_tool(&server, &name, Value::Null).await.is_some(),

@@ -5,15 +5,31 @@ use rmcp::ErrorData;
 use serde_json::{json, Value};
 
 /// Statuses used by the 0.0.1 tool set. The full taxonomy is spec §18.1.
+///
+/// **Declaration order is §18.1's row order restricted to the variants
+/// implemented so far, so a new value is *inserted at its catalogued
+/// position and never appended*.** §18's preamble makes that normative,
+/// and it is a wire fact rather than a style preference: `schemars`
+/// generates `$defs.Status.enum` in declaration order, that array leaves
+/// the daemon on every `outputSchema` an agent reads, and
+/// `scripts/mcp-smoke.sh` compares it **positionally**.
+/// `the_status_enum_is_in_18_1_catalogue_order` is the guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Ok,
     Timeout,
     SessionDied,
+    // §18.1 puts `requires_confirmation` between `session_died` and
+    // these two; it is 0.0.8's, so on this tree they land adjacent.
+    SecretProvided,
+    SecretCancelled,
     SessionNotFound,
     NameTaken,
     LimitReached,
     SpawnFailed,
+    // §18.1 puts `confirmation_invalid` between `spawn_failed` and this
+    // one; also 0.0.8's, also absent here.
+    NotSupportedOnPlatform,
     Unavailable,
 }
 
@@ -23,10 +39,13 @@ impl Status {
             Self::Ok => "ok",
             Self::Timeout => "timeout",
             Self::SessionDied => "session_died",
+            Self::SecretProvided => "secret_provided",
+            Self::SecretCancelled => "secret_cancelled",
             Self::SessionNotFound => "session_not_found",
             Self::NameTaken => "name_taken",
             Self::LimitReached => "limit_reached",
             Self::SpawnFailed => "spawn_failed",
+            Self::NotSupportedOnPlatform => "not_supported_on_platform",
             Self::Unavailable => "unavailable",
         }
     }
@@ -37,10 +56,20 @@ impl Status {
     /// `isError: false` because a deadline elapsing is an outcome the
     /// agent is expected to handle (retry, read output, terminate), not a
     /// failure that should halt its plan.
+    /// `secret_provided` and `secret_cancelled` are both `false` per
+    /// §18.1's column: a request that was raised and answered, and one
+    /// that was raised and did not complete, are both outcomes an agent
+    /// branches on. `not_supported_on_platform` is `true` — the tool is
+    /// not available on this build at all, which is not an outcome of the
+    /// request.
     pub fn is_error(self) -> bool {
         matches!(
             self,
-            Self::SessionNotFound | Self::NameTaken | Self::LimitReached | Self::SpawnFailed
+            Self::SessionNotFound
+                | Self::NameTaken
+                | Self::LimitReached
+                | Self::SpawnFailed
+                | Self::NotSupportedOnPlatform
         )
     }
 }

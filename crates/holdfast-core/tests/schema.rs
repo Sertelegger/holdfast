@@ -24,10 +24,12 @@
 use holdfast_core::detect::Shell;
 use holdfast_core::mcp::envelope;
 use holdfast_core::mcp::tools::{
-    GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ReadOutputArgs, ResizeArgs,
-    SendInputArgs, StartSessionArgs, StatusArgs, TerminateArgs, WaitForPatternArgs,
+    GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ReadOutputArgs,
+    RequestSecretInputArgs, ResizeArgs, SendInputArgs, StartSessionArgs, StatusArgs, TerminateArgs,
+    WaitForPatternArgs,
 };
 use holdfast_core::mcp::HoldfastServer;
+use holdfast_core::platform::Capabilities;
 use holdfast_core::pty::{MockPty, PtyBackend};
 use holdfast_core::session::{new_session_id, Session, SessionConfig};
 use jsonschema::error::ValidationErrorKind;
@@ -55,6 +57,7 @@ fn advertised(name: &str) -> Tool {
         "get_screen_state" => HoldfastServer::get_screen_state_tool_attr(),
         "resize" => HoldfastServer::resize_tool_attr(),
         "interrupt" => HoldfastServer::interrupt_tool_attr(),
+        "request_secret_input" => HoldfastServer::request_secret_input_tool_attr(),
         other => panic!("no such tool: {other}"),
     }
 }
@@ -65,10 +68,10 @@ fn advertised(name: &str) -> Tool {
 ///
 /// **This array cannot see a tool that is in the router and not here** —
 /// `advertised()` panics on an unknown *name*, which is the other
-/// direction. `mcp::tools::tests::the_router_advertises_exactly_the_0_0_4_
+/// direction. `mcp::tools::tests::the_router_advertises_exactly_the_0_0_7_
 /// tool_set` is the link that closes it, because it reads `tool_router()`
 /// and this file cannot (`tool_router` is `pub(crate)`).
-const TOOLS: [&str; 11] = [
+const TOOLS: [&str; 12] = [
     "start_session",
     "read_output",
     "send_input",
@@ -80,6 +83,7 @@ const TOOLS: [&str; 11] = [
     "get_screen_state",
     "resize",
     "interrupt",
+    "request_secret_input",
 ];
 
 fn output_schema(name: &str) -> Value {
@@ -670,6 +674,16 @@ fn every_tool_declares_the_annotations_5_3_assigns_it() {
             Some(false),
             Some(true),
         ),
+        // §5.3's note on the destructive hint: `true` *"because it
+        // modifies session state and blocks waiting for the user"*.
+        (
+            "request_secret_input",
+            "Request a secret from the user",
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
+        ),
     ];
     assert_eq!(
         expected.len(),
@@ -723,11 +737,18 @@ fn every_envelope_status() -> Vec<envelope::Status> {
         match s {
             S::Ok => Some(S::Timeout),
             S::Timeout => Some(S::SessionDied),
-            S::SessionDied => Some(S::SessionNotFound),
+            // §18.1's order, and these are *insertions*: the three 0.0.7
+            // variants land at their catalogued positions rather than at
+            // the end of the chain. `Unavailable => None` not moving is
+            // the visible difference between splicing and appending.
+            S::SessionDied => Some(S::SecretProvided),
+            S::SecretProvided => Some(S::SecretCancelled),
+            S::SecretCancelled => Some(S::SessionNotFound),
             S::SessionNotFound => Some(S::NameTaken),
             S::NameTaken => Some(S::LimitReached),
             S::LimitReached => Some(S::SpawnFailed),
-            S::SpawnFailed => Some(S::Unavailable),
+            S::SpawnFailed => Some(S::NotSupportedOnPlatform),
+            S::NotSupportedOnPlatform => Some(S::Unavailable),
             S::Unavailable => None,
         }
     }
@@ -767,7 +788,7 @@ fn the_status_enum_declares_every_status_the_envelope_can_emit() {
     // because a `successor` chain that somehow returned `None` on its first
     // step would make both differences below empty against an empty set.
     assert!(
-        emitted.len() >= 8,
+        emitted.len() >= 11,
         "the status walk found only {} variant(s); it is not enumerating",
         emitted.len()
     );
@@ -2580,6 +2601,422 @@ async fn every_nested_object_a_tool_returns_has_its_key_set_pinned() {
     kill(&server, &id).await;
 }
 
+// ------------------------------------------- request_secret_input (§9.5)
+
+/// Drive one call to completion with a stand-in for an attached client,
+/// answering it however `answer` says.
+///
+/// The steps are the attach handler's own — take the slot, then report —
+/// because the point is to exercise the *tool*, not to mock it. The
+/// end-to-end version over a real `attach.sock` is `tests/secrets.rs`.
+async fn secret_call_answered_by(
+    server: &HoldfastServer,
+    id: &str,
+    args: RequestSecretInputArgs,
+    answer: impl FnOnce(&Arc<Session>) -> holdfast_core::secret::Resolution + Send + 'static,
+) -> CallToolResult {
+    let waiting = server.clone();
+    let call = tokio::spawn(async move {
+        waiting
+            .request_secret_input(Parameters(args))
+            .await
+            .expect("request_secret_input")
+    });
+    let hub = server.attach_hub();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let outstanding = loop {
+        if let Some(r) = hub.outstanding_secret(id) {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "the call never raised a request");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let raised = hub
+        .close_secret(id, Some(&outstanding.request_id))
+        .expect("the slot was ours to take");
+    let session = server.registry.get(id).expect("the session");
+    raised.answer(answer(&session));
+    call.await.expect("the waiting call")
+}
+
+#[tokio::test]
+async fn request_secret_input_secret_provided_response_matches_its_schema() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    let r = secret_call_answered_by(
+        &server,
+        &id,
+        RequestSecretInputArgs {
+            session: id.clone(),
+            prompt_text: "sudo password for deploy-user".into(),
+            timeout_secs: Some(20),
+            ..Default::default()
+        },
+        |session| holdfast_core::secret::Resolution::Provided {
+            bytes_written: session.write_input(b"\n").expect("write") as u64,
+        },
+    )
+    .await;
+
+    let payload = assert_matches_schema("request_secret_input", &r);
+    assert_eq!(payload["status"], "secret_provided");
+    // **Exactly**, not a subset: a subset check passes against a tool
+    // that declares a field it never emits *and* against one that emits a
+    // field it never declared.
+    assert_eq!(
+        keys(&payload["data"]),
+        {
+            let mut k = set(&["bytes_written", "request_id"]);
+            k.extend(set(&DETECTION_FIELDS));
+            k
+        },
+        "the secret_provided payload's key set moved"
+    );
+    assert_eq!(payload["data"]["bytes_written"], 1);
+    assert!(payload["data"]["request_id"]
+        .as_str()
+        .expect("a request_id")
+        .starts_with("secreq_"));
+    kill(&server, &id).await;
+}
+
+/// REQ-T-019: §5.4's block whole, and the nested `prompt` compared to
+/// `read_output`'s rather than to a literal of its own.
+///
+/// §5.4 records that per-tool literals are exactly what let
+/// `list_sessions[].prompt` diverge for five revisions, so the comparison
+/// is between the two responses.
+#[tokio::test]
+async fn request_secret_input_carries_the_whole_session_state_block() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    let reference = body(&read_tail(&server, &id).await);
+    let r = secret_call_answered_by(
+        &server,
+        &id,
+        RequestSecretInputArgs {
+            session: id.clone(),
+            prompt_text: "a prompt".into(),
+            timeout_secs: Some(20),
+            ..Default::default()
+        },
+        |session| holdfast_core::secret::Resolution::Provided {
+            bytes_written: session.write_input(b"\n").expect("write") as u64,
+        },
+    )
+    .await;
+    let payload = body(&r);
+
+    for field in DETECTION_FIELDS {
+        assert!(
+            payload["data"].get(field).is_some(),
+            "the §5.4 block is missing `{field}`; the tool assembled a narrower shape \
+             instead of calling the one builder"
+        );
+    }
+    assert_eq!(
+        keys(&payload["data"]["prompt"]),
+        keys(&reference["data"]["prompt"]),
+        "request_secret_input's `prompt` object diverged from read_output's"
+    );
+    kill(&server, &id).await;
+}
+
+#[tokio::test]
+async fn request_secret_input_secret_cancelled_response_matches_its_schema() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    let r = server
+        .request_secret_input(Parameters(RequestSecretInputArgs {
+            session: id.clone(),
+            prompt_text: "a prompt".into(),
+            timeout_secs: Some(1),
+            ..Default::default()
+        }))
+        .await
+        .expect("request_secret_input");
+
+    let payload = assert_matches_schema("request_secret_input", &r);
+    assert_eq!(payload["status"], "secret_cancelled");
+    // The second `data` shape, and it carries **no** session-state block:
+    // a schema that only ever saw the success path would not have noticed.
+    assert_eq!(keys(&payload["data"]), set(&["request_id", "reason"]));
+    assert_eq!(payload["data"]["reason"], "timeout");
+    kill(&server, &id).await;
+}
+
+/// REQ-SEC-004, REQ-T-015. The structural half: there is no field on this
+/// response able to hold a secret, and the assertion is an **exact key
+/// set** so a field added later fails whatever it is called.
+#[test]
+fn request_secret_input_has_no_field_that_could_carry_a_value() {
+    let schema = output_schema("request_secret_input");
+    let declared = keys(&schema["$defs"]["RequestSecretInput"]["properties"]);
+    assert_eq!(
+        declared,
+        {
+            let mut k = set(&["bytes_written", "request_id", "reason", "exit_code"]);
+            k.extend(set(&DETECTION_FIELDS));
+            k
+        },
+        "the declared key set moved; §9.2 marks the value `n/a` for redaction because it \
+         reaches no boundary a redactor could run at, so this schema is the control"
+    );
+    // And the named shapes, spelled out, because the equality above is
+    // the guard and this is the sentence that says what it is guarding.
+    for forbidden in ["value", "secret", "bytes", "data", "text", "password"] {
+        assert!(
+            !declared.contains(forbidden),
+            "`{forbidden}` is declared on the response of the one tool whose whole design \
+             is that the value never reaches it"
+        );
+    }
+    // The pairing: the key set is not empty, so the assertion above is
+    // not passing against a schema with no properties at all.
+    assert!(declared.contains("bytes_written"));
+}
+
+/// REQ-T-017's **sequence** clause (rev. 47), and the one thing nothing
+/// in `cargo test` could see before it.
+///
+/// Every other consumer of a `$defs.*.enum` array in this file collects
+/// into a `BTreeSet` first, which sorts and discards order; the only
+/// positional comparison in the repository is in `scripts/mcp-smoke.sh`,
+/// which `cargo test` never runs. §18's preamble makes declaration order
+/// §18.1's row order restricted to the implemented variants, so a new
+/// value is *inserted at its catalogued position and never appended* —
+/// and `schemars` puts that array on the wire.
+#[test]
+fn the_status_enum_is_in_18_1_catalogue_order() {
+    let expected: Vec<String> = [
+        "ok",
+        "timeout",
+        "session_died",
+        "secret_provided",
+        "secret_cancelled",
+        "session_not_found",
+        "name_taken",
+        "limit_reached",
+        "spawn_failed",
+        "not_supported_on_platform",
+        "unavailable",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+
+    let declared: Vec<String> = output_schema("read_output")["$defs"]["Status"]["enum"]
+        .as_array()
+        .expect("Status is an enum")
+        .iter()
+        .map(|v| v.as_str().expect("string variant").to_string())
+        .collect();
+    assert_eq!(
+        declared, expected,
+        "`schema::Status`'s declaration order is what leaves the daemon on every \
+         outputSchema, and scripts/mcp-smoke.sh compares it positionally"
+    );
+
+    let emitted: Vec<String> = every_envelope_status()
+        .iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+    assert_eq!(
+        emitted, expected,
+        "`envelope::Status` and `schema::Status` agree on membership and not on order"
+    );
+
+    // **The pairing, and it is not decoration.** This is what an
+    // *appending* implementation would have produced: the same eleven
+    // spellings, this milestone's three moved to the end. It has
+    // identical membership and a different sequence, which demonstrates
+    // in one run that every set-shaped guard in this file is green
+    // against the wrong answer.
+    let appended: Vec<String> = [
+        "ok",
+        "timeout",
+        "session_died",
+        "session_not_found",
+        "name_taken",
+        "limit_reached",
+        "spawn_failed",
+        "unavailable",
+        "secret_provided",
+        "secret_cancelled",
+        "not_supported_on_platform",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    assert_ne!(
+        appended, expected,
+        "the pairing must be a *different* order"
+    );
+    assert_eq!(
+        appended.iter().cloned().collect::<BTreeSet<_>>(),
+        expected.iter().cloned().collect::<BTreeSet<_>>(),
+        "…and the *same* membership, or it is not demonstrating what a set check misses"
+    );
+}
+
+/// §9.5's cap, in bytes.
+#[tokio::test]
+async fn a_prompt_text_of_513_bytes_is_a_protocol_error() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    let call = |text: String| {
+        let server = server.clone();
+        let id = id.clone();
+        async move {
+            server
+                .request_secret_input(Parameters(RequestSecretInputArgs {
+                    session: id,
+                    prompt_text: text,
+                    // The shortest legal window, so the accepted case
+                    // answers rather than parking this test for 120 s.
+                    timeout_secs: Some(1),
+                    ..Default::default()
+                }))
+                .await
+        }
+    };
+
+    assert!(
+        call("a".repeat(512)).await.is_ok(),
+        "512 bytes is at the cap and must be accepted"
+    );
+    let e = call("a".repeat(513))
+        .await
+        .expect_err("513 bytes is over §9.5's cap");
+    assert!(
+        format!("{e:?}").contains("prompt_text"),
+        "the error must name the argument: {e:?}"
+    );
+
+    // **The pairing that kills a `chars().count()` implementation.** 200
+    // three-byte codepoints is 200 characters and 600 bytes; §9.5 says
+    // bytes.
+    let wide = "€".repeat(200);
+    assert_eq!(wide.chars().count(), 200);
+    assert_eq!(wide.len(), 600);
+    assert!(
+        call(wide).await.is_err(),
+        "the cap counted characters, so 600 bytes of prompt text got through"
+    );
+    kill(&server, &id).await;
+}
+
+#[tokio::test]
+async fn timeout_secs_and_max_secret_bytes_are_bounded_in_both_directions() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    let call = |timeout_secs: Option<u32>, max_secret_bytes: Option<u32>| {
+        let server = server.clone();
+        let id = id.clone();
+        async move {
+            server
+                .request_secret_input(Parameters(RequestSecretInputArgs {
+                    session: id,
+                    prompt_text: "a prompt".into(),
+                    timeout_secs,
+                    max_secret_bytes,
+                    ..Default::default()
+                }))
+                .await
+        }
+    };
+
+    // Both ends of both knobs. One-sided validation passes every test
+    // that only probes the top.
+    assert!(call(Some(0), None).await.is_err(), "timeout_secs = 0");
+    assert!(call(Some(901), None).await.is_err(), "timeout_secs = 901");
+    assert!(
+        call(Some(1), Some(0)).await.is_err(),
+        "max_secret_bytes = 0"
+    );
+    assert!(
+        call(Some(1), Some(65_537)).await.is_err(),
+        "max_secret_bytes = 65537"
+    );
+    // The accepted boundaries, which is what stops the four assertions
+    // above from passing against a tool that rejects everything. The
+    // window is 1 s because 900 s of it would be a test nobody runs.
+    assert!(call(Some(1), Some(65_536)).await.is_ok(), "the ceilings");
+    kill(&server, &id).await;
+}
+
+/// REQ-SEC-010a, adversarially. **The agent cannot name a request.**
+#[tokio::test]
+async fn no_tool_argument_selects_a_request() {
+    // (a) The generated input schema has no `request_id` property. This
+    //     is the declaration an MCP client reads.
+    let schema = Value::Object((*advertised("request_secret_input").input_schema).clone());
+    assert_eq!(
+        keys(&schema["properties"]),
+        set(&[
+            "session",
+            "prompt_text",
+            "append_newline",
+            "timeout_secs",
+            "max_secret_bytes"
+        ]),
+        "the argument key set moved"
+    );
+    assert_eq!(
+        schema["additionalProperties"],
+        json!(false),
+        "`deny_unknown_fields` is what turns the schema above from documentation into a \
+         control; without it a smuggled `request_id` is silently swallowed"
+    );
+
+    // (b) A call carrying `request_id` as an extra argument is rejected,
+    //     through the same deserialiser the daemon uses.
+    let server = HoldfastServer::new();
+    let smuggled = json!({
+        "session": "sess_nope",
+        "prompt_text": "a prompt",
+        "request_id": "secreq_somebodyelses"
+    });
+    let refused = holdfast_core::mcp::passthrough::call_tool(
+        &server,
+        "request_secret_input",
+        smuggled.clone(),
+    )
+    .await
+    .expect("the tool is dispatchable");
+    let e = refused.expect_err("an argument the tool does not model must be refused");
+    assert!(
+        format!("{e:?}").contains("request_id"),
+        "the refusal must name the smuggled argument: {e:?}"
+    );
+
+    // **The pairing.** The identical call *without* the extra argument
+    // gets past the deserialiser — so (b) cannot be satisfied by a tool
+    // that rejects everything. `sess_nope` does not exist, so this is a
+    // `session_not_found` envelope rather than a protocol error, which is
+    // exactly the difference being asserted.
+    let mut plain = smuggled;
+    plain
+        .as_object_mut()
+        .expect("an object")
+        .remove("request_id");
+    let ok = holdfast_core::mcp::passthrough::call_tool(&server, "request_secret_input", plain)
+        .await
+        .expect("dispatchable")
+        .expect("the same call without the extra argument must reach the tool");
+    assert_eq!(body(&ok)["status"], "session_not_found");
+}
+
 /// §18.1, REQ-T-017: every status the agent is told to branch on is one
 /// some tool actually returns.
 ///
@@ -2742,6 +3179,126 @@ async fn every_declared_status_is_returned_by_a_real_response() {
                 .await
                 .expect("send_input"),
         ));
+    }
+
+    // ---- 0.0.7's three.
+
+    // secret_cancelled: a call with nobody attached to answer it, at the
+    // shortest legal window.
+    note(&body(
+        &server
+            .request_secret_input(Parameters(RequestSecretInputArgs {
+                session: id.clone(),
+                prompt_text: "a prompt".into(),
+                timeout_secs: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .expect("request_secret_input"),
+    ));
+
+    // secret_provided: the call waits; something plays the part of an
+    // attached client and answers it. The steps are the attach handler's
+    // own — take the slot, write, report the count — because that is what
+    // makes the status *reachable* rather than mocked. The end-to-end
+    // version, over a real `attach.sock`, is `tests/secrets.rs`.
+    {
+        let waiting = server.clone();
+        let waiting_id = id.clone();
+        let call = tokio::spawn(async move {
+            waiting
+                .request_secret_input(Parameters(RequestSecretInputArgs {
+                    session: waiting_id,
+                    prompt_text: "a prompt".into(),
+                    timeout_secs: Some(20),
+                    ..Default::default()
+                }))
+                .await
+                .expect("request_secret_input")
+        });
+        let hub = server.attach_hub();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let outstanding = loop {
+            if let Some(r) = hub.outstanding_secret(&id) {
+                break r;
+            }
+            assert!(Instant::now() < deadline, "the call never raised a request");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let raised = hub
+            .close_secret(&id, Some(&outstanding.request_id))
+            .expect("the slot was ours to take");
+        let session = server.registry.get(&id).expect("the session");
+        let written = session.write_input(b"\n").expect("write") as u64;
+        raised.answer(holdfast_core::secret::Resolution::Provided {
+            bytes_written: written,
+        });
+        note(&body(&call.await.expect("the waiting call")));
+    }
+
+    // not_supported_on_platform: §3.6's capability, forced. This is the
+    // reason `Capabilities` is a value rather than a `#[cfg]` — without
+    // the seam, this status is declared and unreachable on every machine
+    // CI runs on, which is exactly the defect this test exists to catch.
+    {
+        let windowsish = HoldfastServer::with_capabilities(
+            None,
+            Capabilities {
+                out_of_band_secret_input: false,
+            },
+        );
+        note(&body(
+            &windowsish
+                .request_secret_input(Parameters(RequestSecretInputArgs {
+                    session: "sess_nope".into(),
+                    prompt_text: "a prompt".into(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("request_secret_input"),
+        ));
+    }
+
+    // **The exhaustive match is what the set difference below cannot do.**
+    // A set difference is a *runtime* check over whatever the drives above
+    // happened to produce; this is a *compile-time* one. A variant added
+    // to `schema::Status` with no drive makes this function stop
+    // compiling, which is a red build at the moment the variant lands
+    // rather than a red test whenever somebody next runs the suite.
+    fn producer_of(s: holdfast_core::mcp::schema::Status) -> &'static str {
+        use holdfast_core::mcp::schema::Status as S;
+        match s {
+            S::Ok => "start_session on a live shell",
+            S::Timeout => "wait_for_pattern on a pattern that never matches",
+            S::SessionDied => "send_input after the child was killed",
+            S::SecretProvided => "request_secret_input answered by a stand-in client",
+            S::SecretCancelled => "request_secret_input with nobody attached",
+            S::SessionNotFound => "status on an id that does not exist",
+            S::NameTaken => "two start_session calls with one name",
+            S::LimitReached => "start_session against a registry of one, already full",
+            S::SpawnFailed => "start_session on a binary that does not exist",
+            S::NotSupportedOnPlatform => {
+                "request_secret_input on a server with out_of_band_secret_input forced false"
+            }
+            S::Unavailable => "get_command_history on a session with no shell integration",
+        }
+    }
+    // Named so `producer_of` is not dead code, and so the names are
+    // themselves asserted to be non-empty rather than merely present.
+    for s in [
+        holdfast_core::mcp::schema::Status::Ok,
+        holdfast_core::mcp::schema::Status::Timeout,
+        holdfast_core::mcp::schema::Status::SessionDied,
+        holdfast_core::mcp::schema::Status::SecretProvided,
+        holdfast_core::mcp::schema::Status::SecretCancelled,
+        holdfast_core::mcp::schema::Status::SessionNotFound,
+        holdfast_core::mcp::schema::Status::NameTaken,
+        holdfast_core::mcp::schema::Status::LimitReached,
+        holdfast_core::mcp::schema::Status::SpawnFailed,
+        holdfast_core::mcp::schema::Status::NotSupportedOnPlatform,
+        holdfast_core::mcp::schema::Status::Unavailable,
+    ] {
+        assert!(!producer_of(s).is_empty());
     }
 
     assert_eq!(
