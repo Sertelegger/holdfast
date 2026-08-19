@@ -17,6 +17,12 @@ struct MockState {
     echo: Option<bool>,
     canonical: Option<bool>,
     foreground: Option<i32>,
+    /// When set, SIGTERM is recorded and ignored; only SIGKILL kills.
+    /// An interactive shell behaves this way (§4.4), and without a
+    /// double that does, the reaper's SIGTERM-then-SIGKILL escalation is
+    /// unobservable — a child that dies on the first signal proves
+    /// nothing about the second.
+    traps_terminate: bool,
 }
 
 /// Something to run when `line_discipline` is sampled — see
@@ -59,6 +65,14 @@ impl MockPty {
             }),
             on_line_discipline_sample: Mutex::new(None),
         }
+    }
+
+    /// A mock that ignores SIGTERM and dies only on SIGKILL, the way an
+    /// interactive shell does (§4.4).
+    pub fn ignoring_terminate() -> Self {
+        let mock = Self::new();
+        mock.state.lock().traps_terminate = true;
+        mock
     }
 
     /// Queue bytes that subsequent `read` calls will return.
@@ -146,7 +160,12 @@ impl PtyBackend for MockPty {
     fn signal(&self, sig: Signal) -> Result<()> {
         let mut s = self.state.lock();
         s.signals.push(sig);
-        if matches!(sig, Signal::Terminate | Signal::Kill) {
+        let fatal = match sig {
+            Signal::Kill => true,
+            Signal::Terminate => !s.traps_terminate,
+            Signal::Interrupt => false,
+        };
+        if fatal {
             s.alive = false;
             s.exit_code.get_or_insert(0);
         }

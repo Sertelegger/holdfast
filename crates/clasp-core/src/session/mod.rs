@@ -1,10 +1,13 @@
 //! A single PTY-backed session.
 
+pub mod reaper;
 pub mod registry;
 pub mod wait;
+pub use reaper::Reaper;
 pub use registry::SessionRegistry;
 
 use crate::buffer::{BufferRead, OutputBuffer};
+use crate::clock::Clock;
 use crate::detect::history::{CommandEntry, CommandHistory, DEFAULT_MAX_ENTRIES};
 use crate::detect::{Detection, DetectionConfig, Osc133Source, PromptDetector, Shell};
 use crate::output::rules::RuleSet;
@@ -97,6 +100,30 @@ pub struct SessionConfig {
     pub terminal_queries: bool,
     /// §4.2 `terminal_query_replies_per_min`, default **60**.
     pub terminal_query_replies_per_min: u32,
+    /// §4.2 `default_idle_timeout_secs`, default **1800** (REQ-S-004).
+    ///
+    /// **`0` disables reaping for this session** — and a disabled session
+    /// is *skipped*, not given a deadline far in the future, because a
+    /// sentinel deadline eventually arrives. The resolved value is
+    /// `start_session(idle_timeout_secs:)` when the caller supplied one,
+    /// and `[limits] default_idle_timeout_secs` otherwise; that is
+    /// REQ-CFG-001's precedence pair, and the two names differ on
+    /// purpose.
+    pub idle_timeout_secs: u64,
+    /// The time source for this session's **activity stamps**.
+    ///
+    /// It has to be the reaper's clock and not wall time, or the two
+    /// halves of one decision are read off two different clocks: the
+    /// reaper asks "is `now` past the deadline" on the injectable clock
+    /// while the deadline was written from `SystemTime::now()`, and every
+    /// `advance the clock` test silently measures the gap between them
+    /// instead of the timeout. `Clock::system()` by default, which is
+    /// wall time and what production uses.
+    ///
+    /// **`exited_at_secs` deliberately does not read it.** That is a
+    /// wall-clock fact reported to a caller, not a deadline — the same
+    /// rule `daemon::server::unix_secs_now` follows.
+    pub clock: Clock,
 }
 
 impl Default for SessionConfig {
@@ -108,9 +135,15 @@ impl Default for SessionConfig {
             shell_integration: None,
             terminal_queries: true,
             terminal_query_replies_per_min: DEFAULT_TERMINAL_QUERY_REPLIES_PER_MIN,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            clock: Clock::system(),
         }
     }
 }
+
+/// §4.2's `default_idle_timeout_secs` (REQ-S-004). The config file
+/// overrides it globally and `start_session` per session.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1800;
 
 impl SessionConfig {
     /// A config with a non-default buffer size and everything else stock.
@@ -179,6 +212,27 @@ pub struct Session {
     /// the tree can see the latter, and a field that implies it would be
     /// a more precise lie than no field at all.
     exited_at_secs: Arc<AtomicI64>,
+    /// The absolute instant this session becomes reapable, in the same
+    /// Unix-epoch milliseconds `last_activity_ms` uses. **0 means reaping
+    /// is disabled** for this session (REQ-S-004's `idle_timeout_secs =
+    /// 0`), which the reaper skips rather than treating as a deadline in
+    /// the past.
+    ///
+    /// An `AtomicI64` beside `last_activity_ms` and **not behind the
+    /// session mutex** (REQ-S-007): the reaper reads every session on
+    /// every 30-second sweep, and taking a per-session lock to read a
+    /// deadline would put it in contention with the read path for no
+    /// reason. Written at exactly the sites that bump activity, so it can
+    /// never be stale with respect to the value it is derived from.
+    idle_deadline_ms: Arc<AtomicI64>,
+    /// `idle_timeout_secs * 1000`, or 0 when reaping is disabled. Fixed
+    /// at construction — 0.0.5 has no surface that changes a session's
+    /// timeout after `start_session` — so the reader thread captures it
+    /// by value rather than sharing an atomic it would never see change.
+    idle_timeout_ms: i64,
+    /// The clock the activity stamps above are written from. Held so
+    /// `touch` and the reaper cannot disagree about what time it is.
+    clock: Clock,
     pub created_at: std::time::SystemTime,
 }
 
@@ -205,6 +259,20 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The idle deadline for an activity stamp, or **0 when reaping is
+/// disabled**.
+///
+/// The zero is the whole of REQ-S-004's disable value and it is spelled
+/// here once, because a disabled session must be *skipped* rather than
+/// given a far-future sentinel — a sentinel eventually arrives.
+fn deadline_from(activity_ms: i64, idle_timeout_ms: i64) -> i64 {
+    if idle_timeout_ms <= 0 {
+        0
+    } else {
+        activity_ms.saturating_add(idle_timeout_ms)
+    }
+}
+
 /// `(cols, rows)` in one `u32`, so a reader can never observe a half-applied
 /// resize (a width from after the call beside a height from before it).
 fn pack_size(cols: u16, rows: u16) -> u32 {
@@ -229,7 +297,13 @@ impl Session {
         let buffer = Arc::new(Mutex::new(OutputBuffer::new(config.buffer_capacity)));
         let detector = Arc::new(Mutex::new(PromptDetector::new(config.detection)));
         let history = Arc::new(Mutex::new(CommandHistory::new(config.history_max_entries)));
-        let last_activity_ms = Arc::new(AtomicI64::new(now_ms()));
+        let clock = config.clock.clone();
+        let started_ms = clock.now_ms();
+        let last_activity_ms = Arc::new(AtomicI64::new(started_ms));
+        // Saturating, so a caller who asks for a century of idleness gets
+        // "effectively never" rather than a wrapped deadline in the past.
+        let idle_timeout_ms = (config.idle_timeout_secs as i64).saturating_mul(1000);
+        let idle_deadline_ms = Arc::new(AtomicI64::new(deadline_from(started_ms, idle_timeout_ms)));
         let (output_tx, _) = broadcast::channel(OUTPUT_BROADCAST_FRAMES);
 
         // Geometry and mode are applied by `set_screen_config` right
@@ -266,6 +340,9 @@ impl Session {
             output_tx: output_tx.clone(),
             last_activity_ms: Arc::clone(&last_activity_ms),
             exited_at_secs: Arc::new(AtomicI64::new(0)),
+            idle_deadline_ms: Arc::clone(&idle_deadline_ms),
+            idle_timeout_ms,
+            clock: clock.clone(),
             created_at: std::time::SystemTime::now(),
         });
 
@@ -281,6 +358,8 @@ impl Session {
         let weak_detector = Arc::downgrade(&detector);
         let weak_history = Arc::downgrade(&history);
         let activity = Arc::clone(&last_activity_ms);
+        let deadline = Arc::clone(&idle_deadline_ms);
+        let reader_clock = clock.clone();
         let reader_backend = Arc::clone(&backend);
         // §4.5.1's responder is used from the reader thread alone, so it
         // needs no `Mutex` and no `Weak` — it is moved into the closure
@@ -403,7 +482,13 @@ impl Session {
                 }
                 drop(detector);
                 drop(history);
-                activity.store(now_ms(), Ordering::Relaxed);
+                let at = reader_clock.now_ms();
+                activity.store(at, Ordering::Relaxed);
+                // The deadline moves with the stamp it is derived from,
+                // at every site that bumps one (REQ-S-005/REQ-S-007).
+                // Two atomics rather than one derived read, because the
+                // reaper's sweep must not have to hold anything.
+                deadline.store(deadline_from(at, idle_timeout_ms), Ordering::Relaxed);
             }
         });
 
@@ -951,7 +1036,7 @@ impl Session {
         }
         let pre_write_head = self.buffer.lock().head();
         self.backend.write(data)?;
-        self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+        self.touch();
         Ok(WriteAck {
             bytes_written: data.len(),
             pre_write_head,
@@ -961,10 +1046,57 @@ impl Session {
     /// Signals are *not* liveness-guarded: terminating an
     /// already-exited session is a no-op, not an error, so `terminate`
     /// stays idempotent.
+    ///
+    /// **This bumps activity, which the reaper must account for.** A
+    /// SIGTERM refreshes `last_activity_ms`, so an escalation that
+    /// re-derived "still idle" from the stamp after signalling would
+    /// never escalate. `session::reaper` tracks its own
+    /// SIGTERM-then-SIGKILL state for exactly that reason.
     pub fn signal(&self, sig: Signal) -> Result<()> {
         self.backend.signal(sig)?;
-        self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+        self.touch();
         Ok(())
+    }
+
+    /// Stamp activity now and move the idle deadline with it.
+    ///
+    /// One function rather than two stores at each site: the deadline is
+    /// derived from the stamp, and a site that updated one without the
+    /// other would leave a session reapable while it was busy — or
+    /// immortal while it was idle — with nothing that fails.
+    fn touch(&self) {
+        let at = self.clock.now_ms();
+        self.last_activity_ms.store(at, Ordering::Relaxed);
+        self.idle_deadline_ms
+            .store(deadline_from(at, self.idle_timeout_ms), Ordering::Relaxed);
+    }
+
+    /// The absolute instant this session becomes reapable, in Unix
+    /// epoch milliseconds. `None` when `idle_timeout_secs` is `0` and
+    /// reaping is disabled for it (REQ-S-004).
+    pub fn idle_deadline_ms(&self) -> Option<i64> {
+        match self.idle_deadline_ms.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    /// The resolved per-session idle timeout in seconds, `0` when
+    /// reaping is disabled.
+    pub fn idle_timeout_secs(&self) -> u64 {
+        (self.idle_timeout_ms / 1000).max(0) as u64
+    }
+
+    /// Whether this session is past its idle deadline on `now_ms`.
+    ///
+    /// A session with reaping disabled is **skipped**, not compared: the
+    /// naive `now - last >= 0` a zero timeout produces reaps immediately,
+    /// which is the opposite of what `0` means.
+    pub fn is_past_idle_deadline(&self, now_ms: i64) -> bool {
+        match self.idle_deadline_ms() {
+            None => false,
+            Some(deadline) => now_ms >= deadline,
+        }
     }
 }
 
@@ -1913,6 +2045,8 @@ mod tests {
                 // default is 60) answers both queries instead of one.
                 terminal_queries: true,
                 terminal_query_replies_per_min: 1,
+                idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+                clock: Clock::system(),
             },
         );
         pty.queue_output(&bytes);

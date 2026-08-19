@@ -168,7 +168,6 @@ pub struct Config {
     pub daemon: DaemonConfig,
 }
 
-
 /// §4.2's limits table.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]

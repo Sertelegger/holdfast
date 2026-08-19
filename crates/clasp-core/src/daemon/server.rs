@@ -15,12 +15,13 @@ use crate::mcp::{passthrough, ClaspServer};
 use crate::protocol::frame::{self, FrameError};
 use crate::protocol::handshake::{self, ClientKind, HandshakeParams};
 use crate::protocol::method::{self, ErrorCode, Request, Response};
+use crate::session::Reaper;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
@@ -45,6 +46,38 @@ pub struct StopParams {
     pub force: Option<bool>,
     #[serde(default)]
     pub timeout_secs: Option<u32>,
+}
+
+/// §7.4.1's and §3.2's default `daemon/stop` grace.
+///
+/// **Ten seconds, and deliberately not the reaper's five.** Three graces
+/// meet in this milestone: `daemon/stop`'s 10 s (§7.4.1's `timeout_secs`
+/// default, restated in §3.2 as *"wait up to 10 seconds for clean
+/// shutdown"*), the idle reaper's 5 s (REQ-S-005, §16.7), and
+/// `terminate(force=false)`'s 5 s (§5.2, REQ-P-004). The reaper's is the
+/// one that leaked into this constant in an earlier revision, and it is
+/// invisible to any test that passes an explicit `timeout_secs` — which
+/// is why `stop_defaults_its_grace_to_ten_seconds_not_the_reapers_five`
+/// reads the resolved value rather than timing the call.
+pub const DEFAULT_STOP_GRACE_SECS: u32 = 10;
+
+/// How often the graceful stop re-checks whether the sessions have gone.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+impl StopParams {
+    /// Whether this stop escalates immediately. Absent means `false`,
+    /// which is §7.4.1's default and the graceful path.
+    pub fn is_forced(&self) -> bool {
+        self.force.unwrap_or(false)
+    }
+
+    /// The resolved grace: the caller's `timeout_secs`, or
+    /// [`DEFAULT_STOP_GRACE_SECS`].
+    pub fn grace(&self) -> Duration {
+        Duration::from_secs(u64::from(
+            self.timeout_secs.unwrap_or(DEFAULT_STOP_GRACE_SECS),
+        ))
+    }
 }
 
 /// `daemon/stop` response data.
@@ -184,7 +217,12 @@ impl Daemon {
         Arc::new(Self {
             server: ClaspServer::with_audit_path_and_config(Some(audit_path), &config),
             paths,
-            started_at: Instant::now(),
+            // On the daemon's own clock, not `Instant::now()`. §7.3's
+            // window falls back to this when no client has ever
+            // connected, and comparing a hand-driven `now` against a
+            // wall-clock origin would measure the gap between two clocks
+            // rather than the window.
+            started_at: clock.now(),
             shutdown_tx,
             connections: AtomicU64::new(0),
             owner_uid,
@@ -248,8 +286,12 @@ impl Daemon {
         }
     }
 
-    /// Ask the accept loop to stop. Returns how many live sessions were
-    /// killed on the way out.
+    /// Ask the accept loop to stop, killing every live session outright.
+    ///
+    /// The immediate form: SIGKILL, no grace. Used by the SIGTERM
+    /// handler, by `daemon/stop` with `force: true`, and by the
+    /// belt-and-braces call at the end of [`run`]. The graceful form is
+    /// [`Daemon::shutdown_graceful`].
     pub fn shutdown(&self) -> u64 {
         let mut terminated = 0;
         for session in self.server.registry.all() {
@@ -260,6 +302,84 @@ impl Daemon {
         }
         let _ = self.shutdown_tx.send(true);
         terminated
+    }
+
+    /// `daemon/stop` with `force: false`: SIGTERM every live session,
+    /// wait up to `grace` for them to go, then SIGKILL whatever is left.
+    ///
+    /// Returns how many sessions were signalled, which is the count
+    /// `StopOutcome.sessions_terminated` reports either way.
+    ///
+    /// The grace is §7.4.1's and §3.2's **10 s by default and not the
+    /// reaper's 5** — see [`StopParams::grace`]. It covers *every*
+    /// session sweeping down at once, including interactive shells, which
+    /// ignore SIGTERM (§4.4) and always reach the escalation; the
+    /// reaper's grace covers one session at a time.
+    pub async fn shutdown_graceful(&self, grace: Duration) -> u64 {
+        let live: Vec<_> = self
+            .server
+            .registry
+            .all()
+            .into_iter()
+            .filter(|s| s.is_alive())
+            .collect();
+        for session in &live {
+            let _ = session.signal(crate::pty::Signal::Terminate);
+        }
+
+        if !live.is_empty() {
+            // Poll rather than sleeping the whole grace: a well-behaved
+            // child exits in milliseconds, and making every `clasp daemon
+            // stop` cost ten seconds would be a tax on the common case.
+            let deadline = self.clock.now() + grace;
+            while self.clock.now() < deadline {
+                if live.iter().all(|s| !s.is_alive()) {
+                    break;
+                }
+                let next = (self.clock.now() + STOP_POLL_INTERVAL).min(deadline);
+                self.clock.sleep_until(next).await;
+            }
+            for session in &live {
+                if session.is_alive() {
+                    let _ = session.signal(crate::pty::Signal::Kill);
+                }
+            }
+        }
+
+        let _ = self.shutdown_tx.send(true);
+        live.len() as u64
+    }
+
+    /// §7.3's client-less exit, as a **conjunction** (REQ-D-006).
+    ///
+    /// *"Daemon exits … when **all** sessions have exited **and** no
+    /// clients have connected for >24 hours (configurable, can be
+    /// disabled)."* Both conjuncts, or the daemon reaches its window with
+    /// live sessions and takes them down with it — a `sleep 86400` in a
+    /// session nobody has attached to is exactly the case this feature
+    /// must not kill, and it is the case the feature exists for.
+    ///
+    /// **`0` disables it**, which is 0.0.5's ruling: §7.3 says the exit
+    /// is *"configurable, can be disabled"* and names neither the key nor
+    /// the disabling value, and `0` is the spelling
+    /// `[limits] default_idle_timeout_secs` already uses for the same
+    /// idea in the same file.
+    pub fn client_less_exit_due(&self) -> bool {
+        let window = self.config().daemon.idle_shutdown_after_secs;
+        if window == 0 {
+            return false;
+        }
+        // First conjunct: every session has exited. Exited sessions keep
+        // their registry entries (§5.5.1), so this asks about liveness
+        // rather than about emptiness.
+        if self.server.registry.all().iter().any(|s| s.is_alive()) {
+            return false;
+        }
+        // Second conjunct: the window runs from the **last connection**,
+        // not from boot — a daemon in continuous use must not be killed
+        // by a timer that started when the process did.
+        let since = self.last_client_connect().unwrap_or(self.started_at);
+        self.clock.now().saturating_duration_since(since) >= Duration::from_secs(window)
     }
 
     pub fn shutdown_signalled(&self) -> watch::Receiver<bool> {
@@ -330,6 +450,67 @@ pub async fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
     }
 }
 
+/// How often the reaper loop re-runs the §19.1 rotation sweep.
+///
+/// §19.1 rolls on a period boundary and the retention windows are days
+/// and weeks, so once a day is the right cadence — and it is on the
+/// reaper's tick rather than on every write, which would put a directory
+/// walk in the read path.
+const LOG_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The daemon's one periodic tick: the idle reaper (§16.7), §7.3's
+/// client-less exit, and §19.1's rotation sweep.
+///
+/// All three live here because the reaper is the only periodic timer in
+/// the process, and a second one would be a second answer to "how often
+/// does the daemon look at itself".
+async fn reaper_loop(daemon: Arc<Daemon>) {
+    let reaper = Reaper::new(Arc::clone(&daemon.server.registry), daemon.clock());
+    let mut shutdown = daemon.shutdown_signalled();
+    let clock = daemon.clock();
+    let mut next_log_sweep = clock.now() + LOG_SWEEP_INTERVAL;
+
+    loop {
+        reaper.scan_once();
+
+        // §7.3's conjunction, checked after the sweep so a session the
+        // reaper just took down counts towards "all sessions have
+        // exited" on this pass rather than the next one.
+        if daemon.client_less_exit_due() {
+            daemon.shutdown();
+            return;
+        }
+
+        if clock.now() >= next_log_sweep {
+            let retention = LogRetention::from(daemon.config());
+            match daemon
+                .paths()
+                .sweep_logs(retention, std::time::SystemTime::now())
+            {
+                // The daemon has held `audit.log` open since start-up, so
+                // a rotation here renames the file out from under an open
+                // descriptor. Without the reopen every subsequent record
+                // lands in an unlinked inode: every file on disk looks
+                // correct and §9.4's trail silently stops.
+                Ok(sweep) => {
+                    if !sweep.rotated.is_empty() {
+                        if let Err(e) = daemon.server.processor.audit.reopen() {
+                            eprintln!("clasp daemon: cannot reopen the audit log: {e}");
+                        }
+                    }
+                }
+                Err(e) => eprintln!("clasp daemon: log rotation sweep failed: {e}"),
+            }
+            next_log_sweep = clock.now() + LOG_SWEEP_INTERVAL;
+        }
+
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = reaper.wait_for_next_tick() => {}
+        }
+    }
+}
+
 /// Run a daemon to completion: bind, write the pid file, serve, clean up.
 pub async fn run(paths: RuntimePaths) -> anyhow::Result<()> {
     // **Config first, and before `bind_control`** (REQ-CFG-003). An
@@ -377,6 +558,8 @@ pub async fn run(paths: RuntimePaths) -> anyhow::Result<()> {
         term.recv().await;
         sig_daemon.shutdown();
     });
+
+    tokio::spawn(reaper_loop(Arc::clone(&daemon)));
 
     serve(Arc::clone(&daemon), listener).await;
 
@@ -574,17 +757,19 @@ async fn dispatch(
         ),
         method::METHOD_DAEMON_STOP => {
             // `force` and `timeout_secs` describe how hard to push the
-            // *sessions*; 0.0.5 always sends SIGKILL to the process
-            // group, so both are **parsed and then deliberately unused**
-            // until the reaper's SIGTERM-then-SIGKILL escalation lands.
+            // *sessions*, and Task 16 makes them differentiate: `force:
+            // false` is SIGTERM, wait `timeout_secs`, then SIGKILL;
+            // `force: true` escalates immediately. The wire shape was
+            // settled in Task 3 precisely so this needed no protocol
+            // change.
+            //
             // Parsed, not ignored: this used to be `unwrap_or_default()`,
             // which made `daemon/stop` the one method that answers `ok`
             // to structurally garbage params — and, worse, left
             // `StopParams`' wire names unpinned, because nothing could
-            // observe whether the daemon had read them. Task 16 makes
-            // these two knobs differentiate behaviour, at which point a
-            // rename would silently stop forcing with nothing red.
-            let _params: StopParams = match req.params_as() {
+            // observe whether the daemon had read them. Now that the
+            // knobs act, a rename would silently stop forcing.
+            let params: StopParams = match req.params_as() {
                 Ok(p) => p,
                 Err(e) => {
                     return (
@@ -593,7 +778,11 @@ async fn dispatch(
                     )
                 }
             };
-            let terminated = daemon.shutdown();
+            let terminated = if params.is_forced() {
+                daemon.shutdown()
+            } else {
+                daemon.shutdown_graceful(params.grace()).await
+            };
             let outcome = StopOutcome {
                 stopped_at_unix_secs: unix_secs_now(),
                 sessions_terminated: terminated,
@@ -877,5 +1066,250 @@ mod tests {
 
         daemon.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------ §7.3's client-less exit (Task 16)
+
+    fn scratch(tag: &str) -> RuntimePaths {
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        RuntimePaths::with_dir(format!("/tmp/clasp-d16-{tag}-{}", &unique[..8]))
+    }
+
+    struct Scratch(RuntimePaths);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.dir());
+        }
+    }
+
+    fn configured(window: u64) -> Config {
+        crate::config::parse_str(&format!("[daemon]\nidle_shutdown_after_secs = {window}\n"))
+            .expect("loads")
+    }
+
+    fn mock_session(id: &str, clock: &Clock) -> Arc<crate::session::Session> {
+        crate::session::Session::new(
+            id.to_string(),
+            None,
+            "mock".into(),
+            vec![],
+            Arc::new(crate::pty::MockPty::new()),
+            crate::session::SessionConfig {
+                idle_timeout_secs: 0,
+                clock: clock.clone(),
+                ..crate::session::SessionConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_client_less_daemon_exits_after_the_configured_window() {
+        let paths = scratch("clientless");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        let daemon = Daemon::with_config_and_clock(paths, configured(86_400), clock.clone());
+
+        assert!(!daemon.client_less_exit_due(), "not yet");
+        clock.advance(Duration::from_secs(86_401));
+        assert!(
+            daemon.client_less_exit_due(),
+            "REQ-D-006's second half was configured, documented and never armed"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_has_seen_a_client_does_not_exit_on_the_window() {
+        // The pairing: a timer measured from process start kills a daemon
+        // in continuous use and passes the row above perfectly.
+        let paths = scratch("seen");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        let daemon = Daemon::with_config_and_clock(paths, configured(86_400), clock.clone());
+
+        clock.advance(Duration::from_secs(3600));
+        daemon.note_client_connect();
+        clock.advance(Duration::from_secs(82_801)); // 86 401 s from boot
+        assert!(
+            !daemon.client_less_exit_due(),
+            "the window runs from the last connection, not from boot"
+        );
+        clock.advance(Duration::from_secs(3600));
+        assert!(daemon.client_less_exit_due(), "and it still expires");
+    }
+
+    #[test]
+    fn a_client_less_daemon_does_not_exit_while_a_session_is_live() {
+        // **§7.3's `and`, and the arm that matters.** The client-less half
+        // alone passes against an implementation that ignores sessions
+        // entirely — and that implementation kills the long build nobody
+        // is attached to, which is the case this feature exists for.
+        let paths = scratch("livesession");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        let daemon = Daemon::with_config_and_clock(paths, configured(86_400), clock.clone());
+
+        let live = mock_session("sess_build", &clock);
+        daemon.server.registry.insert(Arc::clone(&live)).unwrap();
+
+        clock.advance(Duration::from_secs(86_401));
+        assert!(
+            !daemon.client_less_exit_due(),
+            "a `sleep 86400` nobody attached to was about to be killed by \
+             the idle-shutdown timer"
+        );
+        assert!(live.is_alive());
+
+        // The pairing inside the pairing: once it exits, the window bites.
+        live.signal(crate::pty::Signal::Kill).unwrap();
+        assert!(
+            daemon.client_less_exit_due(),
+            "with every session exited and no client, the window applies"
+        );
+    }
+
+    #[test]
+    fn idle_shutdown_after_secs_zero_disables_the_client_less_exit() {
+        let paths = scratch("zerowindow");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        // The config must **load**, which is the half Task 15's non-zero
+        // rule would otherwise have taken.
+        let config = configured(0);
+        assert_eq!(config.daemon.idle_shutdown_after_secs, 0);
+        let daemon = Daemon::with_config_and_clock(paths, config, clock.clone());
+
+        clock.advance(Duration::from_secs(7 * 86_400));
+        assert!(
+            !daemon.client_less_exit_due(),
+            "`0` was treated as \"exit immediately\", which is what a naive \
+             `now - last >= 0` does and which kills every daemon at its \
+             first scan"
+        );
+    }
+
+    // ------------------------------------- daemon/stop escalation (Task 16)
+
+    #[test]
+    fn stop_defaults_its_grace_to_ten_seconds_not_the_reapers_five() {
+        // Read off the resolved value rather than by timing the call: both
+        // rows below drive an explicit value or a trapping child, and
+        // neither observes the default. The reaper's 5 s is the number
+        // that leaked into this default in an earlier revision.
+        assert_eq!(StopParams::default().grace(), Duration::from_secs(10));
+        assert_eq!(DEFAULT_STOP_GRACE_SECS, 10);
+        assert_ne!(
+            StopParams::default().grace(),
+            crate::session::reaper::REAP_GRACE,
+            "daemon/stop took the idle reaper's grace"
+        );
+        // And a caller's value wins, or the default is the only value.
+        assert_eq!(
+            StopParams {
+                force: None,
+                timeout_secs: Some(3)
+            }
+            .grace(),
+            Duration::from_secs(3)
+        );
+        assert!(
+            !StopParams::default().is_forced(),
+            "§7.4.1: force defaults to false"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_without_force_sends_sigterm_first() {
+        let paths = scratch("gracefulstop");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = Daemon::new(paths);
+
+        let mock = Arc::new(crate::pty::MockPty::new());
+        let s = crate::session::Session::new(
+            "sess_graceful".into(),
+            None,
+            "mock".into(),
+            vec![],
+            Arc::clone(&mock) as Arc<dyn crate::pty::PtyBackend>,
+            crate::session::SessionConfig::default(),
+        );
+        daemon.server.registry.insert(Arc::clone(&s)).unwrap();
+
+        let terminated = daemon.shutdown_graceful(Duration::from_secs(10)).await;
+        assert_eq!(terminated, 1);
+        assert_eq!(
+            mock.signals().first(),
+            Some(&crate::pty::Signal::Terminate),
+            "`force: false` must SIGTERM first; `force` still ignored is the \
+             state this replaces"
+        );
+        assert!(!s.is_alive());
+    }
+
+    #[tokio::test]
+    async fn stop_with_force_does_not_wait_for_the_grace_period() {
+        // The pairing: escalating unconditionally makes `force` cosmetic,
+        // and waiting unconditionally makes a forced stop cost the grace.
+        let paths = scratch("forcedstop");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = Daemon::new(paths);
+
+        let mock = Arc::new(crate::pty::MockPty::ignoring_terminate());
+        let s = crate::session::Session::new(
+            "sess_forced".into(),
+            None,
+            "mock".into(),
+            vec![],
+            Arc::clone(&mock) as Arc<dyn crate::pty::PtyBackend>,
+            crate::session::SessionConfig::default(),
+        );
+        daemon.server.registry.insert(Arc::clone(&s)).unwrap();
+
+        let started = Instant::now();
+        let terminated = daemon.shutdown();
+        assert_eq!(terminated, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a forced stop waited out a grace it was told to skip"
+        );
+        assert_eq!(mock.signals(), vec![crate::pty::Signal::Kill]);
+        assert!(!s.is_alive());
+    }
+
+    #[tokio::test]
+    async fn a_graceful_stop_escalates_a_child_that_ignores_sigterm() {
+        // A trapping child is the case §4.4 names, and without the
+        // escalation a graceful stop leaves it running forever.
+        let paths = scratch("trapstop");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = Daemon::new(paths);
+
+        let mock = Arc::new(crate::pty::MockPty::ignoring_terminate());
+        let s = crate::session::Session::new(
+            "sess_trapstop".into(),
+            None,
+            "mock".into(),
+            vec![],
+            Arc::clone(&mock) as Arc<dyn crate::pty::PtyBackend>,
+            crate::session::SessionConfig::default(),
+        );
+        daemon.server.registry.insert(Arc::clone(&s)).unwrap();
+
+        // A short explicit grace, so this row costs milliseconds rather
+        // than the ten seconds the default would.
+        let terminated = daemon.shutdown_graceful(Duration::from_millis(120)).await;
+        assert_eq!(terminated, 1);
+        assert_eq!(
+            mock.signals(),
+            vec![crate::pty::Signal::Terminate, crate::pty::Signal::Kill],
+            "SIGTERM alone leaves a trapping child running forever"
+        );
+        assert!(!s.is_alive());
     }
 }

@@ -350,6 +350,11 @@ fn session_record_keys() -> BTreeSet<String> {
         "started_at_unix_secs",
         "exited_at_unix_secs",
         "last_activity_unix_ms",
+        // 0.0.5's reaper closes §5.2's declared-but-unemitted
+        // `idle_deadline`. Emitted through the one shared
+        // `session_record`, so `list_sessions` carries it too — a field
+        // on only one of the two is REQ-T-015's fault.
+        "idle_deadline_unix_secs",
         "buffer",
         // The session's cumulative redaction tally (§9.2, REQ-O-012).
         // Emitted by both tools through the one shared `session_record`,

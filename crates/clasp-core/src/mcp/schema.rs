@@ -335,6 +335,12 @@ pub struct SessionRecord {
     pub command_count: Option<u64>,
     pub started_at_unix_secs: Option<u64>,
     pub last_activity_unix_ms: Option<i64>,
+    /// Unix seconds at which the idle reaper will terminate this session
+    /// (§5.2, REQ-S-004/REQ-S-007). **`null` means reaping is disabled**
+    /// for it — `idle_timeout_secs = 0` — which is a different statement
+    /// from a deadline far in the future. Named for its unit per
+    /// REQ-T-018.
+    pub idle_deadline_unix_secs: Option<u64>,
     pub buffer: Option<Buffer>,
     /// Cumulative `rule kind -> count` for the session (§9.2). Distinct
     /// from `read_output.redactions`, which is per response (REQ-O-012).

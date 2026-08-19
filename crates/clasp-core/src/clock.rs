@@ -39,6 +39,17 @@ enum Inner {
     Manual {
         now: Mutex<Instant>,
         waiters: Mutex<Vec<(Instant, oneshot::Sender<()>)>>,
+        /// Where the hand started, and the Unix-epoch millisecond it
+        /// stood at then.
+        ///
+        /// `Instant` is monotonic and has no epoch, but
+        /// `Session::last_activity_ms` is Unix-epoch milliseconds — so a
+        /// purely `Instant`-based clock cannot be compared with the one
+        /// value the reaper's whole decision rests on. Anchoring the
+        /// hand to an epoch here keeps that comparison inside one clock
+        /// instead of quietly mixing two.
+        start: Instant,
+        epoch_ms: i64,
     },
 }
 
@@ -54,6 +65,8 @@ impl Clock {
         Clock(Arc::new(Inner::Manual {
             now: Mutex::new(start),
             waiters: Mutex::new(Vec::new()),
+            start,
+            epoch_ms: system_now_ms(),
         }))
     }
 
@@ -71,6 +84,28 @@ impl Clock {
         }
     }
 
+    /// The current time **on this clock**, in Unix-epoch milliseconds.
+    ///
+    /// This is the view the reaper needs: `Session::last_activity_ms`
+    /// and `Session::idle_deadline_ms` are epoch millis, so comparing
+    /// them against `Instant`s would be comparing two clocks. On
+    /// `Manual` it advances only when [`Clock::advance`] does, which is
+    /// what lets a test drive a 30-minute timeout in microseconds.
+    pub fn now_ms(&self) -> i64 {
+        match &*self.0 {
+            Inner::System => system_now_ms(),
+            Inner::Manual {
+                now,
+                start,
+                epoch_ms,
+                ..
+            } => {
+                let elapsed = now.lock().saturating_duration_since(*start);
+                epoch_ms.saturating_add(elapsed.as_millis() as i64)
+            }
+        }
+    }
+
     /// Resolves once `deadline` has passed **on this clock**. `System`
     /// is a `tokio::time::sleep_until`; `Manual` parks a waiter and
     /// returns only when [`Clock::advance`] moves the hand past it.
@@ -79,7 +114,7 @@ impl Clock {
             Inner::System => {
                 tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
             }
-            Inner::Manual { now, waiters } => {
+            Inner::Manual { now, waiters, .. } => {
                 let rx = {
                     // `now` is taken before `waiters` here and in
                     // `advance`, so the two can never deadlock; holding
@@ -110,7 +145,7 @@ impl Clock {
             Inner::System => {
                 panic!("Clock::advance called on the system clock: only a manual clock has a hand")
             }
-            Inner::Manual { now, waiters } => {
+            Inner::Manual { now, waiters, .. } => {
                 let mut fired = {
                     // Same lock order as `sleep_until`: `now`, then
                     // `waiters`. Holding both across the split is what
@@ -142,6 +177,13 @@ impl Clock {
             }
         }
     }
+}
+
+fn system_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl std::fmt::Debug for Clock {
@@ -268,6 +310,35 @@ mod tests {
         tokio::time::timeout(WAKE_BOUND, clock.sleep_until(deadline))
             .await
             .expect("a deadline already behind the hand parked forever");
+    }
+
+    #[test]
+    fn the_epoch_view_advances_with_the_hand_and_not_with_wall_time() {
+        // The reaper compares `Clock::now_ms()` against
+        // `Session::last_activity_ms`, which is Unix-epoch millis. A
+        // `now_ms` that read `SystemTime::now()` even on a manual clock
+        // would make every "advance the clock" reaper test a wall-clock
+        // test — the exact failure `Clock` exists to prevent, one field
+        // deeper.
+        let clock = Clock::manual(Instant::now());
+        let before = clock.now_ms();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(before, clock.now_ms(), "the epoch view followed wall time");
+        clock.advance(Duration::from_secs(1800));
+        assert_eq!(clock.now_ms(), before + 1_800_000);
+    }
+
+    #[test]
+    fn the_system_epoch_view_is_real_wall_time() {
+        // The pairing: a `now_ms` that always returned a frozen value
+        // would pass the row above and stop the production reaper dead.
+        let clock = Clock::system();
+        let a = clock.now_ms();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            clock.now_ms() > a,
+            "the system clock's epoch view did not move"
+        );
     }
 
     #[test]

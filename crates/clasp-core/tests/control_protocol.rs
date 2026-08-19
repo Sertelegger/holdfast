@@ -53,11 +53,18 @@ struct TestDaemon {
 
 impl TestDaemon {
     async fn start(tag: &str) -> Self {
+        Self::start_with(tag, clasp_core::config::Config::default()).await
+    }
+
+    /// A daemon built from an explicit `config.toml`, which is how the
+    /// precedence half of REQ-CFG-001 is testable over the wire: the
+    /// global value has to reach the daemon that runs `start_session`.
+    async fn start_with(tag: &str, config: clasp_core::config::Config) -> Self {
         // Short path: `sockaddr_un.sun_path` cannot hold a socket under
         // the workspace's `target/` directory.
         let paths = RuntimePaths::with_dir(scratch_dir(tag));
         let listener = server::bind_control(&paths).expect("bind control.sock");
-        let daemon = Daemon::new(paths.clone());
+        let daemon = Daemon::with_config(paths.clone(), config);
         tokio::spawn(server::serve(Arc::clone(&daemon), listener));
         // The connect probe below proves the socket *file* is bound, and
         // nothing more. `bind_control` hands back an already-`listen()`ing
@@ -1187,4 +1194,137 @@ async fn a_stale_socket_file_is_cleared_rather_than_blocking_startup() {
     let listener = server::bind_control(&paths).expect("stale socket must be cleared");
     drop(listener);
     remove_dir_all_retrying(paths.dir());
+}
+
+/// REQ-CFG-001's precedence pair, over the wire, where both layers can
+/// actually be set: `hardcoded < global TOML < per-session args`.
+///
+/// **The two key names differ and that is the point.** The global knob is
+/// `[limits] default_idle_timeout_secs` and the per-session argument is
+/// `idle_timeout_secs`; unifying them would delete the distinction the
+/// precedence rule is about, and under `deny_unknown_fields` a config
+/// spelled with the narrow name would not load at all.
+#[tokio::test]
+async fn a_per_session_argument_beats_the_config_file() {
+    let config = clasp_core::config::parse_str("[limits]\ndefault_idle_timeout_secs = 60\n")
+        .expect("the global half loads under its own name");
+    let d = TestDaemon::start_with("precedence", config).await;
+    let client = d.client().await.unwrap();
+
+    // No argument: the config file's value governs, which is the arm
+    // that fails if the daemon never reads its config.
+    let params = method::to_cbor(&json!({
+        "command": "bash",
+        "args": ["--norc", "--noprofile"],
+        "name": "from-config",
+    }))
+    .unwrap();
+    let resp = client.call_raw("tool/start_session", params).await.unwrap();
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    let global_id = data["session_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        d.daemon
+            .server
+            .registry
+            .get(&global_id)
+            .unwrap()
+            .idle_timeout_secs(),
+        60,
+        "the global TOML value did not reach start_session"
+    );
+
+    // With an argument: 120 wins. Precedence applied in the wrong order
+    // is indistinguishable unless both layers set the same knob, which
+    // is why this test sets both.
+    let params = method::to_cbor(&json!({
+        "command": "bash",
+        "args": ["--norc", "--noprofile"],
+        "name": "from-argument",
+        "idle_timeout_secs": 120,
+    }))
+    .unwrap();
+    let resp = client.call_raw("tool/start_session", params).await.unwrap();
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    let per_session_id = data["session_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        d.daemon
+            .server
+            .registry
+            .get(&per_session_id)
+            .unwrap()
+            .idle_timeout_secs(),
+        120,
+        "the per-session argument lost to the config file"
+    );
+}
+
+/// §5.2 declared `idle_deadline` from rev. 2 and nothing emitted it.
+///
+/// Asserted over the wire because the field is built in the one shared
+/// `session_record`, so `status` and `list_sessions` must both carry it —
+/// a field on only one of them is REQ-T-015's declared-but-unemitted
+/// fault wearing the other shape.
+#[tokio::test]
+async fn status_reports_the_idle_deadline_and_null_means_disabled() {
+    let d = TestDaemon::start("idledeadline").await;
+    let client = d.client().await.unwrap();
+
+    let reaped = start_bash(&client, "reapable").await;
+    let params = method::to_cbor(&json!({ "session": reaped })).unwrap();
+    let resp = client.call_raw("tool/status", params).await.unwrap();
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    let deadline = data["idle_deadline_unix_secs"]
+        .as_u64()
+        .expect("a session with reaping enabled carries a deadline");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        deadline > now && deadline <= now + 1801,
+        "the deadline must be about half an hour out, got {deadline} against {now}"
+    );
+
+    // The pairing: `null` means *disabled*, which is a different
+    // statement from "far away". A deadline emitted as a far-future
+    // sentinel instead would pass the arm above and make the disable
+    // value unobservable.
+    let params = method::to_cbor(&json!({
+        "command": "bash",
+        "args": ["--norc", "--noprofile"],
+        "name": "never-reaped",
+        "idle_timeout_secs": 0,
+    }))
+    .unwrap();
+    let resp = client.call_raw("tool/start_session", params).await.unwrap();
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    let forever = data["session_id"].as_str().unwrap().to_string();
+
+    let params = method::to_cbor(&json!({ "session": forever })).unwrap();
+    let resp = client.call_raw("tool/status", params).await.unwrap();
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    assert_eq!(
+        data["idle_deadline_unix_secs"],
+        Value::Null,
+        "`idle_timeout_secs = 0` disables reaping; a sentinel deadline \
+         eventually arrives"
+    );
+
+    // And `list_sessions` carries it too, through the same builder.
+    let resp = client
+        .call_raw("tool/list_sessions", method::to_cbor(&json!({})).unwrap())
+        .await
+        .unwrap();
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    for entry in data["sessions"].as_array().unwrap() {
+        assert!(
+            entry
+                .as_object()
+                .unwrap()
+                .contains_key("idle_deadline_unix_secs"),
+            "list_sessions dropped a field status carries: {entry}"
+        );
+    }
 }

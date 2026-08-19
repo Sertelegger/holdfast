@@ -181,6 +181,11 @@ pub struct StartSessionArgs {
     /// for fish — in exchange for writing nothing into the child's input.
     #[serde(default)]
     pub terminal_queries: Option<bool>,
+    /// Seconds of inactivity after which the idle reaper terminates this
+    /// session. Defaults to the daemon's `default_idle_timeout_secs`
+    /// (1800 unless configured). `0` disables reaping for this session.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -309,6 +314,9 @@ impl ClaspServer {
                 Ok(p) => p,
                 Err(e) => return envelope::from_error(&e),
             };
+        let idle_timeout_secs_resolved = args
+            .idle_timeout_secs
+            .unwrap_or(self.config.limits.default_idle_timeout_secs);
         let config = SessionConfig {
             detection: DetectionConfig {
                 settle_threshold_ms: args
@@ -325,6 +333,13 @@ impl ClaspServer {
             // "global config + per-session"; 0.0.5 brings the config file
             // and with it the global half.
             terminal_queries: args.terminal_queries.unwrap_or(true),
+            // REQ-CFG-001's precedence pair, folded per field: the
+            // per-session argument beats the config file, which beats the
+            // hardcoded default. The two keys are spelled differently on
+            // purpose — `[limits] default_idle_timeout_secs` globally and
+            // `idle_timeout_secs` here — and unifying them would delete
+            // the distinction the precedence rule is about.
+            idle_timeout_secs: idle_timeout_secs_resolved,
             ..SessionConfig::default()
         };
 
@@ -400,13 +415,15 @@ impl ClaspServer {
                 "args": cfg.args,
                 "cwd": cfg.cwd,
                 "env_keys": env_keys,
-                // Null, not §5.2's 1800 default: `idle_timeout_secs` is a
-                // `start_session` argument no milestone has built yet
-                // (REQ-S-004 is 0.0.5's, with the reaper), so nothing in
-                // this build would reap at any value written here. §9.4
-                // names the field, so the key is present; a number would
-                // be a promise nothing keeps.
-                "idle_timeout_secs": serde_json::Value::Null,
+                // The **resolved** value, not the argument: §9.4 wants to
+                // record what this session will actually be reaped at,
+                // and that is the per-session argument when one was
+                // supplied and `[limits] default_idle_timeout_secs`
+                // otherwise. This was `null` through 0.0.4 with a comment
+                // saying a number would be "a promise nothing keeps" —
+                // true while no milestone had built the reaper, and no
+                // longer true now that Task 16 has.
+                "idle_timeout_secs": idle_timeout_secs_resolved,
                 // Unconditionally true until `redaction_enabled` becomes a
                 // per-session argument, which is 0.0.5's too.
                 "redaction_enabled": true,
@@ -1396,6 +1413,13 @@ fn session_record(session: &Session, rules: &RuleSet) -> serde_json::Value {
         "command_count": session.command_count(),
         "started_at_unix_secs": unix_secs(session.created_at),
         "last_activity_unix_ms": session.last_activity_ms(),
+        // §5.2 declares `idle_deadline` and nothing emitted it. Named for
+        // its unit per REQ-T-018 — `tests/schema.rs` keeps a
+        // `BARE_TEMPORAL_NAMES` list with `idle_deadline` on it precisely
+        // so the bare spelling cannot come back. `null` means reaping is
+        // disabled for this session (`idle_timeout_secs = 0`), which is a
+        // different statement from "the deadline is far away".
+        "idle_deadline_unix_secs": session.idle_deadline_ms().map(|ms| ms / 1000),
         "buffer": {
             "head": session.buffer_head(),
             "tail": session.buffer_tail(),

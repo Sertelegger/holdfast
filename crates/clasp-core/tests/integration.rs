@@ -2148,11 +2148,18 @@ async fn session_start_records_the_field_set_9_4_names() {
     );
     assert_eq!(entries[0]["env_keys"], json!([]));
     assert_eq!(entries[0]["redaction_enabled"], true);
+    // The **resolved** timeout, not the argument. This asserted `null`
+    // through 0.0.4, with a comment saying a number would be "a promise
+    // nothing keeps" — true while no milestone had built the reaper, and
+    // an assertion that expires the moment one does. 0.0.5's Task 16 is
+    // that milestone, so the honest form is the number the session will
+    // actually be reaped at: `[limits] default_idle_timeout_secs`, since
+    // this call passed no override.
     assert_eq!(
         entries[0]["idle_timeout_secs"],
-        Value::Null,
-        "no milestone has built idle reaping yet; a number here would be a \
-         promise nothing keeps"
+        json!(1800),
+        "§9.4 records what this session will be reaped at, and this one \
+         took the config default"
     );
     assert_eq!(
         entries[0]["pid"],
