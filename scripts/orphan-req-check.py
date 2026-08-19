@@ -21,7 +21,7 @@
 # is the set of ids the §20 tables *define*; plans are read only to strike
 # ids off it.
 #
-# FOUR JUDGEMENTS, STATED RATHER THAN IMPLIED:
+# FIVE JUDGEMENTS, STATED RATHER THAN IMPLIED:
 #
 #   1. RANGE NOTATION IS NOT A CITATION. A plan writing `REQ-SEC-012..017`
 #      has named a count, not six requirements. Ranges are expanded and the
@@ -64,6 +64,42 @@
 #      that claims it, and it is read from HEADINGS only: see
 #      `DEFERRAL_HEADING_RE` for why the sentence is not enough and why the
 #      pattern is a phrase list rather than the word "deferred".
+#
+#   5. DEFERRAL IS A STATUS, NOT A LOCATION (§23.3a, rev. 50). Judgement 2
+#      reads a section HEADING, which is a proxy for the rule the spec
+#      actually states -- "deferred requirements do not count" -- and §23.3a
+#      is explicit that rev. 50 is the case where the proxy and the rule
+#      disagree: "One carve-out, and it is the only one: REQ-SPTY-001..005
+#      (§20.17.1) count." Their item became milestone 0.0.10a, so they are
+#      owed at v0.1.0 while sitting under a heading that says otherwise. They
+#      were deliberately NOT moved into §20.1-§20.15, because every citation
+#      of them resolves where they are. REQ-SPTY-006 is in the same table and
+#      is still deferred -- which is exactly what makes this a ROW-level fact
+#      that no section-level answer can express.
+#
+#      So: a row inside a deferred section is carved back IN iff its own
+#      Status cell names a MILESTONE rather than a roadmap tier. Read from the
+#      table, for judgement 2's reason -- a hardcoded `REQ-SPTY-001..005` list
+#      would be a second enumeration that goes stale in silence, and the
+#      Status column is already the per-row statement of precisely this fact.
+#      A whole-section answer read off the heading is what the carve-out
+#      exists to defeat; so is a whole-section exception, which would silence
+#      the twelve genuinely-deferred rows' neighbours along with them.
+#
+#      SELF-LIMITING THREE WAYS, because the only exemption that gets removed
+#      is one nobody has to remember to remove:
+#        * It expires by being SATISFIED. A carved-in row joins the universe,
+#          so it reads UNOWNED until a 0.0.10a plan names it. §23.3a: "that is
+#          the check working, not breaking". When that plan lands the row goes
+#          green with no edit here.
+#        * It expires by being RETIRED. Ship the milestone, or move the rows
+#          into §20.1-§20.15, and the Status cell stops naming a milestone --
+#          the carve-in stops firing on its own. Nothing below says "SPTY".
+#        * It cannot expire by ACCIDENT. If a deferred section's prose claims
+#          the carve-out and no row's Status backs it up -- or the reverse --
+#          that is a warning rather than a silent green. §23.3a names this
+#          failure mode directly: "the rule lives only in this paragraph and
+#          the automated answer quietly disagrees with it."
 #
 # WHERE THIS RUNS. Not in CI, deliberately. `docs/` is git-ignored in this
 # repository and lives in a separate git repo, so the spec and the plans are
@@ -148,6 +184,47 @@ DEFERRAL_HEADING_RE = re.compile(
     re.I,
 )
 
+# ---- the row-level carve-out: deferral is a status, not a location -------
+#
+# §23.3a, rev. 50; judgement 5 in the header. A row in a deferred section
+# counts anyway iff its own Status cell names a milestone.
+#
+# WHY "THREE-PART VERSION *AND NOT* A TIER" rather than matching "0.0.10a".
+# A bare three-part match is not enough on the real corpus: REQ-RTD-007's
+# Status is "§14.3, §9.3.2", and the section reference §9.3.2 is three-part.
+# The tier guard is what makes the rule mean "names a milestone" instead of
+# "contains a dotted number". Matching the literal string "0.0.10a" would be
+# the hardcoded id list wearing a different hat -- it would not notice the
+# next scheduled roadmap item, and it would keep firing after this one ships.
+#
+# It FAILS SAFE in the direction that matters: a Status this cannot classify
+# is not carved in, so an unreadable table gives the pre-rev.-50 answer
+# rather than a new and confident wrong one. The prose cross-check below is
+# what stops that silence from being mistaken for agreement.
+MILESTONE_STATUS_RE = re.compile(r"\b[0-9]+\.[0-9]+\.[0-9]+[a-z]?\b")
+
+DEFERRED_TIER_RE = re.compile(
+    r"\bv[0-9]+\.[0-9]+"          # "v0.2 (§14.1)", "v0.3–v0.5 (§14.2)"
+    r"|\bspeculative\b"           # "speculative (§14.3)"
+    r"|§\s*14\.[0-9]",            # "§14.3, §9.3.2" — a §14 roadmap tier
+    re.I,
+)
+
+# The prose half of the same claim. §20.17.1 states the carve-out in its
+# blockquote -- "they count in the §23.3a completeness check" -- and this is
+# read ONLY to cross-check it against the Status cells. Neither one is
+# allowed to be the answer on its own: if they disagree, say so.
+CARVE_IN_PROSE_RE = re.compile(
+    r"count\s+in\s+the\s+§?\s*23\.3a\s+completeness\s+check", re.I)
+
+
+def status_is_owed(status: str) -> bool:
+    """True iff a deferred row's Status names a milestone, not a roadmap tier."""
+    if not status:
+        return False
+    return bool(MILESTONE_STATUS_RE.search(status)) and not DEFERRED_TIER_RE.search(status)
+
+
 EXIT_OK = 0
 EXIT_FINDINGS = 1
 EXIT_ERROR = 2
@@ -168,11 +245,34 @@ class Section:
         self.deferred_heading = "post-v0.1.0" in title.lower()
         self.has_status_column = False
         self.saw_table = False
-        self.req_ids: list[str] = []
+        # (id, Status cell). The Status cell is empty for an in-scope section,
+        # which carries a Tests column instead — that difference IS the §20
+        # convention, and §23.3a's carve-out is read straight off it.
+        self.rows: list[tuple[str, str]] = []
+        # Set when this section's own prose states the §23.3a carve-out.
+        self.carve_in_prose = False
+
+    @property
+    def req_ids(self) -> list[str]:
+        return [rid for rid, _ in self.rows]
 
     @property
     def in_scope(self) -> bool:
         return self.saw_table and not self.deferred_heading and not self.has_status_column
+
+    @property
+    def carved_rows(self) -> list[str]:
+        """Rows this deferred section owes anyway — §23.3a's row-level carve-out.
+
+        Empty for an in-scope section, whose rows are already counted, and for
+        a deferred section whose every row names a roadmap tier — which is all
+        of them but §20.17.1 today, and that is the point: the answer is per
+        row, so the five owed rows and the one speculative row in that single
+        table come out on opposite sides.
+        """
+        if self.in_scope or not self.saw_table:
+            return []
+        return [rid for rid, status in self.rows if status_is_owed(status)]
 
 
 HEADING_RE = re.compile(r"^(#{2,4})\s+(20(?:\.[0-9]+[a-z]?)*)\.?\s+(.*)$")
@@ -208,12 +308,17 @@ def parse_spec(spec_path: Path) -> tuple[list[Section], list[str]]:
     sections: list[Section] = []
     current: Section | None = None
     parent_deferred = False
+    status_idx: int | None = None
+
+    def cells_of(row: str) -> list[str]:
+        return [c.strip() for c in row.strip().strip("|").split("|")]
 
     for offset, line in enumerate(lines[start:end]):
         lineno = start + offset + 1
 
         m = HEADING_RE.match(line)
         if m:
+            status_idx = None
             hashes, number, title = m.groups()
             level = len(hashes)
             if level == 2:
@@ -235,13 +340,27 @@ def parse_spec(spec_path: Path) -> tuple[list[Section], list[str]]:
 
         if line.startswith("| ID |"):
             current.saw_table = True
-            if "| Status |" in line:
-                current.has_status_column = True
+            header = cells_of(line)
+            status_idx = header.index("Status") if "Status" in header else None
+            current.has_status_column = status_idx is not None
             continue
 
         rm = ROW_ID_RE.match(line)
         if rm:
-            current.req_ids.append(rm.group(1))
+            status = ""
+            if status_idx is not None:
+                row = cells_of(line)
+                # A row that does not split into the header's shape (a literal
+                # or escaped pipe inside a cell) yields no Status, and a row
+                # with no Status is never carved in. Fail safe: the answer
+                # stays the pre-carve-out one rather than becoming a guess.
+                if len(row) > status_idx:
+                    status = row[status_idx]
+            current.rows.append((rm.group(1), status))
+            continue
+
+        if CARVE_IN_PROSE_RE.search(line):
+            current.carve_in_prose = True
 
     # Cross-check the structural verdict against the numbering §23.3a
     # states today, and warn rather than silently trusting either one.
@@ -262,6 +381,35 @@ def parse_spec(spec_path: Path) -> tuple[list[Section], list[str]]:
                 f"{'IN' if numerically_in_scope else 'OUT of'} scope by §23.3a's "
                 f"§20.1–§20.15 numbering. §20's preamble says the marker wins; "
                 f"if that is wrong here, the section is mislabelled."
+            )
+
+    # §23.3a's own named failure mode: "the rule lives only in this paragraph
+    # and the automated answer quietly disagrees with it." The carve-out is
+    # stated twice in the spec — once in §20.17.1's prose, once in each row's
+    # Status cell — and this check refuses to let either one be the answer
+    # alone. Reformat the Status column and the carve-in silently stops
+    # firing; that is the shape of every check in this project that could not
+    # fail, so it is a warning rather than a green run.
+    for sec in sections:
+        if sec.in_scope or not sec.saw_table:
+            continue
+        carved = sec.carved_rows
+        if sec.carve_in_prose and not carved:
+            warnings.append(
+                f"§{sec.number} ({sec.title[:60]}) says in prose that rows here "
+                f"count in the §23.3a completeness check, but no row's Status "
+                f"cell names a milestone, so none was carved in. Either the "
+                f"Status column was reformatted or the carve-out was retired "
+                f"without deleting the sentence — the count just moved and "
+                f"nothing said so."
+            )
+        elif carved and not sec.carve_in_prose:
+            warnings.append(
+                f"§{sec.number} ({sec.title[:60]}) has {len(carved)} row(s) whose "
+                f"Status names a milestone ({', '.join(carved)}), so they are "
+                f"counted against the ship-list, but this section's prose does "
+                f"not state the §23.3a carve-out. Either a Status cell was "
+                f"typo'd into scope or a real carve-out is undocumented."
             )
 
     dupes = {}
@@ -416,6 +564,16 @@ def build_report(spec_path: Path, plan_paths: list[Path], root: Path) -> dict:
         for rid in sec.req_ids:
             universe.append((rid, sec.number))
 
+    # §23.3a's row-level carve-out. These rows sit in a section the heading
+    # excludes, and they count anyway because their own Status says they are
+    # owed. Their neighbours in the same table do not come with them —
+    # judgement 5 in the header.
+    carved_in: list[dict] = []
+    for sec in deferred_sections:
+        for rid in sec.carved_rows:
+            universe.append((rid, sec.number))
+            carved_in.append({"id": rid, "section": sec.number})
+
     orphans, range_only, deferred_only, owned = [], [], [], []
     for rid, sec_no in universe:
         entry = {
@@ -464,6 +622,7 @@ def build_report(spec_path: Path, plan_paths: list[Path], root: Path) -> dict:
         "areas": areas,
         "sections_in_scope": [s.number for s in in_scope_sections],
         "sections_excluded": [s.number for s in deferred_sections],
+        "rows_carved_in": carved_in,
         "warnings": warnings,
         "counts": {
             "requirements_in_scope": len(universe),
@@ -492,6 +651,12 @@ def render(report: dict) -> str:
     w(f"plans:    {len(report['plans'])}")
     w(f"in scope: §{', §'.join(report['sections_in_scope'])}")
     w(f"excluded: §{', §'.join(report['sections_excluded'])}  (post-v0.1.0, per §20 preamble)")
+    if report["rows_carved_in"]:
+        secs = sorted({e["section"] for e in report["rows_carved_in"]})
+        w(f"carved in: {', '.join(e['id'] for e in report['rows_carved_in'])}")
+        w(f"           — rows in §{', §'.join(secs)} whose own Status names a")
+        w( "             milestone. §23.3a: deferral is a status, not a location.")
+        w( "             Every OTHER row in those sections stays excluded.")
     w("")
     w(f"  requirements in scope ....... {c['requirements_in_scope']}")
     w(f"  owned by >=1 plan ........... {c['owned']}")
@@ -607,6 +772,28 @@ Deferred sections use a `Verification` column rather than `Tests`.
 | REQ-ZZS-001 | must never be reported as an orphan | §1 | v0.2 | manual |
 | REQ-ZZS-002 | must never be reported as an orphan | §1 | v0.2 | manual |
 
+### 20.17 Roadmap requirements (REQ-ZZT, REQ-ZZR) — post-v0.1.0
+
+#### 20.17.1 One scheduled item and one that is not (REQ-ZZT)
+
+> **REQ-ZZT-001..002 are the one part of §20.17 that is not deferred.** Their
+> item became a milestone, so they count in the §23.3a completeness check.
+> REQ-ZZT-003 is unaffected and stays speculative.
+
+| ID | Requirement | Spec | Status | Verification |
+|---|---|---|---|---|
+| REQ-ZZT-001 | OWED: Status names a milestone, and no plan names it | §1 | **0.0.10a** (§23.2) | integration |
+| REQ-ZZT-002 | OWED: Status names a milestone, and a plan does name it | §1 | **0.0.10a** (§23.2) | integration |
+| REQ-ZZT-003 | NOT owed: speculative, in the SAME table as the two above | §1 | speculative (§14.3) | manual |
+| REQ-ZZT-004 | NOT owed: a §14 tier whose cell contains a 3-part § ref | §1 | §14.3, §9.3.2 | manual |
+
+#### 20.17.2 Ordinary deferred things (REQ-ZZR)
+
+| ID | Requirement | Spec | Status | Verification |
+|---|---|---|---|---|
+| REQ-ZZR-001 | must never be reported: a sibling's carve-out is not ours | §1 | v0.2 (§14.1) | manual |
+| REQ-ZZR-002 | must never be reported: a sibling's carve-out is not ours | §1 | v0.3–v0.5 (§14.2) | manual |
+
 ## 21. Rollout
 """
 
@@ -683,6 +870,7 @@ SELF_TEST_PLAN_OWNER = """\
 | REQ | Covered by |
 |---|---|
 | REQ-ZZC-007 | Task 1 |
+| REQ-ZZT-002 | Task 2 — a carved-in row that IS owned |
 """
 
 # Everything named literally, under no heading at all: the negative control
@@ -693,6 +881,7 @@ SELF_TEST_PLAN_ALL = """\
 
 REQ-ZZA-002 REQ-ZZA-003 REQ-ZZA-004 REQ-ZZA-005 REQ-ZZB-001
 REQ-ZZC-001 REQ-ZZC-002 REQ-ZZC-003 REQ-ZZC-006 REQ-ZZC-007 REQ-ZZC-008
+REQ-ZZT-001
 """
 
 
@@ -728,8 +917,9 @@ def self_test() -> int:
 
         print("Self-test — synthetic spec and plan\n")
 
-        check("an uncited requirement is reported as ORPHAN",
-              orphan_ids, ["REQ-ZZA-002"])
+        check("an uncited requirement is reported as ORPHAN (REQ-ZZA-002 in "
+              "scope by heading, REQ-ZZT-001 by §23.3a's row-level carve-out)",
+              sorted(orphan_ids), ["REQ-ZZA-002", "REQ-ZZT-001"])
 
         check("a literally-cited requirement is NOT reported",
               "REQ-ZZA-001" in reported, False)
@@ -829,8 +1019,9 @@ def self_test() -> int:
         check("no post-v0.1.0 (§20.16) row is reported",
               [i for i in reported if i.startswith("REQ-ZZS")], [])
 
-        check("§20.16 is recognised as excluded",
-              rep["sections_excluded"], ["20.16"])
+        check("§20.16 is recognised as excluded, and so are the §20.17.x "
+              "subsections that inherit the marker from their parent",
+              rep["sections_excluded"], ["20.16", "20.17.1", "20.17.2"])
 
         check("counts are reported, not just names",
               (rep["counts"]["requirements_in_scope"],
@@ -839,7 +1030,41 @@ def self_test() -> int:
                rep["counts"]["orphan"],
                rep["counts"]["range_only"],
                rep["counts"]["deferred_only"]),
-              (15, 6, 9, 1, 3, 5))
+              (17, 7, 10, 2, 3, 5))
+
+        # ------------------------------------------------------------------
+        # §23.3a'S ROW-LEVEL CARVE-OUT (rev. 50). The heading over §20.17.1
+        # says deferred and for two rows out of four it is right; the other
+        # two rows' Status says otherwise, and the Status wins, because
+        # "deferral is a status, not a location". A section-level answer
+        # cannot express this in either direction -- which is the point. A
+        # carve-out that dragged its neighbours in, or one that silenced
+        # them, would be a section rule wearing a row-level costume.
+        # ------------------------------------------------------------------
+
+        check("a row in a deferred section whose Status names a MILESTONE is "
+              "carved in, and is reported when no plan names it",
+              "REQ-ZZT-001" in set(orphan_ids), True)
+
+        check("the carve-in is ROW-level: a speculative row in the SAME table "
+              "stays excluded, and so does one whose tier cell happens to "
+              "contain a three-part § reference",
+              sorted(i for i in reported if i.startswith("REQ-ZZT")
+                     and i not in {"REQ-ZZT-001", "REQ-ZZT-002"}),
+              [])
+
+        check("a sibling deferred subsection is not dragged in by §20.17.1's "
+              "carve-out",
+              [i for i in reported if i.startswith("REQ-ZZR")], [])
+
+        check("the carve-in is reported explicitly — exactly which rows it "
+              "promoted, and out of where",
+              sorted((e["id"], e["section"]) for e in rep["rows_carved_in"]),
+              [("REQ-ZZT-001", "20.17.1"), ("REQ-ZZT-002", "20.17.1")])
+
+        check("a carved-in row that a plan DOES name is owned, not reported "
+              "(the carve-out puts rows in scope; it does not fail them)",
+              "REQ-ZZT-002" in reported, False)
 
         # Mutation: delete the deferred marker from the excluded section and
         # its rows must become findings. A check that reports the same thing
@@ -850,6 +1075,8 @@ def self_test() -> int:
         ).replace(
             "| ID | Requirement | Spec | Status | Verification |\n|---|---|---|---|---|",
             "| ID | Requirement | Spec | Tests |\n|---|---|---|---|",
+            1,  # §20.16's table comes first; the §20.17 tables share this
+                # header and are not what this mutation is about.
         )
         spec.write_text(mutated, encoding="utf-8")
         mrep = build_report(spec, sorted(plans.glob("*.md")), root)
@@ -858,6 +1085,50 @@ def self_test() -> int:
               "the same rows DO get reported (the exclusion is load-bearing)",
               sorted(i for i in mut_ids if i.startswith("REQ-ZZS")),
               ["REQ-ZZS-001", "REQ-ZZS-002"])
+
+        # Mutation: the STATUS CELL is the carve-in's gate. Retier the two
+        # milestone rows, change nothing else, and they must leave the
+        # universe entirely. Without this, a carve-in hardcoded to a literal
+        # id list would pass every carve-out assertion above and would go on
+        # firing forever after the milestone shipped -- which is the "an
+        # exemption with no expiry becomes permanent" failure, and it is the
+        # one a checker fix is most likely to introduce.
+        spec.write_text(
+            SELF_TEST_SPEC.replace("**0.0.10a** (§23.2)", "v0.9 (§14.1)"),
+            encoding="utf-8")
+        srep = build_report(spec, sorted(plans.glob("*.md")), root)
+        check("MUTATION — with the milestone Status retiered, the carved rows "
+              "leave scope (the Status cell is the gate, not a hardcoded list)",
+              (srep["rows_carved_in"],
+               [e["id"] for e in srep["orphans"] if e["id"].startswith("REQ-ZZT")]),
+              ([], []))
+
+        # ...and that retirement must not be SILENT. §23.3a's named failure
+        # mode is the prose and the tooling quietly disagreeing; here the
+        # blockquote still claims the carve-out and no row backs it up.
+        check("MUTATION — a silently-retired carve-out is a WARNING, not a "
+              "quiet green: §20.17.1's prose and its Status column disagree",
+              [w for w in srep["warnings"]
+               if "20.17.1" in w and "23.3a completeness check" in w] != [],
+              True)
+
+        # Mutation: the carve-out expires by being SATISFIED, with no edit to
+        # this script. This is the whole of the "until a 0.0.10a plan exists"
+        # expiry -- nothing has to remember to delete an exemption, because
+        # there is no exemption: the row is in scope and simply becomes owned.
+        spec.write_text(SELF_TEST_SPEC, encoding="utf-8")
+        (plans / "milestone-plan.md").write_text(
+            "# Fake milestone plan\n\n## Requirements covered\n\n"
+            "| REQ | Covered by |\n|---|---|\n| REQ-ZZT-001 | Task 1 |\n",
+            encoding="utf-8")
+        prep = build_report(spec, sorted(plans.glob("*.md")), root)
+        check("MUTATION — a plan naming the carved-in id closes it with no "
+              "change here (the carve-out expires by being satisfied, and the "
+              "row stays in scope afterwards rather than vanishing)",
+              ([e["id"] for e in prep["orphans"]],
+               sorted(e["id"] for e in prep["rows_carved_in"])),
+              (["REQ-ZZA-002"], ["REQ-ZZT-001", "REQ-ZZT-002"]))
+        (plans / "milestone-plan.md").unlink()
 
         # Mutation: the deferral headings are the gate. Retitle them as
         # ordinary section headings, change nothing else, and every id they
