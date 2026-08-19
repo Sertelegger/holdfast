@@ -17,8 +17,8 @@ Requirements: a Unix host (Linux or macOS; WSL counts), the toolchain pinned in
 installs for you on first build — and `jq` for the smoke script.
 
 ```bash
-git clone https://github.com/Sertelegger/clasp.git
-cd clasp
+git clone https://github.com/Sertelegger/holdfast.git
+cd holdfast
 cargo build --workspace
 ```
 

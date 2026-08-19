@@ -19,7 +19,7 @@ This table becomes a real support statement at the first release. Until then,
 
 Please **do not** open a public issue for security problems. Use GitHub's
 private vulnerability reporting: go to the
-[Security tab](https://github.com/Sertelegger/clasp/security) → **Report a
+[Security tab](https://github.com/Sertelegger/holdfast/security) → **Report a
 vulnerability**.
 
 This is a personal open-source project, so response times are best-effort —

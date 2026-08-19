@@ -419,4 +419,4 @@ Stated because they are easy to mistake for bugs:
   group plus the terminal's foreground group, so a background job in a third
   group can survive `terminate`.
 
-[Unreleased]: https://github.com/Sertelegger/clasp/commits/main
+[Unreleased]: https://github.com/Sertelegger/holdfast/commits/main

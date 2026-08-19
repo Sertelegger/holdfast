@@ -16,7 +16,7 @@ body:
         Before filing, note what is **already known** and does not need a report:
         output is returned raw and unredacted, transport is stdio only, sessions
         die with the MCP process, and only Unix is supported. See
-        [CHANGELOG.md](https://github.com/Sertelegger/clasp/blob/main/CHANGELOG.md#known-limitations).
+        [CHANGELOG.md](https://github.com/Sertelegger/holdfast/blob/main/CHANGELOG.md#known-limitations).
   - type: textarea
     id: what-happened
     attributes:

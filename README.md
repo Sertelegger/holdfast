@@ -186,7 +186,7 @@ true`, self-expiring 2026-09-09) and has already shown a **green** tick in
 `gh run list` for a sweep that tested zero mutants. Until that key is gone:
 
 ```bash
-gh api repos/Sertelegger/clasp/actions/runs/<id>/jobs \
+gh api repos/Sertelegger/holdfast/actions/runs/<id>/jobs \
   --jq '.jobs[] | .name + ": " + .conclusion'
 ```
 

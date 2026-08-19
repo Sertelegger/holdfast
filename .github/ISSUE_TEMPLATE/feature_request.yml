@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Before filing, check
-        [ROADMAP.md](https://github.com/Sertelegger/clasp/blob/main/ROADMAP.md) —
+        [ROADMAP.md](https://github.com/Sertelegger/holdfast/blob/main/ROADMAP.md) —
         redaction, a persistent daemon, attach and a CLI, out-of-band secret
         input, command preflight, a web UI, and Windows are all already planned
         and ordered. If your idea is one of those, a 👍 or a comment on the
