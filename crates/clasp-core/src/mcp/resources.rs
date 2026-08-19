@@ -38,9 +38,14 @@ use crate::session::{Session, SessionRegistry};
 
 use super::caller;
 
-/// §4.2's `resource_read_max_bytes`. The daemon-configured hard cap on a
-/// single resource fetch, and the default when the caller names none.
-pub const DEFAULT_RESOURCE_READ_MAX_BYTES: usize = 4 * 1024 * 1024;
+// `DEFAULT_RESOURCE_READ_MAX_BYTES = 4 MiB` stood here and is deleted.
+// It was a second, independent spelling of `[limits]
+// resource_read_max_bytes`'s default with nothing tying the two
+// together: both real call sites (`ClaspServer::read_resource` and the
+// daemon's `resource_read` route) pass `config.limits.
+// resource_read_max_bytes`, so the constant's only remaining reader was
+// a test, and an operator lowering the knob would have left it stale and
+// silent. `config::d_resource_read_max_bytes` is the one spelling.
 
 /// The `tool` recorded in §9.4's `redaction_disabled` for a resource
 /// read. `ReadRequest.tool`'s own doc comment already names this string.
@@ -508,6 +513,9 @@ pub fn read_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Session`, `SessionRegistry` and `Arc` arrive through `super::*`.
+    use crate::pty::MockPty;
+    use crate::session::{new_session_id, SessionConfig};
 
     #[test]
     fn the_three_uri_shapes_parse_and_a_fourth_is_malformed() {
@@ -600,23 +608,86 @@ mod tests {
         assert_eq!(q.max_bytes, None);
     }
 
-    #[test]
-    fn a_caller_max_bytes_above_the_ceiling_is_clamped_down() {
-        // Arithmetic only, so the row is about the rule rather than about
-        // a buffer: `min` in the wrong order, or an `unwrap_or` that
-        // honoured the caller, both survive a read-through test whose
-        // buffer is smaller than either number.
-        let ceiling = DEFAULT_RESOURCE_READ_MAX_BYTES;
-        let requested = 99_999_999usize;
-        assert!(requested > ceiling);
-        assert_eq!(requested.min(ceiling), ceiling, "clamped down, never up");
-        let smaller = 1024usize;
-        assert_eq!(
-            smaller.min(ceiling),
-            smaller,
-            "a caller asking for less than the ceiling gets what it asked for"
+    /// A registry holding one live `MockPty`-backed session whose buffer
+    /// already holds `bytes`.
+    fn registry_with_session(bytes: &[u8]) -> (SessionRegistry, Arc<Session>) {
+        let pty = Arc::new(MockPty::new());
+        let session = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn crate::pty::PtyBackend>,
+            SessionConfig::with_buffer_capacity(4096),
         );
-        assert_eq!(DEFAULT_RESOURCE_READ_MAX_BYTES, 4 * 1024 * 1024);
+        pty.queue_output(bytes);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while session.buffer_head() < bytes.len() as u64 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            session.buffer_head(),
+            bytes.len() as u64,
+            "the reader never drained the mock PTY, so any byte count below \
+             would be measured against a buffer that is short for an unrelated \
+             reason"
+        );
+        let registry = SessionRegistry::with_defaults();
+        registry
+            .insert(Arc::clone(&session))
+            .expect("an empty registry accepts one session");
+        (registry, session)
+    }
+
+    fn text_of(result: &ReadResourceResult) -> &str {
+        match &result.contents[0] {
+            ResourceContents::TextResourceContents { text, .. } => text,
+            other => panic!("expected text contents, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_caller_max_bytes_is_clamped_down_against_the_ceiling_and_never_up() {
+        // Drives `read_resource`. The version this replaces asserted
+        // `requested.min(ceiling) == ceiling` and `smaller.min(ceiling)
+        // == smaller` — properties of the standard library, true of
+        // every possible implementation of this module — against a
+        // `DEFAULT_RESOURCE_READ_MAX_BYTES` nothing else read. `.min` →
+        // `.max` at the clamp, the exact mutation it named, survived it.
+        //
+        // A 16-byte buffer against an 8-byte ceiling, so every case
+        // below has a distinct expected string rather than a length that
+        // several wrong clamps could produce. `redact=false` because the
+        // §4.1 holdback would otherwise be free to shorten a read for a
+        // reason that has nothing to do with the cap.
+        let (registry, session) = registry_with_session(b"abcdefghijklmnop");
+        let processor = crate::output::OutputProcessor::builtin().expect("built-in rules compile");
+        let ceiling = 8usize;
+        let read = |query: &str| -> String {
+            let uri = format!(
+                "clasp://session/{}/buffer?since_cursor=0&redact=false{query}",
+                session.id
+            );
+            let result =
+                read_resource(&registry, &processor, &uri, ceiling).expect("a live session reads");
+            text_of(&result).to_string()
+        };
+
+        assert_eq!(
+            read("&max_bytes=99999999"),
+            "abcdefgh",
+            "a caller above the ceiling must be clamped down to it, never up"
+        );
+        assert_eq!(
+            read("&max_bytes=4"),
+            "abcd",
+            "a caller below the ceiling gets what it asked for, not the ceiling"
+        );
+        assert_eq!(
+            read(""),
+            "abcdefgh",
+            "no max_bytes means the ceiling, not the whole buffer"
+        );
     }
 
     #[test]

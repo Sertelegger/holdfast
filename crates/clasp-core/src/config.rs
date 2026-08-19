@@ -830,6 +830,29 @@ impl Config {
         Ok(())
     }
 
+    /// The redaction rule set this config puts in force (§9.2).
+    ///
+    /// Today it is exactly [`RuleSet::builtin`]:
+    /// `security.extra_redaction_patterns` is parsed, validated and
+    /// **not** in it, because §15.1 has not settled the `ExtraRule` →
+    /// `RuleSpec` mapping (see that field's own doc for why guessing is
+    /// worse than stopping).
+    ///
+    /// **This function is the seam that stop is written on.** It exists
+    /// so there is one named place a config-derived rule set is built,
+    /// rather than a `RuleSet::builtin()` call scattered at each
+    /// construction site: the milestone that resolves §15.1 replaces
+    /// this body with a `builtin_with_extra`-shaped call, and
+    /// `a_user_redaction_pattern_is_accepted_and_not_yet_in_force`
+    /// reddens on the same commit — which is the point. That test also
+    /// watches the rule set `ClaspServer` actually hands the read path,
+    /// so wiring the key anywhere else reddens it too.
+    pub fn redaction_rules(
+        &self,
+    ) -> Result<crate::output::rules::RuleSet, crate::output::rules::RuleError> {
+        crate::output::rules::RuleSet::builtin()
+    }
+
     /// The four §4.2 knobs `OutputProcessor` already takes as parameters.
     pub fn processing_limits(&self) -> crate::output::ProcessingLimits {
         crate::output::ProcessingLimits {
@@ -978,18 +1001,15 @@ mod tests {
         parse_str(EXAMPLE).expect("§10.2's published example must load as a Config");
     }
 
-    #[test]
-    fn the_fixture_on_disk_is_the_one_the_tests_compile_in() {
-        let path = std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/example_config.toml"
-        ));
-        let on_disk = std::fs::read_to_string(path).expect("read the fixture");
-        assert_eq!(
-            on_disk, EXAMPLE,
-            "the vendored copy and the file on disk have diverged"
-        );
-    }
+    // `the_fixture_on_disk_is_the_one_the_tests_compile_in` stood here
+    // and is deleted. It read
+    // `$CARGO_MANIFEST_DIR/tests/fixtures/example_config.toml` and
+    // compared it to `EXAMPLE` — the `include_str!` of *that same path*,
+    // so it compared the file to itself and could not fail. The
+    // "vendored copy" its message named does not exist: there is one
+    // fixture in the tree, and Cargo's dep-info tracks `include_str!`,
+    // so a stale-build divergence is not reachable either.
+    // `the_published_example_config_loads` is the guard over that file.
 
     #[test]
     fn an_adapters_array_of_tables_is_accepted() {
@@ -1264,21 +1284,54 @@ require_confirm = false
         .expect("§10.2's own example rule must load");
         assert_eq!(cfg.security.extra_redaction_patterns.len(), 1);
 
-        let active = RuleSet::builtin().expect("built-in rules compile");
-        assert_eq!(
-            active.len(),
-            RuleSet::builtin().unwrap().len(),
-            "computed, never a literal — the shipped set drifts"
-        );
-        // The rule demonstrably did not reach the redactor: the active
-        // set is exactly the built-in one.
-        assert!(
-            !active
-                .rules
-                .iter()
-                .any(|r| r.name == "internal-token"),
-            "the config's rule reached the redactor — §15.1 is still open, so this is the guess this step declines to make"
-        );
+        // Both rule sets below are derived **from `cfg`**. The earlier
+        // version of this test read `RuleSet::builtin()` into a local
+        // named `active` and compared it to `RuleSet::builtin()` — a
+        // tautology, which meant the tripwire this test exists to be
+        // stayed green whether or not a later milestone wired the key.
+        //
+        // Two observations rather than one, because there are two places
+        // the wiring can land and a tripwire watching only one of them is
+        // one the wiring steps over:
+        //
+        //  1. `Config::redaction_rules()`, the accessor this file names
+        //     as the seam. A milestone that resolves §15.1 by making the
+        //     config build its own set edits *that function*.
+        //  2. the set the read path actually runs with, taken from the
+        //     server this `cfg` builds. A milestone that instead wires
+        //     the key where `ClaspServer` assembles its
+        //     `OutputProcessor` never touches `redaction_rules()`, and
+        //     only this second observation catches it.
+        let from_config = cfg.redaction_rules().expect("built-in rules compile");
+        let server = crate::mcp::ClaspServer::with_audit_path_and_config(None, &cfg);
+
+        let builtin = RuleSet::builtin().expect("built-in rules compile");
+        for (what, active) in [
+            ("Config::redaction_rules()", &from_config),
+            (
+                "the OutputProcessor the read path runs with",
+                &*server.processor.rules,
+            ),
+        ] {
+            assert_eq!(
+                active.len(),
+                builtin.len(),
+                "{what} carries {} rules against the built-in set's {} — §15.1 \
+                 settled and the key is in force. This test is the record of why \
+                 it was left unwired; read it before deleting it.",
+                active.len(),
+                builtin.len()
+            );
+            // Length alone would pass against a wiring that *replaced* a
+            // built-in of the same name, so name the rule too. (It is
+            // absent from `data/redaction_default.toml`, which is what
+            // makes its presence mean "the config's rule arrived".)
+            assert!(
+                !active.rules.iter().any(|r| r.name == "internal-token"),
+                "the config's rule reached {what} — §15.1 is still open, so this \
+                 is the guess this step declines to make"
+            );
+        }
     }
 
     #[test]
