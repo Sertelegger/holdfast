@@ -43,6 +43,14 @@ pub const SEED_BYTES_PER_CELL: usize = 4;
 /// `diff_from` degrades to a full grid rather than an error.
 pub const DEFAULT_RETAINED_REVISIONS: usize = 4;
 
+/// How many `set_size` calls the boundary replay will reproduce before it
+/// stops trying. A resize that lands with no output since the last one
+/// costs nothing (they coalesce), so reaching this needs a session that
+/// has genuinely resized this many times mid-stream; past it the replay
+/// falls back to the current geometry, which over-masks the reflowed rows
+/// rather than reconstructing something it cannot vouch for.
+const TRACKED_RESIZES_MAX: usize = 64;
+
 /// Revision number that never matches a `diff_from`. Returned by the
 /// one-shot render used when `screen_tracking = "off"`, where nothing is
 /// retained to diff against.
@@ -100,6 +108,27 @@ pub struct Seed {
 pub struct Replay {
     pub bytes: Vec<u8>,
     pub start: u64,
+}
+
+/// What [`ScreenTracker::boundary_screen`] has to reproduce: the stream
+/// range a parser is a function of, and the geometry it saw that range at.
+///
+/// The geometry half is not bookkeeping. A `set_size` reflows the live
+/// grid without re-reading a byte, so two parsers fed identical input at
+/// different sizes are different screens — and the mask is a cell-by-cell
+/// comparison of exactly those two things.
+struct ReplaySpan<'a> {
+    /// First stream byte the parser saw.
+    from: u64,
+    /// First stream byte it has *not* seen.
+    head: u64,
+    /// Grid size in force at `from`.
+    origin: (u16, u16),
+    /// `(offset, rows, cols)` for every `set_size` since, in order.
+    changes: &'a [(u64, u16, u16)],
+    /// Size now — where the replay must end up, so its cells line up with
+    /// the live grid's.
+    current: (u16, u16),
 }
 
 /// Where a re-seed gets its bytes. Implemented for the session's ring
@@ -213,6 +242,30 @@ pub struct ScreenTracker {
     /// lets the boundary render be an exact replay of the same input
     /// rather than an approximation of it (see `boundary_screen`).
     seeded_from: u64,
+    /// Grid size in force when the parser was seeded, and every
+    /// `set_size` applied to it since as `(stream offset, rows, cols)`.
+    ///
+    /// **The live parser is not a pure function of its bytes alone — it is
+    /// a function of the bytes *and* the geometry they were painted at**,
+    /// and `boundary_screen`'s replay has to reproduce both or it is
+    /// comparing two different renderings. A widening `set_size` extends
+    /// each row with blank cells and leaves the old wrap points where they
+    /// were, so a replay built at the new width re-wraps and every row
+    /// whose wrapping moved differs from the live one — and gets masked,
+    /// on a session that may be withholding nothing near those rows.
+    ///
+    /// A narrowing resize re-seeds instead (see [`Self::resize`]), which
+    /// clears both of these, so `changes` never holds a width *shrink* —
+    /// which is also why replaying it cannot reach `set_size`'s
+    /// half-a-wide-character panic.
+    seed_geometry: (u16, u16),
+    resizes: Vec<(u64, u16, u16)>,
+    /// Set when `resizes` reached [`TRACKED_RESIZES_MAX`] and was dropped.
+    /// The replay then falls back to building at the current geometry,
+    /// which is the conservative reading — it over-masks the reflowed rows
+    /// exactly as it did before the schedule existed — rather than a
+    /// reconstruction that cannot be vouched for.
+    resizes_overflowed: bool,
     next_revision: u64,
     /// `(revision, redacted, screen)`. The flag is not bookkeeping: §9.2's
     /// screen-state row requires a `diff_from` naming a revision rendered
@@ -228,6 +281,7 @@ pub struct ScreenTracker {
 impl ScreenTracker {
     pub fn new(cfg: ScreenConfig, rules: Arc<RuleSet>, now: Instant) -> Self {
         let policy = TrackingPolicy::new(cfg.mode, cfg.idle_disable, cfg.no_signal_grace, now);
+        let seed_geometry = (cfg.rows, cfg.cols);
         Self {
             cfg,
             rules,
@@ -236,6 +290,9 @@ impl ScreenTracker {
             parser: None,
             consumed_head: 0,
             seeded_from: 0,
+            seed_geometry,
+            resizes: Vec::new(),
+            resizes_overflowed: false,
             next_revision: UNRETAINED_REVISION + 1,
             retained: VecDeque::new(),
             stability: cursor::CursorStability::new(),
@@ -451,11 +508,12 @@ impl ScreenTracker {
         if self.parser.is_some() {
             if narrowed {
                 // Rebuilds at the new `cfg` geometry and resets
-                // `seeded_from`, `consumed_head`, `retained` and the
-                // cursor stability window.
+                // `seeded_from`, `consumed_head`, `retained`, the cursor
+                // stability window and the geometry schedule.
                 self.seed_parser(seed);
             } else if let Some(parser) = self.parser.as_mut() {
                 parser.screen_mut().set_size(rows, cols);
+                self.note_resize(rows, cols);
             }
         }
         self.retained.clear();
@@ -481,6 +539,54 @@ impl ScreenTracker {
             stable,
             stable_samples: self.stability.samples(),
         })
+    }
+
+    /// Record a `set_size` the live parser has just been through, so
+    /// [`Self::boundary_screen`]'s replay can go through the same one at
+    /// the same point in the stream.
+    ///
+    /// Two resizes with no output between them are one change to the
+    /// replay — it has no bytes to apply at the first — so they coalesce
+    /// on the offset. That is also what keeps an agent hammering `resize`
+    /// on a quiet session from growing this at all.
+    fn note_resize(&mut self, rows: u16, cols: u16) {
+        if self.resizes_overflowed {
+            return;
+        }
+        match self.resizes.last_mut() {
+            Some(last) if last.0 == self.consumed_head => *last = (self.consumed_head, rows, cols),
+            _ => self.resizes.push((self.consumed_head, rows, cols)),
+        }
+        if self.resizes.len() > TRACKED_RESIZES_MAX {
+            // Bounded rather than truthful: a session that has resized
+            // this many times with output between each is past what this
+            // reconstruction is worth carrying, and the fallback is the
+            // conservative one.
+            self.resizes = Vec::new();
+            self.resizes_overflowed = true;
+        }
+    }
+
+    /// The byte range the live parser is a function of, and the geometry
+    /// it saw that range at — everything [`Self::boundary_screen`] needs to
+    /// reproduce the parser's own history up to a holdback boundary.
+    fn tracked_span(&self, current: (u16, u16)) -> ReplaySpan<'_> {
+        if self.resizes_overflowed {
+            return ReplaySpan {
+                from: self.seeded_from,
+                head: self.consumed_head,
+                origin: current,
+                changes: &[],
+                current,
+            };
+        }
+        ReplaySpan {
+            from: self.seeded_from,
+            head: self.consumed_head,
+            origin: self.seed_geometry,
+            changes: &self.resizes,
+            current,
+        }
     }
 
     fn sync_parser(&mut self, seed: &dyn SeedSource) {
@@ -511,6 +617,11 @@ impl ScreenTracker {
         self.parser = Some(parser);
         self.consumed_head = seed.head;
         self.seeded_from = seed.head - seed.bytes.len() as u64;
+        // The rebuilt parser has been through no resize: it was built at
+        // `cfg`'s size and parsed every byte at it.
+        self.seed_geometry = (self.cfg.rows, self.cfg.cols);
+        self.resizes.clear();
+        self.resizes_overflowed = false;
         self.retained.clear();
         self.stability.reset();
     }
@@ -551,8 +662,17 @@ impl ScreenTracker {
         // mask — as every other capture. Its input range is the seed
         // window rather than the tracked range, so that is what the
         // boundary render replays.
-        let from = taken.head - taken.bytes.len() as u64;
-        let boundary = self.boundary_screen(&parser, from, taken.head, redact, seed, holdback);
+        // No schedule: this parser was built a statement ago, at the
+        // current geometry, and has been through no resize.
+        let current = parser.screen().size();
+        let span = ReplaySpan {
+            from: taken.head - taken.bytes.len() as u64,
+            head: taken.head,
+            origin: current,
+            changes: &[],
+            current,
+        };
+        let boundary = self.boundary_screen(span, redact, seed, holdback);
         let (rendered, held_back) = self.rendered_screen(&parser, redact, boundary.as_ref());
         let title = self.rendered_title(&parser, redact);
         grid_of(rendered.screen(), title, UNRETAINED_REVISION, held_back)
@@ -566,13 +686,25 @@ impl ScreenTracker {
     /// and that is what makes the diff below mean what it says.** The live
     /// grid is a pure function of the stream range
     /// `[seeded_from, consumed_head)` (a seed window plus every chunk fed
-    /// since), so feeding `[seeded_from, boundary)` to a fresh parser of
-    /// the same geometry yields precisely the state the live parser passed
-    /// through on its way here. No byte offset is mapped onto a cell
-    /// anywhere in this: the extent is found by rendering twice and
-    /// comparing cells, because a `\r` redraw, a multi-byte character and
-    /// a withheld region spanning rows each break that arithmetic
-    /// differently.
+    /// since) **and of the geometry it saw that range at**, so the replay
+    /// reproduces both: it starts at [`ScreenTracker::seed_geometry`] and
+    /// goes through the same `set_size` calls, at the same stream offsets,
+    /// that [`ScreenTracker::resizes`] recorded. Feeding
+    /// `[seeded_from, boundary)` that way yields precisely the state the
+    /// live parser passed through on its way here. No byte offset is
+    /// mapped onto a cell anywhere in this: the extent is found by
+    /// rendering twice and comparing cells, because a `\r` redraw, a
+    /// multi-byte character and a withheld region spanning rows each break
+    /// that arithmetic differently.
+    ///
+    /// **Without the geometry half it is not a replay of the same thing.**
+    /// A widening `set_size` extends each row with blanks and leaves the
+    /// old wrap points where they are; a height shrink re-scrolls. A
+    /// replay built at the *current* size instead re-wraps and re-scrolls
+    /// from scratch, so it disagrees with the live grid about which cell
+    /// holds what — and every such cell is masked, on a session that may
+    /// be withholding nothing near it. Measured: a 24-row grid shrunk to
+    /// 10 masked all ten visible rows' text.
     ///
     /// **`redact: false` skips it, deliberately.** §4.1 answers the same
     /// way — `holdback_boundary` returns `head` when `!opts.redact` — and
@@ -580,13 +712,34 @@ impl ScreenTracker {
     /// holdback. A masked grid under `redact: false` would be a hole in
     /// that recourse, not a second layer of safety.
     ///
-    /// **The one residual, and it fails safe.** If the ring buffer has
-    /// evicted the front of `[seeded_from, boundary)` the replay starts
-    /// late and its grid is missing whatever those bytes painted; the
-    /// affected cells then differ from the live ones and are *masked*
-    /// rather than shown. Over-masking is the direction this must fail in,
-    /// and it is the direction it does: a cell can only escape the mask by
-    /// being identical to a cell the pre-boundary bytes produced.
+    /// **The one residual, and it fails safe — but it is the steady state,
+    /// not an edge case.** If the ring buffer has evicted the front of
+    /// `[seeded_from, boundary)` the replay starts late and its grid is
+    /// missing whatever those bytes painted; the affected cells then
+    /// differ from the live ones and are *masked* rather than shown. For a
+    /// session that has outlived its ring buffer that is **every**
+    /// pre-boundary row, for as long as a holdback stays open — the whole
+    /// visible screen comes back `[REDACTED:unresolved]`, which is a
+    /// safe answer and a nearly useless one.
+    ///
+    /// **It is not repaired by replaying twice and diffing the replays
+    /// against each other, and that is worth stating because it is the
+    /// obvious next step from the geometry schedule above.** Both replays
+    /// would be missing the same front, so their difference looks like the
+    /// exact footprint of `[boundary, head)`. It is not: the withheld
+    /// bytes are always in the ring, but the *state they land on* is not,
+    /// so a replay that missed forty lines of scrolling paints them on row
+    /// 2 where the live parser has them on row 23. The mask would cover
+    /// row 2 and leave the withheld bytes readable on row 23 — a leak in
+    /// exchange for the over-masking. Measured, and pinned by
+    /// `an_evicted_front_still_masks_the_withheld_bytes_wherever_the_live_grid_put_them`.
+    /// Closing the eviction arm needs the pre-boundary state in the live
+    /// grid's own coordinates, which means state kept at feed time rather
+    /// than a second reconstruction at render time.
+    ///
+    /// Over-masking is the direction this must fail in, and it is the
+    /// direction it does: a cell can only escape the mask by being
+    /// identical to a cell the pre-boundary bytes produced.
     ///
     /// The replay is **not** added to `parsed_bytes`, on the same rule the
     /// repaint parser in `rendered_screen` already follows: that counter
@@ -595,21 +748,36 @@ impl ScreenTracker {
     /// render-time reconstruction on a read.
     fn boundary_screen(
         &self,
-        live: &vt100::Parser<TitleSink>,
-        from: u64,
-        head: u64,
+        span: ReplaySpan<'_>,
         redact: bool,
         seed: &dyn SeedSource,
         holdback: Option<u64>,
     ) -> Option<vt100::Screen> {
         let boundary = holdback?;
-        if !redact || boundary >= head {
+        if !redact || boundary >= span.head {
             return None;
         }
-        let replay = seed.replay(from, boundary);
-        let (rows, cols) = live.screen().size();
-        let mut parser = vt100::Parser::new(rows, cols, 0);
-        parser.process(&replay.bytes);
+        let replay = seed.replay(span.from, boundary);
+        let mut parser = vt100::Parser::new(span.origin.0, span.origin.1, 0);
+        // The same bytes through the same `set_size` calls at the same
+        // points. `at <= replay.start` leaves nothing to process and just
+        // applies the size, which is right: the front the ring evicted was
+        // painted at a geometry no cell of this render survives from.
+        let mut pos = replay.start;
+        for &(at, rows, cols) in span.changes {
+            let upto = at.clamp(pos, boundary);
+            parser.process(slice_of(&replay, pos, upto));
+            pos = upto;
+            parser.screen_mut().set_size(rows, cols);
+        }
+        parser.process(slice_of(&replay, pos, boundary));
+        // A resize *after* the boundary still applies: the mask compares
+        // this render with the live grid cell by cell, and the live grid
+        // has been through it.
+        let (rows, cols) = span.current;
+        if parser.screen().size() != (rows, cols) {
+            parser.screen_mut().set_size(rows, cols);
+        }
         Some(parser.screen().clone())
     }
 
@@ -834,9 +1002,7 @@ impl ScreenTracker {
         // second one, so a `diff_from` across a moving holdback describes
         // the masking as an ordinary screen change.
         let boundary = self.boundary_screen(
-            parser,
-            self.seeded_from,
-            self.consumed_head,
+            self.tracked_span(parser.screen().size()),
             redact,
             seed,
             holdback,
@@ -921,6 +1087,18 @@ fn char_slice(text: &str, start: usize, end: usize) -> &str {
     } else {
         &text[a..b]
     }
+}
+
+/// `replay.bytes` for the absolute range `[start, end)`, clamped to what
+/// the replay actually holds. Absolute offsets go in, so a range the ring
+/// evicted comes back empty rather than shifted — the one arithmetic in
+/// this module that maps a stream offset onto anything, and it maps it
+/// onto a byte, never onto a cell.
+fn slice_of(replay: &Replay, start: u64, end: u64) -> &[u8] {
+    let base = replay.start;
+    let lo = start.saturating_sub(base).min(replay.bytes.len() as u64) as usize;
+    let hi = end.saturating_sub(base).min(replay.bytes.len() as u64) as usize;
+    &replay.bytes[lo..hi.max(lo)]
 }
 
 fn grid_of(
@@ -2151,6 +2329,300 @@ negative = ["MARK"]
             "",
             "the wrapped continuation must lose the covered text, not gain \
              a second marker"
+        );
+    }
+
+    /// §4.1's mask must survive a resize the way it survives a re-seed —
+    /// and a **widening** does not go through the re-seed
+    /// `a_width_shrink_keeps_the_holdback_mask` covers. The live parser is
+    /// `set_size`d, which extends each row with blanks and leaves the old
+    /// wrap points alone, while the boundary replay is built at the *new*
+    /// width and re-wraps. Every row whose wrapping moved then differs
+    /// from its replay and is masked, so an agent that resizes its view
+    /// while a secret is in flight loses lines of ordinary program output
+    /// it had already been shown, with `held_back: true` giving it no way
+    /// to tell that loss from a real withholding.
+    ///
+    /// Both directions are asserted, because "never mask" passes the first
+    /// half on its own: the reflowed rows must come back **readable** and
+    /// the withheld row must still come back **masked**.
+    #[test]
+    fn a_widening_resize_does_not_mask_the_rows_it_reflowed() {
+        let unresolved = marker(UNRESOLVED_KIND);
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(
+            ScreenConfig {
+                mode: ScreenTracking::On,
+                rows: 24,
+                cols: 30,
+                ..ScreenConfig::default()
+            },
+            rules(),
+            t0,
+        );
+        // 45 columns of text on a 30-column grid: row 0 fills and wraps,
+        // row 1 takes the remaining 15. Widening to 60 fits it all on row
+        // 0 — so row 1 is exactly the row whose wrapping the resize moves.
+        // 30 columns rather than 20 because the marker is 21 characters
+        // and `clip_to_cols` would otherwise cut it, turning every
+        // assertion below into a measurement of the clip.
+        let (wide, rest) = ("A".repeat(30), "A".repeat(15));
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        feed(&mut t, &mut log, t0, format!("{wide}{rest}").as_bytes());
+        let boundary = log.bytes.len() as u64;
+        feed(&mut t, &mut log, t0, b"\x1b[5;1Hwithheld");
+
+        // The control at the geometry the bytes were painted at: the mask
+        // covers row 4 and nothing else, so what changes below is the
+        // resize and not the fixture.
+        let before = full(t.capture(None, true, t0, &log, Some(boundary)));
+        assert!(before.held_back);
+        assert_eq!(before.lines[0].trim_end(), wide);
+        assert_eq!(before.lines[1].trim_end(), rest);
+        assert_eq!(before.lines[4].trim_end(), unresolved);
+
+        t.resize(60, 24, &log);
+        let after = full(t.capture(None, true, t0, &log, Some(boundary)));
+        assert_eq!(
+            after.lines[0].trim_end(),
+            wide,
+            "row 0 lost its pre-boundary output to the resize: {:?}",
+            after.lines[0]
+        );
+        assert_eq!(
+            after.lines[1].trim_end(),
+            rest,
+            "the row whose wrapping the resize moved came back masked, and \
+             the agent cannot tell that from a withholding: {:?}",
+            after.lines[1]
+        );
+        assert_eq!(
+            after.lines[4].trim_end(),
+            unresolved,
+            "the withheld row must still be masked after the resize: {:?}",
+            after.lines[4]
+        );
+        assert!(after.held_back);
+
+        // And with no holdback the same resized parser renders all of it,
+        // so the two assertions above are about the mask and not about a
+        // grid the resize emptied.
+        let plain = full(t.capture(None, true, t0, &log, None));
+        assert!(!plain.held_back);
+        assert_eq!(plain.lines[0].trim_end(), wide);
+        assert_eq!(plain.lines[1].trim_end(), rest);
+        assert_eq!(plain.lines[4].trim_end(), "withheld");
+        assert!(!plain.lines.iter().any(|l| l.contains("[REDACTED:")));
+    }
+
+    /// The height half of the same defect, and the louder one. A shrink
+    /// that drops rows below the live parser's cursor makes the replay —
+    /// built at the *new* height and re-scrolled — sit two lines out of
+    /// step with the live grid, so **every** row differs by its own
+    /// content and the whole visible screen masks. Measured without the
+    /// geometry schedule: twelve lines painted, shrink 24 rows to 10, and
+    /// all ten rows come back `line [REDACTED:unresolved]`.
+    ///
+    /// The withheld paint lands on a row that survives the shrink, so the
+    /// arrangement asserts both directions after the resize: the scrolled
+    /// rows readable, and the withheld one still masked.
+    #[test]
+    fn a_height_shrink_does_not_mask_the_rows_it_scrolled() {
+        let unresolved = marker(UNRESOLVED_KIND);
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(
+            ScreenConfig {
+                mode: ScreenTracking::On,
+                rows: 24,
+                cols: 40,
+                ..ScreenConfig::default()
+            },
+            rules(),
+            t0,
+        );
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        // Twelve lines, so a 10-row grid has to scroll to hold them and a
+        // 24-row one does not.
+        for i in 0..12 {
+            feed(&mut t, &mut log, t0, format!("line {i}\r\n").as_bytes());
+        }
+        let boundary = log.bytes.len() as u64;
+        // A run that shares no character with the `line 3` under it: a
+        // cell that happens to match is not masked, and two masked runs
+        // either side of it would be two markers rather than one.
+        feed(&mut t, &mut log, t0, b"\x1b[4;1HXXXXXXXX");
+
+        let before = full(t.capture(None, true, t0, &log, Some(boundary)));
+        assert!(before.held_back);
+        assert_eq!(before.lines[3].trim_end(), unresolved);
+        assert_eq!(before.lines[4].trim_end(), "line 4");
+
+        t.resize(40, 10, &log);
+        let after = full(t.capture(None, true, t0, &log, Some(boundary)));
+        assert!(after.held_back, "the withheld row is still on the grid");
+        assert_eq!(
+            after.lines[3].trim_end(),
+            unresolved,
+            "the withheld row must still be masked after the resize: {:?}",
+            after.lines[3]
+        );
+        for (i, line) in after.lines.iter().enumerate() {
+            if i == 3 {
+                continue;
+            }
+            assert_eq!(
+                line.trim_end(),
+                format!("line {i}"),
+                "row {i} lost its pre-boundary output to the resize: {:?}",
+                after.lines
+            );
+        }
+
+        // The control: with no holdback the same resized parser renders
+        // every one of those rows, withheld text and all.
+        let plain = full(t.capture(None, true, t0, &log, None));
+        assert!(!plain.held_back);
+        assert_eq!(plain.lines[3].trim_end(), "XXXXXXXX");
+        assert_eq!(plain.lines[9].trim_end(), "line 9");
+    }
+
+    /// The schedule is bounded, and what it falls back to when it runs out
+    /// is the conservative reading rather than a reconstruction it cannot
+    /// vouch for: the replay is built at the current geometry, which
+    /// over-masks the reflowed rows exactly as it did before the schedule
+    /// existed, and the withheld region stays masked.
+    ///
+    /// Reaching the ceiling needs output between the resizes — two resizes
+    /// with nothing in between coalesce onto one offset — so the loop
+    /// feeds a byte each time. That is the premise, and it is asserted
+    /// rather than assumed.
+    #[test]
+    fn the_resize_schedule_has_a_ceiling_and_falls_back_to_masking_more() {
+        let unresolved = marker(UNRESOLVED_KIND);
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(
+            ScreenConfig {
+                mode: ScreenTracking::On,
+                rows: 24,
+                cols: 40,
+                ..ScreenConfig::default()
+            },
+            rules(),
+            t0,
+        );
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+
+        // The coalesce first, since it is what makes the ceiling hard to
+        // reach: two resizes with no output between them are one change to
+        // the replay, because it has no bytes to apply at the first.
+        t.resize(40, 25, &log);
+        t.resize(40, 26, &log);
+        assert_eq!(t.resizes.len(), 1, "resizes at one offset are one entry");
+        assert_eq!(t.resizes[0], (t.consumed_head, 26, 40));
+
+        // Rows alternate: a width *shrink* would re-seed and clear the
+        // schedule, and this must fill it.
+        for i in 0..=TRACKED_RESIZES_MAX {
+            feed(&mut t, &mut log, t0, b".");
+            t.resize(40, if i % 2 == 0 { 25 } else { 24 }, &log);
+        }
+        assert!(
+            t.resizes_overflowed,
+            "the ceiling was never reached, so nothing below is about it"
+        );
+        assert!(
+            t.resizes.is_empty(),
+            "the dropped schedule still costs memory"
+        );
+
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        let boundary = log.bytes.len() as u64;
+        feed(&mut t, &mut log, t0, b"\x1b[5;1Hwithheld");
+        let masked = full(t.capture(None, true, t0, &log, Some(boundary)));
+        assert!(masked.held_back, "the fallback dropped §4.1's mask");
+        assert_eq!(masked.lines[4].trim_end(), unresolved);
+        assert!(
+            !masked.lines.iter().any(|l| l.contains("withheld")),
+            "the withheld text reached the grid: {:?}",
+            masked.lines
+        );
+    }
+
+    /// **Why the eviction arm is not repaired by diffing the two replays
+    /// against each other**, which is the obvious next step from the
+    /// resize fix above and is why this test is here rather than the
+    /// repair.
+    ///
+    /// Once the ring has evicted the front of `[seeded_from, boundary)`
+    /// the replay starts late, its cursor is wherever the *retained* bytes
+    /// put it, and every pre-boundary row differs from the live grid — so
+    /// with a holdback open the whole visible screen comes back
+    /// `[REDACTED:unresolved]`. That is a real defect and it is the steady
+    /// state for a long-running session, not an edge case. The tempting
+    /// cure is to replay the range **twice** — once truncated at the
+    /// boundary, once whole — and mask only the cells that differ between
+    /// *those*, since both would then be missing the same front.
+    ///
+    /// It leaks. The withheld bytes are always at the head of the stream
+    /// and so are always in the ring, but the *state they land on* is not:
+    /// a replay that missed forty lines of scrolling paints them on row 2
+    /// where the live parser has them on row 23. The mask would then cover
+    /// row 2 — ordinary output the agent should have — and leave the
+    /// withheld bytes readable on row 23. Over-masking is the direction
+    /// this must fail in (see [`ScreenTracker::boundary_screen`]), so the
+    /// eviction arm stays over-masked until the pre-boundary state can be
+    /// reconstructed in the live grid's own coordinates, which needs state
+    /// kept at feed time rather than a second replay at render time.
+    ///
+    /// This test is that argument, executable: it fails under the
+    /// two-replay repair with `SECRETTEXT` on the grid.
+    #[test]
+    fn an_evicted_front_still_masks_the_withheld_bytes_wherever_the_live_grid_put_them() {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(
+            ScreenConfig {
+                mode: ScreenTracking::On,
+                rows: 24,
+                cols: 40,
+                ..ScreenConfig::default()
+            },
+            rules(),
+            t0,
+        );
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        // Forty lines on a 24-row grid: the live parser has scrolled, so
+        // its cursor is on the last row and a replay that missed the
+        // scrolling is nowhere near it.
+        for i in 0..40 {
+            feed(&mut t, &mut log, t0, format!("line {i:02}\r\n").as_bytes());
+        }
+        let boundary = log.bytes.len() as u64;
+        feed(&mut t, &mut log, t0, b"SECRETTEXT");
+
+        // The control, with the whole log still reachable: the withheld
+        // text is masked and the rows above it are not.
+        let whole = full(t.capture(None, true, t0, &log, Some(boundary)));
+        assert!(whole.held_back);
+        assert!(!whole.lines.iter().any(|l| l.contains("SECRETTEXT")));
+        assert_eq!(whole.lines[22].trim_end(), "line 39");
+
+        // And with all but the newest 30 bytes evicted — two lines of
+        // pre-boundary output and the withheld bytes.
+        let ring = WrappedRing {
+            log: &log,
+            keep: 30,
+        };
+        let evicted = full(t.capture(None, true, t0, &ring, Some(boundary)));
+        assert!(evicted.held_back);
+        assert!(
+            !evicted.lines.iter().any(|l| l.contains("SECRETTEXT")),
+            "the withheld bytes reached the grid once the ring had evicted \
+             the front of the replay: {:?}",
+            evicted.lines
         );
     }
 
