@@ -274,7 +274,8 @@ async fn exchange(
 }
 
 /// Whether this response is a refusal the daemon issued about the
-/// **connection** rather than about a request (§18.3's closing column).
+/// **connection** rather than about a request
+/// ([`ErrorCode::closes_connection`]).
 ///
 /// **`is_some_and`, not `is_none_or`, and the difference from
 /// [`reusable`] is deliberate.** Both read a code this build may not
@@ -283,6 +284,18 @@ async fn exchange(
 /// reconnect. Waiving *id correlation* costs the caller another call's
 /// payload typed as its own — so an unrecognised code keeps the id
 /// check, which is the conservative reading in that direction.
+///
+/// **`daemon_shutting_down` joined that set with I-1, and it is the one
+/// member whose id the daemon does know**: `handle_connection` answers
+/// it with `req.id` (the frame-layer refusals are built before the body
+/// was decoded and necessarily send `id: 0`). Waiving the check for it
+/// is therefore wider than it needs to be, and costs nothing — the
+/// waived comparison can only differ on a stream that is already
+/// desynchronised, and on that stream the caller is handed a retriable
+/// refusal instead of an `IdMismatch`, which is an error either way and
+/// the more actionable of the two. Narrowing it would mean a second
+/// list of codes here, disagreeing with the first by one row: the shape
+/// that produced I-1.
 fn connection_scoped_refusal(resp: &Response) -> bool {
     resp.control_error()
         .and_then(|e| ErrorCode::from_wire(&e.code))
@@ -295,9 +308,18 @@ fn connection_scoped_refusal(resp: &Response) -> bool {
 /// Two ways it cannot. A transport fault leaves the stream at an unknown
 /// offset — half a frame may be written, or a length prefix read without
 /// its body — and re-using it would desynchronise every later call on
-/// it. And §18.3's `closes_connection()` codes are the ones the daemon
-/// answers and then hangs up on (`handle_connection`), so parking that
-/// stream would hand a later call a socket already at EOF.
+/// it. And [`ErrorCode::closes_connection`]'s codes are the ones the
+/// daemon answers and then hangs up on (`handle_connection`), so parking
+/// that stream would hand a later call a socket already at EOF.
+///
+/// **`daemon_shutting_down` is the case that made this real.** It is the
+/// one code the daemon advertises as retriable, and while it read as
+/// non-closing this function parked the socket the daemon hung up on
+/// half a statement later — so the very call the daemon invited back
+/// met an `Eof` that `ClientError::retriable()` calls fatal. The
+/// classifier is what makes the advertised retry reach a *new*
+/// connection; the retry itself is asserted end to end by
+/// `a_request_to_a_stopping_daemon_is_refused_with_the_retriable_code`.
 ///
 /// **The unknown code fails closed, and here that is not theoretical.**
 /// This is the one side of the protocol that parses a code it did not
@@ -597,7 +619,6 @@ mod tests {
             ErrorCode::UnknownMethod,
             ErrorCode::BadParams,
             ErrorCode::LimitReached,
-            ErrorCode::DaemonShuttingDown,
         ] {
             assert!(
                 reusable(&Ok(Response::error(1, code, "m"))),
@@ -605,13 +626,20 @@ mod tests {
                 code.as_str()
             );
         }
-        // §18.3's three closing rows, named rather than filtered through
+        // The closing rows, named rather than filtered through
         // `closes_connection()` — deriving the expectation from the
         // predicate under test would make this vacuous.
+        //
+        // `daemon_shutting_down` is here because its producer writes it
+        // and returns from `handle_connection` on the next statement.
+        // This list had it in the group above, and that was I-1: the
+        // pool parked a socket already at EOF, so the retry the daemon
+        // had just advertised came back as a non-retriable `Eof`.
         for code in [
             ErrorCode::FrameTooLarge,
             ErrorCode::NoHandshake,
             ErrorCode::ProtocolViolation,
+            ErrorCode::DaemonShuttingDown,
         ] {
             assert!(
                 !reusable(&Ok(Response::error(1, code, "m"))),
@@ -646,10 +674,11 @@ mod tests {
         assert!(!with("bad_params").closes_connection());
         assert!(!with("unknown_method").closes_connection());
         assert!(!with("limit_reached").closes_connection());
-        // `daemon_shutting_down` answers `false` deliberately: the daemon
-        // does close that connection, but on its own schedule and not on
-        // this code's account (§18.3).
-        assert!(!with("daemon_shutting_down").closes_connection());
+        // `daemon_shutting_down` answers `true`: the producer returns
+        // from `handle_connection` on the statement after the write, so
+        // a caller told this and left to believe the connection survives
+        // is a caller holding an EOF. It answered `false` until I-1.
+        assert!(with("daemon_shutting_down").closes_connection());
         assert!(
             with("a_code_from_the_future").closes_connection(),
             "fail closed on a code from a newer daemon"

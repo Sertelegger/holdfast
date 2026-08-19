@@ -1289,6 +1289,15 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
         // Checked **after** the read and before the dispatch, so the
         // `daemon/stop` that set the flag is itself dispatched normally
         // and answers its own caller with a `StopOutcome`.
+        //
+        // **The `return` below is part of the code's contract, not an
+        // implementation detail of this arm.** There is no grace window
+        // in which this connection carries another call: the client is
+        // told to reconnect precisely because this socket is finished,
+        // and `ErrorCode::closes_connection()` answers `true` for the
+        // code so the client's pool declines to park it. When that
+        // answered `false` the pool parked this socket and the invited
+        // retry came back as `Eof`.
         if daemon.is_shutting_down() {
             let resp = Response::error(
                 req.id,
@@ -1338,8 +1347,9 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
 /// socket and the stream is still frame-aligned. A codec that wrote the
 /// prefix first could not do this.
 ///
-/// The connection still closes — `frame_too_large` is one of §18.3's
-/// three `closes_connection` codes — but it closes *after* saying why,
+/// The connection still closes — `frame_too_large` is one of
+/// [`ErrorCode::closes_connection`]'s codes — but it closes *after*
+/// saying why,
 /// correlated to the request that provoked it, so `ControlClient` drops
 /// that connection instead of parking it and the next call dials a fresh
 /// one. The failure is one call, not the rest of the MCP session.
@@ -2056,7 +2066,6 @@ mod tests {
             ErrorCode::UnknownMethod,
             ErrorCode::BadParams,
             ErrorCode::LimitReached,
-            ErrorCode::DaemonShuttingDown,
         ] {
             assert!(
                 !response_closes_connection(&Response::error(1, code, "m")),
@@ -2064,13 +2073,20 @@ mod tests {
                 code.as_str()
             );
         }
-        // §18.3's three closing rows, named rather than filtered
-        // through `closes_connection()` — deriving the expectation from
-        // the predicate under test would make this vacuous.
+        // The closing rows, named rather than filtered through
+        // `closes_connection()` — deriving the expectation from the
+        // predicate under test would make this vacuous.
+        //
+        // `daemon_shutting_down` is one of them since I-1. This
+        // dispatcher cannot reach it — the shutdown arm answers and
+        // returns before `dispatch` runs — but the code's contract is
+        // "the connection is over", and a daemon that ever emitted it
+        // from a dispatch arm would have to hang up too.
         for code in [
             ErrorCode::FrameTooLarge,
             ErrorCode::NoHandshake,
             ErrorCode::ProtocolViolation,
+            ErrorCode::DaemonShuttingDown,
         ] {
             assert!(
                 response_closes_connection(&Response::error(1, code, "m")),

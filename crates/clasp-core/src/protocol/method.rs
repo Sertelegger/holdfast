@@ -146,30 +146,53 @@ impl ErrorCode {
     /// bare `bool` — there is nowhere to put it. It is recorded instead:
     /// the retry must follow a **reconnect**, since the connection this
     /// code arrived on is being torn down. A client that retries
-    /// immediately on the same socket spins.
+    /// immediately on the same socket spins. [`Self::closes_connection`]
+    /// answers `true` for this row for exactly that reason, and is what
+    /// makes the reconnect happen rather than leaving it to a caller's
+    /// good manners.
     pub fn retriable(self) -> bool {
         matches!(self, Self::DaemonShuttingDown)
     }
 
-    /// Whether the connection must be closed after emitting this code.
+    /// Whether the connection is over once this code has been sent.
     /// `unknown_method`, `bad_params` and `limit_reached` are per-request
     /// faults and leave the connection usable; `frame_too_large`,
     /// `no_handshake` and `protocol_violation` mean the peer is
-    /// mis-framing or unwelcome (§7.4, §18.3). `daemon_shutting_down` is
-    /// in neither group and answers `false` deliberately: the daemon
-    /// does close that connection, but on its own schedule and not on
-    /// this code's account, so a peer must not read the code as the
-    /// instruction.
+    /// mis-framing or unwelcome (§7.4, §18.3).
     ///
-    /// `limit_reached` is in the *first* group deliberately. §18.3 marks
-    /// only `frame_too_large` as closing, and the caller that meets
-    /// `limit_reached` is a `bridge/register` (0.0.10) on a connection it
+    /// **`daemon_shutting_down` is in the closing group, and the reason
+    /// is one line of `handle_connection`.** This answered `false` on the
+    /// reasoning that "the daemon does close that connection, but on its
+    /// own schedule and not on this code's account". There is no separate
+    /// schedule: the producer writes this code and `return`s on the very
+    /// next statement, so the stream is at EOF before the peer has
+    /// finished reading the frame. `false` there told
+    /// [`super::client::reusable`] to park a socket the daemon had
+    /// already hung up on, and the next call met a `FrameError::Eof` that
+    /// `ClientError::retriable()` classifies `false` — so the daemon
+    /// advertised `retriable: true`, said *"reconnect and retry"*, and
+    /// the client's own pool turned that retry into a hard failure. The
+    /// retriable column and this one are not in tension: `retriable()`'s
+    /// own doc already records that the retry must follow a **reconnect**
+    /// because "the connection this code arrived on is being torn down",
+    /// which is this function answering `true`.
+    ///
+    /// §18.3 has no closing column — it carries `Retriable` and
+    /// `Meaning` — so this set is not a transcription of a table. It is
+    /// the wire behaviour of the four producers, and it is asserted
+    /// against them, not against the spec.
+    ///
+    /// `limit_reached` is in the *first* group deliberately: the caller
+    /// that meets it is a `bridge/register` (0.0.10) on a connection it
     /// still needs for every other method — tearing it down would turn a
     /// full table into a dropped client.
     pub fn closes_connection(self) -> bool {
         matches!(
             self,
-            Self::FrameTooLarge | Self::NoHandshake | Self::ProtocolViolation
+            Self::FrameTooLarge
+                | Self::NoHandshake
+                | Self::ProtocolViolation
+                | Self::DaemonShuttingDown
         )
     }
 
@@ -533,12 +556,19 @@ mod tests {
     }
 
     #[test]
-    fn exactly_three_codes_close_the_connection() {
-        // §18.3's closing column, and `limit_reached` is not in it.
-        // Without this the new variant could join `closes_connection`'s
-        // `matches!` unnoticed, and a full bridge table would drop a
-        // control connection the caller still needs for every other
-        // method. A sequence assertion again, for the same reason.
+    fn exactly_the_codes_the_daemon_hangs_up_after_close_the_connection() {
+        // Not a transcription of §18.3 — that table has no closing
+        // column — but of what the four producers do to the socket.
+        // `limit_reached` is deliberately absent: without this assertion
+        // the new variant could join `closes_connection`'s `matches!`
+        // unnoticed, and a full bridge table would drop a control
+        // connection the caller still needs for every other method.
+        // `daemon_shutting_down` is deliberately present: its producer
+        // returns from `handle_connection` on the statement after the
+        // write, and this list answering `false` for it was I-1 — a pool
+        // that parked a dead socket and turned the daemon's advertised
+        // retry into a non-retriable `Eof`. A sequence assertion again,
+        // in `ALL` order, for the same reason as the row test above.
         let closing: Vec<&str> = ErrorCode::ALL
             .iter()
             .filter(|c| c.closes_connection())
@@ -546,8 +576,13 @@ mod tests {
             .collect();
         assert_eq!(
             closing,
-            vec!["frame_too_large", "no_handshake", "protocol_violation"],
-            "§7.4/§18.3: these three close the connection and nothing else does"
+            vec![
+                "frame_too_large",
+                "no_handshake",
+                "protocol_violation",
+                "daemon_shutting_down",
+            ],
+            "§7.4: these four end the connection and nothing else does"
         );
     }
 

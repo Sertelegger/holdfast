@@ -816,6 +816,62 @@ async fn a_request_to_a_stopping_daemon_is_refused_with_the_retriable_code() {
     // would stay green against a producer that emitted the string with
     // the flag cleared.
     assert!(err.retriable(), "ClientError::retriable() must agree");
+
+    // ------------------------------------------------------------------
+    // And now the retry the daemon just invited, because asserting
+    // `retriable: true` and then never retrying is what let I-1 ship.
+    //
+    // The refusal above arrived on a **pooled** connection, and the
+    // daemon `return`ed from `handle_connection` on the statement after
+    // it — so that socket is at EOF. While `daemon_shutting_down` read
+    // as non-closing, `reusable()` parked it, this call checked it back
+    // out, and the caller met `FrameError::Eof`, which
+    // `ClientError::retriable()` classifies **false**. The daemon said
+    // "reconnect and retry", the client's own pool made the retry a hard
+    // failure, and every assertion above stayed green.
+    //
+    // The listener is drained to a known state first: `serve` breaks its
+    // accept loop on the shutdown signal and drops the listener, so
+    // once a raw dial is refused, every later dial is refused the same
+    // way and this row has no window to be flaky in. It is a *bounded*
+    // loop — an unbounded wait here would be a hung CI job rather than a
+    // red test, and there is no `nextest.toml` to time it out.
+    let sock = d.paths.control_sock();
+    let mut listener_gone = false;
+    for _ in 0..400 {
+        if UnixStream::connect(&sock).await.is_err() {
+            listener_gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        listener_gone,
+        "a daemon told to stop must stop accepting; without this the retry below \
+         could reach a live listener and the row would prove nothing"
+    );
+
+    let retry = client
+        .call::<_, DaemonStatus>(method::METHOD_DAEMON_STATUS, &json!({}))
+        .await
+        .expect_err("the daemon is still stopping, so the retry cannot succeed");
+    // The shape, not the finding: whatever the retry meets, it must not
+    // be *less* actionable than the refusal that invited it. A pooled
+    // EOF answers `false` here; a fresh dial at a dead socket answers
+    // `true` as `ClientError::Connect`, which is also the auto-spawn
+    // signal — the honest report that the daemon is gone.
+    assert!(
+        retry.retriable(),
+        "the daemon advertised a retriable refusal; the retry must not come back \
+         fatal, got {retry:?}"
+    );
+    // And the finding itself, named, because `Frame(Eof)` is the one
+    // outcome that proves the pool handed back the hung-up socket rather
+    // than dialling.
+    assert!(
+        !matches!(retry, ClientError::Frame(_)),
+        "the retry re-used the connection the daemon had already closed: {retry:?}"
+    );
 }
 
 #[tokio::test]
