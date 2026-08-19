@@ -197,11 +197,26 @@ pub async fn ensure_daemon(
         Err(_) => {}
     }
 
+    // **`stdout` is nulled, and that is a protocol requirement rather than
+    // tidiness.** The overwhelmingly common caller is `clasp mcp`, whose
+    // stdout *is* the MCP JSON-RPC transport; a child that inherits it
+    // writes onto the wire. `clasp daemon start` prints `daemon started
+    // (pid N)` on success by §3.2, so before this line the first thing an
+    // auto-spawning shim sent its client was a bare line of English. It
+    // parsed as nothing, and `scripts/mcp-smoke.sh` measured 20 of its
+    // `jq -s` assertions failing at once because one unparseable line
+    // poisons the whole slurp.
+    //
+    // `stderr` is deliberately left inherited: it is not the transport,
+    // MCP clients surface it as server logs, and a failed spawn's own
+    // diagnostic is the most useful thing a user can be shown when the
+    // error below points them at the daemon log.
     let status = std::process::Command::new(exe)
         .arg("daemon")
         .arg("start")
         .env(super::paths::RUNTIME_DIR_ENV, paths.dir())
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
         .status()
         .map_err(|source| ClientError::Connect {
             path: exe.display().to_string(),

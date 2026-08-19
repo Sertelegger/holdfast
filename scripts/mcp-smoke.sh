@@ -75,6 +75,43 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+# A private CLASP instance for this run, and the teardown that goes with
+# it. From 0.0.5 on, `"$BIN" mcp` is hybrid mode: it AUTO-SPAWNS a daemon
+# and leaves it running when the transcript block ends. Without this
+# export that daemon lands in the invoking user's default runtime
+# directory, and two deterministic failures follow.
+#
+#   1. The headline check goes red on the SECOND run. `list_sessions`
+#      maps over the whole registry with no filter and the registry
+#      retains exited sessions, so a surviving daemon still holds the
+#      previous run's terminated `smoke` session -- `data(13).sessions |
+#      length` is then 2, and `.[0]` over a `HashMap` is not even
+#      deterministically the new one.
+#   2. It re-opens the false pass this file's self-build was added to
+#      close. A daemon surviving from a previous BUILD serves that older
+#      binary's behaviour, and `cargo build` cannot reach a process that
+#      is already running -- the same shape as the stale-binary `SMOKE
+#      OK` measured above, and just as green.
+#
+# `--no-daemon` is deliberately NOT the fix: it would retreat the only
+# real-JSON-RPC check in the project onto the non-default transport at
+# the exact milestone that makes hybrid mode the default, leaving the
+# transport most agents actually use smoked by nothing.
+#
+# `mktemp` rather than `/tmp/clasp-smoke-$$`: two runs can collide on a
+# recycled pid, and the second would then adopt the first's daemon --
+# which is the bug this isolation exists to close. Short, under `/tmp`,
+# for the `sun_path` reason: a socket under the workspace `target/`
+# overruns the ~100-byte budget.
+export CLASP_RUNTIME_DIR="$(mktemp -d /tmp/clasp-smoke-XXXXXX)"
+# EXACTLY ONE `EXIT` trap, and it must stay that way: bash keeps one, so
+# a second `trap ... EXIT` anywhere in this file replaces this one
+# silently and leaks both the daemon and the directory. Installed after
+# `BIN` resolves and before the transcript runs, so a failed check still
+# tears down. `daemon stop` with no daemon exits 0 by §3.2, so the trap
+# is idempotent and its status is ignored.
+trap '"$BIN" daemon stop >/dev/null 2>&1; rm -rf "$CLASP_RUNTIME_DIR"' EXIT
+
 req() { printf '%s\n' "$1"; }
 
 OUT="$(
@@ -138,6 +175,24 @@ OUT="$(
     req '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}'
     req '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_command_history","arguments":{"session":"smoke"}}}'
     req '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"status","arguments":{"session":"smoke"}}}'
+    # The one place in this transcript where ORDER, not elapsed time, is
+    # what the sleep buys. Everything above is a read; `terminate` is the
+    # single mutation, and it ends the session's claim on the name
+    # `smoke` -- so any read that lands after it answers
+    # `session_not_found`.
+    #
+    # Requests are written ahead of time and responses are never read, so
+    # the only thing separating two requests is a sleep. That was
+    # survivable while the tools ran in-process and finished in arrival
+    # order; from 0.0.5 each one is a socket round-trip through the shim,
+    # rmcp dispatches a task per request, and completion order is
+    # whatever the runtime picks. Measured without this line: responses
+    # came back `... 16 13 6 7 8` -- `terminate` overtook the two
+    # requests written before it, and `get_command_history` and `status`
+    # both answered `session_not_found` about a session that had been
+    # alive when they were sent. Four checks red, none of them about
+    # anything that was broken.
+    sleep 1
     req '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"terminate","arguments":{"session":"smoke","force":true}}}'
     sleep 0.3
   } | "$BIN" mcp
