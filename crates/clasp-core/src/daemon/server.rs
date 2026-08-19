@@ -557,10 +557,10 @@ impl Daemon {
             LogRetention::from(self.config()),
             std::time::SystemTime::now(),
         ) {
-            eprintln!("clasp daemon: log rotation sweep failed: {e}");
+            crate::diag!("clasp daemon: log rotation sweep failed: {e}");
         }
         if let Err(e) = self.server.processor.audit.reopen() {
-            eprintln!("clasp daemon: cannot reopen the audit log: {e}");
+            crate::diag!("clasp daemon: cannot reopen the audit log: {e}");
         }
     }
 }
@@ -674,7 +674,7 @@ pub async fn serve(daemon: Arc<Daemon>, listener: UnixListener) {
                         });
                     }
                     Err(e) => {
-                        eprintln!("clasp daemon: accept failed: {e}");
+                        crate::diag!("clasp daemon: accept failed: {e}");
                     }
                 }
             }
@@ -799,7 +799,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // that will not start because a log could not be renamed is a worse
     // outcome than one that runs and says so.
     if let Err(e) = paths.sweep_logs(LogRetention::from(&config), std::time::SystemTime::now()) {
-        eprintln!("clasp daemon: log rotation sweep failed: {e}");
+        crate::diag!("clasp daemon: log rotation sweep failed: {e}");
     }
 
     let daemon = Daemon::with_config(paths.clone(), config);
@@ -810,7 +810,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("clasp daemon: cannot install SIGTERM handler: {e}");
+                    crate::diag!("clasp daemon: cannot install SIGTERM handler: {e}");
                     return;
                 }
             };
@@ -916,11 +916,12 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
         // Diagnostics only, and after the verdict rather than inside it:
         // nothing below can change who is admitted.
         match &cred {
-            Ok(c) => eprintln!(
+            Ok(c) => crate::diag!(
                 "clasp daemon: refused a connection from uid {} (daemon runs as uid {})",
-                c.uid, daemon.owner_uid
+                c.uid,
+                daemon.owner_uid
             ),
-            Err(e) => eprintln!("clasp daemon: cannot read peer credentials, refusing: {e}"),
+            Err(e) => crate::diag!("clasp daemon: cannot read peer credentials, refusing: {e}"),
         }
         return;
     }
@@ -1036,7 +1037,7 @@ async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
     match frame::write_frame(w, resp).await {
         Ok(()) => true,
         Err(FrameError::TooLarge { len }) => {
-            eprintln!(
+            crate::diag!(
                 "clasp daemon: the response to request {id} is {len} bytes, over the \
                  {}-byte frame limit; refusing it and closing the connection",
                 frame::MAX_FRAME_BYTES
