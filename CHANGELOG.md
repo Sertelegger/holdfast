@@ -6,13 +6,52 @@ upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.0.6] — 2026-08-19
+
+**"Human-Observable" stops being an aspiration.** 0.0.5's changelog said the
+attach and watch surfaces "that would make it true are still future work". This
+is that work: a second Unix socket carrying a live terminal stream to human
+clients, alongside the MCP surface the agent uses, on the same sessions at the
+same time.
+
+### Added
+
+- **`holdfast attach <session>`** — a raw-mode view of a live session with
+  tmux-style detach (`Ctrl-B d`). What the agent sees, you see, and you can
+  type into the same shell.
+- **`holdfast watch <session>`** — the same stream read-only. It cannot send a
+  write frame at all: the refusal is a server-side frame-kind table checked
+  before every arm, not a client-side politeness.
+- **A per-connection redaction role.** An observer's stream is redacted; an
+  interactive client's is not. The decision reads the connection's *role* and
+  never `client_kind`, which is audit attribution only — a rule that was prose
+  until this milestone and is now a test that dies under a carve-out in either
+  direction.
+- **Streaming redaction**, which had to solve a problem the batch redactor did
+  not: a secret split across chunk boundaries in a stream that cannot be
+  rewound. It withholds an unterminated match rather than emitting it, which
+  makes it *stronger* than the read path over the first ~24 KiB.
+- **`SecretInput`** — a password typed into an attached client reaches the
+  child's PTY without crossing the MCP wire, without appearing in any other
+  client's stream, and without an audit entry carrying its content. The prompt
+  is detected from termios `ECHO`, not from matching the word `Password:`.
+- **`SessionExited`, `Detached` and `AwaitingSecret` frames**, so a client is
+  told why a stream ended rather than discovering it by silence.
+
 ### Changed
 
-- **Renamed from CLASP to Holdfast.** The project was *CLASP — Claude's Live
+- **The GitHub repository is now `Sertelegger/holdfast`.** The v0.0.5 notes
+  recorded the slug as deliberately unchanged; it changed immediately after
+  that tag. Old URLs redirect, but `Cargo.toml`'s `repository` field does not
+  benefit from a redirect, so it moved too.
+- **Renamed from CLASP to Holdfast.** *This shipped inside the `v0.0.5` tag* —
+  it is recorded here because the section was written after that tag was cut,
+  and because nothing was ever released under the old name, so it is history
+  rather than an upgrade step. The project was *CLASP — Claude's Live
   Agent Shell Proxy*; it is now **HOLDFAST — Human-Observable Long-lived Daemon
-  For Agent Shell Terminals**. "Human-Observable" names the design intent, not a
-  shipped property: the attach, watch and web-UI surfaces that would make it
-  true are still future work (see [ROADMAP.md](./ROADMAP.md)).
+  For Agent Shell Terminals**.
 
   The rename is not only cosmetic. Everything below changes behaviour:
 
