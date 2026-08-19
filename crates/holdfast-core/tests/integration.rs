@@ -1948,7 +1948,7 @@ async fn get_command_history_bounds_its_response_at_the_ring_default() {
 // have masked, and the field list is §9.4's.
 
 /// A server writing its audit trail into a temporary directory, plus the
-/// path to read it back from. Never the real `~/.clasp/logs/audit.log`.
+/// path to read it back from. Never the real `~/.holdfast/logs/audit.log`.
 fn server_with_audit(dir: &std::path::Path) -> (HoldfastServer, std::path::PathBuf) {
     let path = dir.join("audit.log");
     (

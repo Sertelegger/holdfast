@@ -1,6 +1,6 @@
 //! Daemon auto-spawn and the start lock (spec §7.3, §3.4).
 //!
-//! The sequence, which REQ-D-005 names verbatim: acquire `clasp.lock` →
+//! The sequence, which REQ-D-005 names verbatim: acquire `holdfast.lock` →
 //! re-check (another shim may have won the race) → fork-detach →
 //! poll up to 2 s for the socket.
 
@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 
 /// How long to wait for a freshly-spawned daemon's socket (§7.3 step 3).
 pub const SPAWN_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long to wait for `clasp.lock` before giving up.
+/// How long to wait for `holdfast.lock` before giving up.
 pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// An exclusive `flock` on `clasp.lock`, released on drop.
+/// An exclusive `flock` on `holdfast.lock`, released on drop.
 pub struct DaemonLock {
     file: std::fs::File,
 }
@@ -161,7 +161,7 @@ pub fn start_detached(paths: &RuntimePaths, exe: &Path) -> io::Result<StartOutco
     // load-bearing.** The child inherits this process's environment, so
     // an explicit instance already crosses; setting it from
     // `paths.dir()` *invents* one where the user chose none. On the
-    // default instance `paths.dir()` is `$XDG_RUNTIME_DIR/clasp`, so the
+    // default instance `paths.dir()` is `$XDG_RUNTIME_DIR/holdfast`, so the
     // child's `resolve` would take §7.1's relocation branch and put
     // `audit.log` and `daemon.log` on tmpfs — cleared at logout, where
     // §19.1's 14-day and 4-week windows cannot be met, and where neither
@@ -280,7 +280,7 @@ mod tests {
 
     fn temp_paths(tag: &str) -> RuntimePaths {
         let unique = uuid::Uuid::new_v4().simple().to_string();
-        RuntimePaths::with_dir(format!("/tmp/clasp-t-{tag}-{}", &unique[..8]))
+        RuntimePaths::with_dir(format!("/tmp/holdfast-t-{tag}-{}", &unique[..8]))
     }
 
     struct Scoped(RuntimePaths);
@@ -331,7 +331,7 @@ mod tests {
     /// directory **only** when `CLASP_RUNTIME_DIR` is explicitly set.
     /// Passing `paths.dir()` to the child set it always, so the child of
     /// a *default* instance saw an explicit one, took the relocation
-    /// branch, and wrote both logs to `$XDG_RUNTIME_DIR/clasp/logs` —
+    /// branch, and wrote both logs to `$XDG_RUNTIME_DIR/holdfast/logs` —
     /// tmpfs, cleared at logout, where §19.1's 14-day and 4-week
     /// retention windows cannot be met and `clasp logs` does not look.
     ///

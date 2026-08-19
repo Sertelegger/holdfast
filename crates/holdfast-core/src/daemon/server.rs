@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
-/// `clasp.pid`'s creation mode.
+/// `holdfast.pid`'s creation mode.
 ///
 /// Its own constant rather than a reuse of `SOCKET_MODE`: the two agree
 /// today and answer different questions — one is the daemon's access
@@ -211,7 +211,7 @@ impl Daemon {
     /// because `default_path()` takes no environment override
     /// (`audit.rs`: *"There is no environment override … the config-file
     /// path arrives with the daemon in 0.0.5"*). On the default instance
-    /// `paths.audit_log()` **is** `~/.clasp/logs/audit.log`, so the two
+    /// `paths.audit_log()` **is** `~/.holdfast/logs/audit.log`, so the two
     /// agree; under an explicit `CLASP_RUNTIME_DIR` the audit log follows
     /// the instance, which is what will stop every `daemon_cli.rs` test
     /// (Task 14) from appending to the developer's real audit log. See
@@ -603,7 +603,7 @@ impl Daemon {
 /// stale file and binds — handed the successor the predecessor's inode
 /// number **500 times out of 500**. The same probe on tmpfs collides 0
 /// times, because tmpfs, btrfs and APFS allocate from a monotonic
-/// counter and never reuse one. So on the filesystem `~/.clasp` most
+/// counter and never reuse one. So on the filesystem `~/.holdfast` most
 /// often lives on, the obvious comparison would have named a successor's
 /// socket as our own with near-certainty inside the window it exists to
 /// guard. [`OwnedSocket`]'s pin is what closes that; `ctime` is a second,
@@ -777,7 +777,7 @@ pub(crate) fn bind_control_within(
     // can forget it: `run` is not the only path that binds — the
     // `TestDaemon` harness and the uid-gate test bind directly.
     //
-    // `bind.lock` and **not** `clasp.lock`: see
+    // `bind.lock` and **not** `holdfast.lock`: see
     // [`RuntimePaths::bind_lock_file`]. Held to the end of this
     // function, which is exactly the window, and released on return.
     let _bind_lock = super::spawn::DaemonLock::acquire_bind_within(paths, lock_timeout)?;
@@ -985,7 +985,7 @@ pub async fn run(paths: RuntimePaths) -> anyhow::Result<()> {
 /// [`run`] with the configuration supplied rather than discovered.
 ///
 /// **Split out so the exit path has a caller a test can drive.** `run`
-/// reads `$XDG_CONFIG_HOME/clasp/config.toml` from the developer's real
+/// reads `$XDG_CONFIG_HOME/holdfast/config.toml` from the developer's real
 /// home, so nothing in the workspace could call it — which left the
 /// teardown at the bottom of this function unasserted, and it was
 /// unlinking a *successor* daemon's socket. The config discovery stays
@@ -1166,10 +1166,10 @@ pub(crate) fn remove_runtime_files_we_own(paths: &RuntimePaths, ours: &OwnedSock
     }
 }
 
-/// Write `clasp.pid`, owner-only, like every other file this daemon
+/// Write `holdfast.pid`, owner-only, like every other file this daemon
 /// creates.
 ///
-/// **Consistency, not exposure.** `bind.lock` and `clasp.lock` are
+/// **Consistency, not exposure.** `bind.lock` and `holdfast.lock` are
 /// created `0600` (`spawn.rs`), `control.sock` is chmodded `0600` and
 /// then re-read and verified, and this one alone took the ambient umask.
 /// Its contents are a pid and a version string — both of which `/proc`
@@ -1186,7 +1186,7 @@ pub(crate) fn remove_runtime_files_we_own(paths: &RuntimePaths, ours: &OwnedSock
 /// and never notice — so the defect would stay invisible until something
 /// read the version field.
 ///
-/// `mode` applies only when the file is *created*, so a `clasp.pid`
+/// `mode` applies only when the file is *created*, so a `holdfast.pid`
 /// inherited from an older, wider-umask build keeps its mode until it is
 /// removed. §7.3's teardown removes it on every clean exit, and the
 /// enclosing `0700` is the control that does not depend on this one.
@@ -1203,7 +1203,7 @@ fn write_pid_file(paths: &RuntimePaths) -> io::Result<()> {
     writeln!(f, "{} {}", std::process::id(), env!("CARGO_PKG_VERSION"))
 }
 
-/// Read `clasp.pid`. `None` if absent or unparseable.
+/// Read `holdfast.pid`. `None` if absent or unparseable.
 pub fn read_pid_file(paths: &RuntimePaths) -> Option<u32> {
     let text = std::fs::read_to_string(paths.pid_file()).ok()?;
     text.split_whitespace().next()?.parse().ok()
@@ -1886,7 +1886,7 @@ mod tests {
     async fn observed_caller_for(kind: ClientKind) -> Option<Caller> {
         OBSERVED.with(|o| o.set(None));
         let dir = format!(
-            "/tmp/clasp-t-caller-{}",
+            "/tmp/holdfast-t-caller-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
         let paths = RuntimePaths::with_dir(&dir);
@@ -2130,7 +2130,7 @@ mod tests {
     #[tokio::test]
     async fn a_connection_from_a_foreign_uid_is_closed_before_the_handshake() {
         let dir = format!(
-            "/tmp/clasp-t-uidgate-{}",
+            "/tmp/holdfast-t-uidgate-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
         let paths = RuntimePaths::with_dir(&dir);
@@ -2181,7 +2181,7 @@ mod tests {
 
     fn scratch(tag: &str) -> RuntimePaths {
         let unique = uuid::Uuid::new_v4().simple().to_string();
-        RuntimePaths::with_dir(format!("/tmp/clasp-d16-{tag}-{}", &unique[..8]))
+        RuntimePaths::with_dir(format!("/tmp/holdfast-d16-{tag}-{}", &unique[..8]))
     }
 
     struct Scratch(RuntimePaths);
@@ -2664,7 +2664,7 @@ mod tests {
         drop(listener);
     }
 
-    /// `clasp.pid` is created owner-only, like every other file the
+    /// `holdfast.pid` is created owner-only, like every other file the
     /// daemon creates, rather than at the ambient umask.
     ///
     /// The mode is asserted against [`PID_FILE_MODE`] deliberately *not*
@@ -2678,16 +2678,16 @@ mod tests {
         let _s = Scratch(paths.clone());
         paths.ensure_dir().unwrap();
 
-        write_pid_file(&paths).expect("write clasp.pid");
+        write_pid_file(&paths).expect("write holdfast.pid");
 
         let mode = std::fs::metadata(paths.pid_file())
-            .expect("clasp.pid")
+            .expect("holdfast.pid")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(
             mode, 0o600,
-            "clasp.pid was created at the ambient umask; every sibling in the \
+            "holdfast.pid was created at the ambient umask; every sibling in the \
              runtime directory is explicit about this"
         );
     }
@@ -2707,9 +2707,9 @@ mod tests {
         paths.ensure_dir().unwrap();
 
         std::fs::write(paths.pid_file(), "4294967295 99.99.99-a-much-longer-line\n").unwrap();
-        write_pid_file(&paths).expect("rewrite clasp.pid");
+        write_pid_file(&paths).expect("rewrite holdfast.pid");
 
-        let text = std::fs::read_to_string(paths.pid_file()).expect("clasp.pid");
+        let text = std::fs::read_to_string(paths.pid_file()).expect("holdfast.pid");
         assert_eq!(
             text,
             format!("{} {}\n", std::process::id(), env!("CARGO_PKG_VERSION")),

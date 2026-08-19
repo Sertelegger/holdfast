@@ -1,7 +1,7 @@
 //! The global TOML configuration file (§10.1, §10.2).
 //!
-//! Discovery is `$XDG_CONFIG_HOME/clasp/config.toml`, falling back to
-//! `~/.config/clasp/config.toml` (REQ-CFG-002). **`CLASP_RUNTIME_DIR`
+//! Discovery is `$XDG_CONFIG_HOME/holdfast/config.toml`, falling back to
+//! `~/.config/holdfast/config.toml` (REQ-CFG-002). **`CLASP_RUNTIME_DIR`
 //! does not move it** — REQ-CFG-005 makes that variable *instance*
 //! selection, and wiring config discovery to it would turn the one
 //! environment variable this project allows into exactly the override
@@ -138,7 +138,7 @@ fn redacted(message: &str) -> String {
 
 // ------------------------------------------------------------ discovery
 
-/// `$XDG_CONFIG_HOME/clasp/config.toml`, else `$HOME/.config/clasp/config.toml`.
+/// `$XDG_CONFIG_HOME/holdfast/config.toml`, else `$HOME/.config/holdfast/config.toml`.
 ///
 /// `None` when neither variable is set, which is the same as "no file":
 /// a process with no home is not a misconfigured one.
@@ -160,7 +160,7 @@ fn config_path_from(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> 
             home.join(".config")
         }
     };
-    Some(base.join("clasp").join("config.toml"))
+    Some(base.join("holdfast").join("config.toml"))
 }
 
 /// Load the global config from its discovered path.
@@ -274,7 +274,7 @@ fn untrusted_reason(meta: &std::fs::Metadata) -> Option<String> {
 ///   [`peer::is_authorized`](crate::daemon::peer::is_authorized), which
 ///   refuses root: there root is a *peer* asking to drive another user's
 ///   sessions, here it is the owner of a file inside that user's own
-///   home — a state one `sudo $EDITOR ~/.config/clasp/config.toml`
+///   home — a state one `sudo $EDITOR ~/.config/holdfast/config.toml`
 ///   produces, and one root could reach by any other route anyway.
 ///
 /// * **Not world-writable** — `0o002`, and pointedly not `0o022`.
@@ -282,7 +282,7 @@ fn untrusted_reason(meta: &std::fs::Metadata) -> Option<String> {
 ///   that Debian, Ubuntu and RHEL ship: `0664`, on systems whose
 ///   user-private groups make that the user alone. Refusing it would
 ///   refuse a stock install, which is the mistake `ensure_dir` made on a
-///   `0775` `~/.clasp/logs` and had to take back. World-writable has no
+///   `0775` `~/.holdfast/logs` and had to take back. World-writable has no
 ///   such benign origin — it wants `umask 000` or a deliberate `chmod` —
 ///   and it means any local user can rewrite the file.
 fn trust_verdict(is_file: bool, uid: u32, mode: u32, euid: u32) -> Option<String> {
@@ -1354,10 +1354,10 @@ require_confirm = false
         // In the same test: a rejection must not be mistaken for a
         // relocation. `RuntimePaths` is the only source of the log
         // directory, and nothing in this module can move it.
-        let paths = crate::daemon::RuntimePaths::with_dir("/tmp/clasp-config-log-dir-probe");
+        let paths = crate::daemon::RuntimePaths::with_dir("/tmp/holdfast-config-log-dir-probe");
         assert_eq!(
             paths.log_dir(),
-            std::path::Path::new("/tmp/clasp-config-log-dir-probe/logs"),
+            std::path::Path::new("/tmp/holdfast-config-log-dir-probe/logs"),
             "RuntimePaths::log_dir() answered to a config key"
         );
     }
@@ -1664,16 +1664,16 @@ require_confirm = false
     fn config_discovery_prefers_xdg_config_home_over_home() {
         assert_eq!(
             config_path_from(Some("/x".into()), Some("/h".into())),
-            Some(PathBuf::from("/x/clasp/config.toml"))
+            Some(PathBuf::from("/x/holdfast/config.toml"))
         );
         assert_eq!(
             config_path_from(None, Some("/h".into())),
-            Some(PathBuf::from("/h/.config/clasp/config.toml")),
+            Some(PathBuf::from("/h/.config/holdfast/config.toml")),
         );
         // An empty XDG_CONFIG_HOME is no instruction, not an empty base.
         assert_eq!(
             config_path_from(Some("".into()), Some("/h".into())),
-            Some(PathBuf::from("/h/.config/clasp/config.toml")),
+            Some(PathBuf::from("/h/.config/holdfast/config.toml")),
         );
         assert_eq!(config_path_from(None, None), None);
     }
@@ -1813,7 +1813,7 @@ require_confirm = false
         // 0664 is the one that decides whether this check refuses a
         // stock install: it is what an editor writes under the `umask
         // 002` Debian, Ubuntu and RHEL ship, and refusing 0775 on
-        // `~/.clasp/logs` for the same reason is a bug this milestone
+        // `~/.holdfast/logs` for the same reason is a bug this milestone
         // already had to take back once.
         for mode in [0o600, 0o640, 0o644, 0o664] {
             chmod(mode);
@@ -1907,7 +1907,7 @@ require_confirm = false
         assert!(
             trust_verdict(true, 0, 0o644, 1000).is_none(),
             "root-owned is trusted, as OpenSSH's StrictModes has it — one \
-             `sudo $EDITOR ~/.config/clasp/config.toml` produces it"
+             `sudo $EDITOR ~/.config/holdfast/config.toml` produces it"
         );
 
         let other = trust_verdict(true, 2000, 0o600, 1000).expect("another user's file");

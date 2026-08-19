@@ -55,7 +55,7 @@ impl AuditLog {
     /// `OpenOptions`. This constructor is what `serve_stdio` reaches
     /// with no `RuntimePaths` and no `ensure_dir` behind it, so on the
     /// stdio transport it is the *only* thing standing between
-    /// `~/.clasp/logs/audit.log` and `0644`.
+    /// `~/.holdfast/logs/audit.log` and `0644`.
     pub fn to_path(path: impl AsRef<Path>, rules: Arc<RuleSet>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = open_log_append(&path)?;
@@ -254,7 +254,7 @@ impl AuditLog {
     }
 }
 
-/// `~/.clasp/logs/audit.log` — the one path §9.4 names. There is no
+/// `~/.holdfast/logs/audit.log` — the one path §9.4 names. There is no
 /// environment override: §10.1 reserves env vars for operational logging
 /// knobs, not configuration, and the config-file path arrives with the
 /// daemon in 0.0.5.
@@ -270,14 +270,14 @@ pub fn default_path() -> Option<PathBuf> {
 /// under a parallel test runner and, from Rust 2024 on, unsafe.
 ///
 /// An **empty** `$HOME` is treated as unset. `PathBuf::from("")` joins to
-/// a *relative* `.clasp/logs/audit.log`, so the one thing worse than no
+/// a *relative* `.holdfast/logs/audit.log`, so the one thing worse than no
 /// audit trail — an audit trail written into whatever directory the
 /// daemon happened to start in, where nothing will look for it — is what
 /// the obvious spelling produces.
 fn audit_path_under_home(home: Option<OsString>) -> Option<PathBuf> {
     home.filter(|h| !h.is_empty()).map(|h| {
         PathBuf::from(h)
-            .join(".clasp")
+            .join(".holdfast")
             .join("logs")
             .join("audit.log")
     })
@@ -546,7 +546,7 @@ mod tests {
     ///
     /// `serve_stdio` opens this log through `to_path` with no
     /// `RuntimePaths` and no `ensure_dir` ahead of it, so on a machine
-    /// that had never run the daemon `~/.clasp/logs/audit.log` was
+    /// that had never run the daemon `~/.holdfast/logs/audit.log` was
     /// created `0644` and any local user could read the command line,
     /// the cwd and the env-var key set of everything the agent had run.
     /// The daemon path was fine, because `bind_control` → `ensure_dir`
@@ -628,7 +628,7 @@ mod tests {
     fn the_default_path_is_the_one_9_4_names_and_is_absent_without_a_home() {
         assert_eq!(
             audit_path_under_home(Some(OsString::from("/home/u"))),
-            Some(PathBuf::from("/home/u/.clasp/logs/audit.log")),
+            Some(PathBuf::from("/home/u/.holdfast/logs/audit.log")),
         );
         assert_eq!(audit_path_under_home(None), None, "no $HOME, no guess");
         assert_eq!(
@@ -644,7 +644,7 @@ mod tests {
                 default_path(),
                 Some(
                     PathBuf::from(home)
-                        .join(".clasp")
+                        .join(".holdfast")
                         .join("logs")
                         .join("audit.log")
                 ),

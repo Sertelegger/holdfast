@@ -36,7 +36,7 @@ ENVIRONMENT:
                                    daemon log
 
 FILES:
-    $XDG_CONFIG_HOME/clasp/config.toml, else ~/.config/clasp/config.toml
+    $XDG_CONFIG_HOME/holdfast/config.toml, else ~/.config/holdfast/config.toml
                                    Read by both transports, `mcp
                                    --no-daemon` included. Absent is the
                                    defaults; present and invalid refuses

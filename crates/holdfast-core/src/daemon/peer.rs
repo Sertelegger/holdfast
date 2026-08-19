@@ -122,7 +122,7 @@ mod tests {
 
     /// RAII cleanup, mirroring `daemon::paths`'s guard of the same name.
     /// Cleanup at the end of the function runs only on the *passing*
-    /// path, so a failing assertion leaks `/tmp/clasp-t-peer-*` —
+    /// path, so a failing assertion leaks `/tmp/holdfast-t-peer-*` —
     /// exactly when someone is re-running the test. The retry loop is
     /// kept: the socket inside may not be unlinked the instant its
     /// listener drops.
@@ -145,7 +145,7 @@ mod tests {
         // returned a zeroed `ucred` would pass the latter on a
         // root-owned CI runner and fail here for every normal user.
         let dir = format!(
-            "/tmp/clasp-t-peer-{}",
+            "/tmp/holdfast-t-peer-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
         std::fs::create_dir_all(&dir).unwrap();

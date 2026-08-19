@@ -1757,7 +1757,7 @@ mod tests {
     /// audit entry, read back off disk.
     ///
     /// The log goes to a temporary directory, never to the invoking
-    /// user's `~/.clasp/logs/audit.log`.
+    /// user's `~/.holdfast/logs/audit.log`.
     async fn session_start_entry(config: &crate::config::Config) -> serde_json::Value {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("audit.log");

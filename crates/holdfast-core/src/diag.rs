@@ -282,7 +282,7 @@ mod tests {
         }
 
         let unique = uuid::Uuid::new_v4().simple().to_string();
-        let paths = RuntimePaths::with_dir(format!("/tmp/clasp-t-diag-{}", &unique[..8]));
+        let paths = RuntimePaths::with_dir(format!("/tmp/holdfast-t-diag-{}", &unique[..8]));
         struct Scoped(RuntimePaths);
         impl Drop for Scoped {
             fn drop(&mut self) {

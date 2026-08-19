@@ -241,7 +241,7 @@ enum StopRpc {
 
 async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
     // No discoverable runtime directory means no socket to call on and
-    // no `clasp.pid` to read, which is the same outcome as nothing
+    // no `holdfast.pid` to read, which is the same outcome as nothing
     // listening — and is what the old `connect()` reported too, since a
     // failed `discover()` was raised as `ClientError::Connect`.
     let Some(paths) = paths else {
@@ -282,7 +282,7 @@ pub async fn daemon_stop(force: bool) -> ExitCode {
     };
     // `paths()` is resolved once, here, rather than twice inside. An
     // undiscoverable runtime directory means no socket and no
-    // `clasp.pid`, and both halves below have to agree about that.
+    // `holdfast.pid`, and both halves below have to agree about that.
     ExitCode::from(daemon_stop_within(force, paths().ok(), deadline).await)
 }
 
@@ -335,7 +335,7 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
 
     let escalation = match &paths {
         Some(p) => escalate_to_sigkill(p),
-        // No runtime directory means no `clasp.pid` to read. The RPC arm
+        // No runtime directory means no `holdfast.pid` to read. The RPC arm
         // below already reports what it saw, which for an undiscoverable
         // directory is `NotRunning`.
         None => Escalation::Nothing,
@@ -371,7 +371,7 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
             }
             Escalation::NotSignalled { pid, why } => {
                 println!("no daemon running");
-                diag!("clasp daemon stop: clasp.pid names pid {pid}, not signalled: {why}");
+                diag!("clasp daemon stop: holdfast.pid names pid {pid}, not signalled: {why}");
                 0
             }
         },
@@ -384,7 +384,7 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
                 }
                 Escalation::Nothing => EXIT_FAILED,
                 Escalation::NotSignalled { pid, why } => {
-                    diag!("clasp daemon stop: clasp.pid names pid {pid}, not signalled: {why}");
+                    diag!("clasp daemon stop: holdfast.pid names pid {pid}, not signalled: {why}");
                     EXIT_FAILED
                 }
             }
@@ -397,15 +397,15 @@ enum Escalation {
     /// SIGKILL was delivered to a pid confirmed to be this instance's
     /// daemon.
     Killed(u32),
-    /// Nothing to signal: no `clasp.pid`, or the pid it names is gone.
+    /// Nothing to signal: no `holdfast.pid`, or the pid it names is gone.
     Nothing,
-    /// `clasp.pid` named a live pid that was **not** signalled, because
+    /// `holdfast.pid` named a live pid that was **not** signalled, because
     /// it could not be confirmed as this instance's daemon (or because
     /// the signal itself failed).
     NotSignalled { pid: u32, why: String },
 }
 
-/// SIGKILL the daemon process named by `clasp.pid`, if it is really it.
+/// SIGKILL the daemon process named by `holdfast.pid`, if it is really it.
 ///
 /// This does not reap the daemon's sessions. With the in-process PTY
 /// backend they are its children, and what ends them is the master side
@@ -447,7 +447,7 @@ fn escalate_to_sigkill(paths: &RuntimePaths) -> Escalation {
 /// symmetric: a false negative costs `--force` its escalation and prints
 /// why, a false positive costs an unrelated process its life.
 ///
-/// **What the evidence is, and what it is not.** `clasp.pid` on its own
+/// **What the evidence is, and what it is not.** `holdfast.pid` on its own
 /// establishes almost nothing about the *process*. It is written once at
 /// startup and removed only on a clean exit, so a daemon that was
 /// killed, panicked, or lost its machine leaves the file behind naming a
@@ -764,7 +764,10 @@ mod tests {
     fn scratch(tag: &str) -> RuntimePaths {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        RuntimePaths::with_dir(format!("/tmp/clasp-t-cmd-{tag}-{}-{n}", std::process::id()))
+        RuntimePaths::with_dir(format!(
+            "/tmp/holdfast-t-cmd-{tag}-{}-{n}",
+            std::process::id()
+        ))
     }
 
     struct Scoped(RuntimePaths);

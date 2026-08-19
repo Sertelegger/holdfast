@@ -8,7 +8,7 @@
 //! **Logs are not sockets.** §7.1 relocates `daemon.log` under the
 //! runtime directory only when `CLASP_RUNTIME_DIR` is explicitly set, so
 //! an isolated instance leaves nothing in the user's home. With the
-//! variable unset, §19.1's `~/.clasp/logs` applies: `$XDG_RUNTIME_DIR` is
+//! variable unset, §19.1's `~/.holdfast/logs` applies: `$XDG_RUNTIME_DIR` is
 //! tmpfs on most Linux systems and is cleared at logout, which cannot
 //! hold the retention windows §19.1 specifies.
 
@@ -239,7 +239,7 @@ pub const LOG_MODE: u32 = 0o600;
 /// lives at the point of creation rather than at the call sites for a
 /// reason measured in this milestone: `serve_stdio` reaches
 /// `AuditLog::to_path` with no `ensure_dir` ahead of it, so on a machine
-/// that had never run the daemon `~/.clasp/logs/audit.log` was created
+/// that had never run the daemon `~/.holdfast/logs/audit.log` was created
 /// `0644` while the daemon's copy of the same file was `0600`. That is a
 /// security property enforced on the transport somebody tested and not
 /// on the one they did not, and a mode set at one call site would leave
@@ -355,10 +355,10 @@ impl RuntimePaths {
             )
         });
 
-        // §19.1: the daemon log lives in `~/.clasp/logs` whenever the
+        // §19.1: the daemon log lives in `~/.holdfast/logs` whenever the
         // instance is the default one, whatever the runtime directory is.
         let log_dir = match &home {
-            Ok(h) => h.join(".clasp").join("logs"),
+            Ok(h) => h.join(".holdfast").join("logs"),
             Err(_) => PathBuf::new(),
         };
 
@@ -366,16 +366,16 @@ impl RuntimePaths {
             if let Some(xdg) = xdg_runtime_dir {
                 let log_dir = log_dir_or_err(log_dir, &home)?;
                 return Ok(Self {
-                    dir: xdg.join("clasp"),
+                    dir: xdg.join("holdfast"),
                     log_dir,
                 });
             }
         }
         let home = home?;
         let dir = if is_macos {
-            home.join("Library/Application Support/clasp")
+            home.join("Library/Application Support/holdfast")
         } else {
-            home.join(".clasp")
+            home.join(".holdfast")
         };
         Ok(Self {
             log_dir: dir.join("logs"),
@@ -383,9 +383,9 @@ impl RuntimePaths {
         })
     }
 
-    /// Spec §7.1: `$CLASP_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/clasp`
-    /// (Linux), else `~/Library/Application Support/clasp` (macOS), else
-    /// `~/.clasp`.
+    /// Spec §7.1: `$CLASP_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/holdfast`
+    /// (Linux), else `~/Library/Application Support/holdfast` (macOS), else
+    /// `~/.holdfast`.
     pub fn discover() -> io::Result<Self> {
         Self::resolve(
             std::env::var_os(RUNTIME_DIR_ENV).map(PathBuf::from),
@@ -426,22 +426,22 @@ impl RuntimePaths {
     }
 
     pub fn pid_file(&self) -> PathBuf {
-        self.dir.join("clasp.pid")
+        self.dir.join("holdfast.pid")
     }
 
     /// The **start** lock (§7.3 steps 1–2): who gets to decide that no
     /// daemon is running and spawn one.
     pub fn lock_file(&self) -> PathBuf {
-        self.dir.join("clasp.lock")
+        self.dir.join("holdfast.lock")
     }
 
     /// The **bind** lock: who owns `bind_control`'s probe → unlink →
     /// bind window.
     ///
     /// **A second file, and it must stay a second file.** The obvious
-    /// simplification — have `bind_control` take `clasp.lock` —
+    /// simplification — have `bind_control` take `holdfast.lock` —
     /// deadlocks `clasp daemon start` outright: `start_detached` holds
-    /// `clasp.lock` across the spawn *and* the 2 s poll that waits for
+    /// `holdfast.lock` across the spawn *and* the 2 s poll that waits for
     /// the socket (`spawn.rs`, `let _lock = …` living to end of
     /// function), and the child `clasp daemon run` does not inherit it
     /// because Rust opens `O_CLOEXEC`. The child would block on the
@@ -449,15 +449,15 @@ impl RuntimePaths {
     /// socket it is itself preventing.
     ///
     /// The two locks answer different questions and neither subsumes the
-    /// other: `clasp.lock` serialises *starters*, this one serialises
-    /// *binders*. The case that needs it is the one `clasp.lock` cannot
+    /// other: `holdfast.lock` serialises *starters*, this one serialises
+    /// *binders*. The case that needs it is the one `holdfast.lock` cannot
     /// see — a `start_detached` that already timed out and released
     /// while its child was still binding.
     pub fn bind_lock_file(&self) -> PathBuf {
         self.dir.join("bind.lock")
     }
 
-    /// §19.1's log directory — `~/.clasp/logs` by default, relocated
+    /// §19.1's log directory — `~/.holdfast/logs` by default, relocated
     /// under the runtime directory only for an explicit instance (§7.1).
     pub fn log_dir(&self) -> PathBuf {
         self.log_dir.clone()
@@ -470,11 +470,11 @@ impl RuntimePaths {
     /// §9.4's audit trail, in the same directory as `daemon.log` and for
     /// the same reason.
     ///
-    /// `audit::default_path()` is `~/.clasp/logs/audit.log` and takes no
+    /// `audit::default_path()` is `~/.holdfast/logs/audit.log` and takes no
     /// environment override, so on the **default** instance this returns
     /// exactly that path — the two agree by construction rather than by
     /// coincidence, because `log_dir` for the default instance *is*
-    /// `~/.clasp/logs`. On an explicit `CLASP_RUNTIME_DIR` instance the
+    /// `~/.holdfast/logs`. On an explicit `CLASP_RUNTIME_DIR` instance the
     /// audit log follows the instance, which §7.1 states only for
     /// `daemon.log`; see the decision recorded in **Decisions taken**.
     /// Without this, every `daemon_cli.rs` test with a private runtime
@@ -496,7 +496,7 @@ impl RuntimePaths {
     pub fn ensure_dir(&self) -> io::Result<()> {
         self.check_socket_path_length()?;
         // `self.dir` first, and the order is load-bearing: on the
-        // `~/.clasp` fallback instance `log_dir` is *inside* it, so the
+        // `~/.holdfast` fallback instance `log_dir` is *inside* it, so the
         // refusal below has to land before anything traverses a `logs/`
         // that may be somebody else's symlink.
         ensure_owner_only(&self.dir, Writable::Refuse)?;
@@ -594,7 +594,7 @@ impl RuntimePaths {
 /// is what closes it.
 ///
 /// **`log_dir` is not that parent, and refusing it refused correct
-/// installs.** On the default instance it is `~/.clasp/logs`, which every
+/// installs.** On the default instance it is `~/.holdfast/logs`, which every
 /// install predating 0.0.5 created through `audit::default_path()`'s
 /// plain `create_dir_all` under the ambient umask — `0775` under the
 /// `002` that Debian, Ubuntu, RHEL and most corporate images ship. It
@@ -607,11 +607,11 @@ impl RuntimePaths {
 ///
 /// **What it does not get is a guarded parent, and this used to claim
 /// otherwise.** The sentence here read "its parent chain is the user's
-/// home, whose own mode is the gate" — true only on the `~/.clasp`
+/// home, whose own mode is the gate" — true only on the `~/.holdfast`
 /// fallback. On the XDG path the two live in different trees: `dir` is
-/// `$XDG_RUNTIME_DIR/clasp` and `log_dir` is `~/.clasp/logs`, so
-/// `log_dir`'s immediate parent is `~/.clasp`, which the `Refuse` above
-/// never sees and nothing else checks. A pre-0.0.5 `~/.clasp` left at
+/// `$XDG_RUNTIME_DIR/holdfast` and `log_dir` is `~/.holdfast/logs`, so
+/// `log_dir`'s immediate parent is `~/.holdfast`, which the `Refuse` above
+/// never sees and nothing else checks. A pre-0.0.5 `~/.holdfast` left at
 /// `0775` on a host with a *shared* primary group is therefore writable
 /// by someone else, and the tighten arm is what they would aim at. That
 /// is why the check below refuses a symlink outright instead of trusting
@@ -708,7 +708,7 @@ mod tests {
     /// would exceed `sun_path`.
     fn temp_dir(tag: &str) -> PathBuf {
         let unique = uuid::Uuid::new_v4().simple().to_string();
-        PathBuf::from(format!("/tmp/clasp-t-{tag}-{}", &unique[..8]))
+        PathBuf::from(format!("/tmp/holdfast-t-{tag}-{}", &unique[..8]))
     }
 
     struct Scoped(PathBuf);
@@ -1102,26 +1102,26 @@ mod tests {
 
     #[test]
     fn every_socket_lives_in_the_runtime_directory() {
-        let p = RuntimePaths::with_dir("/run/user/1000/clasp");
+        let p = RuntimePaths::with_dir("/run/user/1000/holdfast");
         assert_eq!(
             p.control_sock(),
-            PathBuf::from("/run/user/1000/clasp/control.sock")
+            PathBuf::from("/run/user/1000/holdfast/control.sock")
         );
         assert_eq!(
             p.attach_sock(),
-            PathBuf::from("/run/user/1000/clasp/attach.sock")
+            PathBuf::from("/run/user/1000/holdfast/attach.sock")
         );
         assert_eq!(
             p.http_sock(),
-            PathBuf::from("/run/user/1000/clasp/http.sock")
+            PathBuf::from("/run/user/1000/holdfast/http.sock")
         );
         assert_eq!(
             p.pid_file(),
-            PathBuf::from("/run/user/1000/clasp/clasp.pid")
+            PathBuf::from("/run/user/1000/holdfast/holdfast.pid")
         );
         assert_eq!(
             p.lock_file(),
-            PathBuf::from("/run/user/1000/clasp/clasp.lock")
+            PathBuf::from("/run/user/1000/holdfast/holdfast.lock")
         );
     }
 
@@ -1259,7 +1259,7 @@ mod tests {
     /// directory that holds the **sockets**, and applying it to the log
     /// directory refused a correct install.
     ///
-    /// `~/.clasp/logs` on every install predating 0.0.5 was created by
+    /// `~/.holdfast/logs` on every install predating 0.0.5 was created by
     /// `audit::default_path()`'s plain `create_dir_all` under the ambient
     /// umask, which is `002` on Debian, Ubuntu, RHEL and most corporate
     /// images — `0775`. That directory's parent chain is the user's home,
@@ -1326,9 +1326,9 @@ mod tests {
 
     #[test]
     fn a_symlinked_log_directory_is_refused_and_its_target_left_alone() {
-        // The tighten arm's hazard. `~/.clasp` is checked by nothing on
+        // The tighten arm's hazard. `~/.holdfast` is checked by nothing on
         // the XDG path — `dir` and `log_dir` are in different trees
-        // there — so a pre-0.0.5 `~/.clasp` at 0775 on a host with a
+        // there — so a pre-0.0.5 `~/.holdfast` at 0775 on a host with a
         // shared primary group lets someone else plant `logs` as a link.
         let target = temp_dir("symlinkvictim");
         let _scoped_target = Scoped(target.clone());
@@ -1391,26 +1391,26 @@ mod tests {
         // §7.1: `CLASP_RUNTIME_DIR` relocates the daemon log too, so an
         // isolated instance leaves nothing in the user's home.
         let p = RuntimePaths::resolve(
-            Some("/tmp/clasp-instance".into()),
+            Some("/tmp/holdfast-instance".into()),
             Some("/run/user/1000".into()),
             Some("/home/u".into()),
             true,
             false,
         )
         .unwrap();
-        assert_eq!(p.dir(), Path::new("/tmp/clasp-instance"));
+        assert_eq!(p.dir(), Path::new("/tmp/holdfast-instance"));
         assert_eq!(
             p.daemon_log(),
-            PathBuf::from("/tmp/clasp-instance/logs/daemon.log")
+            PathBuf::from("/tmp/holdfast-instance/logs/daemon.log")
         );
         assert_eq!(
             p.audit_log(),
-            PathBuf::from("/tmp/clasp-instance/logs/audit.log")
+            PathBuf::from("/tmp/holdfast-instance/logs/audit.log")
         );
         // Both logs, not just the one §7.1 names. `audit::default_path()`
         // has no environment override, so if the audit log did not follow
         // the instance, every test with a private `CLASP_RUNTIME_DIR`
-        // would append to the developer's real `~/.clasp/logs/audit.log`
+        // would append to the developer's real `~/.holdfast/logs/audit.log`
         // — which the `daemon_log`-only version of this assertion could
         // not see.
         //
@@ -1431,7 +1431,7 @@ mod tests {
 
     #[test]
     fn the_default_instance_logs_to_the_home_directory_not_tmpfs() {
-        // §19.1 puts daemon.log in `~/.clasp/logs` with a 4-week
+        // §19.1 puts daemon.log in `~/.holdfast/logs` with a 4-week
         // retention. `$XDG_RUNTIME_DIR` is tmpfs and is cleared at
         // logout, so a log written there could never survive its own
         // retention window — the bug this test exists to prevent.
@@ -1443,14 +1443,14 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(p.dir(), Path::new("/run/user/1000/clasp"));
+        assert_eq!(p.dir(), Path::new("/run/user/1000/holdfast"));
         assert_eq!(
             p.control_sock(),
-            PathBuf::from("/run/user/1000/clasp/control.sock")
+            PathBuf::from("/run/user/1000/holdfast/control.sock")
         );
         assert_eq!(
             p.daemon_log(),
-            PathBuf::from("/home/u/.clasp/logs/daemon.log"),
+            PathBuf::from("/home/u/.holdfast/logs/daemon.log"),
             "§19.1: the default instance logs under HOME, not under tmpfs"
         );
         // The pairing that makes `Daemon::new`'s audit path safe to take
@@ -1461,30 +1461,30 @@ mod tests {
         // assertion above — relocation must not leak into the default.
         assert_eq!(
             p.audit_log(),
-            PathBuf::from("/home/u/.clasp/logs/audit.log"),
-            "§9.4's default path is `~/.clasp/logs/audit.log` and takes no override"
+            PathBuf::from("/home/u/.holdfast/logs/audit.log"),
+            "§9.4's default path is `~/.holdfast/logs/audit.log` and takes no override"
         );
     }
 
     #[test]
     fn discovery_falls_back_to_the_home_directory_for_both() {
         // No XDG (or not Linux): runtime dir and logs coincide under
-        // `~/.clasp`, which is what §7.1's fallback and §19.1 both name.
+        // `~/.holdfast`, which is what §7.1's fallback and §19.1 both name.
         let p = RuntimePaths::resolve(None, None, Some("/home/u".into()), true, false).unwrap();
-        assert_eq!(p.dir(), Path::new("/home/u/.clasp"));
+        assert_eq!(p.dir(), Path::new("/home/u/.holdfast"));
         assert_eq!(
             p.daemon_log(),
-            PathBuf::from("/home/u/.clasp/logs/daemon.log")
+            PathBuf::from("/home/u/.holdfast/logs/daemon.log")
         );
 
         let mac = RuntimePaths::resolve(None, None, Some("/Users/u".into()), false, true).unwrap();
         assert_eq!(
             mac.dir(),
-            Path::new("/Users/u/Library/Application Support/clasp")
+            Path::new("/Users/u/Library/Application Support/holdfast")
         );
         assert_eq!(
             mac.daemon_log(),
-            PathBuf::from("/Users/u/Library/Application Support/clasp/logs/daemon.log")
+            PathBuf::from("/Users/u/Library/Application Support/holdfast/logs/daemon.log")
         );
     }
 

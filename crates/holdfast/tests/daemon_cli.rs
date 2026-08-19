@@ -34,7 +34,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_holdfast");
 /// How long a `clasp` subcommand may take before it is treated as hung.
 ///
 /// Generous on purpose: `daemon start` can legitimately spend
-/// `LOCK_TIMEOUT` (5 s) waiting for a contended `clasp.lock` and then
+/// `LOCK_TIMEOUT` (5 s) waiting for a contended `holdfast.lock` and then
 /// `SPAWN_TIMEOUT` (2 s) waiting for the daemon to answer, and the whole
 /// suite runs in parallel on a machine that may be loaded. This is not a
 /// performance assertion — it is the line past which "slow" and
@@ -59,14 +59,14 @@ struct TestEnv {
 
 impl TestEnv {
     fn new(tag: &str) -> Self {
-        // `/tmp/clasp-cli-*`, not the workspace `target/`: a socket under
+        // `/tmp/holdfast-cli-*`, not the workspace `target/`: a socket under
         // `target/` overruns `sockaddr_un.sun_path`.
         let unique = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
-        let dir = PathBuf::from(format!("/tmp/clasp-cli-{tag}-{unique}-{nanos}"));
+        let dir = PathBuf::from(format!("/tmp/holdfast-cli-{tag}-{unique}-{nanos}"));
         let _ = std::fs::remove_dir_all(&dir);
         Self { dir }
     }
@@ -74,12 +74,12 @@ impl TestEnv {
     fn cmd(&self) -> Command {
         let mut c = Command::new(BIN);
         c.env("CLASP_RUNTIME_DIR", &self.dir);
-        // §10.1's discovery is `$XDG_CONFIG_HOME/clasp/config.toml`, and
+        // §10.1's discovery is `$XDG_CONFIG_HOME/holdfast/config.toml`, and
         // `CLASP_RUNTIME_DIR` deliberately does **not** move it
         // (REQ-CFG-005 is instance selection, not a configuration knob).
         // So a test that did not set this would run the daemon against
-        // the *developer's* `~/.config/clasp/config.toml` — the same
-        // class of leak `audit_log()` closes for `~/.clasp/logs`, and
+        // the *developer's* `~/.config/holdfast/config.toml` — the same
+        // class of leak `audit_log()` closes for `~/.holdfast/logs`, and
         // the reason a config assertion here could otherwise mean
         // nothing. Absent by default, which resolves to `Config::default`.
         c.env("XDG_CONFIG_HOME", self.dir.join("xdg-config"));
@@ -101,7 +101,7 @@ impl TestEnv {
             .mode(0o700)
             .create(&self.dir)
             .expect("create runtime dir 0700");
-        let dir = self.dir.join("xdg-config").join("clasp");
+        let dir = self.dir.join("xdg-config").join("holdfast");
         std::fs::create_dir_all(&dir).expect("create config dir");
         std::fs::write(dir.join("config.toml"), body).expect("write config.toml");
     }
@@ -125,29 +125,29 @@ impl TestEnv {
     }
 
     fn daemon_pid(&self) -> Option<u32> {
-        let text = std::fs::read_to_string(self.dir.join("clasp.pid")).ok()?;
+        let text = std::fs::read_to_string(self.dir.join("holdfast.pid")).ok()?;
         text.split_whitespace().next()?.parse().ok()
     }
 
-    /// Plant a `clasp.pid` naming `pid`, in `write_pid_file`'s shape —
+    /// Plant a `holdfast.pid` naming `pid`, in `write_pid_file`'s shape —
     /// `"<pid> <version>\n"` — which is what a daemon that died without
     /// cleaning up leaves behind.
     fn plant_pid_file(&self, pid: u32) {
         std::fs::write(
-            self.dir.join("clasp.pid"),
+            self.dir.join("holdfast.pid"),
             format!("{pid} {}\n", env!("CARGO_PKG_VERSION")),
         )
-        .expect("write clasp.pid");
+        .expect("write holdfast.pid");
     }
 
-    /// Wait, bounded, for the daemon to remove its own `clasp.pid`.
+    /// Wait, bounded, for the daemon to remove its own `holdfast.pid`.
     ///
     /// `daemon/stop` is answered before `server::run` reaches its
     /// cleanup, so a test that planted a pid file the instant the command
     /// returned could have it deleted out from under itself — and would
     /// then pass against a `--force` that never read one at all.
     fn await_no_pid_file(&self) {
-        let path = self.dir.join("clasp.pid");
+        let path = self.dir.join("holdfast.pid");
         let deadline = Instant::now() + Duration::from_secs(10);
         while path.exists() {
             assert!(
@@ -162,7 +162,7 @@ impl TestEnv {
     /// Every `redaction_disabled` entry in this instance's §9.4 audit log.
     ///
     /// Read from `$CLASP_RUNTIME_DIR/logs/audit.log` rather than from
-    /// `~/.clasp/logs`, which is what keeps a test run out of the
+    /// `~/.holdfast/logs`, which is what keeps a test run out of the
     /// developer's real trail — and what makes a count assertion mean
     /// anything at all.
     fn redaction_disabled_entries(&self) -> Vec<Value> {
@@ -519,7 +519,7 @@ fn daemon_start_is_idempotent_and_status_reports_the_running_daemon() {
 fn an_explicit_runtime_dir_keeps_its_daemon_log_out_of_the_home_directory() {
     // §7.1: `CLASP_RUNTIME_DIR` relocates the daemon log too, so an
     // isolated instance leaves nothing behind in `~`. §19.1's
-    // `~/.clasp/logs/daemon.log` is the *default* instance's path, and a
+    // `~/.holdfast/logs/daemon.log` is the *default* instance's path, and a
     // daemon that wrote there unconditionally would have every test run
     // and every scratch instance appending to the user's real log.
     let env = TestEnv::new("logdir");
@@ -666,7 +666,7 @@ fn daemon_stop_force_kills_a_daemon_that_has_stopped_answering() {
 #[test]
 fn daemon_stop_force_does_not_signal_a_pid_that_is_not_this_daemon() {
     // The other half of the escalation, and the reason it is allowed to
-    // exist. `clasp.pid` is written once at startup and removed only on
+    // exist. `holdfast.pid` is written once at startup and removed only on
     // a clean exit, so a daemon that was killed leaves it behind naming
     // a pid the kernel is free to hand to anything — and the version
     // string the file also carries says only which clasp *wrote* it, not
@@ -862,7 +862,7 @@ fn two_shims_racing_to_start_share_one_daemon() {
     let env = TestEnv::new("race");
     // Genuinely concurrent: the barrier holds both threads until both are
     // ready, so neither shim can finish its spawn before the other has
-    // begun. That is the window `clasp.lock` exists for; starting them in
+    // begun. That is the window `holdfast.lock` exists for; starting them in
     // sequence would let the first finish and the second merely connect,
     // which tests nothing.
     let gate = Barrier::new(2);
@@ -1374,11 +1374,11 @@ fn the_no_daemon_server_honours_a_configured_session_cap() {
     env.write_config("[limits]\nmax_concurrent_sessions = 1\n");
 
     // `$HOME` inside the test directory. `--no-daemon`'s §9.4 trail is
-    // `audit::default_path()` — `$HOME/.clasp/logs/audit.log` — and not
+    // `audit::default_path()` — `$HOME/.holdfast/logs/audit.log` — and not
     // the runtime directory's, so without this the two `start_session`
     // calls below append `session_start` rows to the *developer's* real
     // audit log. Same reason `redaction_disabled_entries` reads the
-    // instance's log rather than `~/.clasp/logs`. Config discovery is
+    // instance's log rather than `~/.holdfast/logs`. Config discovery is
     // unaffected: §10.1 prefers `$XDG_CONFIG_HOME`, which `cmd` sets.
     let mut cmd = env.cmd();
     cmd.env("HOME", &env.dir);

@@ -112,7 +112,7 @@ impl Drop for TestDaemon {
 /// A short, unique `/tmp` path for one test's runtime directory.
 fn scratch_dir(tag: &str) -> PathBuf {
     let unique = uuid::Uuid::new_v4().simple().to_string();
-    PathBuf::from(format!("/tmp/clasp-it-{tag}-{}", &unique[..8]))
+    PathBuf::from(format!("/tmp/holdfast-it-{tag}-{}", &unique[..8]))
 }
 
 /// Remove a test's runtime directory, retrying briefly.

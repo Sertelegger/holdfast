@@ -760,7 +760,7 @@ mod tests {
     /// A `/tmp` path short enough for `sockaddr_un.sun_path`.
     fn scratch_dir(tag: &str) -> PathBuf {
         let unique = uuid::Uuid::new_v4().simple().to_string();
-        PathBuf::from(format!("/tmp/clasp-t-client-{tag}-{}", &unique[..8]))
+        PathBuf::from(format!("/tmp/holdfast-t-client-{tag}-{}", &unique[..8]))
     }
 
     struct Scoped(PathBuf);
