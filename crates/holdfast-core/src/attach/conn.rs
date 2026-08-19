@@ -254,7 +254,39 @@ async fn read_loop(
             Err(_) => return,
         };
 
-        match super::frames::decode_client_frame(&body) {
+        let decoded = super::frames::decode_client_frame(&body);
+
+        // **§7.5's ReadOnly gate, and it runs before every arm below.**
+        // Server-side, on the mode the *handshake* carried — a client
+        // does not get to re-declare it, and there is no second place a
+        // write can enter from, because every write arm is downstream of
+        // this check. §4.3: a rejected frame does not reach `write_tx`,
+        // does not signal, mutates no session state, does not bump
+        // `last_activity`, and leaves the connection open.
+        //
+        // Ordering: the gate precedes the out-of-order `Attach` arm on
+        // purpose. §18.4's `read_only_attach` is *"any frame but `Detach`
+        // from a `ReadOnly` client"* with no carve-out, and checking the
+        // arms first would leave `ClientFrameKind::Attach`'s row in the
+        // table unreachable by any input at all.
+        if let ClientDecode::Frame(f) = &decoded {
+            let kind = f.kind();
+            if conn.mode == AttachMode::ReadOnly && !kind.readonly_allowed() {
+                if tx
+                    .send(protocol_error(
+                        "read_only_attach",
+                        Some(kind.as_str().to_string()),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+        }
+
+        match decoded {
             ClientDecode::Frame(ClientFrame::Detach) => return,
             ClientDecode::Frame(ClientFrame::Input { bytes }) => {
                 // §4.3's queue, not a direct write: it is what serialises
@@ -315,7 +347,6 @@ async fn read_loop(
                 }
             }
         }
-        let _ = conn;
     }
 }
 

@@ -18,7 +18,7 @@
 //!   fresh, well-formed attach that must still succeed.
 
 use holdfast_core::attach::frames::{decode_server_frame, ClientFrame, ServerFrame};
-use holdfast_core::attach::{AttachMode, AttachRole};
+use holdfast_core::attach::{AttachMode, AttachRole, SignalName};
 use holdfast_core::daemon::attach_server;
 use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::server::{self, Daemon};
@@ -109,14 +109,38 @@ fn attach_to(session: &str) -> ClientFrame {
 }
 
 fn attach_at(session: &str, protocol_major: u32) -> ClientFrame {
+    attach_as(session, AttachMode::ReadWrite, AttachRole::Interactive)
+        .with_protocol_major(protocol_major)
+}
+
+/// The handshake with `mode` and `role` chosen explicitly.
+///
+/// **The two are orthogonal and this helper keeps them so** (§7.5): a
+/// builder that took one argument and derived the other is exactly the
+/// inference the protocol forbids, and every ReadOnly/observer test below
+/// would then be asserting the helper's opinion rather than the daemon's.
+fn attach_as(session: &str, mode: AttachMode, role: AttachRole) -> ClientFrame {
     ClientFrame::Attach {
         session: session.to_string(),
-        mode: AttachMode::ReadWrite,
-        role: AttachRole::Interactive,
+        mode,
+        role,
         client_kind: ClientKind::Cli,
         client_version: "test".into(),
-        protocol_major,
+        protocol_major: PROTOCOL_MAJOR,
         protocol_minor: PROTOCOL_MINOR,
+    }
+}
+
+trait WithProtocolMajor {
+    fn with_protocol_major(self, major: u32) -> Self;
+}
+
+impl WithProtocolMajor for ClientFrame {
+    fn with_protocol_major(mut self, major: u32) -> Self {
+        if let ClientFrame::Attach { protocol_major, .. } = &mut self {
+            *protocol_major = major;
+        }
+        self
     }
 }
 
@@ -855,6 +879,298 @@ async fn daemon_status_counts_live_attach_clients() {
         0,
         "detached clients are still counted"
     );
+}
+
+// ------------------------------------------- ReadOnly enforcement (§7.5)
+
+/// The four write frames §7.5's ReadOnly rule ranges over, each paired
+/// with the `frame_kind` string it must be refused under.
+///
+/// One list, used by both the refusal test and its ReadWrite pairing, so
+/// the two cannot drift apart into asserting different frames — which is
+/// how "reject everything" survives a pairing that exercises a smaller
+/// set on the permitted side.
+fn write_frames() -> Vec<(ClientFrame, &'static str)> {
+    vec![
+        (
+            ClientFrame::Input {
+                bytes: b"XYZZY\n".to_vec(),
+            },
+            "Input",
+        ),
+        (
+            ClientFrame::SecretInput {
+                request_id: "secreq_none".into(),
+                bytes: b"XYZZY\n".to_vec(),
+            },
+            "SecretInput",
+        ),
+        (
+            ClientFrame::Resize {
+                cols: 100,
+                rows: 30,
+            },
+            "Resize",
+        ),
+        (
+            ClientFrame::Signal {
+                sig: SignalName::Int,
+            },
+            "Signal",
+        ),
+    ]
+}
+
+async fn attach_ok(d: &TestDaemon, session: &str, mode: AttachMode) -> UnixStream {
+    let mut c = d.dial().await;
+    send(&mut c, &attach_as(session, mode, AttachRole::Interactive)).await;
+    match recv(&mut c).await {
+        ServerFrame::Attached { .. } => c,
+        other => panic!("expected Attached for {mode:?}, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn every_write_frame_is_rejected_from_a_readonly_client() {
+    // §7.5: *"ReadOnly enforcement is server-side."* All four write
+    // frames on **one** connection, so the refusals are also proof that
+    // each rejection left the connection usable for the next frame.
+    let d = TestDaemon::start("rowrite").await;
+    let (s, pty) = d.session(None);
+
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+    for (f, kind) in write_frames() {
+        send(&mut c, &f).await;
+        match recv(&mut c).await {
+            ServerFrame::ProtocolError { reason, frame_kind } => {
+                assert_eq!(reason, "read_only_attach", "{kind} was not refused");
+                // §7.5: *"`frame_kind` echoes which one"*. A single
+                // generic rejection carrying a fixed string passes a
+                // `reason`-only assertion for all four.
+                assert_eq!(
+                    frame_kind.as_deref(),
+                    Some(kind),
+                    "the refusal named the wrong frame"
+                );
+            }
+            other => panic!("{kind} from a ReadOnly client got {other:?}"),
+        }
+    }
+
+    // §4.3: a refused frame reaches neither the PTY, nor the signal
+    // path, nor the session's geometry. Asserting only the frame leaves
+    // "answer `read_only_attach` **and** apply it" passing.
+    assert!(
+        pty.written().is_empty(),
+        "a refused Input reached the child: {:?}",
+        String::from_utf8_lossy(&pty.written())
+    );
+    assert!(
+        pty.signals().is_empty(),
+        "a refused Signal was delivered: {:?}",
+        pty.signals()
+    );
+    assert_eq!(
+        s.size(),
+        (120, 40),
+        "a refused Resize changed the session's geometry"
+    );
+}
+
+#[tokio::test]
+async fn the_identical_frames_are_accepted_from_a_readwrite_client() {
+    // **The pairing.** The same four frames, the same bytes, the same
+    // session — and no `read_only_attach`. Without this, "refuse every
+    // write frame from everybody" passes the row above completely.
+    //
+    // What is asserted per frame is the *absence of the mode refusal*
+    // plus `Input`'s effect; the observable effects of `Resize` and
+    // `Signal` are asserted by Task 9's rows, which is the commit that
+    // routes them. `SecretInput` is permitted to answer
+    // `unknown_request_id` (§18.4) once Task 10 lands — that is a refusal
+    // about *state*, not about mode, and tolerating it here is what keeps
+    // this row true across that commit instead of turning it red for the
+    // right behaviour.
+    let d = TestDaemon::start("rwwrite").await;
+    let (s, pty) = d.session(None);
+
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    for (f, _kind) in write_frames() {
+        send(&mut c, &f).await;
+    }
+    drain_until_marker(&mut c, &pty, b"RWOK").await;
+
+    wait_for_written(&pty, b"XYZZY\n").await;
+}
+
+/// Queue `marker` on the PTY and drain the connection until it arrives,
+/// returning every frame seen on the way.
+///
+/// The frames are read in FIFO order off the connection's own queue, so
+/// anything the daemon answered to a frame sent *before* the marker was
+/// queued is in the returned vector. A `read_only_attach` hiding behind
+/// the marker is what this exists to surface.
+async fn drain_until_marker(c: &mut UnixStream, pty: &Arc<MockPty>, marker: &[u8]) {
+    // The daemon has to have processed the frames already sent before the
+    // marker is queued, or the ordering argument above is not available.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    pty.queue_output(marker);
+    loop {
+        let f = recv(c).await;
+        if let ServerFrame::ProtocolError { reason, frame_kind } = &f {
+            assert_ne!(
+                reason, "read_only_attach",
+                "a ReadWrite connection was refused as ReadOnly ({frame_kind:?})"
+            );
+        }
+        if matches!(&f, ServerFrame::Output { bytes, .. } if bytes.windows(marker.len()).any(|w| w == marker))
+        {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_frame_does_not_reach_the_pty() {
+    // Replying `ProtocolError` **and** applying the operation is a bug
+    // the frame assertion cannot see. The control is the second half:
+    // the identical bytes from a ReadWrite client on the same session
+    // **do** reach the child, so "nothing ever reaches the PTY" — which
+    // satisfies the absence on its own — is red.
+    let d = TestDaemon::start("ropty").await;
+    let (s, pty) = d.session(None);
+
+    let mut ro = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+    send(
+        &mut ro,
+        &ClientFrame::Input {
+            bytes: b"XYZZY\n".to_vec(),
+        },
+    )
+    .await;
+    match recv(&mut ro).await {
+        ServerFrame::ProtocolError { reason, .. } => assert_eq!(reason, "read_only_attach"),
+        other => panic!("expected ProtocolError, got {other:?}"),
+    }
+
+    let mut rw = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    send(
+        &mut rw,
+        &ClientFrame::Input {
+            bytes: b"PLUGH\n".to_vec(),
+        },
+    )
+    .await;
+    wait_for_written(&pty, b"PLUGH\n").await;
+
+    // The ReadWrite write arrived, so the write path is live and the
+    // absence below is a decision rather than a dead channel.
+    let written = pty.written();
+    assert!(
+        !written.windows(5).any(|w| w == b"XYZZY"),
+        "the refused bytes reached the child: {:?}",
+        String::from_utf8_lossy(&written)
+    );
+}
+
+#[tokio::test]
+async fn the_connection_stays_open_after_a_read_only_rejection() {
+    // §18.4: `read_only_attach` does not close. A daemon that dropped the
+    // connection would make a ReadOnly client that fat-fingers one
+    // keystroke lose its whole stream.
+    let d = TestDaemon::start("rostay").await;
+    let (s, pty) = d.session(None);
+
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+    send(
+        &mut c,
+        &ClientFrame::Input {
+            bytes: b"nope\n".to_vec(),
+        },
+    )
+    .await;
+    match recv(&mut c).await {
+        ServerFrame::ProtocolError { reason, .. } => assert_eq!(reason, "read_only_attach"),
+        other => panic!("expected ProtocolError, got {other:?}"),
+    }
+
+    pty.queue_output(b"STILLHERE");
+    match recv(&mut c).await {
+        ServerFrame::Output { bytes, .. } => assert_eq!(bytes, b"STILLHERE"),
+        other => panic!("the stream stopped after a refusal: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_second_attach_is_refused_under_read_only_attach_from_a_readonly_client() {
+    // **The reachability pairing for the `Attach` row of the table.**
+    // §18.4's `read_only_attach` is *"any frame but `Detach` from a
+    // `ReadOnly` client"*, with no carve-out for an out-of-order one — so
+    // the gate runs before the `Attach` arm. Check the arm first and
+    // `ClientFrameKind::Attach`'s row in the allowlist can never be
+    // reached by any input, which is a policy nobody can observe.
+    //
+    // The ReadWrite half is what stops "answer `read_only_attach` to
+    // every second `Attach`" passing: the same frame, a different mode, a
+    // different reason.
+    let d = TestDaemon::start("roattach").await;
+    let (s, _pty) = d.session(None);
+
+    let mut ro = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+    send(
+        &mut ro,
+        &attach_as(&s.id, AttachMode::ReadOnly, AttachRole::Interactive),
+    )
+    .await;
+    match recv(&mut ro).await {
+        ServerFrame::ProtocolError { reason, frame_kind } => {
+            assert_eq!(reason, "read_only_attach");
+            assert_eq!(frame_kind.as_deref(), Some("Attach"));
+        }
+        other => panic!("expected ProtocolError, got {other:?}"),
+    }
+
+    let mut rw = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    send(
+        &mut rw,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Interactive),
+    )
+    .await;
+    match recv(&mut rw).await {
+        ServerFrame::ProtocolError { reason, frame_kind } => {
+            assert_eq!(
+                reason, "protocol_violation",
+                "a second Attach is out of order, not a write"
+            );
+            assert_eq!(frame_kind.as_deref(), Some("Attach"));
+        }
+        other => panic!("expected ProtocolError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn detach_is_allowed_from_both_modes() {
+    // The one row of the allowlist that is `true`. Gating `Detach` on
+    // mode strands a ReadOnly client with no way to leave except killing
+    // the process.
+    let d = TestDaemon::start("rodetach").await;
+    let (s, _pty) = d.session(None);
+
+    for mode in [AttachMode::ReadOnly, AttachMode::ReadWrite] {
+        let mut c = attach_ok(&d, &s.id, mode).await;
+        send(&mut c, &ClientFrame::Detach).await;
+        expect_eof(&mut c, "a Detach").await;
+        // The **session** outlives the client, in both modes. A `Detach`
+        // that took the session down with it would satisfy the EOF above.
+        assert!(s.is_alive(), "Detach from {mode:?} ended the session");
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while d.daemon.status().attach_clients != 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(d.daemon.status().attach_clients, 0);
+    assert_daemon_survives(&d, &s.id).await;
 }
 
 // ------------------------------------------------------------ helpers

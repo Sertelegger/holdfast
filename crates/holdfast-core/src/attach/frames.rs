@@ -248,6 +248,38 @@ impl ClientFrameKind {
     }
 }
 
+// A **second** `impl ClientFrameKind` block. Task 2's — `ALL` and
+// `as_str` — stays exactly as it is, above this one: merging the two
+// would put the ReadOnly policy in the same place as the wire spellings,
+// and it is the wire spellings that must not move.
+impl ClientFrameKind {
+    /// Which frames a `mode: ReadOnly` connection may send (§7.5).
+    ///
+    /// A **table**, not `matches!(f, Detach)`, because REQ-SURF-004a adds
+    /// exactly one kind to this list when §7.8 ships: `AttentionAck` —
+    /// an observation about the client's own display, which writes
+    /// nothing to the PTY, changes no session state, and cannot answer
+    /// anything. A table makes that a one-row edit and makes
+    /// `the_readonly_allowlist_is_exactly_detach` the thing that notices.
+    ///
+    /// **`Attach` is in the table rather than short-circuited before it**,
+    /// and the ordering at the call site is what makes that row reachable:
+    /// `conn::read_loop` consults this gate *before* the out-of-order
+    /// `Attach` arm, so a second `Attach` from a ReadOnly client is
+    /// answered `read_only_attach` and from a ReadWrite client
+    /// `protocol_violation`. §18.4's `read_only_attach` row is *"any frame
+    /// but `Detach` from a `ReadOnly` client"*, with no carve-out. Check
+    /// the gate second and this row can never be reached by any input,
+    /// which is a policy nobody can observe.
+    pub fn readonly_allowed(self) -> bool {
+        match self {
+            Self::Detach => true,
+            Self::Attach => false,
+            Self::Input | Self::SecretInput | Self::Resize | Self::Signal => false,
+        }
+    }
+}
+
 impl ClientFrame {
     pub fn kind(&self) -> ClientFrameKind {
         match self {
@@ -808,6 +840,53 @@ mod tests {
         assert_eq!(
             ClientFrame::Input { bytes: vec![] }.kind().as_str(),
             "Input"
+        );
+    }
+
+    #[test]
+    fn the_readonly_allowlist_is_exactly_detach() {
+        // §7.5's ReadOnly rule as a table that can be read whole, which
+        // is the property `matches!(f, Detach)` does not have. Both
+        // directions are asserted: a kind moved onto the allowed side
+        // fails, and a kind moved off it fails. When §7.8 lands
+        // `AttentionAck` (REQ-SURF-004a) this is the row that has to be
+        // edited on purpose.
+        let allowed: Vec<&'static str> = ClientFrameKind::ALL
+            .into_iter()
+            .filter(|k| k.readonly_allowed())
+            .map(ClientFrameKind::as_str)
+            .collect();
+        assert_eq!(
+            allowed,
+            vec!["Detach"],
+            "exactly one kind is permitted from a ReadOnly connection"
+        );
+
+        // By name, so a failure says which kind changed side rather than
+        // that a count moved.
+        assert!(ClientFrameKind::Detach.readonly_allowed());
+        for k in [
+            ClientFrameKind::Attach,
+            ClientFrameKind::Input,
+            ClientFrameKind::SecretInput,
+            ClientFrameKind::Resize,
+            ClientFrameKind::Signal,
+        ] {
+            assert!(
+                !k.readonly_allowed(),
+                "{} is not writable from a ReadOnly connection",
+                k.as_str()
+            );
+        }
+
+        // The count is asserted separately from the names: a seventh
+        // variant added to `ALL` without a decision about its ReadOnly
+        // status would otherwise slip through the loop above, which only
+        // ranges over the five it names.
+        assert_eq!(
+            ClientFrameKind::ALL.len(),
+            6,
+            "a new frame kind needs a ReadOnly decision, not a default"
         );
     }
 }
