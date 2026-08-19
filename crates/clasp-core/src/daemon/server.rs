@@ -92,6 +92,18 @@ pub struct Daemon {
     started_at: Instant,
     shutdown_tx: watch::Sender<bool>,
     connections: AtomicU64,
+    /// The uid this daemon belongs to, captured once at construction
+    /// rather than re-read per connection.
+    ///
+    /// **This field is the seam that makes §9.1's peer-credential gate
+    /// testable at all.** A test process cannot become a second user, so
+    /// "a foreign peer is refused" is unreachable while the daemon asks
+    /// `geteuid()` on every connection: every in-process peer is us.
+    /// Holding the owner as state lets a test build a daemon that
+    /// believes it belongs to *someone else*, which makes an ordinary
+    /// local connection a foreign one — see
+    /// `a_connection_from_a_foreign_uid_is_closed_before_the_handshake`.
+    owner_uid: u32,
 }
 
 impl Daemon {
@@ -113,11 +125,21 @@ impl Daemon {
     /// path arrives with the daemon in 0.0.5"*). On the default instance
     /// `paths.audit_log()` **is** `~/.clasp/logs/audit.log`, so the two
     /// agree; under an explicit `CLASP_RUNTIME_DIR` the audit log follows
-    /// the instance, which is what stops every `daemon_cli.rs` test from
-    /// appending to the developer's real audit log. See **Decisions
-    /// taken** — §7.1 states the relocation for `daemon.log` only, and
-    /// extending it to `audit.log` is this plan's call.
+    /// the instance, which is what will stop every `daemon_cli.rs` test
+    /// (Task 14) from appending to the developer's real audit log. See
+    /// **Decisions taken** — §7.1 states the relocation for `daemon.log`
+    /// only, and extending it to `audit.log` is this plan's call.
     pub fn new(paths: RuntimePaths) -> Arc<Self> {
+        Self::with_owner_uid(paths, peer::current_uid())
+    }
+
+    /// [`Daemon::new`] with the owning uid supplied rather than read from
+    /// the process.
+    ///
+    /// Private, and deliberately so: production has exactly one right
+    /// answer for this and `new` supplies it. It exists because the
+    /// §9.1 gate is otherwise unprovable in-process — see `owner_uid`.
+    fn with_owner_uid(paths: RuntimePaths, owner_uid: u32) -> Arc<Self> {
         let (shutdown_tx, _) = watch::channel(false);
         let audit_path = paths.audit_log();
         Arc::new(Self {
@@ -126,6 +148,7 @@ impl Daemon {
             started_at: Instant::now(),
             shutdown_tx,
             connections: AtomicU64::new(0),
+            owner_uid,
         })
     }
 
@@ -133,8 +156,13 @@ impl Daemon {
         &self.paths
     }
 
-    /// Total connections accepted since start. Used by tests to prove a
-    /// connection was refused *before* the handshake rather than served.
+    /// Total connections accepted by the listener since start.
+    ///
+    /// Counted in `serve`, *before* the §9.1 credential gate runs, so it
+    /// says "the daemon saw this peer" and nothing about whether the peer
+    /// was served. That is exactly what a refusal test needs: silence on
+    /// a socket is also what connecting to a dead daemon looks like, and
+    /// this counter is what separates the two.
     pub fn accepted_connections(&self) -> u64 {
         self.connections.load(Ordering::Relaxed)
     }
@@ -286,24 +314,38 @@ pub fn read_pid_file(paths: &RuntimePaths) -> Option<u32> {
     text.split_whitespace().next()?.parse().ok()
 }
 
+/// §9.1's admission decision, as one expression.
+///
+/// Extracted from `handle_connection` on purpose. Inline, the decision
+/// was a three-armed `match` whose diagnostics were interleaved with its
+/// verdict, and the `Err` arm — the one that must **fail closed** — could
+/// be turned into `Err(_) => {}` with nothing in the workspace going red.
+/// As a function it has one caller, three arms and a unit test that names
+/// all three: `the_uid_gate_admits_only_the_owner_and_fails_closed`.
+///
+/// The `Err` arm answering `false` is the whole point. A daemon that
+/// cannot read a peer's credentials knows nothing about that peer, and
+/// "unknown" is not "ours".
+fn peer_is_authorized(cred: &io::Result<peer::PeerCred>, our_uid: u32) -> bool {
+    matches!(cred, Ok(c) if peer::is_authorized(c.uid, our_uid))
+}
+
 async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
     // Credential check first, before a single frame is read. An
     // unauthorized peer gets no response at all: there is nothing to
     // negotiate, and a reply would confirm the daemon's existence.
-    match peer::peer_cred(&stream) {
-        Ok(cred) if peer::is_authorized(cred.uid, peer::current_uid()) => {}
-        Ok(cred) => {
-            eprintln!(
+    let cred = peer::peer_cred(&stream);
+    if !peer_is_authorized(&cred, daemon.owner_uid) {
+        // Diagnostics only, and after the verdict rather than inside it:
+        // nothing below can change who is admitted.
+        match &cred {
+            Ok(c) => eprintln!(
                 "clasp daemon: refused a connection from uid {} (daemon runs as uid {})",
-                cred.uid,
-                peer::current_uid()
-            );
-            return;
+                c.uid, daemon.owner_uid
+            ),
+            Err(e) => eprintln!("clasp daemon: cannot read peer credentials, refusing: {e}"),
         }
-        Err(e) => {
-            eprintln!("clasp daemon: cannot read peer credentials, refusing: {e}");
-            return;
-        }
+        return;
     }
 
     // The kind the peer declared in its handshake, on a connection whose
@@ -537,6 +579,7 @@ async fn dispatch_tool(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
 
     /// Every field name an agent might reach for to relabel itself.
     fn forged_read_output(kind_it_wants_to_look_like: &str) -> Request {
@@ -637,5 +680,96 @@ mod tests {
         ] {
             assert_eq!(caller_for(kind, &req), expected);
         }
+    }
+
+    #[test]
+    fn the_uid_gate_admits_only_the_owner_and_fails_closed() {
+        // All three arms of the one expression `handle_connection`
+        // consults. The third is the one worth having a test for: an
+        // `Err` that answered `true` — the shape `Err(_) => {}` takes in
+        // the inline `match` this replaced — hands an unauthenticated
+        // peer a full session surface, and no other test in the workspace
+        // can see it.
+        let us = peer::current_uid();
+        let ours = peer::PeerCred {
+            uid: us,
+            gid: 0,
+            pid: None,
+        };
+        let theirs = peer::PeerCred {
+            uid: us.wrapping_add(1),
+            gid: 0,
+            pid: None,
+        };
+        assert!(peer_is_authorized(&Ok(ours), us));
+        assert!(
+            !peer_is_authorized(&Ok(theirs), us),
+            "another user's connection must be refused"
+        );
+        assert!(
+            !peer_is_authorized(&Err(io::Error::from(io::ErrorKind::PermissionDenied)), us),
+            "an unreadable credential must fail closed, not open"
+        );
+    }
+
+    /// The gate is *wired*, not merely correct.
+    ///
+    /// `the_uid_gate_admits_only_the_owner_and_fails_closed` proves the
+    /// decision; on its own, deleting the call site leaves it green. This
+    /// one drives a real `serve`/`handle_connection` over a real socket
+    /// and asserts the connection dies before the handshake is answered.
+    ///
+    /// The trick that makes it possible: the test cannot become a second
+    /// user, so it makes the *daemon* belong to one. `owner_uid` is
+    /// state, so a daemon built for `current_uid() + 1` sees every
+    /// ordinary local connection — including this test's — as foreign.
+    #[tokio::test]
+    async fn a_connection_from_a_foreign_uid_is_closed_before_the_handshake() {
+        let dir = format!(
+            "/tmp/clasp-t-uidgate-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let paths = RuntimePaths::with_dir(&dir);
+        let listener = bind_control(&paths).expect("bind control.sock");
+        let daemon = Daemon::with_owner_uid(paths.clone(), peer::current_uid().wrapping_add(1));
+        tokio::spawn(serve(Arc::clone(&daemon), listener));
+
+        let mut stream = UnixStream::connect(paths.control_sock())
+            .await
+            .expect("connect");
+        let req = Request::new(
+            0,
+            method::METHOD_HANDSHAKE,
+            &HandshakeParams::current(ClientKind::Cli),
+        )
+        .unwrap();
+        // The write may land or may race the close; either is fine, and
+        // neither is the assertion.
+        let _ = frame::write_frame(&mut stream, &req).await;
+
+        // Bounded, because the failure this guards against is a daemon
+        // that keeps the connection open — which as a bare `await` is a
+        // hang rather than a red test.
+        let answered = tokio::time::timeout(
+            Duration::from_secs(5),
+            frame::read_frame::<_, Response>(&mut stream),
+        )
+        .await;
+        assert!(
+            matches!(answered, Ok(Err(_))),
+            "an unauthorized peer must be closed on without a reply; got {answered:?}"
+        );
+        // Without this the test would also pass against a daemon that
+        // never ran: a socket nobody serves reads EOF too. The counter is
+        // incremented in `serve` before the gate, so it proves the daemon
+        // took this connection and then dropped it.
+        assert_eq!(
+            daemon.accepted_connections(),
+            1,
+            "the daemon must have accepted the connection before refusing it"
+        );
+
+        daemon.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
