@@ -881,6 +881,302 @@ async fn daemon_status_counts_live_attach_clients() {
     );
 }
 
+// -------------------------------------- the redaction role (§9.2, Task 7)
+
+/// A GitHub token matching the shipped `github-token` rule, whose kind —
+/// and therefore whose marker — is `github`.
+const GH_TOKEN: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+
+/// Accumulate `Output` bytes until `needle` appears, or fail.
+///
+/// Returns the whole stream seen, because every assertion below is about
+/// what did **and did not** cross the socket, and a helper that returned
+/// only the last frame would make the negative half unwritable.
+async fn stream_until(c: &mut UnixStream, needle: &[u8], secs: u64) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let mut acc: Vec<u8> = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let body = match tokio::time::timeout(
+            deadline - tokio::time::Instant::now(),
+            frame::read_frame_body(&mut *c),
+        )
+        .await
+        {
+            Ok(Ok(b)) => b,
+            _ => break,
+        };
+        match decode_server_frame(&body).expect("a decodable server frame") {
+            ServerFrame::Output { bytes, .. } => acc.extend_from_slice(&bytes),
+            other => panic!("expected Output, got {other:?}"),
+        }
+        if acc.windows(needle.len()).any(|w| w == needle) {
+            return acc;
+        }
+    }
+    panic!(
+        "{:?} never arrived; stream so far ({} bytes): {:?}",
+        String::from_utf8_lossy(needle),
+        acc.len(),
+        String::from_utf8_lossy(&acc[acc.len().saturating_sub(256)..])
+    );
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// An RSA-2048-shaped PEM: far past the 512-byte bound an earlier
+/// revision of the carry used, which is the whole point of the fixture.
+fn rsa_pem() -> Vec<u8> {
+    let mut v = b"-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+    while v.len() < 1700 {
+        v.extend_from_slice(b"MIIEpAIBAAKCAQEA7uJ8xk3nQ2s5vT1wY0zL9pR4bN6cH8dF2gJ5kM7nP0qS3tU\n");
+    }
+    v.extend_from_slice(b"-----END RSA PRIVATE KEY-----\n");
+    v
+}
+
+#[tokio::test]
+async fn the_same_bytes_reach_an_interactive_client_raw_and_an_observer_redacted() {
+    // **The load-bearing pairing.** One session, one token printed once,
+    // two clients attached simultaneously. "Redact everybody" fails the
+    // first assertion and "redact nobody" fails the second; neither can
+    // pass both.
+    let d = TestDaemon::start("roleraw").await;
+    let (s, pty) = d.session(None);
+
+    let mut raw = d.dial().await;
+    send(
+        &mut raw,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Interactive),
+    )
+    .await;
+    assert!(matches!(recv(&mut raw).await, ServerFrame::Attached { .. }));
+
+    let mut watch = d.dial().await;
+    send(
+        &mut watch,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Observer),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut watch).await,
+        ServerFrame::Attached { .. }
+    ));
+
+    pty.queue_output(format!("token={GH_TOKEN}\nEOM\n").as_bytes());
+
+    let raw_seen = stream_until(&mut raw, b"EOM", 5).await;
+    assert!(
+        contains(&raw_seen, GH_TOKEN.as_bytes()),
+        "the interactive client did not get raw fidelity: {:?}",
+        String::from_utf8_lossy(&raw_seen)
+    );
+
+    let watched = stream_until(&mut watch, b"EOM", 5).await;
+    assert!(
+        contains(&watched, b"[REDACTED:github]"),
+        "the observer got no marker: {:?}",
+        String::from_utf8_lossy(&watched)
+    );
+    assert!(
+        !contains(&watched, GH_TOKEN.as_bytes()),
+        "the token reached an observer"
+    );
+}
+
+#[tokio::test]
+async fn the_role_is_read_from_the_frame_not_inferred_from_the_mode() {
+    // §7.5's orthogonality paragraph. Inferring `role` from `mode` passes
+    // every test that only exercises the two conventional pairings, which
+    // is exactly why both unconventional ones are here.
+    let d = TestDaemon::start("roleorth").await;
+    let (s, pty) = d.session(None);
+
+    let mut ro_raw = d.dial().await;
+    send(
+        &mut ro_raw,
+        &attach_as(&s.id, AttachMode::ReadOnly, AttachRole::Interactive),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut ro_raw).await,
+        ServerFrame::Attached { .. }
+    ));
+
+    let mut rw_redacted = d.dial().await;
+    send(
+        &mut rw_redacted,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Observer),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut rw_redacted).await,
+        ServerFrame::Attached { .. }
+    ));
+
+    pty.queue_output(format!("token={GH_TOKEN}\nEOM\n").as_bytes());
+
+    let ro_seen = stream_until(&mut ro_raw, b"EOM", 5).await;
+    assert!(
+        contains(&ro_seen, GH_TOKEN.as_bytes()),
+        "ReadOnly + interactive was redacted: role was inferred from mode"
+    );
+    let rw_seen = stream_until(&mut rw_redacted, b"EOM", 5).await;
+    assert!(
+        !contains(&rw_seen, GH_TOKEN.as_bytes()),
+        "ReadWrite + observer got raw bytes: role was inferred from mode"
+    );
+    assert!(contains(&rw_seen, b"[REDACTED:github]"));
+}
+
+#[tokio::test]
+async fn a_secret_split_across_two_chunks_is_still_redacted() {
+    // Per-chunk redaction with no carry is invisible to a single-chunk
+    // test: each half matches nothing on its own.
+    let d = TestDaemon::start("straddle").await;
+    let (s, pty) = d.session(None);
+
+    let mut watch = d.dial().await;
+    send(
+        &mut watch,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Observer),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut watch).await,
+        ServerFrame::Attached { .. }
+    ));
+
+    let (head, tail) = GH_TOKEN.split_at(10);
+    pty.queue_output(head.as_bytes());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pty.queue_output(format!("{tail}\nEOM\n").as_bytes());
+
+    let seen = stream_until(&mut watch, b"EOM", 5).await;
+    assert!(
+        !contains(&seen, GH_TOKEN.as_bytes()),
+        "the straddled token crossed the socket whole"
+    );
+    assert!(
+        !contains(&seen, b"ghp_"),
+        "the first half was streamed before it could be judged: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&seen)
+            .matches("[REDACTED:github]")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn ordinary_output_is_never_held_back_from_an_observer() {
+    // 0.0.3's REQ-O-003 regression guard, restated for the stream: the
+    // holdback is *targeted*, so output with no secret-shaped prefix is
+    // never delayed and never dropped.
+    //
+    // The mutation this kills is a blanket holdback, and what kills it is
+    // **completeness** — under a blanket carry the sentinel never
+    // arrives at all and `stream_until` fails. The elapsed bound is
+    // deliberately loose beside it: a 250 ms assertion on a loaded box is
+    // a flake, not a guard.
+    let d = TestDaemon::start("noholdback").await;
+    let (s, pty) = d.session(None);
+
+    let mut watch = d.dial().await;
+    send(
+        &mut watch,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Observer),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut watch).await,
+        ServerFrame::Attached { .. }
+    ));
+
+    let mut payload = Vec::new();
+    let mut line = 0u32;
+    while payload.len() < 256 * 1024 {
+        payload.extend_from_slice(format!("   Compiling widget v0.{line}.0\n").as_bytes());
+        line += 1;
+    }
+    payload.extend_from_slice(b"EOM\n");
+    let started = std::time::Instant::now();
+    pty.queue_output(&payload);
+
+    let seen = stream_until(&mut watch, b"EOM", 10).await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        seen.len(),
+        payload.len(),
+        "an observer lost bytes that no rule claimed"
+    );
+    assert_eq!(seen, payload, "an observer's bytes were altered");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "256 KiB of ordinary output took {elapsed:?} to reach an observer"
+    );
+}
+
+#[tokio::test]
+async fn a_private_key_longer_than_the_old_carry_is_redacted_not_streamed() {
+    // **The size fixture a 512-byte carry could not judge**: it flushes
+    // the body at byte 512 and redacts nothing after it. Neither this row
+    // nor the 40-byte straddle above is reachable from the other — that
+    // one fits inside any bound.
+    let d = TestDaemon::start("pemwatch").await;
+    let (s, pty) = d.session(None);
+
+    let mut raw = d.dial().await;
+    send(
+        &mut raw,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Interactive),
+    )
+    .await;
+    assert!(matches!(recv(&mut raw).await, ServerFrame::Attached { .. }));
+
+    let mut watch = d.dial().await;
+    send(
+        &mut watch,
+        &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Observer),
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut watch).await,
+        ServerFrame::Attached { .. }
+    ));
+
+    let key = rsa_pem();
+    let mut payload = key.clone();
+    payload.extend_from_slice(b"EOM\n");
+    pty.queue_output(&payload);
+
+    let body = &key[40..key.len() - 40];
+    let watched = stream_until(&mut watch, b"EOM", 10).await;
+    assert!(
+        contains(&watched, b"[REDACTED:private-key]"),
+        "the observer got no marker for a whole PEM"
+    );
+    for w in body.windows(16).step_by(31) {
+        assert!(
+            !contains(&watched, w),
+            "16 bytes of the key body reached an observer: {:?}",
+            String::from_utf8_lossy(w)
+        );
+    }
+
+    // The pairing: the interactive client on the same session does get
+    // the body verbatim, so the absence above is a decision and not a
+    // dead stream.
+    let raw_seen = stream_until(&mut raw, b"EOM", 10).await;
+    assert!(
+        contains(&raw_seen, body),
+        "the interactive client lost the key body it is supposed to render"
+    );
+}
+
 // ------------------------------------------- ReadOnly enforcement (§7.5)
 
 /// The four write frames §7.5's ReadOnly rule ranges over, each paired

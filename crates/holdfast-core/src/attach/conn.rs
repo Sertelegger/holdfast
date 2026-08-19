@@ -145,8 +145,28 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
     // report clients on a session nobody is watching.
     daemon.attach_hub().register(Arc::clone(&conn));
 
+    // **§9.2's split is by role, and the role is read off the frame.**
+    // Not from `client_kind` (which is attribution only, derived
+    // server-side from the uid-checked handshake), not from `mode`, and
+    // not from which CLI dialled in: §7.5's orthogonality paragraph
+    // forbids all three, and a client with a live pane and a watching
+    // pane opens one connection per pane. One `StreamRedactor` **per
+    // connection**, never per session — two observers must not share
+    // carry state, and an interactive client must not pay for one.
+    let redactor = match conn.role {
+        AttachRole::Interactive => None,
+        AttachRole::Observer => Some(super::redact_stream::StreamRedactor::new(Arc::clone(
+            &daemon.server.processor,
+        ))),
+    };
+
     let writer = tokio::spawn(write_loop(wr, rx));
-    let mut forwarder = tokio::spawn(forward_output(conn.session_id.clone(), output, tx.clone()));
+    let mut forwarder = tokio::spawn(forward_output(
+        conn.session_id.clone(),
+        output,
+        tx.clone(),
+        redactor,
+    ));
 
     // Either half can end the connection. The forwarder ends it when
     // this client stopped draining (§4.3's slow consumer) or when the
@@ -393,15 +413,31 @@ async fn forward_output(
     session_id: String,
     mut output: tokio::sync::broadcast::Receiver<crate::session::OutputFrame>,
     tx: mpsc::Sender<ServerFrame>,
+    mut redactor: Option<super::redact_stream::StreamRedactor>,
 ) {
     use tokio::sync::broadcast::error::RecvError;
     use tokio::sync::mpsc::error::TrySendError;
     loop {
         match output.recv().await {
             Ok(f) => {
+                // **The single conversion point to the wire `Output`
+                // frame is also the single redaction point**, for the
+                // same reason it is the single offset-stripping point: a
+                // second place that built an `Output` would be a second
+                // place that could forget.
+                let bytes = match redactor.as_mut() {
+                    Some(r) => r.feed(&f.bytes),
+                    None => f.bytes.to_vec(),
+                };
+                // A chunk held whole (a secret still arriving) produces
+                // nothing to send. An empty `Output` would be a frame
+                // that says the child printed nothing, which it did not.
+                if bytes.is_empty() {
+                    continue;
+                }
                 let frame = ServerFrame::Output {
                     session: session_id.clone(),
-                    bytes: f.bytes.to_vec(),
+                    bytes,
                 };
                 match tx.try_send(frame) {
                     Ok(()) => {}
@@ -425,7 +461,29 @@ async fn forward_output(
             Err(RecvError::Lagged(n)) => {
                 crate::diag!("holdfast daemon: attach client on {session_id} lagged {n} frames");
             }
-            Err(RecvError::Closed) => return,
+            Err(RecvError::Closed) => {
+                // End of stream: whatever the redactor is still carrying
+                // is emitted here, redacted as far as it can be, so a
+                // session that dies mid-token does not silently swallow
+                // its last line. `flush` emits nothing while withholding,
+                // which is the half that keeps the exit path from
+                // becoming the leak the carry bound exists to stop.
+                //
+                // **This is the only trigger that exists**: §7.5's
+                // `SessionExited { code }` has no producer anywhere in
+                // the tree at this commit, so there is no "on
+                // `SessionExited`" to hang the flush off yet. Whichever
+                // task adds that frame owns calling `flush` before it.
+                if let Some(tail) = redactor.as_mut().map(|r| r.flush()) {
+                    if !tail.is_empty() {
+                        let _ = tx.try_send(ServerFrame::Output {
+                            session: session_id.clone(),
+                            bytes: tail,
+                        });
+                    }
+                }
+                return;
+            }
         }
     }
 }
@@ -543,7 +601,7 @@ mod tests {
         );
 
         let (tx, mut out) = mpsc::channel::<ServerFrame>(4096);
-        let forwarder = tokio::spawn(forward_output("sess_x".to_string(), rx, tx));
+        let forwarder = tokio::spawn(forward_output("sess_x".to_string(), rx, tx, None));
         inner.queue_output(b"Z");
 
         let mut delivered = 0usize;

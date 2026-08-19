@@ -28,6 +28,12 @@ pub mod handshake;
 /// keeping them off `#[cfg(unix)]` is what leaves the per-connection
 /// shape type-checked for the transport that mirrors it in 0.0.10.
 pub mod hub;
+/// **Not gated either.** The streaming redactor names no platform type;
+/// it is the `observer` half of §9.2 and 0.0.10's WebSocket mirror needs
+/// exactly the same one.
+pub mod redact_stream;
+
+pub use redact_stream::{StreamRedactor, STREAM_CARRY_BYTES, UNRESOLVED_KIND};
 
 pub use frames::{
     decode_client_frame, decode_server_frame, AttachMode, AttachRole, ClientDecode, ClientFrame,
