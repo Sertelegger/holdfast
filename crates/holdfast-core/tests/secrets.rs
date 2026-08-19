@@ -32,6 +32,7 @@ use holdfast_core::daemon::attach_server;
 use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::server::{self, Daemon};
 use holdfast_core::mcp::tools::RequestSecretInputArgs;
+use holdfast_core::platform::Capabilities;
 use holdfast_core::protocol::frame;
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use holdfast_core::pty::{InProcessPty, PtyBackend, PtySpawnConfig, Signal};
@@ -81,6 +82,31 @@ impl TestDaemon {
     }
 
     async fn start_with(tag: &str, clock: Clock) -> Self {
+        Self::spawn(tag, |paths| Daemon::with_clock(paths, clock)).await
+    }
+
+    /// A daemon whose server reports the capabilities it is given rather
+    /// than the ones it was compiled for (§3.6).
+    ///
+    /// **A daemon and not a bare `HoldfastServer::with_capabilities`**:
+    /// the negative half of the platform assertion needs a real attached
+    /// client, which needs a socket, which needs a daemon — and a bare
+    /// server built with `None` for its audit path carries a **disabled**
+    /// log, against which "no `secret_input_request` line" is true of
+    /// every implementation there could be.
+    async fn start_unsupported(tag: &str) -> Self {
+        Self::spawn(tag, |paths| {
+            Daemon::with_capabilities(
+                paths,
+                Capabilities {
+                    out_of_band_secret_input: false,
+                },
+            )
+        })
+        .await
+    }
+
+    async fn spawn(tag: &str, make: impl FnOnce(RuntimePaths) -> Arc<Daemon>) -> Self {
         let unique = uuid::Uuid::new_v4().simple().to_string();
         let paths = RuntimePaths::with_dir(PathBuf::from(format!(
             "/tmp/holdfast-secrets-{tag}-{}",
@@ -88,7 +114,7 @@ impl TestDaemon {
         )));
         let (control, _c) = server::bind_control(&paths).expect("bind control.sock");
         let (attach, _a) = attach_server::bind_attach(&paths).expect("bind attach.sock");
-        let daemon = Daemon::with_clock(paths.clone(), clock);
+        let daemon = make(paths.clone());
         tokio::spawn(server::serve(Arc::clone(&daemon), control));
         tokio::spawn(attach_server::serve_attach(Arc::clone(&daemon), attach));
         for _ in 0..200 {
@@ -2171,5 +2197,110 @@ async fn only_one_notice_is_written_per_request() {
         String::from_utf8_lossy(&buffered(&s))
     );
     assert_eq!(cancelled_reason(&joined(c, "caller C").await), "timeout");
+    let _ = s.signal(Signal::Kill);
+}
+
+// -------------------------------------------- not_supported_on_platform
+
+/// §5.2: *"On Windows native, `request_secret_input` returns
+/// `not_supported_on_platform` **before allocating a `request_id`**."*
+///
+/// **The two negative assertions are the ones that catch a check placed
+/// after the raise; the status alone does not.** A prompt broadcast to a
+/// human on a platform that cannot answer it is the harm, and it is
+/// invisible to any assertion about the agent's response.
+#[tokio::test]
+async fn an_unsupported_platform_returns_before_allocating_anything() {
+    let d = TestDaemon::start_unsupported("unsupported").await;
+    // `cat` and **not** the echo-off fixture, which would confound this
+    // measurement rather than strengthen it: an attached client raises a
+    // request off the echo drop all on its own (§8.3), so an outstanding
+    // request would prove nothing about the tool. With echo on, anything
+    // in the slot could only have been put there by the call.
+    let s = d.shell_running("cat");
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    let r = d.call(secret_args(&s.id, 20)).await;
+    assert_eq!(body(&r)["status"], "not_supported_on_platform");
+    assert_eq!(
+        r.is_error,
+        Some(true),
+        "§18.1 puts this status in the error column"
+    );
+
+    // Nothing was raised, so nothing could have been broadcast — which is
+    // §5.2's "before allocating a `request_id`" asserted directly.
+    assert!(
+        d.daemon
+            .server
+            .attach_hub()
+            .outstanding_secret(&s.id)
+            .is_none(),
+        "a request_id was allocated on a platform that cannot answer it"
+    );
+    let quiet = tokio::time::timeout(Duration::from_millis(500), recv(&mut c)).await;
+    if let Ok(ServerFrame::AwaitingSecret { request_id, .. }) = quiet {
+        panic!("a human was shown a prompt nobody can answer: {request_id}");
+    }
+    assert!(
+        audit_entries(&d, &s.id, "secret_input_request").is_empty(),
+        "an entry was written for a request that was never raised"
+    );
+    // The pairing that stops the line above being an assertion about an
+    // empty file: this daemon's trail is live and has other kinds in it.
+    let whole = std::fs::read_to_string(d.paths.audit_log()).unwrap_or_default();
+    assert!(
+        whole.contains("attach_connect"),
+        "the audit log is disabled, so the absence assertion above is vacuous:\n{whole}"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// Ordering the checks the other way tells an agent its platform is the
+/// problem when its argument was.
+#[tokio::test]
+async fn session_not_found_still_outranks_the_capability_check() {
+    let d = TestDaemon::start_unsupported("unsupportedbadid").await;
+    assert_eq!(
+        body(&d.call(secret_args("sess_nosuchsession", 20)).await)["status"],
+        "session_not_found"
+    );
+
+    // The pairing: with a *real* session on the same daemon, the same
+    // call does report the platform — so the row above is about ordering
+    // and not about the capability being ignored.
+    let s = d.shell_running("cat");
+    assert_eq!(
+        body(&d.call(secret_args(&s.id, 20)).await)["status"],
+        "not_supported_on_platform"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// **The pairing for the whole group.** A check inverted or stuck on
+/// makes every row above pass and the tool useless.
+#[tokio::test]
+async fn the_tool_works_when_the_capability_is_present() {
+    let d = TestDaemon::start("supported").await;
+    assert!(
+        Capabilities::default().out_of_band_secret_input,
+        "this test asserts the default is on; on a platform where it is not, \
+         it would be asserting the same thing as the rows above"
+    );
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    await_waiter(&d, &s.id, "the call").await;
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(joined(call, "the call").await["status"], "secret_provided");
     let _ = s.signal(Signal::Kill);
 }

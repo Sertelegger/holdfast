@@ -1278,20 +1278,6 @@ impl HoldfastServer {
         &self,
         Parameters(args): Parameters<RequestSecretInputArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        // §3.6. The `#[cfg]` picks the default and this branch reads the
-        // value — see `crate::platform`. Written as a branch over a field
-        // rather than `#[cfg(windows)] return …` so a Unix test can reach
-        // this status; a status no test on any CI runner can produce is
-        // the REQ-T-017 defect, and it ships silently.
-        if !self.capabilities.out_of_band_secret_input {
-            return Ok(envelope::envelope(
-                Status::NotSupportedOnPlatform,
-                json!({}),
-                "out-of-band secret input needs a daemon holding the session and a client \
-                 attached to it; this platform has neither",
-            ));
-        }
-
         // Every bound below is a **protocol error**, not a status (§5.1):
         // an input-schema violation is `invalid_params`, the same shape
         // `read_output`'s cursor rule already uses. `secret_cancelled`
@@ -1342,6 +1328,32 @@ impl HoldfastServer {
             Ok(s) => s,
             Err(e) => return envelope::from_error(&e),
         };
+
+        // §3.6, and §5.2: *"On Windows native, `request_secret_input`
+        // returns `not_supported_on_platform` **before allocating a
+        // `request_id`**."*
+        //
+        // **Sited after session resolution and before `raise_or_adopt`.**
+        // Ahead of the lookup it answers "your platform is the problem"
+        // to a call whose *argument* was — a bad session id is still
+        // `session_not_found`, and an input-schema violation is still
+        // `invalid_params`. Behind the raise it broadcasts a prompt to a
+        // human on a platform that cannot answer it.
+        //
+        // **A branch over a field, not `#[cfg(windows)] return …`.** The
+        // `#[cfg]` decides the *value* (see `crate::platform`); it does
+        // not decide the branch. An inline `cfg` leaves a status that no
+        // test on any CI runner can produce, which is REQ-T-017's defect
+        // exactly, and it ships silently.
+        if !self.capabilities.out_of_band_secret_input {
+            return Ok(envelope::envelope(
+                Status::NotSupportedOnPlatform,
+                json!({}),
+                "out-of-band secret input needs a daemon holding the session and a client \
+                 attached to it; this platform has neither",
+            ));
+        }
+
         if !session.is_alive() {
             return Ok(envelope::envelope(
                 Status::SessionDied,

@@ -3247,10 +3247,16 @@ async fn every_declared_status_is_returned_by_a_real_response() {
                 out_of_band_secret_input: false,
             },
         );
+        // **A session that exists.** §5.2 sites the capability check
+        // *after* session resolution, so a bogus id here answers
+        // `session_not_found` and this drive silently stops producing the
+        // status it is named for — which is how it was written until
+        // 0.0.7 Task 8 moved the check and this row went red.
+        let (windowsish_id, _pty) = mock_session(&windowsish, Some(true));
         note(&body(
             &windowsish
                 .request_secret_input(Parameters(RequestSecretInputArgs {
-                    session: "sess_nope".into(),
+                    session: windowsish_id,
                     prompt_text: "a prompt".into(),
                     ..Default::default()
                 }))

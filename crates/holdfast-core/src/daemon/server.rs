@@ -284,7 +284,48 @@ impl Daemon {
         Self::build(paths, Config::default(), Clock::system(), owner_uid)
     }
 
+    /// A daemon whose server reports the platform capabilities it is
+    /// given rather than the ones it was compiled for (§3.6).
+    ///
+    /// **The seam that makes `not_supported_on_platform` reachable on the
+    /// platform CI actually runs**, and it is at the *daemon* rather than
+    /// at `HoldfastServer::with_capabilities` for one reason: that
+    /// constructor cannot open a socket, and the negative half of the
+    /// assertion — that no `AwaitingSecret` reached a human who cannot
+    /// answer it — needs a real attached client. Its audit trail is live
+    /// too, where a bare `HoldfastServer::with_capabilities(None, …)`
+    /// builds a **disabled** log against which "no `secret_input_request`
+    /// line" is true of every possible implementation.
+    pub fn with_capabilities(
+        paths: RuntimePaths,
+        capabilities: crate::platform::Capabilities,
+    ) -> Arc<Self> {
+        Self::build_with(
+            paths,
+            Config::default(),
+            Clock::system(),
+            peer::current_uid(),
+            capabilities,
+        )
+    }
+
     fn build(paths: RuntimePaths, config: Config, clock: Clock, owner_uid: u32) -> Arc<Self> {
+        Self::build_with(
+            paths,
+            config,
+            clock,
+            owner_uid,
+            crate::platform::Capabilities::default(),
+        )
+    }
+
+    fn build_with(
+        paths: RuntimePaths,
+        config: Config,
+        clock: Clock,
+        owner_uid: u32,
+        capabilities: crate::platform::Capabilities,
+    ) -> Arc<Self> {
         let (shutdown_tx, _) = watch::channel(false);
         let audit_path = paths.audit_log();
         Arc::new(Self {
@@ -292,10 +333,11 @@ impl Daemon {
             // every `SessionConfig` `start_session` builds. Without it
             // `Daemon::with_clock` moves the reaper's hand while the
             // sessions it is deciding about are stamped from wall time.
-            server: HoldfastServer::with_audit_path_config_and_clock(
+            server: HoldfastServer::with_audit_path_config_clock_and_capabilities(
                 Some(audit_path),
                 &config,
                 clock.clone(),
+                capabilities,
             ),
             paths,
             // On the daemon's own clock, not `Instant::now()`. §7.3's
