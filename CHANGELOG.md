@@ -16,10 +16,8 @@ Every milestone here was built task by task from self-contained briefs, each
 task reviewed against its brief and then again as a whole branch — which is why
 the "Fixed" section names classes of defect rather than issue numbers.
 
-**This file is behind the tree.** Milestones 0.0.3 (output processing and
-redaction) and 0.0.4 (screen state, resize, interrupt) are merged and have no
-sections of their own; README and ROADMAP describe what they added. The gap is
-recorded here rather than guessed at.
+Milestones 0.0.3 and 0.0.4 were merged before they had sections here; they were
+backfilled from their commit history rather than reconstructed from memory.
 
 ### Added
 
@@ -86,6 +84,57 @@ recorded here rather than guessed at.
 - **Session options on `start_session`**: `cwd` (validated and canonicalised),
   `env`, `cols`/`rows`, `prompt_patterns`, `prompt_patterns_replace`,
   `settle_threshold_ms`, `shell_integration`.
+
+#### Milestone 0.0.3 — output processing and redaction
+
+- **Secrets are removed from output by default.** A 51-rule set derived from
+  Gitleaks finds credentials in the byte stream and replaces each with a
+  `[REDACTED:<kind>]` marker naming the rule that matched. Every rule carries
+  positive *and* negative examples, and the loader rejects one that has neither
+  — a pattern nobody has watched fail is a pattern nobody has tested.
+- **A secret split across two reads is withheld rather than leaked in halves.**
+  A prefix index scans the trailing region for the start of any rule, and while
+  one is open the read stops short and reports `held_back: true`, resuming once
+  the bytes either complete a match or prove not to be one. `tail_lines` and
+  `tail_bytes` reads opt out of this by argument, and that per-call opt-in is
+  the licence — not the shape of the read.
+- **ANSI stripping with a boundary rule**, so a sequence cut across a chunk
+  boundary is not half-emitted as text, and **`text_encoding` modes** for
+  callers that need the bytes rather than the rendering.
+- **An audit trail with mandatory redaction** (§9.4). Every string handed to the
+  log passes through the redactor first, so a session's own record cannot carry
+  the secret whose disclosure it is recording. `read_output(redact: false)`
+  returns the raw bytes and writes an entry saying so.
+- **`status` and `list_sessions` redact on the way out** — `command`, `args` and
+  `prompt.last_line` — and sessions gained `exited_at_unix_secs`.
+- **`wait_for_pattern`**, and `send_input(wait_for:)`, so an agent can block
+  until a regex matches new output instead of polling. The tool set is eight.
+
+#### Milestone 0.0.4 — screen state, resize, interrupt
+
+- **`get_screen_state`** renders what a full-screen program is actually showing.
+  A `vt100` parser maintains a grid seeded from the ring buffer, and the tool
+  returns either the whole screen or a `diff_from` delta against a revision the
+  caller already has.
+- **Tracking is adaptive, not always-on.** A Tier-A probe watches for the
+  signals that mean a program has taken over the screen — the alternate screen,
+  bracketed paste, a cursor-position report — and only then does the parser
+  start. A line-oriented shell session pays nothing, which §11.4 asserts under
+  load as `parsed_bytes == 0`.
+- **`resize` and `interrupt`** as tools, bringing the set to **eleven**. `resize`
+  reports the geometry read back from the session *after* the `ioctl`, not the
+  geometry requested, so a resize that did not take effect cannot report success.
+- **A cursor-position prompt sub-signal (T3c).** Where the heuristic tier
+  previously scored only the text of the last line, it now also scores where the
+  cursor is sitting, combined as `quiescent × max(pattern, cursor)`.
+- **CLASP answers Primary Device Attributes** (`\x1b[?6c`, byte-exact, no
+  optional parameters), which is what stops a `fish` session stalling ~10 s at
+  startup waiting for a terminal that never replies. Measured: answering the
+  other three common probes while withholding DA1 changes nothing; answering
+  DA1 alone takes the stall from 10.04 s to 0.02 s. Replies are rate-limited,
+  are never a `send_input` audit event, and deliberately do not count as session
+  activity — otherwise a child querying in a loop would keep its session alive
+  for ever.
 
 #### Milestone 0.0.5 — the daemon and the control protocol
 
@@ -209,21 +258,26 @@ residuals that are known and accepted.
 
 Stated because they are easy to mistake for bugs:
 
-- **Output is returned raw and unredacted.** No secret redaction, no ANSI
-  stripping. A token printed by a command is read by the agent and lands in the
-  transcript.
-- **stdio transport only, and sessions die with the MCP process.** There is no
-  daemon and no attach; closing the client kills every session.
+- **No attach yet.** Sessions now outlive the MCP client (0.0.5), but there is
+  no `clasp attach` or `clasp watch`, and no web UI — a human cannot yet look at
+  or type into a session the agent is driving.
 - **Unix only.** The tree is kept compiling and clippy-clean for
   `x86_64-pc-windows-gnu`, but signalling returns an error there and there is no
   process-group handling.
-- **Seven tools.** No `interrupt`, `resize`, `wait_for_pattern`,
-  `precheck_command` or `request_secret_input` yet — the backend supports
-  signalling and resizing, but neither is exposed as a tool.
+- **Eleven tools.** No `precheck_command`, `request_secret_input`, `send_file`,
+  `fetch_file` or `wait_for_any` yet.
 - **`get_command_history`'s `command` field is best-effort**, reconstructed from
   the terminal's echo: a command longer than the terminal width is captured
-  truncated to its tail with no ellipsis and no error, and non-ASCII bytes are
-  recorded as Latin-1.
+  truncated to its *tail* with no ellipsis and no error, and non-ASCII bytes are
+  recorded as Latin-1. **The truncation runs upstream of the redactor**, so a
+  credential whose leading token falls in the discarded front reaches the agent
+  unredacted on a field otherwise documented as redacted. Known, tracked, and
+  not yet fixed; the repair belongs where the front is discarded, not in the
+  redactor.
+- **`fish` shell integration is unverified at runtime**, and the Primary Device
+  Attributes stall measurements it rests on were taken by hand rather than in
+  CI — `fish` is deliberately absent from the runner. README's platform section
+  explains why installing it would not close the gap.
 - **On Unix without `/proc`**, the process-group sweep degrades to the child's
   group plus the terminal's foreground group, so a background job in a third
   group can survive `terminate`.
