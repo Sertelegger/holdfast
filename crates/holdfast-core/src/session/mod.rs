@@ -1092,6 +1092,34 @@ impl Session {
     /// match intersects the withheld region; that is the only reason this
     /// is exposed separately, and it must never become a second rule.
     pub fn holdback_boundary(&self, processor: &OutputProcessor) -> u64 {
+        self.holdback_snapshot(processor).0
+    }
+
+    /// The §4.1 boundary as an **open** value: `Some(b)` only when bytes
+    /// really are withheld, `None` when nothing is.
+    ///
+    /// **`holdback_boundary` answers "nothing withheld" with a *value* —
+    /// `w.head` — and that value is only distinguishable from a real
+    /// boundary against the head sampled in the same snapshot.** Every
+    /// consumer that re-reads `buffer.head()` afterwards is comparing a
+    /// head from `T2` against a boundary from `T1`, so any byte that
+    /// arrives in between reads as "a secret is still arriving" when
+    /// nothing is. The pairing is done *here*, inside the one lock that
+    /// saw both numbers, so no caller can get it wrong.
+    ///
+    /// `boundary == head` is unambiguous: `earliest_partial` returns the
+    /// start of a match of at least one byte, so a real partial always
+    /// begins strictly before `head`.
+    pub fn open_holdback(&self, processor: &OutputProcessor) -> Option<u64> {
+        let (boundary, head) = self.holdback_snapshot(processor);
+        (boundary < head).then_some(boundary)
+    }
+
+    /// The §4.1 boundary **and** the head it was measured against, from
+    /// one `buffer.lock()`. The pair is the unit of truth; see
+    /// [`open_holdback`](Self::open_holdback) for why splitting it is a
+    /// defect rather than a style choice.
+    fn holdback_snapshot(&self, processor: &OutputProcessor) -> (u64, u64) {
         let limits = processor.limits;
         let (tail_region, scan_start, head) = {
             let buffer = self.buffer.lock();
@@ -1115,7 +1143,10 @@ impl Session {
             front_clipped: false,
             truncated_at_tail: false,
         };
-        processor.holdback_boundary(&snapshot, &ReadOptions::default())
+        (
+            processor.holdback_boundary(&snapshot, &ReadOptions::default()),
+            head,
+        )
     }
 
     /// A snapshot of the cumulative per-session redaction tally.
@@ -1350,14 +1381,16 @@ impl Session {
         redact: bool,
         processor: &OutputProcessor,
     ) -> ScreenCapture {
-        let holdback = self.holdback_boundary(processor);
-        self.screen.lock().capture(
-            diff_from,
-            redact,
-            Instant::now(),
-            &*self.buffer,
-            Some(holdback),
-        )
+        // **`open_holdback`, not `Some(holdback_boundary(..))`.** The
+        // tracker re-samples its own `consumed_head` when it seeds, so a
+        // `Some(head)` handed down from here is a `T1` boundary judged
+        // against a `T2` head: bytes that arrive in between make the
+        // tracker mask cells for a secret nobody is withholding. The
+        // pairing has to happen where both numbers were read.
+        let holdback = self.open_holdback(processor);
+        self.screen
+            .lock()
+            .capture(diff_from, redact, Instant::now(), &*self.buffer, holdback)
     }
 
     /// The §8.6 T3c cursor sub-signal, or `None` when Tier B is off.
@@ -3154,6 +3187,61 @@ mod tests {
         let back = capture(&s);
         assert_eq!((back.cols, back.rows), (80, 24));
         assert_eq!(back.lines[0].trim_end(), "PAINTED");
+    }
+
+    // ------------------------------------- §4.1's boundary, as a pair
+
+    /// **`holdback_boundary` says "nothing is withheld" by returning
+    /// `w.head`** — so that answer is a *value*, and it means nothing
+    /// except beside the head it was measured against. `screen_state`
+    /// used to hand the tracker `Some(that value)`; the tracker
+    /// re-samples its own head when it seeds, so every byte that landed
+    /// in between left a `T1` boundary sitting strictly behind a `T2`
+    /// head, and the grid came back masked — `held_back: true`, cells
+    /// replaced — for a secret nobody anywhere was withholding.
+    ///
+    /// Nothing in this stream is secret-shaped, so a correct
+    /// implementation can never fail this; the reader thread supplies the
+    /// race for free, because it drains the `MockPty` on its own schedule
+    /// and the test does not have to find the window by hand.
+    #[test]
+    fn a_capture_racing_the_reader_masks_nothing_when_nothing_is_withheld() {
+        let (s, pty) = painted_session(ScreenTracking::On);
+        let processor = OutputProcessor::builtin().expect("builtin rules");
+        for i in 0..300u32 {
+            pty.queue_output(format!("build output line {i}\r\n").as_bytes());
+            let g = grid(s.screen_state(None, true, &processor));
+            assert!(
+                !g.held_back,
+                "iteration {i}: the grid was masked for a secret nobody is \
+                 withholding — a boundary sampled before the reader ran, \
+                 judged against a head sampled after it"
+            );
+        }
+    }
+
+    /// The pairing, and it is not optional: without it the row above is
+    /// satisfied by an `open_holdback` that answers `None` to everything,
+    /// which would hand the agent the withheld bytes it exists to keep.
+    #[test]
+    fn a_real_partial_still_masks_the_grid_through_screen_state() {
+        let (s, pty) = painted_session(ScreenTracking::On);
+        let processor = OutputProcessor::builtin().expect("builtin rules");
+        let body = "PjLkMnBvCxZaSdFgHjKlQwErTyUiOpAsDfGhJkLzXcVbNmQwErTyUiOpAsDfGhJk";
+        pty.queue_output(format!("\r\n-----BEGIN RSA PRIVATE KEY-----\r\n{body}").as_bytes());
+        wait_until("the key body to reach the buffer", || {
+            s.open_holdback(&processor).is_some()
+        });
+        assert!(
+            s.open_holdback(&processor).expect("open") < s.buffer_head(),
+            "an open boundary is strictly behind the head by construction — \
+             `earliest_partial` returns the start of a match of at least one \
+             byte"
+        );
+        assert!(
+            grid(s.screen_state(None, true, &processor)).held_back,
+            "the bytes §4.1 is withholding reached the grid unmasked"
+        );
     }
 
     /// **Why the floor is two and not one.** Measured against
