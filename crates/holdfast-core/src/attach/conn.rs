@@ -759,7 +759,6 @@ async fn forward_output(
     mut redactor: Option<super::redact_stream::StreamRedactor>,
 ) -> Forwarded {
     use tokio::sync::broadcast::error::RecvError;
-    use tokio::sync::mpsc::error::TrySendError;
 
     // **The client that arrived after the edge had already passed.**
     // `SessionEvent::Exited` is sent once, by the reader thread, and a
@@ -781,6 +780,44 @@ async fn forward_output(
     // the task returns at the first one, so there is no double
     // `SessionExited`.
     if !session.is_alive() {
+        // **Drain first, exactly as the loop below does.** This check
+        // short-circuits the `biased` select, and with it the
+        // output-before-exit ordering that select exists to impose — so
+        // the drain has to be done here explicitly or the child's last
+        // bytes are dropped on the floor.
+        //
+        // **The window is the whole of `run`'s setup, not an
+        // instant.** `run` subscribes before writing `Attached` and does
+        // not spawn this task until after the `is_awaiting_secret`
+        // replay check, the `Attached` write, the §9.4 audit write and
+        // three `tokio::spawn`s. Everything the child printed across
+        // that span is already in *this* receiver's 256-frame ring, and
+        // returning straight to `send_exit` told the client
+        // `SessionExited` having sent it no `Output` at all. Covered by
+        // `a_session_that_exited_during_the_handshake_still_delivers_its_last_bytes`,
+        // which is red without these lines with the whole frame list
+        // being `[SessionExited { code: 7 }]`.
+        //
+        // `try_recv` and not `recv().await`: the child is already gone,
+        // so anything not in the ring now is never coming, and awaiting
+        // would park this task on a channel with no producer left.
+        loop {
+            match output.try_recv() {
+                Ok(f) => match forward_chunk(&session_id, &f.bytes, &mut redactor, &tx) {
+                    Queued::Sent => {}
+                    // The queue filled or the socket died: there is
+                    // nowhere to put a `SessionExited` either.
+                    Queued::Stopped => return Forwarded::Stopped,
+                },
+                // §4.3 again: a lag is resynced by continuing, never by
+                // backfilling out of the ring buffer.
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                // `Empty` is the ordinary end of the drain; `Closed`
+                // means the `Session` itself is gone and there is
+                // nothing further to read.
+                Err(_) => break,
+            }
+        }
         return send_exit(
             &session_id,
             reported_exit_code(&session),
@@ -828,41 +865,13 @@ async fn forward_output(
             Either::Event(Err(RecvError::Closed)) => return Forwarded::Stopped,
         };
         match next {
-            Ok(f) => {
-                // **The single conversion point to the wire `Output`
-                // frame is also the single redaction point**, for the
-                // same reason it is the single offset-stripping point: a
-                // second place that built an `Output` would be a second
-                // place that could forget.
-                let bytes = match redactor.as_mut() {
-                    Some(r) => r.feed(&f.bytes),
-                    None => f.bytes.to_vec(),
-                };
-                // A chunk held whole (a secret still arriving) produces
-                // nothing to send. An empty `Output` would be a frame
-                // that says the child printed nothing, which it did not.
-                if bytes.is_empty() {
-                    continue;
-                }
-                let frame = ServerFrame::Output {
-                    session: session_id.clone(),
-                    bytes,
-                };
-                match tx.try_send(frame) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        // The `Detached { reason: "slow_consumer" }` is
-                        // **not** written here. `run` writes all three
-                        // wire reasons at one place, so the closed set of
-                        // three cannot grow a fourth in a corner.
-                        crate::diag!(
-                            "holdfast daemon: detaching a slow attach client on {session_id}"
-                        );
-                        return Forwarded::Stopped;
-                    }
-                    Err(TrySendError::Closed(_)) => return Forwarded::Stopped,
-                }
-            }
+            // Redaction and the wire conversion both live in
+            // [`forward_chunk`] — see its docs for why there is exactly
+            // one of each and why this arm is not allowed to inline them.
+            Ok(f) => match forward_chunk(&session_id, &f.bytes, &mut redactor, &tx) {
+                Queued::Sent => {}
+                Queued::Stopped => return Forwarded::Stopped,
+            },
             // §4.3: *"Attach clients that are only rendering live bytes
             // do not attempt replay."* Resync by **continuing** — a
             // backfill from the ring buffer would interleave stale bytes
@@ -880,12 +889,7 @@ async fn forward_output(
             // torn out from under a live connection.
             Err(RecvError::Closed) => {
                 if let Some(tail) = redactor.as_mut().map(|r| r.flush()) {
-                    if !tail.is_empty() {
-                        let _ = tx.try_send(ServerFrame::Output {
-                            session: session_id.clone(),
-                            bytes: tail,
-                        });
-                    }
+                    let _ = queue_output(&session_id, tail, &tx);
                 }
                 return Forwarded::Stopped;
             }
@@ -903,22 +907,103 @@ async fn forward_output(
 /// `Detached` (queued by `run` when this returns) is still last. Two
 /// hand-written copies of that could drift, and the one that drifted
 /// would be the rarely-taken one.
+///
+/// **Only the flush, never a drain.** Both callers have already emptied
+/// the output receiver — the loop by polling it first under `biased`,
+/// the pre-loop check by draining with `try_recv` — so this function's
+/// one job is the redactor's carry. Putting a drain in here as well
+/// would double-drain the loop's caller.
 fn send_exit(
     session_id: &str,
     code: i32,
     tx: &mpsc::Sender<ServerFrame>,
     redactor: &mut Option<super::redact_stream::StreamRedactor>,
 ) -> Forwarded {
+    // The carry has already been through `feed`; it goes to the queue
+    // directly rather than back through [`forward_chunk`], which would
+    // redact it twice.
     if let Some(tail) = redactor.as_mut().map(|r| r.flush()) {
-        if !tail.is_empty() {
-            let _ = tx.try_send(ServerFrame::Output {
-                session: session_id.to_string(),
-                bytes: tail,
-            });
-        }
+        let _ = queue_output(session_id, tail, tx);
     }
     let _ = tx.try_send(ServerFrame::SessionExited { code });
     Forwarded::SessionExit
+}
+
+/// Whether one chunk reached the connection's queue, or the connection
+/// is over.
+///
+/// A named two-state answer rather than a `bool`, because the caller's
+/// obligation on the second one is to *stop* — a `bool` at a call site
+/// reads as "delivered?" and invites being ignored.
+enum Queued {
+    /// On the queue, or deliberately nothing to send.
+    Sent,
+    /// The client stopped draining (§4.3) or the socket died under the
+    /// writer. Either way this attachment is over.
+    Stopped,
+}
+
+/// Redact one live chunk and queue it — **the single redaction point**
+/// for bytes on their way to an attach client.
+///
+/// One place, for the same reason [`queue_output`] is one place: a
+/// second call site that fed the redactor could be a call site that
+/// forgot to, and §9.2's guarantee is that an observer never sees an
+/// unredacted byte. Both of `forward_output`'s paths to a live chunk —
+/// the loop, and the pre-loop drain for a session that died during the
+/// handshake — come through here.
+fn forward_chunk(
+    session_id: &str,
+    bytes: &[u8],
+    redactor: &mut Option<super::redact_stream::StreamRedactor>,
+    tx: &mpsc::Sender<ServerFrame>,
+) -> Queued {
+    let bytes = match redactor.as_mut() {
+        Some(r) => r.feed(bytes),
+        None => bytes.to_vec(),
+    };
+    queue_output(session_id, bytes, tx)
+}
+
+/// Build §7.5's `Output` and put it on the connection's queue — **the
+/// single conversion point to the wire frame**.
+///
+/// It is the single conversion point for the reason it is also the
+/// single offset-stripping point: the internal [`OutputFrame`] carries
+/// `start`/`end` and §4.1 is explicit that *"raw offsets are not part of
+/// the public attach protocol in v0.1.0"*, so a second place that built
+/// an `Output` would be a second place that could forget. The same
+/// argument covers the other two rules folded in here — the empty frame
+/// is suppressed, and a full queue is §4.3's slow consumer — which is
+/// why the exit path's flush and the pre-loop drain call this rather
+/// than writing `ServerFrame::Output` themselves.
+///
+/// [`OutputFrame`]: crate::session::OutputFrame
+fn queue_output(session_id: &str, bytes: Vec<u8>, tx: &mpsc::Sender<ServerFrame>) -> Queued {
+    use tokio::sync::mpsc::error::TrySendError;
+
+    // A chunk held whole (a secret still arriving) produces nothing to
+    // send, and so does a redactor flush with an empty carry. An empty
+    // `Output` would be a frame that says the child printed nothing,
+    // which it did not.
+    if bytes.is_empty() {
+        return Queued::Sent;
+    }
+    match tx.try_send(ServerFrame::Output {
+        session: session_id.to_string(),
+        bytes,
+    }) {
+        Ok(()) => Queued::Sent,
+        Err(TrySendError::Full(_)) => {
+            // The `Detached { reason: "slow_consumer" }` is **not**
+            // written here. `run` writes all three wire reasons at one
+            // place, so the closed set of three cannot grow a fourth in
+            // a corner.
+            crate::diag!("holdfast daemon: detaching a slow attach client on {session_id}");
+            Queued::Stopped
+        }
+        Err(TrySendError::Closed(_)) => Queued::Stopped,
+    }
 }
 
 /// The status a `SessionExited` reports for a session that had already
@@ -1229,6 +1314,130 @@ mod tests {
             delivered <= OUTPUT_BROADCAST_FRAMES + 1,
             "the forwarder replayed {delivered} bytes for a channel that can hold \
              {OUTPUT_BROADCAST_FRAMES}: bytes lost to a lag are gone, not backfilled"
+        );
+    }
+
+    /// §7.5's exit sequence must still carry the child's **last bytes**
+    /// when the child died during the handshake.
+    ///
+    /// **The window this covers is the whole of `run`'s setup.** The
+    /// output receiver is subscribed before `Attached` is written, and
+    /// `forward_output` is not spawned until after the
+    /// `is_awaiting_secret` replay check, the `Attached` write, the
+    /// audit write and three `tokio::spawn`s. Everything the child
+    /// prints across that span is already sitting in *this connection's*
+    /// receiver — 256 frames of it — so a pre-loop `is_alive()` check
+    /// that returned straight to `send_exit` dropped it on the floor,
+    /// and the client was told `SessionExited` having received no
+    /// `Output` at all.
+    ///
+    /// **Deterministic, at the same seam
+    /// `broadcast_lag_does_not_replay_stale_bytes` uses.** Over a socket
+    /// the ordering is a scheduler race nothing can pin; here the
+    /// receiver is taken first, the line is published into it (proved by
+    /// `buffer_head`, not by a sleep), the child is exited (proved by
+    /// `is_alive`, not by a sleep), and only *then* is the forwarder
+    /// handed the receiver. The event receiver is taken after the exit,
+    /// so the `Exited` edge is genuinely gone and the state check is the
+    /// only thing left to catch it — which is precisely the arrangement
+    /// that makes the drop visible. Watched failing at `b1bb9a6` with
+    /// the whole frame list being `[SessionExited { code: 7 }]`.
+    ///
+    /// **None of the three rows that came with the check can see
+    /// this**: `attaching_to_an_already_exited_session_is_told_and_torn_down`
+    /// exits the session before dialling, so its ring is empty by
+    /// construction, and the two CLI rows assert only `wait_exit` plus
+    /// the "session exited (N)" line.
+    #[tokio::test]
+    async fn a_session_that_exited_during_the_handshake_still_delivers_its_last_bytes() {
+        let inner = Arc::new(MockPty::new());
+        let session = crate::session::Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&inner) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(64 * 1024),
+        );
+
+        // Subscribed where `run` subscribes: before anything else in the
+        // setup, and long before the forwarder exists.
+        let rx = session.subscribe();
+
+        const LAST_LINE: &[u8] = b"LAST-LINE\n";
+        inner.queue_output(LAST_LINE);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.buffer_head() < LAST_LINE.len() as u64 && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        // The publish is what puts the frame in `rx`'s ring, and it has
+        // to have happened *after* the subscribe for this test to be
+        // about anything.
+        assert_eq!(
+            session.buffer_head(),
+            LAST_LINE.len() as u64,
+            "the fixture must publish the child's last line into the subscribed receiver"
+        );
+
+        inner.exit(7);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.is_alive() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            !session.is_alive(),
+            "the fixture must actually have the child gone before the forwarder starts"
+        );
+
+        let (tx, mut out) = mpsc::channel::<ServerFrame>(4096);
+        let forwarder = tokio::spawn(forward_output(
+            Arc::clone(&session),
+            "sess_x".to_string(),
+            rx,
+            session.subscribe_events(),
+            tx,
+            None,
+        ));
+
+        // Ends at `SessionExited` or at 200 ms of silence, and the
+        // silent end is the one that matters: under the defect there is
+        // no `Output` to wait for and the assertions below have to run
+        // anyway rather than hanging.
+        let mut frames = Vec::new();
+        while let Ok(Some(f)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), out.recv()).await
+        {
+            let last = matches!(f, ServerFrame::SessionExited { .. });
+            frames.push(f);
+            if last {
+                break;
+            }
+        }
+        forwarder.abort();
+
+        let carries_last_line = |f: &ServerFrame| match f {
+            ServerFrame::Output { bytes, .. } => {
+                bytes.windows(LAST_LINE.len()).any(|w| w == LAST_LINE)
+            }
+            _ => false,
+        };
+        let line_at = frames.iter().position(carries_last_line);
+        let exit_at = frames
+            .iter()
+            .position(|f| matches!(f, ServerFrame::SessionExited { code: 7 }));
+
+        // **The harm, not the diagnosis.** The bytes are simply absent
+        // under the defect — this is not a mis-ordering, so an
+        // ordering-only assertion is green through it.
+        let line_at = line_at.unwrap_or_else(|| {
+            panic!("the child's last line was dropped; frames were: {frames:?}")
+        });
+        let exit_at = exit_at
+            .unwrap_or_else(|| panic!("no SessionExited {{ code: 7 }}; frames were: {frames:?}"));
+        assert!(
+            line_at < exit_at,
+            "§7.5 flushes the child's bytes before SessionExited; frames were: {frames:?}"
         );
     }
 }
