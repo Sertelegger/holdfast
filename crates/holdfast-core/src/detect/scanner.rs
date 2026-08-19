@@ -75,7 +75,14 @@ pub enum Osc133 {
     CommandStart,
     /// `C` — the command was submitted; what follows is its output.
     /// `command` is the text echoed between `B` and `C`.
-    OutputStart { command: String },
+    ///
+    /// `truncated` says the echo capture is **missing its front**: a bare
+    /// `\r` discarded text that was never repainted (see
+    /// `ModeScanner::resolve_capture_return`), so `command` is a tail
+    /// whose front was dropped *before* any redactor could see it. The
+    /// text is still carried — §8.5.1 rule 5's injection-line suppression
+    /// matches on it as a suffix — but no consumer may present it.
+    OutputStart { command: String, truncated: bool },
     /// `D;<code>` — the command finished.
     CommandDone { exit_code: Option<i32> },
 }
@@ -268,6 +275,11 @@ pub struct ModeScanner {
     /// A bare `\r` was seen inside the capture and the overwrite it
     /// promises has not been observed yet. See `capture_return`.
     capture_return_pending: bool,
+    /// Bytes an applied `\r` discarded from the front of the capture that
+    /// the repaint it promised has **not** written back yet. See
+    /// `resolve_capture_return`; zero means the capture holds everything
+    /// that was ever on the line.
+    capture_debt: usize,
     /// Last OSC 133 marker letter seen (`A`/`B`/`C`/`D`), for the T1 state.
     last_marker: Option<u8>,
     /// Per marker letter (`A`, `B`, `C`, `D`), whether a **foreign** marker
@@ -313,6 +325,7 @@ impl ModeScanner {
             seq_len: 0,
             capture: None,
             capture_return_pending: false,
+            capture_debt: 0,
             last_marker: None,
             foreign_letters: [false; 4],
             holdfast_letters: [false; 4],
@@ -594,6 +607,7 @@ impl ModeScanner {
                 cap.push(b as char);
             }
         }
+        self.settle_capture_debt();
     }
 
     /// A bare `\r` inside the capture *promises* an overwrite; it does not
@@ -635,6 +649,29 @@ impl ModeScanner {
     /// Apply an armed `\r`: the line is being written over, so everything
     /// after the last newline goes. Called from the two places that put
     /// bytes on the line, and deliberately *not* from `capture_newline`.
+    /// **What it discards is what the redactor never sees, so the discard
+    /// opens a debt.** The bytes dropped here are gone before
+    /// `get_command_history` redacts the field, so a secret whose anchor
+    /// sat in the discarded front — `export K=AKIAIOSF` `\r` `ODNN7EXAMPLE`
+    /// — leaves a body no rule can match and the tail is emitted verbatim
+    /// on a field §9.2 documents as redacted. The scanner cannot repair
+    /// that (it has no grid; see `CommandEntry::command`), so it refuses:
+    /// `capture_debt` records how many bytes went away, `settle_capture_debt`
+    /// clears it once the repaint has written at least that many back, and
+    /// an unpaid debt at OSC 133 `C` marks the capture untrustworthy.
+    ///
+    /// **The debt, rather than a bare "a `\r` was applied" flag, is what
+    /// keeps fish working.** fish repaints a word at a time, so its normal
+    /// cycle applies this two or three times per command and still ends
+    /// holding the whole line — `a_measured_fish_session_records_the_command_that_was_typed`
+    /// is that stream byte for byte, and a bare flag marks every fish
+    /// command untrustworthy while fixing nothing about the case above.
+    /// A wrap redraw is the opposite shape: it discards 78 characters and
+    /// repaints 47, and the debt is still outstanding when `C` arrives.
+    ///
+    /// `max` rather than `+=`: a second discard while a debt is
+    /// outstanding replaces a line whose front was already missing, so the
+    /// larger of the two is what the repaint has to cover, not their sum.
     fn resolve_capture_return(&mut self) {
         if !self.capture_return_pending {
             return;
@@ -642,7 +679,28 @@ impl ModeScanner {
         self.capture_return_pending = false;
         if let Some(cap) = self.capture.as_mut() {
             let keep = cap.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let dropped = cap.len() - keep;
             cap.truncate(keep);
+            self.capture_debt = self.capture_debt.max(dropped);
+        }
+    }
+
+    /// Clear the debt once the capture is at least as long as the discard
+    /// that opened it — the repaint the `\r` promised has arrived.
+    ///
+    /// Length rather than content: the discarded bytes are not kept, and
+    /// keeping them to compare would hold a copy of the secret this exists
+    /// to withhold. Erring toward "still owed" costs one best-effort
+    /// field; erring the other way emits the half of a secret redaction
+    /// can no longer see.
+    fn settle_capture_debt(&mut self) {
+        if self.capture_debt == 0 {
+            return;
+        }
+        if let Some(cap) = self.capture.as_ref() {
+            if cap.len() >= self.capture_debt {
+                self.capture_debt = 0;
+            }
         }
     }
 
@@ -652,6 +710,7 @@ impl ModeScanner {
                 cap.push('\n');
             }
         }
+        self.settle_capture_debt();
     }
 
     fn capture_backspace(&mut self) {
@@ -853,23 +912,31 @@ impl ModeScanner {
             self.foreign_letters[slot] = true;
         }
         // Every modelled marker begins or ends a capture, so none of them
-        // may inherit an armed `\r` from the span before it.
+        // may inherit an armed `\r` — or an unpaid discard — from the span
+        // before it.
         self.capture_return_pending = false;
         let marker = match kind {
             b'A' => {
                 self.capture = None;
+                self.capture_debt = 0;
                 Osc133::PromptStart
             }
             b'B' => {
                 self.capture = Some(String::new());
+                self.capture_debt = 0;
                 Osc133::CommandStart
             }
             b'C' => {
                 let command = self.capture.take().unwrap_or_default().trim().to_string();
-                Osc133::OutputStart { command }
+                // A debt the repaint never repaid: the line's front went
+                // to a `\r` and is not in `command`.
+                let truncated = self.capture_debt > 0;
+                self.capture_debt = 0;
+                Osc133::OutputStart { command, truncated }
             }
             b'D' => {
                 self.capture = None;
+                self.capture_debt = 0;
                 // `D` alone means "finished, status unknown"; `D;<n>`
                 // carries it.
                 let exit_code = rest[1..]
@@ -1141,7 +1208,8 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: "ls".into()
+                command: "ls".into(),
+                truncated: false,
             },
             "a well-formed sequence under SEQUENCE_MAX leaked into the \
              captured command"
@@ -1262,7 +1330,8 @@ mod tests {
         assert_eq!(
             ev[2].marker,
             Osc133::OutputStart {
-                command: "echo hi".into()
+                command: "echo hi".into(),
+                truncated: false,
             }
         );
         assert_eq!(ev[3].marker, Osc133::CommandDone { exit_code: Some(0) });
@@ -1287,7 +1356,8 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "echo hello".into()
+                command: "echo hello".into(),
+                truncated: false,
             }
         );
     }
@@ -1298,7 +1368,8 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "real command".into()
+                command: "real command".into(),
+                truncated: false,
             }
         );
     }
@@ -1350,7 +1421,8 @@ mod tests {
             assert_eq!(
                 ev[1].marker,
                 Osc133::OutputStart {
-                    command: want.into()
+                    command: want.into(),
+                    truncated: false,
                 },
                 "fish repaint lost the command"
             );
@@ -1365,7 +1437,8 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "real command".into()
+                command: "real command".into(),
+                truncated: false,
             },
             "a carriage return that was written over must still discard"
         );
@@ -1391,13 +1464,15 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "first".into()
+                command: "first".into(),
+                truncated: false,
             }
         );
         assert_eq!(
             ev.last().unwrap().marker,
             Osc133::OutputStart {
-                command: "echo hello".into()
+                command: "echo hello".into(),
+                truncated: false,
             },
             "a carriage return armed in one span fired inside the next"
         );
@@ -1411,7 +1486,8 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: "echo hi".into()
+                command: "echo hi".into(),
+                truncated: false,
             }
         );
     }
@@ -1431,7 +1507,8 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: "real".into()
+                command: "real".into(),
+                truncated: false,
             },
             "the carriage return did not carry across the chunk boundary"
         );
@@ -1446,7 +1523,8 @@ mod tests {
         assert_eq!(
             ev[2].marker,
             Osc133::OutputStart {
-                command: "two".into()
+                command: "two".into(),
+                truncated: false,
             }
         );
     }
@@ -1458,7 +1536,8 @@ mod tests {
         assert_eq!(
             ev[2].marker,
             Osc133::OutputStart {
-                command: "ls".into()
+                command: "ls".into(),
+                truncated: false,
             }
         );
     }
@@ -1494,7 +1573,8 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: String::new()
+                command: String::new(),
+                truncated: false,
             }
         );
         assert_eq!(ev[0].start, 0);

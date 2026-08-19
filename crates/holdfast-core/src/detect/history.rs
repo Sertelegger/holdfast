@@ -6,6 +6,7 @@
 //! stays empty and the tool reports `unavailable`.
 
 use super::scanner::{Osc133, Osc133Event};
+use crate::output::redact::{marker, UNRESOLVED_KIND};
 use std::collections::VecDeque;
 
 /// Default `command_history_max_entries` (spec §4.2).
@@ -21,19 +22,26 @@ pub struct CommandEntry {
     /// anything the shell reports about what it ran. It is wrong in two
     /// measured ways.
     ///
-    /// A command longer than the terminal width is captured **truncated to
-    /// its tail**: 125 characters typed at 80 columns yields 47, with the
-    /// leading 78 silently gone. The line editor's wrap redraw emits `\r`
-    /// followed by `\x1b[K`, which is a *within-line reposition*; a scanner
-    /// with no grid and no cursor cannot distinguish that from a fresh line,
-    /// so it discards everything before it. That is not a defect in the
-    /// capture rules and must not be fixed there — modelling it is exactly
-    /// the cursor arithmetic tier A is defined not to do (tier B, 0.0.4).
+    /// A command longer than the terminal width loses its front: 125
+    /// characters typed at 80 columns leaves 47, with the leading 78 gone.
+    /// The line editor's wrap redraw emits `\r` followed by `\x1b[K`, which
+    /// is a *within-line reposition*; a scanner with no grid and no cursor
+    /// cannot distinguish that from a fresh line, so it discards everything
+    /// before it. That is not a defect in the capture rules and must not be
+    /// fixed there — modelling it is exactly the cursor arithmetic tier A
+    /// is defined not to do (tier B, 0.0.4).
     ///
-    /// Truncation is the dangerous half, because a tail *looks like a whole
-    /// command*. A consumer sees something plausible and gets no signal that
-    /// the front of the line is missing, so any caller presenting this value
-    /// has to say it is approximate.
+    /// **So that case is refused instead of reported.** Truncation is the
+    /// dangerous half twice over: a tail *looks like a whole command*, and
+    /// the front is dropped inside the scanner, long before this field is
+    /// redacted — so `export K=AKIAIOSF` + wrap + `ODNN7EXAMPLE` yields a
+    /// body whose anchor is gone, no rule matches it, and half a live
+    /// secret is emitted on a field §9.2 documents as redacted. When the
+    /// scanner reports the capture truncated this field is
+    /// `[REDACTED:unresolved]` — the reserved pseudo-kind's own meaning,
+    /// "the bytes are withheld and no rule claimed them" — rather than a
+    /// plausible-looking tail. Anything else this field carries is a
+    /// capture the scanner saw whole.
     ///
     /// Non-ASCII bytes are also recorded as Latin-1 rather than decoded
     /// UTF-8 (`echo café` → `echo cafÃ©`), because the capture maps each
@@ -168,7 +176,7 @@ impl CommandHistory {
     pub fn apply(&mut self, event: &Osc133Event, now_ms: i64) {
         self.active = true;
         match &event.marker {
-            Osc133::OutputStart { command } => {
+            Osc133::OutputStart { command, truncated } => {
                 if let Some(line) = self.injection_line.take() {
                     // Matched against the line Holdfast itself typed, never
                     // against incidental content. The capture is a *suffix*
@@ -212,9 +220,22 @@ impl CommandHistory {
                     }
                 }
                 // The output span starts just past the `C` marker.
+                //
+                // **A truncated capture is refused rather than repaired.**
+                // The scanner dropped the front of this line before any
+                // redactor saw it (`ModeScanner::resolve_capture_return`),
+                // so a secret whose anchor was in the dropped part leaves a
+                // body no rule matches. The marker is `unresolved` in its
+                // §9.2 sense — "the bytes were withheld and nothing
+                // matched" — and it is substituted *here*, past the
+                // injection-line test above, which needs the raw suffix.
                 self.push(CommandEntry {
                     index: self.next_index,
-                    command: command.clone(),
+                    command: if *truncated {
+                        marker(UNRESOLVED_KIND)
+                    } else {
+                        command.clone()
+                    },
                     exit_code: None,
                     started_at_unix_ms: now_ms,
                     duration_ms: None,
@@ -312,6 +333,68 @@ mod tests {
 
     const ONE_COMMAND: &[u8] =
         b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07";
+
+    /// The field as `get_command_history` emits it: `mcp::tools` renders
+    /// `redact_str(rules, &e.command)`, so a test that asserts on
+    /// `e.command` alone is asserting one layer above the harm.
+    fn as_emitted(e: &CommandEntry) -> String {
+        crate::output::redact::redact_str(&crate::output::rules::builtin_shared(), &e.command)
+    }
+
+    /// A live secret straddling the point a wrap redraw discarded: the
+    /// anchor (`AKIA`) is in the front the `\r` threw away and the body
+    /// survives into the capture, so no rule matches what is left and the
+    /// tail is emitted verbatim on a field §9.2 documents as redacted.
+    ///
+    /// **Stated as the harm rather than as the mechanism**: twelve bytes of
+    /// an AWS key reach the agent's transcript. The paired arm below is
+    /// what keeps "refuse everything" from passing this.
+    #[test]
+    fn a_secret_whose_anchor_the_redraw_discarded_never_reaches_the_command_field() {
+        // 19 characters, then a bare `\r`, then a 12-character repaint —
+        // the wrap redraw's shape: less comes back than went away.
+        let h = replay(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07export K=AKIAIOSF\rODNN7EXAMPLE\r\n\
+              \x1b]133;C\x07out\r\n\x1b]133;D;0\x07",
+            100,
+        );
+        let e = h.entries(0, 50);
+        assert_eq!(e.len(), 1, "the fixture must record exactly one command");
+        let emitted = as_emitted(&e[0]);
+        assert!(
+            !emitted.contains("ODNN7EXAMPLE"),
+            "the surviving half of AKIAIOSFODNN7EXAMPLE reached `command`: {emitted:?}"
+        );
+        // And the entry is still an entry: the refusal costs the one
+        // untrustworthy field, not the exit code or the output span that
+        // `read_output` needs to fetch the command's own output.
+        assert_eq!(e[0].exit_code, Some(0));
+        assert!(e[0].output_end_cursor.is_some());
+    }
+
+    /// The paired arm, and the reason the one above cannot be satisfied by
+    /// refusing every command: a capture the scanner saw whole still
+    /// carries its own text, and a *complete* secret in one still comes
+    /// back as its own kind — which is the more useful of the two true
+    /// things §9.2 can say.
+    #[test]
+    fn a_capture_the_scanner_saw_whole_keeps_its_text_and_its_own_redaction() {
+        let h = replay(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07\
+              \x1b]133;A\x07$ \x1b]133;B\x07export K=AKIAIOSFODNN7EXAMPLE\r\n\
+              \x1b]133;C\x07\r\n\x1b]133;D;0\x07",
+            100,
+        );
+        let e = h.entries(0, 50);
+        assert_eq!(e.len(), 2, "two commands: {e:?}");
+        assert_eq!(as_emitted(&e[0]), "echo hi");
+        assert_eq!(
+            as_emitted(&e[1]),
+            "export K=[REDACTED:aws]",
+            "a complete value must come back as its rule's kind, not as \
+             `unresolved` and not as itself"
+        );
+    }
 
     #[test]
     fn a_command_is_recorded_with_its_exit_code_and_span() {

@@ -2682,7 +2682,8 @@ mod tests {
                     vec![
                         Osc133::CommandStart,
                         Osc133::OutputStart {
-                            command: "ls\nrm -rf /".into()
+                            command: "ls\nrm -rf /".into(),
+                            truncated: false,
                         }
                     ],
                     "{name}"
