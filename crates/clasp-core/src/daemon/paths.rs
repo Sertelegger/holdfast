@@ -424,65 +424,18 @@ impl RuntimePaths {
     /// so an existing world-readable directory would otherwise sail
     /// through and the sockets inside it would be reachable by any local
     /// user with the right timing (§7.1).
+    ///
+    /// The two directories get **different** answers to a
+    /// group-writable mode, and the asymmetry is the point — see
+    /// [`Writable`].
     pub fn ensure_dir(&self) -> io::Result<()> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-
         self.check_socket_path_length()?;
-        for dir in [self.dir.clone(), self.log_dir.clone()] {
-            if !dir.exists() {
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(DIR_MODE)
-                    .create(&dir)?;
-            }
-            let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
-            // Tighten a *leak*; **refuse** a writable one. The two cases
-            // differ in what tightening can still repair.
-            //
-            // A `0755` leftover from an earlier install leaks the names
-            // of the sockets inside, and a chmod to `0700` removes that
-            // leak outright — §7.1 describes exactly this case, and
-            // tightening rather than rejecting it is this milestone's
-            // recorded divergence from REQ-CFG-005's verification column.
-            //
-            // A group- or world-**writable** directory is not the same
-            // thing, and a chmod does not repair it. Another local user
-            // could already have pre-created `logs/` inside it as a
-            // **symlink**: `dir.exists()` follows it, `metadata` follows
-            // it, `set_permissions` would chmod the *target*, and
-            // `Daemon::new` then appends §9.4 audit entries through an
-            // attacker-chosen path. `bind_control`'s stale-socket sweep
-            // defends `control.sock`; nothing defends `logs/`. Refusing
-            // the parent is what closes it, and the loop reaches
-            // `self.dir` before `self.log_dir`, so the refusal lands
-            // before any such symlink is traversed.
-            if mode & 0o022 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "{} is mode {mode:o}: group/world-writable, so another local user \
-                         may already have planted entries inside it. Refusing rather than \
-                         tightening — a chmod does not undo what is already there. Remove \
-                         it, or set {RUNTIME_DIR_ENV} to a directory you own.",
-                        dir.display()
-                    ),
-                ));
-            }
-            if mode != DIR_MODE {
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DIR_MODE))?;
-                let after = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
-                if after != DIR_MODE {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "{} is mode {after:o}, and could not be tightened to {DIR_MODE:o}",
-                            dir.display()
-                        ),
-                    ));
-                }
-            }
-        }
-        Ok(())
+        // `self.dir` first, and the order is load-bearing: on the
+        // `~/.clasp` fallback instance `log_dir` is *inside* it, so the
+        // refusal below has to land before anything traverses a `logs/`
+        // that may be somebody else's symlink.
+        ensure_owner_only(&self.dir, Writable::Refuse)?;
+        ensure_owner_only(&self.log_dir, Writable::Tighten)
     }
 
     /// Rotate the two §19.1 logs and delete what has aged out
@@ -550,6 +503,82 @@ impl RuntimePaths {
         }
         Ok(())
     }
+}
+
+/// What a group- or world-**writable** directory gets: refused, or
+/// tightened like any other too-loose mode.
+///
+/// Tighten a *leak*; **refuse** a writable one — the two cases differ in
+/// what a chmod can still repair. A `0755` leftover from an earlier
+/// install leaks the names of the sockets inside, and a chmod to `0700`
+/// removes that leak outright (§7.1 describes exactly this case, and
+/// tightening rather than rejecting it is this milestone's recorded
+/// divergence from REQ-CFG-005's verification column). A **writable**
+/// runtime directory is not the same thing: another local user could
+/// already have pre-created `logs/` inside it as a **symlink**, and
+/// `exists()` follows it, `metadata` follows it, `set_permissions` would
+/// chmod the *target*, and `Daemon::new` then appends §9.4 audit entries
+/// through an attacker-chosen path. `bind_control`'s stale-socket sweep
+/// defends `control.sock`; nothing defends `logs/`. Refusing the parent
+/// is what closes it.
+///
+/// **`log_dir` is not that parent, and refusing it refused correct
+/// installs.** On the default instance it is `~/.clasp/logs`, which every
+/// install predating 0.0.5 created through `audit::default_path()`'s
+/// plain `create_dir_all` under the ambient umask — `0775` under the
+/// `002` that Debian, Ubuntu, RHEL and most corporate images ship. Its
+/// parent chain is the user's home, whose own mode is the gate, and it
+/// holds no socket. Refusing it made `clasp daemon start` and the
+/// systemd/launchd `clasp daemon run` path (§7.3) fail on an untouched
+/// install while `clasp mcp` — which had relocated its log directory —
+/// started fine: two entry points to one daemon disagreeing about
+/// whether the install was startable. It gets the same tighten-or-fail a
+/// `0755` leftover gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Writable {
+    Refuse,
+    Tighten,
+}
+
+/// Create `dir` `0700` if it is absent, then bring an existing one to
+/// `0700` — or say why it cannot be.
+fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    if !dir.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(DIR_MODE)
+            .create(dir)?;
+    }
+    let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+    if writable == Writable::Refuse && mode & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{d} is mode {mode:o}: group/world-writable, so another local user may \
+                 already have planted entries inside it. Refusing rather than tightening \
+                 — a chmod does not undo what is already there. Check what is inside it, \
+                 then `chmod 700 {d}`; or set {RUNTIME_DIR_ENV} to run this instance from \
+                 a directory somewhere else.",
+                d = dir.display()
+            ),
+        ));
+    }
+    if mode != DIR_MODE {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DIR_MODE))?;
+        let after = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+        if after != DIR_MODE {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is mode {after:o}, and could not be tightened to {DIR_MODE:o}",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `home` is only needed for the log directory on the XDG path, so its
@@ -1035,6 +1064,75 @@ mod tests {
                 "nothing may be created inside a directory that was refused"
             );
         }
+    }
+
+    /// The residual of the test above: the refusal is a rule about the
+    /// directory that holds the **sockets**, and applying it to the log
+    /// directory refused a correct install.
+    ///
+    /// `~/.clasp/logs` on every install predating 0.0.5 was created by
+    /// `audit::default_path()`'s plain `create_dir_all` under the ambient
+    /// umask, which is `002` on Debian, Ubuntu, RHEL and most corporate
+    /// images — `0775`. That directory's parent chain is the user's home,
+    /// whose own mode is the gate, so a chmod does repair it and the
+    /// symlink argument the refusal is written for does not reach it.
+    ///
+    /// Both halves are here because either alone is passed by a wrong
+    /// fix. Without the first, a pre-0.0.5 install cannot start
+    /// (`clasp daemon start` refuses while `clasp mcp` — resolving a
+    /// different log directory — does not, so the two entry points to one
+    /// daemon disagree about whether the install is startable). Without
+    /// the second, deleting the refusal outright is green.
+    #[test]
+    fn a_group_writable_log_directory_is_tightened_and_the_runtime_directory_still_refused() {
+        let dir = temp_dir("legacylogs");
+        let _scoped = Scoped(dir.clone());
+        let paths = RuntimePaths::with_dir(&dir);
+        std::fs::create_dir_all(paths.log_dir()).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DIR_MODE)).unwrap();
+        std::fs::set_permissions(paths.log_dir(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        // The fixture, asserted *before* the call that repairs it: a
+        // repair path that runs ahead of its own assertion is how
+        // `ensure_dir_creates_the_tree_mode_0700` went blind, and without
+        // these two rows this test could not tell a tightened directory
+        // from one that was never loose.
+        assert_eq!(mode_of(&dir), DIR_MODE);
+        assert_eq!(mode_of(&paths.log_dir()), 0o775);
+
+        paths
+            .ensure_dir()
+            .expect("a 0775 log directory is the state every pre-0.0.5 install is in");
+        assert_eq!(
+            mode_of(&paths.log_dir()),
+            DIR_MODE,
+            "the log directory was accepted but not tightened"
+        );
+        assert_eq!(mode_of(&dir), DIR_MODE);
+
+        // The control. A "fix" that drops the writable check has the
+        // first half green and hands `logs/` back to the symlink case the
+        // check exists for.
+        let socket_dir = temp_dir("legacyroot");
+        let _scoped = Scoped(socket_dir.clone());
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = RuntimePaths::with_dir(&socket_dir)
+            .ensure_dir()
+            .expect_err("a writable *runtime* directory must still be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            !socket_dir.join("logs").exists(),
+            "nothing may be created inside a directory that was refused"
+        );
+        // And it names the remedy that actually applies. "Remove it"
+        // deletes the audit trail and `CLASP_RUNTIME_DIR` is instance
+        // selection, not a permissions fix; the user owns this directory
+        // and can chmod it.
+        assert!(
+            err.to_string()
+                .contains(&format!("chmod 700 {}", socket_dir.display())),
+            "the error must name the fix the user can actually apply: {err}"
+        );
     }
 
     #[test]
