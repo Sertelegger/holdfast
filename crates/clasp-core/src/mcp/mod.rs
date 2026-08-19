@@ -123,8 +123,8 @@ pub struct ClaspServer {
     /// Why the §9.4 trail is off when a path for it *was* supplied.
     ///
     /// **The audit log used to fail open with nothing but a line on
-    /// stderr.** A root-owned `audit.log` left by one `sudo clasp`, or a
-    /// full disk, produced a server that ran normally and recorded
+    /// stderr.** A root-owned `audit.log` left by one `sudo clasp`
+    /// produced a server that ran normally and recorded
     /// nothing — every `session_start`, every `redaction_disabled`,
     /// gone, with the daemon reporting perfect health. The comparison
     /// that settles it is `server::run`, which already refuses to start
@@ -450,7 +450,7 @@ mod tests {
     ///
     /// It used to leave only a line on stderr, which under
     /// `clasp daemon run` goes wherever the launcher pointed it — so a
-    /// root-owned `audit.log` from one `sudo clasp`, or a full disk, gave
+    /// root-owned `audit.log` from one `sudo clasp` gave
     /// a server that ran normally and wrote no §9.4 trail at all, with
     /// nothing in the process able to tell. `server::run_with_config`
     /// refuses to serve on this, and it can only refuse on something it

@@ -100,6 +100,44 @@ impl AuditLog {
         self.write_errors.load(Ordering::Relaxed)
     }
 
+    /// Count a dropped entry, and say so the *first* time.
+    ///
+    /// **The open fails closed; the writes do not, and that asymmetry is
+    /// deliberate but was silent.** Refusing to start without a trail is
+    /// cheap — nothing is running yet. Aborting a daemon mid-flight
+    /// because one `write_all` returned `ENOSPC` would take every live
+    /// PTY session with it, which is the one thing this tool exists to
+    /// avoid, so a dropped entry is survivable in a way a missing log is
+    /// not.
+    ///
+    /// What was not defensible is that nothing said so. The counter had
+    /// no non-test reader, so the daemon would refuse to start without a
+    /// trail and then run for days with one that had silently stopped.
+    /// Now the transition to "not recording" is announced.
+    ///
+    /// **The full-disk case belongs here, and four comments used to
+    /// claim it belonged at the open.** [`AuditLog::to_path`] opens
+    /// append-or-create, so on a full disk with an existing `audit.log`
+    /// the *open succeeds* and `ENOSPC` arrives at `write_all` — this
+    /// branch. The same condition takes opposite branches depending only
+    /// on whether the file was already there, which is why citing it as
+    /// the thing the startup refusal catches was wrong. What that
+    /// refusal does catch is the root-owned `audit.log` left by one
+    /// `sudo clasp`, and those comments now say only that.
+    ///
+    /// **Once, not per entry.** A full disk fails every subsequent write
+    /// too, and a line per dropped entry would bury the first one — the
+    /// only one carrying the cause — under thousands of copies, in a
+    /// `daemon.log` sitting on the same full disk. `fetch_add` returns
+    /// the previous value, so this fires on the 0 -> 1 edge only;
+    /// `write_errors()` carries the running total for anyone who wants
+    /// the magnitude.
+    fn note_write_failure(&self, why: &str) {
+        if self.write_errors.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::diag!("clasp: the audit trail has stopped recording: {why}");
+        }
+    }
+
     /// Redact every string in a JSON payload, however deeply nested.
     pub fn redact_value(&self, value: &Value) -> Value {
         match value {
@@ -134,8 +172,8 @@ impl AuditLog {
         }
         let mut text = match serde_json::to_string(&Value::Object(line)) {
             Ok(t) => t,
-            Err(_) => {
-                self.write_errors.fetch_add(1, Ordering::Relaxed);
+            Err(e) => {
+                self.note_write_failure(&format!("cannot serialise a {kind} entry: {e}"));
                 return;
             }
         };
@@ -143,8 +181,8 @@ impl AuditLog {
 
         let mut sink = self.sink.lock();
         if let Sink::File(file) = &mut *sink {
-            if file.write_all(text.as_bytes()).is_err() {
-                self.write_errors.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = file.write_all(text.as_bytes()) {
+                self.note_write_failure(&format!("cannot append a {kind} entry: {e}"));
             }
         }
     }
@@ -448,6 +486,45 @@ mod tests {
         ok.record("daemon_start", None, json!({"pid": 1}));
         ok.record("daemon_stop", None, json!({"reason": "explicit"}));
         assert_eq!(ok.write_errors(), 0);
+    }
+
+    /// The asymmetry itself, which four comments used to describe
+    /// backwards.
+    ///
+    /// `with_audit_path`'s refusal is an *open-time* guarantee, and
+    /// `to_path` opens append-or-create — so on a full disk with an
+    /// existing `audit.log` the open succeeds and the failure arrives at
+    /// `write_all` instead. Those comments cited a full disk as the
+    /// thing startup refused, which inverted it: the same condition
+    /// takes opposite branches depending only on whether the file was
+    /// already there.
+    ///
+    /// This asserts the branch, not the counter — `a_write_that_fails_is
+    /// _counted_and_does_not_panic` owns the counting. If someone later
+    /// makes `to_path` probe writability at open, this row goes red and
+    /// that is the conversation worth having, not a silent divergence
+    /// from the comments again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_disk_is_not_caught_by_the_open_that_claims_to_catch_it() {
+        let rules = Arc::new(RuleSet::builtin().unwrap());
+        let Ok(full) = AuditLog::to_path("/dev/full", Arc::clone(&rules)) else {
+            // No /dev/full here, so the premise is unavailable rather
+            // than false. Skipping beats inventing a pass.
+            return;
+        };
+        // The open succeeded against a sink that cannot accept a byte.
+        assert_eq!(
+            full.write_errors(),
+            0,
+            "the open reported success and nothing has been attempted yet"
+        );
+        full.record("daemon_start", None, json!({"pid": 1}));
+        assert_eq!(
+            full.write_errors(),
+            1,
+            "the failure lands on the write, which is the fail-open path"
+        );
     }
 
     #[test]

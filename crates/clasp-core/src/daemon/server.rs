@@ -1021,7 +1021,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // **The §9.4 trail fails closed on this host.** `with_audit_path`
     // leaves the log disabled and records why; on every other host that
     // is the right answer, and on the daemon it is not. A root-owned
-    // `audit.log` from one `sudo clasp`, or a full disk, otherwise gave
+    // `audit.log` from one `sudo clasp` otherwise gave
     // a daemon that served every client on the box with no
     // `session_start`, no `redaction_disabled` — nothing — while
     // reporting perfect health, and the only trace was a line on stderr
@@ -2195,7 +2195,7 @@ mod tests {
     ///
     /// `with_audit_path` leaves an unopenable log *disabled* and says so
     /// on stderr; that used to be the whole response, so a root-owned
-    /// `audit.log` from one `sudo clasp` — or a full disk — produced a
+    /// `audit.log` from one `sudo clasp` produced a
     /// daemon serving every client on the box while recording nothing,
     /// and reporting perfect health. REQ-CFG-003 already refuses startup
     /// for an invalid config knob; the trail was getting weaker
