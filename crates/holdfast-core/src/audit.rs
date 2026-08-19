@@ -249,6 +249,49 @@ impl AuditLog {
         );
     }
 
+    /// `session_terminate` with `reason: "attach_signal"` (§9.4,
+    /// REQ-D-008): a session that ended because a human at an attached
+    /// client sent a §7.5 `Signal` frame, rather than one that ended on
+    /// its own.
+    ///
+    /// **The `attach_signal` case only, deliberately.** §9.4's
+    /// `session_terminate` has six reasons and this milestone can reach
+    /// exactly one of them; the other five (`agent_terminate`,
+    /// `agent_interrupt`, `child_exit`, `idle_reap`, `daemon_shutdown`)
+    /// have **no writer anywhere in the tree** at this commit, and
+    /// inventing their call sites from here would be five cross-milestone
+    /// edits made by the task least able to judge them. A typed writer
+    /// rather than a bare `record` so the reason cannot be spelled two
+    /// ways.
+    ///
+    /// `signal` is one of `int`/`term`/`kill` — the §18.4c wire spelling,
+    /// which is what Holdfast *sent*. §4.4's known limitation makes that
+    /// the only record of how the session ended: `portable-pty` maps
+    /// death-by-signal onto `exit_code: 1`, indistinguishable from a
+    /// child that ran `exit 1`.
+    ///
+    /// `force` is `false`: it belongs to the `terminate` **tool**, which
+    /// escalates on a timeout. §18.4c is explicit that `Signal` does not,
+    /// so the field is present (the shape is one shape) and always
+    /// answers that this was not the escalating operation.
+    pub fn record_session_terminate_attach_signal(
+        &self,
+        session_id: &str,
+        signal: &str,
+        exit_code: Option<i32>,
+    ) {
+        self.record(
+            "session_terminate",
+            Some(session_id),
+            serde_json::json!({
+                "reason": "attach_signal",
+                "exit_code": exit_code,
+                "force": false,
+                "signal": signal,
+            }),
+        );
+    }
+
     pub fn redact_false_count(&self) -> u64 {
         self.redact_false_count.load(Ordering::Relaxed)
     }

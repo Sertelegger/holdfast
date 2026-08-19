@@ -49,7 +49,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use super::frames::{
-    AttachMode, AttachRole, ClientDecode, ClientFrame, ClientFrameKind, ServerFrame,
+    AttachMode, AttachRole, ClientDecode, ClientFrame, ClientFrameKind, ServerFrame, SignalName,
 };
 use super::handshake::{evaluate_attach, REJECT_SESSION_NOT_FOUND};
 use crate::daemon::server::Daemon;
@@ -244,6 +244,18 @@ async fn read_handshake(
             let _ = frame::write_frame(wr, &protocol_error("protocol_violation", Some(name))).await;
             None
         }
+        // A known `type` whose fields did not fit — including a broken
+        // `Attach` itself. `protocol_violation` and **not** `no_handshake`:
+        // the frame did not decode, so nothing here can say it was a
+        // well-formed frame of the wrong kind. It closes either way.
+        ClientDecode::BadFields(kind) => {
+            let _ = frame::write_frame(
+                wr,
+                &protocol_error("protocol_violation", Some(kind.as_str().to_string())),
+            )
+            .await;
+            None
+        }
         ClientDecode::Malformed => {
             let _ = frame::write_frame(wr, &protocol_error("protocol_violation", None)).await;
             None
@@ -259,7 +271,6 @@ async fn read_loop(
     rd: &mut tokio::net::unix::OwnedReadHalf,
     tx: &mpsc::Sender<ServerFrame>,
 ) {
-    let _ = daemon;
     loop {
         let body = match frame::read_frame_body(rd).await {
             Ok(b) => b,
@@ -333,18 +344,92 @@ async fn read_loop(
                     return;
                 }
             }
-            // `Resize`, `Signal` and `SecretInput` are Task 9's and Task
-            // 10's write frames. They are **not** answered
-            // `protocol_violation` — they are valid §7.5 frames and
-            // saying otherwise would be a wire-level lie a client cannot
-            // recover from — and they are not applied here either,
-            // because applying a signal without the §9.4
-            // `session_terminate` entry REQ-D-008 requires would be worse
-            // than not applying it. This arm is the hand-off, written
-            // down rather than left as a silent fall-through.
-            ClientDecode::Frame(ClientFrame::Resize { .. })
-            | ClientDecode::Frame(ClientFrame::Signal { .. })
-            | ClientDecode::Frame(ClientFrame::SecretInput { .. }) => {}
+            ClientDecode::Frame(ClientFrame::Resize { cols, rows }) => {
+                if let Err(e) = session.resize(cols, rows) {
+                    crate::diag!("holdfast daemon: attach resize failed: {e}");
+                    continue;
+                }
+                // §4.1: an attach `Resize` from a ReadWrite client is
+                // activity. The `resize` **tool** is not, which is why
+                // the stamp is here and not inside `Session::resize`.
+                session.note_activity();
+
+                // §7.5: *"canonical PTY size, e.g. when another client
+                // resizes."* The size is re-read from the session rather
+                // than echoed from the request, so what the other panes
+                // reflow to is the geometry the terminal actually got —
+                // `Session::resize` clamps, and a client that asked for
+                // 5000 columns must not tell everybody else it succeeded.
+                let (cols, rows) = session.size();
+                for other in daemon.attach_hub().clients_of(&conn.session_id) {
+                    // The originator is excluded: it already knows, and a
+                    // client that reflows on every `Resize` would loop.
+                    if other.client_id == conn.client_id {
+                        continue;
+                    }
+                    // `try_send`, like the output path: a resize
+                    // notification is not worth blocking this read loop
+                    // behind a client that stopped draining, and that
+                    // client is on its way out anyway.
+                    let _ = other.tx.try_send(ServerFrame::Resize { cols, rows });
+                }
+            }
+            ClientDecode::Frame(ClientFrame::Signal { sig }) => {
+                // §4.4's per-value delivery, reached through
+                // `Session::signal` rather than re-implemented: `int` goes
+                // to the **foreground** group (`tcgetpgrp`) — the command
+                // being interrupted, not the shell hosting it — and
+                // `term`/`kill` sweep the session's process groups.
+                //
+                // **No escalation** (§18.4c, REQ-D-008): `term` sweeps
+                // once with SIGTERM and does not follow with SIGKILL. The
+                // escalating form with its `timeout_secs` is the
+                // `terminate` *tool*, and the two are deliberately not the
+                // same operation.
+                let delivered = match sig {
+                    SignalName::Int => crate::pty::Signal::Interrupt,
+                    SignalName::Term => crate::pty::Signal::Terminate,
+                    SignalName::Kill => crate::pty::Signal::Kill,
+                };
+                if let Err(e) = session.signal(delivered) {
+                    crate::diag!("holdfast daemon: attach signal failed: {e}");
+                    continue;
+                }
+                // `Session::signal` stamps activity itself.
+                if ended_by_signal(session, sig).await {
+                    daemon
+                        .server
+                        .processor
+                        .audit
+                        .record_session_terminate_attach_signal(
+                            &session.id,
+                            sig_wire_name(sig),
+                            session.exit_code(),
+                        );
+                }
+            }
+            // Task 10's frame. Not answered `protocol_violation` — it is
+            // a valid §7.5 frame and saying otherwise would be a
+            // wire-level lie a client cannot recover from — and not
+            // applied here either, because there is no request slot to
+            // match a `request_id` against yet.
+            ClientDecode::Frame(ClientFrame::SecretInput { .. }) => {}
+            // A `type` this build implements whose fields did not fit:
+            // §18.4c's `sig: "stop"` case, and the reason `BadFields`
+            // exists as its own variant. The kind **is** nameable here,
+            // the connection stays open, and nothing was applied.
+            ClientDecode::BadFields(kind) => {
+                if tx
+                    .send(protocol_error(
+                        "protocol_violation",
+                        Some(kind.as_str().to_string()),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
             ClientDecode::UnknownType(name) => {
                 // Post-handshake: answered, ignored, and the connection
                 // **stays open**. §7.5's explicit rule and the one most
@@ -486,6 +571,44 @@ async fn forward_output(
             }
         }
     }
+}
+
+/// §18.4c's wire spelling of a signal — the one the audit trail records,
+/// because it is what Holdfast *sent*.
+fn sig_wire_name(sig: SignalName) -> &'static str {
+    match sig {
+        SignalName::Int => "int",
+        SignalName::Term => "term",
+        SignalName::Kill => "kill",
+    }
+}
+
+/// Did this signal end the session? Bounded, and only the answer to
+/// *"was this the thing that ended it"* — §9.4's `session_terminate`
+/// entry is written when a session **ends** because of a `Signal` frame,
+/// not when one is sent.
+///
+/// **`int` is not waited for and the asymmetry is deliberate.** Ctrl-C is
+/// the frequent case on an interactive attach and it normally ends a
+/// *command*, not the session; parking this read loop for half a second
+/// on every one of them would queue the keystrokes behind it. A child
+/// that does die of SIGINT is still caught, by the immediate check. For
+/// `term`/`kill` the client has asked for the session to end, so the wait
+/// costs nothing anybody is waiting on — and without it the answer is
+/// simply wrong, since a real child takes milliseconds to die and
+/// `is_alive` would still say yes.
+async fn ended_by_signal(session: &Arc<Session>, sig: SignalName) -> bool {
+    if matches!(sig, SignalName::Int) {
+        return !session.is_alive();
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    while tokio::time::Instant::now() < deadline {
+        if !session.is_alive() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    false
 }
 
 fn protocol_error(reason: &str, frame_kind: Option<String>) -> ServerFrame {

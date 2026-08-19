@@ -347,9 +347,25 @@ pub enum ClientDecode {
     /// is carried out rather than folded into [`Self::Malformed`]. A
     /// client that sent `Attch` learns which word was wrong.
     UnknownType(String),
+    /// A `type` this build **does** implement, whose fields did not fit:
+    /// a `Signal` with `sig: "stop"`, a `Resize` with a `cols` that is
+    /// not a number, a missing required field.
+    ///
+    /// **Split out of [`Self::Malformed`] by Task 9, and §18.4c is why.**
+    /// A `sig` outside `{int, term, kill}` must be answered
+    /// `ProtocolError { reason: "protocol_violation", frame_kind:
+    /// Some("Signal") }` — the kind is *nameable* here, and folding this
+    /// case into `Malformed` makes it unnameable, which is a wire-shape
+    /// difference and not a stylistic one. This module's earlier comment
+    /// argued the opposite ("naming the kind there would say the wrong
+    /// thing about why it failed"); §18.4c settles it the other way, and
+    /// the reason it is right is that a client sending `sig: "9"` can act
+    /// on "your Signal frame was wrong" and cannot act on "something you
+    /// sent was wrong".
+    BadFields(ClientFrameKind),
     /// Not a frame at all: bytes that are not CBOR, CBOR that is not a
-    /// map, a map with no `type`, or a known `type` whose fields do not
-    /// fit. `frame_kind` is `None`, because there is nothing to name.
+    /// map, or a map with no string `type`. `frame_kind` is `None`,
+    /// because there is nothing to name.
     Malformed,
 }
 
@@ -364,12 +380,11 @@ pub fn decode_client_frame(body: &[u8]) -> ClientDecode {
     if let Ok(f) = crate::protocol::frame::decode::<ClientFrame>(body) {
         return ClientDecode::Frame(f);
     }
-    // Re-read the map's `type` to separate the two failures. A body that
-    // is not a map with a string `type` is malformed; one whose `type`
-    // is a string this build does not implement is an unknown variant,
-    // *including* a known name whose fields did not fit — which is also
-    // a violation and is reported as `Malformed` below, because naming
-    // the kind there would say the wrong thing about why it failed.
+    // Re-read the map's `type` to separate the three failures. A body
+    // that is not a map with a string `type` is malformed; a `type` this
+    // build does not implement is an unknown variant; a `type` it *does*
+    // implement whose fields did not fit is `BadFields`, which is the
+    // case that can name a kind.
     let Ok(ciborium::value::Value::Map(entries)) =
         crate::protocol::frame::decode::<ciborium::value::Value>(body)
     else {
@@ -380,12 +395,13 @@ pub fn decode_client_frame(body: &[u8]) -> ClientDecode {
             continue;
         }
         if let Some(name) = v.as_text() {
-            if !ClientFrameKind::ALL
+            return match ClientFrameKind::ALL
                 .iter()
-                .any(|kind| kind.as_str() == name)
+                .find(|kind| kind.as_str() == name)
             {
-                return ClientDecode::UnknownType(name.to_string());
-            }
+                Some(kind) => ClientDecode::BadFields(*kind),
+                None => ClientDecode::UnknownType(name.to_string()),
+            };
         }
     }
     ClientDecode::Malformed

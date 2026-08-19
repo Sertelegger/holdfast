@@ -19,14 +19,15 @@
 
 use holdfast_core::attach::frames::{decode_server_frame, ClientFrame, ServerFrame};
 use holdfast_core::attach::{AttachMode, AttachRole, SignalName};
+use holdfast_core::clock::Clock;
 use holdfast_core::daemon::attach_server;
 use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::server::{self, Daemon};
 use holdfast_core::protocol::client::ControlClient;
 use holdfast_core::protocol::frame::{self, FrameError, MAX_FRAME_BYTES};
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
-use holdfast_core::pty::{MockPty, PtyBackend};
-use holdfast_core::session::{new_session_id, Session, SessionConfig};
+use holdfast_core::pty::{InProcessPty, MockPty, PtyBackend, PtySpawnConfig, Signal};
+use holdfast_core::session::{new_session_id, Reaper, Session, SessionConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,10 +41,16 @@ struct TestDaemon {
 
 impl TestDaemon {
     async fn start(tag: &str) -> Self {
+        Self::start_with(tag, Clock::system()).await
+    }
+
+    /// A daemon whose clock is the caller's, so a test can drive the idle
+    /// reaper instead of sleeping past a 30-second scan interval.
+    async fn start_with(tag: &str, clock: Clock) -> Self {
         let paths = RuntimePaths::with_dir(scratch_dir(tag));
         let (control, _c) = server::bind_control(&paths).expect("bind control.sock");
         let (attach, _a) = attach_server::bind_attach(&paths).expect("bind attach.sock");
-        let daemon = Daemon::new(paths.clone());
+        let daemon = Daemon::with_clock(paths.clone(), clock);
         tokio::spawn(server::serve(Arc::clone(&daemon), control));
         tokio::spawn(attach_server::serve_attach(Arc::clone(&daemon), attach));
         // The kernel backlog accepts a connection before `serve_attach`
@@ -62,14 +69,25 @@ impl TestDaemon {
 
     /// Register a live `MockPty`-backed session and return it.
     fn session(&self, name: Option<&str>) -> (Arc<Session>, Arc<MockPty>) {
-        let pty = Arc::new(MockPty::new());
+        self.session_backed(name, Arc::new(MockPty::new()), SessionConfig::default())
+    }
+
+    fn session_backed(
+        &self,
+        name: Option<&str>,
+        pty: Arc<MockPty>,
+        cfg: SessionConfig,
+    ) -> (Arc<Session>, Arc<MockPty>) {
         let s = Session::new(
             new_session_id(),
             name.map(String::from),
             "bash".into(),
             vec![],
             Arc::clone(&pty) as Arc<dyn PtyBackend>,
-            SessionConfig::with_buffer_capacity(256 * 1024),
+            SessionConfig {
+                buffer_capacity: 256 * 1024,
+                ..cfg
+            },
         );
         self.daemon
             .server
@@ -77,6 +95,33 @@ impl TestDaemon {
             .insert(Arc::clone(&s))
             .expect("register");
         (s, pty)
+    }
+
+    /// A session on a **real** PTY running a real shell.
+    ///
+    /// Three of Task 9's rows are not writable against `MockPty`: an echo
+    /// comes from the tty and not from us, `stty size` is the only reading
+    /// of the geometry the child itself can see, and §4.4's foreground
+    /// group is a property of a real process tree. Everything else here
+    /// stays on the mock, where the assertions are deterministic.
+    fn real_session(&self) -> Arc<Session> {
+        let mut cfg = PtySpawnConfig::new("bash");
+        cfg.args = vec!["--norc".into(), "--noprofile".into()];
+        let pty = InProcessPty::spawn(&cfg).expect("spawn a real shell");
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec!["--norc".into(), "--noprofile".into()],
+            Arc::new(pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(256 * 1024),
+        );
+        self.daemon
+            .server
+            .registry
+            .insert(Arc::clone(&s))
+            .expect("register");
+        s
     }
 
     async fn dial(&self) -> UnixStream {
@@ -1485,6 +1530,494 @@ async fn detach_is_allowed_from_both_modes() {
     }
     assert_eq!(d.daemon.status().attach_clients, 0);
     assert_daemon_survives(&d, &s.id).await;
+}
+
+// ------------------------------- write frames: Input, Resize, Signal
+
+#[tokio::test]
+async fn a_keystroke_from_an_attached_client_is_echoed_by_the_pty() {
+    // **The echo comes from the tty, not from us**, so the assertion that
+    // distinguishes "we wrote to the PTY" from "we wrote to the ring
+    // buffer" is the child's *reaction*. `ZZ''TOP` echoes with the quotes
+    // and prints without them, so the two are separately visible: the
+    // first proves the bytes reached the terminal, the second proves the
+    // shell ran them.
+    let d = TestDaemon::start("keystroke").await;
+    let s = d.real_session();
+
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    send(
+        &mut c,
+        &ClientFrame::Input {
+            bytes: b"echo ZZ''TOP\n".to_vec(),
+        },
+    )
+    .await;
+
+    let seen = stream_until(&mut c, b"ZZTOP\r\n", 10).await;
+    assert!(
+        contains(&seen, b"ZZ''TOP"),
+        "the keystrokes were never echoed by the terminal: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // And the ring buffer has it too — the same bytes, by the same route
+    // as any other output.
+    let buffered = s.buffer_slice(s.buffer_tail(), s.buffer_head());
+    assert!(
+        contains(&buffered, b"ZZTOP"),
+        "the child's output never reached the ring buffer"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+#[tokio::test]
+async fn input_from_either_of_two_clients_reaches_the_pty() {
+    // §11.2's scenario. Keying the write path to the first-registered
+    // client passes a single-client test completely.
+    let d = TestDaemon::start("twowrite").await;
+    let (s, pty) = d.session(None);
+
+    let mut a = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut b = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    send(
+        &mut a,
+        &ClientFrame::Input {
+            bytes: b"FROM_A\n".to_vec(),
+        },
+    )
+    .await;
+    send(
+        &mut b,
+        &ClientFrame::Input {
+            bytes: b"FROM_B\n".to_vec(),
+        },
+    )
+    .await;
+
+    wait_for_written(&pty, b"FROM_A\n").await;
+    wait_for_written(&pty, b"FROM_B\n").await;
+}
+
+#[tokio::test]
+async fn a_resize_from_one_client_is_broadcast_to_the_other() {
+    // §7.5: *"canonical PTY size, e.g. when another client resizes."*
+    // Applying the resize without broadcasting leaves the other terminal
+    // rendering at the wrong width with no error anywhere.
+    let d = TestDaemon::start("resizebc").await;
+    let s = d.real_session();
+
+    let mut a = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut b = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    send(
+        &mut a,
+        &ClientFrame::Resize {
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await;
+
+    // B is told, with the canonical geometry.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut told = None;
+    while tokio::time::Instant::now() < deadline && told.is_none() {
+        match recv(&mut b).await {
+            ServerFrame::Resize { cols, rows } => told = Some((cols, rows)),
+            ServerFrame::Output { .. } => {}
+            other => panic!("expected Resize, got {other:?}"),
+        }
+    }
+    assert_eq!(told, Some((100, 30)), "the other client was never told");
+
+    // And the **child** sees it, which is the half a frame-only assertion
+    // cannot reach: `stty size` reads the kernel's idea of the window,
+    // not ours.
+    send(
+        &mut a,
+        &ClientFrame::Input {
+            bytes: b"stty size\n".to_vec(),
+        },
+    )
+    .await;
+    let seen = stream_until(&mut a, b"30 100", 10).await;
+    assert!(contains(&seen, b"30 100"), "the PTY was not resized");
+    let _ = s.signal(Signal::Kill);
+}
+
+#[tokio::test]
+async fn the_resizing_client_does_not_receive_its_own_resize_back() {
+    // The negative half. Broadcasting to all makes a client that reflows
+    // on every `Resize` loop against itself.
+    let d = TestDaemon::start("resizeself").await;
+    let (s, pty) = d.session(None);
+
+    let mut a = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut b = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    send(
+        &mut a,
+        &ClientFrame::Resize {
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await;
+    // B's frame is the happens-before: once the daemon has told B, it has
+    // decided what to tell A.
+    match recv(&mut b).await {
+        ServerFrame::Resize { cols, rows } => assert_eq!((cols, rows), (100, 30)),
+        other => panic!("expected Resize on B, got {other:?}"),
+    }
+
+    // A gets output, not its own resize back.
+    pty.queue_output(b"AFTER");
+    match recv(&mut a).await {
+        ServerFrame::Output { bytes, .. } => assert_eq!(bytes, b"AFTER"),
+        ServerFrame::Resize { .. } => {
+            panic!("the resizing client was told about its own resize")
+        }
+        other => panic!("expected Output on A, got {other:?}"),
+    }
+    assert_eq!(s.size(), (100, 30));
+}
+
+#[tokio::test]
+async fn a_signal_frame_reaches_the_foreground_process_group() {
+    // §4.4: `int` goes to the **foreground** group (`tcgetpgrp`) — the
+    // command being interrupted — and not to the session's pgid, which
+    // would take the shell hosting it down too. A test that only asserts
+    // "something died" cannot tell those apart, so both halves are here.
+    let d = TestDaemon::start("fgsignal").await;
+    let s = d.real_session();
+
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    send(
+        &mut c,
+        &ClientFrame::Input {
+            bytes: b"sleep 300\n".to_vec(),
+        },
+    )
+    .await;
+    // The echoed command line proves the shell has it; the sleep is now
+    // the foreground job.
+    stream_until(&mut c, b"sleep 300", 10).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    send(
+        &mut c,
+        &ClientFrame::Signal {
+            sig: SignalName::Int,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // **Not "the sleep printed something next"**: an interactive bash
+    // abandons the whole command line on SIGINT, so `sleep 300; echo X`
+    // never reaches the `echo` — measured, and it is the shell's
+    // behaviour rather than ours. What proves the `sleep` died is that
+    // the shell is prompting again and runs the next thing it is given,
+    // inside seconds rather than five minutes.
+    send(
+        &mut c,
+        &ClientFrame::Input {
+            bytes: b"echo SHELL''_ALIVE\n".to_vec(),
+        },
+    )
+    .await;
+    let seen = stream_until(&mut c, b"SHELL_ALIVE\r\n", 10).await;
+    assert!(contains(&seen, b"SHELL_ALIVE"));
+    // …and the shell itself is still there, which is the half that fails
+    // when `pgid` is signalled instead of `tcgetpgrp`.
+    assert!(
+        s.is_alive(),
+        "the interrupt took the session's shell down with the job"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// Write a `Signal` frame by hand so `sig` can be something the enum
+/// cannot express.
+async fn write_raw_signal(s: &mut UnixStream, sig: ciborium::value::Value) {
+    let value = ciborium::value::Value::Map(vec![
+        (
+            ciborium::value::Value::Text("type".into()),
+            ciborium::value::Value::Text("Signal".into()),
+        ),
+        (ciborium::value::Value::Text("sig".into()), sig),
+    ]);
+    frame::write_frame(s, &value)
+        .await
+        .expect("write raw signal");
+}
+
+#[tokio::test]
+async fn signal_wire_names_are_the_three_documented_values() {
+    // §18.4c's closed set, and §11.2's adversarial list by name. The
+    // mutation is accepting arbitrary signal names — a remote `kill -9`
+    // primitive with no enumeration — and `"stop"` is on the list because
+    // Holdfast exposes no `cont` on any surface, so SIGSTOP would be an
+    // unrecoverable session reachable from any ReadWrite client.
+    let d = TestDaemon::start("signames").await;
+    let (good, good_pty) = d.session(None);
+    let (bad, bad_pty) = d.session(None);
+
+    // The three that are real, in catalogue order, delivered to the
+    // backend as the three `pty::Signal` values.
+    let mut g = attach_ok(&d, &good.id, AttachMode::ReadWrite).await;
+    for sig in [SignalName::Int, SignalName::Term, SignalName::Kill] {
+        send(&mut g, &ClientFrame::Signal { sig }).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while good_pty.signals().len() < 3 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        good_pty.signals(),
+        vec![Signal::Interrupt, Signal::Terminate, Signal::Kill],
+        "the three wire names did not map onto the three §4.4 deliveries"
+    );
+
+    // Everything else: refused by name, nothing delivered, nothing bumped.
+    let mut c = attach_ok(&d, &bad.id, AttachMode::ReadWrite).await;
+    let before = bad.last_activity_ms();
+    for sig in [
+        ciborium::value::Value::Text("stop".into()),
+        ciborium::value::Value::Text("cont".into()),
+        ciborium::value::Value::Text("9".into()),
+        ciborium::value::Value::Integer(9.into()),
+    ] {
+        write_raw_signal(&mut c, sig.clone()).await;
+        match recv(&mut c).await {
+            ServerFrame::ProtocolError { reason, frame_kind } => {
+                assert_eq!(reason, "protocol_violation", "for sig {sig:?}");
+                // A `reason`-only assertion passes against an
+                // implementation that cannot name the frame at all, which
+                // is what the whole `BadFields` split is for.
+                assert_eq!(
+                    frame_kind.as_deref(),
+                    Some("Signal"),
+                    "the refusal did not name the frame, for sig {sig:?}"
+                );
+            }
+            other => panic!("sig {sig:?} got {other:?}"),
+        }
+        assert!(
+            bad_pty.signals().is_empty(),
+            "a signal was delivered for {sig:?}"
+        );
+        assert!(bad.is_alive(), "the child died for {sig:?}");
+        assert_eq!(
+            bad.last_activity_ms(),
+            before,
+            "a rejected frame bumped last_activity for {sig:?}"
+        );
+    }
+
+    // The connection is still open: a following valid frame is answered.
+    send(
+        &mut c,
+        &ClientFrame::Input {
+            bytes: b"STILL_HERE\n".to_vec(),
+        },
+    )
+    .await;
+    wait_for_written(&bad_pty, b"STILL_HERE\n").await;
+}
+
+#[tokio::test]
+async fn term_does_not_escalate_to_kill() {
+    // REQ-D-008 / §18.4c. The escalating form with its `timeout_secs` is
+    // the `terminate` **tool**, and the two are deliberately not the same
+    // operation.
+    //
+    // On a `MockPty` that traps SIGTERM rather than a real shell with
+    // `trap '' TERM`: the mock models exactly that (`ignoring_terminate`)
+    // and lets the assertion be *"the signal list is `[Terminate]` and
+    // nothing else"* rather than "still alive after 3 s of sleeping",
+    // which is both slower and weaker — a helpful escalation 4 s later
+    // would pass it.
+    let d = TestDaemon::start("noescalate").await;
+    let (s, pty) = d.session_backed(
+        None,
+        Arc::new(MockPty::ignoring_terminate()),
+        SessionConfig::default(),
+    );
+
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    send(
+        &mut c,
+        &ClientFrame::Signal {
+            sig: SignalName::Term,
+        },
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while pty.signals().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert_eq!(
+        pty.signals(),
+        vec![Signal::Terminate],
+        "term escalated on its own"
+    );
+    assert!(s.is_alive(), "the child that ignores SIGTERM was killed");
+
+    // The pairing: without it, "term does nothing at all" passes.
+    send(
+        &mut c,
+        &ClientFrame::Signal {
+            sig: SignalName::Kill,
+        },
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while s.is_alive() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!s.is_alive(), "an explicit kill did not end it");
+}
+
+#[tokio::test]
+async fn a_session_ended_by_a_signal_frame_is_audited_as_attach_signal() {
+    // §9.4 / REQ-D-008: a session a human killed from an attached client
+    // is not logged as one that ended on its own.
+    //
+    // **The plan pairs this with "an ordinary child exit asserted as
+    // `child_exit`", and that pairing is unwritable here**: no writer for
+    // `session_terminate` exists anywhere in the tree, and Task 9's own
+    // instruction is to add the `attach_signal` case only and leave the
+    // other five reasons to their owners. The achievable pairing — and
+    // the one that still kills "log everything as attach_signal" — is a
+    // second session that exits on its own and produces **no**
+    // `session_terminate` line at all.
+    let d = TestDaemon::start("auditsig").await;
+    let (killed, _kpty) = d.session(None);
+    let (natural, npty) = d.session(None);
+
+    let mut c = attach_ok(&d, &killed.id, AttachMode::ReadWrite).await;
+    send(
+        &mut c,
+        &ClientFrame::Signal {
+            sig: SignalName::Kill,
+        },
+    )
+    .await;
+
+    // The other session ends by itself, with nobody attached.
+    npty.exit(3);
+
+    let log = d.paths.audit_log();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut lines = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        lines = text
+            .lines()
+            .filter(|l| l.contains("session_terminate"))
+            .map(str::to_string)
+            .collect();
+        if !lines.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one session_terminate entry, got {lines:?}"
+    );
+    let entry: serde_json::Value = serde_json::from_str(&lines[0]).expect("an audit line is JSON");
+    assert_eq!(entry["kind"], "session_terminate");
+    assert_eq!(entry["session_id"], killed.id.as_str());
+    assert_eq!(
+        entry["reason"], "attach_signal",
+        "a session ended from an attached client was not attributed to it"
+    );
+    assert_eq!(
+        entry["signal"], "kill",
+        "which of the three is not recorded"
+    );
+    assert_eq!(
+        entry["force"], false,
+        "force belongs to the escalating terminate tool, which this is not"
+    );
+    assert!(
+        !lines[0].contains(natural.id.as_str()),
+        "a session that ended on its own was logged as attach_signal"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_readonly_frame_does_not_extend_the_idle_deadline() {
+    // REQ-C-005 / REQ-S-006: a watching client cannot keep a session
+    // alive. **The clock is driven, not slept through** — 0.0.5's reaper
+    // scans every ~30 s off an injectable clock, so a wall-clock version
+    // of this either hangs or passes vacuously.
+    //
+    // This row is Task 8's and lands here because its second half is not
+    // writable until this commit: nothing bumps `last_activity` on a
+    // `Resize` until the frame is routed, so the ReadWrite pairing would
+    // have been red at Task 8 for the right reason.
+    let clock = Clock::manual(std::time::Instant::now());
+    let d = TestDaemon::start_with("roidle", clock.clone()).await;
+
+    let cfg = SessionConfig {
+        idle_timeout_secs: 60,
+        clock: clock.clone(),
+        ..SessionConfig::default()
+    };
+    let (watched, _wp) = d.session_backed(None, Arc::new(MockPty::new()), cfg.clone());
+    let (worked, _kp) = d.session_backed(None, Arc::new(MockPty::new()), cfg);
+
+    let mut ro = attach_ok(&d, &watched.id, AttachMode::ReadOnly).await;
+    let mut rw = attach_ok(&d, &worked.id, AttachMode::ReadWrite).await;
+
+    // The same frame from both, at the same points on the clock.
+    for _ in 0..3 {
+        send(&mut ro, &ClientFrame::Resize { cols: 90, rows: 25 }).await;
+        match recv(&mut ro).await {
+            ServerFrame::ProtocolError { reason, .. } => assert_eq!(reason, "read_only_attach"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        send(&mut rw, &ClientFrame::Resize { cols: 90, rows: 25 }).await;
+        // The ReadWrite one is applied; wait for the effect so the
+        // activity stamp is known to have happened before the clock moves.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while worked.size() != (90, 25) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            worked.size(),
+            (90, 25),
+            "the ReadWrite resize never applied"
+        );
+        clock.advance(Duration::from_secs(21));
+    }
+
+    // 63 s of clock has passed and the timeout is 60 s. One scan.
+    let reaper = Reaper::new(Arc::clone(&d.daemon.server.registry), d.daemon.clock());
+    assert_eq!(
+        reaper.scan_once(),
+        1,
+        "the ReadOnly-watched session was not reaped, or the busy one was"
+    );
+
+    assert!(
+        !watched.is_alive(),
+        "a rejected frame extended the idle deadline"
+    );
+    assert!(
+        worked.is_alive(),
+        "an applied Resize did not count as activity — which is the half \
+         that stops 'nothing ever bumps activity' passing"
+    );
 }
 
 // ------------------------------------------------------------ helpers

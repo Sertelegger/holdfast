@@ -1180,6 +1180,24 @@ impl Session {
         Ok(())
     }
 
+    /// Stamp activity for an event that mutated the session without
+    /// going through `write_input` or `signal` (§4.1, REQ-S-006).
+    ///
+    /// **The one such event in 0.0.6 is an attach `Resize` from a
+    /// ReadWrite client**, and this exists rather than a `touch()` inside
+    /// `Session::resize` because the two callers of `resize` are not the
+    /// same kind of event. §4.1 enumerates what bumps `last_activity` and
+    /// lists *"attach `Input`/`SecretInput`/`Resize`/`Signal` frames from
+    /// ReadWrite clients"*; it does not list the `resize` **tool**, which
+    /// is an agent adjusting its own view. Putting the stamp inside
+    /// `resize` would silently make an agent's geometry poke keep a
+    /// session alive, which is the class of thing REQ-C-005 exists to
+    /// stop — and it would do so with no test able to see it, because
+    /// nothing asserts what the tool does *not* do.
+    pub fn note_activity(&self) {
+        self.touch();
+    }
+
     /// Stamp activity now and move the idle deadline with it.
     ///
     /// One function rather than two stores at each site: the deadline is
