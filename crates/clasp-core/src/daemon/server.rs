@@ -565,12 +565,72 @@ impl Daemon {
     }
 }
 
-/// Bind `control.sock` and tighten it to `0600`.
+/// Which socket file a daemon bound, so its own teardown can tell that
+/// file apart from a successor's.
+///
+/// **Identity, not liveness, and the difference is the whole point.**
+/// `spawn::socket_is_live` answers *"is any process holding a descriptor
+/// on this socket"*, and the teardown needs *"is the file at this path
+/// still the one I created"*. Those diverge in both directions: a
+/// concurrently-forked child that inherited the listening descriptor
+/// keeps the socket answering after its owner has closed it, and a
+/// successor's freshly bound socket answers exactly like one's own.
+///
+/// Read from a single `symlink_metadata` under `bind.lock`, so it names
+/// the file this process bound and nothing later.
+///
+/// **Why `ctime` and not `(dev, ino)` alone.** An unlinked inode's
+/// *number* is free for immediate reuse on ext4 and xfs (tmpfs, btrfs
+/// and APFS allocate from a monotonic counter and never reuse one), so
+/// a successor that binds after clearing our stale socket can be handed
+/// our old number. `ctime` is stamped when the socket is created and
+/// again by the `chmod` below, so a reused number carries a different
+/// one unless the two binds also fall inside a single timestamp
+/// granularity — which the C-5 window cannot arrange, because it opens
+/// only after a daemon has served for some time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl SocketIdentity {
+    /// The identity of whatever the path names right now, without
+    /// following a final symlink.
+    ///
+    /// `symlink_metadata` rather than `metadata` throughout: a symlink
+    /// planted at `control.sock` must read as *someone else's file*
+    /// (mismatch, no unlink), never as a window onto the target's
+    /// identity.
+    fn of(path: &std::path::Path) -> io::Result<Self> {
+        Self::from_meta(&std::fs::symlink_metadata(path)?)
+    }
+
+    fn from_meta(meta: &std::fs::Metadata) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+        })
+    }
+}
+
+/// Bind `control.sock`, tighten it to `0600`, and report which file that
+/// turned out to be.
 ///
 /// The bind→chmod window is closed by the enclosing `0700` directory:
 /// another user cannot reach the socket even during it, because they
 /// cannot traverse the parent.
-pub fn bind_control(paths: &RuntimePaths) -> io::Result<UnixListener> {
+///
+/// **The [`SocketIdentity`] is returned rather than looked up later on
+/// demand** so that no binder can reach [`remove_runtime_files_we_own`]
+/// without one, and so that the only read of it happens under the lock
+/// that makes it true.
+pub fn bind_control(paths: &RuntimePaths) -> io::Result<(UnixListener, SocketIdentity)> {
     bind_control_within(paths, super::spawn::LOCK_TIMEOUT)
 }
 
@@ -581,7 +641,7 @@ pub fn bind_control(paths: &RuntimePaths) -> io::Result<UnixListener> {
 pub(crate) fn bind_control_within(
     paths: &RuntimePaths,
     lock_timeout: Duration,
-) -> io::Result<UnixListener> {
+) -> io::Result<(UnixListener, SocketIdentity)> {
     use std::os::unix::fs::PermissionsExt;
 
     paths.ensure_dir()?;
@@ -622,7 +682,13 @@ pub(crate) fn bind_control_within(
 
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
-    let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+    // One `stat`, two answers: the mode this re-reads rather than
+    // trusting, and the identity the teardown compares against. Taken
+    // after the `chmod`, because the `chmod` moves `ctime`; taken here,
+    // because this is the last point at which `bind.lock` still
+    // guarantees the path names the socket we just created.
+    let meta = std::fs::symlink_metadata(&path)?;
+    let mode = meta.permissions().mode() & 0o777;
     if mode != SOCKET_MODE {
         let _ = std::fs::remove_file(&path);
         return Err(io::Error::new(
@@ -633,7 +699,7 @@ pub(crate) fn bind_control_within(
             ),
         ));
     }
-    Ok(listener)
+    Ok((listener, SocketIdentity::from_meta(&meta)?))
 }
 
 /// Holds [`Daemon::in_flight`] up for the life of one connection.
@@ -789,7 +855,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // audit refusal below sits after this line and not before it. The
     // same ordering holds in `TestDaemon::start`, which binds first for
     // the same reason.
-    let listener = bind_control(&paths)?;
+    let (listener, our_socket) = bind_control(&paths)?;
     write_pid_file(&paths)?;
 
     // The startup half of §19.1's sweep, run **before** `Daemon::new`
@@ -828,14 +894,15 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // a daemon every later `ensure_daemon` has to probe and clear.
     if let Some(why) = daemon.server.audit_open_error() {
         let why = why.to_string();
-        // **Drop the listener first.** `remove_runtime_files_we_own`
-        // skips the socket while `socket_is_live` says something is
-        // serving it — Imp C-5's guard against unlinking a successor's
-        // — and until this drop the something is *us*. The ordinary exit
-        // path gets this for free because `serve_daemon` consumes the
-        // listener before the teardown runs; this path has to say it.
+        // **Drop the listener first**, so no client can connect to a
+        // daemon that has already decided not to serve. It is no longer
+        // what makes the unlink below happen — the teardown compares the
+        // socket's identity, which does not care who holds a descriptor
+        // — but a refusing daemon must not be reachable while it winds
+        // down, and the ordinary exit path gets that for free because
+        // `serve_daemon` consumes the listener.
         drop(listener);
-        remove_runtime_files_we_own(&paths);
+        remove_runtime_files_we_own(&paths, our_socket);
         anyhow::bail!(
             "clasp daemon: refusing to start without the §9.4 audit trail: {why}. \
              Fix the ownership or permissions of that file, or point \
@@ -862,7 +929,7 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // Anything still alive after `shutdown()` (or after a shutdown that
     // never ran, e.g. a bind error unwinding) dies here.
     daemon.shutdown();
-    remove_runtime_files_we_own(&paths);
+    remove_runtime_files_we_own(&paths, our_socket);
     Ok(())
 }
 
@@ -894,22 +961,51 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
 /// normal operator action.
 ///
 /// So: take the binder's lock, and ask twice whether these files are
-/// still ours. A socket that answers is somebody else's, because ours is
-/// closed by the time `serve` has returned. A pid file naming another
-/// process is somebody else's too — one comparison, and it makes the
-/// removal idempotent under any interleaving.
+/// still ours. A pid file naming another process is somebody else's —
+/// one comparison, and it makes the removal idempotent under any
+/// interleaving. The socket is the same question and needs the same kind
+/// of answer, which is [`SocketIdentity`].
+///
+/// **The socket half was `!socket_is_live` and that was wrong.** It asks
+/// whether *anyone* is holding a descriptor on the socket, and answers
+/// `true` for a descriptor that is not the owner's: an AF_UNIX listener
+/// stays connectable while any process references it, and every `fork`
+/// in this tree — `start_detached`, every PTY spawn — briefly gives a
+/// child a copy of ours between `fork` and `exec`. Under a parallel test
+/// suite that window is wide enough to hit roughly half of all runs, and
+/// what it produced was §7.3's unlink being silently skipped for a
+/// socket nobody was serving. The failure was benign in production and
+/// fatal to the point of a gate: the two rows below this one were red
+/// half the time for a reason neither of them is about.
+///
+/// Comparing identity is not a weaker check than liveness, it is a
+/// different and tighter one. Liveness cannot distinguish our socket
+/// from a successor's — both answer — and only the lock ordering made it
+/// usable at all; identity distinguishes them directly, and keeps
+/// working for a successor that has bound but has not yet been
+/// connected to.
+///
+/// **Not the pid-file test, for the socket.** It looks equivalent and is
+/// not: a successor binds and writes its pid file on two consecutive
+/// lines with `bind.lock` released in between, so there is a window in
+/// which the socket is the successor's while the pid file is still the
+/// predecessor's. Reusing the pid comparison for the socket would unlink
+/// the successor's socket in that window — precisely the C-5 defect this
+/// function exists to prevent.
 ///
 /// **Keep the removal.** §7.3 mandates it; the defect was that it was
 /// unlocked and unconditional, not that it happened. Skipping the
 /// cleanup when the lock cannot be taken — `acquire_bind` runs
 /// `ensure_dir` first, which can fail — is the safe direction: it leaves
 /// a stale socket file, which the next binder clears under this same
-/// lock.
-pub(crate) fn remove_runtime_files_we_own(paths: &RuntimePaths) {
+/// lock. Every way the identity comparison can be wrong points the same
+/// way: an unreadable or unequal identity skips the unlink and leaves a
+/// stale socket, and never removes a file that might be someone else's.
+pub(crate) fn remove_runtime_files_we_own(paths: &RuntimePaths, ours: SocketIdentity) {
     let Ok(_bind_lock) = super::spawn::DaemonLock::acquire_bind(paths) else {
         return;
     };
-    if !super::spawn::socket_is_live(paths) {
+    if SocketIdentity::of(&paths.control_sock()).is_ok_and(|now| now == ours) {
         let _ = std::fs::remove_file(paths.control_sock());
     }
     if read_pid_file(paths) == Some(std::process::id()) {
@@ -1839,7 +1935,7 @@ mod tests {
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
         let paths = RuntimePaths::with_dir(&dir);
-        let listener = bind_control(&paths).expect("bind control.sock");
+        let (listener, _) = bind_control(&paths).expect("bind control.sock");
         let daemon = Daemon::with_owner_uid(paths.clone(), peer::current_uid().wrapping_add(1));
         tokio::spawn(serve(Arc::clone(&daemon), listener));
 
@@ -2279,7 +2375,8 @@ mod tests {
         // unrelated reason would satisfy the row above and never bind at
         // all. Once the holder is gone the same call must succeed.
         drop(held);
-        let listener = bind_control(&paths).expect("the lock is free once the holder drops it");
+        let (listener, _) =
+            bind_control(&paths).expect("the lock is free once the holder drops it");
         assert!(paths.control_sock().exists());
         drop(listener);
     }
@@ -2368,15 +2465,28 @@ mod tests {
     /// interleaving happens not to occur is not a test. B's side of the
     /// window is simply already finished when A's teardown runs, which is
     /// exactly the interleaving the report describes.
+    ///
+    /// **A binds for real here**, rather than the teardown being called
+    /// with no predecessor at all. Its identity is the thing under test:
+    /// A must decline to unlink because the file at the path is no longer
+    /// the file A created, and the only way to say that is to have A
+    /// create one.
     #[tokio::test]
     async fn the_exit_cleanup_leaves_a_successor_daemons_socket_and_pid_file_alone() {
         let paths = scratch("exitsuccessor");
         let _s = Scratch(paths.clone());
         paths.ensure_dir().unwrap();
 
+        // Daemon A: binds, learns which file is its own, and its listener
+        // drops as `serve` returns. §7.3's exit has begun and its unlinks
+        // have not run yet.
+        let (a_listener, a_socket) = bind_control(&paths).expect("A binds its control socket");
+        drop(a_listener);
+
         // Daemon B, through the real binder: lock, probe, unlink, bind,
         // chmod. Then its pid file, naming a process that is not us.
-        let b_listener = bind_control(&paths).expect("the successor binds its control socket");
+        let (b_listener, b_socket) =
+            bind_control(&paths).expect("the successor binds its control socket");
         let b_pid = std::process::id().wrapping_add(1);
         std::fs::write(paths.pid_file(), format!("{b_pid} 9.9.9\n")).unwrap();
 
@@ -2388,9 +2498,22 @@ mod tests {
         );
         assert_eq!(read_pid_file(&paths), Some(b_pid));
         assert_ne!(b_pid, std::process::id());
+        // The premise the identity comparison rests on, asserted rather
+        // than assumed: B's bind produced a *different* file. It is also
+        // the tripwire for the one way identity can be fooled — a
+        // filesystem that hands B the inode number A just freed, within
+        // one timestamp granularity. On tmpfs, btrfs and APFS the number
+        // comes from a monotonic counter and cannot repeat; on ext4 and
+        // xfs it can, and this row is where that would surface as a
+        // failure rather than as a silently weakened guard.
+        assert_ne!(
+            a_socket, b_socket,
+            "B rebound the same identity A had: the comparison below cannot \
+             tell the two daemons' sockets apart"
+        );
 
         // Daemon A's teardown, arriving late.
-        remove_runtime_files_we_own(&paths);
+        remove_runtime_files_we_own(&paths, a_socket);
 
         assert!(
             super::super::spawn::socket_is_live(&paths),
@@ -2406,6 +2529,68 @@ mod tests {
         );
 
         drop(b_listener);
+    }
+
+    /// The teardown must remove **its own** socket even while another
+    /// descriptor keeps that socket answering.
+    ///
+    /// This is the row the parallel suite was failing on, made
+    /// deterministic. `!socket_is_live` asked whether *anyone* holds a
+    /// descriptor on `control.sock`, and an AF_UNIX listener answers
+    /// `connect(2)` for as long as any process references it — so a
+    /// child forked between `fork` and `exec` (mio sets `SOCK_CLOEXEC`,
+    /// so that is the whole window) inherits the daemon's listener and
+    /// makes the probe report a live daemon where none is serving. §7.3's
+    /// unlink was then skipped and
+    /// `the_daemon_refuses_to_serve_without_its_audit_trail` and
+    /// `a_daemon_that_exits_removes_the_socket_and_pid_file_it_owns` went
+    /// red — in about half of all default-parallelism `--workspace` runs
+    /// on a 48-core box, and never at `--test-threads=1`.
+    ///
+    /// **A second descriptor in this process, not a fork.** The condition
+    /// the bug needs is "a descriptor other than the owner's listener
+    /// still references the socket"; `try_clone_to_owned` produces
+    /// exactly that, with no dependence on scheduling, on load, or on
+    /// forking from a multi-threaded test binary. The `socket_is_live`
+    /// premise below is what proves the reproduction is faithful: it is
+    /// the predicate the old code consulted, and it says `true`.
+    ///
+    /// Not a `#[tokio::test]` in name only — `UnixListener::bind` needs a
+    /// reactor.
+    #[tokio::test]
+    async fn the_exit_cleanup_removes_its_own_socket_while_a_stray_descriptor_holds_it_open() {
+        use std::os::fd::AsFd;
+
+        let paths = scratch("straydescriptor");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+
+        let (listener, our_socket) = bind_control(&paths).expect("bind control.sock");
+        // The inherited copy. Taken before the listener drops, because
+        // that is the order a `fork` gets it in.
+        let stray = listener
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("a second descriptor on the listening socket");
+        drop(listener);
+
+        assert!(
+            super::super::spawn::socket_is_live(&paths),
+            "the premise: with the owner's listener closed and only a stray \
+             descriptor left, the socket still answers `connect` — this is the \
+             state the old `!socket_is_live` guard read as `a daemon is serving`"
+        );
+
+        remove_runtime_files_we_own(&paths, our_socket);
+
+        assert!(
+            !paths.control_sock().exists(),
+            "§7.3's unlink was skipped because an unrelated descriptor answered \
+             for the socket: the file this daemon created and closed outlives it, \
+             and every later binder has to probe and clear it"
+        );
+
+        drop(stray);
     }
 
     #[tokio::test]
@@ -2503,7 +2688,7 @@ mod tests {
         let _s = Scratch(paths.clone());
         paths.ensure_dir().unwrap();
         let clock = Clock::manual(Instant::now());
-        let listener = bind_control(&paths).expect("bind control.sock");
+        let (listener, _) = bind_control(&paths).expect("bind control.sock");
         let daemon = Daemon::with_config_and_clock(paths, configured(3600), clock.clone());
 
         let served = tokio::spawn(serve_daemon(Arc::clone(&daemon), listener));
@@ -2553,7 +2738,7 @@ mod tests {
         let _s = Scratch(paths.clone());
         paths.ensure_dir().unwrap();
         let clock = Clock::manual(Instant::now());
-        let listener = bind_control(&paths).expect("bind control.sock");
+        let (listener, _) = bind_control(&paths).expect("bind control.sock");
         let daemon = Daemon::with_config_and_clock(paths.clone(), configured(3600), clock.clone());
         let mut served = tokio::spawn(serve_daemon(Arc::clone(&daemon), listener));
         for _ in 0..8 {

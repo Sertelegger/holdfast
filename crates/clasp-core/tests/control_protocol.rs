@@ -63,7 +63,7 @@ impl TestDaemon {
         // Short path: `sockaddr_un.sun_path` cannot hold a socket under
         // the workspace's `target/` directory.
         let paths = RuntimePaths::with_dir(scratch_dir(tag));
-        let listener = server::bind_control(&paths).expect("bind control.sock");
+        let (listener, _) = server::bind_control(&paths).expect("bind control.sock");
         let daemon = Daemon::with_config(paths.clone(), config);
         tokio::spawn(server::serve(Arc::clone(&daemon), listener));
         // The connect probe below proves the socket *file* is bound, and
@@ -1350,7 +1350,7 @@ async fn a_stale_socket_file_is_cleared_rather_than_blocking_startup() {
     std::os::unix::net::UnixListener::bind(paths.control_sock()).unwrap();
     assert!(paths.control_sock().exists());
 
-    let listener = server::bind_control(&paths).expect("stale socket must be cleared");
+    let (listener, _) = server::bind_control(&paths).expect("stale socket must be cleared");
     drop(listener);
     remove_dir_all_retrying(paths.dir());
 }
