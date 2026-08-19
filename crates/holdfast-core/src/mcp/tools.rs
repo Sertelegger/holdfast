@@ -14,7 +14,7 @@ use crate::output::rules::RuleSet;
 use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{clamp_geometry, InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
-use crate::secret::{CancelReason, Resolution};
+use crate::secret::{CancelReason, RaisedBy, Resolution};
 use crate::session::{new_session_id, wait, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -1372,6 +1372,25 @@ impl HoldfastServer {
             // The first caller's request is untouched: no close
             // broadcast, no slot change, no deadline reset.
             Err(collision) => {
+                // §9.4's two entries are written **per tool call**, and a
+                // collision is a call. `raised_by` is the *request's* —
+                // whatever raised the one this call collided with — which
+                // is how an operator sees that a second caller arrived at
+                // somebody else's request rather than raising its own.
+                self.audit_secret_request(
+                    &session.id,
+                    &collision.request_id,
+                    &args.prompt_text,
+                    timeout_secs,
+                    max_secret_bytes,
+                    collision.raised_by,
+                );
+                self.audit_secret_resolved(
+                    &session.id,
+                    &collision.request_id,
+                    CancelReason::ConcurrentRequestPending.as_str(),
+                    None,
+                );
                 return Ok(envelope::envelope(
                     Status::SecretCancelled,
                     json!({
@@ -1383,16 +1402,57 @@ impl HoldfastServer {
             }
         };
         let request_id = adopted.request_id.clone();
+        // **Per call, and this is the line that makes §5.2's *"a raised
+        // request that no call ever adopts produces no
+        // `secret_input_request` entry"* true.** Written before the wait,
+        // so an operator reading a trail mid-flight sees an outstanding
+        // request rather than nothing at all.
+        //
+        // `args.prompt_text` and not the pre-redacted `prompt_text`:
+        // `AuditLog::record` redacts every string it is handed, and
+        // handing it the already-redacted copy would make the end-to-end
+        // assertion pass without the redactor ever running here.
+        self.audit_secret_request(
+            &session.id,
+            &request_id,
+            &args.prompt_text,
+            timeout_secs,
+            max_secret_bytes,
+            adopted.raised_by,
+        );
         // **Only the raising call broadcasts.** An adopting call must not
         // re-announce a request a human may already be typing into, and
         // must not replace its text.
         if adopted.raised_here {
             hub.broadcast_awaiting_secret(&session.id, &request_id, &adopted.prompt_text);
         }
-
         let resolution = self
             .await_secret(&session, &request_id, adopted.rx, timeout_secs)
             .await;
+
+        // **Two vocabularies for one event, and they must not be
+        // unified.** This field carries the *tool status* — `secret_provided`
+        // — while §7.5's `SecretRequestClosed.outcome` carries the *frame
+        // outcome*, `fulfilled`. They describe the same moment from two
+        // sides: this row records what the caller was told, the frame
+        // records what the clients were told. Mapping one enum onto the
+        // other loses `concurrent_request_pending`, which no frame has.
+        let (outcome, bytes_written) = match &resolution {
+            Resolution::Provided { bytes_written } => ("secret_provided", Some(*bytes_written)),
+            Resolution::Cancelled(reason) => (reason.as_str(), None),
+            // **§9.4's enumeration is short by one and this is the
+            // divergence, recorded rather than repaired.** Its five
+            // values are the four `secret_cancelled` reasons plus
+            // `secret_provided`; a session that exits under a waiting
+            // call is answered `session_died` (§5.1) and has no row.
+            // Writing nothing would leave a `secret_input_request` with
+            // no resolution in the trail, which an operator reads as
+            // "still outstanding" — strictly worse than a sixth value in
+            // an audit-only field whose stated job is to record the tool
+            // status. Flagged for §9.4 rather than fixed there.
+            Resolution::SessionDied { .. } => ("session_died", None),
+        };
+        self.audit_secret_resolved(&session.id, &request_id, outcome, bytes_written);
 
         Ok(match resolution {
             Resolution::Provided { bytes_written } => envelope::envelope(
@@ -1419,6 +1479,79 @@ impl HoldfastServer {
 }
 
 impl HoldfastServer {
+    /// §9.4's `secret_input_request`.
+    ///
+    /// **`prompt_text` is handed over raw.** `AuditLog::record` redacts
+    /// every string in the payload it is given, so pre-redacting here
+    /// would make an end-to-end assertion about that redaction pass
+    /// whether or not it happened. The secret *value* never comes near
+    /// this call — §9.2 marks it `n/a` because it reaches no boundary a
+    /// redactor could run at, and if a value ever arrives here the
+    /// protection that matters has already failed.
+    ///
+    /// **`timeout_secs` and `max_secret_bytes` are the *effective*
+    /// values**, after defaults. An entry recording `null` for an omitted
+    /// argument tells an operator nothing about what the daemon enforced,
+    /// and the omitted form is the common call shape.
+    fn audit_secret_request(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        prompt_text: &str,
+        timeout_secs: u32,
+        max_secret_bytes: u32,
+        raised_by: RaisedBy,
+    ) {
+        self.processor.audit.record(
+            "secret_input_request",
+            Some(session_id),
+            json!({
+                "request_id": request_id,
+                "prompt_text": prompt_text,
+                "timeout_secs": timeout_secs,
+                "max_secret_bytes": max_secret_bytes,
+                // §5.2's mismatch record, and the only one §9.4 provides:
+                // a call that *raised* the slot is by construction a call
+                // that arrived with no echo-drop raise outstanding. It
+                // does not say which mode the session was in; the
+                // additive fix is Q9 and is not invented here.
+                "raised_by": raised_by.as_str(),
+            }),
+        );
+    }
+
+    /// §9.4's `secret_input_resolved`.
+    ///
+    /// **`bytes_written` is absent, not `0`, on every outcome but
+    /// `secret_provided`** — an operator reading `0` cannot tell it from
+    /// a zero-length secret.
+    ///
+    /// It *is* emitted on an adopted resolution, for a value a human may
+    /// have entered on their own initiative, so that value's length
+    /// becomes visible to the agent. §5.2 judges that acceptable — it is
+    /// the same number the agent would have received had it called first
+    /// — and names omitting it as a mitigation it is deliberately
+    /// deferring. So: not a new finding, and not quietly omitted here.
+    fn audit_secret_resolved(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        outcome: &str,
+        bytes_written: Option<u64>,
+    ) {
+        let mut fields = serde_json::Map::new();
+        fields.insert("request_id".into(), json!(request_id));
+        fields.insert("outcome".into(), json!(outcome));
+        if let Some(n) = bytes_written {
+            fields.insert("bytes_written".into(), json!(n));
+        }
+        self.processor.audit.record(
+            "secret_input_resolved",
+            Some(session_id),
+            serde_json::Value::Object(fields),
+        );
+    }
+
     /// Wait for the outstanding request to resolve, or for this call's
     /// own deadline.
     ///

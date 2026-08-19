@@ -325,6 +325,34 @@ fn secret_args(session: &str, timeout_secs: u32) -> RequestSecretInputArgs {
     }
 }
 
+/// Every audit line of one kind, parsed, for **one** session.
+///
+/// Read before the `TestDaemon` drops: `Drop` removes the whole runtime
+/// directory, log and all. `unwrap_or_default` on the read, because the
+/// file does not exist until something has been recorded — which for a
+/// negative row is exactly the case under test.
+fn audit_entries(d: &TestDaemon, session_id: &str, kind: &str) -> Vec<Value> {
+    std::fs::read_to_string(d.paths.audit_log())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["kind"] == kind && e["session_id"] == session_id)
+        .collect()
+}
+
+/// The two §9.4 secret kinds for one session, **in the order they were
+/// written** — which is the half a per-kind filter throws away.
+fn secret_audit_kinds(d: &TestDaemon, session_id: &str) -> Vec<String> {
+    std::fs::read_to_string(d.paths.audit_log())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["session_id"] == session_id)
+        .filter_map(|e| e["kind"].as_str().map(str::to_string))
+        .filter(|k| k.starts_with("secret_input_"))
+        .collect()
+}
+
 /// The `reason` on a `secret_cancelled` response — and an assertion that
 /// it *is* one, so a row collecting reasons cannot quietly collect a
 /// `secret_provided`.
@@ -1316,4 +1344,345 @@ async fn a_caller_timeout_re_raises_while_the_child_is_still_asking() {
         panic!("a session that is not awaiting a secret was handed one anyway: {request_id}");
     }
     let _ = plain.signal(Signal::Kill);
+}
+
+// ------------------------------------------------------ §9.4's two kinds
+
+/// Both entries, per call, in order.
+#[tokio::test]
+async fn a_completed_call_writes_exactly_one_request_and_one_resolved_line() {
+    let d = TestDaemon::start("auditpair").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    await_waiter(&d, &s.id, "the call").await;
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id: request_id.clone(),
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(joined(call, "the call").await["status"], "secret_provided");
+
+    assert_eq!(
+        secret_audit_kinds(&d, &s.id),
+        vec![
+            "secret_input_request".to_string(),
+            "secret_input_resolved".to_string()
+        ],
+        "the resolved line was written on the raise, so the trail carries a \
+         resolution for a request that had not resolved"
+    );
+    let req = audit_entries(&d, &s.id, "secret_input_request");
+    let res = audit_entries(&d, &s.id, "secret_input_resolved");
+    assert_eq!(req.len(), 1);
+    assert_eq!(res.len(), 1);
+    assert_eq!(req[0]["request_id"], request_id);
+    assert_eq!(
+        res[0]["request_id"], request_id,
+        "the two lines describe different requests"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// §5.2: *"A raised request that no call ever adopts produces **no**
+/// `secret_input_request` entry."*
+///
+/// **The pairing is what stops this being an assertion about an empty
+/// file.** In the same run, on the same daemon and the same log, a
+/// completed call on a second session writes one of each — so an audit
+/// path that was never wired up at all fails here rather than passing the
+/// zero-assertion perfectly.
+#[tokio::test]
+async fn an_unadopted_raise_writes_no_audit_line_at_all() {
+    let d = TestDaemon::start("unadopted").await;
+
+    // A human answers an echo-drop raise with no tool call anywhere.
+    let lone = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut lc = attach_ok(&d, &lone.id, AttachMode::ReadWrite).await;
+    let (raised_id, _) = next_awaiting_secret(&mut lc, 20).await;
+    send(
+        &mut lc,
+        &ClientFrame::SecretInput {
+            request_id: raised_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    let seen = stream_until(&mut lc, b"got=HUNTER2", 20).await;
+    assert!(
+        contains(&seen, b"got=HUNTER2"),
+        "the human's submission never landed, so this row asserts nothing: {}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // The pairing, on the same log.
+    let called = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut cc = attach_ok(&d, &called.id, AttachMode::ReadWrite).await;
+    let (call_id, _) = next_awaiting_secret(&mut cc, 20).await;
+    let call = spawn_call(&d, secret_args(&called.id, 20));
+    await_waiter(&d, &called.id, "the call").await;
+    send(
+        &mut cc,
+        &ClientFrame::SecretInput {
+            request_id: call_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(joined(call, "the call").await["status"], "secret_provided");
+
+    assert_eq!(
+        secret_audit_kinds(&d, &called.id).len(),
+        2,
+        "the audit path is not wired up at all, which passes the zero-assertion \
+         below perfectly"
+    );
+    assert!(
+        secret_audit_kinds(&d, &lone.id).is_empty(),
+        "the entries are written per raise instead of per call: {:?}",
+        secret_audit_kinds(&d, &lone.id)
+    );
+
+    let _ = lone.signal(Signal::Kill);
+    let _ = called.signal(Signal::Kill);
+}
+
+/// **Both directions in one test**, because a constant passes whichever
+/// single direction is asserted.
+#[tokio::test]
+async fn raised_by_distinguishes_adoption_from_a_cold_call() {
+    let d = TestDaemon::start("raisedby").await;
+
+    // Adopted: the echo drop raised it, so the request is `echo_drop`
+    // however the call arrived.
+    let adopted = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut ac = attach_ok(&d, &adopted.id, AttachMode::ReadWrite).await;
+    let (adopted_id, _) = next_awaiting_secret(&mut ac, 20).await;
+    let call = spawn_call(&d, secret_args(&adopted.id, 20));
+    await_waiter(&d, &adopted.id, "the adopting call").await;
+    send(
+        &mut ac,
+        &ClientFrame::SecretInput {
+            request_id: adopted_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        joined(call, "the adopting call").await["status"],
+        "secret_provided"
+    );
+
+    // Cold: a session that never dropped echo, so the call raised it.
+    let cold = d.shell_running("cat");
+    let cold_payload = joined(spawn_call(&d, secret_args(&cold.id, 2)), "the cold call").await;
+    assert_eq!(cold_payload["status"], "secret_cancelled");
+
+    assert_eq!(
+        audit_entries(&d, &adopted.id, "secret_input_request")[0]["raised_by"],
+        "echo_drop",
+        "an adopting call reported itself as the raiser"
+    );
+    assert_eq!(
+        audit_entries(&d, &cold.id, "secret_input_request")[0]["raised_by"],
+        "tool_call",
+        "§5.2's mismatch record: a call that raised the slot is by construction a \
+         call that arrived with no echo-drop raise outstanding"
+    );
+
+    let _ = adopted.signal(Signal::Kill);
+    let _ = cold.signal(Signal::Kill);
+}
+
+/// Absent, not `0` and not `null` — an operator reading `0` cannot tell
+/// it from a zero-length secret.
+#[tokio::test]
+async fn bytes_written_is_present_only_on_secret_provided() {
+    let d = TestDaemon::start("byteswritten").await;
+
+    let timed_out = d.shell_running("cat");
+    assert_eq!(
+        cancelled_reason(
+            &joined(
+                spawn_call(&d, secret_args(&timed_out.id, 2)),
+                "the timing-out call"
+            )
+            .await
+        ),
+        "timeout"
+    );
+
+    // The pairing: a resolution that *does* carry it.
+    let provided = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut pc = attach_ok(&d, &provided.id, AttachMode::ReadWrite).await;
+    let (id, _) = next_awaiting_secret(&mut pc, 20).await;
+    let call = spawn_call(&d, secret_args(&provided.id, 20));
+    await_waiter(&d, &provided.id, "the call").await;
+    send(
+        &mut pc,
+        &ClientFrame::SecretInput {
+            request_id: id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(joined(call, "the call").await["status"], "secret_provided");
+
+    let cancelled = &audit_entries(&d, &timed_out.id, "secret_input_resolved")[0];
+    assert_eq!(cancelled["outcome"], "timeout");
+    assert!(
+        cancelled.get("bytes_written").is_none(),
+        "a cancelled resolution carried a byte count: {cancelled}"
+    );
+    let ok = &audit_entries(&d, &provided.id, "secret_input_resolved")[0];
+    assert_eq!(
+        ok["outcome"], "secret_provided",
+        "§9.4's outcome is the **tool status**, not §7.5's frame outcome"
+    );
+    assert_eq!(
+        ok["bytes_written"],
+        (PROBE.len() + 1) as u64,
+        "the count is missing from the one resolution that must carry it"
+    );
+
+    let _ = timed_out.signal(Signal::Kill);
+    let _ = provided.signal(Signal::Kill);
+}
+
+/// The **effective** values, after defaults are applied.
+///
+/// **Both halves**, because the omitted-argument case alone cannot tell a
+/// resolved default from a hardcoded `120`.
+#[tokio::test]
+async fn the_effective_timeout_is_logged_not_the_argument() {
+    let d = TestDaemon::start("effective").await;
+
+    // Omitted: the call must still resolve fast, so a human answers it.
+    let defaulted = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut dc = attach_ok(&d, &defaulted.id, AttachMode::ReadWrite).await;
+    let (default_id, _) = next_awaiting_secret(&mut dc, 20).await;
+    let call = spawn_call(
+        &d,
+        RequestSecretInputArgs {
+            session: defaulted.id.clone(),
+            prompt_text: "a credential".into(),
+            ..Default::default()
+        },
+    );
+    await_waiter(&d, &defaulted.id, "the defaulted call").await;
+    send(
+        &mut dc,
+        &ClientFrame::SecretInput {
+            request_id: default_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        joined(call, "the defaulted call").await["status"],
+        "secret_provided"
+    );
+
+    // Stated, and deliberately not the default.
+    let stated = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut sc = attach_ok(&d, &stated.id, AttachMode::ReadWrite).await;
+    let (stated_id, _) = next_awaiting_secret(&mut sc, 20).await;
+    let call = spawn_call(
+        &d,
+        RequestSecretInputArgs {
+            max_secret_bytes: Some(64),
+            ..secret_args(&stated.id, 30)
+        },
+    );
+    await_waiter(&d, &stated.id, "the stated call").await;
+    send(
+        &mut sc,
+        &ClientFrame::SecretInput {
+            request_id: stated_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        joined(call, "the stated call").await["status"],
+        "secret_provided"
+    );
+
+    let defaulted_line = &audit_entries(&d, &defaulted.id, "secret_input_request")[0];
+    assert_eq!(
+        defaulted_line["timeout_secs"], 120,
+        "the raw Option was recorded, so the most common call shape logs `null`"
+    );
+    assert_eq!(defaulted_line["max_secret_bytes"], 4096);
+    let stated_line = &audit_entries(&d, &stated.id, "secret_input_request")[0];
+    assert_eq!(
+        stated_line["timeout_secs"], 30,
+        "a hardcoded default, which the omitted-argument half alone cannot see"
+    );
+    assert_eq!(stated_line["max_secret_bytes"], 64);
+
+    let _ = defaulted.signal(Signal::Kill);
+    let _ = stated.signal(Signal::Kill);
+}
+
+/// `concurrent_request_pending` exists in the audit vocabulary and in no
+/// frame vocabulary, which is why the two must not be unified.
+#[tokio::test]
+async fn a_collision_logs_concurrent_request_pending_and_no_frame() {
+    let d = TestDaemon::start("collisionaudit").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    let first = spawn_call(&d, secret_args(&s.id, 20));
+    await_waiter(&d, &s.id, "the first call").await;
+    let second = body(&d.call(secret_args(&s.id, 20)).await);
+    assert_eq!(second["data"]["reason"], "concurrent_request_pending");
+
+    // **No `SecretRequestClosed` for the collision.** Checked while the
+    // first caller's request is still open, so any frame arriving here is
+    // the collision's.
+    let quiet = tokio::time::timeout(Duration::from_millis(500), recv(&mut c)).await;
+    if let Ok(ServerFrame::SecretRequestClosed {
+        request_id,
+        outcome,
+        ..
+    }) = quiet
+    {
+        panic!("the collision closed a request on the wire: {request_id} / {outcome}");
+    }
+
+    let resolved = audit_entries(&d, &s.id, "secret_input_resolved");
+    assert_eq!(
+        resolved.len(),
+        1,
+        "the collision wrote no resolution, or wrote somebody else's"
+    );
+    assert_eq!(resolved[0]["outcome"], "concurrent_request_pending");
+    assert_eq!(
+        resolved[0]["request_id"], request_id,
+        "§9.4 binds a colliding call to the request it collided with"
+    );
+    // Two calls, two request lines — per call, not per request.
+    assert_eq!(audit_entries(&d, &s.id, "secret_input_request").len(), 2);
+
+    // And the first caller still completes.
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        joined(first, "the first call").await["status"],
+        "secret_provided"
+    );
+    let _ = s.signal(Signal::Kill);
 }
