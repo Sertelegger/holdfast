@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-**CLASP is pre-release. There is no released version.** The workspace is at
+**Holdfast is pre-release. There is no released version.** The workspace is at
 `0.0.2`, which is a milestone marker rather than a published artifact: nothing
 is tagged, nothing is on crates.io, and no binaries are distributed. Fixes land
 on `main`, and there is nothing to backport them to.
@@ -27,23 +27,23 @@ expect an acknowledgment within a week.
 
 ## The thing to understand before reporting
 
-**CLASP exists to run commands on your machine on an AI agent's behalf.** It
+**Holdfast exists to run commands on your machine on an AI agent's behalf.** It
 spawns a real shell on a real PTY and lets an agent type into it. That is the
 product, not a flaw in it. So:
 
 - **"The agent ran a command I didn't want" is not a vulnerability.** It is
-  CLASP working. Failures of the *safety machinery around* command execution
+  Holdfast working. Failures of the *safety machinery around* command execution
   are what this policy is about.
-- **CLASP applies no sandbox, no allow-list, and no privilege reduction.** The
+- **Holdfast applies no sandbox, no allow-list, and no privilege reduction.** The
   child inherits the environment, working directory, and privileges of the
-  process running `clasp mcp`. Run it as a user you are willing to let an agent
+  process running `holdfast mcp`. Run it as a user you are willing to let an agent
   be.
 - **The program inside a session is inside the trust boundary.** A child that
   wants to print bytes that look like a shell prompt can do so directly, at any
-  length, and CLASP cannot tell those bytes from a real shell's. See
+  length, and Holdfast cannot tell those bytes from a real shell's. See
   "Documented residuals" below.
 
-What *is* in scope is everything CLASP claims to do about that execution:
+What *is* in scope is everything Holdfast claims to do about that execution:
 whether the agent is told the truth about what a session is doing, whether a
 `terminate` really terminates, and whether the redactor holds.
 
@@ -82,7 +82,7 @@ security policy that implies shipped protection is worse than none:**
   documents that ("Do not pass secrets"). Putting a credential there puts it in
   the transcript.
 
-What is in scope **today** is CLASP putting sensitive material somewhere the
+What is in scope **today** is Holdfast putting sensitive material somewhere the
 caller did not ask for. One fix of exactly this shape has already shipped:
 `portable-pty`'s spawn error embeds the entire `$PATH`, so `start_session`
 reports a clipped `envelope::brief(&e)` rather than the raw error, which would
@@ -97,7 +97,7 @@ match is the documented limit above.
 
 ### Prompt and interaction-state detection
 
-`crates/clasp-core/src/detect/` — `scanner.rs`, `detector.rs`, `patterns.rs`.
+`crates/holdfast-core/src/detect/` — `scanner.rs`, `detector.rs`, `patterns.rs`.
 
 Detection is what the agent believes. Every prompt-bearing response carries an
 `interaction_mode` (`AtPrompt` / `Executing` / `AwaitingSecret` / `Fullscreen`
@@ -141,7 +141,7 @@ recorded in the code, and accepted:
 
 - **A hostile or merely careless program in the session can print any of these
   bytes directly.** OSC 133 markers, `\x1b[?2004h`, a prompt-shaped line — all
-  of them, at any length, with no ceiling involved. CLASP cannot distinguish
+  of them, at any length, with no ceiling involved. Holdfast cannot distinguish
   them from a shell's, by construction.
 - **`SEQUENCE_MAX` (1 MiB, `scanner.rs`) is a blindness budget, not a forgery
   guard, and does not close.** At the trip point a huge well-formed sequence
@@ -161,7 +161,7 @@ cost of reaching an existing one, is valuable.
 
 ### Process-group signal handling
 
-`crates/clasp-core/src/pty/in_process.rs`. `terminate` must kill everything it
+`crates/holdfast-core/src/pty/in_process.rs`. `terminate` must kill everything it
 owns and **nothing it does not**. Both directions are bugs:
 
 - **Orphans.** The child is spawned with `setsid()` and the PTY as its
@@ -169,7 +169,7 @@ owns and **nothing it does not**. Both directions are bugs:
   enough: shell job control puts each background job in its own process group,
   so `terminate` enumerates every process group in the child's session (via
   `/proc` on Linux) and signals each one, re-enumerating on every sweep.
-- **Over-reach.** `kill(-0, sig)` signals *CLASP's own* process group, which is
+- **Over-reach.** `kill(-0, sig)` signals *Holdfast's own* process group, which is
   why every group is filtered on `pgid > 0`. A reaped PID can be recycled, so
   `signal` refuses to deliver anything once the child has exited — otherwise a
   `/proc` sweep could target a stranger's session. `InProcessPty::signal_deliveries()`
@@ -221,7 +221,7 @@ scope.
 - **A program inside a session forging its own detection signals.** It is
   inside the trust boundary.
 - **Anything that requires an attacker who already runs as the user running
-  `clasp mcp`.** At that point they can start the shell themselves.
+  `holdfast mcp`.** At that point they can start the shell themselves.
 - **Windows.** 0.0.3 is Unix-only. The workspace is kept compiling and
   clippy-clean for `x86_64-pc-windows-gnu`, but signalling returns an error
   there, there is no process-group handling, and `ECHO` is not sampled. Windows

@@ -1,6 +1,6 @@
 # Roadmap
 
-Where CLASP is heading. Shipped work is in [CHANGELOG.md](./CHANGELOG.md).
+Where Holdfast is heading. Shipped work is in [CHANGELOG.md](./CHANGELOG.md).
 
 **Read the numbers as scope groupings, not as a schedule.** `0.0.3`, `0.0.4`
 and so on are working labels for coherent bundles of work in the order they are
@@ -10,15 +10,15 @@ Each group gets its own design pass before implementation, and groups have been
 resequenced before.
 
 The end state this is walking toward is the framing the project is built on:
-**CLASP gives the agent a persistent shell environment, the way tmux gives a
+**Holdfast gives the agent a persistent shell environment, the way tmux gives a
 developer one.** Two milestones in, it gives the agent a shell; the persistence,
 the safety machinery, and the human's view into what the agent is doing are all
 still ahead.
 
 ## Where it is now
 
-Eleven MCP tools, Unix only, in **hybrid mode**: a background `clasp daemon`
-owns the sessions and a `clasp mcp` shim proxies to it over a Unix socket, so
+Eleven MCP tools, Unix only, in **hybrid mode**: a background `holdfast daemon`
+owns the sessions and a `holdfast mcp` shim proxies to it over a Unix socket, so
 sessions outlive the MCP client rather than dying with it. Output is
 ANSI-stripped and **secret-redacted by default**, with `--raw` and
 `read_output(redact: false)` as audited opt-outs. Detection is real — sessions
@@ -29,7 +29,7 @@ preflight. See the README for the accurate current surface and
 
 ## Output processing
 
-**Redaction, and the ANSI stripper.** The largest gap between what CLASP is
+**Redaction, and the ANSI stripper.** The largest gap between what Holdfast is
 designed to be and what it is. A gitleaks-derived redactor at **every** output
 boundary — tool results, the audit log, and every later boundary as it is added
 — plus a read-path ANSI stripper with holdback-aligned boundary rules and an
@@ -60,7 +60,7 @@ depends on it.
 
 ## Attach protocol and CLI clients
 
-**A human can look.** `clasp attach`, `watch`, `list`, and `logs` (with
+**A human can look.** `holdfast attach`, `watch`, `list`, and `logs` (with
 `--raw`), talking the attach protocol to the daemon. The point is not
 convenience: an agent driving a shell that no human can see is the failure mode
 this project exists to avoid, and attach is what makes "what is the agent doing
@@ -100,7 +100,7 @@ The backend already signals and resizes; neither is exposed as a tool.
 
 **The terminal, in a browser.** An `xterm.js` view of a live session, served by
 a daemon that listens on a Unix socket only; a TCP bridge exists solely as an
-explicit `clasp ui` command, with bearer-token auth and `Origin`/`Host`
+explicit `holdfast ui` command, with bearer-token auth and `Origin`/`Host`
 validation. The default has to stay "not reachable from the network", because a
 web view of a shell an agent is typing into is exactly the thing that must not
 be accidentally exposed.

@@ -1,4 +1,4 @@
-# CLASP CI — push and pull-request pipeline.
+# Holdfast CI — push and pull-request pipeline.
 # Plan: docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md
 #
 # Constraints this file is held to (enforced by scripts/ci-hygiene.sh):
@@ -121,7 +121,7 @@ jobs:
       # tests/integration.rs; those are fixed, and the narrower form must
       # not be restored without re-measuring.
       #
-      # This proves CLASP still COMPILES for Windows. It is not evidence
+      # This proves Holdfast still COMPILES for Windows. It is not evidence
       # that it WORKS on Windows — that needs a Windows runner, which is
       # milestone 0.0.11.
       - run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
@@ -211,7 +211,7 @@ jobs:
     #     shells share, in crates/, and belongs to whoever owns detection.
     #
     #     fish 4.8.1, the fish maintainers' PPA — the only route to a
-    #     fish >= 4 on this image. Zero markers in 20 s: CLASP's own
+    #     fish >= 4 on this image. Zero markers in 20 s: Holdfast's own
     #     snippet guard declines to inject. It probes `status test-feature
     #     no-mark-prompt`, but the feature is NAMED `mark-prompt`
     #     (`no-mark-prompt` is the spelling that disables it), so the probe

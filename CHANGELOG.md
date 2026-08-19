@@ -1,19 +1,60 @@
 # Changelog
 
-All notable changes to CLASP are recorded here. The format follows
+All notable changes to Holdfast are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Direction and
 upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **Renamed from CLASP to Holdfast.** The project was *CLASP — Claude's Live
+  Agent Shell Proxy*; it is now **HOLDFAST — Human-Observable Long-lived Daemon
+  For Agent Shell Terminals**. "Human-Observable" names the design intent, not a
+  shipped property: the attach, watch and web-UI surfaces that would make it
+  true are still future work (see [ROADMAP.md](./ROADMAP.md)).
+
+  The rename is not only cosmetic. Everything below changes behaviour:
+
+  - **Crates and binary.** `clasp-core` → `holdfast-core`, `clasp` →
+    `holdfast`. The installed binary is `holdfast`; re-register it with
+    `claude mcp add --scope user holdfast -- <path>/holdfast mcp`.
+  - **MCP identity.** `serverInfo.name` is now `holdfast`.
+  - **MCP resource URIs.** `clasp://session/…` → `holdfast://session/…`, and
+    the response `_meta` namespace key `clasp` → `holdfast`.
+  - **Control protocol.** The handshake method `clasp/handshake` →
+    `holdfast/handshake`. `PROTOCOL_MAJOR`/`PROTOCOL_MINOR` are unchanged; a
+    daemon and a shim from different sides of this rename will not speak, which
+    is fine because nothing was released.
+  - **OSC 133 marker tag.** Injected markers now carry `;holdfast=1` instead of
+    `;clasp=1`, the injected shell functions are `__holdfast_*`, and the
+    `osc133_source` value `clasp` is now `holdfast`.
+  - **Runtime directory.** `~/.clasp` → `~/.holdfast`,
+    `$XDG_RUNTIME_DIR/clasp` → `$XDG_RUNTIME_DIR/holdfast`,
+    `~/Library/Application Support/clasp` → `.../holdfast`, `clasp.pid` →
+    `holdfast.pid`, `clasp.lock` → `holdfast.lock`. **There is no migration
+    shim.** A stale `~/.clasp` from a development build is orphaned, not moved:
+    read anything you still want out of `~/.clasp/logs/audit.log` and delete
+    the directory.
+  - **Config file.** `$XDG_CONFIG_HOME/clasp/config.toml` →
+    `.../holdfast/config.toml` (likewise `~/.config/clasp` →
+    `~/.config/holdfast`). An existing config file is not read from the old
+    path; move it.
+  - **Environment variables.** `CLASP_RUNTIME_DIR` → `HOLDFAST_RUNTIME_DIR`,
+    `CLASP_BUILD_SHA` → `HOLDFAST_BUILD_SHA`, `CLASP_SHELL_INTEGRATION` →
+    `HOLDFAST_SHELL_INTEGRATION`. The old names are not read as a fallback.
+
+  Unchanged on purpose: the protocol version numbers, the socket filenames
+  (`control.sock`, `attach.sock`, `http.sock`), the log filenames, the
+  `sess_` session-id prefix, every MCP tool name, and the GitHub repository
+  slug.
 
 ## [0.0.5] — 2026-08-19
 
 **The first tagged release.** Until now the workspace version sat at `0.0.2`
 and had not tracked the milestone number since — a placeholder rather than a
 published artifact — so a build would have reported `0.0.2` and written it into
-`clasp.pid`. The version and the milestone agree from here.
+`holdfast.pid`. The version and the milestone agree from here.
 
 Milestones 0.0.1 through 0.0.5 are all in this release; there was no earlier
 tag, nothing on crates.io, and no distributed binary. The sections below are
@@ -33,7 +74,7 @@ backfilled from their commit history rather than reconstructed from memory.
 
 - **A working stdio MCP server** (`rmcp`) with four tools: `start_session`,
   `read_output`, `send_input`, `terminate`. Single Cargo workspace —
-  `clasp-core` (library) and `clasp` (binary, subcommands `mcp` and `version`).
+  `holdfast-core` (library) and `holdfast` (binary, subcommands `mcp` and `version`).
 - **`InProcessPty`**, a `portable-pty`-backed PTY behind a `PtyBackend` trait,
   with `setsid()` and the PTY as controlling terminal so the child's process
   group, session id and PID coincide. The trait exists so later milestones can
@@ -135,7 +176,7 @@ backfilled from their commit history rather than reconstructed from memory.
 - **A cursor-position prompt sub-signal (T3c).** Where the heuristic tier
   previously scored only the text of the last line, it now also scores where the
   cursor is sitting, combined as `quiescent × max(pattern, cursor)`.
-- **CLASP answers Primary Device Attributes** (`\x1b[?6c`, byte-exact, no
+- **Holdfast answers Primary Device Attributes** (`\x1b[?6c`, byte-exact, no
   optional parameters), which is what stops a `fish` session stalling ~10 s at
   startup waiting for a terminal that never replies. Measured: answering the
   other three common probes while withholding DA1 changes nothing; answering
@@ -146,11 +187,11 @@ backfilled from their commit history rather than reconstructed from memory.
 
 #### Milestone 0.0.5 — the daemon and the control protocol
 
-- **Sessions no longer die with the MCP client.** `clasp mcp` is now a thin
-  shim: on first use it auto-spawns a background `clasp daemon`, and afterwards
+- **Sessions no longer die with the MCP client.** `holdfast mcp` is now a thin
+  shim: on first use it auto-spawns a background `holdfast daemon`, and afterwards
   it reconnects to the one already running. The daemon owns the PTYs, so
   quitting and restarting Claude Code leaves every session alive, at the same
-  prompt, with its output buffer intact. `clasp mcp --no-daemon` keeps the old
+  prompt, with its output buffer intact. `holdfast mcp --no-daemon` keeps the old
   single-process behaviour, and is the shape the Windows build will reuse.
 - **A versioned control protocol** over a Unix socket — length-prefixed CBOR
   frames with a 16 MiB cap, a `holdfast/handshake` that both peers check, and the
@@ -162,14 +203,14 @@ backfilled from their commit history rather than reconstructed from memory.
   peer credentials are read with `SO_PEERCRED` and compared to the daemon's own
   uid *before a single frame is parsed*. A credential that cannot be read fails
   closed.
-- **New CLI subcommands** — `clasp daemon run|start|stop|status`, `clasp list`,
-  and `clasp logs <session> [--tail N] [--raw]`, with §18.8's exit codes and
+- **New CLI subcommands** — `holdfast daemon run|start|stop|status`, `holdfast list`,
+  and `holdfast logs <session> [--tail N] [--raw]`, with §18.8's exit codes and
   §3.2's idempotence contracts (`daemon start` on a running daemon and
   `daemon stop` on a dead one both succeed and say so).
 - **The §9.4 caller is derived from the connection, never from the request.**
   A read that disables redaction records two facts: `tool`, the mechanism, and
   `client_kind`, the accountable party — taken from the uid-checked handshake,
-  so `clasp logs --raw` is logged as `cli` and an agent's
+  so `holdfast logs --raw` is logged as `cli` and an agent's
   `read_output(redact: false)` as `shim`. There is deliberately no argument an
   agent could set to label itself as a human. `client_kind` is attribution
   only; nothing in the read path branches on it.
@@ -253,7 +294,7 @@ than a one-off:
   Each of the three parts was correct alone. `--no-daemon` dispatched them
   concurrently all along, so the agent's documented escape from a hung wait
   worked on one transport and not the other.
-- **A permission check refused ordinary installs.** Any `~/.clasp/logs` created
+- **A permission check refused ordinary installs.** Any `~/.holdfast/logs` created
   before 0.0.5 is `0775` under the umask 002 that Debian, Ubuntu and RHEL ship,
   and the daemon refused to start on it — reproduced on the author's own
   machine with no setup. Both remedies the error suggested were wrong: one
@@ -261,10 +302,10 @@ than a one-off:
   that has nothing to do with permissions. A check that rejects a normal
   install is a bug, not a hardening.
 - **Auto-spawn quietly moved the logs onto tmpfs.** Reaching the default
-  instance through `clasp mcp` wrote `audit.log` and `daemon.log` under
+  instance through `holdfast mcp` wrote `audit.log` and `daemon.log` under
   `$XDG_RUNTIME_DIR`, where they are destroyed at logout — making the retention
   windows unreachable in the configuration every install actually uses.
-- **`clasp mcp --no-daemon` ran the entire tool surface on `Config::default()`**,
+- **`holdfast mcp --no-daemon` ran the entire tool surface on `Config::default()`**,
   ignoring the operator's configuration completely. On Windows that is the only
   transport. It now refuses a config the daemon would also refuse, which is a
   new failure mode on that transport and an intended one.
@@ -286,7 +327,7 @@ than a one-off:
 - **Signals are refused once the child has exited.** A reaped PID can be
   recycled, and the `/proc` sweep would then target a stranger's session. Every
   candidate group is also filtered on `pgid > 0`, because `kill(-0, sig)`
-  signals CLASP's own process group.
+  signals Holdfast's own process group.
 - **Caller-supplied inputs are bounded**: at most 64 prompt patterns, each
   compiled under a 64 KiB size limit, with rejected patterns clipped to 120
   characters in the error message; `send_input` payloads at 64 KiB;
@@ -336,7 +377,7 @@ residuals that are known and accepted.
 Stated because they are easy to mistake for bugs:
 
 - **No attach yet.** Sessions now outlive the MCP client (0.0.5), but there is
-  no `clasp attach` or `clasp watch`, and no web UI — a human cannot yet look at
+  no `holdfast attach` or `holdfast watch`, and no web UI — a human cannot yet look at
   or type into a session the agent is driving.
 - **Unix only.** The tree is kept compiling and clippy-clean for
   `x86_64-pc-windows-gnu`, but signalling returns an error there and there is no

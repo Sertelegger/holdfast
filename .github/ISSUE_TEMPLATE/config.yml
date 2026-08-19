@@ -2,7 +2,7 @@ blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
     url: https://github.com/Sertelegger/clasp/security
-    about: Please report security issues privately via GitHub's vulnerability reporting, not as public issues. Read SECURITY.md first — CLASP runs commands on your machine by design, so the scope is narrower than it looks.
+    about: Please report security issues privately via GitHub's vulnerability reporting, not as public issues. Read SECURITY.md first — Holdfast runs commands on your machine by design, so the scope is narrower than it looks.
   - name: Known limitation, not a bug
     url: https://github.com/Sertelegger/clasp/blob/main/CHANGELOG.md#known-limitations
     about: Raw unredacted output, stdio-only transport, sessions dying with the MCP process, and Unix-only support are all current and known. Check here before filing.

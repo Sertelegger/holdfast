@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CLASP CI capability probe. The `test` job `needs:` it.
+# Holdfast CI capability probe. The `test` job `needs:` it.
 #
 # It asserts the three things the test suite silently assumes and that no
 # assertion in the suite itself can check:
@@ -79,7 +79,7 @@ done
 # versions obtainable there: 3.7.0 (noble's archive) fails the row on
 # `(exit 42)`, which is a subshell in bash and zsh and a rejected command
 # substitution in fish; 4.8.1 (the maintainers' PPA) fails it because
-# CLASP's own snippet guard declines to inject. Installing either would
+# Holdfast's own snippet guard declines to inject. Installing either would
 # turn a silent skip into a red row that says nothing about CI. See
 # ci.yml above the `test` job.
 if command -v fish >/dev/null 2>&1; then
@@ -170,7 +170,7 @@ while True:
 sys.exit(0 if b"PTY_OK_42" in buf else 1)
 PY
   then ok "forkpty + shell round-trip works"
-  else bad "forkpty round-trip FAILED — this runner cannot host CLASP's tests"
+  else bad "forkpty round-trip FAILED — this runner cannot host Holdfast's tests"
   fi
 else
   bad "python3 missing; cannot probe pty allocation"

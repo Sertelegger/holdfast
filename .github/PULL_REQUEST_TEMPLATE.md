@@ -23,4 +23,4 @@ Write "no test changes" if that's the case.
 - [ ] If a tool was added or removed: `tools.rs`'s router test, `tests/schema.rs`'s `TOOLS` list and annotation table, and the MCP server's `instructions` string are all updated
 - [ ] If an advertised number changed (a byte cap, a default, a threshold): the constant and the schema description it appears in moved together
 - [ ] If anything platform-gated changed: clippy is clean for `--target x86_64-pc-windows-gnu`
-- [ ] If this changes what CLASP claims to support: `README.md`, `CHANGELOG.md`, and — for anything touching detection, signals, secrets, or output — `SECURITY.md` are updated
+- [ ] If this changes what Holdfast claims to support: `README.md`, `CHANGELOG.md`, and — for anything touching detection, signals, secrets, or output — `SECURITY.md` are updated

@@ -486,7 +486,7 @@ def render(report: dict) -> str:
     out: list[str] = []
     w = out.append
 
-    w("CLASP orphan-requirement check")
+    w("Holdfast orphan-requirement check")
     w("=" * 66)
     w(f"spec:     {report['spec']}")
     w(f"plans:    {len(report['plans'])}")
@@ -923,7 +923,7 @@ def self_test() -> int:
 
 HOOK_BODY = """\
 #!/bin/sh
-# Installed by clasp/scripts/orphan-req-check.py --install-hook
+# Installed by holdfast/scripts/orphan-req-check.py --install-hook
 #
 # The spec lives in this repository, not in the one CI checks out, so this
 # is the only place the drift event -- a spec revision -- is observable.
@@ -962,7 +962,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Report §20 requirements that no implementation plan owns.")
     ap.add_argument("--repo-root", type=Path, default=None,
-                    help="clasp checkout (default: this script's parent repo)")
+                    help="holdfast checkout (default: this script's parent repo)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--self-test", action="store_true",
                     help="run the check against synthetic fixtures with known answers")

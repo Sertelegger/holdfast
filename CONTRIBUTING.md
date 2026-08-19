@@ -1,11 +1,11 @@
-# Contributing to CLASP
+# Contributing to Holdfast
 
 Thanks for your interest. This document covers the local setup, the checks that
 have to pass, and the two testing standards this project actually enforces —
 they are unusual enough that they trip people up, and they are the reason the
 suite is worth anything.
 
-CLASP is **early**. Milestones 0.0.1 through 0.0.5 have landed on `main`,
+Holdfast is **early**. Milestones 0.0.1 through 0.0.5 have landed on `main`,
 nothing is released, and the surface moves. [ROADMAP.md](./ROADMAP.md) shows
 what is being built next; opening an issue before a large change is
 appreciated.
@@ -25,15 +25,15 @@ cargo build --workspace
 To point Claude Code at your build:
 
 ```bash
-claude mcp add --scope user clasp -- "$(pwd)/target/debug/clasp" mcp
+claude mcp add --scope user holdfast -- "$(pwd)/target/debug/holdfast" mcp
 ```
 
-`clasp mcp [--no-daemon]` speaks MCP over stdio. By default it runs in
-**hybrid mode**: it auto-spawns a background `clasp daemon` that owns the
-sessions, so they outlive the MCP client that started them. `clasp daemon
-run|start|stop [--force]|status [--json]`, `clasp list [--json]`, `clasp logs
-<session> [--tail N] [--raw]`, and `clasp version` are all live subcommands.
-`clasp attach`, `watch`, `ui`, `confirm`, and the dangerous-command preflight
+`holdfast mcp [--no-daemon]` speaks MCP over stdio. By default it runs in
+**hybrid mode**: it auto-spawns a background `holdfast daemon` that owns the
+sessions, so they outlive the MCP client that started them. `holdfast daemon
+run|start|stop [--force]|status [--json]`, `holdfast list [--json]`, `holdfast logs
+<session> [--tail N] [--raw]`, and `holdfast version` are all live subcommands.
+`holdfast attach`, `watch`, `ui`, `confirm`, and the dangerous-command preflight
 are later milestones — see [ROADMAP.md](./ROADMAP.md).
 
 ## The checks
@@ -55,15 +55,15 @@ public, running these locally is still the actual gate and a red job is
 something a human has to notice.
 
 `cargo test --workspace` was 890 tests at the `v0.0.5` tag: 669 unit (666 in
-`clasp-core`'s lib, 3 in `clasp`'s bin), 23 in `tests/detection.rs`, 71 in
+`holdfast-core`'s lib, 3 in `holdfast`'s bin), 23 in `tests/detection.rs`, 71 in
 `tests/integration.rs`, 42 in `tests/schema.rs`, 19 in `tests/screen.rs`, 1 in
 `tests/stress_write_path.rs`, 1 in `tests/source_guards.rs`, 39 in
-`tests/control_protocol.rs`, and 25 in `crates/clasp/tests/daemon_cli.rs`.
+`tests/control_protocol.rs`, and 25 in `crates/holdfast/tests/daemon_cli.rs`.
 **Treat that count as already stale, not just as a tripwire.** It moved five
 times in the course of one milestone review and its own fix: wrong when a
 review first measured it, wronger while that review's own fix was being
 written two whole suites short, off by two more when a sibling change landed
-mid-fix, off by one *again* — a different suite, the `clasp-core` lib —
+mid-fix, off by one *again* — a different suite, the `holdfast-core` lib —
 between two re-measurements of *this very paragraph* taken minutes apart in
 an isolated worktree, and then by nine more when the re-review's own four
 fixes landed, one of which added a whole test file. No check in this repository currently fails when this

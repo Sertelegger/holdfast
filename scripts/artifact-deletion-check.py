@@ -1623,7 +1623,7 @@ def render(report: dict, show_record: bool) -> str:
     out: list[str] = []
     w = out.append
 
-    w("CLASP artifact deletion check — whole file, and whole item")
+    w("Holdfast artifact deletion check — whole file, and whole item")
     w("=" * 72)
     w(f"root:   {report['root']}")
     w(f"plans:  {len(report['plans'])}  "
@@ -3320,7 +3320,7 @@ def self_test(corpus_root: Path | None) -> int:
 
 HOOK_HEADER = """\
 #!/bin/sh
-# Post-commit hooks for the CLASP docs repo.
+# Post-commit hooks for the Holdfast docs repo.
 #
 # The plans and the spec live in THIS repository, not in the one CI checks
 # out, so this is the only place the drift events -- a spec revision, a plan
@@ -3377,7 +3377,7 @@ def main() -> int:
         description="Report plan steps that hand over the whole of an artifact "
                     "that has grown since the step was written.")
     ap.add_argument("--repo-root", type=Path, default=None,
-                    help="clasp checkout (default: this script's parent repo)")
+                    help="holdfast checkout (default: this script's parent repo)")
     ap.add_argument("--plans-dir", type=Path, default=None,
                     help="audit an arbitrary directory of plans instead of docs/")
     ap.add_argument("--all", action="store_true",

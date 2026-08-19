@@ -4,7 +4,7 @@
 # Two shapes of shortfall. One census, because they are one defect:
 #
 #   1. A ROW THAT DID NOT RUN. Eight rows of
-#      crates/clasp-core/tests/detection.rs early-`return` when their host
+#      crates/holdfast-core/tests/detection.rs early-`return` when their host
 #      requirement is unmet. libtest reports every one of them as `ok` and
 #      swallows the explanation unless `--show-output` is passed, so a
 #      suite that measured half of what its name promises still prints a
@@ -13,7 +13,7 @@
 #   2. AN ASSERTION THAT DID NOT RUN, INSIDE A ROW THAT DID. Spec §11.4's
 #      control-path p99 is asserted only where `available_parallelism()`
 #      reports >= 8 cores; below that the number measures the scheduler
-#      rather than CLASP. Measured on the 2-vCPU runner: the sampling loop
+#      rather than Holdfast. Measured on the 2-vCPU runner: the sampling loop
 #      gets 13 turns in three seconds instead of ~590, `percentile(0.99)`
 #      of thirteen samples IS the maximum, and one 500.89 ms scheduling
 #      stall failed a 500 ms budget. GitHub's standard hosted runners are
@@ -154,7 +154,7 @@ EXPECTED=(
 #   self-hosted runner, or a lowered `P99_MIN_CORES` does. Any of those
 #   makes the marker stop appearing in CI, which fails the stale half
 #   below — delete this entry then, and the gate in
-#   crates/clasp-core/tests/stress_write_path.rs with it.
+#   crates/holdfast-core/tests/stress_write_path.rs with it.
 GATED_EXPECTED=(
   "stress_write_path::control_path_p99|tier_b_stays_off_and_the_control_path_stays_responsive_under_load|8"
 )
@@ -503,7 +503,7 @@ self_test() {
   # notices inside it. The `not-asserted: ` line below is the one a real
   # 2-core run of this suite emits, copied verbatim.
   cat > "$td/ci.log" <<'FIXTURE'
-   Compiling clasp-core v0.0.4 (/repo/crates/clasp-core)
+   Compiling holdfast-core v0.0.4 (/repo/crates/holdfast-core)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 41.02s
      Running tests/detection.rs (/repo/target/debug/deps/detection-0000000000000001)
 
@@ -530,7 +530,7 @@ test tier_b_stays_off_and_the_control_path_stays_responsive_under_load ... ok
 successes:
 
 ---- tier_b_stays_off_and_the_control_path_stays_responsive_under_load stdout ----
-not-asserted: stress_write_path::control_path_p99 cores=2 min_cores=8 — §11.4's p99 needs >= 8 cores to be a statement about CLASP rather than about the scheduler; this box has 2. Measured anyway: p99 1.109297052s, max 1.109297052s, 17 samples, 2343186436 bytes streamed.
+not-asserted: stress_write_path::control_path_p99 cores=2 min_cores=8 — §11.4's p99 needs >= 8 cores to be a statement about Holdfast rather than about the scheduler; this box has 2. Measured anyway: p99 1.109297052s, max 1.109297052s, 17 samples, 2343186436 bytes streamed.
 
 
 successes:

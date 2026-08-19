@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Drive `clasp mcp` over stdio with raw JSON-RPC and CHECK the responses.
+# Drive `holdfast mcp` over stdio with raw JSON-RPC and CHECK the responses.
 #
 # This is the only thing in the project that exercises the real JSON-RPC
 # surface end to end: every Rust test asserts against in-process objects,
@@ -75,7 +75,7 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-# A private CLASP instance for this run, and the teardown that goes with
+# A private Holdfast instance for this run, and the teardown that goes with
 # it. From 0.0.5 on, `"$BIN" mcp` is hybrid mode: it AUTO-SPAWNS a daemon
 # and leaves it running when the transcript block ends. Without this
 # export that daemon lands in the invoking user's default runtime
@@ -332,7 +332,7 @@ jcheck "initialize advertises the tools capability" \
 # the wrong reason: it asserted the advertisement, and nothing anywhere
 # asserted the delivery. The forwarder that turns a
 # `resource_list_changed` pulse into an MCP notification is
-# `ClaspServer::on_initialized`, which needs the MCP peer; this script
+# `HoldfastServer::on_initialized`, which needs the MCP peer; this script
 # runs the DEFAULT transport, where that object lives in the daemon and
 # the pulse goes into a broadcast channel with zero receivers. §7.4.1's
 # streaming frames are reserved and unused in v0.1.0, so nothing carries
@@ -593,7 +593,7 @@ jcheck "list_sessions returns the session start_session created" \
    | data(13).sessions | [length, (.[0] | [.id == $id, .name, .state])]' \
   '[1,[true,"smoke","Running"]]'
 # `osc133_source` rides here rather than in its own check: the smoke shell
-# is a CLASP-integrated bash with no foreign emitter, so `holdfast` is the
+# is a Holdfast-integrated bash with no foreign emitter, so `holdfast` is the
 # only correct answer and it is only reachable if the snippet ran, was
 # tagged, and was not discarded. `null` means no marker ever arrived --
 # which the tier-1 check above already contradicts, so a disagreement

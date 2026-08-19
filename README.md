@@ -1,6 +1,11 @@
-# CLASP — Claude's Live Agent Shell Proxy
+# HOLDFAST — Human-Observable Long-lived Daemon For Agent Shell Terminals
 
 An MCP server that gives AI agents persistent, PTY-backed shell sessions.
+
+The **Human-Observable** in that name is the design intent, not a shipped
+property: as of 0.0.5 there is no `holdfast attach`, no `holdfast watch` and
+no web UI, so a human cannot yet look at a live session. See
+[ROADMAP.md](./ROADMAP.md).
 
 > **Status: milestone 0.0.5 — early development.** Eleven tools, hybrid
 > mode on Linux/macOS/WSL, Unix only. Sessions live in a background
@@ -33,12 +38,12 @@ An MCP server that gives AI agents persistent, PTY-backed shell sessions.
   still clipped at the old width
 - `interrupt` — send Ctrl+C to the foreground process group, stopping the
   command that is running without killing the shell hosting it
-- `clasp daemon start|stop|status|run` — manage the background daemon
-- `clasp list` / `clasp logs <session> [--tail N] [--raw]` — inspect
+- `holdfast daemon start|stop|status|run` — manage the background daemon
+- `holdfast list` / `holdfast logs <session> [--tail N] [--raw]` — inspect
   sessions from any terminal
 
-Sessions outlive the MCP client: `clasp mcp` auto-spawns a daemon on
-first use and reconnects to it afterwards. `clasp mcp --no-daemon` runs
+Sessions outlive the MCP client: `holdfast mcp` auto-spawns a daemon on
+first use and reconnects to it afterwards. `holdfast mcp --no-daemon` runs
 everything in-process instead.
 
 Sessions report **what the program is doing**, not a guess:
@@ -70,7 +75,7 @@ the cursor is sitting relative to a prompt character on the rendered
 line. The cursor term is 0 whenever tracking is off, so it can only add
 recall, never take it away.
 
-CLASP answers exactly one terminal query — Primary Device Attributes,
+Holdfast answers exactly one terminal query — Primary Device Attributes,
 replying `\x1b[?6c` with no optional parameter, so it claims no
 capability it does not have. A PTY master is not a terminal, so a shell
 that *waits* on a query stalls until its own timeout: measured, `fish`
@@ -83,7 +88,7 @@ into the child and accept the stall.
 
 ### Shell integration
 
-When the session command is `bash`, `zsh` or `fish`, CLASP types a
+When the session command is `bash`, `zsh` or `fish`, Holdfast types a
 one-line OSC 133 snippet at the first prompt, so the shell marks its own
 prompt, command and exit-code boundaries and detection runs at the
 `semantic` tier. The snippet wraps whatever `PS1` the shell ended up with
@@ -92,7 +97,7 @@ emits OSC 133, and is not exported — a nested shell is integrated in its
 own right. Pass `shell_integration: false` to `start_session` to skip it.
 
 It is **typed into the session, never installed**: there is nothing to add
-to an rc file, and `crates/clasp-core/src/detect/shell.rs` holds the only
+to an rc file, and `crates/holdfast-core/src/detect/shell.rs` holds the only
 copy of each snippet. Anything else — `dash`, `sh`, a REPL, a plain
 program — degrades silently to `terminal_mode` or `heuristic`, with no
 configuration and no error.
@@ -118,7 +123,7 @@ is licensed by `read_output`'s own `tail_lines` / `tail_bytes` argument
 ```bash
 cargo build --workspace
 ./scripts/mcp-smoke.sh                  # raw JSON-RPC smoke test (needs jq)
-claude mcp add --scope user clasp -- "$(pwd)/target/debug/clasp" mcp
+claude mcp add --scope user holdfast -- "$(pwd)/target/debug/holdfast" mcp
 ```
 
 ## Development
@@ -144,7 +149,7 @@ request runs:
 | `hygiene` | `scripts/ci-hygiene.sh` — asserts the workflows have not grown a publish step, a `continue-on-error`, a retry action, a `secrets.` reference, an unpinned action, a missing job timeout, or a checkout that leaves a pushable credential behind |
 | `fmt` | `cargo fmt --all --check` |
 | `clippy` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
-| `windows-cross` | The same clippy invocation against `x86_64-pc-windows-gnu`. A **cross-compilation check, not a test run** — it proves CLASP still *compiles* for Windows; it is not evidence that it *works* there |
+| `windows-cross` | The same clippy invocation against `x86_64-pc-windows-gnu`. A **cross-compilation check, not a test run** — it proves Holdfast still *compiles* for Windows; it is not evidence that it *works* there |
 | `probe` | `scripts/ci-probe.sh` — toolchain version, pseudoterminal allocation, and every shell and interpreter the suite spawns by name. Ten of `tests/detection.rs`'s 23 tests skip *and report as passing* when their program is absent, so this gate is part of what makes the test job's green mean something |
 | `test` | `scripts/ci-skip-census.sh --self-test` (the census's own gates, deleted one at a time against fixtures), then `cargo test --workspace --locked --no-fail-fast -- --test-threads=4 --show-output`, then `scripts/ci-skip-census.sh` over the captured log — which fails on any skipped row the pipeline has not agreed to, on any *assertion* gated off inside a row that ran without an agreed entry, **and on an agreed one of either kind that stopped happening** |
 | `package` | `cargo build --release --locked`, the MCP smoke script against the *release* binary, and a downloadable artifact + SHA-256. It `needs:` a green `test`, so the build that gets installed is the build that was tested |
@@ -235,10 +240,10 @@ runner image, at both fish versions obtainable on it:
   rejects it outright, so the shared assertion helper's expected marker stream
   never arrives.
 - **any fish ≥ 4.0** — a marker collision. Fish emits OSC 133 natively from
-  4.0 onward, and CLASP's snippet now injects unconditionally: the guard that
+  4.0 onward, and Holdfast's snippet now injects unconditionally: the guard that
   used to decline was deleted, because declining left a session with **no `B`
   marker at all** on 4.0–4.2 (which emit none of their own), so `command` was
-  empty forever. CLASP tags its markers `holdfast=1` and yields **per letter**,
+  empty forever. Holdfast tags its markers `holdfast=1` and yields **per letter**,
   which is the correct behaviour and is verified — a live fish 4.0.2 session
   driven through the MCP surface reports three commands, exit codes
   `[0, 1, 42]`, `osc133_source: "mixed"`, and no entry for the install line.
@@ -250,7 +255,7 @@ named row, and fails both on an unexpected skip and on that expected skip
 disappearing.
 
 **Spec §11.4's control-path p99 is never asserted in CI.**
-`crates/clasp-core/tests/stress_write_path.rs` asserts it only where
+`crates/holdfast-core/tests/stress_write_path.rs` asserts it only where
 `available_parallelism()` reports at least 8 cores, and GitHub's standard
 hosted runners are 2-core on a private repository — so the row runs, guards
 its other two assertions (`parsed == 0`, and the produced-bytes floor that
@@ -258,7 +263,7 @@ stops the run passing vacuously) on every host, and *reports the p99 instead
 of asserting it*. That is deliberate: measured on 2 cores, the sampling loop
 gets 13 turns in three seconds instead of ~590, `percentile(0.99)` of
 thirteen samples **is** the maximum, and the number describes the Linux
-scheduler rather than CLASP — a real 2-core run of this suite answers
+scheduler rather than Holdfast — a real 2-core run of this suite answers
 p99 = 1.11 s against a 500 ms budget, where 48 cores answer 731 µs.
 
 It is **explicit rather than silent** the same way the fish row is. The test
@@ -276,7 +281,7 @@ more, the assertion simply runs and the census says so.
   rather than a schedule
 - [CONTRIBUTING.md](./CONTRIBUTING.md) — the checks, and the two testing
   standards this project actually enforces
-- [SECURITY.md](./SECURITY.md) — what is in scope. CLASP runs commands on your
+- [SECURITY.md](./SECURITY.md) — what is in scope. Holdfast runs commands on your
   machine by design, so the interesting surface is the machinery around that:
   detection, signals, and the redactor that now runs at every output boundary.
 

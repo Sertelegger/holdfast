@@ -1,9 +1,9 @@
-# CLASP weekly mutation sweep.
+# Holdfast weekly mutation sweep.
 # Plan: docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md Task 6.
 #
-# holdfast-core AND clasp -- see the shard-calibration comment below for why
+# holdfast-core AND holdfast -- see the shard-calibration comment below for why
 # holdfast-core-only stopped being the right scope (0.0.5 milestone review,
-# finding I-18: crates/clasp/src/commands.rs holds `daemon stop --force`'s
+# finding I-18: crates/holdfast/src/commands.rs holds `daemon stop --force`'s
 # SIGKILL confirmation, the exit codes, and the /proc liveness evidence, and
 # was never mutation-tested by any scheduled job). NEVER on the push path --
 # a sweep is hours, and a per-push sweep is the first thing anyone disables.
@@ -98,7 +98,7 @@ jobs:
       # RE-CALIBRATED 2026-08-18 (0.0.5 milestone review, finding I-18).
       # Two things were wrong with the previous calibration, not one:
       #
-      # 1. SCOPE. holdfast-core only, so crates/clasp/src/commands.rs --
+      # 1. SCOPE. holdfast-core only, so crates/holdfast/src/commands.rs --
       #    `daemon stop --force`'s SIGKILL confirmation, the exit codes, the
       #    /proc liveness evidence -- was never mutation-tested by any
       #    scheduled job. Fixed by adding `--package holdfast` below.
@@ -107,7 +107,7 @@ jobs:
       #    (holdfast-core only) on 2026-08-17, and run 31883173007 was
       #    CANCELLED at the 350-minute timeout on 2026-08-15 having produced
       #    no verdict at all. 0.0.5 then added 10,652 lines to
-      #    crates/{holdfast-core,clasp}/src after the 08-17 measurement, so the
+      #    crates/{holdfast-core,holdfast}/src after the 08-17 measurement, so the
       #    3-way, holdfast-core-only shard math was already wrong by the time
       #    anyone would next read it.
       #
@@ -117,7 +117,7 @@ jobs:
       # protocol/method.rs) mid-edit by other in-flight work at the moment
       # of measurement:
       #   holdfast-core .................................... 1742 mutants
-      #   clasp ............................................ 47 mutants
+      #   holdfast ............................................ 47 mutants
       #   combined (both --package flags, one invocation) . 1789 mutants
       # cargo-mutants reads the working tree, not a commit, and the total
       # moved by several mutants within this same calibration session as
