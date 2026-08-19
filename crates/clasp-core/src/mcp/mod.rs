@@ -98,6 +98,28 @@ pub struct ClaspServer {
     /// periodic tick fires it — which is the half §5.5 says needs the
     /// daemon, since in hybrid mode the shim holds no registry.
     pub resource_list_changed: tokio::sync::broadcast::Sender<()>,
+    /// The time source every session this server creates is stamped
+    /// from (§16.7, REQ-S-005).
+    ///
+    /// **This field is the seam between the reaper's two halves.**
+    /// `SessionConfig::clock` and `Clock::now_ms` were both added so
+    /// that `scan_once`'s comparison — `clock.now_ms()` against
+    /// `Session::last_activity_ms` — stays inside one clock. But
+    /// `start_session` built its `SessionConfig` from
+    /// `..SessionConfig::default()` and never set `clock`, and
+    /// `ClaspServer` had no clock to give it: `Clock` had **zero**
+    /// occurrences anywhere under `mcp/`. So
+    /// `Daemon::with_clock(paths, Clock::manual(..))` ran the reaper on
+    /// the hand while every session created through the tool surface
+    /// stamped its deadline from `SystemTime::now()`, and the two halves
+    /// of one decision were read off two clocks.
+    ///
+    /// It appeared to work only because `Clock::manual` anchors its
+    /// epoch at construction, so the numbers coincide while the daemon
+    /// and the session are created within about a second of each other
+    /// — which is the failure `now_ms()` exists to prevent, one layer
+    /// up, and the seam 0.0.6's over-`attach.sock` test is promised.
+    pub clock: crate::clock::Clock,
 }
 
 impl ClaspServer {
@@ -130,6 +152,23 @@ impl ClaspServer {
         path: Option<PathBuf>,
         config: &crate::config::Config,
     ) -> Self {
+        Self::with_audit_path_config_and_clock(path, config, crate::clock::Clock::system())
+    }
+
+    /// The constructor the **daemon** uses, and the only one that can
+    /// hand a session the daemon's own clock.
+    ///
+    /// Every other constructor is wall time, which is right for them:
+    /// `serve_stdio` and every in-process test run on the system clock,
+    /// and a `Clock::manual` that nothing advances would freeze their
+    /// deadlines. The daemon is the one host that owns a clock, so it is
+    /// the one host that has to pass it down — see
+    /// [`ClaspServer::clock`].
+    pub fn with_audit_path_config_and_clock(
+        path: Option<PathBuf>,
+        config: &crate::config::Config,
+        clock: crate::clock::Clock,
+    ) -> Self {
         let rules = builtin_shared();
         let audit = match path {
             Some(p) => match AuditLog::to_path(&p, Arc::clone(&rules)) {
@@ -150,6 +189,7 @@ impl ClaspServer {
             )),
             config: Arc::new(config.clone()),
             resource_list_changed: tokio::sync::broadcast::channel(RESOURCE_EVENT_CAPACITY).0,
+            clock,
         }
     }
 

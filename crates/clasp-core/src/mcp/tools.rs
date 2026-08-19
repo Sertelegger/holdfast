@@ -340,6 +340,13 @@ impl ClaspServer {
             // `idle_timeout_secs` here — and unifying them would delete
             // the distinction the precedence rule is about.
             idle_timeout_secs: idle_timeout_secs_resolved,
+            // §16.7's other half. `..SessionConfig::default()` supplies
+            // `Clock::system()`, so leaving this unset stamps the
+            // session's deadline from wall time while the reaper decides
+            // about it on the daemon's injectable clock — the two halves
+            // of one decision read off two clocks, which is the failure
+            // `Clock::now_ms` was added to prevent one layer down.
+            clock: self.clock.clone(),
             ..SessionConfig::default()
         };
 
@@ -1634,6 +1641,96 @@ mod tests {
              its annotation table, and scripts/mcp-smoke.sh (which only CI \
              runs) to match"
         );
+    }
+
+    /// §16.7's two halves have to be read off **one** clock, and
+    /// `start_session` is where they were read off two.
+    ///
+    /// `Session::new` stamps `last_activity_ms` from
+    /// `SessionConfig::clock`, and the reaper compares that stamp
+    /// against `Clock::now_ms()`. But `start_session` built its config
+    /// from `..SessionConfig::default()` and never set `clock`, and
+    /// `ClaspServer` had no clock to set it from — `Clock` had zero
+    /// occurrences anywhere under `mcp/`. So a daemon built with
+    /// `Daemon::with_clock(paths, Clock::manual(..))` advanced its own
+    /// hand while every session it created was stamped from
+    /// `SystemTime::now()`.
+    ///
+    /// **The hand is advanced before the session exists, which is the
+    /// only way to see it.** `Clock::manual` anchors its epoch at
+    /// construction, so a session created immediately after the server
+    /// gets nearly the same number from either clock and the defect is
+    /// invisible — which is exactly why it survived.
+    ///
+    /// The last two assertions are the point: an hour of hand against a
+    /// 30-minute default idle timeout means the mixed-clock version does
+    /// not merely mis-stamp, it **reaps a session one instruction after
+    /// creating it**. The paired advance kills the opposite reading, a
+    /// reaper that never reaps at all.
+    #[tokio::test]
+    async fn a_session_is_stamped_from_the_servers_clock_and_not_from_wall_time() {
+        use crate::clock::Clock;
+        use crate::session::Reaper;
+        use std::time::Duration;
+
+        let clock = Clock::manual(Instant::now());
+        let server = ClaspServer::with_audit_path_config_and_clock(
+            None,
+            &crate::config::Config::default(),
+            clock.clone(),
+        );
+        clock.advance(Duration::from_secs(3600));
+
+        server
+            .start_session(Parameters(StartSessionArgs {
+                // Reads its PTY and stays alive, so the session is live
+                // when the reaper looks at it.
+                command: "cat".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("start_session");
+
+        let all = server.registry.all();
+        assert_eq!(all.len(), 1, "the session was not created");
+        let session = Arc::clone(&all[0]);
+
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(
+            session.last_activity_ms() > wall_ms + 3_000_000,
+            "the session was stamped from wall time ({}) while the reaper \
+             decides about it on the daemon's clock ({})",
+            session.last_activity_ms(),
+            clock.now_ms()
+        );
+        assert!(
+            (session.last_activity_ms() - clock.now_ms()).abs() < 5_000,
+            "the session is on neither clock: stamp {}, server clock {}",
+            session.last_activity_ms(),
+            clock.now_ms()
+        );
+
+        // And the consequence, which is the whole reason the seam
+        // matters: `[limits] default_idle_timeout_secs` is 1800, so a
+        // stamp an hour behind the reaper's `now` is already past its
+        // deadline the instant the session is born.
+        let reaper = Reaper::new(Arc::clone(&server.registry), clock.clone());
+        assert_eq!(
+            reaper.scan_once(),
+            0,
+            "the reaper killed a session created a moment ago"
+        );
+        assert!(session.is_alive());
+
+        // The pairing: a reaper that reaps nothing at all satisfies the
+        // row above perfectly.
+        clock.advance(Duration::from_secs(1801));
+        assert_eq!(reaper.scan_once(), 1);
+
+        let _ = session.signal(crate::pty::Signal::Kill);
     }
 
     /// The advertised description of one tool argument, as the agent

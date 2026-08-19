@@ -2654,6 +2654,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
             // replaced, because the point here is the *registry* limit.
             config: std::sync::Arc::clone(&small.config),
             resource_list_changed: small.resource_list_changed.clone(),
+            clock: small.clock.clone(),
         };
         let (_first, _) = start_bash(&server_one).await;
         note(&body(

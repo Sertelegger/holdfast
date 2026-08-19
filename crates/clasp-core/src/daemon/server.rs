@@ -225,7 +225,15 @@ impl Daemon {
         let (shutdown_tx, _) = watch::channel(false);
         let audit_path = paths.audit_log();
         Arc::new(Self {
-            server: ClaspServer::with_audit_path_and_config(Some(audit_path), &config),
+            // The clock goes down to the server, and from there into
+            // every `SessionConfig` `start_session` builds. Without it
+            // `Daemon::with_clock` moves the reaper's hand while the
+            // sessions it is deciding about are stamped from wall time.
+            server: ClaspServer::with_audit_path_config_and_clock(
+                Some(audit_path),
+                &config,
+                clock.clone(),
+            ),
             paths,
             // On the daemon's own clock, not `Instant::now()`. §7.3's
             // window falls back to this when no client has ever
@@ -1659,6 +1667,43 @@ mod tests {
             "SIGTERM alone leaves a trapping child running forever"
         );
         assert!(!s.is_alive());
+    }
+
+    /// The daemon's clock has to reach the server, or
+    /// `Daemon::with_clock` moves a hand that nothing downstream reads.
+    ///
+    /// This is the middle link of a three-part chain, and it was the
+    /// broken one. `Clock::now_ms` keeps the reaper's comparison inside
+    /// one clock; `mcp::tools`'s
+    /// `a_session_is_stamped_from_the_servers_clock_and_not_from_wall_time`
+    /// proves the server stamps every session it creates from its own;
+    /// and this proves the daemon gives the server the hand it is itself
+    /// reading. Revert `build` to `with_audit_path_and_config` and the
+    /// server silently falls back to `Clock::system()`.
+    #[test]
+    fn the_daemons_clock_reaches_the_server_that_creates_its_sessions() {
+        let paths = scratch("clockseam");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        let daemon = Daemon::with_config_and_clock(paths, Config::default(), clock.clone());
+
+        clock.advance(Duration::from_secs(3600));
+        assert_eq!(
+            daemon.server.clock.now_ms(),
+            clock.now_ms(),
+            "the server reads wall time while the daemon's hand is an hour \
+             ahead, so every session it creates carries a deadline the reaper \
+             evaluates against a different clock"
+        );
+        // The separator. Two `Clock::system()`s agree to the millisecond
+        // as readily as one shared hand does, so the row above proves
+        // nothing on its own — this is what says the clock under test
+        // really has been displaced from wall time.
+        assert!(
+            daemon.server.clock.now_ms() - Clock::system().now_ms() > 3_000_000,
+            "the clock being compared is not a hand at all"
+        );
     }
 
     // ------------------------------- the periodic tick, actuated (Task 16)
