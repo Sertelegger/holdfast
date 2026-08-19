@@ -7,6 +7,16 @@
 // there, and `holdfast logs --raw` is specified to be unredacted.
 #![deny(clippy::print_stderr)]
 
+/// The local terminal half of `holdfast attach`.
+///
+/// **Gated here rather than with an inner `#![cfg(unix)]`**, so the
+/// `windows-cross` job sees a module that does not exist rather than one
+/// that exists and is empty — and so this line and `commands`'s
+/// `#[cfg(windows)]` refusal arms sit where a reader looking for the
+/// platform boundary will find them together. §3.6 marks `holdfast
+/// attach` and `holdfast watch` `✗` on Windows native permanently.
+#[cfg(unix)]
+mod attach_tty;
 mod commands;
 
 // Imports the module *and* the `diag!` macro — a `#[macro_export]` macro
@@ -28,6 +38,8 @@ USAGE:
     holdfast list [--json]            List sessions
     holdfast logs <session> [--tail N] [--raw]
                                       Print a session's output
+    holdfast attach <session>         Take over the session's terminal
+                                      (detach with Ctrl-B then d)
     holdfast version                  Print version information
 
 ENVIRONMENT:
@@ -115,6 +127,12 @@ async fn run() -> ExitCode {
                 None => None,
             };
             commands::logs(session, tail, flag("--raw")).await
+        }
+        Some("attach") => {
+            let Some(session) = args.get(1).filter(|a| !a.starts_with("--")) else {
+                return usage_error("`attach` needs a session id or name");
+            };
+            commands::attach(session).await
         }
         Some("version") => commands::version(),
         Some(other) => usage_error(&format!("unknown subcommand `{other}`")),

@@ -16,3 +16,12 @@ libc.workspace = true
 rmcp.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+# NEW in 0.0.6 — `crates/holdfast` has had no `[dev-dependencies]` section
+# through 0.0.5, deliberately: a binary crate's regular dependencies are
+# visible to its integration tests, so nothing needed one until
+# `attach_cli.rs` wanted a PTY *master* of its own. The shipped `holdfast
+# attach` allocates no PTY — it uses the terminal it was given — which is
+# why this is a dev-dependency and not a dependency.
+[dev-dependencies]
+portable-pty.workspace = true

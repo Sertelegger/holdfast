@@ -741,6 +741,424 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
     ExitCode::SUCCESS
 }
 
+/// The §7.5 handshake `holdfast attach` sends, **in full**.
+///
+/// §7.5 spells out that its own example is elided: `client_kind`,
+/// `client_version`, `protocol_major` and `protocol_minor` are *not*
+/// optional and **only `role` is**, so an abbreviation here is a client
+/// that cannot complete a handshake.
+///
+/// `role: Interactive` is REQ-SEC-008's first half: raw fidelity, no
+/// redaction. A redacted password prompt would corrupt what the human
+/// types back. `holdfast watch` sends the other pairing.
+///
+/// Note the constant path — `protocol::PROTOCOL_MAJOR`, **not**
+/// `protocol::handshake::PROTOCOL_MAJOR`. It is the same path
+/// [`version`] prints from, which is what makes
+/// `holdfast_version_prints_the_protocol_the_sockets_speak` an assertion
+/// about one number rather than two.
+#[cfg(unix)]
+fn attach_handshake(
+    session: &str,
+    mode: holdfast_core::attach::AttachMode,
+    role: holdfast_core::attach::AttachRole,
+) -> holdfast_core::attach::ClientFrame {
+    holdfast_core::attach::ClientFrame::Attach {
+        session: session.to_string(),
+        mode,
+        role,
+        client_kind: ClientKind::Cli,
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_major: holdfast_core::protocol::PROTOCOL_MAJOR,
+        protocol_minor: holdfast_core::protocol::PROTOCOL_MINOR,
+    }
+}
+
+/// What the handshake settled on, or why it did not.
+#[cfg(unix)]
+enum Dialled {
+    /// Attached. The stream's two halves, plus the geometry the session
+    /// is currently at.
+    Ok(
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+    ),
+    /// The daemon refused, or answered something unusable, and has
+    /// already been reported. Carries the exit code.
+    Refused(u8),
+}
+
+/// Connect to `attach.sock`, send the handshake, and check the answer —
+/// including the half §7.5 makes the *client's* job.
+///
+/// **The client re-checks the major even though the daemon accepted**
+/// (REQ-D-004a's third case). An older daemon that never heard of the
+/// symmetry rule can accept a client it cannot understand, and the client
+/// is the peer that can still tell. §7.5: *"there is no wire token for
+/// that refusal"* — so the message below carries none, and the test
+/// asserts that.
+#[cfg(unix)]
+async fn dial_attach(
+    session: &str,
+    mode: holdfast_core::attach::AttachMode,
+    role: holdfast_core::attach::AttachRole,
+    what: &str,
+) -> Dialled {
+    use holdfast_core::attach::{client_accepts_daemon, ServerFrame};
+    use holdfast_core::protocol::frame;
+
+    let paths = match paths() {
+        Ok(p) => p,
+        Err(e) => {
+            diag!("holdfast {what}: {e}");
+            return Dialled::Refused(EXIT_UNREACHABLE);
+        }
+    };
+    let sock = paths.attach_sock();
+    let stream = match tokio::net::UnixStream::connect(&sock).await {
+        Ok(s) => s,
+        Err(e) => {
+            diag!(
+                "holdfast {what}: cannot reach the daemon at {}: {e}",
+                sock.display()
+            );
+            return Dialled::Refused(EXIT_UNREACHABLE);
+        }
+    };
+    let (mut rd, mut wr) = stream.into_split();
+
+    if let Err(e) = frame::write_frame(&mut wr, &attach_handshake(session, mode, role)).await {
+        diag!("holdfast {what}: could not send the attach handshake: {e}");
+        return Dialled::Refused(EXIT_UNREACHABLE);
+    }
+
+    loop {
+        let body = match frame::read_frame_body(&mut rd).await {
+            Ok(b) => b,
+            Err(e) => {
+                diag!("holdfast {what}: the daemon closed the connection: {e}");
+                return Dialled::Refused(EXIT_UNREACHABLE);
+            }
+        };
+        let f = match holdfast_core::attach::decode_server_frame(&body) {
+            Ok(f) => f,
+            Err(e) => {
+                diag!("holdfast {what}: undecodable frame from the daemon: {e}");
+                return Dialled::Refused(EXIT_FAILED);
+            }
+        };
+        match f {
+            // §12.3's forward-compatibility seam, and it is live from the
+            // first frame: a newer daemon may prepend a frame this build
+            // has never heard of, and skipping it is what lets §7.8 land
+            // additively (REQ-SURF-002).
+            ServerFrame::Unknown { .. } => continue,
+            ServerFrame::Attached {
+                protocol_major,
+                protocol_minor,
+                ..
+            } => {
+                if !client_accepts_daemon(protocol_major) {
+                    // **No wire reason token in this message**, on
+                    // purpose: §7.5 gives this refusal none, because the
+                    // peer that would have sent one is the peer that
+                    // failed to check. And no further frame is sent —
+                    // not even `Detach`.
+                    diag!(
+                        "holdfast {what}: this daemon accepted an attach it should have \
+                         refused. It speaks attach protocol {protocol_major}.{protocol_minor} \
+                         and this client speaks {}.{}. Upgrade whichever is older.",
+                        holdfast_core::protocol::PROTOCOL_MAJOR,
+                        holdfast_core::protocol::PROTOCOL_MINOR,
+                    );
+                    return Dialled::Refused(EXIT_FAILED);
+                }
+                return Dialled::Ok(rd, wr);
+            }
+            // §7.5's refusal. `message` is a whole sentence that *begins*
+            // with the §18.4b token, so printing it verbatim is what lets
+            // an operator tell `session_not_found` from
+            // `protocol_too_old` — a bare "failed to attach" cannot.
+            ServerFrame::AttachReject { message, .. } => {
+                diag!("holdfast {what}: {message}");
+                return Dialled::Refused(EXIT_FAILED);
+            }
+            ServerFrame::ProtocolError {
+                reason, frame_kind, ..
+            } => {
+                match frame_kind {
+                    Some(k) => diag!("holdfast {what}: protocol error: {reason} ({k})"),
+                    None => diag!("holdfast {what}: protocol error: {reason}"),
+                }
+                return Dialled::Refused(EXIT_FAILED);
+            }
+            other => {
+                diag!(
+                    "holdfast {what}: the daemon answered {:?} before `Attached`",
+                    other.tag()
+                );
+                return Dialled::Refused(EXIT_FAILED);
+            }
+        }
+    }
+}
+
+/// Read whole frame bodies off the socket into a channel.
+///
+/// **A dedicated task and not a `select!` branch.** `read_frame_body`
+/// reads a 4-byte prefix and then the body; cancelling it between the two
+/// leaves the stream desynchronised for every frame after it, and a
+/// `select!` cancels whichever branch did not win *every time round the
+/// loop*. A channel receive is cancel-safe, so the framing lives here and
+/// the loop only ever drops a `recv`.
+#[cfg(unix)]
+fn spawn_frame_reader(
+    mut rd: tokio::net::unix::OwnedReadHalf,
+) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    tokio::spawn(async move {
+        while let Ok(body) = holdfast_core::protocol::frame::read_frame_body(&mut rd).await {
+            if tx.send(body).await.is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// Read the local terminal on a dedicated OS thread.
+///
+/// Not `tokio::io::stdin()`: that borrows the blocking pool for the life
+/// of the process, and the runtime's shutdown grace then has a parked
+/// `read` in it on every exit path. A plain thread is never joined and
+/// costs nothing at exit, because returning from `main` ends the process
+/// whatever its threads are doing.
+#[cfg(unix)]
+fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// Write bytes to the local terminal, unmodified.
+///
+/// `write_all` and not `print!`: the payload is a PTY's raw byte stream,
+/// which is not UTF-8 in general (a `less` redraw and a `vim` session both
+/// carry lone `0x9b`-style bytes), and it must not be reformatted.
+#[cfg(unix)]
+fn render(bytes: &[u8]) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+}
+
+/// `holdfast attach <session>` — §6.1 Layer 1.
+///
+/// Your terminal *becomes* the session: raw mode, full colour, full
+/// keyboard, no redaction (`role: interactive`, REQ-SEC-008). Detach with
+/// `Ctrl-B` then `d`; **the session keeps running** (§6.1: *"cleanly
+/// disconnects without killing the session"*).
+#[cfg(unix)]
+pub async fn attach(session: &str) -> ExitCode {
+    use holdfast_core::attach::{AttachMode, AttachRole, ClientFrame, ServerFrame};
+    use holdfast_core::protocol::frame;
+    use std::os::unix::io::AsRawFd;
+
+    let (rd, mut wr) = match dial_attach(
+        session,
+        AttachMode::ReadWrite,
+        AttachRole::Interactive,
+        "attach",
+    )
+    .await
+    {
+        Dialled::Ok(rd, wr) => (rd, wr),
+        Dialled::Refused(code) => return ExitCode::from(code),
+    };
+
+    // The controlling terminal. **The guard is taken before anything
+    // else can fail**, and every exit path below — including a panic —
+    // runs its `Drop`. A restore that has to be remembered on each path
+    // is one that gets forgotten on exactly one of them, and the cost is
+    // the user's shell left mute.
+    let tty = std::io::stdin().as_raw_fd();
+    let _raw = match crate::attach_tty::TermiosGuard::raw(tty) {
+        Ok(g) => g,
+        Err(e) => {
+            diag!(
+                "holdfast attach: this is not a terminal ({e}). `holdfast attach` needs \
+                 one; use `holdfast watch` to follow a session from a pipe."
+            );
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
+
+    let mut frames = spawn_frame_reader(rd);
+    let mut keys = spawn_stdin_reader();
+    let mut winch =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
+            Ok(s) => s,
+            Err(e) => {
+                diag!("holdfast attach: cannot watch for terminal resizes: {e}");
+                return ExitCode::from(EXIT_FAILED);
+            }
+        };
+
+    // One at startup, so the session reflows to *this* terminal
+    // immediately rather than at the first time the user drags a window.
+    if let Ok((cols, rows)) = crate::attach_tty::window_size(tty) {
+        if frame::write_frame(&mut wr, &ClientFrame::Resize { cols, rows })
+            .await
+            .is_err()
+        {
+            return ExitCode::from(EXIT_UNREACHABLE);
+        }
+    }
+
+    let mut detach = crate::attach_tty::DetachKey::default();
+    // `Some` while an `AwaitingSecret` is outstanding: the request id to
+    // answer, and the line being typed. While this is set, keystrokes go
+    // into the line and **not** onto the wire as `Input` — which is what
+    // keeps the value off the session's echo as well as off this terminal
+    // (§9.5).
+    let mut secret: Option<(String, crate::attach_tty::SecretLine)> = None;
+
+    loop {
+        tokio::select! {
+            body = frames.recv() => {
+                let Some(body) = body else {
+                    // EOF with no `Detached` before it: the daemon died
+                    // or the socket broke. Distinct from every clean
+                    // ending, which returns from inside this match.
+                    diag!("holdfast attach: the daemon closed the connection");
+                    return ExitCode::from(EXIT_UNREACHABLE);
+                };
+                let f = match holdfast_core::attach::decode_server_frame(&body) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        diag!("holdfast attach: undecodable frame: {e}");
+                        return ExitCode::from(EXIT_FAILED);
+                    }
+                };
+                match f {
+                    ServerFrame::Output { bytes, .. } => render(&bytes),
+                    ServerFrame::SessionExited { code } => {
+                        diag!("holdfast attach: the session exited ({code})");
+                    }
+                    ServerFrame::Detached { reason } => {
+                        diag!("holdfast attach: detached ({reason})");
+                        return ExitCode::SUCCESS;
+                    }
+                    ServerFrame::AwaitingSecret { request_id, prompt_text } => {
+                        // On its own line, so it cannot be mistaken for
+                        // part of whatever the child last drew.
+                        render(b"\r\n");
+                        render(prompt_text.as_bytes());
+                        render(b"\r\n");
+                        secret = Some((request_id, crate::attach_tty::SecretLine::default()));
+                    }
+                    ServerFrame::SecretRequestClosed { request_id, outcome } => {
+                        if secret.as_ref().is_some_and(|(id, _)| *id == request_id) {
+                            secret = None;
+                            diag!("holdfast attach: secret request {outcome}");
+                        }
+                    }
+                    // Another client resized the session. This terminal
+                    // cannot be resized from here, so the view is simply
+                    // reported rather than silently wrong.
+                    ServerFrame::Resize { cols, rows } => {
+                        diag!("holdfast attach: the session is now {cols}x{rows}");
+                    }
+                    ServerFrame::ProtocolError { reason, frame_kind } => {
+                        match frame_kind {
+                            Some(k) => diag!("holdfast attach: protocol error: {reason} ({k})"),
+                            None => diag!("holdfast attach: protocol error: {reason}"),
+                        }
+                    }
+                    // §7.5's client-side skip. Not an error: this is the
+                    // property that lets a newer daemon add a frame.
+                    ServerFrame::Unknown { .. } => {}
+                    ServerFrame::Attached { .. } | ServerFrame::AttachReject { .. } => {
+                        diag!("holdfast attach: a second handshake frame arrived; ignoring it");
+                    }
+                }
+            }
+            chunk = keys.recv() => {
+                let Some(chunk) = chunk else {
+                    // Local stdin closed. Leave without killing the
+                    // session, exactly as the detach key does.
+                    let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
+                    return ExitCode::SUCCESS;
+                };
+                if let Some((id, line)) = secret.as_mut() {
+                    if let Some(bytes) = line.feed(&chunk) {
+                        let f = ClientFrame::SecretInput { request_id: id.clone(), bytes };
+                        let sent = frame::write_frame(&mut wr, &f).await;
+                        secret = None;
+                        render(b"\r\n");
+                        if sent.is_err() {
+                            return ExitCode::from(EXIT_UNREACHABLE);
+                        }
+                    }
+                    continue;
+                }
+                let (forward, detached) = detach.feed(&chunk);
+                if !forward.is_empty() {
+                    let f = ClientFrame::Input { bytes: forward };
+                    if frame::write_frame(&mut wr, &f).await.is_err() {
+                        return ExitCode::from(EXIT_UNREACHABLE);
+                    }
+                }
+                if detached {
+                    let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
+                    render(b"\r\n");
+                    return ExitCode::SUCCESS;
+                }
+            }
+            _ = winch.recv() => {
+                if let Ok((cols, rows)) = crate::attach_tty::window_size(tty) {
+                    if frame::write_frame(&mut wr, &ClientFrame::Resize { cols, rows })
+                        .await
+                        .is_err()
+                    {
+                        return ExitCode::from(EXIT_UNREACHABLE);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// §3.6 marks `holdfast attach` `✗` on Windows native **permanently** —
+/// there is no daemon there to attach to.
+///
+/// The arm exists so `main.rs`'s unconditional match compiles on that
+/// target: a `#[cfg(unix)]`-only function referenced by an unconditional
+/// caller is a hard error under `windows-cross`, not a warning.
+#[cfg(windows)]
+pub async fn attach(_session: &str) -> ExitCode {
+    diag!(
+        "holdfast attach is not supported on Windows native (§3.6): there is \
+         no daemon to attach to. Use WSL."
+    );
+    ExitCode::from(EXIT_USAGE)
+}
+
 /// `holdfast version`
 pub fn version() -> ExitCode {
     println!(

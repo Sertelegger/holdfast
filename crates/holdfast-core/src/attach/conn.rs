@@ -105,7 +105,20 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream) {
                 &mut wr,
                 &ServerFrame::AttachReject {
                     reason: REJECT_SESSION_NOT_FOUND.to_string(),
-                    message: format!("no live session matched {:?}", hs.session),
+                    // **Begins with the §18.4b token**, like every other
+                    // `AttachReject.message`. §7.5's rule is that the
+                    // message *"carries a whole sentence and always
+                    // begins with one of these, so a client branches on
+                    // the cause without matching prose"* — and this arm
+                    // did not, so `holdfast attach` printing the message
+                    // verbatim reported a missing session with no way for
+                    // an operator to tell it from a version refusal.
+                    // Found by Task 11's client-side row; the separator
+                    // is `evaluate_attach`'s, space + em dash + space.
+                    message: format!(
+                        "{REJECT_SESSION_NOT_FOUND} — no live session matched {:?}",
+                        hs.session
+                    ),
                 },
             )
             .await;

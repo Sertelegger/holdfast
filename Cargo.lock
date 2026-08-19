@@ -485,6 +485,7 @@ dependencies = [
  "anyhow",
  "holdfast-core",
  "libc",
+ "portable-pty",
  "rmcp",
  "serde_json",
  "tokio",
