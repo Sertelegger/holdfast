@@ -471,6 +471,58 @@ async fn attached_reports_the_same_state_strings_as_the_mcp_surface() {
 }
 
 #[tokio::test]
+async fn attaching_to_an_already_exited_session_is_told_and_torn_down() {
+    // **`SessionEvent::Exited` is a one-shot edge and this client
+    // arrived after it.** The row above proves the *state string* is
+    // right and then abandons the connection; this one asks what happens
+    // next, which used to be: nothing, ever. The output broadcast cannot
+    // close either — §5.5.1 retains exited sessions for the daemon's
+    // lifetime and `SessionRegistry::remove` has no caller anywhere in
+    // the repo — so `forward_output` parked forever and
+    // `holdfast watch <exited-session>` hung until the user found
+    // Ctrl-C.
+    //
+    // The sequence asserted is §7.5's, unchanged: the same
+    // flush → `SessionExited` → `Detached` → close a client attached
+    // *before* the exit receives. A daemon that told the client only in
+    // `Attached.state` would pass the first arm and hang on the second,
+    // which is exactly the shipped behaviour this replaces.
+    let d = TestDaemon::start("exitedattach").await;
+    let (s, pty) = d.session(None);
+    let id = s.id.clone();
+    pty.exit(7);
+
+    let mut c = d.dial().await;
+    send(&mut c, &attach_to(&id)).await;
+    match recv(&mut c).await {
+        ServerFrame::Attached {
+            state, exit_code, ..
+        } => {
+            assert_eq!(state, "Exited");
+            assert_eq!(exit_code, Some(7));
+        }
+        other => panic!("expected Attached, got {other:?}"),
+    }
+    // The **same** number as `Attached.exit_code` above, and not by
+    // coincidence: both are derived from `Session::state()`, so the two
+    // fields cannot disagree about one child.
+    match recv(&mut c).await {
+        ServerFrame::SessionExited { code } => assert_eq!(code, 7),
+        other => panic!("expected SessionExited, got {other:?}"),
+    }
+    match recv(&mut c).await {
+        ServerFrame::Detached { reason } => assert_eq!(reason, "session_exit"),
+        other => panic!("expected Detached, got {other:?}"),
+    }
+    expect_eof(&mut c, "an attach to an already-exited session").await;
+
+    // And the daemon is still serving: an exited session must be a dead
+    // end for one connection, not for the process.
+    let (live, _p) = d.session(None);
+    assert_daemon_survives(&d, &live.id).await;
+}
+
+#[tokio::test]
 async fn a_version_mismatched_client_is_rejected_over_attach_sock_in_both_directions() {
     // REQ-D-004a's integration clause, and the reason the unit tests in
     // `attach::handshake` alone do not cover it. Four assertions per

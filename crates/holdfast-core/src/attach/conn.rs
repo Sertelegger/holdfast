@@ -251,6 +251,7 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
 
     let writer = tokio::spawn(write_loop(wr, rx));
     let mut forwarder = tokio::spawn(forward_output(
+        Arc::clone(&session),
         conn.session_id.clone(),
         output,
         exit_events,
@@ -750,6 +751,7 @@ async fn write_loop(mut wr: tokio::net::unix::OwnedWriteHalf, mut rx: mpsc::Rece
 /// reasons about the WebSocket's version of this, where the same frame
 /// *is* deliverable.
 async fn forward_output(
+    session: Arc<Session>,
     session_id: String,
     mut output: tokio::sync::broadcast::Receiver<crate::session::OutputFrame>,
     mut exits: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
@@ -758,6 +760,35 @@ async fn forward_output(
 ) -> Forwarded {
     use tokio::sync::broadcast::error::RecvError;
     use tokio::sync::mpsc::error::TrySendError;
+
+    // **The client that arrived after the edge had already passed.**
+    // `SessionEvent::Exited` is sent once, by the reader thread, and a
+    // connection that subscribed afterwards can never see it. Nor does
+    // the output broadcast ever close: §5.5.1 retains exited sessions
+    // for the daemon's lifetime — deliberately, so `holdfast logs` can
+    // still read one — `SessionRegistry::remove` has no caller anywhere
+    // in the tree, and the `Session` holds its own `Sender`. So without
+    // this the task parked forever on two channels that were never going
+    // to produce anything, and `holdfast watch <exited-session>` hung
+    // until the operator found Ctrl-C.
+    //
+    // **Read the state rather than replay the edge**, because the state
+    // is what the daemon already knows: `Attached.state` said `"Exited"`
+    // in frame one all along. And checked **here**, after `run` has
+    // subscribed to both channels, not before — a session that dies in
+    // the window between the subscribe and this line is caught by the
+    // event instead, so the two together have no gap. Whichever fires,
+    // the task returns at the first one, so there is no double
+    // `SessionExited`.
+    if !session.is_alive() {
+        return send_exit(
+            &session_id,
+            reported_exit_code(&session),
+            &tx,
+            &mut redactor,
+        );
+    }
+
     loop {
         // **`biased`, output first, and it is what orders the two
         // channels against each other.** The child's last bytes and its
@@ -782,16 +813,7 @@ async fn forward_output(
             // half that keeps this path from becoming the leak the carry
             // bound exists to stop.
             Either::Event(Ok(crate::session::SessionEvent::Exited { code })) => {
-                if let Some(tail) = redactor.as_mut().map(|r| r.flush()) {
-                    if !tail.is_empty() {
-                        let _ = tx.try_send(ServerFrame::Output {
-                            session: session_id.clone(),
-                            bytes: tail,
-                        });
-                    }
-                }
-                let _ = tx.try_send(ServerFrame::SessionExited { code });
-                return Forwarded::SessionExit;
+                return send_exit(&session_id, code, &tx, &mut redactor);
             }
             // The secret edges belong to `forward_events`, which is the
             // task that can reach the hub. Ignored rather than matched
@@ -868,6 +890,50 @@ async fn forward_output(
                 return Forwarded::Stopped;
             }
         }
+    }
+}
+
+/// §7.5's exit sequence, from whichever of its two triggers reached it.
+///
+/// **One function and not two copies**, because the ordering is the
+/// requirement: everything the redactor is still carrying is flushed
+/// *first* — a session that died mid-token must not silently swallow its
+/// last line — and only then does `SessionExited` go on the queue. Both
+/// callers put their frames on the same FIFO that `write_loop` drains, so
+/// `Detached` (queued by `run` when this returns) is still last. Two
+/// hand-written copies of that could drift, and the one that drifted
+/// would be the rarely-taken one.
+fn send_exit(
+    session_id: &str,
+    code: i32,
+    tx: &mpsc::Sender<ServerFrame>,
+    redactor: &mut Option<super::redact_stream::StreamRedactor>,
+) -> Forwarded {
+    if let Some(tail) = redactor.as_mut().map(|r| r.flush()) {
+        if !tail.is_empty() {
+            let _ = tx.try_send(ServerFrame::Output {
+                session: session_id.to_string(),
+                bytes: tail,
+            });
+        }
+    }
+    let _ = tx.try_send(ServerFrame::SessionExited { code });
+    Forwarded::SessionExit
+}
+
+/// The status a `SessionExited` reports for a session that had already
+/// ended before this connection existed.
+///
+/// **The same derivation [`attached_frame`] uses for `Attached.exit_code`
+/// and the reader thread uses for the edge**, so the two fields cannot
+/// disagree about one child. `Session::state()` folds
+/// `backend.exit_code().unwrap_or(-1)` itself; the fallback below is for
+/// `Dead`, which carries a reason and no wait status, and `-1` is
+/// already this protocol's "no status available".
+fn reported_exit_code(session: &Arc<Session>) -> i32 {
+    match session.state() {
+        SessionState::Exited(code) => code,
+        _ => session.exit_code().unwrap_or(-1),
     }
 }
 
@@ -1119,6 +1185,7 @@ mod tests {
 
         let (tx, mut out) = mpsc::channel::<ServerFrame>(4096);
         let forwarder = tokio::spawn(forward_output(
+            Arc::clone(&session),
             "sess_x".to_string(),
             rx,
             session.subscribe_events(),

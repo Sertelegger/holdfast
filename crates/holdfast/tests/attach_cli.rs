@@ -1369,3 +1369,67 @@ async fn ctrl_c_abandons_a_real_secret_prompt_and_reaches_the_child() {
     );
     let _ = s.signal(holdfast_core::pty::Signal::Kill);
 }
+
+// ------------------------ a session that is already over (§5.5.1, §7.5)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watching_an_already_exited_session_ends_instead_of_hanging() {
+    // A first-contact bug: §5.5.1 keeps an exited session addressable
+    // precisely so an operator can go and look at it, and looking at it
+    // used to be a hang. `SessionEvent::Exited` is a one-shot edge that
+    // had already fired, and the output broadcast never closes because
+    // nothing ever removes a session from the registry — so the client
+    // waited on a channel nothing was ever going to end.
+    //
+    // `Term::wait_exit` fails on a deadline rather than blocking, so the
+    // defect this row names is a **red row and not a hung CI job**.
+    //
+    // **By id and not by name**, which is not a stylistic choice: an
+    // exited session releases its name, so `watch alreadygone` is
+    // `session_not_found` and exits 1. That is a different code path and
+    // it would have made this row green against the very hang it exists
+    // for — measured, at dd6ad0e, before the id was used here.
+    let d = TestDaemon::start("watchexited").await;
+    let (s, pty) = d.session(Some("alreadygone"));
+    pty.exit(3);
+
+    let mut term = Term::spawn(d.paths.dir(), &["watch", &s.id], 80, 24);
+    assert_eq!(
+        term.wait_exit(15),
+        0,
+        "watching a finished session is an ordinary ending, not a failure"
+    );
+    // Told, not merely dropped. A client that exited because the socket
+    // vanished would satisfy the assertion above and leave the operator
+    // guessing why.
+    let seen = term.snapshot();
+    assert!(
+        contains(&seen, b"the session exited (3)"),
+        "the exit status was never reported:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attaching_to_an_already_exited_session_ends_instead_of_hanging() {
+    // The same daemon-side edge seen from the other client, which has
+    // its own frame loop and its own exit conditions — and, unlike
+    // `watch`, holds the terminal in raw mode while it waits, so the
+    // hang was a mute shell as well as a stuck process.
+    let d = TestDaemon::start("attachexited").await;
+    let (s, pty) = d.session(None);
+    pty.exit(5);
+
+    let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 80, 24);
+    assert_eq!(
+        term.wait_exit(15),
+        0,
+        "attaching to a finished session is an ordinary ending"
+    );
+    let seen = term.snapshot();
+    assert!(
+        contains(&seen, b"the session exited (5)"),
+        "the exit status was never reported:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+}
