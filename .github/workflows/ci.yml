@@ -220,17 +220,37 @@ jobs:
     #     queries the terminal at startup and waits 10 s for a Primary
     #     Device Attribute reply that a bare PTY never sends.
     #
-    # So the shortfall is exactly one row of the 21 in tests/detection.rs,
-    # and it is ASSERTED rather than tolerated: scripts/ci-skip-census.sh
-    # fails on any skip other than that one, and on that one disappearing.
+    # THE SHORTFALL IS TWO ROWS IN TWO BINARIES. This comment said "exactly
+    # one row of the 21 in tests/detection.rs" until 2026-08-19 and that was
+    # measurably false: REQ-TS-008's row in
+    # crates/holdfast-core/tests/screen.rs skips on a fish-less host too,
+    # for its own reason, and NEITHER measurement above touches it. It never
+    # runs `(exit 42)` — that bash-ism is in detection.rs's shared assertion
+    # helper — and it sets `shell_integration: None` and injects no snippet,
+    # so the marker collision cannot reach it either. The census could not
+    # see the second row because all three skip lines began with the same
+    # words and one match satisfied the one agreed prefix.
+    #
+    # Both are ASSERTED rather than tolerated: scripts/ci-skip-census.sh now
+    # carries one record per ROW, keyed on the libtest row name, and fails
+    # on any skip other than those two, on either of them ceasing to happen,
+    # and on either ROW going missing from the log.
+    #
     # Setting the variable today would paint this job red for a defect that
     # is not the pipeline's; installing fish would do the same; dropping
     # fish from the picture would restore the silent green that this whole
-    # change exists to end.
+    # change exists to end. The variable would ALSO not reach REQ-TS-008 if
+    # it were set — it is read only by tests/detection.rs's `have()`, and
+    # tests/screen.rs is a separate binary — which is review finding I7(a)
+    # and a change to that test file rather than to this one.
     #
-    # WHEN THE FISH ROW CAN PASS, five things move in ONE change: `fish`
-    # into the apt line here and in the probe job, the variable set here
-    # and in nightly.yml, and the entry deleted from ci-skip-census.sh.
+    # WHAT THAT ROW NEEDED WAS ITS OWN FISH, and it now has one: the
+    # `fish-req-ts-008` job below installs fish 4.8.1 and measures it.
+    #
+    # WHEN DETECTION.RS'S FISH ROW CAN PASS, five things move in ONE change:
+    # `fish` into the apt line here and in the probe job, the variable set
+    # here and in nightly.yml, and BOTH records deleted from
+    # ci-skip-census.sh.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -286,6 +306,113 @@ jobs:
       # the day the runner is big enough, which is the only notice anyone
       # will get.
       - run: ./scripts/ci-skip-census.sh test-output.log
+
+  # --- the one row the fish-less suite cannot measure ----------------------
+
+  fish-req-ts-008:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # §4.5.1's decision to write unsolicited bytes into a child's stdin rests
+    # on this row's three-arm measurement, and until now that measurement had
+    # executed NOWHERE in this repository's automation — the only evidence
+    # was two container trials recorded in a prose comment. The `test` job
+    # cannot host it: installing fish there takes detection.rs's fish row
+    # red, for a defect that is not the pipeline's. So the row gets its own
+    # job and its own fish, and the `detection` binary is never invoked here,
+    # which leaves that expected failure exactly where it was.
+    #
+    # THE PPA IS NOT A CONVENIENCE. Measured 2026-08-19 by running this row's
+    # own test binary in containers, at all three fish versions obtainable:
+    #
+    #   fish 4.8.1 (this PPA)  — the row RUNS and PASSES. Silent arm 10.02 s,
+    #     all-but-DA1 10.07 s with all four probes answered, DA1 0.054 s,
+    #     against assertions of >= 5 s / >= 5 s / < 1 s. This is the fish the
+    #     row was calibrated on.
+    #   fish 4.2.1 (Ubuntu 26.04's archive) — the row RUNS and FAILS, twice
+    #     over: 4.2.1 emits no OSC 11 background query at all, so the middle
+    #     arm answers three probes of four and its `assert_eq!` fails, and
+    #     its silent arm reaches a prompt in 2.01 s rather than the >= 5 s
+    #     the row asserts. 4.2.1 does not do 4.1's ten-second DA1 wait.
+    #   fish 3.7.0 (noble's own archive) — the row's second arm SKIPS it.
+    #
+    # So "install any fish >= 4" is not the requirement and would be a red
+    # job; noble's own fish is not the requirement and would be a silent
+    # skip. `ppa:fish-shell/release-4` is the only route to a fish this row
+    # can measure on ubuntu-24.04, and it was verified on that exact base
+    # image: `apt-cache policy fish` reports 4.8.1-1~noble after the add.
+    #
+    # Not gated on `probe`: the probe asserts the presence of the shells the
+    # main suite spawns by name, and fish is deliberately not among them —
+    # this job installs its own. Gating would add the probe's minutes to a
+    # job that needs none of its assertions.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install fish 4.x from the fish-shell maintainers' PPA
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends software-properties-common
+          sudo add-apt-repository -y ppa:fish-shell/release-4
+          sudo apt-get install -y -qq --no-install-recommends fish
+          fish --version
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: fish-req-ts-008
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # `--show-output` is load-bearing twice over, not decoration copied
+      # from the `test` job. The row announces what it measured with
+      # `eprintln!`, and libtest captures that for a PASSING test; without
+      # the flag the log below contains neither the `skipping: ` notice nor
+      # the `REQ-TS-008 measured against ` line, and the "did it skip?" check
+      # would be reading a file that cannot contain the answer either way.
+      #
+      # `set -o pipefail`: the default shell for `run:` is `bash -e {0}`
+      # WITHOUT it, so a failing `cargo test` piped into `tee` exits 0.
+      - name: Measure REQ-TS-008 against a real fish
+        run: |
+          set -o pipefail
+          cargo test -p holdfast-core --locked --test screen -- \
+            --exact only_answering_da1_takes_fish_to_its_first_prompt \
+            --show-output 2>&1 | tee fish-req-ts-008.log
+      # A step that installs fish and a row that still skips is the same
+      # defect one layer up, and it is the one this job exists to end: a
+      # SKIPPED row reports `ok` and `1 passed; 0 failed`, so the step above
+      # is green either way. Three checks, each catching what the others
+      # cannot:
+      #
+      #   1. exactly one row ran — catches the row RENAMED or DELETED, where
+      #      the filter matches nothing and libtest reports `0 passed` with
+      #      everything filtered out, cheerfully, at exit 0.
+      #   2. no `skipping: ` notice — catches the fish install silently
+      #      resolving to noble's 3.7.0, which the row's second arm skips.
+      #   3. the row's own `REQ-TS-008 measured against ` line IS present —
+      #      the anti-vacuity check that makes 2 mean something. Without it,
+      #      a log whose `--show-output` was dropped contains no `skipping: `
+      #      line for the reason that it contains no captured output at all,
+      #      and check 2 passes on a run that proves nothing.
+      - name: The row must have RUN — a skipped row is a pass that is not one
+        run: |
+          if ! grep -qE '^test result: ok\. 1 passed; 0 failed;' fish-req-ts-008.log; then
+            echo "REQ-TS-008 did not report exactly one passing row. The row was" >&2
+            echo "renamed, deleted, or filtered out — this job measured nothing." >&2
+            grep -E '^test result:' fish-req-ts-008.log >&2 || true
+            exit 1
+          fi
+          if grep -q '^skipping: ' fish-req-ts-008.log; then
+            echo "REQ-TS-008 SKIPPED on a runner that installed fish for it:" >&2
+            grep '^skipping: ' fish-req-ts-008.log >&2
+            fish --version >&2 || true
+            exit 1
+          fi
+          if ! grep -q '^REQ-TS-008 measured against ' fish-req-ts-008.log; then
+            echo "The row reported no 'REQ-TS-008 measured against …' line, so this" >&2
+            echo "log cannot show whether it skipped. Was --show-output dropped?" >&2
+            exit 1
+          fi
+          grep -E '^REQ-TS-008 ' fish-req-ts-008.log
 
   # --- the artifact --------------------------------------------------------
 
