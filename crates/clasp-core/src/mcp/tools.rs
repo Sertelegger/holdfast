@@ -431,9 +431,29 @@ impl ClaspServer {
                 // true while no milestone had built the reaper, and no
                 // longer true now that Task 16 has.
                 "idle_timeout_secs": idle_timeout_secs_resolved,
-                // Unconditionally true until `redaction_enabled` becomes a
-                // per-session argument, which is 0.0.5's too.
-                "redaction_enabled": true,
+                // **Read from the operator's config, not written as a
+                // literal.** This stood as `true` unconditionally, with
+                // a comment promising to wire it "when `redaction_enabled`
+                // becomes a per-session argument". `[security]
+                // redaction_enabled` is already a live, validated,
+                // operator-settable key; the literal made this row an
+                // audit record asserting a fact it had not checked, and
+                // the day the knob is honoured on the read path the one
+                // field whose job is to make the redaction posture
+                // reconstructible would have been false by construction
+                // — with no test in the tree failing. A field that is
+                // sometimes wrong is worse than no field, so it reads
+                // the same value the reader will.
+                //
+                // What it records is the **configured posture**, which
+                // is what §9.4 asks of a `session_start` row: `read_output`
+                // and `resources/read` still take a per-call `redact`,
+                // and an individual read that opts out is recorded by
+                // §9.4's separate `redaction_disabled` entry from inside
+                // `Session::read_processed`. The two rows answer
+                // different questions and neither substitutes for the
+                // other.
+                "redaction_enabled": self.config.security.redaction_enabled,
                 "pid": session.pid(),
             }),
         );
@@ -1731,6 +1751,69 @@ mod tests {
         assert_eq!(reaper.scan_once(), 1);
 
         let _ = session.signal(crate::pty::Signal::Kill);
+    }
+
+    /// Start one session under `config` and return its `session_start`
+    /// audit entry, read back off disk.
+    ///
+    /// The log goes to a temporary directory, never to the invoking
+    /// user's `~/.clasp/logs/audit.log`.
+    async fn session_start_entry(config: &crate::config::Config) -> serde_json::Value {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.log");
+        let server = ClaspServer::with_audit_path_and_config(Some(path.clone()), config);
+        server
+            .start_session(Parameters(StartSessionArgs {
+                // Reads its PTY and stays alive, so nothing races the
+                // log write with an exit.
+                command: "cat".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("start_session");
+        let text = std::fs::read_to_string(&path).expect("the audit log must exist");
+        let entry = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("one JSON object a line"))
+            .find(|e| e["kind"] == "session_start")
+            .expect("§9.4 writes a `session_start` row");
+        for s in server.registry.all() {
+            let _ = s.signal(crate::pty::Signal::Kill);
+        }
+        entry
+    }
+
+    /// §9.4's `redaction_enabled` must report the **configured** posture.
+    ///
+    /// It was the literal `true`, with a comment promising to wire it
+    /// later. `[security] redaction_enabled` is already a live,
+    /// validated, operator-settable key, so an operator who set it
+    /// `false` got an audit trail asserting the opposite on every
+    /// session — the one field whose job is to make the redaction
+    /// posture reconstructible, false by construction, with nothing in
+    /// the tree failing.
+    ///
+    /// **Both rows, and they are not interchangeable.** The `false` row
+    /// is the one the literal fails; the `true` row is what separates
+    /// "reads the config" from a mutation that swapped one literal for
+    /// the other. Neither alone is a test of this field.
+    #[tokio::test]
+    async fn session_start_records_the_configured_redaction_posture() {
+        let mut off = crate::config::Config::default();
+        off.security.redaction_enabled = false;
+        assert_eq!(
+            session_start_entry(&off).await["redaction_enabled"],
+            serde_json::json!(false),
+            "the operator turned redaction off and §9.4 recorded that it was on"
+        );
+
+        let mut on = crate::config::Config::default();
+        on.security.redaction_enabled = true;
+        assert_eq!(
+            session_start_entry(&on).await["redaction_enabled"],
+            serde_json::json!(true),
+            "a row hardcoded to `false` satisfies the assertion above perfectly"
+        );
     }
 
     /// The advertised description of one tool argument, as the agent
