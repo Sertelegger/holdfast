@@ -356,8 +356,18 @@ mod tests {
             "a probe that binds nothing cannot be reported Started: {outcome:?}"
         );
 
+        // `outcome` is carried into the message rather than dropped: if
+        // the probe never ran at all, the interesting thing is *why* the
+        // spawn failed, and without it a transient exec failure — the
+        // test binary forks constantly, and a fork during this file's
+        // `write` holds a write descriptor on it until the child execs,
+        // which is `ETXTBSY` — reads exactly like the defect. Observed
+        // once in a hundred-odd runs and never reproduced; the message
+        // is so that the next person does not have to guess.
         assert_eq!(
-            std::fs::read_to_string(&seen).expect("the probe ran"),
+            std::fs::read_to_string(&seen).unwrap_or_else(|e| panic!(
+                "the probe left no record: {e}; spawn said {outcome:?}"
+            )),
             parent_view(),
             "the child's instance selection must be this process's own"
         );
@@ -381,8 +391,18 @@ mod tests {
             "nothing is listening, so the connect after the spawn must fail"
         );
 
+        // `outcome` is carried into the message rather than dropped: if
+        // the probe never ran at all, the interesting thing is *why* the
+        // spawn failed, and without it a transient exec failure — the
+        // test binary forks constantly, and a fork during this file's
+        // `write` holds a write descriptor on it until the child execs,
+        // which is `ETXTBSY` — reads exactly like the defect. Observed
+        // once in a hundred-odd runs and never reproduced; the message
+        // is so that the next person does not have to guess.
         assert_eq!(
-            std::fs::read_to_string(&seen).expect("the probe ran"),
+            std::fs::read_to_string(&seen).unwrap_or_else(|e| panic!(
+                "the probe left no record: {e}; spawn said {outcome:?}"
+            )),
             parent_view(),
             "the child's instance selection must be this process's own"
         );
