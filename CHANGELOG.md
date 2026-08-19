@@ -223,6 +223,48 @@ than a one-off:
   own command line, and so passed against a session running `sleep 300` instead
   of a shell. Injecting the defect and confirming the test goes red is now
   standard practice; see [CONTRIBUTING.md](./CONTRIBUTING.md).
+- **The exit cleanup asked who *holds* the socket, not whose it *is*.** A
+  daemon's teardown probed `control.sock` with a `connect()` and unlinked it if
+  nothing answered — but an AF_UNIX listener stays connectable while *any*
+  descriptor references it, so a forked child holding an inherited fd made the
+  probe report "live" about a listener nobody served. It failed roughly half of
+  all default-parallel test runs. Identity replaced liveness, and the obvious
+  form of that fix was itself wrong: on ext4 the successor is handed the
+  predecessor's freed inode number in **500 of 500** measured trials (tmpfs
+  0/500, monotonic counter), so comparing `(dev, ino)` would have silently
+  restored the very bug it was closing. The daemon now holds an inert `O_PATH`
+  descriptor and compares against an inode it still owns — not a number it
+  wrote down. `O_PATH` rather than a duplicated listener, because a duplicate
+  keeps the socket answering across teardown and converts a clean
+  connect-refused-and-respawn into a reset that respawns nothing.
+- **A `wait_for_pattern` blocked the `interrupt` that would have ended it.**
+  One `Arc<ControlClient>`, a mutex held across both the write and the read,
+  and a sequential per-connection loop composed into a transport where a single
+  outstanding call — default 30 s, capped at 3600 — blocked `interrupt`,
+  `terminate`, `read_output`, `status` and `list_sessions` on *every* session.
+  Each of the three parts was correct alone. `--no-daemon` dispatched them
+  concurrently all along, so the agent's documented escape from a hung wait
+  worked on one transport and not the other.
+- **A permission check refused ordinary installs.** Any `~/.clasp/logs` created
+  before 0.0.5 is `0775` under the umask 002 that Debian, Ubuntu and RHEL ship,
+  and the daemon refused to start on it — reproduced on the author's own
+  machine with no setup. Both remedies the error suggested were wrong: one
+  deletes the audit trail, and the other names an instance-selection variable
+  that has nothing to do with permissions. A check that rejects a normal
+  install is a bug, not a hardening.
+- **Auto-spawn quietly moved the logs onto tmpfs.** Reaching the default
+  instance through `clasp mcp` wrote `audit.log` and `daemon.log` under
+  `$XDG_RUNTIME_DIR`, where they are destroyed at logout — making the retention
+  windows unreachable in the configuration every install actually uses.
+- **`clasp mcp --no-daemon` ran the entire tool surface on `Config::default()`**,
+  ignoring the operator's configuration completely. On Windows that is the only
+  transport. It now refuses a config the daemon would also refuse, which is a
+  new failure mode on that transport and an intended one.
+- **A smoke check passed against a server that never started.** Splitting one
+  assertion in two left the "no `listChanged`" half comparing `null` to `null`
+  in `jq`, which holds whether or not a server is there. Run against `/bin/true`
+  it was the lone survivor of 39 checks. The script now reports its own check
+  count, so the number in the documentation cannot drift away from it again.
 
 ### Security
 
@@ -250,6 +292,33 @@ than a one-off:
   machine as ordinary text — measured, a 9 KiB OSC 52 clipboard write ending
   `\r\nroot@prod:/etc# ` produced exactly that as the detector's last line, which
   the pattern table scores at the act threshold.
+- **A size-capped read returned a cursor inside the secret it had just
+  redacted.** The chunk itself was correct — the whole secret was replaced by a
+  marker — but the continuation offset landed mid-span, and the 512-byte
+  lookbehind on the next read cannot reach back to a `-----BEGIN` anchor a
+  kilobyte earlier. The following chunk therefore matched nothing and returned
+  raw key material, with an empty `redactions` map and no audit entry, so it was
+  indistinguishable from output that never held a secret. With `max_bytes` set
+  to 1024 — an ordinary choice made to save tokens — a 1.7 KB PEM split that way
+  every time, not occasionally. The cursor now advances past the end of any span
+  it would otherwise land inside. The lookbehind was deliberately *not* enlarged:
+  any bound is exceeded by one more byte, which fixes an instance instead of the
+  class.
+- **The audit trail failed open, and one output boundary had no redactor at
+  all.** A daemon that could not write its audit log served anyway; `daemon.log`
+  was written raw, with no panic hook, so a panic message carrying the values
+  that caused it went to disk unredacted; a config parse error echoed the
+  offending line verbatim, which for a config file is a line that may *be* the
+  credential; and `session_start` recorded `redaction_enabled: true` as a
+  constant rather than as something it had checked. The parse-error fix drops
+  the underlying `toml` error rather than keeping it as a `source`, because a
+  redacted `Display` over a raw source is the same disclosure one chain-walk
+  away.
+- **The config file was trusted on nothing but its path.** It is now checked
+  through the open descriptor — regular file, owned by the caller or root, not
+  world-writable — so there is no second lookup to race. Symlinks are
+  deliberately still accepted: the checks judge what the link resolves to, and
+  refusing them outright would break every `stow`, `chezmoi` and `yadm` install.
 
 See [SECURITY.md](./SECURITY.md) for what is and is not in scope, including the
 residuals that are known and accepted.
