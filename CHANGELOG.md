@@ -153,7 +153,7 @@ backfilled from their commit history rather than reconstructed from memory.
   prompt, with its output buffer intact. `clasp mcp --no-daemon` keeps the old
   single-process behaviour, and is the shape the Windows build will reuse.
 - **A versioned control protocol** over a Unix socket — length-prefixed CBOR
-  frames with a 16 MiB cap, a `clasp/handshake` that both peers check, and the
+  frames with a 16 MiB cap, a `holdfast/handshake` that both peers check, and the
   §18.3 error catalogue. Mismatched protocol majors refuse to connect from
   *either* side, so a protocol break cannot be papered over by one end being
   lenient.

@@ -67,7 +67,7 @@ impl ClientKind {
     }
 }
 
-/// `clasp/handshake` params — client → daemon.
+/// `holdfast/handshake` params — client → daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HandshakeParams {
     pub protocol_major: u32,
@@ -88,7 +88,7 @@ impl HandshakeParams {
     }
 }
 
-/// `clasp/handshake` data — daemon → client.
+/// `holdfast/handshake` data — daemon → client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HandshakeData {
     pub protocol_major: u32,

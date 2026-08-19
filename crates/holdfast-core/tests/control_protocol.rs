@@ -669,7 +669,7 @@ async fn the_handshake_frames_carry_the_7_4_1_field_names_on_the_wire() {
     ]);
     let req = Request {
         id: 0,
-        method: "clasp/handshake".into(),
+        method: "holdfast/handshake".into(),
         params,
     };
     frame::write_frame(&mut stream, &req).await.unwrap();

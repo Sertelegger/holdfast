@@ -112,7 +112,7 @@ struct Dial {
 }
 
 impl ControlClient {
-    /// Connect and complete the `clasp/handshake` exchange.
+    /// Connect and complete the `holdfast/handshake` exchange.
     pub async fn connect(path: &Path, kind: ClientKind) -> Result<Self, ClientError> {
         let mut stream = dial(path).await?;
         let daemon = handshake_exchange(&mut stream, kind).await?;
@@ -346,7 +346,7 @@ fn reusable(outcome: &Result<Response, ClientError>) -> bool {
     }
 }
 
-/// The `clasp/handshake` exchange, and both of §18.3a's gates.
+/// The `holdfast/handshake` exchange, and both of §18.3a's gates.
 ///
 /// A free function because **every** connection performs it, not just
 /// the first: it is what a pooled connection must do before it may carry
@@ -774,7 +774,7 @@ mod tests {
         CborValue::Map(Vec::new())
     }
 
-    /// Answer `clasp/handshake` as an accepting daemon of this build.
+    /// Answer `holdfast/handshake` as an accepting daemon of this build.
     async fn accept_handshake(stream: &mut UnixStream) {
         let req: Request = frame::read_frame(stream).await.expect("a handshake first");
         let data = HandshakeData {

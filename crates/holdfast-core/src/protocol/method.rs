@@ -13,7 +13,7 @@ pub type CborValue = ciborium::Value;
 pub const TOOL_METHOD_PREFIX: &str = "tool/";
 
 /// The connect handshake. Must be the first method on every connection.
-pub const METHOD_HANDSHAKE: &str = "clasp/handshake";
+pub const METHOD_HANDSHAKE: &str = "holdfast/handshake";
 /// Daemon introspection, behind `clasp daemon status`.
 pub const METHOD_DAEMON_STATUS: &str = "daemon/status";
 /// Graceful daemon shutdown, behind `clasp daemon stop`.
@@ -357,7 +357,7 @@ mod tests {
         // big-endian length prefix, one layer up. The **literals** are
         // the pinning; replacing them with the constants deletes the
         // test while leaving it green.
-        assert_eq!(METHOD_HANDSHAKE, "clasp/handshake");
+        assert_eq!(METHOD_HANDSHAKE, "holdfast/handshake");
         assert_eq!(METHOD_DAEMON_STATUS, "daemon/status");
         assert_eq!(METHOD_DAEMON_STOP, "daemon/stop");
         assert_eq!(TOOL_METHOD_PREFIX, "tool/");
