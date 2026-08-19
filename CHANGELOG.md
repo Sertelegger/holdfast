@@ -6,11 +6,19 @@ upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
 ## [Unreleased]
 
-**Nothing has been released yet.** The workspace version is `0.0.2` and has not
-tracked the milestone number since; it is a placeholder rather than a published
-artifact, and there is no tag, nothing on crates.io, and no distributed binary.
-Everything below has landed on `main` and will be folded into the first
-release's notes.
+Nothing yet.
+
+## [0.0.5] — 2026-08-19
+
+**The first tagged release.** Until now the workspace version sat at `0.0.2`
+and had not tracked the milestone number since — a placeholder rather than a
+published artifact — so a build would have reported `0.0.2` and written it into
+`clasp.pid`. The version and the milestone agree from here.
+
+Milestones 0.0.1 through 0.0.5 are all in this release; there was no earlier
+tag, nothing on crates.io, and no distributed binary. The sections below are
+grouped by milestone because that is how the work was built and reviewed, not
+because each shipped separately.
 
 Every milestone here was built task by task from self-contained briefs, each
 task reviewed against its brief and then again as a whole branch — which is why

@@ -54,18 +54,19 @@ are gated to public repositories on GitHub Free. Until this repository goes
 public, running these locally is still the actual gate and a red job is
 something a human has to notice.
 
-`cargo test --workspace` was 881 tests as of `3ac20b0`: 661 unit (658 in
+`cargo test --workspace` was 890 tests at the `v0.0.5` tag: 669 unit (666 in
 `clasp-core`'s lib, 3 in `clasp`'s bin), 23 in `tests/detection.rs`, 71 in
 `tests/integration.rs`, 42 in `tests/schema.rs`, 19 in `tests/screen.rs`, 1 in
-`tests/stress_write_path.rs`, 39 in `tests/control_protocol.rs`, and 25 in
-`crates/clasp/tests/daemon_cli.rs`.
-**Treat that count as already stale, not just as a tripwire.** It moved four
+`tests/stress_write_path.rs`, 1 in `tests/source_guards.rs`, 39 in
+`tests/control_protocol.rs`, and 25 in `crates/clasp/tests/daemon_cli.rs`.
+**Treat that count as already stale, not just as a tripwire.** It moved five
 times in the course of one milestone review and its own fix: wrong when a
 review first measured it, wronger while that review's own fix was being
 written two whole suites short, off by two more when a sibling change landed
-mid-fix, and off by one *again* — a different suite, the `clasp-core` lib —
+mid-fix, off by one *again* — a different suite, the `clasp-core` lib —
 between two re-measurements of *this very paragraph* taken minutes apart in
-an isolated worktree. No check in this repository currently fails when this
+an isolated worktree, and then by nine more when the re-review's own four
+fixes landed, one of which added a whole test file. No check in this repository currently fails when this
 paragraph goes stale, so do not trust it: run `cargo test -p <crate> --test
 <name> -- --list` per target (or `--lib` for the two unit targets) and read
 the `N tests` line it prints — that is the only number worth acting on. If
