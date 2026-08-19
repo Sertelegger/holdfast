@@ -215,8 +215,8 @@ fails=0
 # then dies of SIGPIPE, and `set -o pipefail` turns the whole pipeline
 # into status 141 -- a **false red** on a pattern that is present.
 # Measured on this file at 3-6 runs in 20 under load, always on a pattern
-# that matches near the start of the transcript (`"capabilities":{"tools":`
-# is the first thing the server writes) because that is when grep exits
+# that matches near the start of the transcript (the `capabilities`
+# object is the first thing the server writes) because that is when grep exits
 # earliest. Without `-q`, grep reads to EOF and the race does not exist.
 check() {
   if printf '%s' "$OUT" | grep -F -- "$2" >/dev/null; then
@@ -297,7 +297,16 @@ fi
 
 # ---------------------------------------------------------- the handshake
 
-check "initialize advertises tool capability" '"capabilities":{"tools":'
+# Order-independent, because it is not: 0.0.5 added the `resources`
+# capability (§5.5) and the serialised object no longer opens with
+# `"tools"`. A substring check on `{"tools":` asserted a field *order*
+# rmcp chooses, which is not a contract this project owns.
+jcheck "initialize advertises the tools capability" \
+  'resp(1).result.capabilities.tools != null' 'true'
+# §5.5: `resources` with `listChanged: true`, because the daemon emits
+# `notifications/resources/list_changed` on session create and exit.
+jcheck "initialize advertises the resources capability with listChanged" \
+  'resp(1).result.capabilities.resources.listChanged' 'true'
 # The `instructions` string is the first thing an agent reads about this
 # server, and it described a four-tool 0.0.1 surface for the whole of
 # 0.0.2. Asserting the names rather than the prose keeps it honest

@@ -11,11 +11,13 @@ use super::passthrough;
 use crate::protocol::client::{ClientError, ControlClient};
 use crate::protocol::method::{self, TOOL_METHOD_PREFIX};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
+use serde_json::json;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -73,6 +75,31 @@ impl ShimServer {
             details: resp.details,
         }))
     }
+
+    /// One `resource/*` round trip, returning the response `data`.
+    ///
+    /// `bad_params` becomes `ErrorData::invalid_params` for the same
+    /// reason `forward` does it: §5.5.2's validation faults are
+    /// `-32602 Invalid params` on the MCP wire, and flattening them into
+    /// "internal error" would tell the agent its URI was fine and the
+    /// server broke.
+    async fn forward_resource(&self, method: &str, params: Value) -> Result<Value, ErrorData> {
+        let params =
+            method::to_cbor(&params).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let resp = self
+            .client
+            .call_raw(method, params)
+            .await
+            .map_err(map_client_error)?;
+        if let Some(e) = resp.control_error() {
+            return Err(if e.code == method::ErrorCode::BadParams.as_str() {
+                ErrorData::invalid_params(e.message, None)
+            } else {
+                ErrorData::internal_error(format!("[{}] {}", e.code, e.message), None)
+            });
+        }
+        method::from_cbor(&resp.data).map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
 }
 
 /// The daemon-backed server's `instructions`, **derived** from the
@@ -113,7 +140,7 @@ fn map_client_error(e: ClientError) -> ErrorData {
 impl ServerHandler for ShimServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = super::server_capabilities();
         info.server_info = Implementation::new("clasp", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(instructions());
         info
@@ -139,6 +166,51 @@ impl ServerHandler for ShimServer {
             return Err(ErrorData::invalid_params(format!("no tool {name}"), None));
         }
         Ok(self.forward(&name, request.arguments).await?.into())
+    }
+
+    // §5.5's three methods, forwarded to §7.4.1's three control methods.
+    // **The spellings differ on the two wires** — MCP says
+    // `resources/templates/list`, the control protocol says
+    // `resource/templates_list` — and the constants below are the only
+    // place that mapping is written down.
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let data = self
+            .forward_resource(method::METHOD_RESOURCE_LIST, json!({}))
+            .await?;
+        let resources = serde_json::from_value(data.get("resources").cloned().unwrap_or(json!([])))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        let data = self
+            .forward_resource(method::METHOD_RESOURCE_TEMPLATES_LIST, json!({}))
+            .await?;
+        let templates =
+            serde_json::from_value(data.get("resourceTemplates").cloned().unwrap_or(json!([])))
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(ListResourceTemplatesResult::with_all_items(templates))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let data = self
+            .forward_resource(method::METHOD_RESOURCE_READ, json!({ "uri": request.uri }))
+            .await?;
+        let result: ReadResourceResult = serde_json::from_value(data)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(result.into())
     }
 }
 

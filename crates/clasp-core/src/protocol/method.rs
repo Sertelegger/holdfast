@@ -19,6 +19,17 @@ pub const METHOD_DAEMON_STATUS: &str = "daemon/status";
 /// Graceful daemon shutdown, behind `clasp daemon stop`.
 pub const METHOD_DAEMON_STOP: &str = "daemon/stop";
 
+// §7.4.1's MCP-resource methods (§5.5). Note the spelling: the control
+// protocol says `resource/templates_list` with an **underscore**, while
+// MCP itself says `resources/templates/list` with slashes. The two are
+// different wires and §7.4.1 owns this one.
+/// `resources/list` behind the socket (§5.5.1).
+pub const METHOD_RESOURCE_LIST: &str = "resource/list";
+/// `resources/templates/list` behind the socket (§5.5.2).
+pub const METHOD_RESOURCE_TEMPLATES_LIST: &str = "resource/templates_list";
+/// `resources/read` behind the socket (§5.5.3).
+pub const METHOD_RESOURCE_READ: &str = "resource/read";
+
 /// `{ id, method, params }` — spec §7.4.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
@@ -277,6 +288,14 @@ mod tests {
         assert_eq!(METHOD_DAEMON_STATUS, "daemon/status");
         assert_eq!(METHOD_DAEMON_STOP, "daemon/stop");
         assert_eq!(TOOL_METHOD_PREFIX, "tool/");
+        assert_eq!(METHOD_RESOURCE_LIST, "resource/list");
+        // **Underscore, not a slash.** §7.4.1 spells the control-protocol
+        // method `resource/templates_list` while MCP itself spells the
+        // client-facing one `resources/templates/list`. Two wires, two
+        // spellings, and a shim that used one for both would forward a
+        // method no daemon answers.
+        assert_eq!(METHOD_RESOURCE_TEMPLATES_LIST, "resource/templates_list");
+        assert_eq!(METHOD_RESOURCE_READ, "resource/read");
     }
 
     #[test]

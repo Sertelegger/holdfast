@@ -11,7 +11,7 @@ use super::peer;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::mcp::caller::{self, Caller};
-use crate::mcp::{passthrough, ClaspServer};
+use crate::mcp::{passthrough, resources, ClaspServer};
 use crate::protocol::frame::{self, FrameError};
 use crate::protocol::handshake::{self, ClientKind, HandshakeParams};
 use crate::protocol::method::{self, ErrorCode, Request, Response};
@@ -152,6 +152,16 @@ pub struct Daemon {
     /// exit. `None` means "never", which is what the window measures from
     /// on a daemon nobody has connected to.
     last_client_connect: Mutex<Option<Instant>>,
+    /// The live-session ids the last `resources/list` would have shown,
+    /// for REQ-R-006's **exit** half.
+    ///
+    /// A session's exit is observed rather than announced — nothing
+    /// calls back when a child dies — so the daemon notices by comparing
+    /// this set on its own tick. Creation does not go through here: it
+    /// fires synchronously from `start_session`, because an agent that
+    /// had to wait 30 s to learn about the session it just started would
+    /// re-list at exactly the wrong moment.
+    listed_sessions: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl Daemon {
@@ -228,6 +238,7 @@ impl Daemon {
             owner_uid,
             clock,
             last_client_connect: Mutex::new(None),
+            listed_sessions: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -250,6 +261,34 @@ impl Daemon {
     /// clock. `None` when none ever has.
     pub fn last_client_connect(&self) -> Option<Instant> {
         *self.last_client_connect.lock()
+    }
+
+    /// Fire REQ-R-006's `list_changed` pulse if the set of live sessions
+    /// has moved since the last call. Returns whether it fired.
+    ///
+    /// **This is the exit half and it belongs to the daemon**, which is
+    /// what §5.5 means by saying the event originates daemon-side: in
+    /// hybrid mode the shim holds no registry, so nothing there can
+    /// notice a child that died. Called from the reaper's tick, which is
+    /// the only periodic timer in the process, and reachable from a test
+    /// so that "fires on exit" is an assertion rather than a hope.
+    pub fn poll_resource_list_changed(&self) -> bool {
+        let now_live: std::collections::BTreeSet<String> = self
+            .server
+            .registry
+            .all()
+            .into_iter()
+            .filter(|s| s.is_alive())
+            .map(|s| s.id.clone())
+            .collect();
+        let mut known = self.listed_sessions.lock();
+        if *known == now_live {
+            return false;
+        }
+        *known = now_live;
+        drop(known);
+        self.server.notify_resource_list_changed();
+        true
     }
 
     /// Record a client connection for §7.3's window.
@@ -469,9 +508,14 @@ async fn reaper_loop(daemon: Arc<Daemon>) {
     let mut shutdown = daemon.shutdown_signalled();
     let clock = daemon.clock();
     let mut next_log_sweep = clock.now() + LOG_SWEEP_INTERVAL;
+    // Seed the known set, so the first tick does not announce every
+    // session that already existed as a change.
+    daemon.poll_resource_list_changed();
 
     loop {
         reaper.scan_once();
+        // REQ-R-006's exit half, on the only periodic tick there is.
+        daemon.poll_resource_list_changed();
 
         // §7.3's conjunction, checked after the sweep so a session the
         // reaper just took down counts towards "all sessions have
@@ -736,12 +780,23 @@ fn caller_for(connection: ClientKind, _req: &Request) -> Caller {
 }
 
 /// Route one request. The `bool` is "shut the daemon down after replying".
+///
+/// **Grouped rather than flat.** This was one `match` with four arms,
+/// which is the right shape for a handful of methods and the wrong shape
+/// for thirty; §5.5's three `resource/*` methods are where it crossed, so
+/// they arrive as a group with their own function rather than as three
+/// more arms with their bodies inline.
 async fn dispatch(
     daemon: &Arc<Daemon>,
     req: &Request,
     client_kind: ClientKind,
 ) -> (Response, bool) {
     match req.method.as_str() {
+        method::METHOD_RESOURCE_LIST
+        | method::METHOD_RESOURCE_TEMPLATES_LIST
+        | method::METHOD_RESOURCE_READ => {
+            (dispatch_resource(daemon, req, client_kind).await, false)
+        }
         method::METHOD_HANDSHAKE => (
             Response::error(
                 req.id,
@@ -813,6 +868,75 @@ async fn dispatch(
             (dispatch_tool(daemon, req, tool, client_kind).await, false)
         }
     }
+}
+
+/// §7.4.1's three `resource/*` methods (§5.5).
+///
+/// Scoped to the connection's caller exactly as `dispatch_tool` is,
+/// because `resource/read` reaches `Session::read_processed` and a
+/// `?redact=false` fetch therefore writes a §9.4 `redaction_disabled`
+/// entry from inside the read path. Outside the scope that entry would
+/// read `client_kind: "in_process"` — §9.4's *"no control-protocol
+/// connection existed"* — on the one transport where a connection
+/// certainly did.
+async fn dispatch_resource(
+    daemon: &Arc<Daemon>,
+    req: &Request,
+    client_kind: ClientKind,
+) -> Response {
+    let who = caller_for(client_kind, req);
+    let server = &daemon.server;
+    let ok = |data: serde_json::Value| -> Response {
+        Response::ok(req.id, &data, "ok")
+            .unwrap_or_else(|e| Response::error(req.id, ErrorCode::BadParams, e.to_string()))
+    };
+    let call = async {
+        match req.method.as_str() {
+            method::METHOD_RESOURCE_LIST => ok(serde_json::json!({
+                "resources": resources::list_resources(&server.registry),
+            })),
+            method::METHOD_RESOURCE_TEMPLATES_LIST => ok(serde_json::json!({
+                "resourceTemplates": resources::list_resource_templates(),
+            })),
+            _ => {
+                #[derive(Deserialize)]
+                struct ReadParams {
+                    uri: String,
+                }
+                let params: ReadParams = match req.params_as() {
+                    Ok(p) => p,
+                    Err(e) => return Response::error(req.id, ErrorCode::BadParams, e.to_string()),
+                };
+                match resources::read_resource(
+                    &server.registry,
+                    &server.processor,
+                    &params.uri,
+                    server.config.limits.resource_read_max_bytes,
+                ) {
+                    // §5.5.2's validation faults are `-32602 Invalid
+                    // params` on the MCP wire; §18.3's nearest catalogued
+                    // code is `bad_params`, which the shim already raises
+                    // back as `ErrorData::invalid_params`. The structured
+                    // `data.code` travels in the message rather than
+                    // being invented as a new control-protocol code.
+                    Err(e) => Response::error(
+                        req.id,
+                        ErrorCode::BadParams,
+                        serde_json::to_string(&serde_json::json!({
+                            "message": e.message,
+                            "data": e.data,
+                        }))
+                        .unwrap_or_else(|_| e.message.to_string()),
+                    ),
+                    Ok(result) => match serde_json::to_value(&result) {
+                        Ok(v) => ok(v),
+                        Err(e) => Response::error(req.id, ErrorCode::BadParams, e.to_string()),
+                    },
+                }
+            }
+        }
+    };
+    caller::with_caller(who, call).await
 }
 
 async fn dispatch_tool(

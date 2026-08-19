@@ -1328,3 +1328,337 @@ async fn status_reports_the_idle_deadline_and_null_means_disabled() {
         );
     }
 }
+
+// ------------------------------------------------ MCP resources (§5.5)
+
+async fn resource_list(client: &ControlClient) -> Vec<Value> {
+    let resp = client
+        .call_raw(
+            method::METHOD_RESOURCE_LIST,
+            method::to_cbor(&json!({})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    data["resources"].as_array().cloned().unwrap_or_default()
+}
+
+async fn resource_read(client: &ControlClient, uri: &str) -> Response {
+    client
+        .call_raw(
+            method::METHOD_RESOURCE_READ,
+            method::to_cbor(&json!({ "uri": uri })).unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+fn first_text(resp: &Response) -> String {
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    data["contents"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_live_session_is_in_the_resource_list_and_an_exited_one_is_not() {
+    let d = TestDaemon::start("reslist").await;
+    let client = d.client().await.unwrap();
+
+    // The pairing first: a list that returns nothing passes the
+    // disappears-on-exit assertion perfectly.
+    let id = start_bash(&client, "listed").await;
+    let listed = resource_list(&client).await;
+    assert_eq!(listed.len(), 1, "a live session must be listed: {listed:?}");
+    assert_eq!(
+        listed[0]["uri"].as_str().unwrap(),
+        format!("clasp://session/{id}/buffer")
+    );
+    assert_eq!(
+        listed[0]["mimeType"].as_str().unwrap(),
+        "text/plain; charset=utf-8",
+        "§5.5.1: the listed type is the default-parameter URI's"
+    );
+
+    let params = method::to_cbor(&json!({ "session": id, "force": true })).unwrap();
+    let resp = client.call_raw("tool/terminate", params).await.unwrap();
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+    for _ in 0..200 {
+        if resource_list(&client).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        resource_list(&client).await.is_empty(),
+        "§5.5.1 lists live sessions only; listing the whole registry \
+         includes terminal sessions"
+    );
+
+    // And it is still ID-addressable, which is the other half of §5.5.1
+    // and the reason the reaper keeps the registry entry.
+    let resp = resource_read(&client, &format!("clasp://session/{id}/buffer")).await;
+    assert_eq!(
+        resp.status, "ok",
+        "an exited session stays ID-addressable: {}",
+        resp.details
+    );
+}
+
+#[tokio::test]
+async fn a_name_keyed_uri_resolves_only_while_the_name_is_live() {
+    let d = TestDaemon::start("resname").await;
+    let client = d.client().await.unwrap();
+
+    let first = start_bash(&client, "reused").await;
+    let uri = "clasp://session-name/reused/buffer";
+    let resp = resource_read(&client, uri).await;
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+
+    let params = method::to_cbor(&json!({ "session": first, "force": true })).unwrap();
+    client.call_raw("tool/terminate", params).await.unwrap();
+    for _ in 0..200 {
+        if resource_list(&client).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // A *different* session takes the released name (REQ-S-002).
+    let second = start_bash(&client, "reused").await;
+    assert_ne!(first, second);
+    let resp = resource_read(&client, uri).await;
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    assert_eq!(
+        data["contents"][0]["uri"].as_str().unwrap(),
+        uri,
+        "the response echoes the URI the caller asked for"
+    );
+    // The id-keyed URI for the *old* session must still be distinct and
+    // still resolve — a cached name→id mapping hands one session's
+    // output to a reader who asked for another.
+    let old = resource_read(&client, &format!("clasp://session/{first}/buffer")).await;
+    assert_eq!(old.status, "ok");
+    let new = resource_read(&client, &format!("clasp://session/{second}/buffer")).await;
+    assert_eq!(new.status, "ok");
+}
+
+#[tokio::test]
+async fn a_resource_read_and_a_read_output_return_the_same_bytes() {
+    let d = TestDaemon::start("ressame").await;
+    let client = d.client().await.unwrap();
+    let id = start_bash(&client, "same").await;
+    read_until(&client, &id, "$").await;
+
+    // Same cursor, same knobs, both paths. A second read implementation
+    // that drifted from the processor shows up here and nowhere else.
+    let params = method::to_cbor(&json!({
+        "session": id,
+        "since_cursor": 0,
+    }))
+    .unwrap();
+    let resp = client.call_raw("tool/read_output", params).await.unwrap();
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    let via_tool = data["output"].as_str().unwrap().to_string();
+    // The tool's own default cap is 32 KiB; ask the resource path for the
+    // same window so the comparison is of bytes and not of caps.
+    let uri = format!(
+        "clasp://session/{id}/buffer?since_cursor=0&max_bytes={}",
+        32 * 1024
+    );
+    let via_resource = first_text(&resource_read(&client, &uri).await);
+    assert_eq!(
+        via_tool, via_resource,
+        "the two paths must be the same processor, not two implementations"
+    );
+    assert!(
+        !via_tool.is_empty(),
+        "and the comparison must not be vacuous"
+    );
+
+    // `read_output` now emits the bulk URI beside its own bytes (§5.2).
+    assert_eq!(
+        data["resource_uri"].as_str().unwrap(),
+        format!("clasp://session/{id}/buffer")
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_parameter_is_an_invalid_params_error() {
+    let d = TestDaemon::start("resbad").await;
+    let client = d.client().await.unwrap();
+    let id = start_bash(&client, "bad").await;
+
+    let resp = resource_read(&client, &format!("clasp://session/{id}/buffer?ansi=purple")).await;
+    assert!(resp.is_error(), "a bad enum must not default-and-continue");
+    let err = resp.control_error().expect("a §7.4.1 error payload");
+    assert_eq!(err.code, ErrorCode::BadParams.as_str());
+    // The structured `data.code` §5.5.2 requires, carried through.
+    assert!(
+        err.message.contains("invalid_enum") && err.message.contains("ansi"),
+        "the structured code must survive the control protocol: {}",
+        err.message
+    );
+
+    // The pairing: a *good* parameter must still be honoured, or this
+    // row passes against a server that rejects every query.
+    let resp = resource_read(&client, &format!("clasp://session/{id}/buffer?ansi=raw")).await;
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+}
+
+#[tokio::test]
+async fn the_resource_templates_list_is_a_separate_method_with_no_mime_type() {
+    let d = TestDaemon::start("restpl").await;
+    let client = d.client().await.unwrap();
+    let resp = client
+        .call_raw(
+            method::METHOD_RESOURCE_TEMPLATES_LIST,
+            method::to_cbor(&json!({})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    let templates = data["resourceTemplates"].as_array().unwrap();
+    assert_eq!(templates.len(), 1);
+    let t = &templates[0];
+    assert!(t["uriTemplate"].as_str().unwrap().contains("{session_id}"));
+    assert!(
+        t.get("mimeType").is_none() || t["mimeType"].is_null(),
+        "§5.5.2: the type depends on text_encoding, so the template names none: {t}"
+    );
+}
+
+#[tokio::test]
+async fn a_redact_false_resource_read_is_audited_as_resource_read() {
+    let d = TestDaemon::start("resaudit").await;
+    let client = d.client().await.unwrap();
+    let id = start_bash(&client, "audited").await;
+
+    let uri = format!("clasp://session/{id}/buffer?since_cursor=0&redact=false");
+    let resp = resource_read(&client, &uri).await;
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+
+    let log = std::fs::read_to_string(d.paths.audit_log()).expect("audit log");
+    let entry = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|e| e["kind"] == "redaction_disabled")
+        .expect("a redaction_disabled entry");
+    assert_eq!(
+        entry["tool"], "resource_read",
+        "a resource path that bypassed the audited read path would leave \
+         no entry at all, and one naming `read_output` would mean the \
+         resource layer borrowed another surface's name"
+    );
+    // Derived server-side from the uid-checked handshake, never from the
+    // request: this connection is a `cli` one.
+    assert_eq!(entry["client_kind"], "cli");
+}
+
+#[tokio::test]
+async fn a_caller_max_bytes_is_clamped_down_against_the_configured_ceiling() {
+    // The ceiling is a config knob, so the clamp is observable by setting
+    // it low rather than by asking for 4 MiB of a small buffer.
+    let config =
+        clasp_core::config::parse_str("[limits]\nresource_read_max_bytes = 8\n").expect("loads");
+    let d = TestDaemon::start_with("resclamp", config).await;
+    let client = d.client().await.unwrap();
+    let id = start_bash(&client, "clamped").await;
+    read_until(&client, &id, "$").await;
+
+    let uri = format!("clasp://session/{id}/buffer?since_cursor=0&max_bytes=99999999");
+    let resp = resource_read(&client, &uri).await;
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+    let text = first_text(&resp);
+    assert!(
+        text.len() <= 8,
+        "a caller asking for 99 MB got {} bytes against an 8-byte ceiling — \
+         clamped up, or honoured",
+        text.len()
+    );
+
+    // And the response says there is more, which is what makes the clamp
+    // a continuation rather than a silent truncation.
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    let meta = &data["contents"][0]["_meta"]["clasp"];
+    assert_eq!(
+        meta["truncated_for_size"],
+        json!(true),
+        "the size cap must be reported, and distinctly from held_back: {data}"
+    );
+    assert!(
+        meta.get("held_back").is_none(),
+        "§5.5.3: `held_back` and `truncated_for_size` are distinct, and \
+         collapsing them into one flag is the fault to avoid: {data}"
+    );
+    let next = meta["next_uri"].as_str().expect("a continuation URI");
+    assert!(next.contains("since_cursor="), "{next}");
+}
+
+#[tokio::test]
+async fn list_changed_fires_on_create_and_on_exit() {
+    // REQ-R-006. Subscribed on the daemon's own broadcast rather than on
+    // an MCP peer, because the *source* is what this milestone owns: the
+    // peer forwarder in `on_initialized` has no registry of its own.
+    let d = TestDaemon::start("reschanged").await;
+    // Seed the daemon's known set on an empty registry, the way
+    // `reaper_loop` does before its first tick.
+    assert!(
+        !d.daemon.poll_resource_list_changed(),
+        "nothing to announce yet"
+    );
+    let mut events = d.daemon.server.resource_list_changed.subscribe();
+    let client = d.client().await.unwrap();
+
+    let id = start_bash(&client, "announced").await;
+    tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("no list_changed on create")
+        .expect("the sender went away");
+
+    // A tick lands between the create and the exit in any real daemon,
+    // so let the daemon take the create into its known set the way
+    // `reaper_loop` would. Without this the set never leaves "empty" and
+    // the exit is not a change at all.
+    assert!(
+        d.daemon.poll_resource_list_changed(),
+        "the daemon did not notice the new session on its tick"
+    );
+
+    let params = method::to_cbor(&json!({ "session": id, "force": true })).unwrap();
+    client.call_raw("tool/terminate", params).await.unwrap();
+
+    // The exit half is observed rather than announced, so the daemon's
+    // periodic tick is what notices. Drive one sweep by hand rather than
+    // waiting 30 s of wall time.
+    let reaper = clasp_core::session::Reaper::new(
+        std::sync::Arc::clone(&d.daemon.server.registry),
+        d.daemon.clock(),
+    );
+    for _ in 0..200 {
+        reaper.scan_once();
+        if d.daemon.server.registry.all().iter().all(|s| !s.is_alive()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // **The daemon's own detection, not the test's.** Calling
+    // `notify_resource_list_changed()` here would put the repair path
+    // ahead of the assertion: the row would pass against a daemon that
+    // never notices an exit at all.
+    assert!(
+        d.daemon.poll_resource_list_changed(),
+        "the daemon did not notice that a session left the list"
+    );
+    tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect(
+            "no list_changed on exit — firing only on create leaves the \
+                 agent's list stale in the direction that matters",
+        )
+        .expect("the sender went away");
+}

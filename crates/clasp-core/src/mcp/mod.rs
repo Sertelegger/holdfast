@@ -4,6 +4,7 @@ pub mod caller;
 pub mod detection;
 pub mod envelope;
 pub mod passthrough;
+pub mod resources;
 pub mod schema;
 pub mod shim;
 pub mod tools;
@@ -12,8 +13,12 @@ use crate::audit::AuditLog;
 use crate::output::rules::builtin_shared;
 use crate::output::OutputProcessor;
 use crate::session::SessionRegistry;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool_handler, ServerHandler, ServiceExt};
+use rmcp::model::{
+    Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{tool_handler, ErrorData, RoleServer, ServerHandler, ServiceExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -56,6 +61,12 @@ pub const INSTRUCTIONS: &str = "CLASP gives you PTY-backed shell sessions. start
      and secret-redacted by default; secrets are replaced with \
      [REDACTED:<kind>] markers.";
 
+/// Buffered `list_changed` pulses before a slow subscriber starts
+/// missing them. Small on purpose: the notification is idempotent — a
+/// client that missed three re-lists once — so a deep queue would buy
+/// nothing and hold memory.
+const RESOURCE_EVENT_CAPACITY: usize = 16;
+
 #[derive(Clone)]
 pub struct ClaspServer {
     pub registry: Arc<SessionRegistry>,
@@ -77,6 +88,16 @@ pub struct ClaspServer {
     /// is already parsed and validated instead of adding a field and a
     /// second place for the operator's file to be misread.
     pub config: Arc<crate::config::Config>,
+    /// A pulse whenever the resource list changes (REQ-R-006).
+    ///
+    /// §5.5 declares `listChanged: true`, and the event is a *pulse*
+    /// rather than a delta because `notifications/resources/list_changed`
+    /// carries no payload: the client re-lists. Session **creation**
+    /// fires it here, synchronously, from `start_session`; session
+    /// **exit** is observed rather than announced, so the daemon's
+    /// periodic tick fires it — which is the half §5.5 says needs the
+    /// daemon, since in hybrid mode the shim holds no registry.
+    pub resource_list_changed: tokio::sync::broadcast::Sender<()>,
 }
 
 impl ClaspServer {
@@ -128,7 +149,18 @@ impl ClaspServer {
                 config.processing_limits(),
             )),
             config: Arc::new(config.clone()),
+            resource_list_changed: tokio::sync::broadcast::channel(RESOURCE_EVENT_CAPACITY).0,
         }
+    }
+
+    /// Announce that `resources/list` would now answer differently.
+    ///
+    /// Lossy by construction: a subscriber that falls behind receives a
+    /// lag error rather than every pulse, which is correct for a
+    /// "re-list" signal and wrong for anything carrying state. That is
+    /// the reason this carries none.
+    pub fn notify_resource_list_changed(&self) {
+        let _ = self.resource_list_changed.send(());
     }
 
     /// The operator configuration this server was built with.
@@ -143,16 +175,95 @@ impl Default for ClaspServer {
     }
 }
 
+/// The `resources` capability §5.5 requires, for either transport.
+///
+/// `listChanged: true` because the daemon emits
+/// `notifications/resources/list_changed` when a session is created or
+/// exits. `subscribe` is deliberately **absent** rather than `false`:
+/// §5.5 writes `"subscribe": false`, `ResourcesCapability` is
+/// `#[non_exhaustive]` so an explicit `false` cannot be constructed from
+/// outside `rmcp`, and an omitted capability and a `false` one mean the
+/// same thing to a client. v0.1.0 does not implement subscriptions
+/// either way (§14.2).
+pub fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities::builder()
+        .enable_tools()
+        .enable_resources()
+        .enable_resources_list_changed()
+        .build()
+}
+
 #[tool_handler]
 impl ServerHandler for ClaspServer {
     fn get_info(&self) -> ServerInfo {
         // ServerInfo (= InitializeResult) and Implementation are
         // #[non_exhaustive]: build from Default, then assign.
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = server_capabilities();
         info.server_info = Implementation::new("clasp", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(INSTRUCTIONS.into());
         info
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::with_all_items(
+            resources::list_resources(&self.registry),
+        ))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        Ok(ListResourceTemplatesResult::with_all_items(
+            resources::list_resource_templates(),
+        ))
+    }
+
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+        // The peer is only reachable from here, so this is where
+        // REQ-R-006's delivery half is wired: a task that forwards every
+        // pulse to the client until the connection goes away.
+        let mut events = self.resource_list_changed.subscribe();
+        let peer = context.peer.clone();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(()) => {
+                        if peer.notify_resource_list_changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    // Lagged: the list changed more often than this
+                    // client drained. Re-listing once covers all of it.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if peer.notify_resource_list_changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let result = resources::read_resource(
+            &self.registry,
+            &self.processor,
+            &request.uri,
+            self.config.limits.resource_read_max_bytes,
+        )?;
+        Ok(result.into())
     }
 }
 

@@ -218,6 +218,11 @@ pub struct ReadOutput {
     /// Empty on an unredacted read; absent only on an error envelope.
     pub redactions: Option<std::collections::BTreeMap<String, u64>>,
     pub next_cursor: Option<u64>,
+    /// The `clasp://` URI that fetches this session's whole buffer as an
+    /// MCP resource (§5.2, §5.5). Declared since rev. 2 and emitted only
+    /// from 0.0.5, because `resources/read` had to resolve it first —
+    /// 0.0.3 was told explicitly not to stub it.
+    pub resource_uri: Option<String>,
     pub state: Option<SessionState>,
     pub exit_code: Option<i32>,
     pub interaction_mode: Option<InteractionMode>,
@@ -312,6 +317,15 @@ pub struct Terminate {
 pub struct Buffer {
     pub head: u64,
     pub tail: u64,
+    /// Bytes currently held in the ring, i.e. `head - tail` (§5.4).
+    /// Declared since rev. 2 with nothing emitting it until 0.0.5's
+    /// resource layer gave it a consumer.
+    pub total_bytes: Option<u64>,
+    /// The `clasp://` URI that fetches this buffer in bulk (§5.5).
+    /// Declared since rev. 2 with no producer; emitted only now that
+    /// `resources/read` resolves it, because a URI that does not resolve
+    /// is worse than an absent one.
+    pub resource_uri: Option<String>,
 }
 
 /// One session record, shared by `status` and `list_sessions` entries.

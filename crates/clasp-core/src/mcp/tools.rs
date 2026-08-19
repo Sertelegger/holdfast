@@ -431,6 +431,11 @@ impl ClaspServer {
             }),
         );
 
+        // REQ-R-006's create half: `resources/list` would now answer
+        // differently, so the client is told to re-list. Fired after the
+        // session is in the registry, or the re-list races the insert.
+        self.notify_resource_list_changed();
+
         Ok(envelope::ok(
             json!({
                 "session_id": session.id,
@@ -572,6 +577,11 @@ impl ClaspServer {
                     "truncated_for_size": read.truncated_for_size,
                     "held_back": read.held_back,
                     "next_cursor": read.next_cursor,
+                    // §5.2 declares this without a `?` and nothing had
+                    // ever emitted it. The bulk counterpart to this
+                    // incremental read: same processor, same redaction
+                    // defaults, same audit behaviour (§5.5.5).
+                    "resource_uri": crate::mcp::resources::ResourceUri::buffer_uri(&session.id),
                     "redactions": read.redactions,
                     "state": state.as_str(),
                     "exit_code": session.exit_code(),
@@ -1423,6 +1433,12 @@ fn session_record(session: &Session, rules: &RuleSet) -> serde_json::Value {
         "buffer": {
             "head": session.buffer_head(),
             "tail": session.buffer_tail(),
+            "total_bytes": session.buffer_head().saturating_sub(session.buffer_tail()),
+            // §5.4 declared this from rev. 2 and nothing emitted it. It
+            // is honest only now that `resources/read` resolves it —
+            // emitting a URI that does not resolve is worse than an
+            // absent field, which is why 0.0.3 was told not to stub it.
+            "resource_uri": crate::mcp::resources::ResourceUri::buffer_uri(&session.id),
         },
         // The session's cumulative tally (§9.2, REQ-O-012), and a
         // *different* number from `read_output.redactions`: that one

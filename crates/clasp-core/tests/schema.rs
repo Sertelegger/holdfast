@@ -1094,6 +1094,12 @@ async fn read_output_emits_every_field_5_4_promises() {
             "held_back",
             "redactions",
             "next_cursor",
+            // 0.0.5's resource layer closes §5.2's `resource_uri`, which
+            // was declared without a `?` from rev. 2 and emitted by
+            // nothing. It lands here rather than earlier because a URI
+            // that does not resolve is worse than an absent field, and
+            // `resources/read` is what makes it resolve.
+            "resource_uri",
             "state",
             "exit_code",
             // The §5.4 block. Dropping `with_detection` deletes these five
@@ -1340,7 +1346,10 @@ async fn status_response_matches_its_schema() {
     );
     assert_eq!(
         keys(&payload["data"]["buffer"]),
-        set(&["head", "tail"]),
+        // §5.4 has declared `total_bytes` and `resource_uri` on this
+        // object since rev. 2 and this literal pinned `{head, tail}`
+        // through 0.0.4, which is what kept the omission invisible.
+        set(&["head", "tail", "total_bytes", "resource_uri"]),
         "the buffer extent changed shape"
     );
     assert_eq!(
@@ -2534,7 +2543,10 @@ async fn every_nested_object_a_tool_returns_has_its_key_set_pinned() {
         .expect("the session")
         .clone();
     assert_eq!(keys(&entry["prompt"]), prompt_keys());
-    assert_eq!(keys(&entry["buffer"]), set(&["head", "tail"]));
+    assert_eq!(
+        keys(&entry["buffer"]),
+        set(&["head", "tail", "total_bytes", "resource_uri"])
+    );
 
     // `get_command_history.entries[]`.
     let history = body(
@@ -2641,6 +2653,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
             // keeps the default one rather than the registry it just
             // replaced, because the point here is the *registry* limit.
             config: std::sync::Arc::clone(&small.config),
+            resource_list_changed: small.resource_list_changed.clone(),
         };
         let (_first, _) = start_bash(&server_one).await;
         note(&body(
