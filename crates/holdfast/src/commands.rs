@@ -1000,6 +1000,45 @@ pub async fn attach(session: &str) -> ExitCode {
         Dialled::Refused(code) => return ExitCode::from(code),
     };
 
+    // **The two signals that would otherwise skip the restore, and they
+    // are installed before raw mode is taken.** `TermiosGuard`'s `Drop`
+    // covers the normal path, `?` and a panic unwinding — but a process
+    // terminated by a signal's *default* disposition runs no
+    // destructors, and the user is left holding a shell with `ECHO` and
+    // `ICANON` off, recoverable only by typing `stty sane` blind.
+    // `pkill holdfast` is exactly what an operator reaches for, and a
+    // keyboard `Ctrl-C` cannot get here at all — raw mode clears `ISIG`
+    // — so an external kill is the whole of this hazard.
+    //
+    // **Above the guard, because installing them is what changes the
+    // disposition.** Taking the terminal first left a window — two task
+    // spawns and the `winch` registration wide — in which the terminal
+    // was already raw and `SIGTERM` still meant *die without running
+    // destructors*, which is the same defect and the same mute shell,
+    // only narrower. Nothing here depends on `tty`, `frames`, `keys` or
+    // `winch`, so the ordering costs nothing; a registration that fails
+    // now also returns before the guard exists rather than after it.
+    //
+    // Created **once, above the loop**, like `winch` and not like
+    // `watch`'s `ctrl_c()`: tokio's `register_listener` marks the
+    // current version seen, so a listener constructed inside the loop
+    // can be created after the broadcast and never see it.
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            diag!("holdfast attach: cannot install a SIGTERM handler: {e}");
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
+    let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            diag!("holdfast attach: cannot install a SIGHUP handler: {e}");
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
+
     // The controlling terminal. **The guard is taken before anything
     // else can fail**, and every exit path below — including a panic —
     // runs its `Drop`. A restore that has to be remembered on each path
@@ -1027,35 +1066,6 @@ pub async fn attach(session: &str) -> ExitCode {
                 return ExitCode::from(EXIT_FAILED);
             }
         };
-    // **The two signals that would otherwise skip the restore.**
-    // `TermiosGuard`'s `Drop` covers the normal path, `?` and a panic
-    // unwinding — but a process terminated by a signal's *default*
-    // disposition runs no destructors, and the user is left holding a
-    // shell with `ECHO` and `ICANON` off, recoverable only by typing
-    // `stty sane` blind. `pkill holdfast` is exactly what an operator
-    // reaches for, and a keyboard `Ctrl-C` cannot get here at all —
-    // raw mode clears `ISIG` — so an external kill is the whole of this
-    // hazard.
-    //
-    // Created **once, above the loop**, like `winch` and not like
-    // `watch`'s `ctrl_c()`: tokio's `register_listener` marks the
-    // current version seen, so a listener constructed inside the loop
-    // can be created after the broadcast and never see it.
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(s) => s,
-        Err(e) => {
-            diag!("holdfast attach: cannot install a SIGTERM handler: {e}");
-            return ExitCode::from(EXIT_FAILED);
-        }
-    };
-    let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-        Ok(s) => s,
-        Err(e) => {
-            diag!("holdfast attach: cannot install a SIGHUP handler: {e}");
-            return ExitCode::from(EXIT_FAILED);
-        }
-    };
 
     // One at startup, so the session reflows to *this* terminal
     // immediately rather than at the first time the user drags a window.
