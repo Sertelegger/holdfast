@@ -127,10 +127,10 @@ pub fn start_detached(paths: &RuntimePaths, exe: &Path) -> io::Result<StartOutco
         });
     }
 
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.daemon_log())?;
+    // Owner-only, through the one opener — `daemon.log` carries the
+    // daemon's stderr, which is where its diagnostics (and anything a
+    // child wrote to a shared fd) land.
+    let log = super::paths::open_log_append(&paths.daemon_log())?;
     let log_err = log.try_clone()?;
 
     let mut cmd = std::process::Command::new(exe);

@@ -153,6 +153,93 @@ pub const RUNTIME_DIR_ENV: &str = "CLASP_RUNTIME_DIR";
 pub const DIR_MODE: u32 = 0o700;
 /// Mode for every socket in it (spec §7.1: `0600` on each socket).
 pub const SOCKET_MODE: u32 = 0o600;
+/// Mode for every log file CLASP creates — the same `0600` as the
+/// sockets, and for a stronger reason.
+///
+/// §9.4's audit trail records the command line, the argv, the cwd and
+/// the env-var **key set** of everything the agent has run. A trail any
+/// local user can read discloses more than the socket whose `0600` §7.1
+/// spells out, so it does not get a weaker mode than the socket.
+///
+/// `0600` rather than `0400`, because the daemon appends to it for its
+/// whole life; and an explicit mode rather than a umask, because a
+/// umask is the invoking user's setting and the default one on every
+/// mainstream distribution (`022`) yields `0644`.
+pub const LOG_MODE: u32 = 0o600;
+
+/// Open a CLASP log for appending, creating it — and the directory that
+/// holds it — owner-only.
+///
+/// **Every log this codebase creates goes through here**, and the mode
+/// lives at the point of creation rather than at the call sites for a
+/// reason measured in this milestone: `serve_stdio` reaches
+/// `AuditLog::to_path` with no `ensure_dir` ahead of it, so on a machine
+/// that had never run the daemon `~/.clasp/logs/audit.log` was created
+/// `0644` while the daemon's copy of the same file was `0600`. That is a
+/// security property enforced on the transport somebody tested and not
+/// on the one they did not, and a mode set at one call site would leave
+/// the next caller free to reintroduce it.
+///
+/// The `open(2)` mode is applied by the kernel at creation and a umask
+/// can only *clear* bits from it, so `0600` cannot be widened by the
+/// environment. It has no effect on a file that already exists, which is
+/// deliberate: there is **no verify-and-tighten step** here, for two
+/// reasons. A `chmod` follows symlinks, so tightening a log another user
+/// pre-created would chmod whatever they pointed it at. And a repair
+/// path that runs before every assertion is exactly how
+/// `ensure_dir_creates_the_tree_mode_0700` came to be unable to observe
+/// its own `DirBuilder::mode` — see the note on that test.
+pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    if let Some(parent) = path.parent() {
+        // `recursive(true)` succeeds on a directory that already exists,
+        // and applies `mode` only to the ones it creates — the same
+        // "silently fine on a pre-existing world-readable directory"
+        // that `ensure_dir` exists to catch on the runtime directory.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(DIR_MODE)
+            .create(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(LOG_MODE)
+        .open(path)
+}
+
+/// Forces the process umask for the lifetime of the guard.
+///
+/// A mode test without this measures the developer's shell rather than
+/// the code: under `umask 077` a file created with **no** explicit mode
+/// already comes out `0600`, so the assertion passes against the very
+/// defect it exists to catch. Forcing `022` — the default on every
+/// mainstream distribution — makes the naive creation come out `0644`,
+/// which is what gives the assertion something to discriminate.
+///
+/// The umask is process-global and the test binary is threaded, so this
+/// is deliberately the loosest value anything here asserts against:
+/// `022` can clear no bit of `0600` or `0700`, so a concurrent test
+/// creating a file with an explicit mode is unaffected either way.
+#[cfg(test)]
+pub(crate) struct ForcedUmask(libc::mode_t);
+
+#[cfg(test)]
+impl ForcedUmask {
+    pub(crate) fn loose() -> Self {
+        // SAFETY: `umask` cannot fail; it returns the previous mask.
+        Self(unsafe { libc::umask(0o022) })
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedUmask {
+    fn drop(&mut self) {
+        // SAFETY: as above, restoring what we replaced.
+        unsafe { libc::umask(self.0) };
+    }
+}
 
 /// `sockaddr_un.sun_path` is 108 bytes on Linux and 104 on macOS, minus
 /// the NUL. Binding a longer path fails with a confusing `EINVAL`, so we
@@ -816,6 +903,58 @@ mod tests {
             let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{} is mode {mode:o}", d.display());
         }
+    }
+
+    /// **The creation mode, with a control that says the mode came from
+    /// us.** Unlike `ensure_dir`, `open_log_append` has no
+    /// verify-and-tighten step, so this assertion really does observe
+    /// what `OpenOptions::mode` set — delete `.mode(LOG_MODE)` and the
+    /// log comes out `0644` and this row goes red.
+    ///
+    /// The `naive` half is the control, and it is the one that stops
+    /// this passing for the wrong reason: it creates a file exactly the
+    /// way the defective code did, in the same directory, under the same
+    /// forced umask. If the umask forcing failed to take, `naive` comes
+    /// out `0600` too and its assertion fails — so a green run means the
+    /// environment was genuinely permissive and the log was tight
+    /// anyway.
+    #[test]
+    fn a_log_is_created_owner_only_under_an_owner_only_directory() {
+        let dir = temp_dir("logmode");
+        let _scoped = Scoped(dir.clone());
+        let _umask = ForcedUmask::loose();
+
+        let naive = dir.join("naive").join("daemon.log");
+        std::fs::create_dir_all(naive.parent().unwrap()).unwrap();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&naive)
+            .unwrap();
+        assert_eq!(
+            mode_of(&naive),
+            0o644,
+            "the control did not come out world-readable, so this test could \
+             not have told a set mode from an ambient one"
+        );
+        assert_eq!(mode_of(naive.parent().unwrap()), 0o755);
+
+        let log = dir.join("logs").join("audit.log");
+        open_log_append(&log).unwrap();
+        assert_eq!(
+            mode_of(&log),
+            LOG_MODE,
+            "the log is readable by every local user"
+        );
+        assert_eq!(
+            mode_of(log.parent().unwrap()),
+            DIR_MODE,
+            "the directory holding it leaks the names inside"
+        );
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     #[test]

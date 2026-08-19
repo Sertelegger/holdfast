@@ -5,12 +5,13 @@
 //! the payload and redacts it, so an audit line cannot carry a secret even
 //! when the session it describes has redaction disabled (§9.4, REQ-O-010).
 
+use crate::daemon::paths::open_log_append;
 use crate::output::redact::redact_str;
 use crate::output::rules::RuleSet;
 use parking_lot::Mutex;
 use serde_json::{Map, Value};
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,12 +50,15 @@ impl AuditLog {
     }
 
     /// Open (or create) an audit log at `path`, appending.
+    ///
+    /// Owner-only, via [`open_log_append`] — **not** a bare
+    /// `OpenOptions`. This constructor is what `serve_stdio` reaches
+    /// with no `RuntimePaths` and no `ensure_dir` behind it, so on the
+    /// stdio transport it is the *only* thing standing between
+    /// `~/.clasp/logs/audit.log` and `0644`.
     pub fn to_path(path: impl AsRef<Path>, rules: Arc<RuleSet>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_log_append(&path)?;
         Ok(Self {
             rules,
             sink: Mutex::new(Sink::File(file)),
@@ -77,14 +81,17 @@ impl AuditLog {
     /// §9.4's trail silently stops. A disabled log stays disabled: there
     /// is no path to reopen and inventing one would turn the
     /// audit-disabled test constructor into a writer.
+    ///
+    /// Through the same [`open_log_append`] as [`AuditLog::to_path`],
+    /// which is the whole point of there being one opener: a rotation
+    /// **re-creates** this file, so a `reopen` that set no mode would
+    /// hand the trail back to every local user once a day, undoing even
+    /// a `chmod` somebody had applied by hand.
     pub fn reopen(&self) -> std::io::Result<()> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = open_log_append(path)?;
         *self.sink.lock() = Sink::File(file);
         Ok(())
     }
@@ -456,6 +463,84 @@ mod tests {
         assert_eq!(entries.len(), 2, "a restart must not truncate the trail");
         assert_eq!(entries[0]["pid"], 1);
         assert_eq!(entries[1]["pid"], 2);
+    }
+
+    /// **The audit trail is owner-only, on the transport nobody tested.**
+    ///
+    /// `serve_stdio` opens this log through `to_path` with no
+    /// `RuntimePaths` and no `ensure_dir` ahead of it, so on a machine
+    /// that had never run the daemon `~/.clasp/logs/audit.log` was
+    /// created `0644` and any local user could read the command line,
+    /// the cwd and the env-var key set of everything the agent had run.
+    /// The daemon path was fine, because `bind_control` → `ensure_dir`
+    /// had already made the directory `0700` — one transport enforcing
+    /// the milestone's own non-negotiable and the other not.
+    ///
+    /// Both creation sites are exercised, because both create the file:
+    /// `to_path` at start-up, and `reopen` after §19.1 renames it away
+    /// once a day. The `reopen` half is the one a `chmod` by hand could
+    /// not survive.
+    ///
+    /// The umask is forced (see [`ForcedUmask`]) so this measures what
+    /// the code set rather than what the developer's shell masked off,
+    /// and the `naive` control is what proves the forcing took: it
+    /// creates a file the way the defective code did and asserts it
+    /// comes out `0644`. Delete the mode from `open_log_append` and the
+    /// two audit assertions redden while the control stays green.
+    #[test]
+    fn the_audit_log_is_owner_only_when_it_is_created_and_when_it_is_reopened() {
+        use crate::daemon::paths::ForcedUmask;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let _umask = ForcedUmask::loose();
+
+        let naive = dir.path().join("naive").join("audit.log");
+        std::fs::create_dir_all(naive.parent().unwrap()).unwrap();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&naive)
+            .unwrap();
+        assert_eq!(
+            mode_of(&naive),
+            0o644,
+            "the control did not come out world-readable, so this test could \
+             not have told a set mode from an ambient one"
+        );
+
+        let path = dir.path().join("logs").join("audit.log");
+        let log = AuditLog::to_path(&path, Arc::new(RuleSet::builtin().unwrap())).unwrap();
+        log.record("session_start", Some("sess_a"), json!({"pid": 1}));
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "every local user can read the agent's command lines"
+        );
+        assert_eq!(
+            mode_of(path.parent().unwrap()),
+            0o700,
+            "the directory holding the trail lists its contents to anyone"
+        );
+
+        // The rotation half: §19.1 renames the file away, so `reopen`
+        // creates a fresh one and gets to choose its mode all over again.
+        std::fs::rename(&path, dir.path().join("logs").join("audit.log.rolled")).unwrap();
+        log.reopen().expect("reopen after rotation");
+        log.record("session_start", Some("sess_b"), json!({"pid": 2}));
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "a rotation re-created the trail world-readable, undoing even a \
+             chmod applied by hand"
+        );
+        // Not an empty file whose mode happens to be right: the reopen
+        // has to have actually landed the entry here.
+        assert!(std::fs::read_to_string(&path).unwrap().contains("sess_b"));
     }
 
     /// §9.4 names exactly one path, and both of `default_path`'s answers
