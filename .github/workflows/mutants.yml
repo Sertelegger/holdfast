@@ -1,8 +1,12 @@
 # CLASP weekly mutation sweep.
 # Plan: docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md Task 6.
 #
-# clasp-core only. NEVER on the push path -- a sweep is hours, and a
-# per-push sweep is the first thing anyone disables.
+# clasp-core AND clasp -- see the shard-calibration comment below for why
+# clasp-core-only stopped being the right scope (0.0.5 milestone review,
+# finding I-18: crates/clasp/src/commands.rs holds `daemon stop --force`'s
+# SIGKILL confirmation, the exit codes, and the /proc liveness evidence, and
+# was never mutation-tested by any scheduled job). NEVER on the push path --
+# a sweep is hours, and a per-push sweep is the first thing anyone disables.
 #
 # Pinned inputs:
 #   runner image    ubuntu-24.04
@@ -88,19 +92,88 @@ jobs:
       # halves: the real config is where the tool looks, and no inert decoy
       # has reappeared at the root for someone to edit in good faith.
       - run: test -f .cargo/mutants.toml && test ! -e mutants.toml
-      # ONE SHARD PER WEEK, rotating; the whole crate every three weeks.
+      # ONE SHARD PER WEEK, rotating; the whole (now two-package) scope
+      # every eight weeks.
       #
-      # The unsharded sweep stopped fitting. Measured: 464 mutants on
-      # 2026-08-13, 1110 on 2026-08-17 -- the crate more than doubled across
-      # 0.0.3 and 0.0.4 -- and run 31883173007 was CANCELLED at the 350-minute
-      # timeout on 2026-08-15 having produced no verdict at all. Raising the
-      # timeout only moves that date: mutant count tracks the codebase, and
-      # this codebase is a third of the way through its spec.
+      # RE-CALIBRATED 2026-08-18 (0.0.5 milestone review, finding I-18).
+      # Two things were wrong with the previous calibration, not one:
       #
-      # `--shard k/n` partitions the generated set. Verified 2026-08-17:
-      # 0/3, 1/3 and 2/3 list 370 mutants each, summing to exactly 1110, so
-      # no mutant is dropped and none is run twice. ~370 fits comfortably in
-      # the budget that 1110 overran.
+      # 1. SCOPE. clasp-core only, so crates/clasp/src/commands.rs --
+      #    `daemon stop --force`'s SIGKILL confirmation, the exit codes, the
+      #    /proc liveness evidence -- was never mutation-tested by any
+      #    scheduled job. Fixed by adding `--package clasp` below.
+      #
+      # 2. CALIBRATION was stale. Measured: 464 mutants on 2026-08-13, 1110
+      #    (clasp-core only) on 2026-08-17, and run 31883173007 was
+      #    CANCELLED at the 350-minute timeout on 2026-08-15 having produced
+      #    no verdict at all. 0.0.5 then added 10,652 lines to
+      #    crates/{clasp-core,clasp}/src after the 08-17 measurement, so the
+      #    3-way, clasp-core-only shard math was already wrong by the time
+      #    anyone would next read it.
+      #
+      # Re-measured 2026-08-18, `cargo mutants --list` (cheap -- it doesn't
+      # build or run anything), against HEAD b5a8393 with four files
+      # (daemon/server.rs, mcp/shim.rs, protocol/client.rs,
+      # protocol/method.rs) mid-edit by other in-flight work at the moment
+      # of measurement:
+      #   clasp-core .................................... 1742 mutants
+      #   clasp ............................................ 47 mutants
+      #   combined (both --package flags, one invocation) . 1789 mutants
+      # cargo-mutants reads the working tree, not a commit, and the total
+      # moved by several mutants within this same calibration session as
+      # other lanes committed -- this is a snapshot against a growing
+      # codebase, not a fixed point, the same way 464/1110 above were.
+      #
+      # RATE, from the two real timed runs, not a guess:
+      #   run 31751264509 (2026-08-13) COMPLETED (job conclusion "failure" --
+      #     mutants were caught; continue-on-error made the WORKFLOW show
+      #     "success," which is worth remembering next time this comment is
+      #     trusted at a glance): 464 mutants, job wall time 22:45:57 to
+      #     01:33:15 = 167.3 min -> 2.77 mutants/min.
+      #   run 31883173007 (2026-08-15) was CANCELLED at 350.4 min having
+      #     processed 458 of that day's 1080 mutants (caught.txt + missed.txt
+      #     + timeout.txt + unviable.txt line counts, from the uploaded
+      #     mutants-out-31883173007 artifact, which is non-empty precisely
+      #     because a cancelled sweep still flushes partial progress -- see
+      #     "WHAT THIS ARTIFACT DOES NOT TELL YOU" on the upload step
+      #     below) -> 1.31 mutants/min.
+      # The two rates disagree by >2x: GitHub-hosted runners are shared
+      # hardware and this job has exactly two real data points. The SLOWER
+      # figure (1.31/min, i.e. 0.765 min/mutant) is what the shard count
+      # below is sized against; the faster one is upside, not the plan.
+      #
+      # FIXED COST CHECK -- more shards is not automatically a fix, and
+      # would not be one if a full build dominated each shard's time. It
+      # doesn't here: the job runs exactly ONE shard per scheduled invocation, not
+      # all N in sequence, so the ~2-minute fixed setup (checkout, apt-get,
+      # toolchain, rust-cache, cargo install cargo-mutants, baseline build --
+      # measured needing 2m02s total before the mutants step started, on
+      # 2026-08-13's smaller tree) is paid once per week regardless of N; it
+      # does not multiply the way N builds inside one job would. And it was
+      # ~1% of that run's 167.3-minute total, so it is not the cost being
+      # divided when N changes. Raising N is a real fix here.
+      #
+      # SHARD COUNT: 8, up from 3. `--shard k/n` partitions the generated
+      # set; verified 2026-08-18 against the same HEAD as the counts above:
+      # 0/8 through 6/8 list 224 mutants each and 7/8 lists 221, summing to
+      # exactly 1789 -- no mutant dropped, none run twice (checked with a
+      # byte-exact dedup across all eight lists; `sort -u` alone, under this
+      # shell's default locale, under-counts distinct mutant lines by
+      # collating away punctuation, which looks exactly like a sharding bug
+      # and is not one -- use `sort | uniq -c` if re-verifying this).
+      #
+      # Projected runtime at 224 mutants/shard: 83 min at the fast rate, 176
+      # min at the slow one it's sized against -- 24%-50% of the 350-minute
+      # budget. Growth headroom at the slow rate before this shard size
+      # reaches the cap again: ~2x (max sustainable shard ~451 mutants at
+      # 0.765 min/mutant net of fixed cost). That is deliberately less
+      # generous than it could be: full-scope coverage was every 3 weeks and
+      # is now every 8, and pushing N higher to buy more growth headroom
+      # trades directly against that -- "finding survivors in code NOBODY
+      # HAS TOUCHED" (below) gets slower to complete the wider N gets. 8 was
+      # chosen so a single further doubling -- the same magnitude as the
+      # 08-13-to-08-17 measurement -- does not immediately reopen this
+      # finding.
       #
       # Why not `--in-diff`, which is the obvious answer: every task in this
       # project already runs a manual mutation sweep over its own diff, and
@@ -112,15 +185,33 @@ jobs:
       #
       # The rotation is by ISO week so it needs no state. `--no-shuffle` and
       # the pinned tool version keep shard membership stable between runs,
-      # so week N+3 re-runs the same 370 mutants unless the code moved.
+      # so week N+8 re-runs the same ~224 mutants unless the code moved.
       - run: |
-          shard=$(( $(date -u +%V) % 3 ))
-          echo "ISO week $(date -u +%V) -> shard ${shard}/3"
-          cargo mutants --package clasp-core --no-shuffle --jobs 2 \
-            --shard "${shard}/3" -- --locked
+          shard=$(( $(date -u +%V) % 8 ))
+          echo "ISO week $(date -u +%V) -> shard ${shard}/8"
+          cargo mutants --package clasp-core --package clasp --no-shuffle \
+            --jobs 2 --shard "${shard}/8" -- --locked
       # mutants.out/ is the only durable evidence this job produced anything.
       # `if-no-files-found: error` is what stops a sweep that produced
       # nothing from uploading nothing and looking identical to a clean one.
+      #
+      # WHAT THIS ARTIFACT DOES NOT TELL YOU: whether the sweep finished.
+      # Confirmed against run 31883173007's own upload -- cargo-mutants
+      # flushes outcomes.json/caught.txt/missed.txt incrementally, so a
+      # sweep CANCELLED by `timeout-minutes` still has a non-empty
+      # mutants.out/ at the moment it is killed, and `if: always()` still
+      # runs this step and still uploads it. A completed-clean run and a
+      # timed-out one both produce an artifact this check accepts; do not
+      # read "an artifact exists" as "a verdict exists."
+      # What DOES distinguish them, and is not masked by continue-on-error
+      # (which only ever turns a FAILURE conclusion into a reported
+      # success, never a CANCELLED one): the run's own conclusion --
+      #   gh run list --workflow mutants.yml --json conclusion --limit 5
+      # reads "success" for a clean sweep or a still-masked survivor-found
+      # sweep (indistinguishable from each other until 2026-09-09, by
+      # design -- see the continue-on-error comment above), and reads
+      # "cancelled" for a timeout with no verdict. That is the check;
+      # artifact presence alone is not.
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
