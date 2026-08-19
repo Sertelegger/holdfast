@@ -195,7 +195,18 @@ mod tests {
         // passes identically against an implementation that answers
         // everything, which is the outcome §4.5.1's admission rule exists
         // to prevent.
-        let declined: [(&str, &[u8]); 8] = [
+        //
+        // **The last three are the ones that discriminate a matcher.**
+        // Every one of the eight above them ends in `u`, `q` or `n`, so a
+        // rewrite of the shape "any CSI whose final byte is `c` is a
+        // Device Attributes query" — the form a *"parse the CSI properly"*
+        // tidy-up naturally takes — passed all eight. Measured: with only
+        // those eight, that mutant survived the entire workspace.
+        // Secondary DA and a private DA are real queries a real terminal
+        // answers differently; `\x1b[1c` is not DA1 at all, because DA1's
+        // parameter is admitted only in its two spellings and `1` is
+        // neither.
+        let declined: [(&str, &[u8]); 11] = [
             ("XTGETTCAP", b"\x1bP+q696e646e\x1b\\"),
             ("OSC 10 foreground", b"\x1b]10;?\x07"),
             ("OSC 11 background", b"\x1b]11;?\x07"),
@@ -206,6 +217,9 @@ mod tests {
             // §4.5.1's worked example of the rule saying no: a fabricated
             // cursor position is worse than silence.
             ("CPR", b"\x1b[6n"),
+            ("secondary DA", b"\x1b[>c"),
+            ("DA1 with a foreign parameter", b"\x1b[1c"),
+            ("private DA", b"\x1b[?c"),
         ];
         for (name, bytes) in declined {
             let out = responder().feed(bytes, Instant::now());
@@ -240,11 +254,77 @@ mod tests {
         assert_eq!(r.feed(b"0c", Instant::now()), vec![DA1_REPLY]);
 
         // And the negative that separates a carry from a matcher that
-        // simply answers any chunk starting with `0c`: a split that does
-        // *not* reconstitute a query stays silent.
+        // answers **whatever the carry happened to be waiting for**: a
+        // split that does *not* reconstitute a query stays silent.
+        //
+        // Note what this arm does **not** separate, because its comment
+        // used to claim it did: the second chunk here is `1;1H` and does
+        // not begin with `0c`, so nothing about "a matcher that simply
+        // answers any chunk starting with `0c`" is measured. That property
+        // is `an_enabled_responder_answers_nothing_to_a_bare_query_tail`,
+        // below, and it needed its own test.
         let mut r = responder();
         assert!(r.feed(b"noise\x1b[", Instant::now()).is_empty());
         assert!(r.feed(b"1;1H", Instant::now()).is_empty());
+    }
+
+    /// The carry's other half: an **enabled** responder with **nothing
+    /// carried** must answer nothing to a query's tail on its own.
+    ///
+    /// Nothing in this module used to say so. Every negative here is a
+    /// complete, well-formed declined query; the one place a bare `0c` was
+    /// fed with an empty expectation is
+    /// `a_disabled_responder_carries_nothing_across_chunks`, and that
+    /// responder is `QueryResponder::new(false, …)`, which short-circuits
+    /// at the `!self.enabled` guard **before reaching any matcher**. It
+    /// proves the knob works and nothing whatever about matching.
+    ///
+    /// Measured: a matcher that also accepted the parameterised spelling
+    /// with its `\x1b[` introducer stripped — the shape of a *"fish sends
+    /// `CSI 0 c`, be lenient"* change — survived every other test in this
+    /// module.
+    ///
+    /// **The harm is not a wrong number in a report.** It is
+    /// `\x1b[?6c` typed into the child's stdin, up to
+    /// `DEFAULT_TERMINAL_QUERY_REPLIES_PER_MIN` times a minute, on
+    /// ordinary output that merely contains the digraph — and
+    /// `terminal_queries: true` is the shipped default, so the exposure is
+    /// every session by default rather than an opt-in.
+    #[test]
+    fn an_enabled_responder_answers_nothing_to_a_bare_query_tail() {
+        // The positive first, so every silence below is a decision rather
+        // than a dead reply path.
+        assert_eq!(
+            responder().feed(b"\x1b[0c", Instant::now()),
+            vec![DA1_REPLY]
+        );
+
+        let mute: [(&str, &[u8]); 4] = [
+            ("the tail on its own", b"0c"),
+            // The same two bytes as they actually reach a reader.
+            ("a git SHA", b"commit 3f0c9a1d\n"),
+            ("a hex dump line", b"00000010  0c 0d 0a 00  |....|\n"),
+            ("a filename", b"tmp/dump-0c.bin\n"),
+        ];
+        for (name, bytes) in mute {
+            let out = responder().feed(bytes, Instant::now());
+            assert!(
+                out.is_empty(),
+                "{name} ({bytes:?}) was answered with {out:?} — that reply \
+                 is typed into the child's stdin"
+            );
+        }
+
+        // And the near miss must not consume the real query behind it: a
+        // matcher that treated `0c` as a hit would have advanced its scan
+        // past bytes it never matched.
+        let mut r = responder();
+        assert!(r.feed(b"0c", Instant::now()).is_empty());
+        assert_eq!(
+            r.feed(b"\x1b[0c", Instant::now()),
+            vec![DA1_REPLY],
+            "a real query after the near miss went unanswered"
+        );
     }
 
     #[test]
