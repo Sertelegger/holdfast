@@ -963,7 +963,7 @@ mod tests {
         let err = shim
             .forward_resource(
                 method::METHOD_RESOURCE_READ,
-                json!({ "uri": "clasp://session/s/buffer?ansi=purple" }),
+                json!({ "uri": "holdfast://session/s/buffer?ansi=purple" }),
             )
             .await
             .expect_err("§5.5.2 routes a bad parameter to the protocol channel");

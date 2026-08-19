@@ -31,7 +31,7 @@
 //!
 //! So a reaped session keeps its id, its buffer and its registry entry:
 //! `tool/status` and `tool/read_output` still resolve it,
-//! `clasp://session/{id}/buffer` still resolves it, `resources/list`
+//! `holdfast://session/{id}/buffer` still resolves it, `resources/list`
 //! omits it, the name is released for reuse (REQ-S-002), and
 //! `sessions_exited_retained` counts it. **`session_not_found` after a
 //! reap is not this milestone's behaviour and no test asserts it.**

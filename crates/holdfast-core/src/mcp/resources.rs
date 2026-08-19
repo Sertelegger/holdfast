@@ -1,5 +1,5 @@
 //! MCP resources (§5.5): `resources/list`, `resources/templates/list`
-//! and `resources/read`, plus the `clasp://` URI grammar all three share.
+//! and `resources/read`, plus the `holdfast://` URI grammar all three share.
 //!
 //! **The same `OutputProcessor` pipeline as `read_output`, and
 //! deliberately so.** A resource fetch is bulk inspection of the buffer a
@@ -16,9 +16,9 @@
 //!
 //! | Shape | Owner | Here |
 //! |---|---|---|
-//! | `clasp://session/{id}/buffer{?…}` | §5.5.1 | served |
-//! | `clasp://session-name/<name>/buffer` | §5.5.4, REQ-R-007 | served, **live sessions only** |
-//! | `clasp://session/{id}/file/{transfer_id}` | §5.5.6, §5.7 | recognised, not served — 0.0.9 |
+//! | `holdfast://session/{id}/buffer{?…}` | §5.5.1 | served |
+//! | `holdfast://session-name/<name>/buffer` | §5.5.4, REQ-R-007 | served, **live sessions only** |
+//! | `holdfast://session/{id}/file/{transfer_id}` | §5.5.6, §5.7 | recognised, not served — 0.0.9 |
 //!
 //! The third is recognised on purpose. Answering it `malformed_uri`
 //! would tell an agent the URI is ill-formed when it is a shape this
@@ -51,28 +51,28 @@ use super::caller;
 /// read. `ReadRequest.tool`'s own doc comment already names this string.
 pub const RESOURCE_READ_TOOL: &str = "resource_read";
 
-const SCHEME: &str = "clasp://";
+const SCHEME: &str = "holdfast://";
 const ANSI_ALLOWED: [&str; 2] = ["strip", "raw"];
 const ENCODING_ALLOWED: [&str; 3] = ["utf8", "base64", "lossy_printable"];
 const BOOL_ALLOWED: [&str; 2] = ["true", "false"];
 
 /// §5.5.2's single template. `{?…}` is RFC 6570 form-style expansion.
 pub const BUFFER_URI_TEMPLATE: &str =
-    "clasp://session/{session_id}/buffer{?ansi,text_encoding,redact,since_cursor,max_bytes}";
+    "holdfast://session/{session_id}/buffer{?ansi,text_encoding,redact,since_cursor,max_bytes}";
 
-/// What a `clasp://` URI names.
+/// What a `holdfast://` URI names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceTarget {
-    /// `clasp://session/{id}/buffer` — resolves whether or not the
+    /// `holdfast://session/{id}/buffer` — resolves whether or not the
     /// session is still running (§5.5.1).
     SessionId(String),
-    /// `clasp://session-name/<name>/buffer` — resolves **only to live
+    /// `holdfast://session-name/<name>/buffer` — resolves **only to live
     /// sessions** (§5.5.4, REQ-S-002, REQ-R-007). A name is released
     /// when a session exits, so this must re-resolve on every read and
     /// must never be cached: the failure hands one session's output to a
     /// reader who asked for another.
     SessionName(String),
-    /// `clasp://session/{id}/file/{transfer_id}` — §5.5.6's shape,
+    /// `holdfast://session/{id}/file/{transfer_id}` — §5.5.6's shape,
     /// recognised so it is not reported as malformed, and not served
     /// until 0.0.9 builds file transfer.
     File {
@@ -105,7 +105,7 @@ impl Default for ResourceQuery {
     }
 }
 
-/// A parsed `clasp://` URI.
+/// A parsed `holdfast://` URI.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResourceUri {
     pub target: ResourceTarget,
@@ -175,7 +175,7 @@ impl UriError {
 }
 
 /// Minimal percent-decoding, for session names that carry a space or a
-/// `%`. Nothing else in a `clasp://` URI needs it, and pulling in a URL
+/// `%`. Nothing else in a `holdfast://` URI needs it, and pulling in a URL
 /// crate for two escapes would be a dependency for a footnote.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -197,7 +197,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 impl ResourceUri {
-    /// Parse and validate a `clasp://` URI against §5.5.2.
+    /// Parse and validate a `holdfast://` URI against §5.5.2.
     pub fn parse(uri: &str) -> Result<Self, UriError> {
         let Some(rest) = uri.strip_prefix(SCHEME) else {
             return Err(UriError::malformed(format!(
@@ -238,13 +238,13 @@ impl ResourceUri {
     /// `resources/list` publishes and the one the MIME type in that list
     /// describes.
     pub fn buffer_uri(session_id: &str) -> String {
-        format!("clasp://session/{session_id}/buffer")
+        format!("holdfast://session/{session_id}/buffer")
     }
 
-    /// The same URI with a `since_cursor`, for `_meta.clasp.next_uri`.
+    /// The same URI with a `since_cursor`, for `_meta.holdfast.next_uri`.
     ///
     /// The next offset is encoded **inside** `next_uri` as a query
-    /// parameter and not as a separate `_meta.clasp.cursor` field, which
+    /// parameter and not as a separate `_meta.holdfast.cursor` field, which
     /// is §5.5.3's own rule.
     ///
     /// **`session_id` is the session the bytes actually came from, and a
@@ -252,7 +252,7 @@ impl ResourceUri {
     /// into one session's buffer and means nothing in another's. A name
     /// is released when a session exits (§5.5.4, REQ-R-007) and may be
     /// reused immediately, so an agent handed
-    /// `clasp://session-name/build/buffer?since_cursor=4096`, that
+    /// `holdfast://session-name/build/buffer?since_cursor=4096`, that
     /// retried after `build` exited and a new `build` started, was
     /// served the **new** session's bytes at an offset that means
     /// nothing there — with no flag saying the identity had changed.
@@ -271,13 +271,13 @@ impl ResourceUri {
             // written as one arm rather than two so that a later edit
             // cannot restore the name-keyed form for one of them alone.
             ResourceTarget::SessionId(_) | ResourceTarget::SessionName(_) => {
-                format!("clasp://session/{session_id}/buffer")
+                format!("holdfast://session/{session_id}/buffer")
             }
             // Unreachable while §5.5.6 is unserved — `resolve` refuses
             // this shape — and left keyed on its own fields so that
             // 0.0.9 inherits a transfer URI rather than a buffer one.
             ResourceTarget::File { transfer_id, .. } => {
-                format!("clasp://session/{session_id}/file/{transfer_id}")
+                format!("holdfast://session/{session_id}/file/{transfer_id}")
             }
         };
         let q = &self.query;
@@ -410,8 +410,8 @@ pub fn list_resources(registry: &SessionRegistry) -> Vec<Resource> {
 pub fn list_resource_templates() -> Vec<ResourceTemplate> {
     // `mime_type` is left at `new`'s `None` on purpose — see above.
     vec![
-        ResourceTemplate::new(BUFFER_URI_TEMPLATE, "CLASP session buffer").with_description(
-            "Buffered output of a CLASP session. Parameters mirror read_output args. \
+        ResourceTemplate::new(BUFFER_URI_TEMPLATE, "Holdfast session buffer").with_description(
+            "Buffered output of a Holdfast session. Parameters mirror read_output args. \
          ansi: strip|raw (default strip). \
          text_encoding: utf8|base64|lossy_printable (default utf8; affects MIME type \
          — text encodings yield text/plain, base64 yields application/octet-stream). \
@@ -499,33 +499,33 @@ pub fn read_resource(
 
     // §5.5.3's extension fields, exactly: `truncated_for_size`,
     // `held_back`, `truncated_at_tail`, `next_uri`. **`held_back` and
-    // `truncated_for_size` are distinct** — one means CLASP is
+    // `truncated_for_size` are distinct** — one means Holdfast is
     // deliberately withholding bytes, the other that more exist beyond a
     // cap — and collapsing them into one flag is the fault to avoid.
     let mut meta = MetaObject::new();
-    let mut clasp = serde_json::Map::new();
+    let mut holdfast = serde_json::Map::new();
     if read.truncated_for_size {
-        clasp.insert("truncated_for_size".into(), json!(true));
+        holdfast.insert("truncated_for_size".into(), json!(true));
     }
     if read.held_back {
-        clasp.insert("held_back".into(), json!(true));
+        holdfast.insert("held_back".into(), json!(true));
     }
     if read.truncated_at_tail {
-        clasp.insert("truncated_at_tail".into(), json!(true));
+        holdfast.insert("truncated_at_tail".into(), json!(true));
     }
     if let Some(next) = read.next_cursor {
         // The **resolved** session's id, not the URI's own key: a
         // name-keyed read continues under the id it resolved to, so the
         // cursor cannot be replayed against a different session that
         // has since taken the name.
-        clasp.insert(
+        holdfast.insert(
             "next_uri".into(),
             json!(uri.continuation(&session.id, next)),
         );
     }
-    let has_meta = !clasp.is_empty();
+    let has_meta = !holdfast.is_empty();
     meta.0
-        .insert("clasp".into(), serde_json::Value::Object(clasp));
+        .insert("holdfast".into(), serde_json::Value::Object(holdfast));
 
     let mime = uri.query.text_encoding.mime_type();
     let contents = match uri.query.text_encoding {
@@ -552,19 +552,19 @@ mod tests {
     #[test]
     fn the_three_uri_shapes_parse_and_a_fourth_is_malformed() {
         assert_eq!(
-            ResourceUri::parse("clasp://session/sess_a1b2/buffer")
+            ResourceUri::parse("holdfast://session/sess_a1b2/buffer")
                 .unwrap()
                 .target,
             ResourceTarget::SessionId("sess_a1b2".into())
         );
         assert_eq!(
-            ResourceUri::parse("clasp://session-name/build/buffer")
+            ResourceUri::parse("holdfast://session-name/build/buffer")
                 .unwrap()
                 .target,
             ResourceTarget::SessionName("build".into())
         );
         assert_eq!(
-            ResourceUri::parse("clasp://session/sess_a1b2/file/tr_9")
+            ResourceUri::parse("holdfast://session/sess_a1b2/file/tr_9")
                 .unwrap()
                 .target,
             ResourceTarget::File {
@@ -576,9 +576,9 @@ mod tests {
         );
         for bad in [
             "http://session/x/buffer",
-            "clasp://session/x/screen",
-            "clasp://session//buffer",
-            "clasp://nonsense",
+            "holdfast://session/x/screen",
+            "holdfast://session//buffer",
+            "holdfast://nonsense",
         ] {
             let e = ResourceUri::parse(bad).unwrap_err();
             assert_eq!(e.code, "malformed_uri", "{bad} should be malformed");
@@ -590,34 +590,34 @@ mod tests {
         // §5.5.2 names four codes and they are not interchangeable: an
         // agent branches on `data.code` to know whether to fix a name, a
         // value or a range.
-        let e = ResourceUri::parse("clasp://session/s/buffer?ansi=purple").unwrap_err();
+        let e = ResourceUri::parse("holdfast://session/s/buffer?ansi=purple").unwrap_err();
         assert_eq!(e.code, "invalid_enum");
         assert_eq!(e.data["param"], "ansi");
         assert_eq!(e.data["value"], "purple");
         assert_eq!(e.data["allowed"], json!(["strip", "raw"]));
 
-        let e = ResourceUri::parse("clasp://session/s/buffer?colour=red").unwrap_err();
+        let e = ResourceUri::parse("holdfast://session/s/buffer?colour=red").unwrap_err();
         assert_eq!(e.code, "unknown_query_param");
         assert_eq!(e.data["param"], "colour");
 
-        let e = ResourceUri::parse("clasp://session/s/buffer?since_cursor=-5").unwrap_err();
+        let e = ResourceUri::parse("holdfast://session/s/buffer?since_cursor=-5").unwrap_err();
         assert_eq!(e.code, "out_of_range");
         assert_eq!(e.data["param"], "since_cursor");
 
-        let e = ResourceUri::parse("clasp://session/s/buffer?max_bytes=0").unwrap_err();
+        let e = ResourceUri::parse("holdfast://session/s/buffer?max_bytes=0").unwrap_err();
         assert_eq!(e.code, "out_of_range");
         assert_eq!(e.data["constraint"], "must be at least 1");
 
-        let e = ResourceUri::parse("clasp://session/s/buffer?text_encoding=xml").unwrap_err();
+        let e = ResourceUri::parse("holdfast://session/s/buffer?text_encoding=xml").unwrap_err();
         assert_eq!(e.code, "invalid_enum");
 
-        let e = ResourceUri::parse("clasp://session/s/buffer?redact=maybe").unwrap_err();
+        let e = ResourceUri::parse("holdfast://session/s/buffer?redact=maybe").unwrap_err();
         assert_eq!(e.code, "invalid_enum");
 
         // The pairing: every legal value must still parse, or this whole
         // block passes against a parser that rejects any query at all.
         let ok = ResourceUri::parse(
-            "clasp://session/s/buffer?ansi=raw&text_encoding=base64&redact=false\
+            "holdfast://session/s/buffer?ansi=raw&text_encoding=base64&redact=false\
              &since_cursor=42&max_bytes=99",
         )
         .expect("the full legal query must parse");
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn the_defaults_are_the_ones_5_5_2_publishes() {
-        let q = ResourceUri::parse("clasp://session/s/buffer")
+        let q = ResourceUri::parse("holdfast://session/s/buffer")
             .unwrap()
             .query;
         assert_eq!(q.ansi, AnsiMode::Strip);
@@ -706,7 +706,7 @@ mod tests {
         let ceiling = 8usize;
         let read = |query: &str| -> String {
             let uri = format!(
-                "clasp://session/{}/buffer?since_cursor=0&redact=false{query}",
+                "holdfast://session/{}/buffer?since_cursor=0&redact=false{query}",
                 session.id
             );
             let result =
@@ -734,11 +734,11 @@ mod tests {
     #[test]
     fn a_continuation_uri_carries_the_cursor_and_the_original_knobs() {
         // §5.5.3: the next offset lives **inside** `next_uri`, not as a
-        // separate `_meta.clasp.cursor` field — and a continuation that
+        // separate `_meta.holdfast.cursor` field — and a continuation that
         // dropped the caller's knobs would silently re-redact a stream
         // they asked for raw.
         let uri = ResourceUri::parse(
-            "clasp://session/s/buffer?ansi=raw&text_encoding=base64&redact=false",
+            "holdfast://session/s/buffer?ansi=raw&text_encoding=base64&redact=false",
         )
         .unwrap();
         let next = uri.continuation("s", 4096);
@@ -767,7 +767,7 @@ mod tests {
     /// identity change. A cursor is an offset into one buffer.
     #[test]
     fn a_name_keyed_continuation_switches_to_the_id_it_resolved_to() {
-        let uri = ResourceUri::parse("clasp://session-name/build/buffer").unwrap();
+        let uri = ResourceUri::parse("holdfast://session-name/build/buffer").unwrap();
         let next = uri.continuation("sess_9f3a", 10);
         assert_eq!(
             ResourceUri::parse(&next).unwrap().target,
@@ -776,7 +776,7 @@ mod tests {
              name a different session may hold by the time it is followed: {next}"
         );
         // The negative that separates "switched keys" from "dropped the
-        // name and kept the shape": a `clasp://session-name/sess_9f3a/`
+        // name and kept the shape": a `holdfast://session-name/sess_9f3a/`
         // URI parses as a *name* and would resolve against a live
         // session called `sess_9f3a`, which is not what was read.
         assert!(
@@ -804,7 +804,7 @@ mod tests {
         let result = read_resource(
             &registry,
             &processor,
-            "clasp://session-name/build/buffer?since_cursor=0&redact=false&max_bytes=4",
+            "holdfast://session-name/build/buffer?since_cursor=0&redact=false&max_bytes=4",
             4096,
         )
         .expect("a live named session resolves");
@@ -812,7 +812,7 @@ mod tests {
         let ResourceContents::TextResourceContents { meta, .. } = &result.contents[0] else {
             panic!("utf8 travels in `text`")
         };
-        let next = meta.as_ref().expect("a capped read carries `_meta`").0["clasp"]["next_uri"]
+        let next = meta.as_ref().expect("a capped read carries `_meta`").0["holdfast"]["next_uri"]
             .as_str()
             .expect("§5.5.3's next_uri")
             .to_string();
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn percent_escapes_in_a_name_are_decoded() {
         assert_eq!(
-            ResourceUri::parse("clasp://session-name/my%20build/buffer")
+            ResourceUri::parse("holdfast://session-name/my%20build/buffer")
                 .unwrap()
                 .target,
             ResourceTarget::SessionName("my build".into())

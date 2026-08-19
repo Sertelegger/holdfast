@@ -1589,7 +1589,7 @@ async fn a_live_session_is_in_the_resource_list_and_an_exited_one_is_not() {
     assert_eq!(listed.len(), 1, "a live session must be listed: {listed:?}");
     assert_eq!(
         listed[0]["uri"].as_str().unwrap(),
-        format!("clasp://session/{id}/buffer")
+        format!("holdfast://session/{id}/buffer")
     );
     assert_eq!(
         listed[0]["mimeType"].as_str().unwrap(),
@@ -1614,7 +1614,7 @@ async fn a_live_session_is_in_the_resource_list_and_an_exited_one_is_not() {
 
     // And it is still ID-addressable, which is the other half of §5.5.1
     // and the reason the reaper keeps the registry entry.
-    let resp = resource_read(&client, &format!("clasp://session/{id}/buffer")).await;
+    let resp = resource_read(&client, &format!("holdfast://session/{id}/buffer")).await;
     assert_eq!(
         resp.status, "ok",
         "an exited session stays ID-addressable: {}",
@@ -1628,7 +1628,7 @@ async fn a_name_keyed_uri_resolves_only_while_the_name_is_live() {
     let client = d.client().await.unwrap();
 
     let first = start_bash(&client, "reused").await;
-    let uri = "clasp://session-name/reused/buffer";
+    let uri = "holdfast://session-name/reused/buffer";
     let resp = resource_read(&client, uri).await;
     assert_eq!(resp.status, "ok", "{}", resp.details);
 
@@ -1655,9 +1655,9 @@ async fn a_name_keyed_uri_resolves_only_while_the_name_is_live() {
     // The id-keyed URI for the *old* session must still be distinct and
     // still resolve — a cached name→id mapping hands one session's
     // output to a reader who asked for another.
-    let old = resource_read(&client, &format!("clasp://session/{first}/buffer")).await;
+    let old = resource_read(&client, &format!("holdfast://session/{first}/buffer")).await;
     assert_eq!(old.status, "ok");
-    let new = resource_read(&client, &format!("clasp://session/{second}/buffer")).await;
+    let new = resource_read(&client, &format!("holdfast://session/{second}/buffer")).await;
     assert_eq!(new.status, "ok");
 }
 
@@ -1681,7 +1681,7 @@ async fn a_resource_read_and_a_read_output_return_the_same_bytes() {
     // The tool's own default cap is 32 KiB; ask the resource path for the
     // same window so the comparison is of bytes and not of caps.
     let uri = format!(
-        "clasp://session/{id}/buffer?since_cursor=0&max_bytes={}",
+        "holdfast://session/{id}/buffer?since_cursor=0&max_bytes={}",
         32 * 1024
     );
     let via_resource = first_text(&resource_read(&client, &uri).await);
@@ -1697,7 +1697,7 @@ async fn a_resource_read_and_a_read_output_return_the_same_bytes() {
     // `read_output` now emits the bulk URI beside its own bytes (§5.2).
     assert_eq!(
         data["resource_uri"].as_str().unwrap(),
-        format!("clasp://session/{id}/buffer")
+        format!("holdfast://session/{id}/buffer")
     );
 }
 
@@ -1707,7 +1707,7 @@ async fn a_malformed_parameter_is_an_invalid_params_error() {
     let client = d.client().await.unwrap();
     let id = start_bash(&client, "bad").await;
 
-    let resp = resource_read(&client, &format!("clasp://session/{id}/buffer?ansi=purple")).await;
+    let resp = resource_read(&client, &format!("holdfast://session/{id}/buffer?ansi=purple")).await;
     assert!(resp.is_error(), "a bad enum must not default-and-continue");
     let err = resp.control_error().expect("a §7.4.1 error payload");
     assert_eq!(err.code, ErrorCode::BadParams.as_str());
@@ -1732,7 +1732,7 @@ async fn a_malformed_parameter_is_an_invalid_params_error() {
     // is `-32002 resource_not_found`, and reporting it as
     // `invalid_params` tells the agent its URI was malformed when it was
     // not.
-    let resp = resource_read(&client, "clasp://session/sess_nope/buffer").await;
+    let resp = resource_read(&client, "holdfast://session/sess_nope/buffer").await;
     assert!(resp.is_error(), "an unknown session id is not a valid read");
     let err = resp.control_error().expect("a §7.4.1 error payload");
     assert_eq!(
@@ -1744,7 +1744,7 @@ async fn a_malformed_parameter_is_an_invalid_params_error() {
 
     // The pairing: a *good* parameter must still be honoured, or this
     // row passes against a server that rejects every query.
-    let resp = resource_read(&client, &format!("clasp://session/{id}/buffer?ansi=raw")).await;
+    let resp = resource_read(&client, &format!("holdfast://session/{id}/buffer?ansi=raw")).await;
     assert_eq!(resp.status, "ok", "{}", resp.details);
 }
 
@@ -1777,7 +1777,7 @@ async fn a_redact_false_resource_read_is_audited_as_resource_read() {
     let client = d.client().await.unwrap();
     let id = start_bash(&client, "audited").await;
 
-    let uri = format!("clasp://session/{id}/buffer?since_cursor=0&redact=false");
+    let uri = format!("holdfast://session/{id}/buffer?since_cursor=0&redact=false");
     let resp = resource_read(&client, &uri).await;
     assert_eq!(resp.status, "ok", "{}", resp.details);
 
@@ -1809,7 +1809,7 @@ async fn a_caller_max_bytes_is_clamped_down_against_the_configured_ceiling() {
     let id = start_bash(&client, "clamped").await;
     read_until(&client, &id, "$").await;
 
-    let uri = format!("clasp://session/{id}/buffer?since_cursor=0&max_bytes=99999999");
+    let uri = format!("holdfast://session/{id}/buffer?since_cursor=0&max_bytes=99999999");
     let resp = resource_read(&client, &uri).await;
     assert_eq!(resp.status, "ok", "{}", resp.details);
     let text = first_text(&resp);
@@ -1823,7 +1823,7 @@ async fn a_caller_max_bytes_is_clamped_down_against_the_configured_ceiling() {
     // And the response says there is more, which is what makes the clamp
     // a continuation rather than a silent truncation.
     let data: Value = method::from_cbor(&resp.data).unwrap();
-    let meta = &data["contents"][0]["_meta"]["clasp"];
+    let meta = &data["contents"][0]["_meta"]["holdfast"];
     assert_eq!(
         meta["truncated_for_size"],
         json!(true),
