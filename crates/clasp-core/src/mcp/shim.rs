@@ -55,16 +55,7 @@ impl ShimServer {
             .map_err(map_client_error)?;
 
         if let Some(e) = resp.control_error() {
-            // `bad_params` is how the daemon reports a tool's own
-            // `ErrorData::invalid_params` (§5.1 protocol channel). Rebuild
-            // it as such rather than flattening every daemon-side fault
-            // into "internal error", so the agent sees the same class of
-            // failure it would in-process.
-            return Err(if e.code == method::ErrorCode::BadParams.as_str() {
-                ErrorData::invalid_params(e.message, None)
-            } else {
-                ErrorData::internal_error(format!("[{}] {}", e.code, e.message), None)
-            });
+            return Err(rebuild_error(e));
         }
 
         let data: Value = method::from_cbor(&resp.data)
@@ -92,13 +83,38 @@ impl ShimServer {
             .await
             .map_err(map_client_error)?;
         if let Some(e) = resp.control_error() {
-            return Err(if e.code == method::ErrorCode::BadParams.as_str() {
-                ErrorData::invalid_params(e.message, None)
-            } else {
-                ErrorData::internal_error(format!("[{}] {}", e.code, e.message), None)
-            });
+            return Err(rebuild_error(e));
         }
         method::from_cbor(&resp.data).map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
+}
+
+/// Rebuild the MCP error the agent would have seen in-process from
+/// §7.4.1's error payload.
+///
+/// **`rpc_code` wins outright when the daemon sent one.** The control
+/// protocol has no room for the JSON-RPC codes an MCP handler raises, so
+/// the daemon flattens every `Err(ErrorData)` onto §18.3's nearest row,
+/// `bad_params`. Rebuilding from `code` alone therefore reported every
+/// *internal* fault as the agent's own bad argument: `openpty failed`
+/// arrived as `invalid_params` here and as `internal_error` under
+/// `--no-daemon`, so the two transports disagreed about whose fault it
+/// was. `rpc_code` is the daemon's record of what the handler really
+/// raised, and it is the whole of the answer when it is present.
+///
+/// Without it — a daemon one minor behind, or any control-protocol fault
+/// that never came from a tool — the original mapping stands.
+/// `bad_params` is `invalid_params`, which is right for §5.5.2's
+/// validation faults; everything else is a server fault and says which
+/// §18.3 code it was.
+fn rebuild_error(e: method::ControlError) -> ErrorData {
+    if let Some(code) = e.rpc_code {
+        return ErrorData::new(rmcp::model::ErrorCode(code), e.message, None);
+    }
+    if e.code == method::ErrorCode::BadParams.as_str() {
+        ErrorData::invalid_params(e.message, None)
+    } else {
+        ErrorData::internal_error(format!("[{}] {}", e.code, e.message), None)
     }
 }
 
@@ -536,5 +552,129 @@ mod tests {
             "the daemon's own message must reach the agent: {}",
             err.message
         );
+    }
+
+    /// An internal fault must not read to the agent as its own bad
+    /// input.
+    ///
+    /// The daemon flattens every `Err(ErrorData)` a tool raises onto
+    /// §18.3's `bad_params`, because §18.3 has no JSON-RPC codes. While
+    /// the rebuild read `code` alone, that flattening was lossy in the
+    /// one direction that matters — `internal_error` came back as
+    /// `invalid_params` — and the *same* fault under `--no-daemon` stayed
+    /// `internal_error`, so the two transports disagreed about whose
+    /// fault it was.
+    ///
+    /// Three distinct codes, not one: a rebuild that hardcoded
+    /// `INVALID_PARAMS` passes any single-code row.
+    #[test]
+    fn rpc_code_decides_the_rebuilt_error_when_the_daemon_sent_one() {
+        let with_rpc = |rpc: i32| method::ControlError {
+            // Always `bad_params`, because that is what the daemon must
+            // send for **every** tool fault. If the §18.3 code decided,
+            // these three would be indistinguishable — which was the bug.
+            code: method::ErrorCode::BadParams.as_str().into(),
+            message: "openpty failed".into(),
+            retriable: false,
+            rpc_code: Some(rpc),
+        };
+        for code in [-32603, -32602, -32002] {
+            let e = rebuild_error(with_rpc(code));
+            assert_eq!(e.code, rmcp::model::ErrorCode(code));
+            assert_eq!(e.message, "openpty failed");
+        }
+    }
+
+    /// The fallback, which is what a daemon one minor behind sends: no
+    /// `rpc_code`, and §18.3's code is all there is. §7.4.1 permits that
+    /// skew explicitly, so this arm is a live path and not a leftover.
+    #[test]
+    fn without_an_rpc_code_the_18_3_code_still_decides() {
+        let bare = |code: method::ErrorCode| method::ControlError {
+            code: code.as_str().into(),
+            message: "m".into(),
+            retriable: false,
+            rpc_code: None,
+        };
+        // §5.5.2's validation faults are `-32602` on the MCP wire, which
+        // is why `bad_params` maps here and not to "internal error".
+        assert_eq!(
+            rebuild_error(bare(method::ErrorCode::BadParams)).code,
+            rmcp::model::ErrorCode::INVALID_PARAMS
+        );
+        // Everything else is a server fault, and says which §18.3 code
+        // it was — the agent cannot act on it, but an operator can.
+        let e = rebuild_error(bare(method::ErrorCode::ProtocolViolation));
+        assert_eq!(e.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert!(
+            e.message.contains("protocol_violation"),
+            "the §18.3 code must survive into the message: {}",
+            e.message
+        );
+    }
+
+    /// **The wire test for the new field.** Everything above decodes
+    /// through the same derived impl the daemon encodes with, so a
+    /// rename of `rpc_code` — or a daemon that spelt it `rpcCode` — is
+    /// invisible to all of it and fatal in production. Only a literal
+    /// CBOR key can see it.
+    #[tokio::test]
+    async fn the_shim_reads_rpc_code_under_its_own_wire_name() {
+        let dir = scratch_dir("rpccode");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+
+        let reply = CborValue::Map(vec![
+            (
+                CborValue::Text("status".into()),
+                CborValue::Text("error".into()),
+            ),
+            (
+                CborValue::Text("data".into()),
+                CborValue::Map(vec![
+                    // The §18.3 code the daemon is obliged to send for
+                    // *every* tool fault. Read alone it says
+                    // "invalid_params", which is the wrong answer here.
+                    (
+                        CborValue::Text("code".into()),
+                        CborValue::Text("bad_params".into()),
+                    ),
+                    (
+                        CborValue::Text("message".into()),
+                        CborValue::Text("write task failed".into()),
+                    ),
+                    (CborValue::Text("retriable".into()), CborValue::Bool(false)),
+                    (
+                        CborValue::Text("rpc_code".into()),
+                        CborValue::Integer((-32603i64).into()),
+                    ),
+                ]),
+            ),
+            (
+                CborValue::Text("details".into()),
+                CborValue::Text("write task failed".into()),
+            ),
+        ]);
+        let _captured = stand_in_daemon(sock.clone(), reply);
+
+        let client = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        let shim = ShimServer::new(Arc::new(client));
+
+        let err = shim
+            .forward("send_input", None)
+            .await
+            .expect_err("a tool protocol fault is not a tool status");
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INTERNAL_ERROR,
+            "a CLASP bug must reach the agent as one, not as its own bad argument"
+        );
+        assert!(err.message.contains("write task failed"), "{}", err.message);
     }
 }

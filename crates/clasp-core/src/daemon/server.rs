@@ -1170,6 +1170,44 @@ async fn dispatch_resource(
     caller::with_caller(who, call).await
 }
 
+/// The control-protocol response for a tool that raised an MCP
+/// **protocol** fault (§5.1) rather than returning an outcome.
+///
+/// §18.3 has no JSON-RPC codes, so the code on the wire is its nearest
+/// catalogued row, `bad_params`, and a peer that knows only §18.3 still
+/// reads a well-formed error.
+///
+/// **`bad_params` is the control-protocol code and not the diagnosis**,
+/// and the two used to be conflated. Only `ErrorData::invalid_params` is
+/// really the caller's fault; `envelope::from_error` maps
+/// `ClaspError::Pty | ClaspError::Io` to `internal_error` from about a
+/// dozen sites in `tools.rs`, and `tools.rs` maps a panicked write task
+/// to `internal_error` with the comment *"a CLASP bug, not a session
+/// outcome"*. Discarding `e.code` told the agent that `openpty failed`
+/// was its own malformed argument — and told it something different
+/// under `--no-daemon`, where the same fault stays `internal_error`.
+/// `rpc_code` carries the real one across, and `mcp::shim::rebuild_error`
+/// puts it back.
+///
+/// **`e.data` is still dropped, deliberately.** It is arbitrary
+/// agent-visible JSON on a §9.4-audited surface; the code is an integer
+/// and carries no content at all. Imp-13 is where the resource path's
+/// structured `data` gets a route, and that route has to go through the
+/// redactor.
+///
+/// A function rather than a `match` arm because it is the one place a
+/// JSON-RPC code is chosen, and inline it could only be exercised
+/// against whichever code a real tool happened to raise — one value, so
+/// a mutation hardcoding that value survived.
+fn tool_error_response(id: u64, e: &rmcp::ErrorData) -> Response {
+    Response::error_with_rpc_code(
+        id,
+        ErrorCode::BadParams,
+        e.message.to_string(),
+        Some(e.code.0),
+    )
+}
+
 async fn dispatch_tool(
     daemon: &Arc<Daemon>,
     req: &Request,
@@ -1202,12 +1240,7 @@ async fn dispatch_tool(
     };
     match caller::with_caller(who, call).await {
         None => Response::error(req.id, ErrorCode::UnknownMethod, format!("no tool {tool}")),
-        // A tool that returns `Err(ErrorData)` is reporting an MCP
-        // *protocol* fault (§5.1) — a schema violation, not an outcome.
-        // It maps onto `bad_params` so the shim can re-raise it as
-        // `invalid_params` instead of handing the agent a tool status
-        // that §18.1 does not define.
-        Some(Err(e)) => Response::error(req.id, ErrorCode::BadParams, e.message.to_string()),
+        Some(Err(e)) => tool_error_response(req.id, &e),
         Some(Ok(result)) => {
             let outcome = passthrough::result_to_outcome(&result);
             let details = outcome.details.clone();
@@ -1362,6 +1395,45 @@ mod tests {
         );
     }
 
+    /// An MCP protocol fault keeps its JSON-RPC code across the socket.
+    ///
+    /// Three **distinct** codes, and that is the point of the row rather
+    /// than thoroughness: over the wire only `invalid_params` is
+    /// reachable from a real tool at this milestone, so a mapping that
+    /// hardcoded `-32602` passed every end-to-end assertion in the tree
+    /// while telling the agent that `openpty failed` was its own bad
+    /// argument. `internal_error` is the code the ~dozen
+    /// `ClaspError::Pty | ClaspError::Io` sites in `tools.rs` produce.
+    #[test]
+    fn a_tool_faults_json_rpc_code_survives_the_flattening_onto_bad_params() {
+        for (built, expected) in [
+            (rmcp::ErrorData::invalid_params("bad arg", None), -32602),
+            (
+                rmcp::ErrorData::internal_error("openpty failed", None),
+                -32603,
+            ),
+            (
+                rmcp::ErrorData::resource_not_found("no such uri", None),
+                -32002,
+            ),
+        ] {
+            let resp = tool_error_response(7, &built);
+            let e = resp.control_error().expect("an error response");
+            assert_eq!(resp.id, 7);
+            // §18.3 is unchanged: a peer that knows only the catalogue
+            // still reads a well-formed error.
+            assert_eq!(e.code, ErrorCode::BadParams.as_str());
+            assert!(!e.retriable);
+            assert_eq!(
+                e.rpc_code,
+                Some(expected),
+                "the tool's own code must reach the shim: {}",
+                e.message
+            );
+            assert_eq!(e.message, built.message, "and so must its message");
+        }
+    }
+
     /// §7.4's "the caller must close the connection", including for a
     /// code this build cannot classify.
     ///
@@ -1415,6 +1487,7 @@ mod tests {
             code: "a_code_from_the_future".into(),
             message: "m".into(),
             retriable: false,
+            rpc_code: None,
         };
         let unknown = Response {
             id: 1,

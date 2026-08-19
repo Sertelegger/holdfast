@@ -961,6 +961,26 @@ async fn a_tools_schema_violation_stays_a_protocol_error_across_the_wire() {
         "the tool's own message must survive: {}",
         e.message
     );
+    // §18.3's `bad_params` is the *control-protocol* code, and the
+    // daemon has to flatten every `Err(ErrorData)` a tool raises onto it
+    // because §18.3 has no JSON-RPC codes. Discarding the tool's own
+    // code on the way made that flattening lossy in the one direction
+    // that matters: `envelope::from_error` maps
+    // `ClaspError::Pty | ClaspError::Io` to `internal_error` from about
+    // a dozen sites in `tools.rs`, and every one of them then read to
+    // the agent as a malformed *argument* in hybrid mode — while staying
+    // a server fault under `--no-daemon`. Two transports, two diagnoses,
+    // one fault.
+    //
+    // This is the wired end of that: a real tool's real `ErrorData`,
+    // over a real socket. The literal is JSON-RPC 2.0's number rather
+    // than `rmcp::model::ErrorCode::INVALID_PARAMS.0`, so it pins what a
+    // peer built from the specification has to see.
+    assert_eq!(
+        e.rpc_code,
+        Some(-32602),
+        "the tool's own JSON-RPC code must survive the flattening"
+    );
 }
 
 /// Start `bash -c <script>` on a PTY and return its session id.

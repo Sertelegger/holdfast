@@ -506,6 +506,7 @@ mod tests {
             code: code.into(),
             message: "m".into(),
             retriable: false,
+            rpc_code: None,
         };
         Response {
             id: 1,

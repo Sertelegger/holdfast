@@ -54,6 +54,37 @@ pub struct ControlError {
     pub code: String,
     pub message: String,
     pub retriable: bool,
+    /// The JSON-RPC error code the shim must re-raise this as, when the
+    /// fault originated in an MCP handler rather than in the control
+    /// protocol itself.
+    ///
+    /// **Why §18.3's `code` is not enough.** A tool that answers
+    /// `Err(ErrorData)` is reporting an MCP-level fault, and §18.3 has
+    /// no row for most of them: `envelope::from_error` maps
+    /// `ClaspError::Pty | ClaspError::Io` to `internal_error` and
+    /// `tools.rs` maps a panicked write task to `internal_error` with
+    /// the comment *"a CLASP bug, not a session outcome"*. The daemon's
+    /// nearest catalogued code for all of them is `bad_params`, so
+    /// without this field `openpty failed` reached the agent as
+    /// `invalid_params` in hybrid mode — its own malformed argument —
+    /// and as `internal_error` under `--no-daemon`. Two transports, two
+    /// diagnoses, for one fault.
+    ///
+    /// **Additive, and it carries no content.** §23.3 makes a new
+    /// optional field a minor-version change and not a major one; serde
+    /// ignores unknown keys and `default` covers its absence, so a peer
+    /// on either side of the skew is unaffected. It is an integer, which
+    /// matters for §9.4: the error *message* still passes through the
+    /// redactor exactly as before, and a richer error surface must not
+    /// become a channel for unredacted bytes.
+    ///
+    /// `PROTOCOL_MINOR` is deliberately **not** bumped for it. The
+    /// protocol has never been distributed (0.0.12 is the milestone that
+    /// does that), so there is no `1.0` peer in the world to skew
+    /// against, and bumping now would advertise a released minor that
+    /// does not exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_code: Option<i32>,
 }
 
 /// Spec §18.3, complete, and **in §18.3's row order**. Producers select
@@ -214,15 +245,34 @@ impl Response {
 
     /// Build the §7.4.1 error response.
     ///
-    /// Infallible on purpose: `ControlError` is three owned primitives,
-    /// so its CBOR encoding cannot fail, and a fallible constructor here
-    /// would give every error path an error path of its own.
+    /// Infallible on purpose: `ControlError` is a handful of owned
+    /// primitives, so its CBOR encoding cannot fail, and a fallible
+    /// constructor here would give every error path an error path of its
+    /// own.
     pub fn error(id: u64, code: ErrorCode, message: impl Into<String>) -> Self {
+        Self::error_with_rpc_code(id, code, message, None)
+    }
+
+    /// [`Response::error`] carrying the JSON-RPC code the shim must
+    /// re-raise it as — see [`ControlError::rpc_code`].
+    ///
+    /// Separate from `error` rather than a fourth argument on it: every
+    /// producer in the tree is a control-protocol fault with no MCP code
+    /// to carry, and the *one* that has one is the tool-passthrough arm
+    /// in `daemon::server::dispatch_tool`. Making them all pass `None`
+    /// would put the exception in thirty places.
+    pub fn error_with_rpc_code(
+        id: u64,
+        code: ErrorCode,
+        message: impl Into<String>,
+        rpc_code: Option<i32>,
+    ) -> Self {
         let message = message.into();
         let payload = ControlError {
             code: code.as_str().into(),
             message: message.clone(),
             retriable: code.retriable(),
+            rpc_code,
         };
         Self {
             id,
@@ -417,6 +467,7 @@ mod tests {
             code: ErrorCode::BadParams.as_str().into(),
             message: "m".into(),
             retriable: false,
+            rpc_code: None,
         };
         let r = Response::ok(1, &payload, "").unwrap();
         assert!(
