@@ -431,6 +431,14 @@ impl Daemon {
     /// the disabling value, and `0` is the spelling
     /// `[limits] default_idle_timeout_secs` already uses for the same
     /// idea in the same file.
+    ///
+    /// **The window's resolution is one reaper tick.** Nothing polls this
+    /// predicate continuously: [`reaper_loop`] evaluates it once per
+    /// [`SCAN_INTERVAL`](crate::session::reaper::SCAN_INTERVAL), which is
+    /// 30 s, so a configured `idle_shutdown_after_secs` below 30 behaves
+    /// as 30 and every window is rounded up to the next tick. That is
+    /// immaterial at §7.3's 24-hour default and worth knowing before
+    /// anyone configures seconds and times the result.
     pub fn client_less_exit_due(&self) -> bool {
         let window = self.config().daemon.idle_shutdown_after_secs;
         if window == 0 {
@@ -665,7 +673,20 @@ pub async fn run(paths: RuntimePaths) -> anyhow::Result<()> {
     // failure mode that requirement exists to prevent — the operator
     // believes a limit is in force and it is not.
     let config = crate::config::load()?;
+    run_with_config(paths, config).await
+}
 
+/// [`run`] with the configuration supplied rather than discovered.
+///
+/// **Split out so the exit path has a caller a test can drive.** `run`
+/// reads `$XDG_CONFIG_HOME/clasp/config.toml` from the developer's real
+/// home, so nothing in the workspace could call it — which left the
+/// teardown at the bottom of this function unasserted, and it was
+/// unlinking a *successor* daemon's socket. The config discovery stays
+/// in `run` above, ahead of everything this function does, so
+/// REQ-CFG-003's "reject startup before a socket is bound" ordering is
+/// still structural rather than a comment.
+pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyhow::Result<()> {
     // `bind_control` runs `paths.ensure_dir()`, which creates the log
     // directory `0700`. That ordering is load-bearing rather than
     // incidental: `Daemon::new` opens the audit log from `paths`, and
@@ -709,9 +730,59 @@ pub async fn run(paths: RuntimePaths) -> anyhow::Result<()> {
     // Anything still alive after `shutdown()` (or after a shutdown that
     // never ran, e.g. a bind error unwinding) dies here.
     daemon.shutdown();
-    let _ = std::fs::remove_file(paths.control_sock());
-    let _ = std::fs::remove_file(paths.pid_file());
+    remove_runtime_files_we_own(&paths);
     Ok(())
+}
+
+/// §7.3's *"On exit: … removes sockets, removes PID file"* — under the
+/// binder's lock, and only for the files this process still owns.
+///
+/// **Every other unlink of `control.sock` sits inside `bind.lock`**
+/// (`bind_control_within`, both arms), and this is the only one that
+/// runs while another process may legitimately be binding.
+/// `bind_control`'s comment reasons about exactly this race and closes
+/// it from the binding side; unlocked and unconditional, the teardown
+/// reopened it from the other side, where the lock cannot see it:
+///
+/// 1. Daemon A's `serve` returns — a `daemon/stop`, a SIGTERM, §7.3's
+///    client-less exit — so its listener is dropped and `socket_is_live`
+///    is now false.
+/// 2. A shim auto-spawns daemon B. B takes `bind.lock`, probes (dead),
+///    unlinks the stale socket, binds a fresh one, chmods it, releases.
+/// 3. A, still on its way out, unlinks **B's just-bound socket**. B
+///    keeps serving — its listener fd is still open — on an unlinked
+///    inode no `connect(2)` can ever reach again, and never learns.
+/// 4. A deletes **B's** pid file too, so a later `daemon stop --force`
+///    reads no pid and escalates to nothing, leaving an unreachable
+///    daemon holding live PTY sessions that nothing can address.
+///
+/// The window is not instantaneous — the `shutdown()` above walks the
+/// registry SIGKILLing sessions first — and the trigger, a
+/// `clasp daemon stop` followed by anything that auto-spawns, is a
+/// normal operator action.
+///
+/// So: take the binder's lock, and ask twice whether these files are
+/// still ours. A socket that answers is somebody else's, because ours is
+/// closed by the time `serve` has returned. A pid file naming another
+/// process is somebody else's too — one comparison, and it makes the
+/// removal idempotent under any interleaving.
+///
+/// **Keep the removal.** §7.3 mandates it; the defect was that it was
+/// unlocked and unconditional, not that it happened. Skipping the
+/// cleanup when the lock cannot be taken — `acquire_bind` runs
+/// `ensure_dir` first, which can fail — is the safe direction: it leaves
+/// a stale socket file, which the next binder clears under this same
+/// lock.
+pub(crate) fn remove_runtime_files_we_own(paths: &RuntimePaths) {
+    let Ok(_bind_lock) = super::spawn::DaemonLock::acquire_bind(paths) else {
+        return;
+    };
+    if !super::spawn::socket_is_live(paths) {
+        let _ = std::fs::remove_file(paths.control_sock());
+    }
+    if read_pid_file(paths) == Some(std::process::id()) {
+        let _ = std::fs::remove_file(paths.pid_file());
+    }
 }
 
 fn write_pid_file(paths: &RuntimePaths) -> io::Result<()> {
@@ -1635,6 +1706,130 @@ mod tests {
         let listener = bind_control(&paths).expect("the lock is free once the holder drops it");
         assert!(paths.control_sock().exists());
         drop(listener);
+    }
+
+    // ------------------------------------ the exit cleanup (§7.3, Imp C-5)
+
+    /// §7.3's *"On exit: … removes sockets, removes PID file"*, driven
+    /// through the daemon's own run-to-completion path.
+    ///
+    /// **This is the row that stops the C-5 fix being "delete the
+    /// cleanup".** Its pair below asserts that a *successor's* files
+    /// survive the teardown, and that assertion is satisfied perfectly by
+    /// a teardown that removes nothing at all — which would leave every
+    /// `clasp daemon stop` behind a stale socket and a pid file naming a
+    /// dead process, i.e. the state `confirm_daemon_pid` exists to
+    /// survive. It also pins the *wiring*: `run_with_config` is what
+    /// production runs, so deleting the call from it goes red here rather
+    /// than leaving a helper that nothing invokes.
+    ///
+    /// Timeouts throughout: every failure mode on this path is a daemon
+    /// that does not stop, and with no `nextest.toml` in this repo a bare
+    /// `await` on one is a hung CI job rather than a red test.
+    #[tokio::test]
+    async fn a_daemon_that_exits_removes_the_socket_and_pid_file_it_owns() {
+        let paths = scratch("exitcleanup");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+
+        let running = tokio::spawn(run_with_config(paths.clone(), Config::default()));
+        assert!(
+            yield_until(|| super::super::spawn::socket_is_live(&paths)).await,
+            "the daemon never bound its control socket"
+        );
+        assert_eq!(
+            read_pid_file(&paths),
+            Some(std::process::id()),
+            "the premise: this daemon wrote its own pid file, or the ownership \
+             check below is deciding about a file that was never ours"
+        );
+
+        let client =
+            crate::protocol::client::ControlClient::connect(&paths.control_sock(), ClientKind::Cli)
+                .await
+                .expect("connect to the daemon under test");
+        let stopped: StopOutcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call(method::METHOD_DAEMON_STOP, &StopParams::default()),
+        )
+        .await
+        .expect("daemon/stop never answered")
+        .expect("daemon/stop failed");
+        assert_eq!(stopped.sessions_terminated, 0);
+
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("the daemon never returned from `run` after daemon/stop")
+            .expect("the daemon task panicked")
+            .expect("`run` returned an error");
+
+        assert!(
+            !paths.control_sock().exists(),
+            "§7.3: a daemon that exits removes its socket. Left behind, it is \
+             the stale file every subsequent binder has to probe and clear"
+        );
+        assert!(
+            !paths.pid_file().exists(),
+            "§7.3: a daemon that exits removes its PID file. Left behind, it \
+             names a dead pid the kernel is free to hand to anything"
+        );
+    }
+
+    /// Imp C-5: the exit cleanup must not destroy a **successor's**
+    /// socket and pid file.
+    ///
+    /// The sequence, all steps ordinary: daemon A's listener drops, so
+    /// `socket_is_live` goes false; a shim auto-spawns daemon B, which
+    /// takes `bind.lock`, clears the stale socket, binds a fresh one and
+    /// writes its own pid file; and only then does A — whose
+    /// `shutdown()` was still walking the registry SIGKILLing sessions —
+    /// reach its unlinks. Unlocked and unconditional, they take out B's
+    /// socket, leaving B serving live PTY sessions on an unlinked inode
+    /// no `connect(2)` can reach, and they take out B's pid file, leaving
+    /// `daemon stop --force` with nothing to escalate to.
+    ///
+    /// Staged rather than raced: a race test that passes whenever the bad
+    /// interleaving happens not to occur is not a test. B's side of the
+    /// window is simply already finished when A's teardown runs, which is
+    /// exactly the interleaving the report describes.
+    #[tokio::test]
+    async fn the_exit_cleanup_leaves_a_successor_daemons_socket_and_pid_file_alone() {
+        let paths = scratch("exitsuccessor");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+
+        // Daemon B, through the real binder: lock, probe, unlink, bind,
+        // chmod. Then its pid file, naming a process that is not us.
+        let b_listener = bind_control(&paths).expect("the successor binds its control socket");
+        let b_pid = std::process::id().wrapping_add(1);
+        std::fs::write(paths.pid_file(), format!("{b_pid} 9.9.9\n")).unwrap();
+
+        // The premises. Without them the assertions below are about a
+        // socket nobody was serving and a file nobody had claimed.
+        assert!(
+            super::super::spawn::socket_is_live(&paths),
+            "the premise: B is listening before A tears down"
+        );
+        assert_eq!(read_pid_file(&paths), Some(b_pid));
+        assert_ne!(b_pid, std::process::id());
+
+        // Daemon A's teardown, arriving late.
+        remove_runtime_files_we_own(&paths);
+
+        assert!(
+            super::super::spawn::socket_is_live(&paths),
+            "A unlinked B's just-bound socket: B goes on serving live PTY \
+             sessions on an inode no `connect(2)` can reach again, and never \
+             learns"
+        );
+        assert_eq!(
+            read_pid_file(&paths),
+            Some(b_pid),
+            "A deleted B's pid file: `daemon stop --force` now reads no pid, \
+             escalates to nothing, and an unreachable daemon keeps its sessions"
+        );
+
+        drop(b_listener);
     }
 
     #[tokio::test]
