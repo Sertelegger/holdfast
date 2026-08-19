@@ -597,14 +597,25 @@ impl RuntimePaths {
 /// installs.** On the default instance it is `~/.clasp/logs`, which every
 /// install predating 0.0.5 created through `audit::default_path()`'s
 /// plain `create_dir_all` under the ambient umask — `0775` under the
-/// `002` that Debian, Ubuntu, RHEL and most corporate images ship. Its
-/// parent chain is the user's home, whose own mode is the gate, and it
+/// `002` that Debian, Ubuntu, RHEL and most corporate images ship. It
 /// holds no socket. Refusing it made `clasp daemon start` and the
 /// systemd/launchd `clasp daemon run` path (§7.3) fail on an untouched
 /// install while `clasp mcp` — which had relocated its log directory —
 /// started fine: two entry points to one daemon disagreeing about
 /// whether the install was startable. It gets the same tighten-or-fail a
 /// `0755` leftover gets.
+///
+/// **What it does not get is a guarded parent, and this used to claim
+/// otherwise.** The sentence here read "its parent chain is the user's
+/// home, whose own mode is the gate" — true only on the `~/.clasp`
+/// fallback. On the XDG path the two live in different trees: `dir` is
+/// `$XDG_RUNTIME_DIR/clasp` and `log_dir` is `~/.clasp/logs`, so
+/// `log_dir`'s immediate parent is `~/.clasp`, which the `Refuse` above
+/// never sees and nothing else checks. A pre-0.0.5 `~/.clasp` left at
+/// `0775` on a host with a *shared* primary group is therefore writable
+/// by someone else, and the tighten arm is what they would aim at. That
+/// is why the check below refuses a symlink outright instead of trusting
+/// a parent to have stopped one being planted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Writable {
     Refuse,
@@ -616,13 +627,40 @@ enum Writable {
 fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-    if !dir.exists() {
+    // `symlink_metadata`, not `exists()` and `metadata`: both of those
+    // follow a link, and every decision below acts on what they report.
+    // A planted `logs -> /elsewhere` would be chmodded at its *target*
+    // and then have the §9.4 trail appended through it. Note this also
+    // reaches a *dangling* link, which `exists()` reports as absent —
+    // the create below would then have followed it.
+    if std::fs::symlink_metadata(dir).is_err() {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(DIR_MODE)
             .create(dir)?;
     }
-    let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+    let md = std::fs::symlink_metadata(dir)?;
+    if md.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{d} is a symlink. Its target would be chmodded to {DIR_MODE:o} and the \
+                 §9.4 audit trail appended through it, so a link planted by another local \
+                 user redirects both. Replace it with a real directory, or set \
+                 {RUNTIME_DIR_ENV} to run this instance from wherever you want it — that \
+                 relocates the whole instance and gets checked the same way.",
+                d = dir.display()
+            ),
+        ));
+    }
+    // Refusing rather than resolving is deliberate: resolving would mean
+    // deciding whose target is acceptable, and `CLASP_RUNTIME_DIR`
+    // already expresses "put this somewhere else" without a link. A
+    // residual remains — `set_permissions` below still resolves, so a
+    // link swapped in after this check is not caught. Closing that needs
+    // `openat(O_DIRECTORY|O_NOFOLLOW)` plus `fchmod`, which is worth
+    // doing and is not this change.
+    let mode = md.permissions().mode() & 0o777;
     if writable == Writable::Refuse && mode & 0o022 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1284,6 +1322,57 @@ mod tests {
                 .contains(&format!("chmod 700 {}", socket_dir.display())),
             "the error must name the fix the user can actually apply: {err}"
         );
+    }
+
+    #[test]
+    fn a_symlinked_log_directory_is_refused_and_its_target_left_alone() {
+        // The tighten arm's hazard. `~/.clasp` is checked by nothing on
+        // the XDG path — `dir` and `log_dir` are in different trees
+        // there — so a pre-0.0.5 `~/.clasp` at 0775 on a host with a
+        // shared primary group lets someone else plant `logs` as a link.
+        let target = temp_dir("symlinkvictim");
+        let _scoped_target = Scoped(target.clone());
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dir = temp_dir("symlinkroot");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DIR_MODE)).unwrap();
+        let paths = RuntimePaths::with_dir(&dir);
+        std::os::unix::fs::symlink(&target, paths.log_dir()).unwrap();
+
+        // The fixture, asserted before the call — the mode this test is
+        // about is the one the call would change.
+        assert_eq!(mode_of(&target), 0o755);
+
+        let err = paths
+            .ensure_dir()
+            .expect_err("a symlinked log directory must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+
+        // The harm, not the diagnosis. Before this fix `metadata` and
+        // `set_permissions` both resolved the link, so the *target* was
+        // chmodded to 0700 and the §9.4 trail was appended through it.
+        // This row is what goes red if the check is reverted; an
+        // assertion on the error alone would not.
+        assert_eq!(
+            mode_of(&target),
+            0o755,
+            "the symlink's target was chmodded through the link"
+        );
+
+        // The control, so this cannot pass by refusing every log
+        // directory: a real one in the same shape still tightens.
+        let ok_dir = temp_dir("symlinkcontrol");
+        let _scoped_ok = Scoped(ok_dir.clone());
+        let ok = RuntimePaths::with_dir(&ok_dir);
+        std::fs::create_dir_all(ok.log_dir()).unwrap();
+        std::fs::set_permissions(&ok_dir, std::fs::Permissions::from_mode(DIR_MODE)).unwrap();
+        std::fs::set_permissions(ok.log_dir(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        ok.ensure_dir()
+            .expect("a real 0775 log directory is still the ordinary pre-0.0.5 install");
+        assert_eq!(mode_of(&ok.log_dir()), DIR_MODE);
     }
 
     #[test]
