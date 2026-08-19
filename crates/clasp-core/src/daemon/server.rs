@@ -25,6 +25,14 @@ use std::time::{Duration, Instant};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
+/// `clasp.pid`'s creation mode.
+///
+/// Its own constant rather than a reuse of `SOCKET_MODE`: the two agree
+/// today and answer different questions — one is the daemon's access
+/// boundary, the other is house style for a file in an already-`0700`
+/// directory — and a change to either must not silently move the other.
+const PID_FILE_MODE: u32 = 0o600;
+
 /// `daemon/status` response data (§7.4.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonStatus {
@@ -353,7 +361,16 @@ impl Daemon {
         let live = all.iter().filter(|s| s.is_alive()).count() as u64;
         DaemonStatus {
             pid: std::process::id(),
-            uptime_secs: self.started_at.elapsed().as_secs(),
+            // `self.clock`, not `started_at.elapsed()`. `elapsed()` is
+            // `Instant::now() - started_at`, and `started_at` is stamped
+            // from the daemon's clock — so under `Clock::manual` the two
+            // are different clocks, an advanced hand puts the origin in
+            // the future, `duration_since` saturates, and `daemon/status`
+            // reports an uptime of zero for a daemon that has been up for
+            // an hour. Identical under `Clock::system()`, which is every
+            // shipped binary; this is what makes the seam usable by the
+            // 0.0.6 tests that drive it.
+            uptime_secs: self.clock.now().duration_since(self.started_at).as_secs(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             sessions_live: live,
             sessions_exited_retained: all.len() as u64 - live,
@@ -1033,11 +1050,41 @@ pub(crate) fn remove_runtime_files_we_own(paths: &RuntimePaths, ours: SocketIden
     }
 }
 
+/// Write `clasp.pid`, owner-only, like every other file this daemon
+/// creates.
+///
+/// **Consistency, not exposure.** `bind.lock` and `clasp.lock` are
+/// created `0600` (`spawn.rs`), `control.sock` is chmodded `0600` and
+/// then re-read and verified, and this one alone took the ambient umask.
+/// Its contents are a pid and a version string — both of which `/proc`
+/// and `clasp version` publish anyway — and it sits in a directory whose
+/// `0700` is re-asserted by `ensure_owner_only(…, Writable::Refuse)` on
+/// every `ensure_dir`, so the mode only matters in a world where the
+/// directory guard has already failed. It is not verified afterwards for
+/// that reason; the socket is, because the socket is the boundary.
+///
+/// **`.truncate(true)` is load-bearing and `std::fs::write` gave it for
+/// free.** `OpenOptions` does not: without it, a shorter pid replacing a
+/// longer one leaves the tail of the old line behind, and
+/// `read_pid_file`'s `split_whitespace().next()` would parse the new pid
+/// and never notice — so the defect would stay invisible until something
+/// read the version field.
+///
+/// `mode` applies only when the file is *created*, so a `clasp.pid`
+/// inherited from an older, wider-umask build keeps its mode until it is
+/// removed. §7.3's teardown removes it on every clean exit, and the
+/// enclosing `0700` is the control that does not depend on this one.
 fn write_pid_file(paths: &RuntimePaths) -> io::Result<()> {
-    std::fs::write(
-        paths.pid_file(),
-        format!("{} {}\n", std::process::id(), env!("CARGO_PKG_VERSION")),
-    )
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(PID_FILE_MODE)
+        .open(paths.pid_file())?;
+    writeln!(f, "{} {}", std::process::id(), env!("CARGO_PKG_VERSION"))
 }
 
 /// Read `clasp.pid`. `None` if absent or unparseable.
@@ -2483,6 +2530,92 @@ mod tests {
             "the sweep followed the link and unlinked its target instead"
         );
         drop(listener);
+    }
+
+    /// `clasp.pid` is created owner-only, like every other file the
+    /// daemon creates, rather than at the ambient umask.
+    ///
+    /// The mode is asserted against [`PID_FILE_MODE`] deliberately *not*
+    /// by name: reading the same constant on both sides of the contract
+    /// would leave the row green for any value, including `0o666`.
+    #[test]
+    fn the_pid_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = scratch("pidmode");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+
+        write_pid_file(&paths).expect("write clasp.pid");
+
+        let mode = std::fs::metadata(paths.pid_file())
+            .expect("clasp.pid")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "clasp.pid was created at the ambient umask; every sibling in the \
+             runtime directory is explicit about this"
+        );
+    }
+
+    /// A rewrite truncates.
+    ///
+    /// `std::fs::write` truncated for free and `OpenOptions` does not, so
+    /// this is the row that goes red if `.truncate(true)` is ever
+    /// dropped. It cannot be `read_pid_file`, which takes
+    /// `split_whitespace().next()` and would parse the new pid off the
+    /// front of a torn line and report success — the defect would stay
+    /// invisible until something read the version field.
+    #[test]
+    fn rewriting_the_pid_file_leaves_no_tail_of_the_previous_one() {
+        let paths = scratch("pidtrunc");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+
+        std::fs::write(paths.pid_file(), "4294967295 99.99.99-a-much-longer-line\n").unwrap();
+        write_pid_file(&paths).expect("rewrite clasp.pid");
+
+        let text = std::fs::read_to_string(paths.pid_file()).expect("clasp.pid");
+        assert_eq!(
+            text,
+            format!("{} {}\n", std::process::id(), env!("CARGO_PKG_VERSION")),
+            "the rewrite left the tail of the longer line behind"
+        );
+    }
+
+    /// `daemon/status`'s uptime runs on the daemon's clock, like every
+    /// other duration it reports.
+    ///
+    /// `started_at` is stamped from `clock.now()` under a comment saying
+    /// it must be, because comparing a hand-driven `now` against a
+    /// wall-clock origin measures the gap between two clocks. Reading it
+    /// back with `Instant::elapsed()` reintroduced exactly that: under a
+    /// manual clock the origin sits in the future, `duration_since`
+    /// saturates, and a daemon that has been up for an hour reports zero.
+    ///
+    /// Identical under `Clock::system()`, so this is a test of the seam
+    /// rather than of shipped behaviour — which is the point, since 0.0.6
+    /// drives this daemon's timers from outside.
+    #[test]
+    fn the_reported_uptime_moves_with_the_daemons_own_clock() {
+        let paths = scratch("uptimeclock");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        let daemon = Daemon::with_config_and_clock(paths, Config::default(), clock.clone());
+
+        assert_eq!(daemon.status().uptime_secs, 0, "the hand has not moved yet");
+
+        clock.advance(Duration::from_secs(3600));
+
+        assert_eq!(
+            daemon.status().uptime_secs,
+            3600,
+            "the uptime read the wall clock while `started_at` was stamped from \
+             the daemon's, so it saturated to zero"
+        );
     }
 
     // ------------------------------------ the exit cleanup (§7.3, Imp C-5)
