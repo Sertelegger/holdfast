@@ -683,12 +683,22 @@ mod tests {
         // §18's preamble (rev. 47): an enum mirroring a §18 table
         // declares its variants in that table's order. §18.4c's rows are
         // int, term, kill — in that order, and not alphabetically, and
-        // not by signal number. Asserted as a **sequence**: a set
-        // comparison is green against an appended fourth value, and a
-        // fourth value is exactly what §18.4c argues must not exist.
-        // Read the wire spelling through the same `field()` helper the
-        // rest of this module uses, so the assertion is about the wire
-        // and not about a `Serialize` impl in isolation.
+        // not by signal number.
+        //
+        // **Three separate facts, because an assertion over the wire
+        // spellings alone catches only the first — measured, not
+        // assumed.** This test was written as that assertion, and the
+        // mutation its own plan row names for it (reorder `SignalName`
+        // to `Kill, Int, Term`) left it **green**: a hand-written
+        // `[Int, Term, Kill]` array carries its own order and cannot see
+        // the declaration's, and a hand-written array of three is blind
+        // to a fourth variant as well. Both properties the comment
+        // claimed were unasserted, so they are asserted below.
+        //
+        // (1) The wire spelling of each value. Read through the same
+        // `field()` helper the rest of this module uses, so the
+        // assertion is about the wire and not about a `Serialize` impl
+        // in isolation.
         let wire: Vec<String> = [SignalName::Int, SignalName::Term, SignalName::Kill]
             .into_iter()
             .map(|sig| {
@@ -697,6 +707,31 @@ mod tests {
             })
             .collect();
         assert_eq!(wire, vec!["int", "term", "kill"]);
+
+        // (2) The **declaration** order, read out of the compiler rather
+        // than out of a list this test wrote. A fieldless enum's
+        // discriminant is its declaration index, so this is the one
+        // reading of the order that a reordering cannot restate.
+        assert_eq!(SignalName::Int as u8, 0, "§18.4c's first row is int");
+        assert_eq!(SignalName::Term as u8, 1, "§18.4c's second row is term");
+        assert_eq!(SignalName::Kill as u8, 2, "§18.4c's third row is kill");
+
+        // (3) That the catalogue stops at three. §18.4c argues a fourth
+        // value must not exist, and no assertion over a three-element
+        // array can see one being added — so the closure is pinned by an
+        // exhaustive match with no catch-all, making a fourth variant a
+        // **compile** error here. Same discipline `ServerFrame::tag()`
+        // uses to keep `KNOWN_SERVER_TYPES` from going short.
+        fn catalogue_position(sig: SignalName) -> u8 {
+            match sig {
+                SignalName::Int => 0,
+                SignalName::Term => 1,
+                SignalName::Kill => 2,
+            }
+        }
+        for sig in [SignalName::Int, SignalName::Term, SignalName::Kill] {
+            assert_eq!(catalogue_position(sig), sig as u8, "{sig:?}");
+        }
     }
 
     #[test]
