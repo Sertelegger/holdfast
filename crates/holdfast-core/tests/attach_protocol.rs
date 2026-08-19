@@ -2157,6 +2157,30 @@ async fn awaiting_secret_is_broadcast_when_echo_drops_with_no_agent_call() {
         }
     }
     assert!(got_output, "the ordinary session's output never arrived");
+    // **And then keep listening.** The reader publishes a chunk's output
+    // to the broadcast *before* it classifies that chunk, so a spurious
+    // raise arrives strictly after the `Output` that provoked it —
+    // measured: without this drain, "classify every live session as
+    // AwaitingSecret" left the loop above green, because it stopped at
+    // the marker.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            Duration::from_millis(400),
+            frame::read_frame_body(&mut plain),
+        )
+        .await
+        {
+            Ok(Ok(body)) => {
+                if let ServerFrame::AwaitingSecret { .. } =
+                    decode_server_frame(&body).expect("decodable")
+                {
+                    panic!("a session whose child never dropped ECHO raised a secret request");
+                }
+            }
+            _ => break,
+        }
+    }
 
     // **And exactly one request while the prompt stays up.** The raise is
     // an *edge*, not a level: more output arriving with echo still off
