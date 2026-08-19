@@ -182,10 +182,23 @@ pub fn load() -> Result<Config, ConfigError> {
 /// about the same file: a path checked and then opened is two lookups
 /// with a window between them, and the window is the whole attack. It is
 /// also what makes a symlink a non-question — see [`trust_verdict`].
+///
+/// **`O_NONBLOCK` on the open, and it is load-bearing rather than
+/// tidiness.** Opening a fifo for reading waits for a writer, in the
+/// kernel, *before* any `fstat` a check could perform — so without the
+/// flag a config path pointing at a fifo hangs daemon startup and
+/// [`trust_verdict`] never gets a turn. On a regular file the flag has
+/// no effect on the read that follows, which is why it can simply stay
+/// set.
 pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
     use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let mut file = match std::fs::File::open(path) {
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(source) => return Err(io_error(path, source)),
@@ -1712,6 +1725,39 @@ require_confirm = false
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
         let cfg = load_from(&link).expect("a stow-style symlink to a regular file must load");
         assert_eq!(cfg.limits.max_concurrent_sessions, 5);
+    }
+
+    /// The fifo, which the regular-file question alone does not reach.
+    ///
+    /// Bounded, and here the **timeout is the evidence** rather than a
+    /// way of giving up: the failure being guarded against is a daemon
+    /// that never starts, so an unbounded `load_from` on this path would
+    /// hang CI instead of reddening it. Opening a fifo for reading waits
+    /// for a writer, which is *before* any `fstat` the check could do —
+    /// so this is not the same row as `/dev/null` and a check that only
+    /// looked at metadata would never get to run.
+    #[test]
+    fn a_config_path_that_resolves_to_a_fifo_does_not_block_startup() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
+        // SAFETY: `mkfifo` takes a NUL-terminated path and a mode, and
+        // `c` outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_from(&probe).is_err());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(refused) => assert!(refused, "a fifo is not a configuration"),
+            Err(_) => panic!(
+                "`load_from` is still blocked in `open`, with no writer coming: that \
+                 is a daemon that never starts and never says why"
+            ),
+        }
     }
 
     /// Ownership, against uids this process cannot create.
