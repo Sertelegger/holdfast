@@ -1239,13 +1239,24 @@ async fn dispatch_resource(
                     &params.uri,
                     server.config.limits.resource_read_max_bytes,
                 ) {
-                    // §5.5.2's validation faults are `-32602 Invalid
-                    // params` on the MCP wire; §18.3's nearest catalogued
-                    // code is `bad_params`, which the shim already raises
-                    // back as `ErrorData::invalid_params`. The structured
-                    // `data.code` travels in the message rather than
-                    // being invented as a new control-protocol code.
-                    Err(e) => Response::error(
+                    // §18.3's nearest catalogued code is `bad_params`, so
+                    // a peer that knows only §18.3 still reads a
+                    // well-formed error. The structured `data.code`
+                    // travels in the message rather than being invented
+                    // as a new control-protocol code, and
+                    // `shim::rebuild_resource_error` decodes exactly this
+                    // envelope back out.
+                    //
+                    // **`rpc_code`, because `bad_params` is not the
+                    // diagnosis here either.** §5.5.2's validation faults
+                    // really are `-32602 Invalid params`, but `resolve`
+                    // answers `-32002 resource_not_found` for a session id
+                    // that does not exist and for §5.5.6's unserved
+                    // file shape — and dropping the code rewrote all
+                    // three to `-32602`, telling an agent whose URI was
+                    // perfectly well formed that it was malformed. Same
+                    // field, same reason, as the tool path above.
+                    Err(e) => Response::error_with_rpc_code(
                         req.id,
                         ErrorCode::BadParams,
                         serde_json::to_string(&serde_json::json!({
@@ -1253,6 +1264,7 @@ async fn dispatch_resource(
                             "data": e.data,
                         }))
                         .unwrap_or_else(|_| e.message.to_string()),
+                        Some(e.code.0),
                     ),
                     Ok(result) => match serde_json::to_value(&result) {
                         Ok(v) => ok(v),

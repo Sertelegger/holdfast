@@ -1661,6 +1661,30 @@ async fn a_malformed_parameter_is_an_invalid_params_error() {
         "the structured code must survive the control protocol: {}",
         err.message
     );
+    // …and the JSON-RPC code the shim has to rebuild from. §18.3 has no
+    // row for `-32602`, so `bad_params` above is the nearest catalogued
+    // code and not the diagnosis; without `rpc_code` the shim can only
+    // guess, and it guessed `-32602` for everything.
+    assert_eq!(
+        err.rpc_code,
+        Some(-32602),
+        "§5.5.2's validation faults are `-32602 Invalid params` on the MCP wire"
+    );
+
+    // The row that shows `-32602` is a *carried* value and not a
+    // constant: a well-formed URI naming a session that does not exist
+    // is `-32002 resource_not_found`, and reporting it as
+    // `invalid_params` tells the agent its URI was malformed when it was
+    // not.
+    let resp = resource_read(&client, "clasp://session/sess_nope/buffer").await;
+    assert!(resp.is_error(), "an unknown session id is not a valid read");
+    let err = resp.control_error().expect("a §7.4.1 error payload");
+    assert_eq!(
+        err.rpc_code,
+        Some(-32002),
+        "§5.5.1's not-found is `-32002`, not `-32602`: {}",
+        err.message
+    );
 
     // The pairing: a *good* parameter must still be honoured, or this
     // row passes against a server that rejects every query.

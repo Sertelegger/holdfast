@@ -69,11 +69,10 @@ impl ShimServer {
 
     /// One `resource/*` round trip, returning the response `data`.
     ///
-    /// `bad_params` becomes `ErrorData::invalid_params` for the same
-    /// reason `forward` does it: §5.5.2's validation faults are
-    /// `-32602 Invalid params` on the MCP wire, and flattening them into
-    /// "internal error" would tell the agent its URI was fine and the
-    /// server broke.
+    /// The error path goes through [`rebuild_resource_error`] rather than
+    /// [`rebuild_error`], because §5.5.2 requires a *structured*
+    /// `data.code` that the control protocol has nowhere to carry and the
+    /// daemon therefore encodes into the error message.
     async fn forward_resource(&self, method: &str, params: Value) -> Result<Value, ErrorData> {
         let params =
             method::to_cbor(&params).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -83,7 +82,7 @@ impl ShimServer {
             .await
             .map_err(map_client_error)?;
         if let Some(e) = resp.control_error() {
-            return Err(rebuild_error(e));
+            return Err(rebuild_resource_error(e));
         }
         method::from_cbor(&resp.data).map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
@@ -116,6 +115,60 @@ fn rebuild_error(e: method::ControlError) -> ErrorData {
     } else {
         ErrorData::internal_error(format!("[{}] {}", e.code, e.message), None)
     }
+}
+
+/// [`rebuild_error`], plus the `{message, data}` envelope the daemon
+/// writes for a `resource/read` fault.
+///
+/// **§5.5.2's four codes are structured `data`, not prose.** The
+/// in-process transport answers a bad URI with
+/// `ErrorData::invalid_params(message, Some({"code": "invalid_enum",
+/// "param": "ansi", "value": "purple", "allowed": [...]}))` and an agent
+/// branches on `data.code` to know whether to fix a name, a value or a
+/// range. `ControlError` has nowhere to put that object, so
+/// `daemon::server::dispatch_resource` JSON-encodes `{message, data}`
+/// into the error *message* — and the rebuild here never decoded it. The
+/// agent got a raw JSON blob where prose belongs and `data: null` where
+/// the four codes belong, on the transport that is the default.
+///
+/// This is the decode for that encode. Nothing new crosses the wire: the
+/// same bytes already travelled, in the wrong field.
+///
+/// Conservative about what it will unwrap — exactly the two keys, a
+/// string `message` — because a §5.5.2 message is prose and any other
+/// producer's message must be left alone. A message that is not this
+/// envelope falls through unchanged.
+fn rebuild_resource_error(e: method::ControlError) -> ErrorData {
+    let mut out = rebuild_error(e);
+    if let Some((message, data)) = decode_resource_envelope(&out.message) {
+        out.message = message.into();
+        out.data = data;
+    }
+    out
+}
+
+/// The `{message, data}` object `dispatch_resource` encodes, parsed back
+/// out. `None` for anything else, including plain prose.
+///
+/// `data: null` becomes `None` rather than `Some(Value::Null)`: the
+/// daemon writes `null` there for an `ErrorData` that carried no
+/// structured payload — `resource_not_found`, for one — and
+/// `Some(Value::Null)` would put a literal `"data": null` on the MCP wire
+/// where the in-process transport omits the field.
+fn decode_resource_envelope(message: &str) -> Option<(String, Option<Value>)> {
+    let parsed: Value = serde_json::from_str(message).ok()?;
+    let obj = parsed.as_object()?;
+    // Both keys and only those two. A message that merely *happens* to
+    // be a JSON object is not this envelope.
+    if obj.len() != 2 || !obj.contains_key("data") {
+        return None;
+    }
+    let message = obj.get("message")?.as_str()?.to_string();
+    let data = match obj.get("data") {
+        Some(Value::Null) | None => None,
+        Some(d) => Some(d.clone()),
+    };
+    Some((message, data))
 }
 
 /// The daemon-backed server's `instructions`, **derived** from the
@@ -684,6 +737,130 @@ mod tests {
             e.message.contains("protocol_violation"),
             "the §18.3 code must survive into the message: {}",
             e.message
+        );
+    }
+
+    /// §5.5.2's structured `data.code` must survive the hybrid hop.
+    ///
+    /// The in-process transport answers a bad query parameter with
+    /// `invalid_params(prose, Some({"code": "invalid_enum", …}))`, and an
+    /// agent branches on `data.code` to know whether to fix a name, a
+    /// value or a range. `ControlError` has nowhere to carry that object,
+    /// so the daemon JSON-encodes `{message, data}` into the error
+    /// *message* — and nothing decoded it: the agent received the raw
+    /// blob as its prose and `data: null` where the four codes belong.
+    ///
+    /// **Driven through `forward_resource`, not through the free
+    /// function.** The decode existing and the resource path *calling*
+    /// it are two different claims, and only the second is the fix.
+    #[tokio::test]
+    async fn a_resource_fault_keeps_the_structured_code_5_5_2_requires() {
+        let dir = scratch_dir("resdata");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+
+        // The daemon's encoding, hand-built from §5.5.2's literal shape
+        // rather than by calling the encoder — a round trip through one
+        // expression would agree with itself whatever that shape is.
+        let envelope = json!({
+            "message": "ansi=purple is not one of strip, raw",
+            "data": {
+                "code": "invalid_enum",
+                "param": "ansi",
+                "value": "purple",
+                "allowed": ["strip", "raw"],
+            },
+        })
+        .to_string();
+        let reply = CborValue::Map(vec![
+            (
+                CborValue::Text("status".into()),
+                CborValue::Text("error".into()),
+            ),
+            (
+                CborValue::Text("data".into()),
+                CborValue::Map(vec![
+                    (
+                        CborValue::Text("code".into()),
+                        CborValue::Text("bad_params".into()),
+                    ),
+                    (
+                        CborValue::Text("message".into()),
+                        CborValue::Text(envelope.clone()),
+                    ),
+                    (CborValue::Text("retriable".into()), CborValue::Bool(false)),
+                    (
+                        CborValue::Text("rpc_code".into()),
+                        CborValue::Integer((-32602i64).into()),
+                    ),
+                ]),
+            ),
+            (CborValue::Text("details".into()), CborValue::Text(envelope)),
+        ]);
+        let _captured = stand_in_daemon(sock.clone(), reply);
+
+        let client = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        let shim = ShimServer::new(Arc::new(client));
+
+        let err = shim
+            .forward_resource(
+                method::METHOD_RESOURCE_READ,
+                json!({ "uri": "clasp://session/s/buffer?ansi=purple" }),
+            )
+            .await
+            .expect_err("§5.5.2 routes a bad parameter to the protocol channel");
+
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            err.data.as_ref().map(|d| &d["code"]),
+            Some(&json!("invalid_enum")),
+            "§5.5.2's four codes are structured `data`, not prose; got data {:?}",
+            err.data
+        );
+        // The other half of the same defect: the prose field held the
+        // JSON blob. An agent shows `message` to a human.
+        assert_eq!(
+            err.message.as_ref(),
+            "ansi=purple is not one of strip, raw",
+            "the message field must carry prose, not the envelope it arrived in"
+        );
+    }
+
+    /// The decode is deliberately narrow, and these are the rows that
+    /// say so. A control error whose message is ordinary prose — every
+    /// producer that is not `dispatch_resource` — must pass through
+    /// untouched, or the shim starts inventing `data` from any message
+    /// that happens to parse.
+    #[test]
+    fn only_the_daemons_own_two_key_envelope_is_unwrapped() {
+        assert_eq!(
+            decode_resource_envelope("no session sess_x"),
+            None,
+            "prose is not an envelope"
+        );
+        assert_eq!(
+            decode_resource_envelope(r#"{"message":"m","data":null,"extra":1}"#),
+            None,
+            "a third key means this came from somewhere else"
+        );
+        assert_eq!(
+            decode_resource_envelope(r#"{"code":"invalid_enum","param":"ansi"}"#),
+            None,
+            "§5.5.2's `data` object on its own is not the envelope"
+        );
+        // `data: null` is what the daemon writes for an `ErrorData` that
+        // carried none — `resource_not_found`, for one. It must become
+        // an absent field, not a literal `"data": null` on the MCP wire
+        // where the in-process transport omits it.
+        assert_eq!(
+            decode_resource_envelope(r#"{"message":"no session sess_x","data":null}"#),
+            Some(("no session sess_x".to_string(), None))
         );
     }
 
