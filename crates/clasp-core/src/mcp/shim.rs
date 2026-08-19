@@ -1,11 +1,31 @@
 //! The hybrid-mode MCP server (spec §3.3): an MCP server whose tool
 //! handlers are thin RPC calls into a daemon.
 //!
-//! `ShimServer` declares no tools of its own. `list_tools` returns the
-//! *daemon-side* manifest ([`passthrough::tool_manifest`]) verbatim and
-//! `call_tool` forwards by name, so the agent-visible surface is
-//! identical whichever transport is in use — which is what §3.5's "there
-//! is no business logic outside `clasp-core`" means in practice.
+//! `ShimServer` declares no tools of its own: `call_tool` forwards by
+//! name, so no tool *behaviour* lives outside `clasp-core`, which is
+//! what §3.5 means in practice.
+//!
+//! **`list_tools` is answered locally, not fetched.** This said the
+//! opposite — that the manifest came from the daemon "verbatim" — and it
+//! did not: [`passthrough::tool_manifest`] is
+//! `ClaspServer::tool_router().list_all()`, a static call **in the
+//! shim's own process**, and §7.4.1 defines no `tool/list` method by
+//! which one could be fetched. `is_passthrough_tool`, the guard on
+//! `call_tool`, reads the same local set.
+//!
+//! It matters because §7.4.1 **explicitly permits** shim/daemon minor
+//! skew (*"Same-major different-minor is forwards/backwards
+//! compatible"*). Under that skew: a tool a daemon minor added is
+//! invisible to an older shim, and a tool this shim knows and the daemon
+//! lacks is advertised and then answered `unknown_method` — which
+//! [`rebuild_tool_error`] now reports as `invalid_params`, matching what
+//! an unknown tool gets in-process, rather than as a server fault.
+//!
+//! `every_router_tool_is_dispatchable` builds both sides from one
+//! process and cannot see any of this. Closing it properly needs a
+//! manifest method on the control protocol, which is a protocol addition
+//! for a later milestone; what is fixed here is the description and the
+//! one code the skew makes reachable.
 
 use super::passthrough;
 use crate::protocol::client::{ClientError, ControlClient};
@@ -55,7 +75,7 @@ impl ShimServer {
             .map_err(map_client_error)?;
 
         if let Some(e) = resp.control_error() {
-            return Err(rebuild_error(e));
+            return Err(rebuild_tool_error(e));
         }
 
         let data: Value = method::from_cbor(&resp.data)
@@ -117,6 +137,33 @@ fn rebuild_error(e: method::ControlError) -> ErrorData {
     }
 }
 
+/// [`rebuild_error`], plus the one §18.3 code whose meaning is
+/// transport-specific on a `tool/*` call.
+///
+/// **`unknown_method` on a tool call means "no such tool", and an
+/// unknown tool is `-32602` on the MCP wire.** rmcp's router answers
+/// `invalid_params("tool not found")` in-process, and `call_tool`'s own
+/// guard two functions down answers `invalid_params` for a name outside
+/// the manifest. Falling through to [`rebuild_error`] made the daemon's
+/// answer `internal_error` instead — the same call, two diagnoses,
+/// decided by which transport was in use.
+///
+/// Not hypothetical: §7.4.1 permits shim/daemon minor skew, and a tool
+/// this shim advertises and an older daemon does not have lands exactly
+/// here. `internal_error` tells the agent to give up on a server bug
+/// where `invalid_params` tells it the tool does not exist, which is
+/// both true and actionable.
+///
+/// `rpc_code` still wins when the daemon sent one, for
+/// [`rebuild_error`]'s reason: it is the handler's own code, and this
+/// arm is a guess made in its absence.
+fn rebuild_tool_error(e: method::ControlError) -> ErrorData {
+    if e.rpc_code.is_none() && e.code == method::ErrorCode::UnknownMethod.as_str() {
+        return ErrorData::invalid_params(e.message, None);
+    }
+    rebuild_error(e)
+}
+
 /// [`rebuild_error`], plus the `{message, data}` envelope the daemon
 /// writes for a `resource/read` fault.
 ///
@@ -174,12 +221,14 @@ fn decode_resource_envelope(message: &str) -> Option<(String, Option<Value>)> {
 /// The daemon-backed server's `instructions`, **derived** from the
 /// in-process text rather than copied from it.
 ///
-/// `list_tools` is forwarded verbatim, so every tool description, output
-/// schema and annotation already has exactly one definition. That leaves
-/// `instructions` as the one agent-visible string not covered by the
-/// forwarding, so it is built from [`super::INSTRUCTIONS`] and differs
-/// by exactly one appended sentence — the single fact that is genuinely
-/// transport-specific.
+/// Both transports build `list_tools` from the same in-process
+/// `ClaspServer::tool_router()`, so every tool description, output
+/// schema and annotation already has exactly one definition — *derived*
+/// on both sides rather than forwarded, which this comment used to
+/// claim. That leaves `instructions` as the one agent-visible string
+/// with no shared derivation of its own, so it is built from
+/// [`super::INSTRUCTIONS`] and differs by exactly one appended sentence
+/// — the single fact that is genuinely transport-specific.
 ///
 /// A second hand-written copy would have been stale the day it was
 /// written. 0.0.2 rewrote that string because it still described a
@@ -737,6 +786,109 @@ mod tests {
             e.message.contains("protocol_violation"),
             "the §18.3 code must survive into the message: {}",
             e.message
+        );
+    }
+
+    /// A tool the daemon does not have must read as "no such tool", not
+    /// as a server fault.
+    ///
+    /// `list_tools` is answered from the shim's **own** process —
+    /// `passthrough::tool_manifest()` is
+    /// `ClaspServer::tool_router().list_all()`, and §7.4.1 defines no
+    /// method by which a manifest could be fetched — while §7.4.1
+    /// explicitly permits shim/daemon minor skew. So a tool this build
+    /// advertises and an older daemon lacks is reachable, and it comes
+    /// back `unknown_method`.
+    ///
+    /// In-process the identical call is `invalid_params("tool not
+    /// found")`, from rmcp's router, and `call_tool`'s own guard answers
+    /// `invalid_params` for a name outside the manifest. Reporting it as
+    /// `internal_error` told the agent to give up on a server bug where
+    /// the truth is that the tool does not exist.
+    ///
+    /// The paired row is the one that keeps this honest: a §18.3 code
+    /// that really *is* a server fault must still arrive as one, or the
+    /// fix is just a second flattening in the other direction.
+    ///
+    /// The first half goes over the socket, because `forward` *calling*
+    /// the right rebuild is a separate claim from the rebuild being
+    /// right — the same split that made the resource path's decode
+    /// worth driving end to end.
+    #[tokio::test]
+    async fn an_unknown_tool_is_the_agents_bad_argument_and_not_a_server_fault() {
+        let dir = scratch_dir("notool");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+
+        // What a daemon one minor behind answers for `tool/<name>` when
+        // it has no such tool: §18.3's `unknown_method`, and no
+        // `rpc_code`, because no handler ever ran to raise one.
+        let reply = CborValue::Map(vec![
+            (
+                CborValue::Text("status".into()),
+                CborValue::Text("error".into()),
+            ),
+            (
+                CborValue::Text("data".into()),
+                CborValue::Map(vec![
+                    (
+                        CborValue::Text("code".into()),
+                        CborValue::Text("unknown_method".into()),
+                    ),
+                    (
+                        CborValue::Text("message".into()),
+                        CborValue::Text("no tool inspect_screen".into()),
+                    ),
+                    (CborValue::Text("retriable".into()), CborValue::Bool(false)),
+                ]),
+            ),
+            (
+                CborValue::Text("details".into()),
+                CborValue::Text("no tool inspect_screen".into()),
+            ),
+        ]);
+        let _captured = stand_in_daemon(sock.clone(), reply);
+
+        let client = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        let shim = ShimServer::new(Arc::new(client));
+        let err = shim
+            .forward("inspect_screen", None)
+            .await
+            .expect_err("a tool the daemon lacks is not an outcome");
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "an unknown tool is `-32602` in-process; the daemon transport must agree"
+        );
+
+        let bare = |code: method::ErrorCode| method::ControlError {
+            code: code.as_str().into(),
+            message: "no tool inspect_screen".into(),
+            retriable: false,
+            rpc_code: None,
+        };
+        assert_eq!(
+            rebuild_tool_error(bare(method::ErrorCode::ProtocolViolation)).code,
+            rmcp::model::ErrorCode::INTERNAL_ERROR,
+            "a real server fault must not be relabelled the agent's bad argument"
+        );
+        // And an `rpc_code` still wins: this arm is a guess made only in
+        // its absence.
+        assert_eq!(
+            rebuild_tool_error(method::ControlError {
+                code: method::ErrorCode::UnknownMethod.as_str().into(),
+                message: "m".into(),
+                retriable: false,
+                rpc_code: Some(-32603),
+            })
+            .code,
+            rmcp::model::ErrorCode::INTERNAL_ERROR,
         );
     }
 
