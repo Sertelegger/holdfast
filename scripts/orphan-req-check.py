@@ -887,8 +887,14 @@ REQ-ZZT-001
 
 def self_test() -> int:
     failures: list[str] = []
+    # Counted rather than stated, because a number written in a comment or a
+    # commit message is a claim nobody re-derives -- the previous commit here
+    # said 28 and 9-new when the answers were 30 and 8-new. A count the run
+    # prints cannot drift from the run.
+    ran: list[str] = []
 
     def check(name: str, got, want):
+        ran.append(name)
         if got == want:
             print(f"  PASS  {name}")
             print(f"          got {got!r}")
@@ -1181,9 +1187,10 @@ def self_test() -> int:
 
     print()
     if failures:
-        print(f"SELF-TEST FAILED: {len(failures)} of the above")
+        print(f"SELF-TEST FAILED: {len(failures)} of {len(ran)} assertions")
         return EXIT_ERROR
-    print("SELF-TEST PASSED — the check discriminates in both directions")
+    print(f"SELF-TEST PASSED — {len(ran)} assertions; "
+          "the check discriminates in both directions")
     return EXIT_OK
 
 
