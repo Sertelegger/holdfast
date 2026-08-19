@@ -464,12 +464,28 @@ mod tests {
         // the carry **alone** loses the token here and streams the value
         // raw. The prefix has already gone out and cannot be recalled;
         // what must not go out is the value.
+        // **Three chunks, and the middle one is the whole point.** With
+        // two, the token is complete by the second feed and `find_spans`
+        // over lookbehind+carry covers the value whatever region the
+        // partial scan used — so a two-chunk fixture passes against the
+        // carry-only bug and proves nothing. The middle chunk is value
+        // bytes with the token still *incomplete*: only a region that
+        // still contains the prefix can see anything in flight there.
         let mut r = redactor();
         assert_eq!(r.feed(b"ghp_"), b"ghp_");
-        let rest = &GH[4..];
-        let out = String::from_utf8_lossy(&r.feed(format!("{rest}\n").as_bytes())).to_string();
+
+        let mid = &GH[4..24];
+        let held = r.feed(mid.as_bytes());
         assert!(
-            !out.contains(&GH[4..20]),
+            held.is_empty(),
+            "value bytes of an incomplete token were streamed raw: {:?}",
+            String::from_utf8_lossy(&held)
+        );
+
+        let out =
+            String::from_utf8_lossy(&r.feed(format!("{}\n", &GH[24..]).as_bytes())).to_string();
+        assert!(
+            !out.contains(mid),
             "the value half of a straddled token was streamed raw: {out:?}"
         );
     }
@@ -478,9 +494,21 @@ mod tests {
     fn a_private_key_longer_than_the_old_carry_is_redacted_not_streamed() {
         // The size fixture a 512-byte carry could not judge: it flushes
         // the body at byte 512 and redacts nothing after it.
+        // **Fed in pieces, and that is what makes the bound load-bearing.**
+        // A whole PEM in one `feed` completes its match inside a single
+        // window, so `earliest_partial` never reports a partial, nothing
+        // is ever carried, and the size of the carry bound cannot matter:
+        // measured, shrinking `STREAM_CARRY_BYTES` to 512 leaves a
+        // single-chunk version of this row **green**. In pieces the
+        // partial stays open across chunks and the carry has to hold ~1.7
+        // KiB, which a 512-byte bound cannot.
         let mut r = redactor();
         let key = pem(1700);
-        let out = String::from_utf8_lossy(&r.feed(&key)).to_string();
+        let mut out = Vec::new();
+        for piece in key.chunks(256) {
+            out.extend(r.feed(piece));
+        }
+        let out = String::from_utf8_lossy(&out).to_string();
         assert!(out.contains("[REDACTED:private-key]"), "got {out:?}");
         let body = &key[40..key.len() - 40];
         for w in body.windows(16).step_by(37) {

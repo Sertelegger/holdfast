@@ -1148,10 +1148,18 @@ async fn a_private_key_longer_than_the_old_carry_is_redacted_not_streamed() {
         ServerFrame::Attached { .. }
     ));
 
+    // **Queued in pieces on purpose.** A whole PEM delivered in one read
+    // completes its match inside a single window, so nothing is ever
+    // carried and the size of the carry bound cannot matter — measured,
+    // a single-chunk version of this row stays green with the bound
+    // shrunk to 512. In pieces the partial stays open across chunks and
+    // the carry has to hold the whole ~1.7 KiB body.
     let key = rsa_pem();
-    let mut payload = key.clone();
-    payload.extend_from_slice(b"EOM\n");
-    pty.queue_output(&payload);
+    for piece in key.chunks(256) {
+        pty.queue_output(piece);
+        tokio::time::sleep(Duration::from_millis(3)).await;
+    }
+    pty.queue_output(b"EOM\n");
 
     let body = &key[40..key.len() - 40];
     let watched = stream_until(&mut watch, b"EOM", 10).await;
