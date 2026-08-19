@@ -35,7 +35,7 @@ set -uo pipefail
 
 # Called with no argument, this script builds what it is about to test.
 #
-# It used not to, and against a stale `target/debug/clasp` it fails two
+# It used not to, and against a stale `target/debug/holdfast` it fails two
 # checks with `osc133_source: null` -- which reads exactly like a 0.0.2
 # regression and cost one milestone's implementer a bisect against a
 # baseline worktree to disprove. A check that fails misleadingly costs
@@ -43,7 +43,7 @@ set -uo pipefail
 # is not a property of the artifact.
 #
 # Only on the default path. An explicit argument names a binary the
-# caller has already produced -- CI passes `./target/release/clasp` after
+# caller has already produced -- CI passes `./target/release/holdfast` after
 # its own `cargo build --release`, and `./scripts/mcp-smoke.sh /bin/true`
 # is the negative control that must fail all 38 checks -- so building in
 # that case would either be wrong or a no-op.
@@ -57,11 +57,11 @@ fi
 # The default path must resolve to the binary the build above *produced*,
 # not to a hardcoded `./target`. `CARGO_TARGET_DIR` is honoured by cargo
 # and was not honoured here, so with one set the script built one binary
-# and smoked another. Measured: a stale `./target/debug/clasp` 23 minutes
+# and smoked another. Measured: a stale `./target/debug/holdfast` 23 minutes
 # older than the fresh build, different hashes, `SMOKE OK` reported. That
 # is worse than the staleness this self-build was added to prevent -- a
 # false pass rather than a misleading failure.
-BIN="${1:-${CARGO_TARGET_DIR:-./target}/debug/clasp}"
+BIN="${1:-${CARGO_TARGET_DIR:-./target}/debug/holdfast}"
 if [ ! -x "$BIN" ]; then
   echo "build first: cargo build --workspace" >&2
   exit 1

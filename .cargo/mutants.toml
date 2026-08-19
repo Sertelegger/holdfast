@@ -4,7 +4,7 @@
 # THE PATH IS LOAD-BEARING. cargo-mutants reads `.cargo/mutants.toml`, not
 # `mutants.toml` at the repository root; the root path is what the plan's
 # file table named, and it is inert. Measured with cargo-mutants 27.1.0 on
-# 2026-08-13, `cargo mutants -p clasp-core --list`:
+# 2026-08-13, `cargo mutants -p holdfast-core --list`:
 #
 #   root mutants.toml, as written by the plan .................. 464 mutants
 #   root mutants.toml, exclude_globs widened to drop src/detect/ 464 mutants
@@ -24,10 +24,10 @@
 # without this line, because cargo-mutants does not mutate the integration
 # test targets under tests/ in the first place. It is kept as a statement of
 # intent that survives a future version which does, not because it is doing
-# work today. `crates/clasp-core/src/pty/mock.rs` (32 mutants) is the test
+# work today. `crates/holdfast-core/src/pty/mock.rs` (32 mutants) is the test
 # double that IS being mutated; whether to exclude it is a calibration
 # decision for the survivor review, not a guess to make in advance.
-exclude_globs = ["crates/clasp-core/tests/**"]
+exclude_globs = ["crates/holdfast-core/tests/**"]
 
 # The suite spawns real shells and has deliberate multi-second waits, so a
 # mutant that hangs must be bounded generously rather than tightly. These

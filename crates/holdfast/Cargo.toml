@@ -1,0 +1,18 @@
+[package]
+name = "holdfast"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "holdfast"
+path = "src/main.rs"
+
+[dependencies]
+holdfast-core = { path = "../holdfast-core" }
+anyhow.workspace = true
+libc.workspace = true
+rmcp.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

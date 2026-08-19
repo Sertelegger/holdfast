@@ -309,14 +309,14 @@ jobs:
       - run: cargo build --release --locked --workspace
       # The same smoke script, against the binary that will actually be
       # installed. `jq` is preinstalled on ubuntu-24.04 (1.7.1).
-      - run: ./scripts/mcp-smoke.sh ./target/release/clasp
-      - run: sha256sum target/release/clasp | tee clasp-linux-x86_64.sha256
+      - run: ./scripts/mcp-smoke.sh ./target/release/holdfast
+      - run: sha256sum target/release/holdfast | tee holdfast-linux-x86_64.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: clasp-linux-x86_64-${{ github.sha }}
+          name: holdfast-linux-x86_64-${{ github.sha }}
           path: |
-            target/release/clasp
-            clasp-linux-x86_64.sha256
+            target/release/holdfast
+            holdfast-linux-x86_64.sha256
           retention-days: 30
           # The default is `warn`, which produces a GREEN job with a warning
           # nobody reads when the binary is missing. That is a job that

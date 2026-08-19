@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/clasp-core", "crates/clasp"]
+members = ["crates/holdfast-core", "crates/holdfast"]
 resolver = "2"
 
 [workspace.package]
