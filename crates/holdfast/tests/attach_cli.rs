@@ -1274,6 +1274,35 @@ fn wait_frames(
     );
 }
 
+/// Everything drawn so far, once **either** of two outcomes appears.
+///
+/// **The abandon and the leak are alternatives, not independent
+/// events.** A client that submitted the half-typed value also consumed
+/// the `0x03` that was supposed to become the child's `SIGINT`, so the
+/// child completes its `read`, never traps, and never prints the
+/// abandon marker. A row that waits only for the marker therefore dies
+/// on the *wait* — with a message about a string that never appeared —
+/// fifteen seconds before it reaches the assertion that names the leak,
+/// which is exactly why that assertion could not fail. Waiting for
+/// whichever outcome the client actually produced gives it back its own
+/// failure message.
+fn wait_for_either(term: &Term, a: &[u8], b: &[u8], secs: u64) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        let seen = term.snapshot();
+        if contains(&seen, a) || contains(&seen, b) {
+            return seen;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "neither {:?} nor {:?} appeared within {secs}s. Seen so far:\n{}",
+        String::from_utf8_lossy(a),
+        String::from_utf8_lossy(b),
+        String::from_utf8_lossy(&term.snapshot())
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_detach_key_works_while_a_secret_prompt_is_outstanding() {
     // §6.1 Layer 1 does not pause for §9.5. A human who reaches a
@@ -1286,6 +1315,17 @@ async fn the_detach_key_works_while_a_secret_prompt_is_outstanding() {
     // password: a client that routed `0x02`/`0x64` into the secret buffer
     // would submit `\x02d` to the child the moment the user pressed Enter
     // trying to escape.
+    //
+    // **The Enter is typed, and it has to be.** The first draft sent
+    // `Ctrl-B d` alone and then asserted no `SecretInput` — but
+    // `SecretLine::feed` returns `Line` on `\r`/`\n` and nothing else,
+    // so a broken client holding `\x02d` in its buffer sends nothing at
+    // all and the negative is a tautology for its own input. The row's
+    // own comment already said the submission happens *"the moment the
+    // user pressed Enter"*; it just never pressed it. Against the fixed
+    // client the trailing `\r` is harmless — `DetachKey::feed` returns
+    // the instant it sees `d` after the prefix and discards the rest of
+    // the chunk, which `attach_tty.rs` states as the rule.
     let stub = StubDaemon::start(
         "secretdetach",
         vec![
@@ -1313,23 +1353,33 @@ async fn the_detach_key_works_while_a_secret_prompt_is_outstanding() {
     // own render of `AwaitingSecret`: the prompt really is outstanding.
     term.wait_for(SECRET_PROMPT_DRAWN, 10);
 
-    term.type_keys(&[0x02, 0x64]);
-    assert_eq!(
-        term.wait_exit(10),
-        0,
-        "`Ctrl-B d` at a secret prompt must detach, not be typed into the password"
-    );
+    term.type_keys(&[0x02, 0x64, 0x0d]);
 
-    let sent = stub.frames();
-    assert!(
-        sent.iter().any(|f| matches!(f, ClientFrame::Detach)),
-        "the detach never reached the daemon: {sent:?}"
-    );
+    // **The wire is read before the exit is waited for, and the order
+    // is what lets the leak assertion fail with its own message.** A
+    // client that typed the sequence into the password never detaches
+    // and never exits, so `wait_exit` first means the row dies on a
+    // ten-second deadline whose message says nothing about a submitted
+    // password. Waiting for *whichever* outcome reaches the stub is the
+    // only ordering under which both assertions below are reachable.
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter()
+            .any(|x| matches!(x, ClientFrame::Detach | ClientFrame::SecretInput { .. }))
+    });
     assert!(
         !sent
             .iter()
             .any(|f| matches!(f, ClientFrame::SecretInput { .. })),
         "the detach sequence was submitted as the secret: {sent:?}"
+    );
+    assert!(
+        sent.iter().any(|f| matches!(f, ClientFrame::Detach)),
+        "the detach never reached the daemon: {sent:?}"
+    );
+    assert_eq!(
+        term.wait_exit(10),
+        0,
+        "`Ctrl-B d` at a secret prompt must detach, not be typed into the password"
     );
 }
 
@@ -1417,6 +1467,15 @@ async fn ctrl_c_abandons_a_real_secret_prompt_and_reaches_the_child() {
     // discipline turning that byte back into a `SIGINT` for the
     // foreground group. The child's trap is the witness — no part of it
     // fires if any link drops the byte.
+    //
+    // **The row waits for whichever of the two outcomes happens, not
+    // for the good one.** The first draft waited for `ABANDONED` and
+    // then asserted `got=` was absent — but under the leak it names
+    // there *is* no `ABANDONED`: the client that submitted `hun` also
+    // swallowed the `0x03`, so the child completes its `read` and prints
+    // `got=hun` instead. The row died on the wait, and the assertion
+    // that named the leak was never evaluated. Waiting for either marker
+    // is what makes it a discriminator rather than a comment.
     let d = TestDaemon::start("realcancel").await;
     let s = d.real_session(
         "sh",
@@ -1432,7 +1491,7 @@ async fn ctrl_c_abandons_a_real_secret_prompt_and_reaches_the_child() {
 
     term.type_keys(b"hun");
     term.type_keys(&[0x03]);
-    let seen = term.wait_for(b"ABANDONED", 15);
+    let seen = wait_for_either(&term, b"ABANDONED", b"got=", 20);
 
     assert!(
         !contains(&seen, b"got="),
@@ -1442,6 +1501,14 @@ async fn ctrl_c_abandons_a_real_secret_prompt_and_reaches_the_child() {
     assert!(
         !contains(&seen, b"hun"),
         "the partial secret reached the terminal:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    // The positive the `wait_for` used to carry, stated rather than
+    // implied: the byte survived every link and became the child's
+    // `SIGINT`.
+    assert!(
+        contains(&seen, b"ABANDONED"),
+        "the interrupt never reached the child's trap:\n{}",
         String::from_utf8_lossy(&seen)
     );
     let _ = s.signal(holdfast_core::pty::Signal::Kill);
