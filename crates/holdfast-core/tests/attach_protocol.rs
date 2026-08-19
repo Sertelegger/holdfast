@@ -960,6 +960,16 @@ async fn every_write_frame_is_rejected_from_a_readonly_client() {
     // §4.3: a refused frame reaches neither the PTY, nor the signal
     // path, nor the session's geometry. Asserting only the frame leaves
     // "answer `read_only_attach` **and** apply it" passing.
+    //
+    // **The PTY line below is a supplement, not the guard, and it was
+    // measured that way.** An `Input` that fell through to the write
+    // queue arrives asynchronously, so this assertion can run before it
+    // lands: injecting exactly that bug ("refuse and apply anyway") left
+    // this row green and turned only `a_rejected_frame_does_not_reach_
+    // the_pty` red — which establishes a happens-before by waiting for a
+    // *ReadWrite* client's marker first. The two below it are different:
+    // `signal` and `resize` are applied inline in the read loop, so they
+    // have landed by the time the refusal frame is on the wire.
     assert!(
         pty.written().is_empty(),
         "a refused Input reached the child: {:?}",
