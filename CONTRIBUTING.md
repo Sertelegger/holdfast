@@ -54,16 +54,23 @@ are gated to public repositories on GitHub Free. Until this repository goes
 public, running these locally is still the actual gate and a red job is
 something a human has to notice.
 
-`cargo test --workspace` is 607 tests today: 452 unit, 23 in
-`tests/detection.rs`, 71 in `tests/integration.rs`, 42 in `tests/schema.rs`,
-18 in `tests/screen.rs`, 1 in `tests/stress_write_path.rs`.
+`cargo test --workspace` is 878 tests today: 660 unit (657 in `clasp-core`'s
+lib, 3 in `clasp`'s bin), 23 in `tests/detection.rs`, 71 in
+`tests/integration.rs`, 42 in `tests/schema.rs`, 19 in `tests/screen.rs`, 1 in
+`tests/stress_write_path.rs`, 39 in `tests/control_protocol.rs`, and 23 in
+`crates/clasp/tests/daemon_cli.rs`.
 Treat those numbers as a tripwire for "a suite stopped being compiled" rather
-than as a contract. Many of the tests spawn real PTYs and real shells, so they
-are not hermetic and they are not fast — and two of the suites are *supposed*
-to be slow. `tests/screen.rs` and `tests/stress_write_path.rs` are dominated
-by real waiting (a 3 s grace window and a 3 s stress run), so a materially
-faster result there means the scenario did not happen, not that the machine
-is quick.
+than as a contract — but if you add a *new* test file, add its row here too:
+this census has twice gone stale by omitting a whole suite a milestone added,
+so the two most recent additions (`control_protocol.rs`, `daemon_cli.rs`) are
+exactly the shape most likely to recur. `cargo test -p <crate> --test <name>
+-- --list` prints a per-target count you can check this against directly,
+without trusting this paragraph. Many of the tests spawn real PTYs and real
+shells, so they are not hermetic and they are not fast — and two of the
+suites are *supposed* to be slow. `tests/screen.rs` and
+`tests/stress_write_path.rs` are dominated by real waiting (a 3 s grace
+window and a 3 s stress run), so a materially faster result there means the
+scenario did not happen, not that the machine is quick.
 
 `scripts/mcp-smoke.sh` (37 checks) is **the only thing that drives the real
 JSON-RPC surface**. Every Rust test asserts against in-process objects, so a
