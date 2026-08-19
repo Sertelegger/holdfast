@@ -1,5 +1,5 @@
 # Holdfast weekly mutation sweep.
-# Plan: docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md Task 6.
+# Plan: docs/superpowers/plans/2026-08-12-holdfast-ci-and-verification-harness.md Task 6.
 #
 # holdfast-core AND holdfast -- see the shard-calibration comment below for why
 # holdfast-core-only stopped being the right scope (0.0.5 milestone review,

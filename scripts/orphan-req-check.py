@@ -715,7 +715,7 @@ def self_test() -> int:
         plans = root / "docs" / "superpowers" / "plans"
         specs.mkdir(parents=True)
         plans.mkdir(parents=True)
-        spec = specs / "0000-00-00-clasp-design.md"
+        spec = specs / "0000-00-00-holdfast-design.md"
         spec.write_text(SELF_TEST_SPEC, encoding="utf-8")
         (plans / "fake-plan.md").write_text(SELF_TEST_PLAN, encoding="utf-8")
         (plans / "owner-plan.md").write_text(SELF_TEST_PLAN_OWNER, encoding="utf-8")
@@ -994,9 +994,9 @@ def main() -> int:
         )
         return EXIT_CANNOT_RUN
 
-    specs = sorted(specs_dir.glob("*-clasp-design.md"))
+    specs = sorted(specs_dir.glob("*-holdfast-design.md"))
     if len(specs) != 1:
-        print(f"error: expected exactly one *-clasp-design.md in {specs_dir}, "
+        print(f"error: expected exactly one *-holdfast-design.md in {specs_dir}, "
               f"found {len(specs)}: {[p.name for p in specs]}", file=sys.stderr)
         return EXIT_ERROR
 

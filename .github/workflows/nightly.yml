@@ -1,5 +1,5 @@
 # Holdfast nightly tier.
-# Plan: docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md
+# Plan: docs/superpowers/plans/2026-08-12-holdfast-ci-and-verification-harness.md
 #
 # Named for the TIER, not for the flake hunt. REQ-TST-004 (tier-4
 # adversarial/property/stress) belongs here when the milestones that write

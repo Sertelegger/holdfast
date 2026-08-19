@@ -1,5 +1,5 @@
 # cargo-mutants configuration for the weekly sweep.
-# See docs/superpowers/plans/2026-08-12-clasp-ci-and-verification-harness.md Task 6.
+# See docs/superpowers/plans/2026-08-12-holdfast-ci-and-verification-harness.md Task 6.
 #
 # THE PATH IS LOAD-BEARING. cargo-mutants reads `.cargo/mutants.toml`, not
 # `mutants.toml` at the repository root; the root path is what the plan's
