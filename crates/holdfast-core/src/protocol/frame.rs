@@ -101,6 +101,24 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    decode(&read_frame_body(r).await?)
+}
+
+/// [`read_frame`] stopping one step short: the body bytes, undecoded.
+///
+/// **This is [`read_frame`]'s own body, extracted, not a second codec.**
+/// §7.5's attach wire needs to tell *"a `type` this build does not
+/// know"* from *"these bytes are not a frame"*, and answer the first
+/// with the unknown name echoed back in `ProtocolError.frame_kind` —
+/// which is impossible once `decode` has consumed the bytes and
+/// returned a `serde` message. `read_frame` is now a `decode` of this,
+/// so the length prefix, the cap and the EOF mapping stay in exactly
+/// one place; a caller that wants the raw body reads it through the
+/// same function the typed reader does.
+pub async fn read_frame_body<R>(r: &mut R) -> Result<Vec<u8>, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut prefix = [0u8; LENGTH_PREFIX_BYTES];
     match r.read_exact(&mut prefix).await {
         Ok(_) => {}
@@ -117,7 +135,7 @@ where
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(FrameError::Eof),
         Err(e) => return Err(FrameError::Io(e)),
     }
-    decode(&body)
+    Ok(body)
 }
 
 #[cfg(test)]

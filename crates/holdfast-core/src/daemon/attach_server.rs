@@ -82,13 +82,7 @@ pub async fn serve_attach(daemon: Arc<Daemon>, listener: UnixListener) {
 /// the accept loop spawns onto, kept here so the accept path and the
 /// protocol path stay in different files.
 async fn handle_attach(daemon: Arc<Daemon>, stream: UnixStream) {
-    // The socket boundary lands before the protocol does, so an
-    // authorized peer is currently accepted and then closed. Nothing
-    // asserts a *reply* here for that reason: the pairing that makes
-    // "the daemon refused this peer" mean anything — a same-uid
-    // connection that gets an `AttachReject` back — is written beside
-    // `attach::conn::run`, where there is something to receive.
-    let _ = (daemon, stream);
+    crate::attach::conn::run(daemon, stream).await;
 }
 
 #[cfg(test)]
@@ -258,6 +252,103 @@ mod tests {
 
         assert!(!s.0.control_sock().exists(), "control.sock left behind");
         assert!(!s.0.attach_sock().exists(), "attach.sock left behind");
+    }
+
+    #[tokio::test]
+    async fn an_attach_connection_from_another_uid_is_dropped_before_a_frame_is_parsed() {
+        // §9.1's gate on the *second* socket, **wired** and not merely
+        // correct: `peer::is_authorized` has its own unit test, and on
+        // its own, deleting this call site leaves that one green.
+        //
+        // The trick is the one `control.sock`'s twin uses — the test
+        // cannot become a second user, so it makes the *daemon* belong
+        // to one. `owner_uid` is state, so a daemon built for
+        // `current_uid() + 1` sees every ordinary local connection,
+        // including this one, as foreign.
+        use crate::attach::frames::{ClientFrame, ServerFrame};
+        use tokio::net::UnixStream;
+
+        let s = Scratch::new("uidgate");
+        let (listener, _owned) = bind_attach(&s.0).expect("bind attach.sock");
+        let daemon = crate::daemon::server::Daemon::with_owner_uid(
+            s.0.clone(),
+            peer::current_uid().wrapping_add(1),
+        );
+        tokio::spawn(serve_attach(Arc::clone(&daemon), listener));
+
+        let mut foreign = UnixStream::connect(s.0.attach_sock())
+            .await
+            .expect("connect");
+        // The write may land or may race the close; neither is the
+        // assertion.
+        let _ = crate::protocol::frame::write_frame(
+            &mut foreign,
+            &ClientFrame::Attach {
+                session: "anything".into(),
+                mode: crate::attach::AttachMode::ReadWrite,
+                role: crate::attach::AttachRole::Interactive,
+                client_kind: crate::protocol::handshake::ClientKind::Cli,
+                client_version: "test".into(),
+                protocol_major: crate::protocol::handshake::PROTOCOL_MAJOR,
+                protocol_minor: crate::protocol::handshake::PROTOCOL_MINOR,
+            },
+        )
+        .await;
+
+        // Bounded: the failure this guards against is a daemon that
+        // keeps the connection open, which as a bare `await` is a hang
+        // rather than a red row. `Ok(Err(_))` **only** — a timeout is
+        // `Err(Elapsed)` and must not read as success.
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::protocol::frame::read_frame_body(&mut foreign),
+        )
+        .await;
+        assert!(
+            matches!(answered, Ok(Err(_))),
+            "an unauthorized peer must be closed on without a reply; got {answered:?}"
+        );
+        daemon.shutdown();
+
+        // **The pairing, and the row proves nothing without it.**
+        // Silence on a socket is also what a daemon that answers nobody
+        // looks like — and at the commit that bound this socket, that is
+        // exactly what it was. A same-uid connection asking for a
+        // session that does not exist must come back `AttachReject`.
+        let s2 = Scratch::new("uidgateok");
+        let (listener2, _owned2) = bind_attach(&s2.0).expect("bind attach.sock");
+        let ours = crate::daemon::server::Daemon::new(s2.0.clone());
+        tokio::spawn(serve_attach(Arc::clone(&ours), listener2));
+
+        let mut mine = UnixStream::connect(s2.0.attach_sock())
+            .await
+            .expect("connect");
+        crate::protocol::frame::write_frame(
+            &mut mine,
+            &ClientFrame::Attach {
+                session: "anything".into(),
+                mode: crate::attach::AttachMode::ReadWrite,
+                role: crate::attach::AttachRole::Interactive,
+                client_kind: crate::protocol::handshake::ClientKind::Cli,
+                client_version: "test".into(),
+                protocol_major: crate::protocol::handshake::PROTOCOL_MAJOR,
+                protocol_minor: crate::protocol::handshake::PROTOCOL_MINOR,
+            },
+        )
+        .await
+        .expect("write attach");
+        let reply: ServerFrame = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::protocol::frame::read_frame(&mut mine),
+        )
+        .await
+        .expect("the owning uid must be answered within 5s")
+        .expect("a server frame");
+        assert!(
+            matches!(reply, ServerFrame::AttachReject { ref reason, .. } if reason == "session_not_found"),
+            "the owning uid must be served, not refused: {reply:?}"
+        );
+        ours.shutdown();
     }
 
     #[tokio::test]

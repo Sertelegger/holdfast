@@ -15,12 +15,19 @@
 //! each `pub mod` line lands in the commit that creates the file it
 //! names, so every commit on the branch compiles on its own.
 
+/// **The only gated submodule in `attach/`**, because it is the only one
+/// that names a `UnixStream`. Blanket-gating the module would take the
+/// frame catalog and the version contract off the `windows-cross` job,
+/// which is where a §23.3 wire surface gets type-checked for the
+/// platform that mirrors it in 0.0.10.
+#[cfg(unix)]
+pub mod conn;
 pub mod frames;
 pub mod handshake;
 
 pub use frames::{
-    decode_server_frame, AttachMode, AttachRole, ClientFrame, ClientFrameKind, ServerFrame,
-    SignalName, KNOWN_SERVER_TYPES,
+    decode_client_frame, decode_server_frame, AttachMode, AttachRole, ClientDecode, ClientFrame,
+    ClientFrameKind, ServerFrame, SignalName, KNOWN_SERVER_TYPES,
 };
 pub use handshake::{
     client_accepts_daemon, evaluate_attach, REJECT_LIMIT_REACHED, REJECT_PROTOCOL_TOO_NEW,

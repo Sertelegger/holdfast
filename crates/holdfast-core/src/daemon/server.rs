@@ -245,10 +245,13 @@ impl Daemon {
     /// [`Daemon::new`] with the owning uid supplied rather than read from
     /// the process.
     ///
-    /// Private, and deliberately so: production has exactly one right
-    /// answer for this and `new` supplies it. It exists because the
-    /// §9.1 gate is otherwise unprovable in-process — see `owner_uid`.
-    fn with_owner_uid(paths: RuntimePaths, owner_uid: u32) -> Arc<Self> {
+    /// `pub(crate)`, and deliberately no wider: production has exactly
+    /// one right answer for this and `new` supplies it. It exists
+    /// because the §9.1 gate is otherwise unprovable in-process — see
+    /// `owner_uid` — and it reaches beyond this module because the gate
+    /// now guards **two** sockets, and `attach_server`'s half of it
+    /// would otherwise be the untestable one.
+    pub(crate) fn with_owner_uid(paths: RuntimePaths, owner_uid: u32) -> Arc<Self> {
         Self::build(paths, Config::default(), Clock::system(), owner_uid)
     }
 

@@ -298,6 +298,67 @@ pub fn decode_server_frame(body: &[u8]) -> Result<ServerFrame, crate::protocol::
     }
 }
 
+/// What a client frame body turned out to be.
+///
+/// The **asymmetric** half of the strictness rule this module's header
+/// states: a server frame with an unknown `type` is skipped by the
+/// client, and a client frame with an unknown `type` is a
+/// `ProtocolError`. The daemon cannot act on a frame it does not
+/// understand, and silently discarding a client's *write* frame is
+/// worse than saying so.
+#[derive(Debug)]
+pub enum ClientDecode {
+    Frame(ClientFrame),
+    /// A `type` this build has never heard of. §18.4's
+    /// `protocol_violation`, with this name echoed in
+    /// `ProtocolError.frame_kind` — which is the whole reason the name
+    /// is carried out rather than folded into [`Self::Malformed`]. A
+    /// client that sent `Attch` learns which word was wrong.
+    UnknownType(String),
+    /// Not a frame at all: bytes that are not CBOR, CBOR that is not a
+    /// map, a map with no `type`, or a known `type` whose fields do not
+    /// fit. `frame_kind` is `None`, because there is nothing to name.
+    Malformed,
+}
+
+/// Decode a client frame body, telling an unknown `type` from a
+/// malformed one.
+///
+/// The mirror of [`decode_server_frame`], and deliberately *not* the
+/// same answer: that one returns [`ServerFrame::Unknown`] so a client
+/// can skip forward, this one returns a name so the daemon can refuse
+/// by name. §12.3's minor-compatibility rule runs one way on this wire.
+pub fn decode_client_frame(body: &[u8]) -> ClientDecode {
+    if let Ok(f) = crate::protocol::frame::decode::<ClientFrame>(body) {
+        return ClientDecode::Frame(f);
+    }
+    // Re-read the map's `type` to separate the two failures. A body that
+    // is not a map with a string `type` is malformed; one whose `type`
+    // is a string this build does not implement is an unknown variant,
+    // *including* a known name whose fields did not fit — which is also
+    // a violation and is reported as `Malformed` below, because naming
+    // the kind there would say the wrong thing about why it failed.
+    let Ok(ciborium::value::Value::Map(entries)) =
+        crate::protocol::frame::decode::<ciborium::value::Value>(body)
+    else {
+        return ClientDecode::Malformed;
+    };
+    for (k, v) in &entries {
+        if k.as_text() != Some("type") {
+            continue;
+        }
+        if let Some(name) = v.as_text() {
+            if !ClientFrameKind::ALL
+                .iter()
+                .any(|kind| kind.as_str() == name)
+            {
+                return ClientDecode::UnknownType(name.to_string());
+            }
+        }
+    }
+    ClientDecode::Malformed
+}
+
 impl ServerFrame {
     /// This frame's wire `type` string, or `None` for the decode-only
     /// [`ServerFrame::Unknown`].
