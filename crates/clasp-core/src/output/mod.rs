@@ -94,6 +94,13 @@ pub struct ReadRequest {
     pub start: ReadStart,
     /// Raw-byte budget (§5.1): caps bytes read *from the ring buffer*,
     /// not the size of the encoded payload.
+    ///
+    /// It has exactly one documented overshoot: when the cap would fall
+    /// inside a secret, the read consumes to the end of that secret so the
+    /// continuation cursor lands past it and not inside it (see
+    /// [`OutputProcessor::process`]). Those extra raw bytes are wholly
+    /// inside the one marker the response already carries, so the returned
+    /// payload is unchanged — only `bytes_returned` and `cursor` move.
     pub max_bytes: usize,
     pub options: ReadOptions,
     /// Which mechanism is reading — `read_output` or, from 0.0.5,
@@ -173,6 +180,8 @@ pub struct ProcessedRead {
     pub output: String,
     /// **Raw** bytes consumed, so it stays consistent with the cursor
     /// arithmetic; the encoded `output` may be longer or shorter (§5.1).
+    /// It may also exceed the request's `max_bytes` — by the tail of a
+    /// secret the cap landed inside, and only then.
     pub bytes_returned: usize,
     /// Absolute offset just past the bytes consumed.
     pub cursor: u64,
@@ -262,15 +271,59 @@ impl OutputProcessor {
             }
         }
 
-        let read_end = safety_end.max(w.req_start).min(w.cap_end);
-        let held_back = safety_end < w.cap_end;
-        let truncated_for_size = w.front_clipped || (w.cap_end < w.head && w.cap_end <= safety_end);
-
         let spans = if opts.redact {
             redact::find_spans(&self.rules, w.window, w.window_start)
         } else {
             Vec::new()
         };
+
+        let mut read_end = safety_end.max(w.req_start).min(w.cap_end);
+        let held_back = safety_end < w.cap_end;
+        let truncated_for_size = w.front_clipped || (w.cap_end < w.head && w.cap_end <= safety_end);
+
+        // **The continuation cursor must never land inside a secret.**
+        //
+        // `render` already replaces a span that straddles `read_end` with
+        // one whole marker, so *this* read is safe whatever `read_end` is.
+        // The danger is the next one: a cursor left mid-secret starts a
+        // window whose lookbehind cannot reach the value's anchor — a
+        // 1.7 KB PEM is far past the 512-byte lookbehind — so `find_spans`
+        // sees nothing, the raw key body is emitted with `redactions: {}`,
+        // and no audit entry marks it. A leak with no symptom. §4.1 states
+        // the opposite as normative: a secret partially in the previous
+        // chunk is fully redacted again in the next one, with no leak.
+        //
+        // Widening the lookbehind cannot fix this — any bound is exceeded
+        // by one more byte. Moving the cursor *past* the span closes the
+        // class.
+        //
+        // This may push `read_end` beyond `cap_end`, i.e. past the caller's
+        // `max_bytes`. That is deliberate, and it costs the caller nothing
+        // it can observe in the payload: every byte in `[cap_end, span.end)`
+        // is inside the span, and `render` emits exactly one marker for that
+        // span either way, so `output` and `redactions` are byte-identical
+        // to what the un-advanced `read_end` would have produced. Only
+        // `bytes_returned` (raw bytes consumed) and the cursor move, and the
+        // overshoot is bounded by the window, hence by `lookahead_bytes`.
+        //
+        // The alternative — pulling `read_end` back to `span.start` — was
+        // rejected: when the request *begins* inside a secret (REQ-O-002,
+        // the documented split-read case) `span.start <= req_start`, so the
+        // read would return zero bytes and hand back the cursor it was
+        // given. That is a paging loop that never terminates, and a hang is
+        // worse than the leak being fixed here. Advancing is monotone:
+        // `read_end` only ever grows, so no read makes less progress than
+        // it did before.
+        //
+        // Spans arrive sorted and non-overlapping from `merge_spans`, so
+        // one forward pass suffices: after an advance every later span
+        // starts at or after the new `read_end`.
+        for span in &spans {
+            if span.start < read_end && read_end < span.end {
+                read_end = span.end;
+            }
+        }
+
         let (bytes, redactions) = self.render(w, &spans, read_end, opts);
 
         ProcessedRead {
@@ -446,16 +499,27 @@ mod tests {
     }
 
     /// The other half of REQ-O-002: a request that *ends* inside a secret.
+    ///
+    /// The cap at 20 lands 13 bytes into the token, so the read consumes
+    /// to the token's end (47) instead: the marker is emitted either way,
+    /// but a cursor of 20 would hand the *continuation* an offset inside
+    /// the secret. `bytes_returned` therefore exceeds `max_bytes` — the
+    /// one documented overshoot, and the payload is not one byte larger
+    /// for it.
     #[test]
     fn a_request_ending_inside_a_secret_still_redacts() {
         let buf = format!("prefix {GITHUB} suffix").into_bytes();
-        // 20 bytes from offset 0 ends 13 bytes into the token.
         let r = read(&buf, 0, 20);
         assert!(!r.output.contains("ghp_012345"), "leaked: {}", r.output);
         assert_eq!(r.output, "prefix [REDACTED:github]");
         assert!(r.truncated_for_size, "more bytes are available now");
         assert!(!r.held_back, "a size cap is not a holdback");
-        assert_eq!(r.next_cursor, Some(20));
+        assert_eq!(
+            r.next_cursor,
+            Some((7 + GITHUB.len()) as u64),
+            "the continuation must resume past the token, never inside it"
+        );
+        assert_eq!(r.bytes_returned, 7 + GITHUB.len());
     }
 
     /// Sequencing two reads over the same secret must leak in neither.
@@ -469,7 +533,110 @@ mod tests {
             assert!(!part.contains("HIJ012345"), "leaked: {part}");
         }
         assert_eq!(first.output, "prefix [REDACTED:github]");
-        assert_eq!(second.output, "[REDACTED:github] suffix");
+        // The first read consumed the whole token, so the second starts
+        // exactly at its end and reports it no second time — `render`'s
+        // `span.end > req_start` gate. The pair shows the secret once.
+        assert_eq!(first.cursor, (7 + GITHUB.len()) as u64);
+        assert_eq!(second.output, " suffix");
+        assert!(second.redactions.is_empty());
+    }
+
+    /// A ~1.6 KB PEM: header, 24 base64 body lines, footer. Its body
+    /// alone is three times `lookbehind_bytes`, which is the whole point
+    /// — once a cursor sits more than 512 bytes past `-----BEGIN`, no
+    /// later window can see the anchor and the rule cannot fire at all.
+    fn pem_private_key() -> (String, String) {
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..24u32 {
+            let mut line = String::new();
+            while line.len() < 64 {
+                line.push_str(&format!("MIIEow{i:02}IBAAKCAQEAy8Dbv8prpJ"));
+            }
+            line.truncate(64);
+            lines.push(line);
+        }
+        let body = lines.join("\n");
+        let pem = format!("-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----");
+        (pem, body)
+    }
+
+    /// §4.1, normative: *"a secret that was partially in the previous
+    /// chunk is fully redacted again in the next chunk, with no leak."*
+    ///
+    /// The failure this pins had no symptom. `render` replaces a straddling
+    /// span with a whole marker, so the *capped* read looked right; the
+    /// cursor it returned pointed into the middle of the key, and the
+    /// continuation read — the documented `next_cursor` paging loop — had
+    /// no `-----BEGIN` within its 512-byte lookbehind, matched nothing,
+    /// and returned raw key bytes with `redactions: {}` and no audit
+    /// entry: indistinguishable from output that never held a secret.
+    ///
+    /// `max_bytes: 1024` is an ordinary agent choice made to save tokens,
+    /// and against a 1.7 KB key it splits *deterministically*.
+    #[test]
+    fn paging_a_capped_read_over_a_private_key_leaks_no_key_material() {
+        let (pem, body) = pem_private_key();
+        let prologue = "cat id_rsa\n";
+        let buf = format!("{prologue}{pem}\ndone\n").into_bytes();
+        let key_start = prologue.len() as u64;
+        let key_end = key_start + pem.len() as u64;
+
+        // Control: read whole, the rule fires and nothing is withheld. If
+        // this fails the fixture is wrong, not the cursor.
+        let whole = read(&buf, 0, 64 * 1024);
+        assert_eq!(whole.output, "cat id_rsa\n[REDACTED:private-key]\ndone\n");
+        assert!(
+            !whole.held_back,
+            "the key is complete; nothing is in flight"
+        );
+
+        const CAP: usize = 1024;
+        assert!(
+            (CAP as u64) < key_end && (CAP as u64) > key_start,
+            "the fixture must actually straddle the cap"
+        );
+
+        let mut chunks: Vec<String> = Vec::new();
+        let mut cursor = 0u64;
+        let mut reads = 0usize;
+        loop {
+            reads += 1;
+            // Bounded so a cursor that stops advancing fails the test
+            // instead of hanging CI.
+            assert!(reads <= 16, "paging did not terminate (cursor {cursor})");
+            let r = read(&buf, cursor, CAP);
+            assert!(
+                !(key_start < r.cursor && r.cursor < key_end),
+                "read {reads} returned cursor {} inside the key [{key_start}, {key_end})",
+                r.cursor
+            );
+            chunks.push(r.output);
+            match r.next_cursor {
+                Some(next) => {
+                    assert!(next > cursor, "cursor stalled at {cursor}");
+                    cursor = next;
+                }
+                None => break,
+            }
+        }
+        assert!(reads >= 2, "the cap must actually have split the read");
+
+        // No run of key material survives anywhere. 32 bytes is far past
+        // anything that could collide by chance, and sweeping every offset
+        // catches a partial line as well as a whole one.
+        for (i, chunk) in chunks.iter().enumerate() {
+            for start in 0..=body.len() - 32 {
+                let needle = &body[start..start + 32];
+                assert!(
+                    !chunk.contains(needle),
+                    "chunk {i} leaked key material from body offset {start}: {chunk}"
+                );
+            }
+        }
+        // And the paged reads say exactly what the single read said —
+        // which also rules out a chunk that leaked nothing by returning
+        // nothing.
+        assert_eq!(chunks.concat(), whole.output);
     }
 
     /// The lookbehind exists so a secret that *straddles* the cursor is
@@ -504,8 +671,16 @@ mod tests {
         assert_eq!(r.output, "[REDACTED:datadog] tail");
     }
 
-    /// The documented limit in §4.1: past the lookbehind window a
-    /// context-based rule can no longer see its label.
+    /// The documented limit in §4.1: past the lookbehind window a rule
+    /// can no longer see the anchor that names its value.
+    ///
+    /// The limit is not peculiar to context rules — a prefix-anchored
+    /// rule is bounded the same way, and `-----BEGIN` sits far more than
+    /// 512 bytes ahead of a PEM's last line. Widening the lookbehind
+    /// cannot repair that; the reason no *paged* read is exposed to it is
+    /// that `process` never leaves a cursor inside a span, which
+    /// `paging_a_capped_read_over_a_private_key_leaks_no_key_material`
+    /// pins. This test is the reason that invariant has to exist.
     #[test]
     fn a_context_prefix_beyond_the_lookbehind_can_no_longer_protect_the_value() {
         let value = "0123456789abcdef0123456789abcdef";
@@ -515,7 +690,8 @@ mod tests {
         let r = read(&buf, req_start, 4096);
         assert!(
             r.output.starts_with(value),
-            "documented limit: prefix-based rules still fire, context ones cannot: {}",
+            "the label is 1 KB back, outside the lookbehind, so nothing \
+             marks this value as a secret: {}",
             r.output
         );
     }

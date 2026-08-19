@@ -1259,6 +1259,70 @@ mod tests {
         assert!(!r.held_back);
     }
 
+    /// C-1 on the real read path (§4.1: *"a secret that was partially in
+    /// the previous chunk is fully redacted again in the next chunk, with
+    /// no leak"*).
+    ///
+    /// The unit test in `output` pins the same invariant against a
+    /// hand-built snapshot; the geometry that actually decides whether a
+    /// continuation read can still see `-----BEGIN` is *this* function's
+    /// (`window_start = req_start − lookbehind_bytes`), so it is pinned
+    /// here as well. A 1.6 KB key is three times the 512-byte lookbehind:
+    /// a cursor left inside it can never be recovered from, and the leak
+    /// carries `redactions: {}` and no audit entry, so nothing downstream
+    /// can tell it happened.
+    #[test]
+    fn paging_a_capped_read_over_a_private_key_leaks_nothing_through_the_session() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..24u32 {
+            let mut line = String::new();
+            while line.len() < 64 {
+                line.push_str(&format!("MIIEow{i:02}IBAAKCAQEAy8Dbv8prpJ"));
+            }
+            line.truncate(64);
+            lines.push(line);
+        }
+        let body = lines.join("\n");
+        let stream = format!(
+            "cat id_rsa\n-----BEGIN RSA PRIVATE KEY-----\n{body}\n\
+             -----END RSA PRIVATE KEY-----\ndone\n"
+        );
+        pty.queue_output(stream.as_bytes());
+        wait_for_bytes(&s, stream.len() as u64);
+
+        // `max_bytes: 1024` is an ordinary agent choice made to save
+        // tokens, and against this key it splits deterministically.
+        let mut joined = String::new();
+        let mut cursor = 0u64;
+        let mut reads = 0usize;
+        loop {
+            reads += 1;
+            // Bounded, so a cursor that stops advancing fails here rather
+            // than hanging CI.
+            assert!(reads <= 16, "paging did not terminate (cursor {cursor})");
+            let r = s.read_processed(&ReadRequest::since(cursor, 1024), &p);
+            joined.push_str(&r.output);
+            match r.next_cursor {
+                Some(next) => {
+                    assert!(next > cursor, "the cursor stalled at {cursor}");
+                    cursor = next;
+                }
+                None => break,
+            }
+        }
+        assert!(reads >= 2, "the cap must actually have split the read");
+        for start in 0..=body.len() - 32 {
+            assert!(
+                !joined.contains(&body[start..start + 32]),
+                "key material leaked at body offset {start}: {joined}"
+            );
+        }
+        assert_eq!(joined, "cat id_rsa\n[REDACTED:private-key]\ndone\n");
+    }
+
     #[test]
     fn read_processed_holds_an_in_flight_token_and_releases_it_on_completion() {
         let (s, pty) = mock_session();
