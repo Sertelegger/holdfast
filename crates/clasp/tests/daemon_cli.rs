@@ -129,6 +129,36 @@ impl TestEnv {
         text.split_whitespace().next()?.parse().ok()
     }
 
+    /// Plant a `clasp.pid` naming `pid`, in `write_pid_file`'s shape —
+    /// `"<pid> <version>\n"` — which is what a daemon that died without
+    /// cleaning up leaves behind.
+    fn plant_pid_file(&self, pid: u32) {
+        std::fs::write(
+            self.dir.join("clasp.pid"),
+            format!("{pid} {}\n", env!("CARGO_PKG_VERSION")),
+        )
+        .expect("write clasp.pid");
+    }
+
+    /// Wait, bounded, for the daemon to remove its own `clasp.pid`.
+    ///
+    /// `daemon/stop` is answered before `server::run` reaches its
+    /// cleanup, so a test that planted a pid file the instant the command
+    /// returned could have it deleted out from under itself — and would
+    /// then pass against a `--force` that never read one at all.
+    fn await_no_pid_file(&self) {
+        let path = self.dir.join("clasp.pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{} outlived `daemon stop`",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// Every `redaction_disabled` entry in this instance's §9.4 audit log.
     ///
     /// Read from `$CLASP_RUNTIME_DIR/logs/audit.log` rather than from
@@ -216,6 +246,39 @@ fn wait_bounded(mut child: Child, limit: Duration) -> Option<(i32, String, Strin
 fn alive(pid: u32) -> bool {
     // SAFETY: signal 0 performs the existence/permission check only.
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn signal(pid: u32, sig: i32) -> bool {
+    // SAFETY: `kill` takes no pointers.
+    unsafe { libc::kill(pid as i32, sig) == 0 }
+}
+
+/// Whether this machine has the `/proc` that `--force`'s pid
+/// confirmation reads. Tests that turn on it skip elsewhere, the way
+/// `the_running_daemon_holds_no_listening_tcp_socket` does.
+fn have_proc() -> bool {
+    PathBuf::from("/proc/self/fd").exists()
+}
+
+/// The state letter from `/proc/<pid>/stat` — `T` stopped, `Z` zombie —
+/// or `None` when the process is gone.
+///
+/// Read from after the **last** `)`: field 2 is the executable name in
+/// parentheses, and it may itself contain spaces and parentheses.
+fn proc_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, after_comm) = stat.rsplit_once(')')?;
+    after_comm.split_whitespace().next()?.chars().next()
+}
+
+/// Dead, or dead enough.
+///
+/// Not `!alive(pid)`: a killed process lingers as a zombie until its
+/// parent reaps it, and `kill(pid, 0)` answers `0` for a zombie. A test
+/// that asked `alive` about a process it had just killed would be
+/// waiting on the reaper, not on the kill.
+fn ended(pid: u32) -> bool {
+    !matches!(proc_state(pid), Some(state) if state != 'Z')
 }
 
 /// A `clasp mcp` process driven over stdio with raw JSON-RPC.
@@ -528,6 +591,172 @@ fn stopping_a_daemon_that_is_not_running_succeeds() {
     let (code, out, _) = env.run(&["daemon", "stop"]);
     assert_eq!(code, 0);
     assert!(out.contains("no daemon running"), "{out}");
+}
+
+#[test]
+fn daemon_stop_force_kills_a_daemon_that_has_stopped_answering() {
+    // §3.2: *"`--force` makes the wait 0 and immediately escalates to
+    // `SIGKILL` on the daemon."* The RPC cannot deliver that on its own —
+    // `daemon/stop` kills the *sessions* and asks the accept loop to
+    // stop, and a wedged accept loop never hears it. A daemon that has
+    // stopped answering is the only situation in which `--force` is the
+    // interesting flag, and it is the situation `TestEnv::drop` assumes
+    // is handled: before the escalation existed, teardown here paid the
+    // full 60 s `CLI_TIMEOUT` and then leaked the process.
+    if !have_proc() {
+        return; // The pid confirmation is `/proc`-based; see `commands.rs`.
+    }
+    let env = TestEnv::new("forcewedge");
+    assert_eq!(env.run(&["daemon", "start"]).0, 0);
+    let pid = env.daemon_pid().expect("pid file");
+    assert!(alive(pid));
+
+    // SIGSTOP is the wedge, and it is what makes this test about
+    // `--force` rather than about the healthy path: the process stays,
+    // its socket stays bound and still completes a `connect` out of the
+    // listen backlog, and nothing behind that socket ever runs again.
+    assert!(
+        signal(pid, libc::SIGSTOP),
+        "SIGSTOP: {}",
+        std::io::Error::last_os_error()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while proc_state(pid) != Some('T') && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        proc_state(pid),
+        Some('T'),
+        "the daemon never entered the stopped state, so this is not a wedged daemon"
+    );
+
+    let started = Instant::now();
+    let (code, out, err) = env.run(&["daemon", "stop", "--force"]);
+    let elapsed = started.elapsed();
+    assert_eq!(code, 0, "stdout: {out} stderr: {err}");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ended(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        ended(pid),
+        "the daemon survived `daemon stop --force`; stdout: {out} stderr: {err}"
+    );
+    // Promptness is part of the contract, not a performance note: the
+    // control client has no timeout of its own, so a `--force` that
+    // waits on the RPC before escalating waits forever against exactly
+    // this daemon. Loose enough not to flake on a loaded machine,
+    // tight enough that it cannot be satisfied by an unbounded wait
+    // (which `TestEnv::run` would turn into a panic at 60 s instead).
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "`--force` spent {elapsed:?} on a daemon that cannot answer"
+    );
+}
+
+#[test]
+fn daemon_stop_force_does_not_signal_a_pid_that_is_not_this_daemon() {
+    // The other half of the escalation, and the reason it is allowed to
+    // exist. `clasp.pid` is written once at startup and removed only on
+    // a clean exit, so a daemon that was killed leaves it behind naming
+    // a pid the kernel is free to hand to anything — and the version
+    // string the file also carries says only which clasp *wrote* it, not
+    // who owns the pid now. A `--force` that trusted the file would
+    // SIGKILL a stranger.
+    let env = TestEnv::new("forcestale");
+    assert_eq!(env.run(&["daemon", "start"]).0, 0);
+    assert_eq!(env.run(&["daemon", "stop"]).0, 0);
+    env.await_no_pid_file();
+
+    let mut bystander = Command::new("sleep")
+        .arg("300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the bystander");
+    let victim = bystander.id();
+    env.plant_pid_file(victim);
+
+    let (code, out, err) = env.run(&["daemon", "stop", "--force"]);
+    assert_eq!(code, 0, "stderr: {err}");
+
+    // The load-bearing assertion, and it goes first so that it is the one
+    // a regression trips on rather than a message check standing in front
+    // of it. `try_wait`, not `alive`: a SIGKILLed child of this process is
+    // a zombie until reaped, and `kill(pid, 0)` answers `0` for a zombie —
+    // so the obvious liveness check would pass against the very failure
+    // this test exists to catch.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        bystander
+            .try_wait()
+            .expect("wait for the bystander")
+            .is_none(),
+        "`--force` signalled pid {victim}, which is a `sleep`, not this instance's daemon"
+    );
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+
+    assert!(out.contains("no daemon running"), "stdout: {out}");
+    // Non-vacuity. Without this, the test would also pass against a
+    // `--force` that reads no pid file at all — which is the state the
+    // finding describes, not the fix.
+    // `daemon_stop_force_kills_a_daemon_that_has_stopped_answering` is
+    // the other half: it proves the same pid file *is* acted on.
+    assert!(
+        err.contains(&victim.to_string()),
+        "`--force` did not report the pid it declined to signal: {err}"
+    );
+}
+
+#[test]
+fn daemon_stop_force_does_not_kill_another_instances_daemon() {
+    // The recycled pid that actually costs something. A stranger at the
+    // pid is caught by any check at all; a *second clasp daemon* at the
+    // pid is caught only by one that is specific to this instance, and
+    // it is the case with real sessions to lose. `--force` must confirm
+    // the pid against this runtime directory's own control socket, not
+    // merely against "looks like a clasp daemon".
+    if !have_proc() {
+        return; // The pid confirmation is `/proc`-based; see `commands.rs`.
+    }
+    let a = TestEnv::new("forceiso-a");
+    let b = TestEnv::new("forceiso-b");
+    assert_eq!(a.run(&["daemon", "start"]).0, 0);
+    assert_eq!(b.run(&["daemon", "start"]).0, 0);
+    let b_pid = b.daemon_pid().expect("B's pid file");
+
+    // A's daemon goes away and A's pid file is then made to name B's —
+    // the shape a recycled pid leaves behind.
+    assert_eq!(a.run(&["daemon", "stop"]).0, 0);
+    a.await_no_pid_file();
+    a.plant_pid_file(b_pid);
+
+    let (code, _, force_err) = a.run(&["daemon", "stop", "--force"]);
+    assert_eq!(code, 0, "stderr: {force_err}");
+
+    // Still *serving*, which is stronger than still alive: a zombie
+    // answers `kill(pid, 0)`, and only a live daemon answers
+    // `daemon/status`. First, so that a regression trips on B's survival
+    // rather than on the message check below it.
+    let (code, out, err) = b.run(&["daemon", "status", "--json"]);
+    assert_eq!(
+        code, 0,
+        "instance B's daemon did not survive instance A's `--force`: {err}"
+    );
+    let status: Value = serde_json::from_str(out.trim()).expect("json status");
+    assert_eq!(
+        status["pid"].as_u64(),
+        Some(b_pid as u64),
+        "B answered from a different process: {out}"
+    );
+
+    assert!(
+        force_err.contains(&b_pid.to_string()),
+        "A did not report the pid it declined to signal: {force_err}"
+    );
 }
 
 #[test]

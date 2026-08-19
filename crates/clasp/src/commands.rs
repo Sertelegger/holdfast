@@ -10,8 +10,11 @@ use clasp_core::protocol::method;
 use clasp_core::protocol::CborValue;
 use rmcp::ServiceExt;
 use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// §18.8 shim exit codes, in §18.8's row order — `0`, `1`, `2`, `64`.
 /// `0` is `ExitCode::SUCCESS` and needs no constant of its own.
@@ -153,18 +156,35 @@ pub fn daemon_start() -> ExitCode {
     }
 }
 
-/// `clasp daemon stop` — idempotent; exit 0 when nothing was running.
-pub async fn daemon_stop(force: bool) -> ExitCode {
+/// How long `--force` waits for `daemon/stop` to answer before it stops
+/// asking and starts signalling.
+///
+/// The RPC is still attempted on the force path — a daemon that *can*
+/// answer terminates its sessions deliberately and reports how many,
+/// which nothing else knows — but it is bounded, because the case
+/// `--force` exists for is a daemon that accepts the connection and then
+/// never replies. `ControlClient` has no timeout of its own (deliberate:
+/// `clasp logs` may legitimately take a while), so an unbounded call
+/// here would park `--force` in exactly the situation it is meant to
+/// resolve. That is what `TestEnv::drop` was paying `CLI_TIMEOUT` for.
+const FORCE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What the `daemon/stop` RPC did, kept separate from what `--force`
+/// then does about it.
+enum StopRpc {
+    Stopped(server::StopOutcome),
+    /// Nothing was listening on the control socket.
+    NotRunning,
+    /// Something was there and the call did not come back with an
+    /// outcome — including the case where it did not come back at all.
+    Failed(String),
+}
+
+async fn stop_rpc(force: bool) -> StopRpc {
     let client = match connect(ClientKind::Cli).await {
         Ok(c) => c,
-        Err(ClientError::Connect { .. }) => {
-            println!("no daemon running");
-            return ExitCode::SUCCESS;
-        }
-        Err(e) => {
-            eprintln!("clasp daemon stop: {e}");
-            return ExitCode::from(EXIT_FAILED);
-        }
+        Err(ClientError::Connect { .. }) => return StopRpc::NotRunning,
+        Err(e) => return StopRpc::Failed(e.to_string()),
     };
     let params = server::StopParams {
         force: Some(force),
@@ -174,18 +194,290 @@ pub async fn daemon_stop(force: bool) -> ExitCode {
         .call::<_, server::StopOutcome>(method::METHOD_DAEMON_STOP, &params)
         .await
     {
-        Ok(outcome) => {
+        Ok(outcome) => StopRpc::Stopped(outcome),
+        Err(e) => StopRpc::Failed(e.to_string()),
+    }
+}
+
+/// `clasp daemon stop [--force]` — idempotent; exit 0 when nothing was
+/// running.
+///
+/// §3.2: *"`--force` makes the wait 0 and immediately escalates to
+/// SIGKILL on the daemon."* The RPC alone cannot do that — `daemon/stop`
+/// kills the *sessions* and asks the accept loop to stop, which a wedged
+/// accept loop will not hear — so `--force` follows it with a signal to
+/// the daemon process itself, whether the RPC answered, failed, or never
+/// came back.
+pub async fn daemon_stop(force: bool) -> ExitCode {
+    if !force {
+        return match stop_rpc(false).await {
+            StopRpc::Stopped(outcome) => {
+                println!(
+                    "daemon stopped ({} session(s) terminated)",
+                    outcome.sessions_terminated
+                );
+                ExitCode::SUCCESS
+            }
+            StopRpc::NotRunning => {
+                println!("no daemon running");
+                ExitCode::SUCCESS
+            }
+            StopRpc::Failed(e) => {
+                eprintln!("clasp daemon stop: {e}");
+                ExitCode::from(EXIT_FAILED)
+            }
+        };
+    }
+
+    let rpc = match tokio::time::timeout(FORCE_RPC_TIMEOUT, stop_rpc(true)).await {
+        Ok(rpc) => rpc,
+        Err(_) => StopRpc::Failed(format!(
+            "the daemon did not answer daemon/stop within {}s",
+            FORCE_RPC_TIMEOUT.as_secs()
+        )),
+    };
+
+    let escalation = match paths() {
+        Ok(p) => escalate_to_sigkill(&p),
+        // No runtime directory means no `clasp.pid` to read. The RPC arm
+        // below already reports what it saw, which for an undiscoverable
+        // directory is `NotRunning`.
+        Err(_) => Escalation::Nothing,
+    };
+
+    match rpc {
+        StopRpc::Stopped(outcome) => {
             println!(
                 "daemon stopped ({} session(s) terminated)",
                 outcome.sessions_terminated
             );
+            if let Escalation::Killed(pid) = escalation {
+                println!("SIGKILL sent to daemon pid {pid}");
+            }
+            // A `NotSignalled` here is not worth a warning: the daemon
+            // answered, so the ordinary reason its pid no longer confirms
+            // is that it has already dropped its listener and is on its
+            // way out. The escalation declined was one nothing needed.
             ExitCode::SUCCESS
         }
-        Err(e) => {
+        // The RPC got nowhere, which is when `--force` has to earn its
+        // name. A confirmed kill *is* the stop, so it exits 0 and the
+        // RPC's complaint goes to stderr as diagnosis rather than as the
+        // verdict.
+        StopRpc::NotRunning => match escalation {
+            Escalation::Killed(pid) => {
+                println!("daemon killed (pid {pid})");
+                ExitCode::SUCCESS
+            }
+            Escalation::Nothing => {
+                println!("no daemon running");
+                ExitCode::SUCCESS
+            }
+            Escalation::NotSignalled { pid, why } => {
+                println!("no daemon running");
+                eprintln!("clasp daemon stop: clasp.pid names pid {pid}, not signalled: {why}");
+                ExitCode::SUCCESS
+            }
+        },
+        StopRpc::Failed(e) => {
             eprintln!("clasp daemon stop: {e}");
-            ExitCode::from(EXIT_FAILED)
+            match escalation {
+                Escalation::Killed(pid) => {
+                    println!("daemon killed (pid {pid})");
+                    ExitCode::SUCCESS
+                }
+                Escalation::Nothing => ExitCode::from(EXIT_FAILED),
+                Escalation::NotSignalled { pid, why } => {
+                    eprintln!("clasp daemon stop: clasp.pid names pid {pid}, not signalled: {why}");
+                    ExitCode::from(EXIT_FAILED)
+                }
+            }
         }
     }
+}
+
+/// The result of §3.2's `--force` escalation.
+enum Escalation {
+    /// SIGKILL was delivered to a pid confirmed to be this instance's
+    /// daemon.
+    Killed(u32),
+    /// Nothing to signal: no `clasp.pid`, or the pid it names is gone.
+    Nothing,
+    /// `clasp.pid` named a live pid that was **not** signalled, because
+    /// it could not be confirmed as this instance's daemon (or because
+    /// the signal itself failed).
+    NotSignalled { pid: u32, why: String },
+}
+
+/// SIGKILL the daemon process named by `clasp.pid`, if it is really it.
+///
+/// This does not reap the daemon's sessions. With the in-process PTY
+/// backend they are its children, and what ends them is the master side
+/// of each PTY closing as the daemon dies, which hangs up the terminal.
+/// The deliberate teardown is the RPC's, and only a daemon that can
+/// answer performs it — which is the trade `--force` makes.
+fn escalate_to_sigkill(paths: &RuntimePaths) -> Escalation {
+    let Some(pid) = server::read_pid_file(paths) else {
+        return Escalation::Nothing;
+    };
+    // Signal 0 is the existence-and-permission check. A pid that is gone
+    // — or belongs to another user, whom we could not signal anyway — is
+    // nothing to escalate to, and asking first keeps the common case (a
+    // daemon that answered and exited) off the `/proc` path entirely.
+    // SAFETY: `kill` takes no pointers, and signal 0 sends nothing.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return Escalation::Nothing;
+    }
+    if let Err(why) = confirm_daemon_pid(paths, pid) {
+        return Escalation::NotSignalled { pid, why };
+    }
+    // SAFETY: as above. SIGKILL cannot be caught or ignored, so a `0`
+    // return means this pid is going away.
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } == 0 {
+        Escalation::Killed(pid)
+    } else {
+        Escalation::NotSignalled {
+            pid,
+            why: format!("SIGKILL failed: {}", std::io::Error::last_os_error()),
+        }
+    }
+}
+
+/// Is `pid` this instance's daemon?
+///
+/// `Ok(())` only for a pid this can *positively* tie to the daemon of
+/// the runtime directory being stopped. Everything else — including
+/// "cannot tell" — is `Err(reason)`, because the two errors are not
+/// symmetric: a false negative costs `--force` its escalation and prints
+/// why, a false positive costs an unrelated process its life.
+///
+/// **What the evidence is, and what it is not.** `clasp.pid` on its own
+/// establishes almost nothing about the *process*. It is written once at
+/// startup and removed only on a clean exit, so a daemon that was
+/// killed, panicked, or lost its machine leaves the file behind naming a
+/// pid the kernel is then free to hand to anything. The version string
+/// the file also carries does not close that: it records which clasp
+/// *wrote* the file, which says nothing about who owns the pid now. What
+/// the file does give is that the runtime directory is `0700`, so no
+/// other user planted it — the hazard is recycling, not forgery.
+///
+/// So the confirmation is made against the live process, in two parts:
+///
+/// 1. It holds an open fd for a socket bound at *this* runtime
+///    directory's `control.sock`. This is the instance-specific half:
+///    a recycled pid does not hold our socket, and neither does a second
+///    clasp daemon running under a different `CLASP_RUNTIME_DIR` — which
+///    is the recycling case that would otherwise cost a live daemon its
+///    sessions.
+/// 2. Its argv contains `daemon run`. Corroboration; (1) is the
+///    load-bearing half.
+///
+/// Both read `/proc`, so **off Linux this confirms nothing** and
+/// `--force` stays what it was before this function existed: the RPC and
+/// no escalation. macOS can get the same answer from
+/// `sysctl(KERN_PROC_PID)`, and that is a later milestone's work — not a
+/// silent fallback to "kill whatever holds that pid", which is the one
+/// behaviour that would open the pid-reuse hazard this exists to keep
+/// closed.
+///
+/// The residual false negative: a daemon that has dropped its listener
+/// but has not yet exited reads as unconfirmed. That is the tail of a
+/// *successful* cooperative shutdown, so the escalation it declines is
+/// one that was not needed.
+fn confirm_daemon_pid(paths: &RuntimePaths, pid: u32) -> Result<(), String> {
+    if !Path::new("/proc/self/cmdline").exists() {
+        return Err("no /proc on this platform, so the pid cannot be tied to a daemon".into());
+    }
+    let sock = paths.control_sock();
+    if !holds_socket_bound_at(pid, &sock)? {
+        return Err(format!(
+            "pid {pid} holds no socket bound at {}",
+            sock.display()
+        ));
+    }
+    let argv = proc_argv(pid)?;
+    if !argv.windows(2).any(|w| w[0] == "daemon" && w[1] == "run") {
+        return Err(format!(
+            "pid {pid} is not running `daemon run` (argv: {argv:?})"
+        ));
+    }
+    Ok(())
+}
+
+fn proc_argv(pid: u32) -> Result<Vec<String>, String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map_err(|e| format!("cannot read /proc/{pid}/cmdline: {e}"))?;
+    Ok(raw
+        .split(|b| *b == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect())
+}
+
+/// Does `pid` hold an open socket bound at `sock`?
+///
+/// `/proc/net/unix` maps a bound path to the inodes of the sockets on
+/// it; `/proc/<pid>/fd` maps a process to the inodes it holds. Neither
+/// alone names both ends, and the intersection is what ties a process to
+/// a path.
+fn holds_socket_bound_at(pid: u32, sock: &Path) -> Result<bool, String> {
+    let table = std::fs::read_to_string("/proc/net/unix")
+        .map_err(|e| format!("cannot read /proc/net/unix: {e}"))?;
+    let sock = sock.to_string_lossy();
+    let want: &str = &sock;
+    let inodes: HashSet<&str> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (inode, path) = unix_socket_row(line)?;
+            (path == want).then_some(inode)
+        })
+        .collect();
+    if inodes.is_empty() {
+        return Ok(false);
+    }
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map_err(|e| format!("cannot read /proc/{pid}/fd: {e}"))?;
+    for entry in fds.flatten() {
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let target = target.to_string_lossy();
+        let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|i| i.strip_suffix(']'))
+        else {
+            continue;
+        };
+        if inodes.contains(inode) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `(inode, path)` from one `/proc/net/unix` row, or `None` for a socket
+/// with no bound path — every connected client, including the connection
+/// this process made a moment ago.
+///
+/// The columns are `Num RefCount Protocol Flags Type St Inode Path`, and
+/// the path is taken as the whole remainder rather than as an eighth
+/// whitespace-separated token: the kernel writes `sun_path` raw and
+/// unescaped, so a runtime directory below a home directory with a space
+/// in it would otherwise be compared against its own first word and
+/// never match.
+fn unix_socket_row(line: &str) -> Option<(&str, &str)> {
+    let mut rest = line.trim_start();
+    let mut inode = "";
+    for column in 0..7 {
+        let end = rest.find(char::is_whitespace)?;
+        let (token, tail) = rest.split_at(end);
+        if column == 6 {
+            inode = token;
+        }
+        rest = tail.trim_start();
+    }
+    (!rest.is_empty()).then_some((inode, rest))
 }
 
 /// `clasp daemon status [--json]`
