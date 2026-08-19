@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::detect::{PromptPattern, MAX_EXTRA_PATTERNS};
+use crate::protocol::MAX_FRAME_BYTES;
 
 /// Everything that can go wrong turning a file into a [`Config`].
 ///
@@ -921,6 +922,67 @@ impl Config {
             )));
         }
 
+        // I-9's second half (milestone-review.md:453). `MAX_FRAME_BYTES`
+        // is enforced on the *encoded, post-redaction* response
+        // (`daemon::server::write_response`) and it **rejects**, so a
+        // buffer cap that reaches it guarantees every response built at
+        // that size is refused at the wire — not a slow degradation, a
+        // hard failure on the first oversized read. This is the
+        // cross-check `write_response`'s doc comment names as still
+        // owed.
+        //
+        // **Do not size the headroom off the cap alone; redaction can
+        // make the encoded body *larger* than the raw bytes that went
+        // in.** A `[REDACTED:<kind>]` marker is sized by the rule's
+        // *kind*, never by what it replaces, so a short secret can grow.
+        // Worked from `data/redaction_default.toml`, not asserted: the
+        // worst case is `database-connection-password` (kind
+        // `connection-string`, the longest kind name shipped, so the
+        // widest marker — `[REDACTED:connection-string]` is 28 bytes).
+        // Its minimum match is `amqp://a:x@` (11 bytes: the shortest
+        // scheme the rule accepts, a 1-byte user, a 1-byte password —
+        // the pattern requires at least one byte of each, never zero).
+        // Redacting just the password leaves the 10 bytes of context
+        // (`amqp://a:` + `@`) untouched and appends the 28-byte marker:
+        // 38 bytes from 11, a ~3.45x ratio — and because the match ends
+        // on a word boundary the same as it started, that string tiles
+        // back-to-back with no separator, so ~3.45x is the ratio for a
+        // buffer built *entirely* from the worst case, not just for one
+        // occurrence in it. No other rule in the shipped set comes
+        // close: every other rule's fixed context is longer, its kind
+        // name shorter, or its minimum value longer, and several rules
+        // shrink outright (`AKIAIOSFODNN7EXAMPLE`, 20 bytes, becomes
+        // `[REDACTED:aws]`, 14).
+        //
+        // Rounded up to a flat 4x for a plain number and a safety
+        // margin over the derived 3.45x, so a buffer at the ceiling
+        // below cannot cross `MAX_FRAME_BYTES` even if every byte in it
+        // is the worst case, with the remaining ~12 MiB absorbing the
+        // response envelope's own few hundred bytes many times over.
+        // `resource_read_max_bytes`'s shipped default (4 MiB) is
+        // already exactly `MAX_FRAME_BYTES / 4` (§10.2) — this turns
+        // that from a coincidence the next edit could silently break
+        // into a named, enforced invariant.
+        //
+        // **Refused, not clamped.** A clamp would silently substitute a
+        // smaller cap than the one the operator wrote and put a stale
+        // number in front of them on every read; refusing at startup —
+        // this project's standing preference over detect-and-repair —
+        // means the config they believe is in force is the config that
+        // is. See `trust_verdict`'s doc comment for the same call made
+        // the same way a few functions up.
+        let frame_headroom_ceiling = MAX_FRAME_BYTES / 4;
+        at_most(
+            "limits.output_buffer_bytes",
+            l.output_buffer_bytes,
+            frame_headroom_ceiling,
+        )?;
+        at_most(
+            "limits.resource_read_max_bytes",
+            l.resource_read_max_bytes,
+            frame_headroom_ceiling,
+        )?;
+
         // `PatternSet::build` enforces this too, as a
         // `ClaspError::InvalidPattern` from another layer. Validated here
         // as well, with the count in the message, so an over-long list is
@@ -1066,6 +1128,19 @@ fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<(), ConfigError> {
         return Err(ConfigError::invalid(format!(
             "{key} = \"{value}\", which is not one of {}",
             allowed.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// `value` must leave headroom under a wire cap. See the I-9 comment in
+/// [`Config::validate`] for what `ceiling` is and why.
+fn at_most(key: &str, value: usize, ceiling: usize) -> Result<(), ConfigError> {
+    if value > ceiling {
+        return Err(ConfigError::invalid(format!(
+            "{key} = {value}, which leaves no headroom under the {MAX_FRAME_BYTES}-byte \
+             control-protocol frame cap; secret redaction can make a response larger \
+             than the bytes that went in, so {key} must stay at or below {ceiling}"
         )));
     }
     Ok(())
@@ -1413,6 +1488,56 @@ require_confirm = false
         let msg = e.to_string();
         assert!(msg.contains("max_concurrent_sessions"), "{msg}");
         assert!(msg.contains('0'), "the message names the value too: {msg}");
+    }
+
+    // ------------------------------------------ I-9's second half (headroom)
+
+    /// A buffer cap that reaches the wire cap is rejected at load, not
+    /// discovered the first time a session produces enough output to hit
+    /// it.
+    ///
+    /// The value under test is exactly [`MAX_FRAME_BYTES`] itself, and
+    /// that choice is the point: a validator written as "reject anything
+    /// *over* the wire cap" — the `cap it at 16 MiB` mistake the fix
+    /// this test guards was warned away from — would wave this value
+    /// through, since it does not exceed the cap, it *is* the cap. Only
+    /// a check that requires real headroom under `MAX_FRAME_BYTES`
+    /// catches it, which is the difference this row exists to pin down.
+    /// The literal is [`MAX_FRAME_BYTES`] itself rather than a value
+    /// derived from whatever ceiling `Config::validate` computes
+    /// internally, so this test does not share an expression with the
+    /// code it is checking.
+    #[test]
+    fn a_buffer_cap_at_the_frame_cap_is_rejected() {
+        for key in ["output_buffer_bytes", "resource_read_max_bytes"] {
+            let src = format!("[limits]\n{key} = {MAX_FRAME_BYTES}\n");
+            let e = parse_str(&src).expect_err(&format!(
+                "{key} at the wire cap must be rejected, not silently accepted"
+            ));
+            let msg = e.to_string();
+            assert!(msg.contains(key), "the error must name the key: {msg}");
+        }
+    }
+
+    /// The pairing, and the negative control the row above needs: absent
+    /// it, a validator that rejects every buffer cap — not just ones
+    /// that reach the wire cap — would pass the positive row perfectly.
+    /// This is [`Config::default`] under [`Config::validate`] directly,
+    /// not a round trip through TOML: `load_from`'s missing-file and
+    /// `load`'s no-discoverable-path arms both return
+    /// `Ok(Config::default())` without ever calling `validate`, so a
+    /// round trip through those entry points would not exercise this
+    /// clause at all.
+    #[test]
+    fn the_shipped_buffer_defaults_clear_the_headroom_check() {
+        let cfg = Config::default();
+        assert_eq!(cfg.limits.output_buffer_bytes, d_output_buffer_bytes());
+        assert_eq!(
+            cfg.limits.resource_read_max_bytes,
+            d_resource_read_max_bytes()
+        );
+        cfg.validate()
+            .expect("the shipped defaults must clear the new headroom check");
     }
 
     #[test]
