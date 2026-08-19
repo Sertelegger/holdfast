@@ -90,12 +90,25 @@ pub enum ConfigError {
     /// value is operator-supplied, so it is redacted like any other.
     #[error("invalid configuration: {0}")]
     Invalid(String),
+    /// The file exists and this process declines to read it. See
+    /// [`trust_verdict`] for the three questions and why each threshold
+    /// is where it is.
+    #[error("config file {path} {reason}")]
+    Untrusted { path: PathBuf, reason: String },
 }
 
 impl ConfigError {
     /// A validation failure, with the operator's value redacted.
     fn invalid(message: impl AsRef<str>) -> Self {
         ConfigError::Invalid(redacted(message.as_ref()))
+    }
+
+    /// A refusal to read a file that failed [`trust_verdict`].
+    fn untrusted(path: &Path, reason: &str) -> Self {
+        ConfigError::Untrusted {
+            path: path.to_path_buf(),
+            reason: redacted(reason),
+        }
     }
 
     /// A parse failure, with the offending source line redacted.
@@ -162,18 +175,128 @@ pub fn load() -> Result<Config, ConfigError> {
 
 /// Load from an explicit path. A file that does not exist resolves to
 /// [`Config::default`]; anything else that fails is an error.
+///
+/// **The file is judged before it is read, and judged through the open
+/// descriptor rather than through the path.** `fstat` on the descriptor
+/// that is about to be read is what makes the check and the read talk
+/// about the same file: a path checked and then opened is two lookups
+/// with a window between them, and the window is the whole attack. It is
+/// also what makes a symlink a non-question — see [`trust_verdict`].
 pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-        Err(source) => {
-            return Err(ConfigError::Io {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
+        Err(source) => return Err(io_error(path, source)),
     };
+    let meta = file.metadata().map_err(|e| io_error(path, e))?;
+    if let Some(reason) = untrusted_reason(&meta) {
+        return Err(ConfigError::untrusted(path, &reason));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| io_error(path, e))?;
     parse_named(&text, path)
+}
+
+fn io_error(path: &Path, source: std::io::Error) -> ConfigError {
+    ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// [`trust_verdict`] over what `fstat` reported, split out so the
+/// verdict itself can be tested against ownerships an unprivileged test
+/// process cannot create.
+///
+/// Unix-only, as this crate already is (`daemon::paths` and
+/// `daemon::peer` both reach for `std::os::unix` unconditionally). A
+/// Windows port owes this function an ACL-shaped answer, not a `#[cfg]`
+/// that returns "trusted".
+fn untrusted_reason(meta: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    trust_verdict(
+        meta.is_file(),
+        meta.uid(),
+        meta.mode() & 0o777,
+        crate::daemon::peer::current_uid(),
+    )
+}
+
+/// Whether this process will read `config.toml`, given what `fstat` says
+/// about the descriptor it just opened. `None` is "trusted".
+///
+/// **Refuse and report; never repair.** A `chmod` from here would follow
+/// the very symlink it is meant to defend against, and a repair that
+/// runs before an assertion makes the assertion vacuous — which is how
+/// `ensure_dir`'s own test went blind, and why `audit.log`'s `0600` is
+/// established by a single opener with no verify-and-tighten. This
+/// function returns a sentence the operator can act on and reads
+/// nothing.
+///
+/// **A symlink is not one of the questions, deliberately.** Dotfile
+/// managers — stow, chezmoi, yadm — symlink `~/.config/**` into a
+/// repository, so refusing a symlinked `config.toml` outright would
+/// refuse a large class of ordinary installs to no end. What matters is
+/// what the link *resolves to*, and because the three questions below
+/// are asked of the open descriptor, that is exactly what they are asked
+/// of: a link into the operator's own dotfiles passes, and a link to
+/// another user's file, to `/dev/null` or to a fifo does not.
+///
+/// The three questions, and why each threshold is where it is:
+///
+/// * **A regular file.** `/dev/null` reads as an empty document, an
+///   empty document parses, and the result is [`Config::default`] — every
+///   knob the operator set, silently gone, with nothing reported
+///   anywhere. A fifo is worse than silent: `read_to_string` blocks
+///   until something writes, so a config path pointing at one hangs
+///   startup rather than failing it.
+///
+/// * **Owned by us, or by root.** Anyone else owning this file owns the
+///   daemon's limits. Root is allowed, as OpenSSH's `StrictModes` allows
+///   it, and that is a deliberate divergence from
+///   [`peer::is_authorized`](crate::daemon::peer::is_authorized), which
+///   refuses root: there root is a *peer* asking to drive another user's
+///   sessions, here it is the owner of a file inside that user's own
+///   home — a state one `sudo $EDITOR ~/.config/clasp/config.toml`
+///   produces, and one root could reach by any other route anyway.
+///
+/// * **Not world-writable** — `0o002`, and pointedly not `0o022`.
+///   Group-writable is what an editor produces under the `umask 002`
+///   that Debian, Ubuntu and RHEL ship: `0664`, on systems whose
+///   user-private groups make that the user alone. Refusing it would
+///   refuse a stock install, which is the mistake `ensure_dir` made on a
+///   `0775` `~/.clasp/logs` and had to take back. World-writable has no
+///   such benign origin — it wants `umask 000` or a deliberate `chmod` —
+///   and it means any local user can rewrite the file.
+fn trust_verdict(is_file: bool, uid: u32, mode: u32, euid: u32) -> Option<String> {
+    if !is_file {
+        return Some(
+            "is not a regular file, so it is not a configuration: a device would \
+             read as an empty document and resolve to the built-in defaults with \
+             nothing reported, and a fifo would block startup until something \
+             wrote to it. Point the path at a file, or remove it."
+                .to_string(),
+        );
+    }
+    if uid != euid && uid != 0 {
+        return Some(format!(
+            "is owned by uid {uid}, and this process runs as uid {euid}: another \
+             local user owns the file that sets this daemon's limits. Refusing to \
+             read it — check what is in it, then `chown {euid}` it or move it aside."
+        ));
+    }
+    if mode & 0o002 != 0 {
+        return Some(format!(
+            "is mode {mode:o}: world-writable, so any local user can rewrite the \
+             file that sets this daemon's limits. Refusing rather than tightening \
+             it — a chmod follows a symlink, and a control that repairs before it \
+             checks has stopped checking. `chmod o-w` it, then start again."
+        ));
+    }
+    None
 }
 
 /// Parse and validate a config from a string, for tests and for callers
@@ -1511,5 +1634,125 @@ require_confirm = false
                 cursor = err.source();
             }
         }
+    }
+
+    // ------------------------------------ the file itself as a trust boundary
+
+    /// The half of the check that a stock install has to survive, paired
+    /// with the half that has to fire. Without the pairing, a `load_from`
+    /// that refused *every* file passes the refusal row perfectly.
+    #[test]
+    fn a_world_writable_config_is_refused_and_the_modes_a_stock_install_carries_are_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[limits]\nmax_concurrent_sessions = 3\n").expect("write");
+        let chmod = |m: u32| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(m)).expect("chmod")
+        };
+
+        chmod(0o666);
+        let e = load_from(&path).expect_err("any local user can rewrite this file");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("666"),
+            "the mode belongs in the message: {msg}"
+        );
+        assert!(
+            msg.contains("world-writable"),
+            "and so does what is wrong with it: {msg}"
+        );
+        // Refused, *not* repaired: the mode on disk is untouched, so the
+        // operator can still see what it was. A control that chmods and
+        // then proceeds is one whose assertion has stopped meaning
+        // anything.
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
+            0o666,
+            "the refusal tightened the file instead of reporting it"
+        );
+
+        // 0664 is the one that decides whether this check refuses a
+        // stock install: it is what an editor writes under the `umask
+        // 002` Debian, Ubuntu and RHEL ship, and refusing 0775 on
+        // `~/.clasp/logs` for the same reason is a bug this milestone
+        // already had to take back once.
+        for mode in [0o600, 0o640, 0o644, 0o664] {
+            chmod(mode);
+            let cfg = load_from(&path)
+                .unwrap_or_else(|e| panic!("mode {mode:o} is a stock install; got: {e}"));
+            assert_eq!(cfg.limits.max_concurrent_sessions, 3);
+        }
+    }
+
+    #[test]
+    fn a_config_path_that_resolves_to_a_device_is_refused_and_one_that_resolves_to_a_file_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // `/dev/null` is the silent case and the reason this question is
+        // asked at all: it reads as an empty document, an empty document
+        // parses, and the operator's whole file becomes
+        // `Config::default()` with nothing reported. A fifo would be the
+        // same check and a worse test — `read_to_string` on one blocks
+        // until something writes, so a fifo row would hang rather than
+        // fail whenever the check is absent.
+        let devnull = dir.path().join("config.toml");
+        std::os::unix::fs::symlink("/dev/null", &devnull).expect("symlink");
+        let e = load_from(&devnull).expect_err("a device is not a configuration");
+        assert!(e.to_string().contains("regular file"), "{e}");
+
+        // The pairing, and the other half of the stock-install question:
+        // stow, chezmoi and yadm all symlink `~/.config/**` into a
+        // repository, so a symlink that resolves to a regular file the
+        // caller owns must load. Refusing symlinks as such would refuse
+        // every dotfile-managed install.
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "[limits]\nmax_concurrent_sessions = 5\n").expect("write");
+        let link = dir.path().join("linked.toml");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let cfg = load_from(&link).expect("a stow-style symlink to a regular file must load");
+        assert_eq!(cfg.limits.max_concurrent_sessions, 5);
+    }
+
+    /// Ownership, against uids this process cannot create.
+    ///
+    /// An unprivileged test cannot `chown`, so this row is asserted
+    /// against the verdict rather than through `load_from`. Being
+    /// honest about what that costs: unlike the two rows above, this one
+    /// could not have failed before the check existed, because the
+    /// function it calls is part of the fix. It is a guard on the
+    /// thresholds, not the discriminator for the finding.
+    ///
+    /// The numbers are literals on purpose. Deriving the expected mode
+    /// from the same expression the check uses would have both sides of
+    /// the contract agree by construction.
+    #[test]
+    fn the_trust_verdict_thresholds_are_the_ones_a_stock_install_survives() {
+        assert!(trust_verdict(true, 1000, 0o600, 1000).is_none());
+        assert!(
+            trust_verdict(true, 1000, 0o664, 1000).is_none(),
+            "group-writable is `umask 002`, which Debian, Ubuntu and RHEL ship"
+        );
+        assert!(
+            trust_verdict(true, 0, 0o644, 1000).is_none(),
+            "root-owned is trusted, as OpenSSH's StrictModes has it — one \
+             `sudo $EDITOR ~/.config/clasp/config.toml` produces it"
+        );
+
+        let other = trust_verdict(true, 2000, 0o600, 1000).expect("another user's file");
+        assert!(other.contains("2000") && other.contains("1000"), "{other}");
+        assert!(
+            trust_verdict(true, 1000, 0o666, 1000).is_some(),
+            "world-writable"
+        );
+        assert!(
+            trust_verdict(false, 1000, 0o600, 1000).is_some(),
+            "not a file"
+        );
+        // Ownership is asked before mode, so the sharper of two faults is
+        // the one reported.
+        assert!(trust_verdict(true, 2000, 0o666, 1000)
+            .expect("both faults")
+            .contains("owned by uid 2000"));
     }
 }
