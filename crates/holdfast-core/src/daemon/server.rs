@@ -19,6 +19,7 @@ use crate::session::Reaper;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -337,6 +338,18 @@ impl Daemon {
     /// clients have connected", and a rejected connection is not one.
     fn note_client_connect(&self) {
         *self.last_client_connect.lock() = Some(self.clock.now());
+    }
+
+    /// The uid this daemon belongs to — see the field.
+    ///
+    /// `pub(crate)` and not `pub`: it exists so the **attach** accept
+    /// loop can run the §9.1 gate against the same answer
+    /// `handle_connection` uses, rather than re-reading `geteuid()` and
+    /// thereby making `Daemon::with_owner_uid`'s seam control one socket
+    /// and not the other. A foreign-uid attach test is unwritable
+    /// without it, for exactly the reason recorded on the field.
+    pub(crate) fn owner_uid(&self) -> u32 {
+        self.owner_uid
     }
 
     /// Total connections accepted by the listener since start.
@@ -760,6 +773,50 @@ pub(crate) fn bind_control_within(
     paths: &RuntimePaths,
     lock_timeout: Duration,
 ) -> io::Result<(UnixListener, OwnedSocket)> {
+    bind_socket_within(paths, paths.control_sock(), lock_timeout)
+}
+
+/// Bind one of the daemon's Unix sockets under the runtime directory and
+/// tighten it to `0600` (§7.1, §7.7).
+///
+/// **Shared by `control.sock` and `attach.sock` rather than copied, and
+/// that is the point.** Every step below is load-bearing, and a second
+/// copy is how one socket ends up `0600` and the other `0644`:
+///
+/// 1. [`RuntimePaths::ensure_dir`] — `0700`, *verified after creation*,
+///    because `create_dir_all` succeeds silently on a pre-existing
+///    `0755`.
+/// 2. `bind.lock`, held across probe → unlink → bind → chmod → stat, so
+///    two binders cannot each conclude the other's socket is stale.
+/// 3. Stale-socket clearing: a socket file whose daemon answers is not
+///    ours to take (`AddrInUse`); one that refuses is stale and removed.
+/// 4. `set_permissions(0600)`, then a **re-read** of the mode, refusing
+///    and unlinking if it is not what was asked for.
+/// 5. The [`OwnedSocket`]: `(dev, ino, ctime)` plus the inert `O_PATH`
+///    pin, taken under the same lock, so §7.3's teardown can tell this
+///    daemon's socket from a successor's.
+///
+/// **`attach.sock` gets every one of those, and the `O_PATH` pin most of
+/// all.** The C-5 window — predecessor closes its listener, successor
+/// unlinks and re-binds — is not a property of *which* socket is in it;
+/// ext4 handed the successor the predecessor's freed inode number 500
+/// times out of 500 on `control.sock`, and there is nothing about the
+/// path that changes the allocator's behaviour. A `bind_attach` that
+/// returned a bare `UnixListener` would leave the second socket with the
+/// weaker teardown, on a filesystem where the weaker teardown is
+/// near-certain to be wrong.
+///
+/// The bind→chmod window is closed by the enclosing `0700` directory:
+/// another user cannot traverse the parent even during it.
+pub fn bind_socket(paths: &RuntimePaths, path: PathBuf) -> io::Result<(UnixListener, OwnedSocket)> {
+    bind_socket_within(paths, path, super::spawn::LOCK_TIMEOUT)
+}
+
+fn bind_socket_within(
+    paths: &RuntimePaths,
+    path: PathBuf,
+    lock_timeout: Duration,
+) -> io::Result<(UnixListener, OwnedSocket)> {
     use std::os::unix::fs::PermissionsExt;
 
     paths.ensure_dir()?;
@@ -782,8 +839,6 @@ pub(crate) fn bind_control_within(
     // function, which is exactly the window, and released on return.
     let _bind_lock = super::spawn::DaemonLock::acquire_bind_within(paths, lock_timeout)?;
 
-    let path = paths.control_sock();
-
     // **`symlink_metadata` and not `exists()`**, which is `fs::metadata`
     // and therefore follows the final symlink. A *dangling* link at
     // `control.sock` — one whose target does not exist — made `exists()`
@@ -796,6 +851,11 @@ pub(crate) fn bind_control_within(
     // daemon to stop, and `remove_runtime_files_we_own` is only reached
     // by a daemon that got *past* this function. The stale-socket branch
     // could not reach the one case that needs it most.
+    //
+    // The narrative below is `control.sock`'s, because that is the
+    // socket the defect was found on; every word of it is true of
+    // `attach.sock` too, which is why `path` is a parameter and this
+    // block is not copied.
     //
     // Widening it is safe, and narrowly so. A dangling link fails
     // `connect` with `ENOENT` and falls to the `remove_file` arm;
@@ -1003,6 +1063,24 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
     // same ordering holds in `TestDaemon::start`, which binds first for
     // the same reason.
     let (listener, our_socket) = bind_control(&paths)?;
+
+    // **Both sockets, or neither** (§7.2). A daemon that binds
+    // `control.sock` and then fails on `attach.sock` must fail to start,
+    // not run half-attached: `holdfast attach` against it gets
+    // `ECONNREFUSED` with no explanation, on a daemon whose
+    // `daemon/status` says it is healthy. The control socket is already
+    // bound at this point, so the failure path has to clear it — the
+    // same teardown the ordinary exit runs, with `None` for the socket
+    // this process never came to own.
+    let (attach_listener, our_attach_socket) = match super::attach_server::bind_attach(&paths) {
+        Ok(bound) => bound,
+        Err(e) => {
+            drop(listener);
+            remove_runtime_files_we_own(&paths, &our_socket, None);
+            return Err(anyhow::Error::new(e).context("holdfast daemon: cannot bind attach.sock"));
+        }
+    };
+
     write_pid_file(&paths)?;
 
     // The startup half of §19.1's sweep, run **before** `Daemon::new`
@@ -1049,7 +1127,8 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
         // down, and the ordinary exit path gets that for free because
         // `serve_daemon` consumes the listener.
         drop(listener);
-        remove_runtime_files_we_own(&paths, &our_socket);
+        drop(attach_listener);
+        remove_runtime_files_we_own(&paths, &our_socket, Some(&our_attach_socket));
         anyhow::bail!(
             "holdfast daemon: refusing to start without the §9.4 audit trail: {why}. \
              Fix the ownership or permissions of that file, or point \
@@ -1071,12 +1150,23 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
         sig_daemon.shutdown();
     });
 
+    // The attach accept loop runs beside the control one and ends on the
+    // same `shutdown_signalled()` watch, so `serve_daemon` returning is
+    // still what ends the process. It is spawned rather than joined for
+    // exactly that reason: the daemon's lifetime is the control loop's,
+    // and an attach listener that outlived it would keep answering after
+    // the sessions were killed.
+    tokio::spawn(super::attach_server::serve_attach(
+        Arc::clone(&daemon),
+        attach_listener,
+    ));
+
     serve_daemon(Arc::clone(&daemon), listener).await;
 
     // Anything still alive after `shutdown()` (or after a shutdown that
     // never ran, e.g. a bind error unwinding) dies here.
     daemon.shutdown();
-    remove_runtime_files_we_own(&paths, &our_socket);
+    remove_runtime_files_we_own(&paths, &our_socket, Some(&our_attach_socket));
     Ok(())
 }
 
@@ -1154,12 +1244,33 @@ pub(crate) async fn run_with_config(paths: RuntimePaths, config: Config) -> anyh
 /// signature that took it by value would drop it here, at the exact
 /// moment the comparison has just been made and the unlink is about to
 /// run.
-pub(crate) fn remove_runtime_files_we_own(paths: &RuntimePaths, ours: &OwnedSocket) {
+/// **`attach` is `Option` because the two sockets are bound on two
+/// consecutive lines and the window between them is a real exit path.**
+/// A daemon that bound `control.sock` and then failed to bind
+/// `attach.sock` must still clear the first one on its way out, and it
+/// has no [`OwnedSocket`] for the second. `None` there means *we never
+/// owned it*, which is a different statement from *it is not ours any
+/// more* — and both skip the unlink, in the same safe direction as every
+/// other way the identity comparison can come out.
+pub(crate) fn remove_runtime_files_we_own(
+    paths: &RuntimePaths,
+    ours: &OwnedSocket,
+    attach: Option<&OwnedSocket>,
+) {
     let Ok(_bind_lock) = super::spawn::DaemonLock::acquire_bind(paths) else {
         return;
     };
     if ours.still_at(&paths.control_sock()) {
         let _ = std::fs::remove_file(paths.control_sock());
+    }
+    // Same identity comparison, same reasoning, second socket: §7.3 says
+    // "removes socket**s**", and a daemon that left `attach.sock` behind
+    // would hand the next binder a stale file to probe — or, in the C-5
+    // window, unlink a successor's if it did the removal unconditionally.
+    if let Some(attach) = attach {
+        if attach.still_at(&paths.attach_sock()) {
+            let _ = std::fs::remove_file(paths.attach_sock());
+        }
     }
     if read_pid_file(paths) == Some(std::process::id()) {
         let _ = std::fs::remove_file(paths.pid_file());
@@ -2880,7 +2991,7 @@ mod tests {
         );
 
         // Daemon A's teardown, arriving late.
-        remove_runtime_files_we_own(&paths, &a_socket);
+        remove_runtime_files_we_own(&paths, &a_socket, None);
 
         assert!(
             super::super::spawn::socket_is_live(&paths),
@@ -2948,7 +3059,7 @@ mod tests {
              state the old `!socket_is_live` guard read as `a daemon is serving`"
         );
 
-        remove_runtime_files_we_own(&paths, &our_socket);
+        remove_runtime_files_we_own(&paths, &our_socket, None);
 
         assert!(
             !paths.control_sock().exists(),

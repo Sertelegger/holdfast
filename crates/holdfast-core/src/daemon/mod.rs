@@ -14,6 +14,7 @@
 // constructor *this* module calls, so its line went into `daemon.log`
 // unredacted while the denial sat one directory away (re-review I-2).
 
+pub mod attach_server;
 pub mod paths;
 pub mod peer;
 pub mod server;

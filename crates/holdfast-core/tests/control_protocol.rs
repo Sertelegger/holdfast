@@ -64,7 +64,19 @@ impl TestDaemon {
         // the workspace's `target/` directory.
         let paths = RuntimePaths::with_dir(scratch_dir(tag));
         let (listener, _) = server::bind_control(&paths).expect("bind control.sock");
+        // **Both sockets, because from 0.0.6 a daemon has two.** The
+        // harness is what
+        // `the_daemon_binds_only_unix_sockets_and_not_http` scans, and a
+        // harness that bound one socket while `server::run` binds two
+        // would leave the second listener outside the only cross-check
+        // against REQ-D-001 there is.
+        let (attach_listener, _) =
+            holdfast_core::daemon::attach_server::bind_attach(&paths).expect("bind attach.sock");
         let daemon = Daemon::with_config(paths.clone(), config);
+        tokio::spawn(holdfast_core::daemon::attach_server::serve_attach(
+            Arc::clone(&daemon),
+            attach_listener,
+        ));
         tokio::spawn(server::serve(Arc::clone(&daemon), listener));
         // The connect probe below proves the socket *file* is bound, and
         // nothing more. `bind_control` hands back an already-`listen()`ing
@@ -299,12 +311,17 @@ async fn the_socket_and_its_directory_are_owner_only() {
 #[tokio::test]
 async fn the_daemon_binds_only_unix_sockets_and_not_http() {
     // REQ-D-001 / §7.2: the daemon never opens a TCP listener. 0.0.6
-    // binds attach.sock (asserted in Task 4, beside the code that binds
-    // it); `http` is still 0.0.10's and a stray bind would show up as a
-    // file here. This assertion is the only guard against that milestone
-    // creeping forward, so it is kept rather than folded away.
+    // binds attach.sock and the harness above binds it too, so the fd
+    // scan below covers **both** listeners; `http` is still 0.0.10's and
+    // a stray bind would show up as a file here. This assertion is the
+    // only guard against that milestone creeping forward, so it is kept
+    // rather than folded away.
     let d = TestDaemon::start("onlyunix").await;
     assert!(d.paths.control_sock().exists());
+    assert!(
+        d.paths.attach_sock().exists(),
+        "0.0.6 binds attach.sock: the positive half of Task 1's inverted guard"
+    );
     assert!(!d.paths.http_sock().exists(), "http.sock belongs to 0.0.10");
 
     #[cfg(target_os = "linux")]
