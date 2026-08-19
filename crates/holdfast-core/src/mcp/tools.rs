@@ -1426,6 +1426,26 @@ impl HoldfastServer {
         if adopted.raised_here {
             hub.broadcast_awaiting_secret(&session.id, &request_id, &adopted.prompt_text);
         }
+
+        // §9.5's rung 3, evaluated **at the moment this caller begins
+        // waiting** — the only moment at which "nobody is looking" is a
+        // fact rather than a guess.
+        //
+        // **At most once per request, by two independent guards.** A
+        // colliding second call returns above and never reaches here; and
+        // `claim_notice` flips the flag under the slot's own lock and
+        // answers `true` to exactly one caller, so even a call that did
+        // reach here could not put a second identical line into the
+        // buffer the agent reads back. A re-raise after a timeout is a
+        // *different* request with a fresh flag and is announced again —
+        // a counter hoisted to the session would leave the re-raised
+        // request silently unannounced.
+        if hub.clients_of(&session.id).is_empty()
+            && hub.secrets().claim_notice(&session.id, &request_id)
+        {
+            session.inject_notice(&crate::secret::buffer_notice(&session.id));
+        }
+
         let resolution = self
             .await_secret(&session, &request_id, adopted.rx, timeout_secs)
             .await;

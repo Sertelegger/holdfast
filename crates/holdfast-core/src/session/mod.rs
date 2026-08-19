@@ -1048,6 +1048,55 @@ impl Session {
         self.buffer.lock().slice(start, end)
     }
 
+    /// Put Holdfast's **own** bytes into this session's output buffer and
+    /// on the wire — §9.5's buffer notice, and nothing else so far.
+    ///
+    /// **Three things this deliberately does not do**, each of which is a
+    /// plausible implementation and each of which is a defect:
+    ///
+    /// 1. **It is not written to the PTY.** §9.5 says the *output buffer*.
+    ///    Writing it to the child's stdin submits
+    ///    `[holdfast] awaiting secret input…` as the **secret**, to a
+    ///    program that is at that moment reading one.
+    /// 2. **It does not feed the detector.** The notice would become the
+    ///    session's last logical line, replacing `prompt.last_line` — the
+    ///    text a keychain binding's `match_prompt` matches against, the
+    ///    text `status` reports, and the text a later `AwaitingSecret`
+    ///    broadcasts. A notice that changes what a binding matches is a
+    ///    notice that silently disables an operator's configuration.
+    /// 3. **It does not bump `last_activity`.** This is Holdfast's own
+    ///    text, not an input or output event from a ReadWrite path
+    ///    (REQ-S-006). A session that keeps itself alive by announcing
+    ///    that it is stuck is a session that never reaps.
+    ///
+    /// **It is the second producer into two structures that have had
+    /// exactly one, so it derives its offsets exactly the way the reader
+    /// thread does**: `head()` sampled *inside* the buffer lock that
+    /// pushes, and the frame published *outside* it. `OutputFrame`'s
+    /// `start`/`end` are buffer offsets, so sampling the head outside the
+    /// lock — or broadcasting without pushing — makes the frames and the
+    /// buffer disagree about where byte 0 is.
+    ///
+    /// Synchronous, and that is not a style preference: this module
+    /// carries 37 `#[test]`s and no `#[tokio::test]`, and an `async`
+    /// signature drags a runtime into every one of them.
+    pub fn inject_notice(&self, bytes: &[u8]) {
+        let base = {
+            let mut b = self.buffer.lock();
+            let base = b.head();
+            b.push(bytes);
+            base
+        };
+        // The error is dropped on purpose: `send` fails only when nobody
+        // is subscribed, which for a session with no client attached —
+        // the only situation that writes a notice — is the ordinary case.
+        let _ = self.output_tx.send(OutputFrame {
+            start: base,
+            end: base + bytes.len() as u64,
+            bytes: Arc::from(bytes),
+        });
+    }
+
     pub fn read_from(&self, since: u64, max_bytes: usize) -> BufferRead {
         self.buffer.lock().read_from(since, max_bytes)
     }

@@ -35,6 +35,32 @@ use tokio::sync::oneshot;
 
 use crate::attach::secret::SecretRequest;
 
+/// §9.5's buffer notice — escalation **rung 3**, which §7.8.3 calls *"the
+/// terminal rung, the only one that requires nothing to be configured or
+/// installed"*. The one thing Holdfast does when a session blocks and
+/// nobody is looking.
+///
+/// **The bytes are §5.2's, verbatim.** §9.5 gives the same string hedged
+/// with *"e.g."*, so §5.2 is the binding site; the two are identical, em
+/// dash included.
+///
+/// **This line is not ASCII.** The separator is a spaced U+2014 em dash,
+/// so `" — "` is **five** bytes (`20 E2 80 94 20`). Anything that
+/// measures, truncates or slices this line works in bytes and must not
+/// cut inside those three.
+///
+/// `<id>` is the **canonical session id** (`sess_…`), never the name —
+/// the name is optional and the notice has to work for a session that has
+/// none. Terminated with `\r\n`, because it lands in a raw PTY byte
+/// stream that attached terminals render without translation.
+pub fn buffer_notice(session_id: &str) -> Vec<u8> {
+    format!(
+        "[holdfast] awaiting secret input — run 'holdfast attach {session_id}' \
+         or open the web UI\r\n"
+    )
+    .into_bytes()
+}
+
 /// How the request a call is bound to came into existence (§9.4).
 ///
 /// **A property of the request, not of the call.** A second caller that
@@ -594,6 +620,48 @@ mod tests {
         let empty = SecretSlots::new();
         assert!(!empty.matches_outstanding(S, "secreq_anything"));
         assert!(empty.take(S, Some("secreq_anything")).is_none());
+    }
+
+    /// The bytes, pinned — including the three the em dash occupies, and
+    /// the fact that `<id>` is substituted rather than printed.
+    #[test]
+    fn the_buffer_notice_is_the_5_2_line_with_the_session_id_in_it() {
+        let notice = buffer_notice("sess_abc123");
+        let text = String::from_utf8(notice.clone()).expect("utf-8");
+        assert_eq!(
+            text,
+            "[holdfast] awaiting secret input — run 'holdfast attach sess_abc123' \
+             or open the web UI\r\n"
+        );
+        assert!(
+            !text.contains("<id>"),
+            "the template shipped with its placeholder still in it"
+        );
+        // The separator is a **spaced U+2014**, not a hyphen and not an
+        // ASCII dash: five bytes where a reader counting characters sees
+        // three.
+        assert!(
+            notice
+                .windows(5)
+                .any(|w| w == [0x20, 0xE2, 0x80, 0x94, 0x20]),
+            "the em dash was normalised away"
+        );
+        assert!(text.ends_with("\r\n"), "a raw PTY stream needs the CR");
+
+        // **The template's own size, measured rather than remembered.**
+        // The 0.0.7 plan states 74 characters and 76 bytes for this line;
+        // both are wrong, and the numbers below are what `buffer_notice`
+        // actually produces. Pinned here so a later edit to the string
+        // has to say so.
+        let template = String::from_utf8(buffer_notice("<id>")).expect("utf-8");
+        let line = template.strip_suffix("\r\n").expect("CRLF");
+        assert_eq!(line.chars().count(), 80, "characters, before <id> grows");
+        assert_eq!(line.len(), 82, "bytes — two more, and both are the em dash");
+        assert_eq!(
+            line.bytes().filter(|b| *b >= 0x80).count(),
+            3,
+            "exactly one three-byte code point in the whole line"
+        );
     }
 
     #[test]

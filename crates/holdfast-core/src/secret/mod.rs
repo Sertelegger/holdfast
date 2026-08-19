@@ -19,5 +19,6 @@
 pub mod request;
 
 pub use request::{
-    Adopted, CancelReason, Collision, RaisedBy, RaisedRequest, Resolution, SecretSlots,
+    buffer_notice, Adopted, CancelReason, Collision, RaisedBy, RaisedRequest, Resolution,
+    SecretSlots,
 };

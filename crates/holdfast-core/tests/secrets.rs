@@ -1946,3 +1946,230 @@ async fn the_512_cap_is_bytes_not_characters() {
     );
     let _ = s.signal(Signal::Kill);
 }
+
+// -------------------------------------------- §9.5's buffer notice
+
+/// A child at a `sudo`-shaped prompt, so the row about the detector has
+/// something recognisable to assert `prompt.last_line` against.
+const SUDO_PROMPT_FIXTURE: &str = "stty -echo; printf '[sudo] password for ada: '; \
+     read x; stty echo; printf 'got=%s\\n' \"$(printf %s \"$x\" | tr a-z A-Z)\"";
+
+/// Everything this session's buffer holds right now, raw.
+///
+/// Raw, and not through `read_output`: that surface redacts, and a
+/// redacted read would pass whether or not the bytes were there.
+fn buffered(s: &Session) -> Vec<u8> {
+    s.buffer_slice(s.buffer_tail(), s.buffer_head())
+}
+
+fn notice_count(s: &Session) -> usize {
+    let buf = buffered(s);
+    buf.windows(b"[holdfast]".len())
+        .filter(|w| *w == b"[holdfast]")
+        .count()
+}
+
+/// The id is the actionable half — a notice that names the session by an
+/// internal index, or omits it, tells a human nothing they can act on.
+#[tokio::test]
+async fn the_notice_appears_in_the_buffer_when_nobody_is_attached() {
+    let d = TestDaemon::start("notice").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    assert_eq!(
+        cancelled_reason(&joined(spawn_call(&d, secret_args(&s.id, 2)), "the call").await),
+        "timeout"
+    );
+
+    let buf = buffered(&s);
+    let want = holdfast_core::secret::buffer_notice(&s.id);
+    assert!(
+        contains(&buf, &want),
+        "the notice is not in the buffer, or not byte-for-byte §5.2's line \
+         with this session's own id in it:\n{}",
+        String::from_utf8_lossy(&buf)
+    );
+    assert!(
+        contains(&buf, s.id.as_bytes()) && s.id.starts_with("sess_"),
+        "the canonical session id is what `holdfast attach` takes"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// **The pairing.** Written unconditionally, it puts Holdfast's chatter
+/// into every ordinary secret flow — including the one where a human is
+/// already looking at the prompt.
+#[tokio::test]
+async fn no_notice_is_written_when_a_client_is_already_attached() {
+    let d = TestDaemon::start("noticeattached").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let _ = next_awaiting_secret(&mut c, 20).await;
+
+    assert_eq!(
+        cancelled_reason(&joined(spawn_call(&d, secret_args(&s.id, 2)), "the call").await),
+        "timeout"
+    );
+    assert_eq!(
+        notice_count(&s),
+        0,
+        "a notice was written while somebody was watching:\n{}",
+        String::from_utf8_lossy(&buffered(&s))
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// §9.5 says the **output buffer**. Written through the PTY path instead,
+/// against a child that is at that moment reading a secret, it submits
+/// `[holdfast] awaiting secret input…` **as the secret**.
+///
+/// **The digest is the only observable that separates the two.** The
+/// obvious form of this row — "assert the buffer holds no second copy of
+/// the notice" — cannot fail: the correct implementation puts one copy
+/// there by injection, and the broken one puts one there (or none, under
+/// `stty -echo`) by the child. So the child's own transform of what it
+/// read is the assertion.
+#[tokio::test]
+async fn the_notice_does_not_reach_the_child() {
+    let d = TestDaemon::start("noticechild").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+
+    // Nothing attached, so the notice is written; the call then times out
+    // with the child still blocked on its read.
+    assert_eq!(
+        cancelled_reason(&joined(spawn_call(&d, secret_args(&s.id, 2)), "the call").await),
+        "timeout"
+    );
+    assert_eq!(notice_count(&s), 1, "the notice was not written at all");
+
+    // Now answer the re-raised request for real, and read what the child
+    // says it got.
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let (again_id, _) = next_awaiting_secret(&mut c, 20).await;
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id: again_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    let seen = stream_until(&mut c, b"got=HUNTER2", 20).await;
+    assert!(
+        contains(&seen, b"got=HUNTER2"),
+        "the child read something other than the submitted value: {}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !contains(&seen, b"got=[HOLDFAST]"),
+        "the notice was typed into the child as its secret"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// The notice must not become the session's last logical line. That line
+/// is what a keychain binding's `match_prompt` matches against (Task 10),
+/// what `status` reports, and what a later `AwaitingSecret` broadcasts —
+/// so a notice that changes it silently disables an operator's
+/// configuration.
+#[tokio::test]
+async fn the_notice_does_not_change_the_prompt_the_detector_reports() {
+    let d = TestDaemon::start("noticeprompt").await;
+    let s = d.shell_running(SUDO_PROMPT_FIXTURE);
+
+    // Wait for the child's prompt to reach the detector before measuring,
+    // or this row compares two empty strings.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !s
+        .prompt_last_line_redacted()
+        .ends_with("password for ada: ")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the detector never saw the prompt: {:?}",
+            s.prompt_last_line_redacted()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let before = s.prompt_last_line_redacted();
+
+    assert_eq!(
+        cancelled_reason(&joined(spawn_call(&d, secret_args(&s.id, 2)), "the call").await),
+        "timeout"
+    );
+    assert_eq!(notice_count(&s), 1, "the notice was not written at all");
+    assert_eq!(
+        s.prompt_last_line_redacted(),
+        before,
+        "the notice was fed to the detector and became the prompt a binding matches"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// REQ-S-006: Holdfast's own text is not a ReadWrite input or output
+/// event. A session that keeps itself alive by announcing that it is
+/// stuck is a session that never reaps.
+#[tokio::test]
+async fn the_notice_does_not_extend_the_idle_deadline() {
+    let d = TestDaemon::start("noticeidle").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+
+    // Let the child go quiet first, so the stamp under test is not being
+    // moved by its own output.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = (s.last_activity_ms(), s.idle_deadline_ms());
+
+    assert_eq!(
+        cancelled_reason(&joined(spawn_call(&d, secret_args(&s.id, 2)), "the call").await),
+        "timeout"
+    );
+    assert_eq!(notice_count(&s), 1, "the notice was not written at all");
+    assert_eq!(
+        (s.last_activity_ms(), s.idle_deadline_ms()),
+        before,
+        "the notice bumped activity, which makes a stuck session immortal"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// One notice per **request**, and a second request gets its own.
+///
+/// **The second half is not optional**: a counter hoisted to the session
+/// would leave a re-raised request silently unannounced, and "one notice
+/// for two sequential calls" would contradict the re-raise rule under
+/// which the second call adopts a *different* request.
+#[tokio::test]
+async fn only_one_notice_is_written_per_request() {
+    let d = TestDaemon::start("noticeonce").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+
+    // A raises with nothing attached and begins waiting.
+    let a = spawn_call(&d, secret_args(&s.id, 3));
+    await_waiter(&d, &s.id, "caller A").await;
+    assert_eq!(notice_count(&s), 1, "A's request was not announced");
+
+    // B collides while A is still waiting.
+    let b = body(&d.call(secret_args(&s.id, 3)).await);
+    assert_eq!(b["data"]["reason"], "concurrent_request_pending");
+    assert_eq!(
+        notice_count(&s),
+        1,
+        "the collision put a second identical line into the buffer the agent \
+         reads back:\n{}",
+        String::from_utf8_lossy(&buffered(&s))
+    );
+
+    // A's deadline expires, which re-raises a **fresh** request; C adopts
+    // that one, and a second notice is correct.
+    assert_eq!(cancelled_reason(&joined(a, "caller A").await), "timeout");
+    let c = spawn_call(&d, secret_args(&s.id, 3));
+    await_waiter(&d, &s.id, "caller C").await;
+    assert_eq!(
+        notice_count(&s),
+        2,
+        "the re-raised request was left silently unannounced — a counter hoisted \
+         to the session rather than kept on the request:\n{}",
+        String::from_utf8_lossy(&buffered(&s))
+    );
+    assert_eq!(cancelled_reason(&joined(c, "caller C").await), "timeout");
+    let _ = s.signal(Signal::Kill);
+}
