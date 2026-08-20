@@ -1329,6 +1329,16 @@ impl HoldfastServer {
                 None,
             ));
         }
+        // **The call's one deadline, and every wait below is bounded by
+        // it.** §5.2 says the window starts at *this call*; it does not
+        // say "at each stage of this call", and a stage that recomputed
+        // `now + timeout_secs` would hand itself a fresh full window. With
+        // §17.5's approval in front of the prompt path that is not
+        // theoretical: an approval may consume up to half of
+        // `timeout_secs`, so a recomputed prompt deadline lets a
+        // `require_confirm` call run for **1.5×** the number the agent
+        // declared. One origin, computed once, threaded into both waits.
+        let caller_deadline = call_start + Duration::from_secs(timeout_secs as u64);
         let max_secret_bytes = args.max_secret_bytes.unwrap_or(DEFAULT_MAX_SECRET_BYTES);
         if max_secret_bytes == 0 || max_secret_bytes > security.max_secret_bytes_ceiling {
             return Err(ErrorData::invalid_params(
@@ -1463,7 +1473,7 @@ impl HoldfastServer {
                             &provider,
                             &approval_prompt,
                             append_newline,
-                            call_start + Duration::from_secs(timeout_secs as u64),
+                            caller_deadline,
                             raised_before,
                         )
                         .await
@@ -1572,7 +1582,7 @@ impl HoldfastServer {
         }
 
         let resolution = self
-            .await_secret(&session, &request_id, adopted.rx, timeout_secs)
+            .await_secret(&session, &request_id, adopted.rx, caller_deadline)
             .await;
 
         // **Two vocabularies for one event, and they must not be
@@ -1889,87 +1899,117 @@ impl HoldfastServer {
             _ = &mut exit => ApprovalWoke::Exited,
         };
 
-        let (outcome, decided_by, decision) = match woke {
-            ApprovalWoke::Decided(d) => (
+        // **Each arm is written out, and the two that may read the
+        // receiver again are separated from the one that must not.** The
+        // first draft folded all three non-decision arms into one
+        // `other =>` branch that fell through to the hand-over read on any
+        // `taken == false`. On the `Superseded` arm that is a **second
+        // poll of a `oneshot::Receiver` that has already completed** —
+        // tokio answers it `panic!("called after complete")` — so the
+        // branch whose whole purpose was to handle a lost approval
+        // defensively was the one that aborted the tool call instead. It
+        // is unreachable today only because nothing but this function
+        // takes an approval slot, and **Task 13's own hand-off (wiring
+        // `forward_events` → `supersede`) is exactly what makes it live**.
+        let end = match woke {
+            ApprovalWoke::Decided(d) => ApprovalEnd::Decided(d),
+
+            // The receiver completed *inside the `select!`*, with an
+            // `Err`. There is nothing further to read and never will be —
+            // the sender is gone — so this arm reads nothing. It clears
+            // the slot if anything is still there (there should not be;
+            // whatever dropped the sender took it) and reports a lost
+            // approval, which §17.5 discards and this caller treats as
+            // *not approved*.
+            ApprovalWoke::Superseded => {
+                hub.approvals().supersede(&session.id);
+                ApprovalEnd::Discarded
+            }
+
+            // The window elapsed. The slot has to be taken under the lock
+            // before anything is concluded: a decision that landed between
+            // the wake and this line is the truth, and the timer is not.
+            ApprovalWoke::Deadline => {
+                if hub
+                    .approvals()
+                    .expire(&session.id, &approval.approval_id)
+                    .is_some()
+                {
+                    ApprovalEnd::Expired
+                } else {
+                    // Somebody decided between the wake and the lock.
+                    // Their answer is on our receiver, or is about to be —
+                    // and on *this* arm the receiver has not been polled
+                    // to completion, so reading it is legal.
+                    //
+                    // Real time and not `self.clock`, for the reason
+                    // `await_secret` gives: a manual clock nothing
+                    // advances would park here forever, and a hand-over
+                    // that has already happened is not a deadline.
+                    match tokio::time::timeout(SECRET_HANDOVER_GRACE, &mut rx).await {
+                        Ok(Ok(d)) => ApprovalEnd::Decided(d),
+                        _ => ApprovalEnd::Discarded,
+                    }
+                }
+            }
+
+            // The child ended. Same discipline, different fallback: if
+            // nothing decided, the session really did die and §5.1 has the
+            // answer.
+            ApprovalWoke::Exited => {
+                if hub.approvals().supersede(&session.id).is_some() {
+                    ApprovalEnd::SessionExited
+                } else {
+                    match tokio::time::timeout(SECRET_HANDOVER_GRACE, &mut rx).await {
+                        Ok(Ok(d)) => ApprovalEnd::Decided(d),
+                        _ => ApprovalEnd::SessionExited,
+                    }
+                }
+            }
+        };
+
+        let (outcome, decided_by) = match &end {
+            ApprovalEnd::Decided(d) => (
                 match d.decision {
                     crate::attach::frames::ApprovalDecision::Approve => {
                         crate::secret::Outcome::Approved
                     }
                     crate::attach::frames::ApprovalDecision::Deny => crate::secret::Outcome::Denied,
                 },
-                Some(d.decided_by),
-                Some(d.decision),
+                Some(d.decided_by.as_str()),
             ),
-            // The window elapsed, or the child died. Either way the slot
-            // has to be taken under the lock before anything is
-            // concluded: a decision that landed between the wake and this
-            // line is the truth, and the timer is not.
-            other => {
-                let taken = match other {
-                    ApprovalWoke::Deadline => hub
-                        .approvals()
-                        .expire(&session.id, &approval.approval_id)
-                        .is_some(),
-                    _ => hub.approvals().supersede(&session.id).is_some(),
-                };
-                if taken {
-                    match other {
-                        ApprovalWoke::Deadline => (crate::secret::Outcome::Expired, None, None),
-                        // §17.5: *"approval discarded; no injection"*, and
-                        // no audit line at all — §9.4's `outcome`
-                        // vocabulary has no value for this state (Q13).
-                        _ => (crate::secret::Outcome::Superseded, None, None),
-                    }
-                } else {
-                    // Somebody decided between the wake and the lock.
-                    // Their answer is on our receiver, or is about to be.
-                    // Real time and not `self.clock`, for the reason
-                    // `await_secret` gives: a manual clock nothing
-                    // advances would park here forever, and a hand-over
-                    // that has already happened is not a deadline.
-                    match tokio::time::timeout(SECRET_HANDOVER_GRACE, rx).await {
-                        Ok(Ok(d)) => (
-                            match d.decision {
-                                crate::attach::frames::ApprovalDecision::Approve => {
-                                    crate::secret::Outcome::Approved
-                                }
-                                crate::attach::frames::ApprovalDecision::Deny => {
-                                    crate::secret::Outcome::Denied
-                                }
-                            },
-                            Some(d.decided_by),
-                            Some(d.decision),
-                        ),
-                        _ => (crate::secret::Outcome::Superseded, None, None),
-                    }
-                }
+            ApprovalEnd::Expired => (crate::secret::Outcome::Expired, None),
+            // §17.5: *"approval discarded; no injection"*, and no audit
+            // line at all — §9.4's `outcome` vocabulary has no value for
+            // this state (Q13). `audit_binding_approval` is what applies
+            // that, off `Outcome::audit_value`.
+            ApprovalEnd::SessionExited | ApprovalEnd::Discarded => {
+                (crate::secret::Outcome::Superseded, None)
             }
         };
-
         crate::secret::audit_binding_approval(
             &self.processor.audit,
             &approval,
             outcome,
-            decided_by.as_deref(),
+            decided_by,
         );
 
-        match decision {
-            Some(crate::attach::frames::ApprovalDecision::Approve) => {}
-            // Denied, expired, or superseded by something that still
-            // answered: REQ-SEC-017's fall-through.
-            Some(crate::attach::frames::ApprovalDecision::Deny) | None
-                if outcome != crate::secret::Outcome::Superseded =>
-            {
-                return None
-            }
-            // §17.5's `Superseded`. The only trigger reachable in this
-            // milestone is the session exiting — the *"outstanding
-            // request_secret_input is cancelled"* trigger cannot fire
-            // here, because this call has not raised one yet — so the
-            // honest answer is §5.1's, and **not** a fall-through that
-            // would broadcast an `AwaitingSecret` affordance pointing at
-            // a child that is already gone.
-            _ => {
+        match end {
+            ApprovalEnd::Decided(d)
+                if d.decision == crate::attach::frames::ApprovalDecision::Approve => {}
+            // REQ-SEC-017's fall-through, for all three ways of not being
+            // approved: a denial, an expiry, and an approval that was
+            // taken away without a decision. **The safe reading of a lost
+            // approval is *not approved*, and the safe answer to it is the
+            // human prompt** — not §5.1's `session_died`, which would be a
+            // claim about a child that may be perfectly alive.
+            ApprovalEnd::Decided(_) | ApprovalEnd::Expired | ApprovalEnd::Discarded => return None,
+            // The child ended under the approval. §5.1's answer is exact
+            // here, and it is **not** a fall-through: that would broadcast
+            // an `AwaitingSecret` affordance pointing at a child that is
+            // already gone, which `await_secret`'s re-raise arm refuses to
+            // do for the same reason.
+            ApprovalEnd::SessionExited => {
                 return Some(envelope::envelope(
                     Status::SessionDied,
                     json!({ "exit_code": session.exit_code() }),
@@ -2105,17 +2145,26 @@ impl HoldfastServer {
     /// window: the value is written to the PTY and the agent is told
     /// `timeout`. So on expiry the caller asks the slot, under the same
     /// lock every other transition takes, whether it is still the waiter.
+    ///
+    /// **`deadline` is passed in, not recomputed here, and that is a
+    /// correctness property rather than a style.** §5.2's rule is that the
+    /// window starts at *this call* — which is what makes an adopting
+    /// call's deadline its own rather than one that may already have
+    /// elapsed — and this function is no longer the first thing the call
+    /// does. §17.5's binding approval runs ahead of it and may consume up
+    /// to half of `timeout_secs`; a `self.clock.now() + timeout_secs`
+    /// computed *here* would therefore be a second full window laid end to
+    /// end with the first, and a `require_confirm` call could run for
+    /// **1.5×** the number the agent declared. The origin is
+    /// `request_secret_input`'s `call_start`, stamped once, on the same
+    /// clock the approval's arithmetic uses.
     async fn await_secret(
         &self,
         session: &Arc<Session>,
         request_id: &str,
         rx: tokio::sync::oneshot::Receiver<Resolution>,
-        timeout_secs: u32,
+        deadline: std::time::Instant,
     ) -> Resolution {
-        // §5.2: the window starts at **this call**, not at the raise —
-        // which is what makes an adopting call's deadline its own rather
-        // than one that may already have elapsed.
-        let deadline = self.clock.now() + Duration::from_secs(timeout_secs as u64);
         let sleep = self.clock.sleep_until(deadline);
         tokio::pin!(sleep);
         tokio::pin!(rx);
@@ -2610,12 +2659,42 @@ enum ApprovalWoke {
     Deadline,
     /// The child ended (§17.5's `Superseded`).
     Exited,
-    /// The registry entry went away without a decision — the other half
-    /// of `Superseded`. Unreachable in this milestone (nothing but this
-    /// function takes an approval slot), and handled rather than
-    /// `unreachable!()`d because the safe reading of a lost approval is
-    /// *not approved*.
+    /// The registry entry went away without a decision, so the sender was
+    /// dropped and **the receiver completed inside the `select!`**.
+    ///
+    /// **This variant's arm must not read the receiver again**, and the
+    /// first draft did: it fell through to the hand-over read, and tokio
+    /// answers a second poll of a completed `oneshot` with
+    /// `panic!("called after complete")`, killing the tool-call task
+    /// instead of answering it. Unreachable in this milestone — nothing
+    /// but `run_binding_approval` takes an approval slot — and **Task
+    /// 13's hand-off, wiring `forward_events` → `supersede`, is precisely
+    /// what makes it reachable**, which is why it is fixed here rather
+    /// than filed. The safe reading of a lost approval is *not approved*.
     Superseded,
+}
+
+/// How one §17.5 approval ended, **after** the slot has been taken under
+/// the lock and the truth is settled.
+///
+/// A separate type from [`ApprovalWoke`], which records only *what woke
+/// the wait*. The two differ on every arm that can be overtaken: a
+/// `Deadline` wake whose `expire` finds the slot already gone did not
+/// expire, and an `Exited` wake whose `supersede` finds it gone was
+/// decided. Collapsing them is how a timer comes to report a decision
+/// somebody else made.
+enum ApprovalEnd {
+    Decided(crate::secret::Decided),
+    /// §17.5's `Expired`: the window elapsed with nobody deciding.
+    Expired,
+    /// §17.5's `Superseded`, by the one trigger this milestone can
+    /// produce — the child ended. §5.1's `session_died` is exact.
+    SessionExited,
+    /// §17.5's `Superseded`, by anything else: the slot was taken without
+    /// a decision while the child is still alive. **Falls through to the
+    /// human prompt**, because "not approved" is the safe reading and
+    /// `session_died` would be a claim about a child that is running.
+    Discarded,
 }
 
 /// What §5.2's step 1 concluded, for the one caller that acts on it.

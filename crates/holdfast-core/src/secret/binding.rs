@@ -2967,6 +2967,178 @@ mod tests {
         let _ = s.signal(Signal::Kill);
     }
 
+    /// **An approval taken away without a decision falls through — it
+    /// does not abort the call.**
+    ///
+    /// §17.5's `Superseded` has two triggers and only one of them is
+    /// reachable from this milestone's own code (the child exiting,
+    /// covered by the row below). The other — *"the outstanding
+    /// `request_secret_input` is cancelled"*, and more generally anything
+    /// that clears the slot without deciding — arrives from **outside**
+    /// the waiting caller, and **Task 13's hand-off is exactly that**:
+    /// `attach::conn`'s `forward_events` calling `approvals().supersede`
+    /// for the caller-less `autofill_on_echo_off` path. So the third party
+    /// here is not a contrivance; it is the next-but-one milestone's
+    /// design, driven a task early.
+    ///
+    /// **The defect this pins is a panic, not a wrong answer.** Dropping
+    /// the sender completes the caller's `oneshot` *inside* its own
+    /// `select!`, and a second read of a completed `oneshot` is
+    /// `panic!("called after complete")` in tokio — so the arm documented
+    /// as handling a lost approval defensively killed the tool-call task
+    /// instead of answering it. The loop below fails **fast and with the
+    /// panic's own text** rather than letting the frame waits time out
+    /// and report only that their frame never came.
+    ///
+    /// The answer is REQ-SEC-017's fall-through and **not** §5.1's
+    /// `session_died`: the child is alive here, and the row asserts that.
+    #[tokio::test]
+    async fn an_approval_taken_away_without_a_decision_falls_through_rather_than_panicking() {
+        let mut sc = Scratch::new("discarded");
+        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
+        let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        await_prompt(&s, b"Password: ").await;
+
+        let mut call = spawn_call(&server, secret_args(&s.id, 20));
+        await_approval(&server, &s.id).await;
+        client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+
+        // The third party, exactly as Task 13 will call it.
+        assert!(
+            server.attach_hub().approvals().supersede(&s.id).is_some(),
+            "the approval was not there to take"
+        );
+
+        // Fail fast, and with the real reason: under the defect the task
+        // is already gone with a `JoinError::Panic`, and every wait below
+        // would otherwise report only that its own frame never arrived.
+        let mut died = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !server.attach_hub().secrets().has_waiter(&s.id) {
+            if call.is_finished() {
+                died = true;
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the call never fell through to the prompt path"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if died {
+            let ended = (&mut call).await;
+            panic!("the call ended instead of falling through to the human prompt: {ended:?}");
+        }
+
+        client.wait_for("AwaitingSecret", is_awaiting).await;
+        answer_as_a_human(&server, &s, b"typedbyahuman").await;
+        let payload = joined(call, "the discarded-approval call").await;
+        assert_eq!(
+            payload["status"], "secret_provided",
+            "a lost approval must fall through to the human prompt: {payload}"
+        );
+
+        // The child is alive, so `session_died` would have been a claim
+        // about a running process — this is the half that separates
+        // `Discarded` from `SessionExited`.
+        assert!(s.is_alive(), "the fixture's child died and spoiled the row");
+        assert!(
+            !sc.ran("prod-ssh"),
+            "an approval nobody granted still read the credential store"
+        );
+        assert_eq!(
+            approval_line(&sc, &s.id),
+            None,
+            "§9.4's `outcome` has no value for `Superseded`, so no line is written (Q13)"
+        );
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **`timeout_secs` bounds the whole call, approval included.**
+    ///
+    /// §5.2's rule is that the window starts at *this call*. It does not
+    /// say "at each stage of this call", and §17.5 put a stage in front of
+    /// the prompt path: an approval may consume up to half of
+    /// `timeout_secs`, so a prompt deadline recomputed as
+    /// `now + timeout_secs` after it is a **second full window laid end to
+    /// end with the first** — a `require_confirm` call running for 1.5×
+    /// the number the agent declared.
+    ///
+    /// Driven on `Clock::manual()` against the **hand**, which is what
+    /// makes it a statement about the deadline's origin rather than about
+    /// how fast the machine is: `timeout_secs: 10`, so the approval window
+    /// is `min(120, 10 / 2)` = 5. Five seconds burn the approval, five
+    /// more reach the caller's own deadline, and the call must be **over**
+    /// at that hand position. Under the recomputation the prompt deadline
+    /// is `call_start + 15` and the call is still parked.
+    ///
+    /// The anti-vacuity half is the assertion **between** the two
+    /// advances: the call is still running after the approval expired, so
+    /// the row cannot pass against an implementation that simply gives up
+    /// at the approval.
+    #[tokio::test]
+    async fn the_callers_timeout_bounds_the_approval_and_the_prompt_together() {
+        let mut sc = Scratch::new("endtoend");
+        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let clock = Clock::manual(std::time::Instant::now());
+        let server = server_full(
+            keychain_mode(vec![b.clone()]),
+            &sc.audit_log(),
+            120,
+            clock.clone(),
+        );
+        let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        await_prompt(&s, b"Password: ").await;
+
+        let call = spawn_call(&server, secret_args(&s.id, 10));
+        await_approval(&server, &s.id).await;
+        client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+
+        // Five seconds: the whole approval window, and nobody decides.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(5));
+        client.wait_for("AwaitingSecret", is_awaiting).await;
+        assert!(
+            !call.is_finished(),
+            "the call ended at the approval's expiry instead of falling through, so the \
+             assertion below would be about nothing"
+        );
+
+        // Five more: the caller's own deadline, measured from the call and
+        // not from the fall-through. Nobody answers the prompt either.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(5));
+
+        let payload = tokio::time::timeout(Duration::from_secs(10), call)
+            .await
+            .expect(
+                "the call was still waiting at `call_start + timeout_secs`: its prompt \
+                 deadline was recomputed after the approval rather than derived from the \
+                 call, so the caller's timeout_secs is not an end-to-end bound",
+            )
+            .expect("the call");
+        assert_eq!(payload["status"], "secret_cancelled", "{payload}");
+        assert_eq!(payload["data"]["reason"], "timeout", "{payload}");
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
     /// §17.5's `Superseded`: the session exits with an approval pending,
     /// and a decision arriving **afterwards** resolves nothing.
     ///
