@@ -3160,7 +3160,22 @@ mod tests {
         let mut sc = Scratch::new("discarded");
         let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
         let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
-        let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        // **A child that reads twice, and the liveness assertion below is
+        // why.** With one read the human's answer *completes* the child,
+        // which then prints and exits — so `s.is_alive()` afterwards races
+        // the exit and the row fails on its own "spoiled the row" message
+        // for a reason that has nothing to do with what it is about.
+        // Measured on the full library target: **1 failure in 12 runs**
+        // before Task 12's rows existed, **5 in 12** after they did, which
+        // is a pre-existing race whose rate rose with ambient load rather
+        // than a defect Task 12 introduced. With two reads the child is
+        // provably parked on the second when the assertion runs, so the
+        // claim — the classification was taken against a **live** session
+        // — is arranged rather than hoped for. The two-read spelling is
+        // this file's existing idiom (`a_human_answering_…` and two others
+        // concatenate the fixture the same way), so GC14 is untouched.
+        let two_reads = format!("{ECHO_OFF_FIXTURE}; {ECHO_OFF_FIXTURE}");
+        let s = session_running("ssh", &["prod-01"], &two_reads);
         server.registry.insert(Arc::clone(&s)).expect("register");
         let mut client = attach_fake(&server, &s.id);
         await_prompt(&s, b"Password: ").await;
@@ -3209,6 +3224,10 @@ mod tests {
         // The child is alive, so `session_died` would have been a claim
         // about a running process — this is the half that separates
         // `Discarded` from `SessionExited`.
+        // The child has consumed the human's answer and is parked on its
+        // second read, so this is a fact about the arrangement rather than
+        // a race with the child's exit.
+        buffer_until(&s, b"got=TYPEDBYAHUMAN", 20).await;
         assert!(s.is_alive(), "the fixture's child died and spoiled the row");
         assert!(
             !sc.ran("prod-ssh"),
