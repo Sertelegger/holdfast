@@ -2590,6 +2590,95 @@ fn the_published_binding_block_loads_and_selects_the_session_it_names() {
     assert!(select(&[], &named, "password:").is_none());
 }
 
+/// §10.2's `[security]` knobs for §9.6, **copied from the current spec
+/// text** and loaded as a `Config` before anything is asserted about them
+/// (Global Constraint 15).
+///
+/// The three keys and their comments are the document's, verbatim,
+/// including the `--` that stands in for an em dash there. Rev. 49 makes
+/// an unknown key a load error, so a remembered fixture fails to parse
+/// rather than merely drifting — which is why this is parsed first and
+/// read second.
+const SPEC_AUTOFILL_BLOCK: &str = r#"
+[security]
+# Secret resolution (§9.6): "prompt" (ask a human), "keychain" (resolve
+# from the OS credential store via an operator-configured binding), or
+# "both" (try keychain, fall back to prompting).
+secret_provider = "prompt"
+# When true, a detected echo-off prompt (§8.3 AwaitingSecret) with a
+# matching binding is filled automatically with no agent tool call.
+# Off by default: silent credential injection is opt-in per deployment.
+autofill_on_echo_off = false
+# When true, dangerous-command confirmation requires a code (shown only
+# via trusted UI surfaces -- web UI dashboard or `holdfast confirm` CLI) in
+# addition to the agent-held token. Agent never receives the code.
+# Default false: relies on the MCP client's tool-call permission UI.
+strict_confirmation = false
+"#;
+
+/// **REQ-SEC-014's config half, read off the published example rather
+/// than off a snippet somebody typed.**
+///
+/// The shipped posture cannot autofill for **two independent reasons** —
+/// the knob is off and the mode is `prompt` — and each is asserted with
+/// the minimal edit that flips it, so neither absence is evidence of a
+/// parser that answers `false` to everything.
+///
+/// This is also the row §9.6's *runtime* mode check defers to. A daemon
+/// with `autofill_on_echo_off = true` and `secret_provider = "prompt"`
+/// does not exist, because the pair is refused at load; the check inside
+/// the daemon is defence in depth for a `SecurityConfig` built in Rust,
+/// and this is the only place the rule is reachable from a config file.
+#[test]
+fn the_published_security_block_ships_with_autofill_off() {
+    let cfg = holdfast_core::config::parse_str(SPEC_AUTOFILL_BLOCK)
+        .expect("§10.2's [security] block must load as a Config");
+    assert!(
+        !cfg.security.autofill_on_echo_off,
+        "REQ-SEC-014: silent credential injection is opt-in per deployment, not \
+         inherited"
+    );
+    assert!(
+        !keychain_step_runs(&cfg.security.secret_provider),
+        "the published example now enables the credential store by default"
+    );
+
+    // The pairing for the knob: the same file with that one line flipped
+    // loads, and reads `true`. Without it the assertion above is satisfied
+    // by a loader that answers `false` whatever the file says.
+    let on = SPEC_AUTOFILL_BLOCK
+        .replace(
+            "autofill_on_echo_off = false",
+            "autofill_on_echo_off = true",
+        )
+        .replace(
+            r#"secret_provider = "prompt""#,
+            r#"secret_provider = "both""#,
+        );
+    let enabled =
+        holdfast_core::config::parse_str(&on).expect("the opted-in spelling must load too");
+    assert!(enabled.security.autofill_on_echo_off);
+    assert!(keychain_step_runs(&enabled.security.secret_provider));
+
+    // And the pair the loader refuses: opting in while leaving the mode at
+    // `prompt` asks for an autofill from a credential store the same file
+    // forbids reading. The error names the key, or an operator cannot act
+    // on it.
+    let contradiction = SPEC_AUTOFILL_BLOCK.replace(
+        "autofill_on_echo_off = false",
+        "autofill_on_echo_off = true",
+    );
+    let err = holdfast_core::config::parse_str(&contradiction)
+        .expect_err(
+            "`autofill_on_echo_off = true` with `secret_provider = \"prompt\"` must be refused",
+        )
+        .to_string();
+    assert!(
+        err.contains("autofill_on_echo_off"),
+        "the refusal does not name the key an operator has to change: {err}"
+    );
+}
+
 // ------------------------------- §17.5 over the socket (§7.5, §18.4)
 //
 // **These three rows are here and not in the library target because the

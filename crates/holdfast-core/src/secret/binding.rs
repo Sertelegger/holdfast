@@ -3519,4 +3519,497 @@ mod tests {
         client.unregister(&server);
         let _ = live.signal(Signal::Kill);
     }
+
+    // ------------------------------- §9.6's `autofill_on_echo_off` (Task 12)
+    //
+    // One boolean, and the most consequential one in the system. The
+    // §8.3 echo drop is an **edge**, so every row below arms the listener
+    // and *then* releases the child — see [`gated_echo_off`].
+
+    /// [`ECHO_OFF_FIXTURE`] held at the starting line until the row opens
+    /// a gate file.
+    ///
+    /// **The echo drop is an edge, and `session_running` returns with the
+    /// child already executing.** A listener armed after that edge has
+    /// fired sees nothing, so a row that armed and then hoped would be
+    /// load-dependent in exactly the direction that hides the defect: the
+    /// negative rows would pass because the listener missed the edge
+    /// rather than because the flag was off. Gating makes "the listener
+    /// was armed first" an arrangement rather than a wish.
+    ///
+    /// A **prefix**, not a re-spelling: GC14's one fixture is unchanged
+    /// and appears verbatim, in the same way the two-read rows above
+    /// concatenate it.
+    fn gated_echo_off(gate: &Path) -> String {
+        format!(
+            "until [ -f '{}' ]; do sleep 1; done; {ECHO_OFF_FIXTURE}",
+            gate.display()
+        )
+    }
+
+    /// `[security]` with the keychain step on **and §9.6's autofill knob
+    /// set explicitly**.
+    fn autofill_mode(bindings: Vec<SecretBinding>, on: bool) -> SecurityConfig {
+        SecurityConfig {
+            autofill_on_echo_off: on,
+            ..keychain_mode(bindings)
+        }
+    }
+
+    /// Everything an autofill row needs: a session, its listener armed,
+    /// the echo-drop raise a connection would have made, and the child
+    /// released.
+    ///
+    /// The raise is arranged **before** the gate opens so that every row
+    /// measures the autofill rather than racing `forward_events`' raise —
+    /// it is the same two lines that arm names in `attach::conn`, and
+    /// there is no connection here to run them.
+    async fn armed_session(
+        server: &HoldfastServer,
+        gate: &Path,
+        command: &str,
+        args: &[&str],
+    ) -> (Arc<Session>, crate::attach::secret::SecretRequest) {
+        let s = session_running(command, args, &gated_echo_off(gate));
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        server.watch_for_autofill(&s);
+        let (raised, first) = server.attach_hub().raise_secret(&s.id, "Password: ");
+        assert!(first, "the row, not something else, raised this request");
+        std::fs::write(gate, b"go").expect("open the gate");
+        await_prompt(&s, b"Password: ").await;
+        (s, raised)
+    }
+
+    /// **REQ-SEC-014, behaviourally.** With `autofill_on_echo_off` unset,
+    /// an echo drop does what 0.0.6 built and nothing more.
+    ///
+    /// Task 1 asserts the config default. That assertion passes perfectly
+    /// against code that never reads the field, which is why this row
+    /// exists: `secret_provider = "both"`, a binding that matches, a
+    /// provider script that works, and the knob left at whatever
+    /// `SecurityConfig::default()` says — and the child stays blocked.
+    ///
+    /// **The enabled twin runs in this row and is its clock.** A negative
+    /// about something that did not happen needs a bound on how long it
+    /// was given to happen, and a fixed sleep is a load-dependent guess.
+    /// The twin session, on the same fixtures with the same provider,
+    /// completes the whole round trip — provider, PTY write, the child's
+    /// own transform — and only then are the disabled session's
+    /// assertions made. If the flag were ignored, the disabled session had
+    /// at least as long as the twin took.
+    #[tokio::test]
+    async fn autofill_is_off_by_default() {
+        let mut sc = Scratch::new("offbydefault");
+        let off_binding = sc.binding("off", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let on_binding = sc.binding("on", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+
+        // `both`, which §5.2 says lets step 1 run — so the mode is not
+        // what stops this.
+        let mut sec = keychain_mode(vec![off_binding]);
+        sec.secret_provider = "both".to_string();
+        assert!(
+            !sec.autofill_on_echo_off,
+            "REQ-SEC-014: the knob must be off with nothing set, or this row is \
+             asserting a value it set itself"
+        );
+        let off_server = server_with(sec, &sc.audit_log());
+
+        let mut on_sec = autofill_mode(vec![on_binding], true);
+        on_sec.secret_provider = "both".to_string();
+        let on_server = server_with(on_sec, &sc.audit_log());
+
+        let off_gate = sc.path("off.gate");
+        let on_gate = sc.path("on.gate");
+        let (off, off_raised) = armed_session(&off_server, &off_gate, "ssh", &["prod-01"]).await;
+        let (on, _) = armed_session(&on_server, &on_gate, "ssh", &["prod-01"]).await;
+
+        // The clock: the enabled twin goes all the way through.
+        buffer_until(&on, b"got=HUNTER2", 20).await;
+        assert!(sc.ran("on"), "the twin's provider never ran");
+
+        // And with the knob unset, none of it happened.
+        assert!(
+            !sc.ran("off"),
+            "a provider process was spawned with `autofill_on_echo_off` unset — \
+             silent credential injection is opt-in per deployment (REQ-SEC-014)"
+        );
+        let seen = buffered(&off);
+        assert!(
+            !contains(&seen, b"got="),
+            "the child completed its read, so something was written to it:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(
+            off.is_awaiting_secret(),
+            "the child is no longer blocked at its echo-off prompt"
+        );
+        assert!(
+            off_server
+                .attach_hub()
+                .secrets()
+                .matches_outstanding(&off.id, &off_raised.request_id),
+            "the request was closed by something on a row where nothing should \
+             have answered it"
+        );
+        assert!(
+            !sc.kinds(&off.id).iter().any(|k| k == "binding_resolved"),
+            "a binding resolved with the knob unset: {:?}",
+            sc.kinds(&off.id)
+        );
+
+        let _ = off.signal(Signal::Kill);
+        let _ = on.signal(Signal::Kill);
+    }
+
+    /// **The pairing.** With the knob on, the daemon resolves and injects
+    /// on the edge and **no MCP tool call happens at all**.
+    ///
+    /// §16.4's closing note: *"steps 4–7 collapse: the daemon resolves and
+    /// injects at step 3 and the agent never makes a secret-related call
+    /// at all."* This row calls no tool — not `start_session`, not
+    /// `request_secret_input` — and the child still prints the digest.
+    /// Without it, a flag that is read and never acted on passes the row
+    /// above perfectly.
+    ///
+    /// The raise the daemon found is closed `fulfilled`, which is what an
+    /// attached human sees happen to the modal in front of them.
+    #[tokio::test]
+    async fn autofill_injects_when_it_is_enabled() {
+        let mut sc = Scratch::new("enabled");
+        let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let mut sec = autofill_mode(vec![b], true);
+        sec.secret_provider = "both".to_string();
+        let server = server_with(sec, &sc.audit_log());
+
+        let gate = sc.path("gate");
+        let s = session_running("ssh", &["prod-01"], &gated_echo_off(&gate));
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        server.watch_for_autofill(&s);
+        let mut client = attach_fake(&server, &s.id);
+        let (raised, first) = server.attach_hub().raise_secret(&s.id, "Password: ");
+        assert!(first);
+        std::fs::write(&gate, b"go").expect("open the gate");
+        await_prompt(&s, b"Password: ").await;
+
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert!(sc.ran("prod-ssh"), "the binding's provider never ran");
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "the resolved value reached the ring buffer: {}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        // §7.5's closure, which is what a human at an attached client sees
+        // happen to the modal in front of them.
+        let closed = client
+            .wait_for("SecretRequestClosed", |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { .. })
+            })
+            .await;
+        let ServerFrame::SecretRequestClosed {
+            request_id,
+            outcome,
+        } = closed
+        else {
+            panic!("wait_for returned the wrong frame");
+        };
+        assert_eq!(request_id, raised.request_id);
+        assert_eq!(outcome, "fulfilled");
+        assert!(
+            server.attach_hub().outstanding_secret(&s.id).is_none(),
+            "the raise the autofill satisfied is still outstanding"
+        );
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **The audit consequence, and it is easy to get wrong.**
+    ///
+    /// An autofilled request produces a `binding_resolved` entry and
+    /// **no** `secret_input_request` / `secret_input_resolved` entries.
+    /// Those two are written **per tool call** (§5.2, Task 6's rule) and
+    /// there was no tool call — writing them would make the trail claim an
+    /// agent asked for something it never asked for, which is worse than a
+    /// gap because an operator reading it has no way to tell.
+    ///
+    /// **The anti-vacuity pairing is the whole trail**, asserted as an
+    /// exact list rather than as three absences: an implementation that
+    /// wrote nothing at all satisfies "no `secret_input_request`", and
+    /// `server_with` has already established that the log is open.
+    #[tokio::test]
+    async fn autofill_writes_binding_resolved_and_no_tool_audit_lines() {
+        let mut sc = Scratch::new("autofillaudit");
+        let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+
+        let gate = sc.path("gate");
+        let (s, _) = armed_session(&server, &gate, "ssh", &["prod-01"]).await;
+        buffer_until(&s, b"got=HUNTER2", 20).await;
+
+        let kinds = sc.kinds(&s.id);
+        assert_eq!(
+            kinds,
+            vec!["binding_resolved".to_string()],
+            "an autofill with no tool call wrote something other than exactly one \
+             `binding_resolved`: {kinds:?}"
+        );
+        let entry = sc
+            .audit(&s.id)
+            .into_iter()
+            .find(|e| e["kind"] == "binding_resolved")
+            .expect("the entry the list above says is there");
+        assert_eq!(entry["binding_name"], sc.name("prod-ssh"));
+        assert_eq!(entry["use_count"], 1);
+        // The reference never reaches the trail, and neither does the
+        // value — with the control that says so is this module's doing.
+        let trail = sc.audit_text();
+        assert!(
+            !trail.contains(REFERENCE) && !trail.contains(PROBE),
+            "the reference or the value reached the audit trail"
+        );
+        let rules = &server.processor.rules;
+        assert_eq!(crate::output::redact::redact_str(rules, PROBE), PROBE);
+        assert_eq!(
+            crate::output::redact::redact_str(rules, REFERENCE),
+            REFERENCE
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// The knob does not override §5.2's mode gate, and it does not
+    /// override the binding match.
+    ///
+    /// Both `keychain` and `both` let step 1 run, so both inject. **The
+    /// pairing is a binding negative and not a restatement of Task 1**:
+    /// `autofill_on_echo_off = true` with `secret_provider = "prompt"` is
+    /// rejected at config load by Task 1's second validation rule, so the
+    /// runtime mode check is defence in depth whose only reachable proof
+    /// is that config test — a clause about it here would assert nothing
+    /// about autofill. What *is* reachable, and what this row drives, is a
+    /// session whose command line matches no binding: no provider process,
+    /// no injection, and the child left blocked exactly as §8.3 found it.
+    ///
+    /// **The matching session is the negative's clock**, on the same
+    /// server, the same config and the same listener — so "no provider
+    /// ran" is bounded by an autofill that provably completed rather than
+    /// by a sleep.
+    #[tokio::test]
+    async fn autofill_respects_the_provider_mode() {
+        for mode in ["keychain", "both"] {
+            let mut sc = Scratch::new(&format!("mode-{mode}"));
+            let b = sc.binding(
+                "prod-ssh",
+                "^ssh\\s+(\\S+@)?prod-0[12]\\b",
+                &format!("printf '{PROBE}\\n'\n"),
+            );
+            let mut sec = autofill_mode(vec![b], true);
+            sec.secret_provider = mode.to_string();
+            let server = server_with(sec, &sc.audit_log());
+
+            // The negative first, so it has been armed and released for at
+            // least as long as the positive takes.
+            let miss_gate = sc.path("miss.gate");
+            let (miss, miss_raised) =
+                armed_session(&server, &miss_gate, "ssh", &["user@staging"]).await;
+            let hit_gate = sc.path("hit.gate");
+            let (hit, _) = armed_session(&server, &hit_gate, "ssh", &["user@prod-01"]).await;
+
+            buffer_until(&hit, b"got=HUNTER2", 20).await;
+            assert!(
+                sc.ran("prod-ssh"),
+                "`secret_provider = {mode:?}` allows the keychain step and it did \
+                 not run"
+            );
+            assert_eq!(
+                sc.kinds(&hit.id),
+                vec!["binding_resolved".to_string()],
+                "the matching session did not autofill under {mode:?}"
+            );
+
+            // The binding negative: a session no binding names.
+            assert!(
+                !contains(&buffered(&miss), b"got="),
+                "a session no binding names received a value under {mode:?}"
+            );
+            assert!(
+                miss.is_awaiting_secret(),
+                "the unmatched session is no longer blocked at its prompt"
+            );
+            assert!(
+                server
+                    .attach_hub()
+                    .secrets()
+                    .matches_outstanding(&miss.id, &miss_raised.request_id),
+                "the unmatched session's request was closed by something"
+            );
+            assert!(
+                sc.kinds(&miss.id).is_empty(),
+                "the unmatched session produced audit lines: {:?}",
+                sc.kinds(&miss.id)
+            );
+
+            let _ = hit.signal(Signal::Kill);
+            let _ = miss.signal(Signal::Kill);
+        }
+    }
+
+    /// **Autofill is not "skip every gate".**
+    ///
+    /// §9.6's `require_confirm` keeps a human in the loop, and it applies
+    /// on this path exactly as it does to a tool call: the daemon
+    /// broadcasts `BindingApprovalRequired`, nothing is resolved and
+    /// nothing is injected until somebody approves. Treating the knob as
+    /// blanket permission is precisely the silent injection REQ-SEC-014's
+    /// default is protecting against.
+    ///
+    /// **The approval frame is the clock** for the "nothing yet" half:
+    /// it exists only after step 1 has run and chosen to ask, so the
+    /// negatives beside it are statements about a decision that has
+    /// already been taken rather than about elapsed time.
+    ///
+    /// With no caller there is no deadline to halve, so §17.5's configured
+    /// `binding_approval_timeout_secs` applies in full — asserted through
+    /// the approval's own `expires_at_unix_secs`.
+    #[tokio::test]
+    async fn autofill_with_require_confirm_still_asks() {
+        let mut sc = Scratch::new("autofillconfirm");
+        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let server = server_full(
+            autofill_mode(vec![b], true),
+            &sc.audit_log(),
+            30,
+            Clock::system(),
+        );
+
+        let gate = sc.path("gate");
+        let s = session_running("ssh", &["prod-01"], &gated_echo_off(&gate));
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        server.watch_for_autofill(&s);
+        let mut client = attach_fake(&server, &s.id);
+        let (raised, first) = server.attach_hub().raise_secret(&s.id, "Password: ");
+        assert!(first);
+        std::fs::write(&gate, b"go").expect("open the gate");
+        await_prompt(&s, b"Password: ").await;
+
+        let approval = await_approval(&server, &s.id).await;
+        let frame = client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+        let ServerFrame::BindingApprovalRequired {
+            binding_name,
+            provider,
+            ..
+        } = frame
+        else {
+            panic!("wait_for returned the wrong frame");
+        };
+        assert_eq!(binding_name, sc.name("prod-ssh"));
+        assert_eq!(provider, "pass");
+
+        // Nothing has been resolved, nothing injected, nothing spent.
+        assert!(
+            !sc.ran("prod-ssh"),
+            "the provider ran before anybody approved — the reference was read out \
+             of a store nobody agreed to read"
+        );
+        assert!(
+            !contains(&buffered(&s), b"got="),
+            "a value was injected before the approval was answered"
+        );
+        assert!(
+            sc.kinds(&s.id).is_empty(),
+            "an unanswered approval wrote an audit line: {:?}",
+            sc.kinds(&s.id)
+        );
+        assert!(
+            server
+                .attach_hub()
+                .secrets()
+                .matches_outstanding(&s.id, &raised.request_id),
+            "the raise was closed while the approval was still pending"
+        );
+
+        // §17.5 with no caller: the configured window applies in full,
+        // rather than half of a deadline that does not exist.
+        let now = server.clock.now_ms().max(0) as u64 / 1000;
+        assert!(
+            approval.expires_at_unix_secs >= now + 25,
+            "the caller-less window was halved: expires at {} against now {now}",
+            approval.expires_at_unix_secs
+        );
+
+        // **And the pairing**: approving releases it.
+        assert_eq!(
+            decide(
+                &server,
+                &s.id,
+                &approval.approval_id,
+                ApprovalDecision::Approve,
+                "ui-bridge"
+            ),
+            crate::secret::Decide::Recorded
+        );
+        buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert!(sc.ran("prod-ssh"), "the approved provider never ran");
+        assert_eq!(
+            approval_line(&sc, &s.id).expect("an approved decision writes a line")["outcome"],
+            "approved"
+        );
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **The production wiring**, which none of the rows above touches.
+    ///
+    /// Every row above arms the listener by hand, so all five would pass
+    /// against a daemon in which nothing ever calls
+    /// `HoldfastServer::watch_for_autofill` — a feature that works only
+    /// when a test sets it up. This row goes through `start_session`,
+    /// which is an MCP tool call and is why it is a separate row from
+    /// `autofill_injects_when_it_is_enabled` rather than folded into it.
+    ///
+    /// The gate is opened **after** `start_session` returns, which is what
+    /// makes "armed before the edge" a property of the arrangement rather
+    /// than of how fast a `fork`/`exec` is on the machine running this.
+    #[tokio::test]
+    async fn start_session_arms_the_echo_drop_watcher() {
+        let mut sc = Scratch::new("startsession");
+        let b = sc.binding("shell", "^sh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+
+        let gate = sc.path("gate");
+        let started = server
+            .start_session(Parameters(crate::mcp::tools::StartSessionArgs {
+                command: "sh".into(),
+                args: vec!["-c".into(), gated_echo_off(&gate)],
+                ..Default::default()
+            }))
+            .await
+            .expect("start_session");
+        let id = body(&started)["data"]["session_id"]
+            .as_str()
+            .expect("a session id")
+            .to_string();
+        let s = server.registry.get(&id).expect("the session");
+
+        std::fs::write(&gate, b"go").expect("open the gate");
+        await_prompt(&s, b"Password: ").await;
+        buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert!(sc.ran("shell"), "the binding's provider never ran");
+        assert!(
+            sc.kinds(&s.id).iter().any(|k| k == "binding_resolved"),
+            "the trail does not record the resolution: {:?}",
+            sc.kinds(&s.id)
+        );
+        // No secret-related tool call was made, and the trail says so.
+        assert!(
+            !sc.kinds(&s.id).iter().any(|k| k == "secret_input_request"),
+            "a `secret_input_request` was written for a flow with no such call"
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
 }

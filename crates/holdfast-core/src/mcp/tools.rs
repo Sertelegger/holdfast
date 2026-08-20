@@ -391,6 +391,17 @@ impl HoldfastServer {
             return envelope::from_error(&e);
         }
 
+        // §9.6's `autofill_on_echo_off`, armed here because this is where a
+        // session comes into existence and the edge it listens for can fire
+        // as soon as the child runs. **After the insert**, so the session
+        // the listener holds is the one every other surface can see; a
+        // listener armed on a session the registry then refused would
+        // resolve a credential into a child that is being killed.
+        //
+        // Spawns nothing at all unless the operator opted in — see
+        // [`Self::watch_for_autofill`].
+        self.watch_for_autofill(&session);
+
         // §9.4's `session_start`, with its field list verbatim.
         //
         // `command` and `args` are *not* pre-redacted here: `record`
@@ -1480,7 +1491,7 @@ impl HoldfastServer {
                             &provider,
                             &approval_prompt,
                             append_newline,
-                            caller_deadline,
+                            Some(caller_deadline),
                             raised_before,
                         )
                         .await
@@ -1845,6 +1856,17 @@ impl HoldfastServer {
     /// makes REQ-SEC-017's fall-through unreachable whenever the two
     /// knobs are equal, which on shipped defaults is always.
     ///
+    /// **`caller_deadline` is `None` for §9.6's `autofill_on_echo_off`
+    /// path, and then the configured value applies in full.** §17.5 states
+    /// exactly that: the halving exists so a caller's prompt path inherits
+    /// at least half of what is left, and *"with no caller — the
+    /// `autofill_on_echo_off` path (§9.6), which has no deadline to
+    /// divide"* — there is nothing to divide and nothing waiting to
+    /// inherit it. An `Option` rather than a synthetic far-future
+    /// `Instant`, because a synthetic one would make `remaining / 2` a
+    /// number that happens to exceed the configured value rather than a
+    /// case the arithmetic knows about.
+    ///
     /// **The timer decides nothing**, exactly as in [`Self::await_secret`]:
     /// on expiry the caller asks the registry, under the same lock every
     /// other transition takes, whether it is still the one waiting. A
@@ -1858,13 +1880,13 @@ impl HoldfastServer {
         provider: &str,
         prompt_text: &str,
         append_newline: bool,
-        caller_deadline: std::time::Instant,
+        caller_deadline: Option<std::time::Instant>,
         raised_before: SlotSnapshot,
     ) -> Option<CallToolResult> {
         let hub = self.attach_hub();
         let window = crate::secret::approval_window(
             self.config.daemon.binding_approval_timeout_secs,
-            Some(caller_deadline.saturating_duration_since(self.clock.now())),
+            caller_deadline.map(|d| d.saturating_duration_since(self.clock.now())),
         );
         // Epoch seconds off **this daemon's clock**, so a manual-clock
         // test and the daemon agree about when this expires. `now_ms`
@@ -2077,6 +2099,157 @@ impl HoldfastServer {
         };
         self.inject_resolved(session, resolved, &raised_before)
             .await
+    }
+
+    /// §9.6's `autofill_on_echo_off`: the daemon's own listener on §8.3's
+    /// echo-drop edge, armed once per session.
+    ///
+    /// > *"When §8.3 raises `interaction_mode: AwaitingSecret` and a
+    /// > binding matches, Holdfast can resolve and inject **without any
+    /// > agent tool call at all** if `security.autofill_on_echo_off = true`
+    /// > (default `false`). That default is deliberate: silent credential
+    /// > injection is powerful and should be opted into per deployment, not
+    /// > inherited."*
+    ///
+    /// §16.4's closing note is the behavioural statement: *"steps 4–7
+    /// collapse: the daemon resolves and injects at step 3 and the agent
+    /// never makes a secret-related call at all."*
+    ///
+    /// **Off, this function spawns nothing and subscribes to nothing**, and
+    /// that is REQ-SEC-014 as behaviour rather than as a config assertion:
+    /// with the flag unset there is no listener, so no binding is consulted
+    /// and no provider can run however the session behaves. It is the same
+    /// discipline `request_secret_input`'s `step_one_possible` guard uses —
+    /// the default posture costs nothing, not even a task.
+    ///
+    /// **The mode and binding-set guards are the same two functions step 1
+    /// checks**, deliberately, in the shape this file already uses twice:
+    /// one copy is a guard that decides whether to spawn, the other is the
+    /// rule itself inside [`crate::secret::binding::autofill`], and they
+    /// call the same function so the rule cannot change for one and not the
+    /// other. `autofill_on_echo_off = true` with `secret_provider =
+    /// "prompt"` is refused at config load (Task 1), so the mode check here
+    /// is defence in depth for a `SecurityConfig` built in Rust.
+    ///
+    /// **This listener does not raise the request, and that is a decision.**
+    /// §16.4 step 3's raise is `attach::conn::forward_events`', once per
+    /// connection, and it stays there: a raise made here would have no
+    /// owner when nobody is attached, because the `AwaitingSecretLeft` and
+    /// `Exited` arms that close a slot are also per connection — leaving a
+    /// per-daemon entry keyed by a session nothing ever releases, which is
+    /// GH #24's shape and one this project has already paid for. What this
+    /// listener does instead is *satisfy* whatever raise exists: with a
+    /// client attached the autofill takes that raise and closes it
+    /// `fulfilled`, which is the `SecretRequestClosed { outcome:
+    /// "fulfilled" }` §7.5 promises; with nobody attached there is no raise
+    /// to close and no client to tell.
+    pub(crate) fn watch_for_autofill(&self, session: &Arc<Session>) {
+        if !self.config.security.autofill_on_echo_off
+            || !crate::secret::binding::keychain_step_runs(&self.config.security.secret_provider)
+            || self.config.security.secret_bindings.is_empty()
+        {
+            return;
+        }
+        // Subscribe **then** re-check liveness, the same order
+        // [`session_exit`] uses and for a sharper reason here: this task
+        // holds an `Arc<Session>`, so the sender never drops under it and a
+        // `Closed` would never arrive. A child that ended between the
+        // caller's spawn and this subscription would leave the task parked
+        // on a `recv()` that can no longer produce anything, holding the
+        // session alive forever.
+        let mut events = session.subscribe_events();
+        if !session.is_alive() {
+            return;
+        }
+        let server = self.clone();
+        let session = Arc::clone(session);
+        tokio::spawn(async move {
+            use crate::session::SessionEvent;
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match events.recv().await {
+                    Ok(SessionEvent::AwaitingSecretEntered { .. }) => {
+                        // **The prompt text is not carried across.** It is
+                        // read off the session inside step 1, from the
+                        // detector's own line, exactly as a tool-call
+                        // autofill reads it — this listener has no argument
+                        // to pass and must not grow one (REQ-SEC-012).
+                        server.autofill_on_echo_drop(&session).await;
+                    }
+                    // The child ended. Nothing further can drop echo, and
+                    // an autofill for a dead session is a write to a closed
+                    // PTY.
+                    Ok(SessionEvent::Exited { .. }) => return,
+                    Ok(SessionEvent::AwaitingSecretLeft) => {}
+                    // An edge is not a stream. A lagged listener has missed
+                    // an echo drop, and there is nothing to replay: the
+                    // session is the authority on whether it is still
+                    // blocked, and it says so on the next edge.
+                    Err(RecvError::Lagged(_)) if !session.is_alive() => return,
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+
+    /// One echo drop, resolved and injected with no tool call in sight.
+    ///
+    /// **The `CallToolResult` is built and discarded, and that is §16.4's
+    /// "steps 4–7 collapse" rather than waste.** `autofill_from_binding` is
+    /// the whole of step 1 including the slot check that stops a credential
+    /// being typed into a prompt somebody else has already answered
+    /// (GH #35), and a second hand-written copy of that tail is a second
+    /// place to get it wrong in the one function where getting it wrong
+    /// puts a password on a tty input queue. The answer it produces has
+    /// nobody to go to; the write it performed is the point.
+    ///
+    /// **Skipped when a tool call is already waiting on the slot.** That
+    /// call owns the answer — it will run step 1 itself — and injecting
+    /// behind it is the same two-values-in-one-`getpass` failure the slot
+    /// check exists to prevent, reached from a third side.
+    async fn autofill_on_echo_drop(&self, session: &Arc<Session>) {
+        if self.attach_hub().secrets().has_waiter(&session.id) {
+            return;
+        }
+        // `true`: an echo-off prompt is waiting for a *line*, which is the
+        // same default `RaisedRequest` carries for a raise with no waiter.
+        // There is no caller here to have expressed `append_newline`.
+        match self.autofill_from_binding(session, true).await {
+            StepOne::Done(_) => {}
+            // §17.5, with no caller. **`require_confirm` is still honoured
+            // — autofill is not "skip every gate"**, which is exactly the
+            // silent injection REQ-SEC-014's default protects against.
+            StepOne::NeedsApproval {
+                binding_name,
+                provider,
+                raised_before,
+            } => {
+                // The session's own prompt line, already redacted on the
+                // way out of the reader (§9.2). There is no agent string on
+                // this path, so the human is shown what the *child* asked
+                // for, which is the only description that exists.
+                let prompt_text = session.prompt_last_line_redacted();
+                let _ = self
+                    .run_binding_approval(
+                        session,
+                        &binding_name,
+                        &provider,
+                        &prompt_text,
+                        true,
+                        // No caller, so nothing to halve: §17.5's
+                        // configured value applies in full.
+                        None,
+                        raised_before,
+                    )
+                    .await;
+            }
+            // Every fall-through leaves the child exactly as §8.3 found it:
+            // blocked at an echo-off prompt with whatever affordance a
+            // human already has. There is no caller to tell and nothing to
+            // fall through *to*.
+            StepOne::FellThrough => {}
+        }
     }
 
     /// The session died under an autofill write.
