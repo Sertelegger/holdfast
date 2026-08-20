@@ -48,5 +48,5 @@ pub use binding::{
 pub use provider::{resolve, ArgvProvider, ProviderError, SecretProvider};
 pub use request::{
     buffer_notice, Adopted, CancelReason, Collision, RaisedBy, RaisedRequest, Resolution,
-    SecretSlots, SlotTake,
+    SecretSlots, SlotSnapshot, SlotTake,
 };

@@ -15,7 +15,7 @@ use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{clamp_geometry, InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
 use crate::secret::binding::{Autofill, Resolved};
-use crate::secret::{CancelReason, RaisedBy, Resolution, SlotTake};
+use crate::secret::{CancelReason, RaisedBy, Resolution, SlotSnapshot, SlotTake};
 use crate::session::{new_session_id, wait, Session, SessionConfig, WriteRequest};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -1674,7 +1674,11 @@ impl HoldfastServer {
         // and the whole point of reading it now is to be able to tell,
         // afterwards, whether the thing it is about to satisfy is still
         // there. See `SecretSlots::take_if_unadopted_matching`.
-        let raised_before = hub.secrets().outstanding(&session.id).map(|r| r.request_id);
+        //
+        // A *snapshot* and not the outstanding id: the id alone cannot see
+        // a raise that appeared **and was answered** while the provider
+        // ran, because that leaves the slot vacant again (GH #35).
+        let raised_before = hub.secrets().snapshot(&session.id);
 
         let security = self.config.security.clone();
         let processor = Arc::clone(&self.processor);
@@ -1708,7 +1712,7 @@ impl HoldfastServer {
         };
 
         match self
-            .inject_resolved(session, resolved, raised_before.as_deref())
+            .inject_resolved(session, resolved, &raised_before)
             .await
         {
             Some(done) => StepOne::Done(done),
@@ -1720,19 +1724,18 @@ impl HoldfastServer {
     /// through — the tail §5.2's step 1 and §17.5's `Approved` arm share.
     ///
     /// **One copy, because the slot check is the dangerous part.**
-    /// `raised_before` is the outstanding `request_id` as it stood before
-    /// this call went away — for the plain path, before the provider ran;
-    /// for the approval path, before the whole human round trip — and the
-    /// three-way answer below is what stops a credential being typed into
-    /// a prompt somebody else has already answered. A second hand-written
-    /// copy of that would be a second place to get it wrong, in the one
-    /// function where getting it wrong puts a password on the tty input
-    /// queue.
+    /// `raised_before` is the slot as it stood before this call went away
+    /// — for the plain path, before the provider ran; for the approval
+    /// path, before the whole human round trip — and the three-way answer
+    /// below is what stops a credential being typed into a prompt somebody
+    /// else has already answered. A second hand-written copy of that would
+    /// be a second place to get it wrong, in the one function where
+    /// getting it wrong puts a password on the tty input queue.
     async fn inject_resolved(
         &self,
         session: &Arc<Session>,
         resolved: Resolved,
-        raised_before: Option<&str>,
+        raised_before: &SlotSnapshot,
     ) -> Option<CallToolResult> {
         let hub = self.attach_hub();
         let Resolved {
@@ -1766,6 +1769,15 @@ impl HoldfastServer {
         // probe afterwards — a check-then-act here is the race being
         // closed, not a way of closing it.
         //
+        // **And the same again when a raise appeared and was answered
+        // inside the window** (GH #35). That leaves the slot vacant, which
+        // no re-check can tell from "nothing happened", so the snapshot
+        // carries the slot's closure count and `NotYours` is what comes
+        // back. This arm used to read `Vacant if raised_before.is_none()`;
+        // that guard is now subsumed — `Vacant` means the slot has not
+        // been through a request since the snapshot *and* holds nothing —
+        // and keeping it would have been a condition that cannot be false.
+        //
         // The `binding_resolved` entry and the spent `max_uses` claim
         // stand: the binding *did* resolve, and §9.6 counts resolutions
         // from the store rather than values written to a PTY.
@@ -1779,12 +1791,8 @@ impl HoldfastServer {
                 hub.broadcast_secret_closed(&session.id, &id, "fulfilled");
                 Some(id)
             }
-            // Nothing outstanding. Safe **only** when nothing was
-            // outstanding when this call began: a raise that was there and
-            // is now gone was answered by somebody else, and the child has
-            // already had a value.
-            SlotTake::Vacant if raised_before.is_none() => None,
-            _ => {
+            SlotTake::Vacant => None,
+            SlotTake::NotYours => {
                 drop(secret);
                 return None;
             }
@@ -1851,7 +1859,7 @@ impl HoldfastServer {
         prompt_text: &str,
         append_newline: bool,
         caller_deadline: std::time::Instant,
-        raised_before: Option<String>,
+        raised_before: SlotSnapshot,
     ) -> Option<CallToolResult> {
         let hub = self.attach_hub();
         let window = crate::secret::approval_window(
@@ -2067,7 +2075,7 @@ impl HoldfastServer {
             // human is asked for the value instead.
             _ => return None,
         };
-        self.inject_resolved(session, resolved, raised_before.as_deref())
+        self.inject_resolved(session, resolved, &raised_before)
             .await
     }
 
@@ -2769,12 +2777,12 @@ enum StepOne {
     NeedsApproval {
         binding_name: String,
         provider: String,
-        /// The outstanding `request_id` as it stood **before** step 1
-        /// began, threaded through the approval wait so the slot check in
+        /// The slot as it stood **before** step 1 began, threaded through
+        /// the approval wait so the check in
         /// [`HoldfastServer::inject_resolved`] covers the human round
         /// trip as well as the provider call. Read off the hub and never
         /// from an argument.
-        raised_before: Option<String>,
+        raised_before: SlotSnapshot,
     },
     /// Step 2: broadcast `AwaitingSecret` and wait for a human.
     FellThrough,

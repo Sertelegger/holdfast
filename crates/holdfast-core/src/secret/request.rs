@@ -238,11 +238,73 @@ pub enum SlotTake {
     NotYours,
 }
 
+/// What a caller saw at the slot before it went away, and the thing its
+/// write is made conditional on (GH #35).
+///
+/// **Two fields, and the second is the one that closes the hole.** The
+/// `request_id` says *which* request the caller was going to satisfy; the
+/// closure count says *whether the slot has been through a request at all*
+/// since the caller looked. The first cannot see a raise that both appeared
+/// and was answered inside the window — that leaves the slot vacant again,
+/// which is byte-for-byte what "nothing ever happened" looks like — and it
+/// is exactly the sequence an anticipatory `request_secret_input` right
+/// after `start_session` produces.
+///
+/// **Constructed only by [`SecretSlots::snapshot`]**, which reads both
+/// fields under one lock. A snapshot assembled from two separate reads
+/// could name a request the count does not agree with, which is the state
+/// this type exists to make unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotSnapshot {
+    /// The outstanding request at the moment of the snapshot, if any.
+    request_id: Option<String>,
+    /// How many requests this session's slot had closed by then.
+    closed: u64,
+}
+
+impl SlotSnapshot {
+    /// Was there a request outstanding when this was taken?
+    ///
+    /// The one thing a caller outside this module needs from the snapshot
+    /// besides handing it back: §9.6's autofill answers with a `request_id`
+    /// only when there was a raise to close.
+    pub fn had_request(&self) -> bool {
+        self.request_id.is_some()
+    }
+}
+
+/// One session's slot and its closure count, behind one lock.
+///
+/// A private struct rather than two fields on [`SecretSlots`] because the
+/// two must be read and written together: [`close`](Self::close) is the
+/// **only** place a request leaves a slot, which is what makes the count
+/// impossible to forget at a new removal site.
+#[derive(Default, Debug)]
+struct Slots {
+    requests: HashMap<String, RaisedRequest>,
+    /// Per session, monotonic, and **never removed** — see
+    /// [`SecretSlots::snapshot`].
+    closed: HashMap<String, u64>,
+}
+
+impl Slots {
+    /// The one removal site. Every `take`-shaped method goes through here.
+    fn close(&mut self, session_id: &str) -> Option<RaisedRequest> {
+        let raised = self.requests.remove(session_id)?;
+        *self.closed.entry(session_id.to_string()).or_insert(0) += 1;
+        Some(raised)
+    }
+
+    fn closed(&self, session_id: &str) -> u64 {
+        self.closed.get(session_id).copied().unwrap_or(0)
+    }
+}
+
 /// Every session's slot. **Vacant is absence from the map**, so there is
 /// no third state to keep consistent with the other two.
 #[derive(Default, Debug)]
 pub struct SecretSlots {
-    inner: Mutex<HashMap<String, RaisedRequest>>,
+    inner: Mutex<Slots>,
 }
 
 impl SecretSlots {
@@ -267,11 +329,11 @@ impl SecretSlots {
         raised_by: RaisedBy,
     ) -> (SecretRequest, bool) {
         let mut slots = self.inner.lock();
-        match slots.get(session_id) {
+        match slots.requests.get(session_id) {
             Some(existing) => (existing.request.clone(), false),
             None => {
                 let request = SecretRequest::new(prompt_text.to_string());
-                slots.insert(
+                slots.requests.insert(
                     session_id.to_string(),
                     RaisedRequest {
                         request: request.clone(),
@@ -307,7 +369,7 @@ impl SecretSlots {
     ) -> Result<Adopted, Collision> {
         let mut slots = self.inner.lock();
         let (tx, rx) = oneshot::channel();
-        match slots.get_mut(session_id) {
+        match slots.requests.get_mut(session_id) {
             // Collide. Note the condition: a waiter, **not** an occupied
             // slot. Treating "occupied" as the collision condition passes
             // every collision test and breaks §16.4's ordinary flow.
@@ -333,7 +395,7 @@ impl SecretSlots {
             None => {
                 let request = SecretRequest::new(prompt_text.to_string());
                 let id = request.request_id.clone();
-                slots.insert(
+                slots.requests.insert(
                     session_id.to_string(),
                     RaisedRequest {
                         request,
@@ -357,7 +419,38 @@ impl SecretSlots {
 
     /// The session's outstanding request, if any.
     pub fn outstanding(&self, session_id: &str) -> Option<SecretRequest> {
-        self.inner.lock().get(session_id).map(|r| r.request.clone())
+        self.inner
+            .lock()
+            .requests
+            .get(session_id)
+            .map(|r| r.request.clone())
+    }
+
+    /// The slot's state, for a caller that is about to go away and come
+    /// back — §9.6's autofill, and nothing else (GH #35).
+    ///
+    /// **Both fields under one lock**, so the id and the closure count
+    /// cannot describe two different moments. Hand the result back to
+    /// [`take_if_unadopted_matching`](Self::take_if_unadopted_matching);
+    /// there is nothing else to do with it.
+    ///
+    /// **The count is never removed, and that is the point.** An entry
+    /// here is one `u64` for a session that has had a secret request
+    /// closed, and sweeping it on session exit would reset the generation
+    /// to zero — after which a snapshot taken before the sweep matches
+    /// again and the hole this closes is open once more. It is bounded by
+    /// the same set the registry already retains: §4.1 keeps an exited
+    /// session in the registry, so a per-session `u64` beside it adds no
+    /// lifetime that was not already there.
+    pub fn snapshot(&self, session_id: &str) -> SlotSnapshot {
+        let slots = self.inner.lock();
+        SlotSnapshot {
+            request_id: slots
+                .requests
+                .get(session_id)
+                .map(|r| r.request.request_id.clone()),
+            closed: slots.closed(session_id),
+        }
     }
 
     /// The call's `max_secret_bytes` and `append_newline`, as the
@@ -372,7 +465,7 @@ impl SecretSlots {
         request_id: &str,
     ) -> Option<(Option<u32>, bool)> {
         let slots = self.inner.lock();
-        let raised = slots.get(session_id)?;
+        let raised = slots.requests.get(session_id)?;
         (raised.request.request_id == request_id)
             .then_some((raised.max_secret_bytes, raised.append_newline))
     }
@@ -411,6 +504,7 @@ impl SecretSlots {
     pub fn has_waiter(&self, session_id: &str) -> bool {
         self.inner
             .lock()
+            .requests
             .get(session_id)
             .is_some_and(|r| r.has_waiter())
     }
@@ -418,6 +512,7 @@ impl SecretSlots {
     pub fn matches_outstanding(&self, session_id: &str, request_id: &str) -> bool {
         self.inner
             .lock()
+            .requests
             .get(session_id)
             .is_some_and(|r| r.request.request_id == request_id)
     }
@@ -439,9 +534,9 @@ impl SecretSlots {
     /// and only learns `bytes_written` afterwards.
     pub fn take(&self, session_id: &str, expect_id: Option<&str>) -> Option<RaisedRequest> {
         let mut slots = self.inner.lock();
-        match slots.get(session_id) {
+        match slots.requests.get(session_id) {
             Some(raised) if expect_id.is_none_or(|id| id == raised.request.request_id) => {
-                slots.remove(session_id)
+                slots.close(session_id)
             }
             _ => None,
         }
@@ -483,6 +578,7 @@ impl SecretSlots {
     pub fn unadopted_sessions(&self) -> Vec<String> {
         self.inner
             .lock()
+            .requests
             .iter()
             .filter(|(_, raised)| !raised.has_waiter())
             .map(|(session_id, _)| session_id.clone())
@@ -525,8 +621,8 @@ impl SecretSlots {
     /// waiting on, and that is the condition this checks.
     pub fn take_if_unadopted(&self, session_id: &str) -> Option<RaisedRequest> {
         let mut slots = self.inner.lock();
-        match slots.get(session_id) {
-            Some(raised) if !raised.has_waiter() => slots.remove(session_id),
+        match slots.requests.get(session_id) {
+            Some(raised) if !raised.has_waiter() => slots.close(session_id),
             _ => None,
         }
     }
@@ -562,39 +658,78 @@ impl SecretSlots {
     /// be typed into the second.
     ///
     /// **Three outcomes and not two**, because the caller's decision needs
-    /// all three and an `Option` collapses two of them. `expect_id` is
-    /// `None` for a caller that found the slot *vacant* before it went
-    /// away, and even that caller must be told [`SlotTake::NotYours`]: a
-    /// raise can appear inside the window and be **adopted by another tool
-    /// call**, and writing into that is the same two-values-in-one-`getpass`
-    /// failure reached from the other side. Answering it here rather than
-    /// with a `has_waiter` probe afterwards is what makes it atomic —
-    /// `take_if_unadopted`'s own doc is where this file records that a
-    /// check-then-`take` outside the lock is exactly the race being closed.
+    /// all three and an `Option` collapses two of them. A snapshot whose
+    /// `request_id` is `None` belongs to a caller that found the slot
+    /// *vacant* before it went away, and even that caller must be told
+    /// [`SlotTake::NotYours`]: a raise can appear inside the window and be
+    /// **adopted by another tool call**, and writing into that is the same
+    /// two-values-in-one-`getpass` failure reached from the other side.
+    /// Answering it here rather than with a `has_waiter` probe afterwards
+    /// is what makes it atomic — `take_if_unadopted`'s own doc is where
+    /// this file records that a check-then-`take` outside the lock is
+    /// exactly the race being closed.
     ///
-    /// **The one thing it cannot see** is a raise that both appeared *and*
-    /// was answered inside the window, starting from a vacant slot: that
-    /// leaves the slot vacant again and is indistinguishable from "nothing
-    /// ever happened", so it answers [`SlotTake::Vacant`] and the caller
-    /// writes. Closing it needs a per-session count of closures that
-    /// outlives the entries it counts; it is filed rather than built, and
-    /// it is **not** exotic — `start_session("ssh prod-01")` followed
-    /// immediately by `request_secret_input`, before the prompt has been
-    /// drawn, is exactly that shape.
-    pub fn take_if_unadopted_matching(
-        &self,
-        session_id: &str,
-        expect_id: Option<&str>,
-    ) -> SlotTake {
+    /// ## The closure count, and what it closes (GH #35)
+    ///
+    /// The id comparison cannot see a raise that both **appeared and was
+    /// answered** inside the window, starting from a vacant slot: that
+    /// leaves the slot vacant again, which is byte-for-byte what "nothing
+    /// ever happened" looks like. Before the count this answered
+    /// [`SlotTake::Vacant`] and the caller wrote — reproduced with a probe
+    /// as `secret_provided`, 8 bytes written, and the child's `got=` count
+    /// **2**, which is the original two-values-in-one-`getpass` defect
+    /// through a smaller door. It is not exotic:
+    /// `start_session("ssh prod-01")` followed immediately by
+    /// `request_secret_input`, before the prompt has been drawn, is exactly
+    /// that shape, and it is the obvious thing for an agent that knows what
+    /// it just started to do.
+    ///
+    /// **A re-check of "is the slot still vacant" is not sufficient and
+    /// that is the whole reason a count exists**: raise-then-answer returns
+    /// the slot to vacant, so the re-check passes. What the write has to be
+    /// conditional on is the slot being *in the state the decision was
+    /// taken against*, and [`SlotSnapshot::closed`] is that state.
+    ///
+    /// **The count is closures, not raises, and the difference is a
+    /// behaviour rather than a detail.** A raise that appeared inside the
+    /// window and is *still outstanding* is unanswered, and is this value's
+    /// to close — that is the ordinary anticipatory case working, and a
+    /// counter that ticked on raises would refuse it, drop a resolved
+    /// credential, and prompt a human who did not need to be asked.
+    ///
+    /// **In production the closure count subsumes the id comparison**, and
+    /// this file says so rather than letting a reader assume two
+    /// independent guards: a *different* request cannot be in the slot
+    /// without the first having been closed, which ticks the count. The
+    /// comparison stays as the second, cheaper statement of the same
+    /// condition — the shape [`take_if_unadopted`](Self::take_if_unadopted)
+    /// and [`unadopted_sessions`](Self::unadopted_sessions) already use in
+    /// this file — and each has a unit row that isolates it, so neither is
+    /// evidence for the other.
+    pub fn take_if_unadopted_matching(&self, session_id: &str, expect: &SlotSnapshot) -> SlotTake {
         let mut slots = self.inner.lock();
-        let Some(raised) = slots.get(session_id) else {
-            return SlotTake::Vacant;
-        };
-        if raised.has_waiter() || expect_id.is_some_and(|id| raised.request.request_id != id) {
+        // Evaluated on the request that is *there*, before the count, so
+        // that a row driving one condition is not answered by the other.
+        if let Some(raised) = slots.requests.get(session_id) {
+            if raised.has_waiter() {
+                return SlotTake::NotYours;
+            }
+            if expect
+                .request_id
+                .as_deref()
+                .is_some_and(|id| raised.request.request_id != id)
+            {
+                return SlotTake::NotYours;
+            }
+        }
+        if slots.closed(session_id) != expect.closed {
             return SlotTake::NotYours;
         }
-        match slots.remove(session_id) {
+        match slots.close(session_id) {
             Some(raised) => SlotTake::Taken(raised),
+            // Nothing there, and nothing has been closed since the
+            // snapshot — so nothing happened, and this value is the only
+            // one the child will receive.
             None => SlotTake::Vacant,
         }
     }
@@ -603,7 +738,7 @@ impl SecretSlots {
     /// that flipped it (Task 7). At most one notice per request.
     pub fn claim_notice(&self, session_id: &str, request_id: &str) -> bool {
         let mut slots = self.inner.lock();
-        match slots.get_mut(session_id) {
+        match slots.requests.get_mut(session_id) {
             Some(raised) if raised.request.request_id == request_id && !raised.notice_written => {
                 raised.notice_written = true;
                 true
@@ -920,6 +1055,21 @@ mod tests {
     /// leaves the slot **vacant** and so never reaches the comparison at
     /// all: dropping this line left the whole workspace green, which is
     /// the shape this project treats as a defect in its own right.
+    /// A snapshot whose closure count is **current** and whose expected id
+    /// is whatever the row is driving.
+    ///
+    /// **This is what keeps the id and waiter rows from being answered by
+    /// the closure count**, which in production subsumes the id comparison
+    /// (see `take_if_unadopted_matching`). Holding the count equal makes
+    /// each row a statement about exactly one condition, so that dropping
+    /// that condition is what reddens it — and the count has its own row
+    /// below.
+    fn expecting(slots: &SecretSlots, request_id: Option<&str>) -> SlotSnapshot {
+        let mut snap = slots.snapshot(S);
+        snap.request_id = request_id.map(str::to_string);
+        snap
+    }
+
     #[test]
     fn the_autofills_take_refuses_an_id_that_is_not_the_one_it_left() {
         let slots = SecretSlots::new();
@@ -933,7 +1083,7 @@ mod tests {
 
         assert!(
             matches!(
-                slots.take_if_unadopted_matching(S, Some(&first.request_id)),
+                slots.take_if_unadopted_matching(S, &expecting(&slots, Some(&first.request_id))),
                 SlotTake::NotYours
             ),
             "a value fetched for the first request was handed the second"
@@ -946,25 +1096,82 @@ mod tests {
         // **The pairing.** The same call with the id that *is* there takes
         // it — without this the row passes against a method that refuses
         // everything, which would break every autofill instead.
-        let SlotTake::Taken(got) = slots.take_if_unadopted_matching(S, Some(&second.request_id))
+        let SlotTake::Taken(got) =
+            slots.take_if_unadopted_matching(S, &expecting(&slots, Some(&second.request_id)))
         else {
             panic!("the matching id must be taken");
         };
         assert_eq!(got.request_id(), second.request_id);
         assert!(slots.outstanding(S).is_none());
 
-        // And a vacant slot is `Vacant` rather than `NotYours`: those two
-        // are opposite instructions to the one caller that writes a
-        // credential, so collapsing them is the bug this enum exists to
-        // make unrepresentable.
+        // And a vacant slot a caller has just looked at is `Vacant` rather
+        // than `NotYours`: those two are opposite instructions to the one
+        // caller that writes a credential, so collapsing them is the bug
+        // this enum exists to make unrepresentable.
         assert!(matches!(
-            slots.take_if_unadopted_matching(S, Some(&second.request_id)),
+            slots.take_if_unadopted_matching(S, &expecting(&slots, None)),
             SlotTake::Vacant
         ));
+    }
+
+    /// **The closure count**, and the sequence it is the only thing that
+    /// can see (GH #35).
+    ///
+    /// The autofill looked at a **vacant** slot, went away for as long as
+    /// `keychain_provider_timeout_secs`, and in that window a raise
+    /// appeared and a human answered it. The slot is vacant again — which
+    /// is byte-for-byte what "nothing ever happened" looks like — so
+    /// neither the id comparison (there is no id to compare) nor a
+    /// re-check of vacancy can tell the two apart. Writing anyway puts
+    /// **two values into one `getpass`**: the human's is consumed and the
+    /// resolved one waits in the tty input queue for whatever the child
+    /// reads next.
+    #[test]
+    fn the_autofills_take_refuses_a_slot_that_was_answered_while_it_was_away() {
+        let slots = SecretSlots::new();
+        // What the autofill saw before the provider call: nothing.
+        let before = slots.snapshot(S);
+
+        // Inside the window: the echo drop raises, and a human at an
+        // attached client answers it through `take`.
+        let (raised, _) = slots.raise(S, "[sudo] password for ada:", RaisedBy::EchoDrop);
+        assert!(slots.take(S, Some(&raised.request_id)).is_some());
+        assert!(
+            slots.outstanding(S).is_none(),
+            "the arrangement must leave the slot vacant, or this row is about \
+             something else"
+        );
+
+        assert!(
+            matches!(
+                slots.take_if_unadopted_matching(S, &before),
+                SlotTake::NotYours
+            ),
+            "a raise appeared and was answered while the provider ran, and the \
+             autofill was told to write anyway — two values into one getpass"
+        );
+
+        // **The pairing, and it is the one that matters**: a snapshot taken
+        // *after* that sequence, over the same vacant slot, still writes.
+        // Without it the row passes against an implementation that never
+        // writes at all, which would break every autofill instead of the
+        // one case this is about.
         assert!(matches!(
-            slots.take_if_unadopted_matching(S, None),
+            slots.take_if_unadopted_matching(S, &slots.snapshot(S)),
             SlotTake::Vacant
         ));
+
+        // **The second pairing, and it is the behaviour a raise counter
+        // would have broken.** A raise that appeared inside the window and
+        // is *still outstanding* is unanswered, so it is this value's to
+        // close — the ordinary anticipatory case, where an agent calls
+        // `request_secret_input` before the prompt is drawn.
+        let fresh = slots.snapshot(S);
+        let (appeared, _) = slots.raise(S, "MySQL password:", RaisedBy::EchoDrop);
+        let SlotTake::Taken(got) = slots.take_if_unadopted_matching(S, &fresh) else {
+            panic!("an unanswered raise that appeared inside the window is the value's to close");
+        };
+        assert_eq!(got.request_id(), appeared.request_id);
     }
 
     /// **The waiter half**, for both callers — the one that left an id
@@ -981,7 +1188,7 @@ mod tests {
         // Before anyone adopts it, it is takeable — the control that makes
         // the refusal below evidence of the waiter rather than of the id.
         assert!(matches!(
-            slots.take_if_unadopted_matching(S, Some(&raised.request_id)),
+            slots.take_if_unadopted_matching(S, &expecting(&slots, Some(&raised.request_id))),
             SlotTake::Taken(_)
         ));
 
@@ -991,22 +1198,24 @@ mod tests {
             .expect("a raised slot with no waiter is adopted");
         assert_eq!(a.request_id, raised.request_id);
 
-        // The id matches and it is still refused, which is what separates
-        // the two conditions.
+        // The id matches **and the closure count matches**, and it is still
+        // refused — which is what leaves the waiter test as the only thing
+        // that can have refused it.
         assert!(
             matches!(
-                slots.take_if_unadopted_matching(S, Some(&raised.request_id)),
+                slots.take_if_unadopted_matching(S, &expecting(&slots, Some(&raised.request_id))),
                 SlotTake::NotYours
             ),
             "the autofill took a slot a waiting call owns"
         );
-        // **And the vacant-before caller is told the same thing.** It
-        // passes `None`, so the id test cannot be what refuses it; only
-        // the waiter test can, and this is the half that stops an autofill
-        // writing into a raise another tool call adopted inside its window.
+        // **And the vacant-before caller is told the same thing.** Its
+        // snapshot carries no id, so the id test cannot be what refuses it;
+        // only the waiter test can, and this is the half that stops an
+        // autofill writing into a raise another tool call adopted inside
+        // its window.
         assert!(
             matches!(
-                slots.take_if_unadopted_matching(S, None),
+                slots.take_if_unadopted_matching(S, &expecting(&slots, None)),
                 SlotTake::NotYours
             ),
             "a caller that found the slot vacant wrote into somebody else's adoption"

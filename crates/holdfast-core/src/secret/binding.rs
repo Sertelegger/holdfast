@@ -1978,6 +1978,159 @@ mod tests {
         let _ = s2.signal(Signal::Kill);
     }
 
+    /// **GH #35: a raise that appears *and is answered* inside the provider
+    /// window, starting from a vacant slot.**
+    ///
+    /// The two rows above cover the raise that was there **before** the
+    /// call (an id to compare) and the raise that appears and is **adopted**
+    /// (a waiter to see). This is the third sequence and the one neither
+    /// could see: from a vacant slot, an echo drop raises and a human at an
+    /// attached client answers it, all inside the provider's window. The
+    /// slot is vacant again, which is byte-for-byte what "nothing ever
+    /// happened" looks like — so a re-check of vacancy passes and the
+    /// autofill writes on top of the human's answer. Reproduced with a
+    /// throwaway probe before the fix: `secret_provided`, **8 bytes
+    /// written**, the child's `got=` count **2**, `got=HUNTER2` present.
+    ///
+    /// It is the ordinary anticipatory pattern rather than a corner:
+    /// `start_session("ssh prod-01")` followed immediately by
+    /// `request_secret_input`, before the prompt has been drawn, is exactly
+    /// a vacant-slot call.
+    ///
+    /// **The pairing is the same window with the human's answer removed**,
+    /// which *does* produce `got=HUNTER2` — without it,
+    /// `!contains("got=HUNTER2")` passes against an autofill that stopped
+    /// writing at all. The two-read child is what makes a second value
+    /// visible: without it a value left in the tty input queue is simply
+    /// discarded at exit and the defect is invisible.
+    #[tokio::test]
+    async fn a_raise_answered_inside_the_provider_window_is_not_overwritten() {
+        let two_reads = format!("{ECHO_OFF_FIXTURE}; {ECHO_OFF_FIXTURE}");
+
+        // ---- raised and answered inside the window: no write
+        let mut sc = Scratch::new("gh35");
+        let gate = sc.path("gate");
+        let b = sc.binding(
+            "slot",
+            "^ssh\\b",
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                gate.display()
+            ),
+        );
+        let server = Arc::new(server_with(keychain_mode(vec![b]), &sc.audit_log()));
+        let s = session_running("ssh", &["prod-01"], &two_reads);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+        // **Vacant**, deliberately: with a raise outstanding this row is
+        // the id comparison's, not the closure count's.
+        assert!(
+            server.attach_hub().outstanding_secret(&s.id).is_none(),
+            "this row is about a slot that was vacant when the call began"
+        );
+
+        let call = {
+            let server = Arc::clone(&server);
+            let args = secret_args(&s.id, 2);
+            tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
+        };
+        // The provider has started and is blocked on the gate, so
+        // everything below happens strictly inside the window.
+        await_ran(&sc, "slot").await;
+
+        // The echo-drop raise `attach::conn`'s `forward_events` makes, and
+        // then a human answering it — `close_secret` by id, then the write,
+        // which is exactly what that arm does.
+        let (appeared, first) = server.attach_hub().raise_secret(&s.id, "Password: ");
+        assert!(first, "the row, not something else, raised this request");
+        let taken = server
+            .attach_hub()
+            .close_secret(&s.id, Some(&appeared.request_id))
+            .expect("the human took the slot while the provider was running");
+        drop(taken);
+        write_as_a_human(&s, b"humanpw").await;
+        buffer_until(&s, b"got=HUMANPW", 20).await;
+        assert!(
+            server.attach_hub().outstanding_secret(&s.id).is_none(),
+            "the arrangement must leave the slot vacant again, or this row is about \
+             the id comparison"
+        );
+
+        std::fs::write(&gate, b"go").expect("open the gate");
+
+        let payload = body(
+            &tokio::time::timeout(Duration::from_secs(60), call)
+                .await
+                .expect("the call never returned")
+                .expect("the call task")
+                .expect("request_secret_input"),
+        );
+        assert_eq!(
+            payload["status"], "secret_cancelled",
+            "the call reported a write it must not have made: {payload}"
+        );
+
+        let seen = buffered(&s);
+        assert!(
+            !contains(&seen, b"got=HUNTER2"),
+            "the resolved value was written on top of the human's answer, and the \
+             child's next read consumed it:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(
+            seen.windows(4).filter(|w| *w == b"got=").count(),
+            1,
+            "the child completed more than one read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        // The binding still resolved — §9.6 counts resolutions from the
+        // store, not values written to a PTY.
+        assert!(
+            sc.kinds(&s.id).iter().any(|k| k == "binding_resolved"),
+            "the provider ran and produced a value; the trail should say so"
+        );
+        let _ = s.signal(Signal::Kill);
+
+        // ---- the pairing: identical, minus the human's answer
+        let mut sc2 = Scratch::new("gh35-control");
+        let gate2 = sc2.path("gate");
+        let b2 = sc2.binding(
+            "slot",
+            "^ssh\\b",
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                gate2.display()
+            ),
+        );
+        let server2 = Arc::new(server_with(keychain_mode(vec![b2]), &sc2.audit_log()));
+        let s2 = session_running("ssh", &["prod-01"], &two_reads);
+        server2.registry.insert(Arc::clone(&s2)).expect("register");
+        await_prompt(&s2, b"Password: ").await;
+
+        let call2 = {
+            let server = Arc::clone(&server2);
+            let args = secret_args(&s2.id, 10);
+            tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
+        };
+        await_ran(&sc2, "slot").await;
+        std::fs::write(&gate2, b"go").expect("open the gate");
+
+        let control = body(
+            &tokio::time::timeout(Duration::from_secs(60), call2)
+                .await
+                .expect("the control call never returned")
+                .expect("the control task")
+                .expect("request_secret_input"),
+        );
+        assert_eq!(
+            control["status"], "secret_provided",
+            "nothing interfered and the autofill still did not write, so the row \
+             above is asserting nothing: {control}"
+        );
+        buffer_until(&s2, b"got=HUNTER2", 20).await;
+        let _ = s2.signal(Signal::Kill);
+    }
+
     /// **Every [`FellThrough`] variant, driven.**
     ///
     /// The enum's fields are read by nothing on the call path — the
