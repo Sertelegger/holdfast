@@ -16,8 +16,12 @@
 //! `prompt_text`, which is an agent-supplied string and a different
 //! thing entirely.
 
+pub mod provider;
 pub mod request;
 
+pub use provider::{
+    resolve, resolve_with, ArgvProvider, ProviderError, ScriptProvider, SecretProvider,
+};
 pub use request::{
     buffer_notice, Adopted, CancelReason, Collision, RaisedBy, RaisedRequest, Resolution,
     SecretSlots,

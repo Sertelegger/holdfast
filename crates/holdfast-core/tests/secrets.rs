@@ -26,8 +26,9 @@
 //! request until its next byte of output.
 
 use holdfast_core::attach::frames::{decode_server_frame, ClientFrame, ServerFrame};
-use holdfast_core::attach::{AttachMode, AttachRole};
+use holdfast_core::attach::{AttachMode, AttachRole, SecretBytes};
 use holdfast_core::clock::Clock;
+use holdfast_core::config::{SecretBinding, SecurityConfig};
 use holdfast_core::daemon::attach_server;
 use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::server::{self, Daemon};
@@ -36,7 +37,10 @@ use holdfast_core::platform::Capabilities;
 use holdfast_core::protocol::frame;
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use holdfast_core::pty::{InProcessPty, PtyBackend, PtySpawnConfig, Signal};
-use holdfast_core::session::{new_session_id, Session, SessionConfig};
+use holdfast_core::secret::{
+    resolve, resolve_with, ArgvProvider, ProviderError, ScriptProvider, SecretProvider,
+};
+use holdfast_core::session::{new_session_id, Session, SessionConfig, WriteRequest};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use serde_json::Value;
@@ -2303,4 +2307,707 @@ async fn the_tool_works_when_the_capability_is_present() {
     .await;
     assert_eq!(joined(call, "the call").await["status"], "secret_provided");
     let _ = s.signal(Signal::Kill);
+}
+
+// ============================================================ §9.6's five
+//
+// **No test below runs a credential store, and none can be made to.**
+// REQ-TST-007 / Global Constraint 12: `secret-tool`, `security`, `pass`
+// and `op` are tools this project neither pins nor installs, and none is
+// present on a runner. So every row here is either an **argv assertion
+// that executes nothing**, or a **script fixture the test itself wrote**
+// — which is what actually pins the daemon's handling of a provider's
+// output, rather than pinning `secret-tool`'s behaviour, which is not
+// this module's job.
+//
+// **Nothing in the daemon calls `resolve` yet.** Choosing a provider for
+// a session, deciding whether its command line matches a binding and
+// writing the `binding_resolved` audit entry are the *next* task's. The
+// fall-through rows below therefore make the dispatch Task 10 will make —
+// `match resolve(…) { Ok(v) => write it, Err(_) => prompt }` — explicitly,
+// in the test, and say so. Where a row's subject genuinely does not exist
+// yet (the `audit.log` half of the no-log row), the assertion is **left
+// out and named** rather than written as an absence against a file
+// nothing writes to: that is the shape Global Constraint 3 calls a
+// decorative test.
+
+/// A scratch directory under `/tmp/holdfast-…` (Global Constraint 11's
+/// sweep pattern) plus any stray paths a row created outside it, removed
+/// even when the row panics.
+struct Scratch {
+    dir: PathBuf,
+    extra: Vec<PathBuf>,
+}
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let dir = PathBuf::from(format!("/tmp/holdfast-provider-{tag}-{}", &unique[..8]));
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+        Self {
+            dir,
+            extra: Vec::new(),
+        }
+    }
+
+    /// Write an executable `/bin/sh` fixture. A shell script and not a
+    /// compiled helper because the *provider* is a program that prints a
+    /// value, and this is the shortest thing that is one.
+    fn script(&self, name: &str, body: &str) -> PathBuf {
+        let path = self.dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write the fixture");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the fixture");
+        path
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for p in &self.extra {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `[security]` with one knob moved. Built in Rust rather than from a
+/// TOML fixture on purpose: `keychain_provider_timeout_secs` has no
+/// §10.2 line to copy (it is one of 0.0.7's three additive keys, Q4), and
+/// `config.rs`'s own default-fold test already pins that it loads and
+/// defaults to 10.
+fn provider_limits(secs: u32) -> SecurityConfig {
+    SecurityConfig {
+        keychain_provider_timeout_secs: secs,
+        ..SecurityConfig::default()
+    }
+}
+
+/// `resolve_with` off the async runtime. It blocks — it waits on an OS
+/// process — so a `#[tokio::test]` that called it inline would block the
+/// current-thread runtime the rest of the row needs.
+async fn resolve_off_thread(
+    provider: ScriptProvider,
+    reference: &str,
+    limits: SecurityConfig,
+    append_newline: bool,
+) -> Result<SecretBytes, ProviderError> {
+    let reference = reference.to_string();
+    tokio::task::spawn_blocking(move || {
+        resolve_with(&provider, &reference, &limits, append_newline)
+    })
+    .await
+    .expect("the resolve task")
+}
+
+/// Put a resolved value on §4.3's write queue exactly as the attach path
+/// does, and answer with the count the PTY took — which is the number
+/// `Resolution::Provided { bytes_written }` carries.
+async fn write_secret(s: &Session, secret: SecretBytes) -> usize {
+    let (req, ack) = WriteRequest::secret(secret);
+    s.write_queue()
+        .send(req)
+        .await
+        .expect("the write queue accepted");
+    ack.await
+        .expect("the writer answered")
+        .expect("the PTY took the write")
+}
+
+/// Poll the ring buffer until `needle` shows up, or fail. Used instead of
+/// an attached client where the row has nothing to say about broadcast.
+async fn buffer_until(s: &Session, needle: &[u8], secs: u64) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let buf = buffered(s);
+        if contains(&buf, needle) {
+            return buf;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{:?} never reached the buffer:\n{}",
+            String::from_utf8_lossy(needle),
+            String::from_utf8_lossy(&buf)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait until the child has dropped `ECHO` — observed through its own
+/// prompt, which `ECHO_OFF_FIXTURE` prints *after* `stty -echo`. Writing
+/// before that point would be echoed back into the ring buffer by the
+/// line discipline, which would make the leak assertions here fail for a
+/// reason that has nothing to do with the provider.
+async fn await_echo_off(s: &Session) {
+    buffer_until(s, b"Password: ", 20).await;
+}
+
+/// §9.6's own example reference, and the one both attribute-addressed
+/// templates are pinned against.
+const ATTR_REFERENCE: &str = "service=holdfast,account=prod-ssh";
+
+/// **Four exact vectors, executing nothing.**
+///
+/// `wincred` is the fifth and has no argv to compare: Windows Credential
+/// Manager is a `CredReadW` call rather than a program, and its body is
+/// 0.0.11's. It is asserted here as *refused*, which is the only claim
+/// this milestone can make about it honestly.
+///
+/// The `-w` on `security` is the reason this row pins the argv exactly
+/// rather than checking that it starts with `security`: without it,
+/// `find-generic-password` prints the item's **metadata** instead of the
+/// password. That is a resolution that succeeds, injects the wrong bytes
+/// and looks correct in every log — and no behavioural test on Linux
+/// could ever see it.
+#[test]
+fn each_provider_builds_the_argv_the_plan_pins() {
+    assert_eq!(
+        ArgvProvider::SecretService.argv(ATTR_REFERENCE).unwrap(),
+        vec![
+            "secret-tool",
+            "lookup",
+            "service",
+            "holdfast",
+            "account",
+            "prod-ssh"
+        ],
+        "the secret-tool template"
+    );
+    assert_eq!(
+        ArgvProvider::Keychain.argv(ATTR_REFERENCE).unwrap(),
+        vec![
+            "security",
+            "find-generic-password",
+            "-s",
+            "holdfast",
+            "-a",
+            "prod-ssh",
+            "-w"
+        ],
+        "the security template — note the trailing -w"
+    );
+    assert_eq!(
+        ArgvProvider::Pass.argv("work/db").unwrap(),
+        vec!["pass", "show", "work/db"],
+        "the pass template"
+    );
+    assert_eq!(
+        ArgvProvider::OnePassword.argv("op://v/i/f").unwrap(),
+        vec!["op", "read", "op://v/i/f"],
+        "the op template"
+    );
+
+    // The fifth, and the two negatives that stop the four above from
+    // being satisfied by a builder that accepts anything.
+    assert_eq!(
+        ArgvProvider::WinCred.argv(ATTR_REFERENCE),
+        Err(ProviderError::NotImplemented {
+            provider: "wincred".to_string()
+        }),
+        "wincred has no argv in this build and must say so rather than \
+         resolving nothing quietly"
+    );
+    assert_eq!(
+        ArgvProvider::Keychain.argv("work/db"),
+        Err(ProviderError::MalformedReference {
+            provider: "keychain".to_string()
+        }),
+        "a path-shaped reference is not two keychain attributes"
+    );
+
+    // And the config spellings, which are what `binding_resolved` and
+    // `BindingApprovalRequired` put on the wire — a re-spelling here is a
+    // re-spelling in an audit log and in an approval dialog.
+    assert_eq!(
+        ArgvProvider::ALL.map(|p| p.as_str()),
+        [
+            "secret-service",
+            "keychain",
+            "pass",
+            "onepassword",
+            "wincred"
+        ]
+    );
+
+    // The binding-shaped entry point, driven only where it cannot reach a
+    // spawn: a `resolve` naming a real provider would run whatever is
+    // installed on the runner, which Global Constraint 12 forbids.
+    let unknown = SecretBinding {
+        name: "deploy".into(),
+        match_command: "ssh *".into(),
+        match_prompt: "password:".into(),
+        provider: "1password".into(),
+        reference: "op://v/i/f".into(),
+        max_uses: None,
+        require_confirm: false,
+    };
+    // `SecretBytes` has no `PartialEq` — and must not gain one, which is
+    // why this compares the error rather than the `Result`.
+    let refused = resolve(&unknown, &provider_limits(10), true)
+        .expect_err("a near-miss spelling must not resolve");
+    assert_eq!(
+        refused,
+        ProviderError::UnknownProvider("1password".to_string()),
+        "the config spelling is `onepassword`, and a near miss must be a \
+         refusal rather than a silent fall-through"
+    );
+}
+
+/// **Two halves, because the argv half executes nothing and so cannot
+/// exercise a canary at all.**
+///
+/// (a) the built argv carries the whole string as one element; (b) the
+/// same reference against a script provider that really is spawned, with
+/// a canary file whose path the reference tries to `rm -rf`. Without (b)
+/// the canary asserts nothing, because nothing ran.
+#[test]
+fn a_reference_with_shell_metacharacters_is_not_interpreted() {
+    let mut fx = Scratch::new("meta");
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let canary = PathBuf::from(format!("/tmp/holdfast-canary-{}", &unique[..8]));
+    std::fs::write(&canary, b"alive").expect("create the canary");
+    fx.extra.push(canary.clone());
+
+    let reference = format!("work/db; rm -rf {}", canary.display());
+
+    // (a) — the whole string, as one element.
+    assert_eq!(
+        ArgvProvider::Pass.argv(&reference).unwrap(),
+        vec!["pass".to_string(), "show".to_string(), reference.clone()],
+        "the reference was split, quoted or interpolated"
+    );
+
+    // (b) — really spawned. The fixture records its `$1` so the argv is
+    // assertable from the child's side too: a `sh -c` boundary would give
+    // it `work/db` and run the rest as a command.
+    let seen = fx.path("argv1");
+    let script = fx.script(
+        "meta.sh",
+        &format!(
+            "printf '%s' \"$1\" > '{}'\nprintf 'hunter2\\n'\n",
+            seen.display()
+        ),
+    );
+    let value = resolve_with(
+        &ScriptProvider::new("pass", &script),
+        &reference,
+        &provider_limits(10),
+        false,
+    )
+    .expect("the fixture resolves");
+    assert_eq!(value.len(), 7, "the fixture's value did not arrive intact");
+
+    assert!(
+        canary.exists(),
+        "the reference reached a shell: {} is gone",
+        canary.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&seen).expect("the fixture recorded its argv"),
+        reference,
+        "the provider saw something other than the whole reference as $1"
+    );
+    // The pairing, and the reason the canary means anything: the same
+    // string really would have deleted the file had a shell seen it.
+    assert!(
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("true {reference}"))
+            .status()
+            .expect("the control shell ran")
+            .success(),
+        "the control could not run"
+    );
+    assert!(
+        !canary.exists(),
+        "the control did not delete the canary, so the assertion above was \
+         asserting nothing"
+    );
+}
+
+/// **The positive control for every absence assertion in this section.**
+///
+/// A provider that answers is a provider whose value reaches the child.
+/// Without this row, a resolver that returned `Ok` with an empty value
+/// satisfies "the value is not in the buffer", "not in the log" and "not
+/// in the response" perfectly.
+#[tokio::test]
+async fn a_provider_that_returns_a_value_resolves_it_to_the_child() {
+    let d = TestDaemon::start("provideok").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    await_echo_off(&s).await;
+
+    let fx = Scratch::new("ok");
+    let script = fx.script("ok.sh", "printf 'hunter2\\n'\n");
+    let value = resolve_off_thread(
+        ScriptProvider::new("pass", &script),
+        "work/db",
+        provider_limits(10),
+        true,
+    )
+    .await
+    .expect("a provider that prints a value resolves it");
+    assert_eq!(
+        value.len(),
+        PROBE.len() + 1,
+        "seven bytes plus the appended newline"
+    );
+
+    // Task 10's `Ok(v) => write it`, made here because nothing calls
+    // `resolve` yet.
+    assert_eq!(write_secret(&s, value).await, PROBE.len() + 1);
+
+    // The child transformed what it read, which is how arrival is
+    // asserted without the value ever being printed.
+    let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+    // ...and the value itself is not in the buffer, because the line
+    // discipline had ECHO off when it arrived. This is the pairing that
+    // separates "the provider resolved" from "the provider echoed".
+    assert!(
+        !contains(&seen, PROBE.as_bytes()),
+        "the resolved value reached the ring buffer:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// §5.2's strip, over a provider's output rather than a client's.
+///
+/// `pass show` and `security -w` both emit a trailing newline, and a
+/// password with one injected into a `getpass` read submits an empty
+/// second line. The trailing-**space** row is the one that separates
+/// "strip exactly one newline" from `trim_end()`, which corrupts a
+/// password ending in a space.
+#[tokio::test]
+async fn the_providers_trailing_newline_is_stripped_exactly_once() {
+    let d = TestDaemon::start("stripnl").await;
+    let s = d.shell_running("cat");
+    let fx = Scratch::new("strip");
+
+    for (name, body, with, without) in [
+        ("lf.sh", "printf 'hunter2\\n'\n", 8usize, 7usize),
+        ("crlf.sh", "printf 'hunter2\\r\\n'\n", 8, 7),
+        ("bare.sh", "printf 'hunter2'\n", 8, 7),
+        // A value that legitimately ends in a space. `trim_end()` makes
+        // this 8/7 and injects the wrong password.
+        ("space.sh", "printf 'hunter2 \\n'\n", 9, 8),
+    ] {
+        let script = fx.script(name, body);
+        for (append, expect) in [(true, with), (false, without)] {
+            let value = resolve_off_thread(
+                ScriptProvider::new("pass", &script),
+                "work/db",
+                provider_limits(10),
+                append,
+            )
+            .await
+            .expect("the fixture resolves");
+            assert_eq!(
+                value.len(),
+                expect,
+                "{name} with append_newline={append}: wrong normalised length"
+            );
+            // ...and the same number really is what the PTY takes, which
+            // is the number `bytes_written` reports to the agent.
+            assert_eq!(
+                write_secret(&s, value).await,
+                expect,
+                "{name} with append_newline={append}: wrong byte count written"
+            );
+        }
+    }
+    let _ = s.signal(Signal::Kill);
+}
+
+/// §9.6's fall-through (Q4): a locked keyring is **not** a call failure.
+///
+/// The flow it protects has a human fallback by design, and turning a
+/// non-zero exit into a hard error would make an unlocked-keyring
+/// requirement out of a convenience.
+#[tokio::test]
+async fn a_provider_that_fails_falls_through_to_the_prompt_path() {
+    let d = TestDaemon::start("providefail").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    let fx = Scratch::new("fail");
+    let script = fx.script(
+        "fail.sh",
+        "printf 'gpg: decryption failed\\n' >&2\nexit 1\n",
+    );
+    let err = resolve_off_thread(
+        ScriptProvider::new("pass", &script),
+        "work/db",
+        provider_limits(10),
+        true,
+    )
+    .await
+    .expect_err("a provider that exits 1 must resolve nothing");
+    match &err {
+        ProviderError::Failed { provider, status } => {
+            assert_eq!(provider, "pass");
+            assert!(
+                status.contains('1'),
+                "the exit status is not named: {status}"
+            );
+        }
+        other => panic!("a non-zero exit should be `Failed`, got {other:?}"),
+    }
+
+    // Task 10's `Err(_) => prompt`. The request is already raised — the
+    // echo drop did it (§8.3) — so the fall-through is the human
+    // answering the prompt that is already on every attached client.
+    let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    await_waiter(&d, &s.id, "the call after the provider failed").await;
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    let payload = joined(call, "the call after the provider failed").await;
+    assert_eq!(
+        payload["status"], "secret_provided",
+        "a failed provider turned a flow with a human fallback into an error"
+    );
+    assert_eq!(payload["data"]["bytes_written"], (PROBE.len() + 1) as u64);
+    buffer_until(&s, b"got=HUNTER2", 20).await;
+    let _ = s.signal(Signal::Kill);
+}
+
+/// Rule 5. `op read` can block on a biometric prompt indefinitely, and it
+/// would be holding the session's **only** request slot while it did.
+///
+/// The process assertion is what separates "gave up waiting" from
+/// "abandoned a running child": a timeout that only stopped waiting
+/// leaves the subprocess alive, and on a daemon that runs for weeks those
+/// accumulate.
+#[tokio::test]
+async fn a_provider_that_hangs_is_killed_and_falls_through() {
+    let d = TestDaemon::start("providehang").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    let fx = Scratch::new("hang");
+    let pidfile = fx.path("pid");
+    // `exec` on purpose: the recorded pid stays the pid of the process
+    // that is actually sleeping, so "the child is gone" is a claim about
+    // the thing that was killed rather than about a shell that had
+    // already left a grandchild behind.
+    let script = fx.script(
+        "hang.sh",
+        &format!("echo $$ > '{}'\nexec sleep 60\n", pidfile.display()),
+    );
+
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(
+        Duration::from_secs(25),
+        resolve_off_thread(
+            ScriptProvider::new("op", &script),
+            "op://v/i/f",
+            provider_limits(1),
+            true,
+        ),
+    )
+    .await
+    .expect("the 1 s budget never fired: the provider was not bounded at all")
+    .expect_err("a provider that never answers must resolve nothing");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        err,
+        ProviderError::TimedOut {
+            provider: "op".to_string(),
+            secs: 1
+        }
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the 1 s budget was ignored and something larger was used: {elapsed:?}"
+    );
+    // The pairing: it really did wait, rather than refusing to run the
+    // provider at all.
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "the provider was never given its second: {elapsed:?}"
+    );
+
+    // The child is **gone**, not merely unwaited-for.
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .expect("the fixture recorded its pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+    assert!(pid > 1, "the fixture recorded a nonsense pid: {pid}");
+    let mut alive = true;
+    for _ in 0..100 {
+        // `kill(pid, 0)` is the POSIX liveness probe: it delivers nothing
+        // and answers ESRCH once the process is both dead and reaped.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            alive = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !alive,
+        "pid {pid} is still running: the timeout abandoned the child rather \
+         than killing it"
+    );
+
+    // ...and the call falls through to the prompt exactly as a failure
+    // does.
+    let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    await_waiter(&d, &s.id, "the call after the provider hung").await;
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        joined(call, "the call after the provider hung").await["status"],
+        "secret_provided"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+/// Rule 3: the provider **name** and the exit status reach the log, and
+/// the reference and the provider's stderr do not.
+///
+/// `pass`'s error messages contain the store path, which *is* the
+/// reference — so `String::from_utf8_lossy(&out.stderr)` in an error
+/// context, the natural thing to write, puts §9.6's one
+/// never-log-this value into a file that is kept for weeks.
+///
+/// **`daemon.log` only, and that is deliberate rather than an oversight.**
+/// The plan's row also names `audit.log`; nothing in this milestone's
+/// task writes a provider outcome there — `binding_resolved` is Task
+/// 10's — so an "audit.log does not contain the reference" assertion here
+/// would be an absence assertion against a file no implementation writes
+/// to, which is Global Constraint 3's named decorative shape. It is left
+/// out and recorded rather than written.
+///
+/// The capture is fd 2 itself: `diag::emit` writes to
+/// `std::io::stderr()` and deliberately bypasses libtest's capture, and
+/// on the daemon that fd *is* `daemon.log`.
+#[test]
+fn a_failing_providers_stderr_and_reference_reach_no_log() {
+    let fx = Scratch::new("nolog");
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let marker = format!("STDERRMARKER{}", &unique[..8]);
+    let reference = format!("work/REFERENCEMARKER{}", &unique[8..16]);
+
+    // The fixture prints its own `$1` — the reference — and a distinctive
+    // string to stderr, then exits 2.
+    let script = fx.script(
+        "stderr.sh",
+        &format!("printf '%s\\n' \"$1\" >&2\nprintf '{marker}\\n' >&2\nexit 2\n"),
+    );
+
+    let capture = fx.path("stderr.txt");
+    let (outcome, log) = with_captured_stderr(&capture, || {
+        resolve_with(
+            &ScriptProvider::new("pass", &script),
+            &reference,
+            &provider_limits(10),
+            true,
+        )
+    });
+    let err = outcome.expect_err("exit 2 must resolve nothing");
+    let ProviderError::Failed { provider, status } = &err else {
+        panic!("expected `Failed`, got {err:?}")
+    };
+
+    // The positive half. Without it, every absence below is satisfied by
+    // a daemon that logs nothing at all.
+    assert!(
+        log.contains(&format!("`{provider}`")),
+        "the provider is not named in the log:\n{log}"
+    );
+    assert!(
+        log.contains(status.as_str()),
+        "the exit status ({status}) is not in the log:\n{log}"
+    );
+    assert!(
+        status.contains('2'),
+        "the exit code is not in the status: {status}"
+    );
+
+    // The absences.
+    assert!(
+        !log.contains(&reference),
+        "the reference reached daemon.log:\n{log}"
+    );
+    assert!(
+        !log.contains(&marker),
+        "the provider's stderr body reached daemon.log:\n{log}"
+    );
+    // ...and on the error value itself, which is what the *caller* will
+    // log. No variant of `ProviderError` can carry either string, and
+    // this is that claim executed.
+    let rendered = format!("{err}");
+    assert!(!rendered.contains(&reference), "{rendered}");
+    assert!(!rendered.contains(&marker), "{rendered}");
+    assert!(rendered.contains("pass"), "{rendered}");
+
+    // The control that says the capture works at all: a string this test
+    // knows was written to fd 2 during the window.
+    assert!(
+        !log.is_empty(),
+        "nothing at all was captured, so neither absence above means anything"
+    );
+}
+
+/// Redirect this process's fd 2 into `path` for the duration of `f`.
+///
+/// fd-level and not `eprintln!`-level because `diag::emit` writes through
+/// `std::io::stderr()` precisely to bypass libtest's capture — the
+/// daemon's diagnostics are the thing under test in more than one place
+/// in this repo, and a capture that ate them would make those tests lie.
+///
+/// **The restore is a `Drop` and not a statement after the call.** libtest
+/// runs these rows on threads of one process, and an `f` that panicked
+/// with the restore written inline would leave *every other row's* stderr
+/// pointing at a temp file this function is about to delete — a whole
+/// suite silently losing its diagnostics because one row failed.
+fn with_captured_stderr<R>(path: &std::path::Path, f: impl FnOnce() -> R) -> (R, String) {
+    use std::os::unix::io::AsRawFd;
+
+    struct Restore(std::os::raw::c_int);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe {
+                libc::dup2(self.0, 2);
+                libc::close(self.0);
+            }
+        }
+    }
+
+    let file = std::fs::File::create(path).expect("create the capture file");
+    let saved = unsafe { libc::dup(2) };
+    assert!(saved >= 0, "dup(2) failed");
+    let _restore = Restore(saved);
+    assert!(
+        unsafe { libc::dup2(file.as_raw_fd(), 2) } >= 0,
+        "dup2 onto fd 2 failed"
+    );
+    let out = f();
+    drop(_restore);
+    drop(file);
+    (
+        out,
+        std::fs::read_to_string(path).expect("read the capture"),
+    )
 }

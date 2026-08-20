@@ -39,6 +39,68 @@ impl std::fmt::Debug for SecretBytes {
 impl Drop for SecretBytes {
     fn drop(&mut self) {
         self.zeroize();
+        // **After the zeroing, and only in a test build.** See
+        // [`drop_witness`]: this is the one vantage point from which the
+        // zeroing is observable without reading freed memory.
+        #[cfg(test)]
+        drop_witness::record(&self.0);
+    }
+}
+
+/// A `#[cfg(test)]` witness that [`SecretBytes::drop`] pushes its
+/// **post-zeroing** buffer into, so a test can assert the zeroing from
+/// inside the drop while the allocation is still ours.
+///
+/// **Why this and not a raw pointer read-back.** The obvious test — drop
+/// the value, then read the buffer through a saved pointer — is a
+/// use-after-free: undefined behaviour, a hard failure under Miri or
+/// ASAN, and measured in 0.0.6 to return `[34, 249, 249, 179, 76, 101,
+/// 0]` for `hunter2`, which is neither the secret nor zeros. A test that
+/// cannot say which answer it is looking at is not a guard.
+///
+/// **Thread-local, so concurrent tests do not see each other's drops.**
+/// libtest runs tests in threads; a process-wide witness would make every
+/// assertion here depend on what else happened to be running. The cost is
+/// that a value dropped on another thread — anything moved into
+/// `spawn_blocking` or a writer thread — is invisible, so a test using
+/// this must do its dropping on its own thread.
+///
+/// `pub(crate)` rather than private to this module: the zeroing is
+/// asserted from `secret::provider`'s unit tests and, from 0.0.7 onward,
+/// from `secret::request`'s as well. A witness private to `attach::secret`
+/// is unreachable from either.
+#[cfg(test)]
+pub(crate) mod drop_witness {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static DROPPED: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Called from [`super::SecretBytes::drop`] **after** `zeroize`. If
+    /// the zeroing loop is ever deleted, what lands here is the
+    /// plaintext — which is exactly the mutation the assertion exists to
+    /// kill.
+    pub(crate) fn record(after_zeroing: &[u8]) {
+        DROPPED.with(|d| d.borrow_mut().push(after_zeroing.to_vec()));
+    }
+
+    /// Drop everything seen so far, so a test asserts over its own drops
+    /// only.
+    pub(crate) fn reset() {
+        DROPPED.with(|d| d.borrow_mut().clear());
+    }
+
+    /// How many drops are recorded, without consuming them — the "nothing
+    /// happened yet" half of an assertion.
+    pub(crate) fn peek_len() -> usize {
+        DROPPED.with(|d| d.borrow().len())
+    }
+
+    /// Everything recorded on this thread since the last [`reset`] or
+    /// [`taken`], leaving the witness empty.
+    pub(crate) fn taken() -> Vec<Vec<u8>> {
+        DROPPED.with(|d| std::mem::take(&mut *d.borrow_mut()))
     }
 }
 
