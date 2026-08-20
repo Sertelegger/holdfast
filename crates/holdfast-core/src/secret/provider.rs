@@ -528,6 +528,13 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
     // milestone compiles for Windows, and an uncompiled `#[cfg]` arm is
     // worse than a named gap.
 
+    // **Not a branch, and not a behaviour: a lock acquisition that is
+    // compiled out entirely.** See [`exec_guard`] for the hazard. It is
+    // sited here because this is the only `fork` in the module, and the
+    // hazard is a fork racing another thread's *write* — so the guard has
+    // to be at the fork, wherever the writing happens.
+    #[cfg(test)]
+    let _no_writer_is_open = exec_guard::spawning();
     let mut child = cmd.spawn().map_err(|e| ProviderError::NotStarted {
         provider: name.to_string(),
         kind: e.kind(),
@@ -628,6 +635,65 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
         });
     }
     Ok(stdout)
+}
+
+/// The `ETXTBSY` interlock for tests that write a program and then run it.
+///
+/// **The hazard is not ours-and-ours-alone, which is why the remedy cannot
+/// be local to a fixture writer.** `execve(2)` answers `ETXTBSY` when the
+/// file is open for writing by *any* process. Rust's `Command::spawn`
+/// forks, and a fork inherits every fd open for writing at that instant —
+/// **including `O_CLOEXEC` ones**, because close-on-exec is processed after
+/// the kernel's `ETXTBSY` check (rust-lang/rust#39237). So thread A writing
+/// `a.sh` while thread B forks leaves B's child holding a write fd to
+/// `a.sh`; if A execs `a.sh` before B reaches its own `execve`, **A** gets
+/// `ETXTBSY` — a failure in A caused by B, for a file B has never heard of.
+///
+/// That is why the obvious fixture-side fixes do not work, and they were
+/// measured rather than assumed: writing to a temporary name and
+/// `rename`ing it into place leaves the inherited fd pointing at the same
+/// **inode**, and an explicit `drop` + `fsync` before `chmod` only
+/// guarantees *our* fd is closed, which was never the one at fault.
+///
+/// What does work is making the two operations mutually exclusive:
+/// **writers take the write lock, and the fork takes the read lock.** No
+/// fork can then happen while any fixture write fd is open, while spawns
+/// still run concurrently with each other. Both critical sections are
+/// microseconds — the write is one `fs::write`, and `Command::spawn`
+/// returns once the child has exec'd or reported failure, so the *waiting*
+/// on a provider happens outside the lock and nothing is serialised that
+/// matters.
+///
+/// Measured, in a standalone reproducer of exactly this shape (32 threads ×
+/// 200 write-then-exec rounds): **600–661 `ETXTBSY` per 6400 unguarded, and
+/// 0 per 19200 guarded across three runs.** In this suite the rate is much
+/// lower — it needs a fixture write to overlap a fork — which is precisely
+/// what makes it a flake rather than a failure, and why it is closed by
+/// construction here rather than by a retry that would only make it rarer.
+///
+/// `#[cfg(test)]`, so a release build contains none of it.
+#[cfg(test)]
+pub(crate) mod exec_guard {
+    use std::sync::OnceLock;
+
+    use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    fn lock() -> &'static RwLock<()> {
+        static LOCK: OnceLock<RwLock<()>> = OnceLock::new();
+        LOCK.get_or_init(|| RwLock::new(()))
+    }
+
+    /// Hold this across writing a file that will later be executed —
+    /// the whole of it, until the writing fd is closed.
+    pub(crate) fn writing() -> RwLockWriteGuard<'static, ()> {
+        lock().write()
+    }
+
+    /// Hold this across a `fork`, so it cannot inherit a write fd to
+    /// somebody else's fixture.
+    pub(crate) fn spawning() -> RwLockReadGuard<'static, ()> {
+        lock().read()
+    }
 }
 
 /// SIGKILL the process group the child leads, taking its forks with it.
@@ -827,6 +893,10 @@ mod tests {
 
         fn named_script(&self, name: &str, body: &str) -> PathBuf {
             let path = self.dir.join(name);
+            // See [`exec_guard`]: the write fd this opens is inheritable by
+            // any *other* thread's `fork`, and the row it then breaks is
+            // that other thread's, not this one's.
+            let guard = exec_guard::writing();
             std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write the fixture");
             #[cfg(unix)]
             {
@@ -834,6 +904,7 @@ mod tests {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
                     .expect("chmod the fixture");
             }
+            drop(guard);
             path
         }
 
@@ -898,7 +969,12 @@ mod tests {
         use crate::session::{new_session_id, Session, SessionConfig};
         let mut cfg = PtySpawnConfig::new("sh");
         cfg.args = vec!["-c".to_string(), script.to_string()];
-        let pty = InProcessPty::spawn(&cfg).expect("spawn a real shell");
+        // A PTY spawn is a `fork`, and [`exec_guard`] is about forks —
+        // see `secret::binding`'s `session_running` for the measurement.
+        let pty = {
+            let _no_writer_is_open = exec_guard::spawning();
+            InProcessPty::spawn(&cfg).expect("spawn a real shell")
+        };
         Session::new(
             new_session_id(),
             None,
@@ -1311,15 +1387,17 @@ mod tests {
         );
         // The pairing, and the reason the canary means anything: the same
         // string really would have deleted the file had a shell seen it.
-        assert!(
+        // Another `fork`, so another [`exec_guard`] site.
+        let control_ok = {
+            let _no_writer_is_open = exec_guard::spawning();
             std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(format!("true {reference}"))
                 .status()
                 .expect("the control shell ran")
-                .success(),
-            "the control could not run"
-        );
+                .success()
+        };
+        assert!(control_ok, "the control could not run");
         assert!(
             !canary.exists(),
             "the control did not delete the canary, so the assertion above was \
@@ -1597,14 +1675,19 @@ mod tests {
     /// context, the natural thing to write, puts §9.6's one
     /// never-log-this value into a file that is kept for weeks.
     ///
-    /// **`daemon.log` only, and that is deliberate rather than an
-    /// oversight.** The plan's row also names `audit.log`; nothing in
-    /// this milestone's task writes a provider outcome there —
-    /// `binding_resolved` is Task 10's — so an "audit.log does not
-    /// contain the reference" assertion here would be an absence
-    /// assertion against a file no implementation writes to, which is
-    /// Global Constraint 3's named decorative shape. It is left out and
-    /// recorded rather than written.
+    /// **`daemon.log` only, and the `audit.log` half now lives next to the
+    /// code that writes one.** The plan's row named both. At Task 9 there
+    /// was no provider outcome in the audit trail at all —
+    /// `binding_resolved` is Task 10's — so the second assertion would
+    /// have been an absence assertion against a file no implementation
+    /// wrote to, which is Global Constraint 3's named decorative shape,
+    /// and it was left out and recorded. **Task 10 discharged it:** see
+    /// `secret::binding::tests::a_failing_providers_reference_and_stderr_reach_no_audit_line`,
+    /// which drives a failing provider through `autofill` with a live
+    /// `AuditLog` and asserts the trail carries neither the reference nor
+    /// the stderr body — paired with the `secret_input_request` entry that
+    /// proves the file it is absent from is populated. The debt is closed;
+    /// this row keeps the `daemon.log` half, which is still its own.
     ///
     /// The capture is fd 2 itself: `diag::emit` writes to
     /// `std::io::stderr()` and deliberately bypasses libtest's capture,

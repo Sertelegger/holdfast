@@ -511,6 +511,60 @@ impl SecretSlots {
         }
     }
 
+    /// [`take_if_unadopted`](Self::take_if_unadopted) for a caller that
+    /// **already knows which request it is answering** — §9.6's autofill.
+    ///
+    /// The autofill path is the one caller that reads the slot, then goes
+    /// away for as long as `keychain_provider_timeout_secs` (default 10 s)
+    /// while a credential store answers, and only then acts. Both of
+    /// `take_if_unadopted`'s conditions can change under it in that window,
+    /// and its `None` cannot tell the three apart:
+    ///
+    /// * there was never a raise (the ordinary autofill case);
+    /// * a human at an attached client **answered** the raise while the
+    ///   provider ran — `attach::conn`'s `SecretInput` arm reaches the slot
+    ///   through `take(session_id, Some(&request_id))`, which requires only
+    ///   a matching id and **not** the absence of a waiter, so it wins the
+    ///   race outright;
+    /// * another tool call adopted it.
+    ///
+    /// Writing anyway in the second case puts **two values into one
+    /// `getpass`**: the human's is consumed and the resolved one is left in
+    /// the tty input queue for whatever the child reads next — for a shell,
+    /// a credential executed as a command and echoed into the ring buffer.
+    /// That is the failure §9 exists to prevent, so the autofill has to be
+    /// able to say *"the slot I am about to satisfy is still the slot I
+    /// left"*, and `expect_id` is how it says it.
+    ///
+    /// A **different** id is refused for the same reason `take`'s
+    /// `expect_id` refuses one: the first request was closed and a second
+    /// was raised in its place, and a value fetched for the first must not
+    /// be typed into the second.
+    ///
+    /// **The one thing it cannot see** is a raise that both appeared *and*
+    /// was answered inside the window, starting from a vacant slot — that
+    /// leaves the slot vacant again and is indistinguishable from "nothing
+    /// ever happened". Closing it needs a per-session monotonic count of
+    /// closures, which has to outlive the entries it counts and therefore
+    /// needs a home that is swept when a session ends (GH #24's shape).
+    /// Recorded rather than built: it needs a client attached, a session
+    /// the agent called against while it was *not* at a prompt, and a human
+    /// answering a prompt the agent never saw, all inside one provider
+    /// call.
+    pub fn take_if_unadopted_matching(
+        &self,
+        session_id: &str,
+        expect_id: &str,
+    ) -> Option<RaisedRequest> {
+        let mut slots = self.inner.lock();
+        match slots.get(session_id) {
+            Some(raised) if !raised.has_waiter() && raised.request.request_id == expect_id => {
+                slots.remove(session_id)
+            }
+            _ => None,
+        }
+    }
+
     /// Mark §9.5's buffer notice written, returning `true` for the caller
     /// that flipped it (Task 7). At most one notice per request.
     pub fn claim_notice(&self, session_id: &str, request_id: &str) -> bool {

@@ -3,15 +3,49 @@
 //! §5.2's resolution order.
 //!
 //! **This is the file REQ-SEC-012 either holds in or does not, and the
-//! whole of it is one sentence: the agent supplies no input to anything
-//! here.** §9.6 is explicit — *"No binding matches → fall through to the
-//! human-prompt path. There is no 'agent asks for a named secret' API at
-//! all."* Every subject a binding is matched against is owned by the
-//! **session**: the command line the session was started with, and the
-//! prompt line the child has drawn on its own tty. `request_secret_input`'s
-//! `prompt_text` is an agent-supplied string, it is logged and shown to a
-//! human, and it reaches no function in this module. Nothing in here takes
-//! it, which is why the guard is a signature rather than a check.
+//! claim it holds is narrower than "the agent supplies no input here" —
+//! which would be false.** §9.6 is explicit about what is closed: *"No
+//! binding matches → fall through to the human-prompt path. There is no
+//! 'agent asks for a named secret' API at all."* What the agent cannot do
+//! is **name** anything: not the reference, not the provider, not the
+//! binding. `request_secret_input`'s `prompt_text` reaches no function in
+//! this module — nothing in here has a parameter it could be passed in,
+//! which is why that guard is a signature rather than a check.
+//!
+//! **What the agent *does* control is one of the two match subjects, and
+//! that is by design rather than by oversight.** `Session.command` and
+//! `Session.args` are the agent's own `start_session` arguments, stored
+//! verbatim — so `match_command`'s entire subject is a string the agent
+//! wrote. §9.6 intends exactly this: an operator binding that fires on
+//! `ssh prod-01` firing for an agent that ran `ssh prod-01` **is** the
+//! feature, and the protection is that to match, the agent must actually
+//! *run* that command line, under a PTY, in a session an operator can
+//! watch. The other subject — the prompt line — is the child's own output
+//! and is influenced only through what the child prints.
+//!
+//! **The consequence, which the un-quoted join below makes sharper: the
+//! agent controls both sides of a word-boundary straddle.** An operator
+//! writing an **unanchored** `match_command` is writing a pattern the
+//! agent can satisfy from an argument. `match_command = "ssh\\s+prod-01"`
+//! is matched by `start_session(command: "cat", args: ["x", "ssh prod-01
+//! y"])`, whose joined line is `cat x ssh prod-01 y` — and the credential
+//! is then typed into `cat`, which echoes it into the ring buffer and out
+//! through `read_output`. §9.6's published example is anchored
+//! (`^ssh\s+(\S+@)?prod-0[12]\b`) and is safe; nothing in this code, in
+//! `Config::validate`, or in §10.2 says why the anchor matters. **Anchor
+//! your patterns.**
+//!
+//! In the same class: **`match_command = ""` is config-legal and matches
+//! everything.** `Config::validate` compiles both patterns and
+//! deliberately does not special-case the empty one; the empty regex
+//! matches every subject, so an empty `match_command` is a credential
+//! store handed to every session on the box — from a two-character config
+//! value. Unlike `match_prompt`, whose empty spelling §9.6 gives a meaning
+//! (*"does not select on the prompt"*), the empty `match_command` has no
+//! documented meaning to apply, so this module implements it literally and
+//! `an_empty_match_command_matches_every_session` pins that it is literal.
+//! Rejecting it belongs at load, in `config.rs`, which this task does not
+//! own.
 //!
 //! ## The two subjects
 //!
@@ -30,7 +64,9 @@
 //! The un-quoted join means an argument containing a space can straddle a
 //! word boundary in the regex. That is a documented property and not a bug
 //! to work around with a quoting scheme an operator would then have to
-//! guess at.
+//! guess at — but it is a documented property whose **both sides the agent
+//! controls**, and the paragraph above is where that is spelled out rather
+//! than left for a reader to derive.
 //!
 //! **`match_prompt` is matched against the *unredacted* prompt line**
 //! ([`crate::session::Session::detection`]), and that is deliberate: the
@@ -124,6 +160,13 @@ pub fn select<'a>(
 
 /// One binding against one session's two subjects.
 fn matches(binding: &SecretBinding, command_line: &str, prompt_line: &str) -> bool {
+    // **The subject here is agent-authored** — see the module header — so
+    // an empty or unanchored pattern is one the agent can satisfy. Read
+    // literally either way: unlike `match_prompt`, §9.6 gives the empty
+    // `match_command` no meaning to apply, and inventing one here would be
+    // a second place an operator's pattern means something other than what
+    // a regex engine says it means. `an_empty_match_command_matches_every_session`
+    // pins that it is literal, and says where the fix belongs.
     if !pattern_matches(
         binding,
         "match_command",
@@ -574,6 +617,12 @@ mod tests {
             let name = self.name(short);
             let path = self.path(&format!("{short}.sh"));
             let marker = self.marker(short);
+            // See `secret::provider::exec_guard`. This task roughly tripled
+            // the number of rows in this one test binary that write an
+            // executable and then spawn it, and the rows it broke were
+            // **Task 9's**, not these: an `ETXTBSY` lands on whoever execs,
+            // not on whoever was writing.
+            let guard = crate::secret::provider::exec_guard::writing();
             std::fs::write(
                 &path,
                 format!("#!/bin/sh\necho ran > '{}'\n{body}", marker.display()),
@@ -585,6 +634,7 @@ mod tests {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
                     .expect("chmod the fixture");
             }
+            drop(guard);
             fixture::install(&name, &path);
             self.minted.push(name.clone());
             plain_binding(&name, match_command)
@@ -696,7 +746,16 @@ mod tests {
     fn session_running(command: &str, args: &[&str], script: &str) -> Arc<Session> {
         let mut cfg = PtySpawnConfig::new("sh");
         cfg.args = vec!["-c".to_string(), script.to_string()];
-        let pty = InProcessPty::spawn(&cfg).expect("spawn a real shell");
+        // **This is a `fork` too**, and `exec_guard` is about forks, not
+        // about providers: a PTY child that inherits a write fd to some
+        // other row's fixture holds it until its own `exec`, and the row
+        // that then runs that fixture gets the `ETXTBSY`. Measured — with
+        // only the provider spawn guarded the rate fell but did not reach
+        // zero, and the rows still failing were the ones that build a PTY.
+        let pty = {
+            let _no_writer_is_open = crate::secret::provider::exec_guard::spawning();
+            InProcessPty::spawn(&cfg).expect("spawn a real shell")
+        };
         Session::new(
             new_session_id(),
             None,
@@ -762,6 +821,39 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Poll until this binding's provider has actually started.
+    ///
+    /// `Scratch::binding` makes the marker the script's **first** act, so
+    /// this returns while a gated fixture is still blocked — which is what
+    /// lets a row act inside the provider's window deterministically
+    /// instead of racing it.
+    async fn await_ran(sc: &Scratch, short: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !sc.ran(short) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the provider for `{short}` never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Put a value on the write queue exactly as `attach::conn`'s
+    /// `SecretInput` arm does, which is what a human at an attached client
+    /// is — §5.2's normalisation applied by the daemon, and the value in
+    /// the one type whose `Drop` zeroes it.
+    async fn write_as_a_human(s: &Session, bytes: &[u8]) {
+        let (req, ack) =
+            crate::session::WriteRequest::secret(SecretBytes::normalise(bytes.to_vec(), true));
+        s.write_queue()
+            .send(req)
+            .await
+            .expect("the write queue accepted");
+        ack.await
+            .expect("the writer answered")
+            .expect("the PTY took the write");
     }
 
     /// The ordinary call these rows make.
@@ -899,6 +991,71 @@ mod tests {
             select(&set[1..2], "ssh prod-01", "$ ").map(|b| b.name.as_str()),
             Some("a")
         );
+    }
+
+    /// **`match_command = ""` matches every session, and an unanchored one
+    /// is satisfiable from an agent-supplied argument.**
+    ///
+    /// The empty-`match_prompt` rule has three rows; this is its missing
+    /// sibling. Both cases are *literal regex behaviour* rather than
+    /// implementation choices, and the row exists so that the behaviour is
+    /// written down rather than discovered by an operator: an empty
+    /// `match_command` loads (`Config::validate` compiles both patterns and
+    /// deliberately does not special-case the empty one) and hands the
+    /// credential store to every session on the box.
+    ///
+    /// The second half is the straddle the module header describes, driven:
+    /// with an unanchored operator pattern, an agent that never runs `ssh`
+    /// at all can still produce a joined command line that matches, by
+    /// putting a space inside one argument. That is why §9.6's published
+    /// example is anchored.
+    ///
+    /// **Neither is a defect in this module and the fix for both is at
+    /// load, in `config.rs`, which this task does not own.** The row is
+    /// here so the next person to open that file finds the case stated as
+    /// a fact rather than as a worry.
+    #[test]
+    fn an_empty_match_command_matches_every_session() {
+        let everything = plain_binding("open", "");
+        for line in [
+            "ssh prod-01",
+            "psql -h staging",
+            "bash",
+            "",
+            "some-utterly-unrelated-command --flag",
+        ] {
+            assert_eq!(
+                select(std::slice::from_ref(&everything), line, "").map(|b| b.name.as_str()),
+                Some("open"),
+                "an empty match_command must be read literally, and the empty regex \
+                 matches {line:?}"
+            );
+        }
+        // The pairing: a non-empty pattern still discriminates, so the row
+        // above is not satisfied by a `select` that answers `Some` always.
+        let narrow = plain_binding("narrow", "^ssh\\b");
+        assert!(select(std::slice::from_ref(&narrow), "ssh prod-01", "").is_some());
+        assert!(select(std::slice::from_ref(&narrow), "psql -h staging", "").is_none());
+
+        // The straddle, driven. The operator's pattern is unanchored and
+        // the agent never runs `ssh`.
+        let unanchored = plain_binding("unanchored", "ssh\\s+prod-01");
+        let agent_line = command_line("cat", &["x".to_string(), "ssh prod-01 y".to_string()]);
+        assert_eq!(agent_line, "cat x ssh prod-01 y");
+        assert!(
+            select(std::slice::from_ref(&unanchored), &agent_line, "").is_some(),
+            "the un-quoted join lets an argument straddle a word boundary, and both \
+             sides of that are agent-controlled"
+        );
+        // Anchored — §9.6's own spelling — and the same line no longer
+        // matches. This is the pairing that makes the sentence in the
+        // module header actionable rather than merely alarming.
+        let anchored = plain_binding("anchored", "^ssh\\s+(\\S+@)?prod-0[12]\\b");
+        assert!(
+            select(std::slice::from_ref(&anchored), &agent_line, "").is_none(),
+            "anchoring is what closes the straddle"
+        );
+        assert!(select(std::slice::from_ref(&anchored), "ssh user@prod-01", "").is_some());
     }
 
     /// A pattern that cannot compile is not a match, and does not panic.
@@ -1365,6 +1522,153 @@ mod tests {
         );
 
         let _ = s.signal(Signal::Kill);
+        let _ = s2.signal(Signal::Kill);
+    }
+
+    /// **A human who answers the prompt while the provider is running
+    /// wins, and the resolved value is dropped rather than written.**
+    ///
+    /// The window is the provider's whole run — up to
+    /// `keychain_provider_timeout_secs`, 10 s by default — and
+    /// `attach::conn`'s `SecretInput` arm reaches the slot through
+    /// `take(session_id, Some(&request_id))`, which needs only a matching
+    /// id and **not** the absence of a waiter. So the human wins the race
+    /// outright, and an autofill that wrote anyway would put its value
+    /// into the tty input queue *behind* theirs, where the child's **next**
+    /// read consumes it. That is what the two-read child below makes
+    /// visible: a second value shows up as a second `got=` line.
+    ///
+    /// The race is made deterministic rather than waited for: the fixture
+    /// blocks on a gate file, the row takes the slot and writes the
+    /// human's value while it is blocked, and only then opens the gate.
+    ///
+    /// **The pairing is the same row without the interference**, which
+    /// *does* produce `got=HUNTER2` — without it, `!contains("got=HUNTER2")`
+    /// passes against a fixture that never resolved anything.
+    #[tokio::test]
+    async fn a_human_answering_during_the_provider_call_is_not_overwritten() {
+        // Two reads, so a value left in the input queue by a second write
+        // is consumed and printed rather than discarded at exit.
+        let two_reads = format!("{ECHO_OFF_FIXTURE}; {ECHO_OFF_FIXTURE}");
+
+        // ---- the race, lost by the autofill on purpose
+        let mut sc = Scratch::new("lostslot");
+        let gate = sc.path("gate");
+        let b = sc.binding(
+            "slot",
+            "^ssh\\b",
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                gate.display()
+            ),
+        );
+        let server = Arc::new(server_with(keychain_mode(vec![b]), &sc.audit_log()));
+        let s = session_running("ssh", &["prod-01"], &two_reads);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+
+        // The echo-drop raise a client would have made (§7.5), so the
+        // slot is occupied when the call starts.
+        let (raised, first) = server.attach_hub().raise_secret(&s.id, "Password: ");
+        assert!(first, "the row, not something else, raised this request");
+
+        let call = {
+            let server = Arc::clone(&server);
+            let args = secret_args(&s.id, 2);
+            tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
+        };
+
+        // The provider has started and is blocked on the gate.
+        await_ran(&sc, "slot").await;
+
+        // The human answers, exactly as `attach::conn` does: take the slot
+        // by id, then queue the write.
+        let taken = server
+            .attach_hub()
+            .close_secret(&s.id, Some(&raised.request_id))
+            .expect("the human took the slot while the provider was running");
+        drop(taken);
+        write_as_a_human(&s, b"humanpw").await;
+        buffer_until(&s, b"got=HUMANPW", 20).await;
+
+        // Only now does the provider answer.
+        std::fs::write(&gate, b"go").expect("open the gate");
+
+        let payload = body(
+            &tokio::time::timeout(Duration::from_secs(60), call)
+                .await
+                .expect("the call never returned")
+                .expect("the call task")
+                .expect("request_secret_input"),
+        );
+        assert_eq!(
+            payload["status"], "secret_cancelled",
+            "the call reported a write it must not have made: {payload}"
+        );
+
+        let seen = buffered(&s);
+        assert!(
+            !contains(&seen, b"got=HUNTER2"),
+            "the resolved value was written on top of the human's answer, and the \
+             child's next read consumed it:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(
+            seen.windows(4).filter(|w| *w == b"got=").count(),
+            1,
+            "the child completed more than one read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        // The binding still resolved — §9.6 counts resolutions from the
+        // store, not values written to a PTY — so the trail says so.
+        assert!(
+            sc.kinds(&s.id).iter().any(|k| k == "binding_resolved"),
+            "the provider ran and produced a value; the trail should say so"
+        );
+        let _ = s.signal(Signal::Kill);
+
+        // ---- the pairing: identical, minus the interference
+        let mut sc2 = Scratch::new("lostslot-control");
+        let gate2 = sc2.path("gate");
+        let b2 = sc2.binding(
+            "slot",
+            "^ssh\\b",
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                gate2.display()
+            ),
+        );
+        let server2 = Arc::new(server_with(keychain_mode(vec![b2]), &sc2.audit_log()));
+        let s2 = session_running("ssh", &["prod-01"], &two_reads);
+        server2.registry.insert(Arc::clone(&s2)).expect("register");
+        await_prompt(&s2, b"Password: ").await;
+        let (raised2, _) = server2.attach_hub().raise_secret(&s2.id, "Password: ");
+
+        let call2 = {
+            let server = Arc::clone(&server2);
+            let args = secret_args(&s2.id, 10);
+            tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
+        };
+        await_ran(&sc2, "slot").await;
+        std::fs::write(&gate2, b"go").expect("open the gate");
+
+        let control = body(
+            &tokio::time::timeout(Duration::from_secs(60), call2)
+                .await
+                .expect("the control call never returned")
+                .expect("the control task")
+                .expect("request_secret_input"),
+        );
+        assert_eq!(
+            control["status"], "secret_provided",
+            "nobody took the slot and the autofill still did not write, so the row \
+             above is asserting nothing: {control}"
+        );
+        assert_eq!(
+            control["data"]["request_id"], raised2.request_id,
+            "the autofill closed a request other than the one it found"
+        );
+        buffer_until(&s2, b"got=HUNTER2", 20).await;
         let _ = s2.signal(Signal::Kill);
     }
 

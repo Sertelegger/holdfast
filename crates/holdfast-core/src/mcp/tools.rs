@@ -1598,6 +1598,14 @@ impl HoldfastServer {
         session: &Arc<Session>,
         append_newline: bool,
     ) -> Option<CallToolResult> {
+        let hub = self.attach_hub();
+        // **The slot as it stands *before* the provider runs.** This call
+        // is about to be away for up to `keychain_provider_timeout_secs`,
+        // and the whole point of reading it now is to be able to tell,
+        // afterwards, whether the thing it is about to satisfy is still
+        // there. See `SecretSlots::take_if_unadopted_matching`.
+        let raised_before = hub.secrets().outstanding(&session.id).map(|r| r.request_id);
+
         let security = self.config.security.clone();
         let processor = Arc::clone(&self.processor);
         let for_task = Arc::clone(session);
@@ -1620,20 +1628,49 @@ impl HoldfastServer {
             Err(_) => return None,
         };
 
-        // **Close the raise before the write is queued**, and for the
-        // same reason `attach::conn`'s `SecretInput` arm does: an echo
-        // drop with a client attached has already broadcast
-        // `AwaitingSecret`, and a human typing into that modal while this
-        // write is in flight would put two values into one `getpass`.
-        // `take_if_unadopted` refuses a slot somebody is waiting on, so
-        // this cannot take a request out from under another call.
-        let hub = self.attach_hub();
-        let request_id = hub.secrets().take_if_unadopted(&session.id).map(|raised| {
-            let id = raised.request_id().to_string();
-            drop(raised);
-            hub.broadcast_secret_closed(&session.id, &id, "fulfilled");
-            id
-        });
+        // **Close the raise before the write is queued**, and for the same
+        // reason `attach::conn`'s `SecretInput` arm does: two answers to
+        // one prompt must produce one write.
+        //
+        // **And do not write at all if the raise went away.** A human at
+        // an attached client can answer an outstanding raise *while the
+        // provider is running* — `conn.rs` reaches the slot through
+        // `take(session_id, Some(&request_id))`, which needs only a
+        // matching id and not the absence of a waiter, so it wins that
+        // race. Writing anyway would put the resolved value into the tty
+        // input queue **behind** the human's, where the child's next read
+        // consumes it: for a shell, a credential run as a command. So a
+        // raise that was outstanding when this call started must still be
+        // there, unadopted and under the same id, or the value is dropped
+        // — `SecretBytes::drop` zeroes it — and the call falls through to
+        // the prompt path like any other non-resolution.
+        //
+        // The `binding_resolved` entry and the spent `max_uses` claim
+        // stand: the binding *did* resolve, and §9.6 counts resolutions
+        // from the store rather than values written to a PTY.
+        let request_id = match &raised_before {
+            Some(before) => {
+                let Some(raised) = hub
+                    .secrets()
+                    .take_if_unadopted_matching(&session.id, before)
+                else {
+                    drop(secret);
+                    return None;
+                };
+                let id = raised.request_id().to_string();
+                drop(raised);
+                hub.broadcast_secret_closed(&session.id, &id, "fulfilled");
+                Some(id)
+            }
+            // Nothing was outstanding when this call began. A raise that
+            // appeared since is unanswered and is this value's to close.
+            None => hub.secrets().take_if_unadopted(&session.id).map(|raised| {
+                let id = raised.request_id().to_string();
+                drop(raised);
+                hub.broadcast_secret_closed(&session.id, &id, "fulfilled");
+                id
+            }),
+        };
 
         // The same write path a client's `SecretInput` takes: the value
         // moves into the queue as a `SecretBytes` and is zeroed by its own
