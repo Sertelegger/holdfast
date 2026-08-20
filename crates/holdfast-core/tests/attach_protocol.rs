@@ -3512,20 +3512,42 @@ fn the_attach_protocol_carries_no_confirmation_frame() {
     }
     // The client half: no redemption kind. Asserted over the whole of
     // `ALL` rather than by naming absent variants, so a differently
-    // spelled one (`Approve`, `Redeem`, `ConfirmCode`) fails too.
+    // spelled one (`Redeem`, `ConfirmCode`) fails too.
     for kind in ClientFrameKind::ALL {
         let name = kind.as_str();
         assert!(
             !name.to_ascii_lowercase().contains("confirm")
-                && !name.to_ascii_lowercase().contains("approve")
                 && !name.to_ascii_lowercase().contains("redeem"),
             "{name} looks like a confirmation-redemption frame; §7.5 has none"
         );
     }
+    // **`approve` was a third banned substring and 0.0.7 makes it wrong,
+    // so it is replaced by an exact-membership assertion rather than
+    // dropped.** §7.5 now carries `ApproveBinding`, which is §9.6's
+    // *binding* approval and not a confirmation redemption: §23.2
+    // separates the two security subsystems on purpose (§17.5's
+    // lifecycle versus §17.2's, different trust models), and 0.0.8's
+    // `confirmation` kind still gets no frame of its own. A substring
+    // ban cannot tell the two apart; a list of exactly which kinds may
+    // contain the word can, and it is strictly stronger — an
+    // `ApproveConfirmation` added later fails here where the old ban
+    // would have caught it and the naive relaxation ("allow anything
+    // with `approve`") would not.
+    let approving: Vec<&str> = ClientFrameKind::ALL
+        .into_iter()
+        .map(ClientFrameKind::as_str)
+        .filter(|n| n.to_ascii_lowercase().contains("approve"))
+        .collect();
+    assert_eq!(
+        approving,
+        vec!["ApproveBinding"],
+        "§7.5's only approval frame is §9.6's binding approval"
+    );
     // And the catalogue really is the one this build serialises — without
-    // this the loop above passes against an empty array.
-    assert_eq!(ClientFrameKind::ALL.len(), 6);
-    assert_eq!(KNOWN_SERVER_TYPES.len(), 9);
+    // this the loop above passes against an empty array. 6 → 7 and 9 → 10
+    // are 0.0.7's two additive variants (§23.3, Global Constraint 13).
+    assert_eq!(ClientFrameKind::ALL.len(), 7);
+    assert_eq!(KNOWN_SERVER_TYPES.len(), 10);
 }
 
 // ------------------------- GH #24: the slot a dead session leaves behind

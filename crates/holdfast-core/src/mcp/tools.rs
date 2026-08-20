@@ -1296,6 +1296,22 @@ impl HoldfastServer {
                 None,
             ));
         }
+        // **§17.5's arithmetic needs a remaining deadline and nothing in
+        // this daemon exposes one**, so this call captures its own.
+        // `timeout_secs` stays a plain `u32` until `await_secret` turns it
+        // into an absolute deadline at the very end of this function
+        // (§5.2: *"the window starts at this call"*), and §5.2's keychain
+        // step — where the approval lives — runs **before** the prompt
+        // fallback. So the start is stamped here, off `self.clock` like
+        // every other deadline in the daemon (REQ-S-005), and the
+        // approval's `min(binding_approval_timeout_secs, remaining / 2)`
+        // is derived from it below.
+        //
+        // Deliberately **earlier** than `await_secret`'s own start, which
+        // makes the derived `remaining` a slight under-estimate — and the
+        // under-estimate is the safe direction: the prompt path inherits
+        // a little more than half rather than a little less.
+        let call_start = self.clock.now();
         let security = &self.config.security;
         let timeout_secs = args.timeout_secs.unwrap_or(DEFAULT_SECRET_TIMEOUT_SECS);
         // Bounded in **both** directions. A one-sided check passes every
@@ -1419,8 +1435,45 @@ impl HoldfastServer {
             crate::secret::binding::keychain_step_runs(&self.config.security.secret_provider)
                 && !self.config.security.secret_bindings.is_empty();
         if step_one_possible && !hub.secrets().has_waiter(&session.id) {
-            if let Some(done) = self.autofill_from_binding(&session, append_newline).await {
-                return Ok(done);
+            match self.autofill_from_binding(&session, append_newline).await {
+                StepOne::Done(done) => return Ok(done),
+                // §17.5's `Pending`. **Sited here and not inside
+                // `autofill_from_binding`, because this is where
+                // `args.prompt_text` is allowed to exist.**
+                // `BindingApprovalRequired` carries the agent's text so a
+                // human sees what is being asked for, and
+                // `autofill_from_binding`'s whole security property is
+                // that it has no parameter that text could enter
+                // (REQ-SEC-012). Keeping the approval out here costs one
+                // `match` arm and keeps that signature exact.
+                StepOne::NeedsApproval {
+                    binding_name,
+                    provider,
+                    raised_before,
+                } => {
+                    // Redacted before any human is shown it, on the same
+                    // rule the `AwaitingSecret` broadcast below follows —
+                    // and a *second* redaction rather than a hoisted
+                    // one, so that ordering claim above stays true.
+                    let approval_prompt = redact_str(&self.processor.rules, &args.prompt_text);
+                    if let Some(done) = self
+                        .run_binding_approval(
+                            &session,
+                            &binding_name,
+                            &provider,
+                            &approval_prompt,
+                            append_newline,
+                            call_start + Duration::from_secs(timeout_secs as u64),
+                            raised_before,
+                        )
+                        .await
+                    {
+                        return Ok(done);
+                    }
+                }
+                // REQ-SEC-017's fall-through, and every other
+                // non-resolution: step 2.
+                StepOne::FellThrough => {}
             }
         }
 
@@ -1588,16 +1641,16 @@ impl HoldfastServer {
     /// worker for ten seconds — and `op read` blocking on a biometric
     /// prompt is exactly that case.
     ///
-    /// Every fall-through is silent to the agent: `None` here is
-    /// indistinguishable from a session with no bindings configured at
+    /// Every fall-through is silent to the agent: [`StepOne::FellThrough`]
+    /// is indistinguishable from a session with no bindings configured at
     /// all. An agent that could tell "your binding is exhausted" from "you
     /// have no binding" could enumerate an operator's bindings from the
-    /// outside.
-    async fn autofill_from_binding(
-        &self,
-        session: &Arc<Session>,
-        append_newline: bool,
-    ) -> Option<CallToolResult> {
+    /// outside. [`StepOne::NeedsApproval`] is **not** an exception: the
+    /// caller either resolves after a human approves, or falls through
+    /// exactly as it would have for any other reason, and no status of
+    /// its own reaches the agent (§18.1 deleted `binding_approval_denied`
+    /// for that reason).
+    async fn autofill_from_binding(&self, session: &Arc<Session>, append_newline: bool) -> StepOne {
         let hub = self.attach_hub();
         // **The slot as it stands *before* the provider runs.** This call
         // is about to be away for up to `keychain_provider_timeout_secs`,
@@ -1614,19 +1667,62 @@ impl HoldfastServer {
         })
         .await;
 
+        let resolved = match outcome {
+            Ok(Autofill::Resolved(resolved)) => resolved,
+            // §17.5's `Pending`: nothing has been resolved, no use has
+            // been spent, and no provider has run. Handed back rather
+            // than acted on here — see [`StepOne::NeedsApproval`].
+            Ok(Autofill::FellThrough(crate::secret::FellThrough::NeedsApproval {
+                binding_name,
+                provider,
+            })) => {
+                return StepOne::NeedsApproval {
+                    binding_name,
+                    provider,
+                    raised_before,
+                }
+            }
+            // Every other answer means the same thing: step 2.
+            Ok(Autofill::FellThrough(_)) => return StepOne::FellThrough,
+            // The blocking task panicked. Falling through is the safe
+            // reading — a human can still answer — and the panic is
+            // already on `daemon.log` through the runtime's own hook.
+            Err(_) => return StepOne::FellThrough,
+        };
+
+        match self
+            .inject_resolved(session, resolved, raised_before.as_deref())
+            .await
+        {
+            Some(done) => StepOne::Done(done),
+            None => StepOne::FellThrough,
+        }
+    }
+
+    /// Put a resolved value into the session's PTY, or drop it and fall
+    /// through — the tail §5.2's step 1 and §17.5's `Approved` arm share.
+    ///
+    /// **One copy, because the slot check is the dangerous part.**
+    /// `raised_before` is the outstanding `request_id` as it stood before
+    /// this call went away — for the plain path, before the provider ran;
+    /// for the approval path, before the whole human round trip — and the
+    /// three-way answer below is what stops a credential being typed into
+    /// a prompt somebody else has already answered. A second hand-written
+    /// copy of that would be a second place to get it wrong, in the one
+    /// function where getting it wrong puts a password on the tty input
+    /// queue.
+    async fn inject_resolved(
+        &self,
+        session: &Arc<Session>,
+        resolved: Resolved,
+        raised_before: Option<&str>,
+    ) -> Option<CallToolResult> {
+        let hub = self.attach_hub();
         let Resolved {
             binding_name,
             secret,
             ..
-        } = match outcome {
-            Ok(Autofill::Resolved(resolved)) => resolved,
-            // Every other answer means the same thing: step 2.
-            Ok(Autofill::FellThrough(_)) => return None,
-            // The blocking task panicked. Falling through is the safe
-            // reading — a human can still answer — and the panic is
-            // already on `daemon.log` through the runtime's own hook.
-            Err(_) => return None,
-        };
+        } = resolved;
 
         // **Close the raise before the write is queued**, and for the same
         // reason `attach::conn`'s `SecretInput` arm does: two answers to
@@ -1658,7 +1754,7 @@ impl HoldfastServer {
         // from the store rather than values written to a PTY.
         let request_id = match hub
             .secrets()
-            .take_if_unadopted_matching(&session.id, raised_before.as_deref())
+            .take_if_unadopted_matching(&session.id, raised_before)
         {
             SlotTake::Taken(raised) => {
                 let id = raised.request_id().to_string();
@@ -1707,6 +1803,211 @@ impl HoldfastServer {
                  `{binding_name}` binding"
             ),
         ))
+    }
+
+    /// §17.5's whole lifecycle for one caller: raise, broadcast, wait,
+    /// audit, and — on `approve` only — resolve and inject.
+    ///
+    /// `Some` is this call's answer and `None` means **fall through to
+    /// the human-prompt path**, which is what REQ-SEC-017 requires of
+    /// both `Denied` and `Expired` and what every other non-resolution in
+    /// §5.2's step 1 already does.
+    ///
+    /// **The window is the lesser of the configured value and half the
+    /// caller's remaining deadline** — see
+    /// [`crate::secret::approval_window`], which is where the arithmetic
+    /// and its argument live. Using the configured value unconditionally
+    /// makes REQ-SEC-017's fall-through unreachable whenever the two
+    /// knobs are equal, which on shipped defaults is always.
+    ///
+    /// **The timer decides nothing**, exactly as in [`Self::await_secret`]:
+    /// on expiry the caller asks the registry, under the same lock every
+    /// other transition takes, whether it is still the one waiting. A
+    /// `select!` that dropped the receiver would lose an `ApproveBinding`
+    /// landing in that window and fall through having been approved.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_binding_approval(
+        &self,
+        session: &Arc<Session>,
+        binding_name: &str,
+        provider: &str,
+        prompt_text: &str,
+        append_newline: bool,
+        caller_deadline: std::time::Instant,
+        raised_before: Option<String>,
+    ) -> Option<CallToolResult> {
+        let hub = self.attach_hub();
+        let window = crate::secret::approval_window(
+            self.config.daemon.binding_approval_timeout_secs,
+            Some(caller_deadline.saturating_duration_since(self.clock.now())),
+        );
+        // Epoch seconds off **this daemon's clock**, so a manual-clock
+        // test and the daemon agree about when this expires. `now_ms`
+        // exists for exactly this: `Instant` is monotonic and has no
+        // epoch, and a field named `_unix_secs` must carry one.
+        let expires_at_unix_secs = self
+            .clock
+            .now_ms()
+            .saturating_add(window.as_millis() as i64)
+            .max(0) as u64
+            / 1000;
+        let approval = crate::secret::Approval::new(
+            &session.id,
+            binding_name,
+            provider,
+            prompt_text,
+            expires_at_unix_secs,
+        );
+        // `None` means this session already has an approval pending —
+        // a second concurrent call reaching step 1 before the first
+        // raised its secret request. Falling through is right: the
+        // first call owns the question, and two approvals for one
+        // session would ask a human twice about one prompt.
+        let rx = hub.approvals().raise(approval.clone())?;
+        hub.broadcast_binding_approval(&approval);
+
+        let deadline = self.clock.now() + window;
+        let sleep = self.clock.sleep_until(deadline);
+        tokio::pin!(sleep);
+        tokio::pin!(rx);
+
+        // §5.1's third way out, subscribed **before** the first poll so
+        // an exit landing in between is still queued for us.
+        let mut events = session.subscribe_events();
+        let exit = session_exit(session, &mut events);
+        tokio::pin!(exit);
+
+        let woke = tokio::select! {
+            r = &mut rx => match r {
+                Ok(decided) => ApprovalWoke::Decided(decided),
+                // The sender went away without answering: somebody took
+                // the slot without deciding, which is §17.5's
+                // `Superseded` however it was reached.
+                Err(_) => ApprovalWoke::Superseded,
+            },
+            _ = &mut sleep => ApprovalWoke::Deadline,
+            _ = &mut exit => ApprovalWoke::Exited,
+        };
+
+        let (outcome, decided_by, decision) = match woke {
+            ApprovalWoke::Decided(d) => (
+                match d.decision {
+                    crate::attach::frames::ApprovalDecision::Approve => {
+                        crate::secret::Outcome::Approved
+                    }
+                    crate::attach::frames::ApprovalDecision::Deny => crate::secret::Outcome::Denied,
+                },
+                Some(d.decided_by),
+                Some(d.decision),
+            ),
+            // The window elapsed, or the child died. Either way the slot
+            // has to be taken under the lock before anything is
+            // concluded: a decision that landed between the wake and this
+            // line is the truth, and the timer is not.
+            other => {
+                let taken = match other {
+                    ApprovalWoke::Deadline => hub
+                        .approvals()
+                        .expire(&session.id, &approval.approval_id)
+                        .is_some(),
+                    _ => hub.approvals().supersede(&session.id).is_some(),
+                };
+                if taken {
+                    match other {
+                        ApprovalWoke::Deadline => (crate::secret::Outcome::Expired, None, None),
+                        // §17.5: *"approval discarded; no injection"*, and
+                        // no audit line at all — §9.4's `outcome`
+                        // vocabulary has no value for this state (Q13).
+                        _ => (crate::secret::Outcome::Superseded, None, None),
+                    }
+                } else {
+                    // Somebody decided between the wake and the lock.
+                    // Their answer is on our receiver, or is about to be.
+                    // Real time and not `self.clock`, for the reason
+                    // `await_secret` gives: a manual clock nothing
+                    // advances would park here forever, and a hand-over
+                    // that has already happened is not a deadline.
+                    match tokio::time::timeout(SECRET_HANDOVER_GRACE, rx).await {
+                        Ok(Ok(d)) => (
+                            match d.decision {
+                                crate::attach::frames::ApprovalDecision::Approve => {
+                                    crate::secret::Outcome::Approved
+                                }
+                                crate::attach::frames::ApprovalDecision::Deny => {
+                                    crate::secret::Outcome::Denied
+                                }
+                            },
+                            Some(d.decided_by),
+                            Some(d.decision),
+                        ),
+                        _ => (crate::secret::Outcome::Superseded, None, None),
+                    }
+                }
+            }
+        };
+
+        crate::secret::audit_binding_approval(
+            &self.processor.audit,
+            &approval,
+            outcome,
+            decided_by.as_deref(),
+        );
+
+        match decision {
+            Some(crate::attach::frames::ApprovalDecision::Approve) => {}
+            // Denied, expired, or superseded by something that still
+            // answered: REQ-SEC-017's fall-through.
+            Some(crate::attach::frames::ApprovalDecision::Deny) | None
+                if outcome != crate::secret::Outcome::Superseded =>
+            {
+                return None
+            }
+            // §17.5's `Superseded`. The only trigger reachable in this
+            // milestone is the session exiting — the *"outstanding
+            // request_secret_input is cancelled"* trigger cannot fire
+            // here, because this call has not raised one yet — so the
+            // honest answer is §5.1's, and **not** a fall-through that
+            // would broadcast an `AwaitingSecret` affordance pointing at
+            // a child that is already gone.
+            _ => {
+                return Some(envelope::envelope(
+                    Status::SessionDied,
+                    json!({ "exit_code": session.exit_code() }),
+                    "the session exited while a binding approval was outstanding",
+                ))
+            }
+        }
+
+        // §17.5's `Approved`: *"resolve reference, inject value into PTY,
+        // zero it, audit-log"*. The resolution happens **now** and not
+        // before the approval — a value fetched speculatively and
+        // discarded on denial is a credential read out of a store nobody
+        // agreed to read.
+        let security = self.config.security.clone();
+        let processor = Arc::clone(&self.processor);
+        let for_task = Arc::clone(session);
+        let name = binding_name.to_string();
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::secret::binding::autofill_approved(
+                &security,
+                &for_task,
+                &name,
+                append_newline,
+                &processor.audit,
+            )
+        })
+        .await;
+
+        let resolved = match outcome {
+            Ok(Autofill::Resolved(resolved)) => resolved,
+            // An approved binding whose provider refused, whose budget is
+            // spent, or which the session no longer selects. Silent to
+            // the agent and identical to every other fall-through: the
+            // human is asked for the value instead.
+            _ => return None,
+        };
+        self.inject_resolved(session, resolved, raised_before.as_deref())
+            .await
     }
 
     /// The session died under an autofill write.
@@ -2291,6 +2592,61 @@ enum Woke {
     Deadline,
     /// §5.1: the child ended while the call was waiting.
     Exited(Option<i32>),
+}
+
+/// What ended a §17.5 binding-approval wait.
+///
+/// **A second enum rather than a widened [`Woke`], and the reason is that
+/// the two waits end differently.** A secret request that times out
+/// answers the caller `secret_cancelled { reason: "timeout" }`; an
+/// approval that times out answers the caller *nothing at all* and falls
+/// through to the human prompt. Folding them would put a `Deadline` arm
+/// in front of two callers that must do opposite things with it, which is
+/// how one of them comes to do the other's.
+enum ApprovalWoke {
+    /// An `ApproveBinding` arrived, with the deciding connection's kind.
+    Decided(crate::secret::Decided),
+    /// The approval window elapsed (§17.5's `Expired`).
+    Deadline,
+    /// The child ended (§17.5's `Superseded`).
+    Exited,
+    /// The registry entry went away without a decision — the other half
+    /// of `Superseded`. Unreachable in this milestone (nothing but this
+    /// function takes an approval slot), and handled rather than
+    /// `unreachable!()`d because the safe reading of a lost approval is
+    /// *not approved*.
+    Superseded,
+}
+
+/// What §5.2's step 1 concluded, for the one caller that acts on it.
+///
+/// **Three answers and not `Option<CallToolResult>`, because §17.5 added
+/// a third.** `None` used to mean *"fall through"* and now has to be told
+/// apart from *"a human has to decide first"* — and the two are handled
+/// in different places on purpose: the approval needs the agent's
+/// `prompt_text`, and `autofill_from_binding`'s security property is that
+/// it has no parameter that string could enter (REQ-SEC-012). Carrying
+/// the distinction out as a value is what lets the approval be sited
+/// where the string legitimately lives.
+enum StepOne {
+    /// Resolved, written, and this is the caller's answer.
+    Done(CallToolResult),
+    /// §17.5's `Pending`: a `require_confirm` binding matched. **Nothing
+    /// has been resolved, no `max_uses` has been spent and no provider
+    /// has run** — §9.6's *"ask me first"* is answered before the store
+    /// is touched, not after.
+    NeedsApproval {
+        binding_name: String,
+        provider: String,
+        /// The outstanding `request_id` as it stood **before** step 1
+        /// began, threaded through the approval wait so the slot check in
+        /// [`HoldfastServer::inject_resolved`] covers the human round
+        /// trip as well as the provider call. Read off the hub and never
+        /// from an argument.
+        raised_before: Option<String>,
+    },
+    /// Step 2: broadcast `AwaitingSecret` and wait for a human.
+    FellThrough,
 }
 
 /// Resolve when this session's child ends, with the code it ended with.

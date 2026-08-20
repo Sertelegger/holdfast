@@ -39,6 +39,7 @@ ClientKind: shim, cli, ui-bridge
 AttachMode: ReadWrite, ReadOnly
 AttachRole: interactive, observer
 SignalName: int, term, kill
+ApprovalDecision: approve, deny
 
 [control]
 Request
@@ -67,7 +68,7 @@ StopOutcome
   wire:     {sessions_terminated: int, stopped_at_unix_secs: int}
 
 [attach.client]
-variants: Attach, Input, SecretInput, Resize, Signal, Detach
+variants: Attach, Input, SecretInput, Resize, Signal, ApproveBinding, Detach
 ClientFrame::Attach
   declared: client_kind, client_version, mode, protocol_major, protocol_minor, role, session
   wire:     {client_kind: "shim", client_version: "<str>", mode: "ReadWrite", protocol_major: int, protocol_minor: int, role: "interactive", session: "<str>", type: "Attach"}
@@ -83,12 +84,15 @@ ClientFrame::Resize
 ClientFrame::Signal
   declared: sig
   wire:     {sig: "int", type: "Signal"}
+ClientFrame::ApproveBinding
+  declared: approval_id, decision
+  wire:     {approval_id: "<str>", decision: "approve", type: "ApproveBinding"}
 ClientFrame::Detach
   declared: (none)
   wire:     {type: "Detach"}
 
 [attach.server]
-variants: Attached, AttachReject, Output, SessionExited, Resize, AwaitingSecret, SecretRequestClosed, ProtocolError, Detached
+variants: Attached, AttachReject, Output, SessionExited, Resize, AwaitingSecret, SecretRequestClosed, BindingApprovalRequired, ProtocolError, Detached
 ServerFrame::Attached
   declared: cols, exit_code, name, protocol_major, protocol_minor, rows, session_id, state
   wire:     {cols: int, exit_code: int, name: "<str>", protocol_major: int, protocol_minor: int, rows: int, session_id: "<str>", state: "<str>", type: "Attached"}
@@ -110,6 +114,9 @@ ServerFrame::AwaitingSecret
 ServerFrame::SecretRequestClosed
   declared: outcome, request_id
   wire:     {outcome: "<str>", request_id: "<str>", type: "SecretRequestClosed"}
+ServerFrame::BindingApprovalRequired
+  declared: approval_id, binding_name, prompt_text, provider, session
+  wire:     {approval_id: "<str>", binding_name: "<str>", prompt_text: "<str>", provider: "<str>", session: "<str>", type: "BindingApprovalRequired"}
 ServerFrame::ProtocolError
   declared: frame_kind, reason
   wire:     {frame_kind: "<str>", reason: "<str>", type: "ProtocolError"}

@@ -11,7 +11,7 @@
 //! | `reason` | Closes | Emitted when |
 //! |---|---|---|
 //! | `read_only_attach` | no | any frame but `Detach` from a `ReadOnly` client |
-//! | `unknown_request_id` | no | a `SecretInput` naming no outstanding prompt |
+//! | `unknown_request_id` | no | a `SecretInput` naming no outstanding prompt, **or an `ApproveBinding` naming no outstanding approval** — `frame_kind` says which |
 //! | `protocol_violation` | pre-handshake yes, post-handshake no | malformed CBOR, an out-of-order frame, an unknown `type`, or a closed-enum field outside its catalogue. **No part of the frame is applied** |
 //! | `no_handshake` | yes (pre-handshake only) | a non-`Attach` initial frame |
 //! | `frame_too_large` | **yes, in both phases** | a length prefix over `MAX_FRAME_BYTES` |
@@ -704,6 +704,84 @@ async fn read_loop(
                             .send(protocol_error(
                                 "unknown_request_id",
                                 Some(ClientFrameKind::SecretInput.as_str().to_string()),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+            // §17.5's `Approved`/`Denied` edge (§7.5, §9.6).
+            //
+            // **`decided_by` is `conn.client_kind`, off the uid-checked
+            // handshake, and never a field of the frame** — the frame has
+            // no such field, which is REQ-SEC-018's rule for
+            // `redaction_disabled` applied structurally rather than by
+            // discipline. A client cannot name itself in an
+            // authorisation record.
+            //
+            // **The ReadOnly gate above has already run.** §18.4's row
+            // names this frame: *"an authorisation decision, not an
+            // observation."* Nothing here re-checks it, for the same
+            // reason no other write arm does — every write arm is
+            // downstream of the one gate, and a second check in one arm
+            // is how the arms come to disagree.
+            //
+            // Everything the decision does — resolving the reference,
+            // injecting, zeroing, both audit entries — belongs to the
+            // waiting call. This arm's whole job is to hand the decision
+            // over atomically, which is why `decide` removes and answers
+            // under one lock: two clients pressing *approve* on one
+            // dialog must produce one resolution.
+            ClientDecode::Frame(ClientFrame::ApproveBinding {
+                approval_id,
+                decision,
+            }) => {
+                match daemon.attach_hub().approvals().decide(
+                    &conn.session_id,
+                    &approval_id,
+                    decision,
+                    conn.client_kind.as_str(),
+                ) {
+                    crate::secret::Decide::Recorded => {
+                        // §4.1 does not list this frame, and it is
+                        // activity for the same reason a `SecretInput`
+                        // is: a human is at the keyboard and the session
+                        // must not idle-reap out from under the approval
+                        // they just gave. Stamped **after** the decision
+                        // landed and only on the arm that landed one —
+                        // a rejected or stale frame moves nothing, which
+                        // is REQ-C-005/REQ-S-006's rule and what
+                        // `a_rejected_approve_binding_does_not_bump_activity`
+                        // pins from the ReadOnly side.
+                        session.note_activity();
+                    }
+                    // No approval outstanding, or one under a different
+                    // id: it expired, was superseded, or somebody else
+                    // decided it first. **The connection stays open and
+                    // nothing is applied**, exactly as the
+                    // `SecretInput` arm's `None` branch does — and it is
+                    // answered rather than dropped, because a human
+                    // whose button did nothing and said nothing presses
+                    // it again.
+                    //
+                    // **`unknown_request_id` is §18.4's nearest
+                    // catalogued reason and its Meaning column names
+                    // only `SecretInput.request_id`.** The condition is
+                    // the same one — *the id you named is not the
+                    // outstanding one* — and `frame_kind` is what
+                    // distinguishes the two producers, which is what
+                    // that field is for. Inventing a sixth reason for a
+                    // §23.3 surface would be worse; so would silence.
+                    // Recorded as a divergence rather than repaired
+                    // from this lane (Global Constraint 16).
+                    crate::secret::Decide::UnknownApprovalId => {
+                        if tx
+                            .send(protocol_error(
+                                "unknown_request_id",
+                                Some(ClientFrameKind::ApproveBinding.as_str().to_string()),
                             ))
                             .await
                             .is_err()

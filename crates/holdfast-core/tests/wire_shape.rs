@@ -91,7 +91,9 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use holdfast_core::attach::frames::{AttachMode, AttachRole, ClientFrame, ServerFrame, SignalName};
+use holdfast_core::attach::frames::{
+    ApprovalDecision, AttachMode, AttachRole, ClientFrame, ServerFrame, SignalName,
+};
 use holdfast_core::daemon::server::{DaemonStatus, StopOutcome, StopParams};
 use holdfast_core::protocol::frame::{self, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES};
 use holdfast_core::protocol::handshake::{ClientKind, HandshakeData, HandshakeParams};
@@ -429,6 +431,10 @@ fn client_frames() -> Vec<ClientFrame> {
         ClientFrame::Signal {
             sig: SignalName::Int,
         },
+        ClientFrame::ApproveBinding {
+            approval_id: STR.into(),
+            decision: ApprovalDecision::Approve,
+        },
         ClientFrame::Detach,
     ]
 }
@@ -468,6 +474,13 @@ fn server_frames() -> Vec<ServerFrame> {
         ServerFrame::SecretRequestClosed {
             request_id: STR.into(),
             outcome: STR.into(),
+        },
+        ServerFrame::BindingApprovalRequired {
+            approval_id: STR.into(),
+            binding_name: STR.into(),
+            provider: STR.into(),
+            session: STR.into(),
+            prompt_text: STR.into(),
         },
         ServerFrame::ProtocolError {
             reason: STR.into(),
@@ -658,6 +671,15 @@ fn vocabularies() -> Vec<(&'static str, Vec<String>)> {
         ("AttachMode", serde_variants::<AttachMode>(plain_probe())),
         ("AttachRole", serde_variants::<AttachRole>(plain_probe())),
         ("SignalName", serde_variants::<SignalName>(plain_probe())),
+        // §7.5's `ApproveBinding.decision`, a closed set of two. Listed
+        // here for the same reason `SignalName` is: the `wire:` line
+        // below records one *sample*, so only one of the two spellings
+        // would otherwise be in the document, and `deny` is exactly the
+        // value a `rename_all` change would move unnoticed.
+        (
+            "ApprovalDecision",
+            serde_variants::<ApprovalDecision>(plain_probe()),
+        ),
     ]
 }
 

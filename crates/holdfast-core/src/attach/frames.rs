@@ -137,6 +137,30 @@ pub enum ClientFrame {
     Signal {
         sig: SignalName,
     },
+    /// Answers an outstanding [`ServerFrame::BindingApprovalRequired`]
+    /// (§7.5, §9.6, §17.5). **ReadOnly clients: rejected** — §18.4's row
+    /// names this frame explicitly, *"an authorisation decision, not an
+    /// observation"*.
+    ///
+    /// **Between `Signal` and `Detach`, and that position is §7.5's.**
+    /// The catalogue lists the client frames as `Input`, `SecretInput`,
+    /// `Resize`, `Signal`, `ApproveBinding`, `Detach` — §5.2's
+    /// `user_cancelled` note repeats the same six in the same order — and
+    /// §18's preamble makes a catalogued position normative rather than
+    /// decorative: a value is inserted where the table puts it and never
+    /// appended. Here it is doubly load-bearing, because the declaration
+    /// order **is** the order `serde`'s own variant list comes back in,
+    /// and `tests/wire_shape.rs` records that list per protocol version.
+    ///
+    /// **No `decided_by` on the wire.** §9.4's `binding_approval` row
+    /// carries one, and it is derived from the *connection*'s handshake
+    /// `client_kind` — the same rule REQ-SEC-018 states for
+    /// `redaction_disabled`. A field a client could fill in would be a
+    /// self-declared identity in an authorisation record.
+    ApproveBinding {
+        approval_id: String,
+        decision: ApprovalDecision,
+    },
     Detach,
 }
 
@@ -163,6 +187,39 @@ pub enum SignalName {
     Term,
     /// SIGKILL session sweep, §4.4.
     Kill,
+}
+
+/// §7.5's `ApproveBinding { decision }` — a **closed set of two**
+/// (§18.4d, §9.6).
+///
+/// An enum and not a `String`, for exactly the reason [`SignalName`] is
+/// one: §18.4 answers *"a closed-enum field carrying a value outside its
+/// catalogue"* with `ProtocolError { reason: "protocol_violation",
+/// frame_kind: … }` and **no part of the frame applied**, and a `String`
+/// field cannot produce that answer — it decodes fine and leaves the
+/// branch to a hand-written comparison downstream, whose natural spelling
+/// (`decision == "approve"`) silently maps every typo onto *deny*. That is
+/// a decision invented from a mistake, in an authorisation path.
+///
+/// With the enum, `decision: "maybe"` fails to deserialise into
+/// [`ClientFrame`], [`decode_client_frame`] re-reads the `type`, finds
+/// `ApproveBinding` in [`ClientFrameKind::ALL`], and answers
+/// [`ClientDecode::BadFields`] — which `conn::read_loop` renders as
+/// `protocol_violation` naming the frame. Identical machinery, no new
+/// branch, and §18.4c's `sig` case is the standing precedent.
+///
+/// Lower case on the wire, like every attach-protocol vocabulary but
+/// `mode` (§7.5: `mode`'s CamelCase *"is not a pattern to copy"*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalDecision {
+    /// §17.5's `Approved`: resolve the reference, inject, zero, audit.
+    Approve,
+    /// §17.5's `Denied`: **fall through to the human-prompt path**
+    /// (REQ-SEC-017). Not an error, and not an answer the agent ever sees
+    /// as its own status — §18.1 deleted `binding_approval_denied`
+    /// precisely because the fall-through is unconditional.
+    Deny,
 }
 
 /// Server → client (§7.5).
@@ -212,6 +269,44 @@ pub enum ServerFrame {
         /// `"fulfilled" | "cancelled" | "timeout"` (§7.5).
         outcome: String,
     },
+    /// §9.6's `require_confirm` approval, raised when a binding that
+    /// carries it matches this session (§7.5, §17.5).
+    ///
+    /// **The binding's *name* and provider, never the reference and never
+    /// the value** (REQ-SEC-016): *"approving is a decision about which
+    /// credential, not an exposure of it."* The reference exists in the
+    /// daemon's config at the moment this frame is built, so its absence
+    /// here is a real omission and not an accident of ordering; the value
+    /// does not exist yet at all, because resolution happens only *after*
+    /// approval.
+    ///
+    /// **No expiry field, and that is REQ-T-018 rather than an
+    /// oversight.** Rev. 47 widened the requirement to this surface and it
+    /// now forbids a bare `expires_at`/`created_at` outright — a bare name
+    /// being *"a claim the value does not support"*. If a later milestone
+    /// puts the deadline on this frame (0.0.10 renders the same lifecycle
+    /// at `GET /api/binding-approvals`), it is `expires_at_unix_secs`, an
+    /// integer, from the first line it is written. §9.4's sibling defect
+    /// on `confirmation/list_pending` is what that rule was learned from.
+    ///
+    /// **Between `SecretRequestClosed` and `ProtocolError`**, which is
+    /// §7.5's order with `TransferProgress` (0.0.9) not yet present — see
+    /// [`KNOWN_SERVER_TYPES`], whose comment already reserved the slot.
+    BindingApprovalRequired {
+        approval_id: String,
+        /// §9.6's override key: *"the only part of a binding any surface
+        /// shows"*.
+        binding_name: String,
+        /// The §9.6 config spelling, as `ArgvProvider::as_str` gives it.
+        provider: String,
+        /// The canonical session id, so a client watching several can put
+        /// the affordance on the right one.
+        session: String,
+        /// The agent's `prompt_text` when a tool call raised the request
+        /// and the raised text otherwise — **redacted either way**, on the
+        /// same rule `AwaitingSecret.prompt_text` follows.
+        prompt_text: String,
+    },
     ProtocolError {
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,6 +345,7 @@ pub enum ClientFrameKind {
     SecretInput,
     Resize,
     Signal,
+    ApproveBinding,
     Detach,
 }
 
@@ -257,12 +353,13 @@ impl ClientFrameKind {
     /// Every kind, in wire order. Task 8 asserts the allowlist against
     /// this, so adding a variant without deciding its ReadOnly status
     /// fails a test rather than defaulting to permitted.
-    pub const ALL: [ClientFrameKind; 6] = [
+    pub const ALL: [ClientFrameKind; 7] = [
         Self::Attach,
         Self::Input,
         Self::SecretInput,
         Self::Resize,
         Self::Signal,
+        Self::ApproveBinding,
         Self::Detach,
     ];
 
@@ -274,6 +371,7 @@ impl ClientFrameKind {
             Self::SecretInput => "SecretInput",
             Self::Resize => "Resize",
             Self::Signal => "Signal",
+            Self::ApproveBinding => "ApproveBinding",
             Self::Detach => "Detach",
         }
     }
@@ -306,7 +404,22 @@ impl ClientFrameKind {
         match self {
             Self::Detach => true,
             Self::Attach => false,
-            Self::Input | Self::SecretInput | Self::Resize | Self::Signal => false,
+            // **`ApproveBinding` is on this side by name, not by
+            // default.** §18.4's row spells it out — *"including
+            // `ApproveBinding` (an authorisation decision, not an
+            // observation)"* — and §7.5 repeats it at the frame. It is
+            // the one new kind whose ReadOnly status a reader might
+            // guess at, because it writes nothing to the PTY and changes
+            // no session state, which is the *shape* of the one frame
+            // that will ever join the allowed side (§7.8.3's
+            // `AttentionAck`). What separates them is that an `Ack` is a
+            // statement about the client's own display and an approval
+            // releases a credential.
+            Self::Input
+            | Self::SecretInput
+            | Self::Resize
+            | Self::Signal
+            | Self::ApproveBinding => false,
         }
     }
 }
@@ -319,6 +432,7 @@ impl ClientFrame {
             Self::SecretInput { .. } => ClientFrameKind::SecretInput,
             Self::Resize { .. } => ClientFrameKind::Resize,
             Self::Signal { .. } => ClientFrameKind::Signal,
+            Self::ApproveBinding { .. } => ClientFrameKind::ApproveBinding,
             Self::Detach => ClientFrameKind::Detach,
         }
     }
@@ -458,6 +572,7 @@ impl ServerFrame {
             Self::Resize { .. } => Some("Resize"),
             Self::AwaitingSecret { .. } => Some("AwaitingSecret"),
             Self::SecretRequestClosed { .. } => Some("SecretRequestClosed"),
+            Self::BindingApprovalRequired { .. } => Some("BindingApprovalRequired"),
             Self::ProtocolError { .. } => Some("ProtocolError"),
             Self::Detached { .. } => Some("Detached"),
             Self::Unknown { .. } => None,
@@ -470,13 +585,14 @@ impl ServerFrame {
 /// one.
 ///
 /// The order is §7.5's — the two handshake frames, then the bulleted
-/// server list — restricted to the variants 0.0.6 implements.
-/// `BindingApprovalRequired` inserts between `SecretRequestClosed` and
-/// `TransferProgress` when 0.0.7 lands it, and `TransferProgress`
-/// between that and `ProtocolError` when 0.0.9 does; **neither
-/// appends**. Same rule §18's preamble states for the §18 catalogues,
-/// applied to §7.5's for the same reason: an array that can be diffed
-/// against the document by eye is worth the arithmetic.
+/// server list — restricted to the variants 0.0.7 implements.
+/// `BindingApprovalRequired` **inserted** between `SecretRequestClosed`
+/// and `TransferProgress` when 0.0.7 landed it, exactly where 0.0.6's
+/// version of this comment reserved the slot; `TransferProgress` goes
+/// between that and `ProtocolError` when 0.0.9 lands, and it does not
+/// append either. Same rule §18's preamble states for the §18
+/// catalogues, applied to §7.5's for the same reason: an array that can
+/// be diffed against the document by eye is worth the arithmetic.
 pub const KNOWN_SERVER_TYPES: &[&str] = &[
     "Attached",
     "AttachReject",
@@ -485,6 +601,7 @@ pub const KNOWN_SERVER_TYPES: &[&str] = &[
     "Resize",
     "AwaitingSecret",
     "SecretRequestClosed",
+    "BindingApprovalRequired",
     "ProtocolError",
     "Detached",
 ];
@@ -661,6 +778,121 @@ mod tests {
     }
 
     #[test]
+    fn both_new_frames_encode_with_exactly_their_specified_keys() {
+        // The same instrument `the_attach_frame_key_set_is_exactly_the_spec_list`
+        // uses, for the same reason: a round-trip test is blind to a
+        // field dropped by a `skip_serializing_if`, to a renamed one and
+        // to an extra one, because it compares the type against itself.
+        // §7.5 fixes these two key sets and REQ-SEC-016 fixes what is
+        // *not* in the first of them.
+        let f = encode(&ServerFrame::BindingApprovalRequired {
+            approval_id: "appr_a1b2".into(),
+            binding_name: "prod-ssh".into(),
+            provider: "secret-service".into(),
+            session: "sess_a1b2".into(),
+            prompt_text: "a credential".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            keys(&f),
+            vec![
+                "approval_id",
+                "binding_name",
+                "prompt_text",
+                "provider",
+                "session",
+                "type",
+            ],
+            "§7.5's five fields and the tag — no `reference`, no `value`, and no bare \
+             `expires_at` (REQ-SEC-016, REQ-T-018)"
+        );
+        assert_eq!(field(&f, "type").as_text(), Some("BindingApprovalRequired"));
+
+        let f = encode(&ClientFrame::ApproveBinding {
+            approval_id: "appr_a1b2".into(),
+            decision: ApprovalDecision::Approve,
+        })
+        .unwrap();
+        assert_eq!(
+            keys(&f),
+            vec!["approval_id", "decision", "type"],
+            "§7.5's two fields and the tag — and no `decided_by`, which §9.4 derives from \
+             the connection and never from the frame"
+        );
+        assert_eq!(field(&f, "type").as_text(), Some("ApproveBinding"));
+
+        // **Both spellings of the closed set, read off the wire.** The
+        // key set above is identical for either value, so without these
+        // two lines the enum's serialisation is unpinned — and
+        // `#[serde(rename_all = "lowercase")]` is one attribute away
+        // from `"Approve"`, which is a different protocol.
+        assert_eq!(field(&f, "decision").as_text(), Some("approve"));
+        let denied = encode(&ClientFrame::ApproveBinding {
+            approval_id: "appr_a1b2".into(),
+            decision: ApprovalDecision::Deny,
+        })
+        .unwrap();
+        assert_eq!(field(&denied, "decision").as_text(), Some("deny"));
+    }
+
+    #[test]
+    fn a_decision_outside_the_closed_set_is_bad_fields_and_names_the_frame() {
+        // §18.4's *"a closed-enum field carrying a value outside its
+        // catalogue"* row, on the second frame that has one. The
+        // classification is what `conn::read_loop` renders as
+        // `ProtocolError { reason: "protocol_violation", frame_kind:
+        // "ApproveBinding" }`, and it is asserted here as well as over
+        // the socket because this is where a `String` field would change
+        // the answer without changing any frame the socket test sends.
+        let map = vec![
+            (
+                Cbor::Text("type".into()),
+                Cbor::Text("ApproveBinding".into()),
+            ),
+            (
+                Cbor::Text("approval_id".into()),
+                Cbor::Text("appr_a1b2".into()),
+            ),
+            (Cbor::Text("decision".into()), Cbor::Text("maybe".into())),
+        ];
+        let body = encode(&Cbor::Map(map)).unwrap();
+        match decode_client_frame(&body[4..]) {
+            ClientDecode::BadFields(kind) => assert_eq!(kind.as_str(), "ApproveBinding"),
+            other => panic!("expected BadFields(ApproveBinding), got {other:?}"),
+        }
+
+        // The pairing: the two catalogued values *do* decode, so the
+        // refusal above is about `"maybe"` and not about a decoder that
+        // rejects every `ApproveBinding`.
+        for (spelling, expected) in [
+            ("approve", ApprovalDecision::Approve),
+            ("deny", ApprovalDecision::Deny),
+        ] {
+            let map = vec![
+                (
+                    Cbor::Text("type".into()),
+                    Cbor::Text("ApproveBinding".into()),
+                ),
+                (
+                    Cbor::Text("approval_id".into()),
+                    Cbor::Text("appr_a1b2".into()),
+                ),
+                (
+                    Cbor::Text("decision".into()),
+                    Cbor::Text(spelling.to_string()),
+                ),
+            ];
+            let body = encode(&Cbor::Map(map)).unwrap();
+            match decode_client_frame(&body[4..]) {
+                ClientDecode::Frame(ClientFrame::ApproveBinding { decision, .. }) => {
+                    assert_eq!(decision, expected, "{spelling}")
+                }
+                other => panic!("{spelling} did not decode: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn mode_and_role_are_independent_fields_with_the_spec_spellings() {
         let f = encode(&ClientFrame::Attach {
             session: "s".into(),
@@ -789,6 +1021,13 @@ mod tests {
                 request_id: "r".into(),
                 outcome: "fulfilled".into(),
             },
+            ServerFrame::BindingApprovalRequired {
+                approval_id: "appr_1".into(),
+                binding_name: "prod-ssh".into(),
+                provider: "secret-service".into(),
+                session: "s".into(),
+                prompt_text: String::new(),
+            },
             ServerFrame::ProtocolError {
                 reason: "read_only_attach".into(),
                 frame_kind: None,
@@ -805,8 +1044,8 @@ mod tests {
         assert_eq!(tags.as_slice(), KNOWN_SERVER_TYPES);
         assert_eq!(
             KNOWN_SERVER_TYPES.len(),
-            9,
-            "nine of §7.5's eleven; two are deferred"
+            10,
+            "ten of §7.5's eleven; only TransferProgress (0.0.9) is deferred"
         );
         // The negative: Unknown is decode-only and must not be in the
         // list, or decode_server_frame would refuse to produce it.
@@ -879,7 +1118,11 @@ mod tests {
         // ALL is what Task 8's allowlist ranges over. A variant added to
         // ClientFrame without a matching ClientFrameKind makes the
         // ReadOnly table silently incomplete.
-        assert_eq!(ClientFrameKind::ALL.len(), 6);
+        //
+        // **6 → 7 is 0.0.7's deliberate update**, licensed by §18.4:
+        // `ApproveBinding` is a client frame and needs a `ClientFrameKind`
+        // so the ReadOnly table can range over it.
+        assert_eq!(ClientFrameKind::ALL.len(), 7);
         for k in ClientFrameKind::ALL {
             assert!(!k.as_str().is_empty());
         }
@@ -887,6 +1130,15 @@ mod tests {
         assert_eq!(
             ClientFrame::Input { bytes: vec![] }.kind().as_str(),
             "Input"
+        );
+        assert_eq!(
+            ClientFrame::ApproveBinding {
+                approval_id: "appr_1".into(),
+                decision: ApprovalDecision::Approve,
+            }
+            .kind()
+            .as_str(),
+            "ApproveBinding"
         );
     }
 
@@ -911,6 +1163,13 @@ mod tests {
 
         // By name, so a failure says which kind changed side rather than
         // that a count moved.
+        //
+        // **`ApproveBinding` joins the denied side, and this is 0.0.7's
+        // deliberate update to this row** — §18.4 rules it *"an
+        // authorisation decision, not an observation"* and §7.5 repeats
+        // the ruling at the frame. It is named in the loop below rather
+        // than left to the count, because the count moving is what a
+        // seventh kind does whichever side it lands on.
         assert!(ClientFrameKind::Detach.readonly_allowed());
         for k in [
             ClientFrameKind::Attach,
@@ -918,6 +1177,7 @@ mod tests {
             ClientFrameKind::SecretInput,
             ClientFrameKind::Resize,
             ClientFrameKind::Signal,
+            ClientFrameKind::ApproveBinding,
         ] {
             assert!(
                 !k.readonly_allowed(),
@@ -926,13 +1186,13 @@ mod tests {
             );
         }
 
-        // The count is asserted separately from the names: a seventh
+        // The count is asserted separately from the names: an eighth
         // variant added to `ALL` without a decision about its ReadOnly
         // status would otherwise slip through the loop above, which only
-        // ranges over the five it names.
+        // ranges over the six it names.
         assert_eq!(
             ClientFrameKind::ALL.len(),
-            6,
+            7,
             "a new frame kind needs a ReadOnly decision, not a default"
         );
     }

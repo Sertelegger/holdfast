@@ -109,11 +109,16 @@
 //! builder and **nowhere upstream**, so the matcher reads the detector's
 //! line even when the response reports `""`.
 //!
-//! ## What is not here
+//! ## `require_confirm` is two calls, not one
 //!
-//! **`require_confirm` is Task 11's.** A binding carrying it does not
-//! resolve in this build — see [`FellThrough::NeedsApproval`], which is
-//! the seam the approval round-trip is written into.
+//! §17.5's approval is a human round trip over a socket and [`autofill`]
+//! is synchronous, so the two cannot be one function. A binding carrying
+//! `require_confirm` answers [`FellThrough::NeedsApproval`] with its name
+//! and provider; the async caller raises the approval, waits out
+//! `min(binding_approval_timeout_secs, remaining / 2)`, and on `approve`
+//! comes back through [`autofill_approved`] — which **re-runs the
+//! selection** and resolves only if the session still selects the binding
+//! whose name was approved. Nothing in between holds a reference.
 
 use std::collections::BTreeMap;
 
@@ -300,16 +305,28 @@ pub enum FellThrough {
     /// which is what *"bounds blast radius if a session is doing something
     /// unexpected"* means.
     Exhausted { binding_name: String, max_uses: u32 },
-    /// **Task 11's seam.** The binding carries `require_confirm = true`,
-    /// which §9.6 answers with a `BindingApprovalRequired` frame, a human
-    /// approval inside `min(binding_approval_timeout_secs, remaining / 2)`
-    /// and only then a resolution. None of that exists yet, so the binding
-    /// does **not** resolve here: a `require_confirm` that silently
-    /// resolved would be the operator's most explicit "ask me first"
-    /// answered by "no". Task 11 replaces this arm with the round trip;
-    /// until then the safe reading of an un-implemented confirmation is
-    /// that it was not given.
-    NeedsApproval { binding_name: String },
+    /// The binding carries `require_confirm = true`, so it does not
+    /// resolve **on this call** (§9.6, §17.5).
+    ///
+    /// **Still a fall-through, and that is the design rather than a
+    /// leftover.** [`autofill`] is synchronous — it runs on a blocking
+    /// pool because a provider is an OS process — and an approval is a
+    /// human round trip over a socket. Fusing them would put a `.await`
+    /// inside `spawn_blocking`. So this variant is the hand-off: the
+    /// async caller broadcasts `BindingApprovalRequired`, waits out
+    /// `min(binding_approval_timeout_secs, remaining / 2)`, and on
+    /// `approve` calls [`autofill_approved`] with the name carried here.
+    /// A caller that ignores it falls through to the human prompt, which
+    /// is the safe reading of a confirmation that was not given.
+    ///
+    /// `provider` rides along because the frame carries it and because
+    /// re-deriving it at the call site would mean handing a
+    /// `&SecretBinding` across the seam — the one shape that puts the
+    /// reference within reach of the wire (REQ-SEC-016).
+    NeedsApproval {
+        binding_name: String,
+        provider: String,
+    },
     /// The provider ran (or could not be started) and produced no value:
     /// a locked keyring, an item that is not there, a `wincred` binding on
     /// Unix, a store that is not installed, a lookup that outran
@@ -373,9 +390,79 @@ pub fn autofill(
     if binding.require_confirm {
         return Autofill::FellThrough(FellThrough::NeedsApproval {
             binding_name: binding.name.clone(),
+            provider: binding.provider.clone(),
         });
     }
 
+    resolve_selected(security, session, binding, append_newline, audit)
+}
+
+/// §17.5's `Approved` arm: the rest of §5.2's step 1, for a binding a
+/// human has just approved **by name**.
+///
+/// **Blocking, like [`autofill`], and for the same reason.** The approval
+/// round trip happens in the async caller between the two calls; this one
+/// only spends the budget, runs the provider and writes the audit entry.
+///
+/// **It re-runs the selection rather than trusting a carried
+/// `&SecretBinding`, and both halves of that matter.** Carrying the
+/// binding across the approval wait would mean holding the *reference* in
+/// a local across a human-scale delay, in the one module whose premise is
+/// that the reference reaches nothing but an argv. And re-selecting is
+/// also the stronger check: between the approval being raised and
+/// answered the session's prompt line can move, which can change which
+/// binding §9.6's *"probed in configured order"* picks. If the session no
+/// longer selects the binding whose **name** was approved, this resolves
+/// **nothing** — a human approved `prod-ssh`, and a different credential
+/// is not what they approved.
+///
+/// The name and not an index or a pointer, because the name is what the
+/// human was shown (§9.6: *"the only part of a binding any surface
+/// shows"*), so the thing checked here is the thing that was agreed to.
+pub fn autofill_approved(
+    security: &SecurityConfig,
+    session: &Session,
+    approved_binding: &str,
+    append_newline: bool,
+    audit: &AuditLog,
+) -> Autofill {
+    if !keychain_step_runs(&security.secret_provider) {
+        return Autofill::FellThrough(FellThrough::ModeIsPrompt);
+    }
+    let subject_command = command_line(&session.command, &session.args);
+    let subject_prompt = session.detection().last_line;
+    let Some(binding) = select(&security.secret_bindings, &subject_command, &subject_prompt) else {
+        return Autofill::FellThrough(FellThrough::NoBindingMatched);
+    };
+    if binding.name != approved_binding {
+        // Reported as *no binding matched*, which is what it is from the
+        // caller's side and what every other fall-through looks like to
+        // the agent. An agent that could tell "the approved binding is no
+        // longer the selected one" from "you have no binding" could
+        // enumerate an operator's bindings from the outside.
+        crate::diag!(
+            "holdfast: approval named `{approved_binding}` but the session now selects \
+             `{}`; resolving nothing",
+            binding.name
+        );
+        return Autofill::FellThrough(FellThrough::NoBindingMatched);
+    }
+    resolve_selected(security, session, binding, append_newline, audit)
+}
+
+/// Budget, provider, audit — the tail both entry points share.
+///
+/// One copy, because the `max_uses` claim and its release on failure are
+/// a pair: a second copy is a second place the release can be forgotten,
+/// and a forgotten release lets a locked keyring eat an operator's whole
+/// budget with no credential ever resolved.
+fn resolve_selected(
+    security: &SecurityConfig,
+    session: &Session,
+    binding: &SecretBinding,
+    append_newline: bool,
+    audit: &AuditLog,
+) -> Autofill {
     // §9.6's bound, claimed **before** the spawn and under the session's
     // own lock, so that "the third prompt in this session falls through"
     // is a fact rather than a race between two calls that both read the
@@ -529,9 +616,13 @@ mod tests {
     use rmcp::model::CallToolResult;
     use serde_json::Value;
 
-    use crate::config::Config;
+    use crate::attach::frames::{ApprovalDecision, AttachMode, AttachRole, ServerFrame};
+    use crate::attach::hub::AttachConn;
+    use crate::clock::Clock;
+    use crate::config::{Config, DaemonConfig};
     use crate::mcp::tools::RequestSecretInputArgs;
     use crate::mcp::HoldfastServer;
+    use crate::protocol::handshake::ClientKind;
     use crate::pty::{InProcessPty, PtyBackend, PtySpawnConfig, Signal};
     use crate::session::{new_session_id, Session, SessionConfig};
 
@@ -741,12 +832,41 @@ mod tests {
     }
 
     fn server_with(security: SecurityConfig, audit_log: &Path) -> HoldfastServer {
+        server_full(
+            security,
+            audit_log,
+            DaemonConfig::default().binding_approval_timeout_secs,
+            Clock::system(),
+        )
+    }
+
+    /// [`server_with`] plus the two knobs §17.5's rows need: the approval
+    /// window, and a clock a test can move.
+    ///
+    /// **The clock has to reach the server and not just the test**, or
+    /// `run_binding_approval`'s `sleep_until` is on wall time and an
+    /// `advance` moves nothing — which is the failure `Clock` exists to
+    /// prevent, and which would show up here as a row that waits out a
+    /// real 120 seconds.
+    fn server_full(
+        security: SecurityConfig,
+        audit_log: &Path,
+        binding_approval_timeout_secs: u64,
+        clock: Clock,
+    ) -> HoldfastServer {
         let config = Config {
             security,
+            daemon: DaemonConfig {
+                binding_approval_timeout_secs,
+                ..DaemonConfig::default()
+            },
             ..Config::default()
         };
-        let server =
-            HoldfastServer::with_audit_path_and_config(Some(audit_log.to_path_buf()), &config);
+        let server = HoldfastServer::with_audit_path_config_and_clock(
+            Some(audit_log.to_path_buf()),
+            &config,
+            clock,
+        );
         // **The control that makes every audit assertion below mean
         // something.** A `HoldfastServer` built with `None` — or with a
         // path it could not open — carries a *disabled* log, against which
@@ -1502,15 +1622,22 @@ mod tests {
         let _ = s2.signal(Signal::Kill);
     }
 
-    /// **`require_confirm` does not resolve in this build — Task 11's
-    /// seam.**
+    /// **`require_confirm` does not resolve without an approval**, and
+    /// nobody approves here.
     ///
-    /// §9.6 answers `require_confirm = true` with a
-    /// `BindingApprovalRequired` frame, a bounded human approval and only
-    /// then a resolution. None of that exists yet, and a binding carrying
-    /// the operator's most explicit *"ask me first"* must not be answered
-    /// with *"no, here it is"*. It falls through, and the provider is not
-    /// consulted.
+    /// **Written when the round trip did not exist and kept, deliberately,
+    /// now that it does.** Its claim has narrowed rather than lapsed: it
+    /// used to say *"nothing answers a `require_confirm` binding in this
+    /// build"*, and it now says *"nothing answers one that no human
+    /// approved"* — which is the same sentence the operator's most
+    /// explicit **ask me first** is entitled to, and the one an
+    /// implementation is most likely to break by accident.
+    ///
+    /// The mechanism it now exercises is §17.5's expiry: `timeout_secs: 1`
+    /// makes the approval window `min(120, 1 / 2)`, so the approval is
+    /// raised, nobody decides, it expires, and the call falls through to
+    /// the prompt path — where, with nothing attached, it times out. The
+    /// provider is not consulted at any point, and no use is spent.
     ///
     /// The pairing is the same binding with the flag cleared, which does
     /// resolve — otherwise this row passes against a `select` that never
@@ -1891,7 +2018,11 @@ mod tests {
         assert_eq!(
             autofill_reason(&keychain_mode(vec![confirmed]), &s, audit),
             FellThrough::NeedsApproval {
-                binding_name: failing.name.clone()
+                binding_name: failing.name.clone(),
+                // The frame needs it, so the variant carries it — and a
+                // `provider` that came back wrong would put the wrong
+                // credential's name in front of the human approving it.
+                provider: "pass".to_string(),
             }
         );
 
@@ -2132,5 +2263,806 @@ mod tests {
             folded.push(c);
         }
         folded
+    }
+
+    // ------------------------------------- §17.5's approval harness
+    //
+    // **A fake attached client and not a socket.** Every row below needs a
+    // provider that *runs*, which forces the library target (see the
+    // fixture note at the top of this module), and a library target has no
+    // `attach.sock`. What it can have is the thing the daemon actually
+    // fans out to: one `AttachConn` on the hub, with the test on the
+    // reading end of the same bounded `mpsc` a real connection's writer
+    // task drains. So the frames asserted here are the frames a human's
+    // client would have received, produced by the same
+    // `broadcast_binding_approval` call. What is *not* covered from here
+    // is the wire — the decode, the ReadOnly gate and the `frame_kind` on
+    // a refusal — and those rows live in `tests/secrets.rs`, over a real
+    // socket, where they need no provider.
+
+    /// One attached client on the hub, with everything it received.
+    struct FakeClient {
+        session_id: String,
+        client_id: u64,
+        rx: tokio::sync::mpsc::Receiver<ServerFrame>,
+        /// **Everything ever received, kept.** REQ-SEC-016's assertion is
+        /// over *every* frame for the whole flow, before and after
+        /// approval; a helper that returned only the latest would make
+        /// that assertion a claim about one frame.
+        seen: Vec<ServerFrame>,
+    }
+
+    fn attach_fake(server: &HoldfastServer, session_id: &str) -> FakeClient {
+        let hub = server.attach_hub();
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::attach::hub::ATTACH_QUEUE_FRAMES);
+        let client_id = hub.next_client_id();
+        hub.register(Arc::new(AttachConn {
+            client_id,
+            session_id: session_id.to_string(),
+            mode: AttachMode::ReadWrite,
+            role: AttachRole::Interactive,
+            client_kind: ClientKind::Cli,
+            client_version: "test".to_string(),
+            peer_pid: None,
+            peer_uid: 0,
+            tx,
+            connected_at: std::time::Instant::now(),
+        }));
+        FakeClient {
+            session_id: session_id.to_string(),
+            client_id,
+            rx,
+            seen: Vec::new(),
+        }
+    }
+
+    impl FakeClient {
+        /// Everything queued right now, added to [`Self::seen`].
+        fn drain(&mut self) {
+            while let Ok(f) = self.rx.try_recv() {
+                self.seen.push(f);
+            }
+        }
+
+        /// Wait for a frame matching `pred`, or fail — **never hang**.
+        async fn wait_for(
+            &mut self,
+            what: &str,
+            pred: impl Fn(&ServerFrame) -> bool,
+        ) -> ServerFrame {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                self.drain();
+                if let Some(f) = self.seen.iter().find(|f| pred(f)) {
+                    return f.clone();
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no {what} reached the client; it saw {:?}",
+                    self.seen
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn has(&self, pred: impl Fn(&ServerFrame) -> bool) -> bool {
+            self.seen.iter().any(pred)
+        }
+
+        fn unregister(&self, server: &HoldfastServer) {
+            server
+                .attach_hub()
+                .unregister(&self.session_id, self.client_id);
+        }
+    }
+
+    fn is_approval(f: &ServerFrame) -> bool {
+        matches!(f, ServerFrame::BindingApprovalRequired { .. })
+    }
+
+    fn is_awaiting(f: &ServerFrame) -> bool {
+        matches!(f, ServerFrame::AwaitingSecret { .. })
+    }
+
+    /// Poll until §17.5's `Pending` really exists, and hand it back.
+    ///
+    /// Read-only, like `SecretSlots::has_waiter`: the obvious way to ask
+    /// this from outside would be to try `raise`, and that would take the
+    /// slot from the call being observed.
+    async fn await_approval(server: &HoldfastServer, session_id: &str) -> crate::secret::Approval {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(a) = server.attach_hub().approvals().outstanding(session_id) {
+                return a;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no binding approval was ever raised"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The decision, as `attach::conn`'s `ApproveBinding` arm makes it —
+    /// same call, same arguments, `decided_by` off the connection.
+    fn decide(
+        server: &HoldfastServer,
+        session_id: &str,
+        approval_id: &str,
+        decision: ApprovalDecision,
+        who: &str,
+    ) -> crate::secret::Decide {
+        server
+            .attach_hub()
+            .approvals()
+            .decide(session_id, approval_id, decision, who)
+    }
+
+    /// Answer the outstanding secret request exactly as `attach::conn`'s
+    /// `SecretInput` arm does: take the slot by id, write through the
+    /// queue, then answer the waiting call with the **count**.
+    ///
+    /// This is what makes "falls through to the human-prompt path" an
+    /// assertion about a human completing the call, rather than about a
+    /// frame having been broadcast at one.
+    async fn answer_as_a_human(server: &HoldfastServer, session: &Session, bytes: &[u8]) {
+        let hub = server.attach_hub();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !hub.secrets().has_waiter(&session.id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the call never fell through to the prompt path"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let id = hub
+            .secrets()
+            .outstanding(&session.id)
+            .expect("outstanding")
+            .request_id;
+        let raised = hub
+            .secrets()
+            .take(&session.id, Some(&id))
+            .expect("the raise is still there");
+        let (write, ack) = crate::session::WriteRequest::secret(SecretBytes::normalise(
+            bytes.to_vec(),
+            raised.append_newline,
+        ));
+        session
+            .write_queue()
+            .send(write)
+            .await
+            .expect("the write queue accepted");
+        let n = ack
+            .await
+            .expect("the writer answered")
+            .expect("the PTY took the write");
+        raised.answer(crate::secret::Resolution::Provided {
+            bytes_written: n as u64,
+        });
+        hub.broadcast_secret_closed(&session.id, &id, "fulfilled");
+    }
+
+    /// The tool call on its own task, so the row can go on to answer it.
+    fn spawn_call(
+        server: &HoldfastServer,
+        args: RequestSecretInputArgs,
+    ) -> tokio::task::JoinHandle<Value> {
+        let server = server.clone();
+        tokio::spawn(async move {
+            body(
+                &server
+                    .request_secret_input(Parameters(args))
+                    .await
+                    .expect("request_secret_input"),
+            )
+        })
+    }
+
+    async fn joined(call: tokio::task::JoinHandle<Value>, what: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(60), call)
+            .await
+            .unwrap_or_else(|_| panic!("{what} never returned"))
+            .expect("the call")
+    }
+
+    /// A `require_confirm` binding whose provider is a script this row
+    /// wrote — §9.6's *"ask me first"*, with something to ask about.
+    fn confirming(sc: &mut Scratch, short: &str, match_command: &str) -> SecretBinding {
+        let mut b = sc.binding(short, match_command, &format!("printf '{PROBE}\\n'\n"));
+        b.require_confirm = true;
+        b
+    }
+
+    /// The one `binding_approval` line for a session, or `None`.
+    fn approval_line(sc: &Scratch, session_id: &str) -> Option<Value> {
+        let lines: Vec<Value> = sc
+            .audit(session_id)
+            .into_iter()
+            .filter(|e| e["kind"] == "binding_approval")
+            .collect();
+        assert!(
+            lines.len() <= 1,
+            "one approval must produce at most one line: {lines:?}"
+        );
+        lines.into_iter().next()
+    }
+
+    /// **An approval is a decision about a *named* binding, and
+    /// [`autofill_approved`] resolves nothing if the session no longer
+    /// selects that name.**
+    ///
+    /// The window between raising an approval and answering it is
+    /// human-scale — up to `min(binding_approval_timeout_secs, remaining /
+    /// 2)` — and §9.6 probes bindings *"in configured order"* against a
+    /// prompt line that can move inside it. Without the name check, a
+    /// human who approved `prod-ssh` could have released `staging-db`.
+    ///
+    /// Driven directly rather than through the round trip, because the
+    /// round trip cannot make the selection move on demand: the branch is
+    /// reachable only from a state a socket-level row would have to race
+    /// for.
+    #[test]
+    fn an_approval_resolves_only_the_binding_whose_name_was_approved() {
+        let mut sc = Scratch::new("approvedname");
+        let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
+        let audit = &server.processor.audit;
+        let s = session_running("ssh", &["prod-01"], "sleep 30");
+
+        // A name the session does not select resolves nothing and runs
+        // nothing — reported as `NoBindingMatched`, which is what it is
+        // from the caller's side and what every fall-through looks like
+        // to the agent.
+        let out = autofill_approved(
+            &keychain_mode(vec![b.clone()]),
+            &s,
+            "some-other-binding",
+            true,
+            audit,
+        );
+        assert!(
+            matches!(out, Autofill::FellThrough(FellThrough::NoBindingMatched)),
+            "{out:?}"
+        );
+        assert!(
+            !sc.ran("prod-ssh"),
+            "a binding nobody approved read the credential store"
+        );
+        assert!(
+            s.binding_uses().is_empty(),
+            "a refused approval still spent a use: {:?}",
+            s.binding_uses()
+        );
+
+        // **The pairing**: the same call with the name that *was*
+        // approved resolves, so the refusal above is about the name and
+        // not about a function that never resolves anything.
+        let out = autofill_approved(&keychain_mode(vec![b.clone()]), &s, &b.name, true, audit);
+        match out {
+            Autofill::Resolved(r) => {
+                assert_eq!(r.binding_name, b.name);
+                assert_eq!(r.use_count, 1);
+            }
+            other => panic!("the approved name did not resolve: {other:?}"),
+        }
+        assert!(sc.ran("prod-ssh"));
+
+        let _ = s.signal(Signal::Kill);
+    }
+
+    // ------------------------------------------ §17.5's four terminals
+
+    /// **The positive control for every absence assertion below.**
+    ///
+    /// A human approves, the reference resolves, and the child gets the
+    /// value — an approval path that resolved *nothing* would satisfy
+    /// every "the value is absent from…" row in this file.
+    #[tokio::test]
+    async fn approving_injects_the_value() {
+        let mut sc = Scratch::new("approve");
+        let b = confirming(&mut sc, "prod-ssh", "^ssh\\s+(\\S+@)?prod-0[12]\\b");
+        let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
+        let s = session_running("ssh", &["user@prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        await_prompt(&s, b"Password: ").await;
+
+        let call = spawn_call(&server, secret_args(&s.id, 20));
+        let approval = await_approval(&server, &s.id).await;
+
+        // The frame reached the client, and it is §7.5's frame: the
+        // binding's name and provider, so a human can see *which*
+        // credential is about to be used.
+        let frame = client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+        let ServerFrame::BindingApprovalRequired {
+            approval_id,
+            binding_name,
+            provider,
+            session,
+            ..
+        } = frame
+        else {
+            unreachable!()
+        };
+        assert_eq!(approval_id, approval.approval_id);
+        assert_eq!(binding_name, b.name);
+        assert_eq!(provider, "pass");
+        assert_eq!(session, s.id);
+        // Nothing has resolved yet: §9.6's "ask me first" is answered
+        // **before** the store is touched, not after.
+        assert!(
+            !sc.ran("prod-ssh"),
+            "the provider ran before anybody approved"
+        );
+
+        assert_eq!(
+            decide(
+                &server,
+                &s.id,
+                &approval.approval_id,
+                ApprovalDecision::Approve,
+                "cli"
+            ),
+            crate::secret::Decide::Recorded
+        );
+
+        let payload = joined(call, "the approved call").await;
+        assert_eq!(payload["status"], "secret_provided", "{payload}");
+        assert_eq!(payload["data"]["bytes_written"], (PROBE.len() + 1) as u64);
+        assert!(sc.ran("prod-ssh"), "approval did not run the provider");
+
+        // The arrival proof, on the child's own output.
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "the resolved value reached the ring buffer"
+        );
+
+        // §9.4's two lines, in order: the decision, then the resolution.
+        assert_eq!(
+            sc.kinds(&s.id),
+            vec![
+                "binding_approval".to_string(),
+                "binding_resolved".to_string()
+            ],
+            "an approved binding writes the decision and the resolution, and no prompt \
+             path ran"
+        );
+        let line = approval_line(&sc, &s.id).expect("a binding_approval line");
+        assert_eq!(line["approval_id"], approval.approval_id);
+        assert_eq!(line["binding_name"], b.name);
+        assert_eq!(line["outcome"], "approved");
+        assert_eq!(
+            line["decided_by"], "cli",
+            "decided_by is the deciding connection's handshake client_kind (§9.4, Q11)"
+        );
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// REQ-SEC-016, **and the ordering is the whole point**.
+    ///
+    /// The *reference* exists when the frame is built, so its absence
+    /// from `BindingApprovalRequired` is a real assertion — asserted
+    /// beside the fact that `binding_name` and `provider` **are** there,
+    /// which is what stops it being satisfied by an empty frame.
+    ///
+    /// The *value* does not exist at that moment at all: resolution
+    /// happens only after approval, so "the value is absent from this one
+    /// frame" is green against every implementation there could be,
+    /// including one that leaks a second later. So it is asserted across
+    /// **every frame the client received for the whole flow**, before and
+    /// after approval, plus the `binding_approval` line and the whole
+    /// audit file.
+    #[tokio::test]
+    async fn the_approval_surface_carries_no_reference_and_no_value() {
+        let mut sc = Scratch::new("surface");
+        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
+        let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        await_prompt(&s, b"Password: ").await;
+
+        // **Driven through §16.4's ordinary shape — an echo drop raised
+        // first, then the call adopting it — and that is not decoration.**
+        // On a cold call the client sees exactly *one* frame for the whole
+        // flow, and "no value in any frame" over one pre-resolution frame
+        // is the vacuous form this row exists not to be. With a raise
+        // outstanding, the approved resolution also closes it, so the
+        // client sees frames on **both** sides of the decision. The raise
+        // and its broadcast are the two lines `attach::conn`'s
+        // `forward_events` runs on an `AwaitingSecretEntered` edge; there
+        // is no connection here to run them.
+        let hub = server.attach_hub();
+        let (raised, first) = hub.raise_secret(&s.id, &s.prompt_last_line_redacted());
+        assert!(first, "the fixture must be the one that raised");
+        hub.broadcast_awaiting_secret(&s.id, &raised.request_id, &raised.prompt_text);
+
+        let call = spawn_call(&server, secret_args(&s.id, 20));
+        let approval = await_approval(&server, &s.id).await;
+        client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+
+        // Half one: the reference. It is in the daemon's config right
+        // now, so leaving it out of the frame is a decision.
+        let encoded = format!("{:?}", client.seen);
+        assert!(
+            !encoded.contains(REFERENCE),
+            "the binding reference reached an attach frame: {encoded}"
+        );
+        assert!(
+            encoded.contains(&b.name) && encoded.contains("pass"),
+            "the frame carries neither the binding name nor the provider, so the absence \
+             above is not evidence of anything: {encoded}"
+        );
+
+        decide(
+            &server,
+            &s.id,
+            &approval.approval_id,
+            ApprovalDecision::Approve,
+            "ui-bridge",
+        );
+        let payload = joined(call, "the approved call").await;
+        assert_eq!(payload["status"], "secret_provided", "{payload}");
+        buffer_until(&s, b"got=HUNTER2", 20).await;
+
+        // Half two: the value, across everything the client ever saw —
+        // which now includes the frames sent *after* resolution.
+        client
+            .wait_for("SecretRequestClosed", |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { .. })
+            })
+            .await;
+        let encoded = format!("{:?}", client.seen);
+        assert!(
+            client.has(is_awaiting) && client.has(is_approval),
+            "the flow did not produce frames on both sides of the decision, so 'every \
+             frame' is one frame: {encoded}"
+        );
+        assert!(
+            !encoded.contains(PROBE) && !encoded.contains(REFERENCE),
+            "a resolved value or reference reached an attach frame: {encoded}"
+        );
+        let trail = sc.audit_text();
+        assert!(
+            !trail.contains(PROBE) && !trail.contains(REFERENCE),
+            "a resolved value or reference reached the audit trail"
+        );
+        assert!(
+            !payload.to_string().contains(PROBE) && !payload.to_string().contains(REFERENCE),
+            "the MCP response carries one of them: {payload}"
+        );
+
+        // **The anti-vacuity control**: neither string matches a built-in
+        // redaction rule, so their absence above is this module's doing
+        // and not the redactor's.
+        let rules = &server.processor.rules;
+        assert_eq!(crate::output::redact::redact_str(rules, PROBE), PROBE);
+        assert_eq!(
+            crate::output::redact::redact_str(rules, REFERENCE),
+            REFERENCE
+        );
+        // And the trail is non-empty and is this session's, so "not in
+        // the file" is not "there is no file".
+        assert!(trail.contains(&s.id), "the audit trail is empty");
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// REQ-SEC-017's first clause: a denial **falls through**, it does not
+    /// fail.
+    ///
+    /// Returning an error on denial would make `require_confirm` a way to
+    /// break a session rather than a way to gate a credential — and §18.1
+    /// deleted `binding_approval_denied` for exactly that reason.
+    #[tokio::test]
+    async fn denying_falls_through_to_the_human_prompt() {
+        let mut sc = Scratch::new("deny");
+        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
+        let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        await_prompt(&s, b"Password: ").await;
+
+        let call = spawn_call(&server, secret_args(&s.id, 20));
+        let approval = await_approval(&server, &s.id).await;
+        client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+        decide(
+            &server,
+            &s.id,
+            &approval.approval_id,
+            ApprovalDecision::Deny,
+            "ui-bridge",
+        );
+
+        // The fall-through is observable as the affordance the human is
+        // supposed to get instead.
+        client.wait_for("AwaitingSecret", is_awaiting).await;
+        answer_as_a_human(&server, &s, b"typedbyahuman").await;
+
+        let payload = joined(call, "the denied call").await;
+        assert_eq!(
+            payload["status"], "secret_provided",
+            "a denial must fall through to the prompt and complete there: {payload}"
+        );
+        assert_eq!(payload["data"]["bytes_written"], 14u64);
+
+        // **Nothing was resolved.** The provider never ran, so denial did
+        // not merely discard a value it had already fetched.
+        assert!(
+            !sc.ran("prod-ssh"),
+            "a denied binding still read the credential store"
+        );
+        let kinds = sc.kinds(&s.id);
+        assert!(
+            !kinds.iter().any(|k| k == "binding_resolved"),
+            "a denied binding wrote a resolution: {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "secret_input_request"),
+            "the prompt path never ran: {kinds:?}"
+        );
+        let line = approval_line(&sc, &s.id).expect("a binding_approval line");
+        assert_eq!(line["outcome"], "denied");
+        assert_eq!(line["decided_by"], "ui-bridge");
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// REQ-SEC-017 again, by the other route: the window elapses.
+    ///
+    /// **`expired` has no decider and the field is absent**, not empty —
+    /// treating expiry as denial-with-a-decider invents an actor in an
+    /// authorisation record.
+    #[tokio::test]
+    async fn an_expired_approval_falls_through_the_same_way() {
+        let mut sc = Scratch::new("expire");
+        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let clock = Clock::manual(std::time::Instant::now());
+        let server = server_full(
+            keychain_mode(vec![b.clone()]),
+            &sc.audit_log(),
+            120,
+            clock.clone(),
+        );
+        let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        await_prompt(&s, b"Password: ").await;
+
+        // min(120, 60 / 2) = 30.
+        let call = spawn_call(&server, secret_args(&s.id, 60));
+        let approval = await_approval(&server, &s.id).await;
+        client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+        // Yield first, so the wait is registered on the hand before it
+        // moves. (`sleep_until` also re-checks under the lock, so this is
+        // belt and braces rather than the correctness argument.)
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(30));
+
+        client.wait_for("AwaitingSecret", is_awaiting).await;
+        answer_as_a_human(&server, &s, b"typedbyahuman").await;
+        let payload = joined(call, "the expired call").await;
+        assert_eq!(payload["status"], "secret_provided", "{payload}");
+
+        assert!(!sc.ran("prod-ssh"), "an expired approval ran the provider");
+        let line = approval_line(&sc, &s.id).expect("a binding_approval line");
+        assert_eq!(line["approval_id"], approval.approval_id);
+        assert_eq!(line["outcome"], "expired");
+        assert!(
+            line.get("decided_by").is_none(),
+            "an expiry has no decider and the field must be absent, not empty: {line}"
+        );
+        // The pairing for that absence: `denying_…` shows the field *is*
+        // written when there is a decider, so this is a rule and not a
+        // field nobody ever populates.
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **Q10, and the arithmetic is asserted rather than only its
+    /// consequence.**
+    ///
+    /// `timeout_secs: 10`, `binding_approval_timeout_secs: 120`, nobody
+    /// approves. `min(120, 10 / 2)` is **5**, so on a manual clock
+    /// `advance(4 s)` must leave the approval pending with no fall-through
+    /// broadcast, and one more second must produce both.
+    ///
+    /// **Two mutations, and only the paired assertion sees both.**
+    /// `min(configured, remaining)` without the halving gives a 10-second
+    /// window: the fall-through fires exactly as the caller's deadline
+    /// expires, so a consequence-only form can pass it on a fast machine.
+    /// Using the configured window unconditionally gives 120 and makes
+    /// REQ-SEC-017's fall-through unreachable whenever the two knobs are
+    /// equal — i.e. by default. `min(configured, remaining)` is what §9.6
+    /// said until rev. 48, so it is the mutation a reader of the stale
+    /// side would write.
+    #[tokio::test]
+    async fn the_approval_window_leaves_time_for_the_fall_through() {
+        let mut sc = Scratch::new("window");
+        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let clock = Clock::manual(std::time::Instant::now());
+        let server = server_full(
+            keychain_mode(vec![b.clone()]),
+            &sc.audit_log(),
+            120,
+            clock.clone(),
+        );
+        let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        await_prompt(&s, b"Password: ").await;
+
+        let call = spawn_call(&server, secret_args(&s.id, 10));
+        let approval = await_approval(&server, &s.id).await;
+        client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+        // The window as a *value*, before anything is driven: the record
+        // says 5 seconds from the call's start, and a wrong arithmetic
+        // shows up here as a wrong number rather than as a timing.
+        assert_eq!(
+            crate::secret::approval_window(120, Some(Duration::from_secs(10))),
+            Duration::from_secs(5)
+        );
+        let started_at = clock.now_ms().max(0) as u64 / 1000;
+        assert_eq!(
+            approval.expires_at_unix_secs,
+            started_at + 5,
+            "the recorded expiry is not min(120, 10 / 2) seconds out"
+        );
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(4));
+        // Give a wrongly-woken waiter every chance to act before this is
+        // asserted, or the row passes by being faster than the bug.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.drain();
+        assert!(
+            server.attach_hub().approvals().outstanding(&s.id).is_some(),
+            "the approval expired four seconds into a five-second window"
+        );
+        assert!(
+            !client.has(is_awaiting),
+            "the fall-through fired early; the client saw {:?}",
+            client.seen
+        );
+
+        clock.advance(Duration::from_secs(1));
+        client.wait_for("AwaitingSecret", is_awaiting).await;
+        assert!(
+            server.attach_hub().approvals().outstanding(&s.id).is_none(),
+            "the window elapsed and the approval is still pending"
+        );
+
+        // And the caller still has time to be answered: the whole point
+        // of halving is that the prompt path inherits a usable deadline.
+        answer_as_a_human(&server, &s, b"typedbyahuman").await;
+        let payload = joined(call, "the call after the window").await;
+        assert_eq!(
+            payload["status"], "secret_provided",
+            "the fall-through ran but the caller's deadline had already gone: {payload}"
+        );
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// §17.5's `Superseded`: the session exits with an approval pending,
+    /// and a decision arriving **afterwards** resolves nothing.
+    ///
+    /// Resolving on a late decision would inject a credential into a PTY
+    /// nothing is reading. And per **Q13** no `binding_approval` line is
+    /// written at all — §9.4's vocabulary has no value for this state, and
+    /// an absent record beats an invented `outcome`.
+    ///
+    /// **The pairing is in the same row**: an identical arrangement on a
+    /// live session approves, spawns the provider and injects — so the
+    /// negative is about supersession and not about a fixture that never
+    /// worked.
+    #[tokio::test]
+    async fn a_session_exit_supersedes_a_pending_approval() {
+        let mut sc = Scratch::new("supersede");
+        let dead_b = confirming(&mut sc, "killed", "^ssh\\b");
+        let live_b = confirming(&mut sc, "alive", "^psql\\b");
+        let server = server_with(
+            keychain_mode(vec![dead_b.clone(), live_b.clone()]),
+            &sc.audit_log(),
+        );
+
+        // ---- the negative: the child dies while the approval is pending
+        let dead = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&dead)).expect("register");
+        let mut client = attach_fake(&server, &dead.id);
+        await_prompt(&dead, b"Password: ").await;
+
+        let call = spawn_call(&server, secret_args(&dead.id, 20));
+        let approval = await_approval(&server, &dead.id).await;
+        client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+
+        let _ = dead.signal(Signal::Kill);
+        let payload = joined(call, "the superseded call").await;
+        assert_eq!(
+            payload["status"], "session_died",
+            "a session that exited under a pending approval answers §5.1's status, not a \
+             prompt for a child that is gone: {payload}"
+        );
+
+        // The decision arrives too late and finds nothing to apply.
+        assert_eq!(
+            decide(
+                &server,
+                &dead.id,
+                &approval.approval_id,
+                ApprovalDecision::Approve,
+                "cli"
+            ),
+            crate::secret::Decide::UnknownApprovalId
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !sc.ran("killed"),
+            "a decision that arrived after the session was gone still ran the provider"
+        );
+        assert_eq!(
+            approval_line(&sc, &dead.id),
+            None,
+            "§9.4's `outcome` has no value for `Superseded`, so no line is written (Q13)"
+        );
+        client.unregister(&server);
+
+        // ---- the pairing: the identical arrangement, nothing killed
+        let live = session_running("psql", &["-h", "prod"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&live)).expect("register");
+        let mut client = attach_fake(&server, &live.id);
+        await_prompt(&live, b"Password: ").await;
+
+        let call = spawn_call(&server, secret_args(&live.id, 20));
+        let approval = await_approval(&server, &live.id).await;
+        client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+        assert_eq!(
+            decide(
+                &server,
+                &live.id,
+                &approval.approval_id,
+                ApprovalDecision::Approve,
+                "cli"
+            ),
+            crate::secret::Decide::Recorded
+        );
+        let payload = joined(call, "the live call").await;
+        assert_eq!(payload["status"], "secret_provided", "{payload}");
+        assert!(sc.ran("alive"), "the pairing's provider never ran");
+        buffer_until(&live, b"got=HUNTER2", 20).await;
+        assert_eq!(
+            approval_line(&sc, &live.id).expect("the pairing writes a line")["outcome"],
+            "approved"
+        );
+
+        client.unregister(&server);
+        let _ = live.signal(Signal::Kill);
     }
 }

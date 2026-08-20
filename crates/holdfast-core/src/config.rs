@@ -474,7 +474,8 @@ pub struct SecurityConfig {
     /// in its name that it reaches no redactor.
     #[serde(default)]
     pub extra_redaction_patterns: Vec<toml::Value>,
-    /// **Unread — 0.0.7.** `prompt` | `keychain` | `both` (§9.6).
+    /// `prompt` | `keychain` | `both` (§9.6). **Read** — it is §5.2 step
+    /// one's gate, via `secret::binding::keychain_step_runs`.
     #[serde(default = "d_secret_provider")]
     pub secret_provider: String,
     /// **Unread — 0.0.7.**
@@ -483,10 +484,10 @@ pub struct SecurityConfig {
     /// **Unread — 0.0.8.**
     #[serde(default = "d_strict_confirmation")]
     pub strict_confirmation: bool,
-    /// **Unread — 0.0.7.** §10.2's example is fully commented, so
-    /// nothing in the published fixture exercises this; §9.6 defines the
-    /// block normatively, so an operator who uncomments it must not get a
-    /// rejected config.
+    /// §9.6's operator bindings. **Read** by `secret::binding::select`.
+    /// §10.2's example is fully commented, so nothing in the published
+    /// fixture exercises this; §9.6 defines the block normatively, so an
+    /// operator who uncomments it must not get a rejected config.
     #[serde(default)]
     pub secret_bindings: Vec<SecretBinding>,
 
@@ -622,7 +623,18 @@ pub struct DaemonConfig {
     /// **Unread — 0.0.9** (§5.8.1 recording).
     #[serde(default = "d_record_all_sessions")]
     pub record_all_sessions: bool,
-    /// **Unread — 0.0.7** (§9.6 keychain approval window).
+    /// §17.5's binding-approval window, **read by
+    /// `mcp::tools`'s `run_binding_approval`** through
+    /// [`crate::secret::approval_window`].
+    ///
+    /// **An operator can measure a window shorter than this number, and
+    /// that is the invariant rather than a defect** (§17.5, indexed at
+    /// §25): with a call waiting, the window is
+    /// `min(binding_approval_timeout_secs, half the caller's remaining
+    /// deadline)`, so REQ-SEC-017's fall-through to the human prompt stays
+    /// reachable. Both this and `request_secret_input.timeout_secs`
+    /// default to 120, so the un-halved reading consumes the caller's
+    /// whole deadline and the fall-through never runs.
     #[serde(default = "d_binding_approval_timeout_secs")]
     pub binding_approval_timeout_secs: u64,
     /// §19.1: `audit.log` rotates daily and is kept this many **days**.

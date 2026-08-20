@@ -82,6 +82,18 @@ pub struct AttachHub {
     /// hub holds it because the hub is what can *reach* the clients a
     /// raise has to be told to.
     secrets: crate::secret::SecretSlots,
+    /// §17.5's outstanding binding approval, **one per session**.
+    ///
+    /// Here for the same reason `secrets` is: the decision arrives as an
+    /// `ApproveBinding` frame from an attached client, and the hub is
+    /// what can reach the clients a raise has to be told to.
+    ///
+    /// **A second map and not a second state on `secrets`.** The two can
+    /// be outstanding on one session at once — §5.2's fall-through raises
+    /// a *secret request* immediately after an approval is denied or
+    /// expires — so one slot holding both would make the fall-through
+    /// overwrite the thing it fell through from.
+    approvals: crate::secret::BindingApprovals,
     /// Monotonic, process-wide. **Never reused**, so an `unregister`
     /// arriving after the slot was refilled cannot remove somebody
     /// else's connection — the same reasoning that puts an `O_PATH` pin
@@ -212,6 +224,40 @@ impl AttachHub {
             let _ = c.tx.try_send(ServerFrame::SecretRequestClosed {
                 request_id: request_id.to_string(),
                 outcome: outcome.to_string(),
+            });
+        }
+    }
+
+    /// §17.5's approval registry, for the callers that need more of it
+    /// than [`broadcast_binding_approval`](Self::broadcast_binding_approval)
+    /// exposes — the waiting tool call, and `attach::conn`'s
+    /// `ApproveBinding` arm.
+    pub fn approvals(&self) -> &crate::secret::BindingApprovals {
+        &self.approvals
+    }
+
+    /// Tell every client attached to this session that a `require_confirm`
+    /// binding is waiting on a human (§7.5, §9.6).
+    ///
+    /// **Built from the [`Approval`] rather than from the binding**, and
+    /// that is REQ-SEC-016 held structurally: the frame's field list and
+    /// the approval record's are the same list, and neither type has a
+    /// field able to carry the reference or the value. A fan-out that took
+    /// a `&SecretBinding` would be one `serde_json::to_value` away from
+    /// putting the reference on the wire.
+    ///
+    /// `try_send`, like the other two fan-outs: §4.3's per-connection
+    /// queue is bounded, and a slow client must not hold up a tool call.
+    ///
+    /// [`Approval`]: crate::secret::Approval
+    pub fn broadcast_binding_approval(&self, approval: &crate::secret::Approval) {
+        for c in self.clients_of(&approval.session_id) {
+            let _ = c.tx.try_send(ServerFrame::BindingApprovalRequired {
+                approval_id: approval.approval_id.clone(),
+                binding_name: approval.binding_name.clone(),
+                provider: approval.provider.clone(),
+                session: approval.session_id.clone(),
+                prompt_text: approval.prompt_text.clone(),
             });
         }
     }

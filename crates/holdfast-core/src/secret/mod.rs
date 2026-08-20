@@ -16,9 +16,17 @@
 //! `prompt_text`, which is an agent-supplied string and a different
 //! thing entirely.
 
+pub mod approval;
 pub mod binding;
 pub mod provider;
 pub mod request;
+
+/// §17.5's binding-approval lifecycle. **Nothing here can hold a value or
+/// a reference** — an approval is a decision about *which* credential
+/// (REQ-SEC-016), and the surface is the binding's name and provider.
+pub use approval::{
+    approval_window, audit_binding_approval, Approval, BindingApprovals, Decide, Decided, Outcome,
+};
 
 /// §9.6's operator bindings. **No item here takes an agent-supplied
 /// string**, which is REQ-SEC-012's structural half stated as a set of
@@ -26,7 +34,9 @@ pub mod request;
 /// `select` takes those plus the child's own prompt line, and `autofill`
 /// takes the operator's config and a `&Session`. There is nowhere to put
 /// a `prompt_text` even by accident.
-pub use binding::{autofill, command_line, keychain_step_runs, select, Autofill, FellThrough};
+pub use binding::{
+    autofill, autofill_approved, command_line, keychain_step_runs, select, Autofill, FellThrough,
+};
 
 /// **`resolve_with` and `ScriptProvider` are deliberately absent from
 /// this list.** Between them they spell *"spawn this program with this

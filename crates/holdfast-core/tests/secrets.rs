@@ -25,10 +25,12 @@
 //! per read chunk: a child that drops `ECHO` and writes nothing raises no
 //! request until its next byte of output.
 
-use holdfast_core::attach::frames::{decode_server_frame, ClientFrame, ServerFrame};
+use holdfast_core::attach::frames::{
+    decode_server_frame, ApprovalDecision, ClientFrame, ServerFrame,
+};
 use holdfast_core::attach::{AttachMode, AttachRole};
 use holdfast_core::clock::Clock;
-use holdfast_core::config::{SecretBinding, SecurityConfig};
+use holdfast_core::config::{Config, DaemonConfig, SecretBinding, SecurityConfig};
 use holdfast_core::daemon::attach_server;
 use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::server::{self, Daemon};
@@ -36,7 +38,7 @@ use holdfast_core::mcp::tools::RequestSecretInputArgs;
 use holdfast_core::platform::Capabilities;
 use holdfast_core::protocol::frame;
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
-use holdfast_core::pty::{InProcessPty, PtyBackend, PtySpawnConfig, Signal};
+use holdfast_core::pty::{InProcessPty, MockPty, PtyBackend, PtySpawnConfig, Signal};
 use holdfast_core::secret::{
     command_line, keychain_step_runs, resolve, select, ArgvProvider, ProviderError, SecretProvider,
 };
@@ -87,6 +89,16 @@ impl TestDaemon {
 
     async fn start_with(tag: &str, clock: Clock) -> Self {
         Self::spawn(tag, |paths| Daemon::with_clock(paths, clock)).await
+    }
+
+    /// A daemon carrying an operator's `[security]` — the rows below that
+    /// are about §9.6's bindings need one, and every other row here wants
+    /// the stock config with no bindings at all.
+    async fn start_with_config(tag: &str, config: Config) -> Self {
+        Self::spawn(tag, |paths| {
+            Daemon::with_config_and_clock(paths, config, Clock::system())
+        })
+        .await
     }
 
     /// A daemon whose server reports the capabilities it is given rather
@@ -144,6 +156,26 @@ impl TestDaemon {
             cfg.args.clone(),
             Arc::new(pty) as Arc<dyn PtyBackend>,
             SessionConfig::with_buffer_capacity(256 * 1024),
+        );
+        self.daemon
+            .server
+            .registry
+            .insert(Arc::clone(&s))
+            .expect("register");
+        s
+    }
+
+    /// A session on a backend that produces **no output at all** unless a
+    /// test queues some — for the one row whose subject is
+    /// `last_activity_ms`, which the reader thread also stamps.
+    fn quiet_session(&self) -> Arc<Session> {
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::new(MockPty::new()) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(64 * 1024),
         );
         self.daemon
             .server
@@ -2556,4 +2588,479 @@ fn the_published_binding_block_loads_and_selects_the_session_it_names() {
     // And the empty set, so `select` is not answering `Some` from
     // somewhere other than the slice it was handed.
     assert!(select(&[], &named, "password:").is_none());
+}
+
+// ------------------------------- §17.5 over the socket (§7.5, §18.4)
+//
+// **These three rows are here and not in the library target because the
+// thing under test is the *wire*: the decode, the ReadOnly gate, and the
+// `frame_kind` on a refusal.** None of them needs a provider to produce a
+// value — the two that let an approval through drive a provider that
+// refuses without spawning anything — so none of them needs the
+// `#[cfg(test)]` script fixture that forces `secret::binding`'s rows into
+// the library. The behavioural half of §17.5 (approve, deny, expire,
+// supersede) lives there, where a provider can run.
+
+/// A binding that always matches this file's sessions and, once
+/// approved, resolves **nothing** — deterministically and on every
+/// platform.
+///
+/// `wincred` is not a way of skipping the provider: it is §9.6's fifth
+/// spelling, and `ArgvProvider::argv` answers it `NotImplemented` on
+/// every target without starting a process. That is exactly what
+/// Global Constraint 12 / REQ-TST-007 require of a row that must not
+/// depend on a credential store being installed — the alternative,
+/// `secret-service` or `pass`, would resolve on a developer's laptop and
+/// fall through on CI, which is a row whose outcome depends on the
+/// machine.
+fn confirming_binding() -> SecretBinding {
+    SecretBinding {
+        name: "prod-shell".to_string(),
+        // Every session here is `sh -c <script>` (see `shell_running`).
+        match_command: "^sh\\b".to_string(),
+        match_prompt: String::new(),
+        provider: "wincred".to_string(),
+        reference: "op://vault/prod-db/password".to_string(),
+        max_uses: None,
+        require_confirm: true,
+    }
+}
+
+fn confirming_config() -> Config {
+    Config {
+        security: SecurityConfig {
+            // §5.2's step 1 does not run at all under the default
+            // `prompt`; without this line every row below would fall
+            // straight through and assert nothing.
+            secret_provider: "keychain".to_string(),
+            secret_bindings: vec![confirming_binding()],
+            ..SecurityConfig::default()
+        },
+        daemon: DaemonConfig::default(),
+        ..Config::default()
+    }
+}
+
+/// The next frame matching `pred`, skipping the child's output.
+async fn next_matching(
+    c: &mut UnixStream,
+    secs: u64,
+    what: &str,
+    pred: impl Fn(&ServerFrame) -> bool,
+) -> ServerFrame {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        let f = recv(c).await;
+        if pred(&f) {
+            return f;
+        }
+        assert!(
+            matches!(
+                f,
+                ServerFrame::Output { .. }
+                    | ServerFrame::Resize { .. }
+                    | ServerFrame::AwaitingSecret { .. }
+                    | ServerFrame::SecretRequestClosed { .. }
+                    | ServerFrame::BindingApprovalRequired { .. }
+            ),
+            "waiting for {what} and got {f:?}"
+        );
+    }
+    panic!("no {what} arrived");
+}
+
+async fn next_binding_approval(c: &mut UnixStream, secs: u64) -> (String, String, String) {
+    match next_matching(c, secs, "BindingApprovalRequired", |f| {
+        matches!(f, ServerFrame::BindingApprovalRequired { .. })
+    })
+    .await
+    {
+        ServerFrame::BindingApprovalRequired {
+            approval_id,
+            binding_name,
+            provider,
+            ..
+        } => (approval_id, binding_name, provider),
+        _ => unreachable!(),
+    }
+}
+
+async fn next_protocol_error(c: &mut UnixStream, secs: u64) -> (String, Option<String>) {
+    match next_matching(c, secs, "ProtocolError", |f| {
+        matches!(f, ServerFrame::ProtocolError { .. })
+    })
+    .await
+    {
+        ServerFrame::ProtocolError { reason, frame_kind } => (reason, frame_kind),
+        _ => unreachable!(),
+    }
+}
+
+/// Write an `ApproveBinding` by hand, so `decision` can be something the
+/// enum cannot express — the same instrument `attach_protocol.rs`'s
+/// `write_raw_signal` uses on §18.4c's other closed set.
+async fn write_raw_approve(
+    s: &mut UnixStream,
+    approval_id: &str,
+    decision: ciborium::value::Value,
+) {
+    let value = ciborium::value::Value::Map(vec![
+        (
+            ciborium::value::Value::Text("type".into()),
+            ciborium::value::Value::Text("ApproveBinding".into()),
+        ),
+        (
+            ciborium::value::Value::Text("approval_id".into()),
+            ciborium::value::Value::Text(approval_id.into()),
+        ),
+        (ciborium::value::Value::Text("decision".into()), decision),
+    ]);
+    frame::write_frame(s, &value)
+        .await
+        .expect("write raw ApproveBinding");
+}
+
+/// Wait for the fall-through and hand back the `request_id` a human
+/// would answer.
+///
+/// **Read off the hub rather than off a fresh `AwaitingSecret` frame**,
+/// and the reason is §5.2's ordinary shape: the echo-off child has
+/// already raised a request, `attach::conn` broadcast it when this client
+/// attached, and the falling-through call therefore **adopts** — which is
+/// exactly the case where §7.5 forbids a second broadcast (*"an adopting
+/// call must not re-announce a request a human may already be typing
+/// into"*). A row waiting for a second frame here would be waiting for a
+/// frame the protocol says must not be sent. That the broadcast *does*
+/// happen when the call raises the request itself is asserted in
+/// `secret::binding::tests::denying_falls_through_to_the_human_prompt`,
+/// where nothing raised one first.
+async fn await_fall_through(d: &TestDaemon, session_id: &str) -> String {
+    await_waiter(d, session_id, "the fall-through to the prompt path").await;
+    d.daemon
+        .attach_hub()
+        .secrets()
+        .outstanding(session_id)
+        .expect("a request is outstanding once a call is waiting on one")
+        .request_id
+}
+
+fn approval_pending(d: &TestDaemon, session_id: &str) -> bool {
+    d.daemon
+        .attach_hub()
+        .approvals()
+        .outstanding(session_id)
+        .is_some()
+}
+
+/// REQ-SEC-017's second clause, and §18.4's row by name: *"any frame but
+/// `Detach` from a `ReadOnly` client, **including `ApproveBinding**`"*.
+///
+/// The mutation is dropping the frame silently, which leaves the human
+/// staring at a button that did nothing. **The follow-up is what proves
+/// the request survived**: after two refusals the approval is still
+/// pending, a ReadWrite client's decision is taken, and the call goes on
+/// to complete through the fall-through.
+#[tokio::test]
+async fn approve_binding_from_a_readonly_client_is_rejected() {
+    let d = TestDaemon::start_with_config("roapprove", confirming_config()).await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut ro = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+    let mut rw = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    let (approval_id, binding_name, provider) = next_binding_approval(&mut rw, 10).await;
+    assert_eq!(binding_name, "prod-shell");
+    assert_eq!(provider, "wincred");
+    // An observer is *shown* the approval — §9.2's role split is about
+    // output, not about attention — and simply may not answer it.
+    let (observed, _, _) = next_binding_approval(&mut ro, 10).await;
+    assert_eq!(observed, approval_id);
+
+    for attempt in 1..=2 {
+        send(
+            &mut ro,
+            &ClientFrame::ApproveBinding {
+                approval_id: approval_id.clone(),
+                decision: ApprovalDecision::Approve,
+            },
+        )
+        .await;
+        let (reason, kind) = next_protocol_error(&mut ro, 10).await;
+        assert_eq!(reason, "read_only_attach", "attempt {attempt}");
+        // A `reason`-only assertion passes against an implementation that
+        // cannot name the frame at all.
+        assert_eq!(kind.as_deref(), Some("ApproveBinding"), "attempt {attempt}");
+        assert!(
+            approval_pending(&d, &s.id),
+            "a ReadOnly client's decision was applied (attempt {attempt})"
+        );
+    }
+    // Two round trips completed on the same connection, which is §18.4's
+    // *"closes: no"* asserted rather than assumed.
+
+    // And a ReadWrite client's decision **is** taken: the request the
+    // ReadOnly frames could not touch is still there to be answered.
+    send(
+        &mut rw,
+        &ClientFrame::ApproveBinding {
+            approval_id: approval_id.clone(),
+            decision: ApprovalDecision::Approve,
+        },
+    )
+    .await;
+    // `wincred` resolves nothing on any platform, so the approved call
+    // falls through to the human — which is the request a human can now
+    // answer.
+    let request_id = await_fall_through(&d, &s.id).await;
+    assert!(
+        !approval_pending(&d, &s.id),
+        "the approval was not consumed"
+    );
+    send(
+        &mut rw,
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+
+    let payload = joined(call, "the approved call").await;
+    assert_eq!(payload["status"], "secret_provided", "{payload}");
+
+    let lines = audit_entries(&d, &s.id, "binding_approval");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["outcome"], "approved");
+    assert_eq!(
+        lines[0]["decided_by"], "cli",
+        "decided_by is the deciding connection's handshake client_kind, never the frame's"
+    );
+
+    let _ = s.signal(Signal::Kill);
+}
+
+/// §18.4's closed-enum rule on the second field that has one:
+/// `decision: "maybe"` is `protocol_violation`, **no part of the frame is
+/// applied**, and the connection stays open.
+///
+/// The mutation is a permissive deserialiser that maps anything
+/// non-`"approve"` onto deny — which silently converts a typo into an
+/// authorisation decision. `Signal.sig` is the standing precedent
+/// (§18.4c) and this row is written against it deliberately.
+#[tokio::test]
+async fn a_decision_outside_the_two_values_is_a_protocol_violation() {
+    let d = TestDaemon::start_with_config("baddecision", confirming_config()).await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    let (approval_id, _, _) = next_binding_approval(&mut c, 10).await;
+
+    for bad in [
+        ciborium::value::Value::Text("maybe".into()),
+        ciborium::value::Value::Text("Approve".into()),
+        ciborium::value::Value::Text(String::new()),
+        ciborium::value::Value::Bool(true),
+    ] {
+        write_raw_approve(&mut c, &approval_id, bad.clone()).await;
+        let (reason, kind) = next_protocol_error(&mut c, 10).await;
+        assert_eq!(reason, "protocol_violation", "for decision {bad:?}");
+        assert_eq!(
+            kind.as_deref(),
+            Some("ApproveBinding"),
+            "the refusal did not name the frame, for decision {bad:?}"
+        );
+        assert!(
+            approval_pending(&d, &s.id),
+            "a decision outside the two values was applied: {bad:?}"
+        );
+    }
+    // Nothing was decided and nothing was resolved.
+    assert!(audit_entries(&d, &s.id, "binding_approval").is_empty());
+    assert!(audit_entries(&d, &s.id, "binding_resolved").is_empty());
+
+    // **The pairing**: the same frame with a catalogued value *is*
+    // applied, so the four refusals above are about the value and not
+    // about a handler that refuses every `ApproveBinding`.
+    send(
+        &mut c,
+        &ClientFrame::ApproveBinding {
+            approval_id: approval_id.clone(),
+            decision: ApprovalDecision::Deny,
+        },
+    )
+    .await;
+    let request_id = await_fall_through(&d, &s.id).await;
+    assert!(!approval_pending(&d, &s.id));
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    let payload = joined(call, "the denied call").await;
+    assert_eq!(payload["status"], "secret_provided", "{payload}");
+    let lines = audit_entries(&d, &s.id, "binding_approval");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["outcome"], "denied");
+
+    let _ = s.signal(Signal::Kill);
+}
+
+/// REQ-C-005 / REQ-S-006 extended to the new frame: an `ApproveBinding`
+/// **rejected** from a ReadOnly client does not extend the session's idle
+/// deadline.
+///
+/// The mutation is bumping activity before the ReadOnly check rather than
+/// after — which would let any observer keep any session alive
+/// indefinitely by sending a frame it is not allowed to send.
+///
+/// **The pairing is in the same test**: an ordinary `Input` frame from a
+/// ReadWrite client on the same session *does* move the stamp, so the row
+/// cannot pass against a harness that could not observe a bump at all.
+///
+/// (Renamed from the plan's `the_readonly_ack_does_not_bump_activity`:
+/// nothing here acks anything, and §7.8.3's `AttentionAck` — the frame
+/// that name belongs to — is post-v0.1.0.)
+#[tokio::test]
+async fn a_rejected_approve_binding_does_not_bump_activity() {
+    let d = TestDaemon::start_with_config("roactivity", confirming_config()).await;
+    // **A `MockPty` and not a real shell, and this is the one row here
+    // that needs one.** `Session`'s reader thread stamps activity once
+    // per output chunk, so *any* byte the child or the tty produces moves
+    // the stamp for a reason that has nothing to do with a frame — and
+    // the negative assertion below cannot tell that apart from the defect
+    // it is written to catch. A backend that produces nothing unless a
+    // test queues it removes the whole class. `attach_protocol.rs`'s
+    // `signal_wire_names_are_the_three_documented_values` makes the same
+    // `last_activity_ms` assertion on the same kind of backend, for the
+    // same reason. (Measured: the first spelling used
+    // `sh -c 'sleep 30'` and flaked once in a loaded full-workspace run.)
+    let s = d.quiet_session();
+    let mut ro = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+    let mut rw = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let before = s.last_activity_ms();
+    send(
+        &mut ro,
+        &ClientFrame::ApproveBinding {
+            approval_id: "appr_nothing_here".into(),
+            decision: ApprovalDecision::Approve,
+        },
+    )
+    .await;
+    let (reason, kind) = next_protocol_error(&mut ro, 10).await;
+    assert_eq!(reason, "read_only_attach");
+    assert_eq!(kind.as_deref(), Some("ApproveBinding"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        s.last_activity_ms(),
+        before,
+        "a rejected ApproveBinding extended the idle deadline"
+    );
+
+    // The pairing: the same session, a frame that *is* allowed.
+    send(
+        &mut rw,
+        &ClientFrame::Input {
+            bytes: b"x".to_vec(),
+        },
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while s.last_activity_ms() <= before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "an accepted Input did not move the stamp either, so the row above asserts \
+             nothing"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let _ = s.signal(Signal::Kill);
+}
+
+/// An `ApproveBinding` whose `approval_id` names nothing outstanding is
+/// **answered**, and by name.
+///
+/// **This is the one behaviour §18.4 does not spell out, and it is
+/// recorded rather than repaired from this lane (Global Constraint 16).**
+/// The table's `unknown_request_id` row reads *"`SecretInput.request_id`
+/// doesn't match the current outstanding prompt"*, because `SecretInput`
+/// was its only producer when it was written. The condition here is the
+/// same one — the id you named is not the outstanding one — and
+/// `frame_kind` is exactly what distinguishes the two producers, which is
+/// what that field exists for. The two alternatives are both worse:
+/// inventing a sixth `reason` on a §23.3 surface, or answering nothing at
+/// all, which leaves a human whose approval expired one second ago
+/// pressing a button that says nothing back.
+///
+/// **The pairing is what makes the refusal about the id**: the same
+/// client, the same frame kind, with the id that *is* outstanding, is
+/// accepted silently and consumes the approval.
+#[tokio::test]
+async fn an_approve_binding_naming_no_outstanding_approval_is_refused_by_name() {
+    let d = TestDaemon::start_with_config("staleapproval", confirming_config()).await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    // Nothing is pending yet, so every id is unknown.
+    assert!(!approval_pending(&d, &s.id));
+    for attempt in 1..=2 {
+        send(
+            &mut c,
+            &ClientFrame::ApproveBinding {
+                approval_id: "appr_never_existed".into(),
+                decision: ApprovalDecision::Approve,
+            },
+        )
+        .await;
+        let (reason, kind) = next_protocol_error(&mut c, 10).await;
+        assert_eq!(reason, "unknown_request_id", "attempt {attempt}");
+        assert_eq!(kind.as_deref(), Some("ApproveBinding"), "attempt {attempt}");
+    }
+    // Two round trips on one connection: §18.4's *"closes: no"*.
+
+    // The pairing: a real approval, the real id, and no `ProtocolError`.
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    let (approval_id, _, _) = next_binding_approval(&mut c, 10).await;
+    let before = s.last_activity_ms();
+    send(
+        &mut c,
+        &ClientFrame::ApproveBinding {
+            approval_id: approval_id.clone(),
+            decision: ApprovalDecision::Approve,
+        },
+    )
+    .await;
+    let request_id = await_fall_through(&d, &s.id).await;
+    assert!(!approval_pending(&d, &s.id), "the real id was refused too");
+    // §4.1: a human deciding at the keyboard is activity, or a session
+    // idle-reaps out from under the approval they just gave. Stamped on
+    // the arm that landed a decision and on no other.
+    assert!(
+        s.last_activity_ms() >= before,
+        "an accepted decision moved the stamp backwards"
+    );
+
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    let payload = joined(call, "the approved call").await;
+    assert_eq!(payload["status"], "secret_provided", "{payload}");
+    // And the accepted frame produced no refusal of its own: the only
+    // `ProtocolError`s on this connection were the two above.
+    let lines = audit_entries(&d, &s.id, "binding_approval");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["outcome"], "approved");
+
+    let _ = s.signal(Signal::Kill);
 }

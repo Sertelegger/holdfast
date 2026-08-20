@@ -1126,6 +1126,22 @@ pub async fn attach(session: &str) -> ExitCode {
                             diag!("holdfast attach: secret request {outcome}");
                         }
                     }
+                    // §17.5's binding approval, **reported and not
+                    // answerable from this build**. Sending
+                    // `ApproveBinding` needs an interactive affordance in
+                    // raw mode, which is CLI work 0.0.7 does not do; the
+                    // arm exists because the variant is additive on a
+                    // §23.3 surface and an exhaustive match must cover
+                    // it. Dropping the frame silently would leave a human
+                    // watching a session stop with nothing said, so it is
+                    // named — **binding and provider only**, which is all
+                    // the frame carries (REQ-SEC-016).
+                    ServerFrame::BindingApprovalRequired { binding_name, provider, .. } => {
+                        diag!(
+                            "holdfast attach: the session is waiting for approval to use the \
+                             `{binding_name}` binding ({provider}); this build cannot answer it"
+                        );
+                    }
                     // Another client resized the session. This terminal
                     // cannot be resized from here, so the view is simply
                     // reported rather than silently wrong.
@@ -1330,6 +1346,18 @@ pub async fn watch(session: &str) -> ExitCode {
                         diag!("holdfast watch: the session is waiting for a secret");
                     }
                     ServerFrame::SecretRequestClosed { .. } => {}
+                    // A watcher is told an approval is pending and
+                    // **cannot answer it in any build**: §18.4 rejects
+                    // `ApproveBinding` from a `ReadOnly` client by name,
+                    // *"an authorisation decision, not an observation"*.
+                    // Reported for the same reason `AwaitingSecret` is,
+                    // and with no more than the frame carries.
+                    ServerFrame::BindingApprovalRequired { binding_name, .. } => {
+                        diag!(
+                            "holdfast watch: the session is waiting for approval to use the \
+                             `{binding_name}` binding"
+                        );
+                    }
                     ServerFrame::Resize { cols, rows } => {
                         diag!("holdfast watch: the session is now {cols}x{rows}");
                     }
