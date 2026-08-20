@@ -481,6 +481,23 @@ impl SecretSlots {
     /// other side, and a check-then-`take` outside the lock is exactly
     /// the race that lets it.
     ///
+    /// **This is the second of two copies of that predicate, not "the"
+    /// guard, and the distinction is load-bearing when reading a mutation
+    /// result.** The sweep's only caller reaches it through
+    /// [`unadopted_sessions`](Self::unadopted_sessions), whose filter
+    /// applies the same test one lock acquisition earlier. Deleting
+    /// *either* copy alone leaves the daemon-level rows green — the other
+    /// still stops the sweep — and only the unit row
+    /// `only_a_slot_with_nobody_waiting_is_a_third_partys_to_take` fails,
+    /// because it exercises both entry points directly. Measured; see
+    /// that row and the comment in
+    /// `a_call_waiting_on_a_dying_session_still_owns_its_own_session_died`.
+    ///
+    /// The duplication is deliberate and stays: the filter is a *query*
+    /// and cannot be atomic with the action, so this re-test under the
+    /// acting lock is what closes the window in which a call adopts
+    /// between the two.
+    ///
     /// **No `expect_id`, unlike [`take`](Self::take).** The caller here
     /// holds no id: it arrives at the slot from the session, not from a
     /// request, and any request it finds unadopted is by definition the

@@ -18,6 +18,7 @@
 //!   fresh, well-formed attach that must still succeed.
 
 use holdfast_core::attach::frames::{decode_server_frame, ClientFrame, ServerFrame};
+use holdfast_core::attach::hub::{AttachConn, ATTACH_QUEUE_FRAMES};
 use holdfast_core::attach::{
     AttachMode, AttachRole, ClientFrameKind, SignalName, KNOWN_SERVER_TYPES,
 };
@@ -34,8 +35,9 @@ use holdfast_core::session::{new_session_id, Reaper, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
+use tokio::sync::mpsc;
 
 /// A daemon serving **both** sockets in this test's own process.
 struct TestDaemon {
@@ -3677,16 +3679,32 @@ async fn a_call_waiting_on_a_dying_session_still_owns_its_own_session_died() {
     // must report nothing either way: refused because a waiter is
     // registered, or nothing left because the caller already took it.
     //
-    // **Measured, and it is the second half that actually happens.**
-    // `take_if_unadopted`'s waiterless guard was deleted and this row
-    // stayed green 5/5: `await_secret` is subscribed to the session's own
-    // event stream and takes the slot before the first sweep below can
-    // reach it, so there is nothing left for a mutated janitor to steal.
-    // **That guard is pinned by `only_a_slot_with_nobody_waiting_is_a_
-    // third_partys_to_take` in `secret::request`, which kills the same
-    // mutation deterministically.** What this row is for is the other
-    // claim — that `a2b747f`'s `session_died` still arrives end to end
-    // with a sweep running against it — and that it does assert.
+    // **The waiterless predicate is implemented at two sites, and this
+    // row is what covers their composition.** `release_exited_secret_slots`
+    // iterates `unadopted_sessions()`, whose filter already drops any
+    // session with a waiter, and `take_if_unadopted` then re-tests the
+    // same predicate under the lock that acts. Measured, three ways:
+    //
+    //   guard deleted at `take_if_unadopted` only -> this row SURVIVES
+    //   guard deleted at the `unadopted_sessions` -> this row SURVIVES
+    //     filter only
+    //   deleted at BOTH                           -> this row DIES, here,
+    //     on the *first* iteration, with the waiter still registered
+    //
+    // So a single-site defect is caught by
+    // `only_a_slot_with_nobody_waiting_is_a_third_partys_to_take` in
+    // `secret::request` (which kills either one, at two different
+    // assertions), and the *composition* — the guard gone as a property
+    // of the sweep rather than of one function — is caught here.
+    //
+    // **It is emphatically not a timing accident, and an earlier revision
+    // of this comment said it was.** There is no `.await` between
+    // `pty.exit(7)` above and the first sweep below, and `#[tokio::test]`
+    // is current-thread, so the spawned call task cannot have run yet:
+    // the waiter *is* still in the slot when the sweep arrives. Nothing
+    // races here and `await_secret` wins nothing. What stops the sweep is
+    // the query filter, which is why deleting one copy of the predicate
+    // leaves this row green.
     for _ in 0..5 {
         assert_eq!(
             d.daemon.release_exited_secret_slots(),
@@ -3711,6 +3729,78 @@ async fn a_call_waiting_on_a_dying_session_still_owns_its_own_session_died() {
     );
     // And the caller's own close left nothing behind either.
     assert!(d.daemon.attach_hub().outstanding_secret(&s.id).is_none());
+}
+
+/// §7.5: the clients still on a session are told the request is over, and
+/// told **`cancelled`** — the sweep releases a request that ended without
+/// a value, so it may claim no fulfilment and may invent no third
+/// outcome.
+///
+/// **The client here is registered straight into the hub rather than
+/// attached over the socket, and that is the whole reason this row can
+/// fail.** A real attach spawns `forward_events`, whose own `Exited` arm
+/// closes the slot and broadcasts `cancelled` by itself — so a row built
+/// on a real client passes with the sweep's broadcast deleted, which is
+/// exactly the hole this row exists to close. Registering the connection
+/// directly leaves the sweep as the only thing in the process that can
+/// produce the frame.
+#[tokio::test]
+async fn the_sweep_tells_the_clients_still_on_a_dead_session_that_the_request_closed() {
+    let d = TestDaemon::start("gh24closed").await;
+    let (s, pty) = d.session(None);
+    let raised = raise_unadopted(&d, &s.id);
+
+    let (tx, mut rx) = mpsc::channel(ATTACH_QUEUE_FRAMES);
+    d.daemon.attach_hub().register(Arc::new(AttachConn {
+        client_id: d.daemon.attach_hub().next_client_id(),
+        session_id: s.id.clone(),
+        mode: AttachMode::ReadWrite,
+        role: AttachRole::Interactive,
+        client_kind: ClientKind::Cli,
+        client_version: "test".into(),
+        peer_pid: None,
+        peer_uid: 0,
+        tx,
+        connected_at: Instant::now(),
+    }));
+
+    // **The control.** While the session is alive the sweep releases
+    // nothing, so it must also say nothing — otherwise a broadcast that
+    // fired unconditionally would pass the assertions below.
+    assert_eq!(d.daemon.release_exited_secret_slots(), 0);
+    assert!(
+        rx.try_recv().is_err(),
+        "a client was told a live session's request had closed"
+    );
+
+    pty.exit(0);
+    assert_eq!(d.daemon.release_exited_secret_slots(), 1);
+
+    match rx.try_recv().expect("the sweep closed the slot in silence") {
+        ServerFrame::SecretRequestClosed {
+            request_id,
+            outcome,
+        } => {
+            assert_eq!(
+                request_id, raised,
+                "the closure named a request this client was never told about"
+            );
+            assert_eq!(
+                outcome, "cancelled",
+                "§7.5 has three spellings and the sweep must use the one that \
+                 claims no value: the request ended without one"
+            );
+        }
+        other => panic!("expected SecretRequestClosed, got {other:?}"),
+    }
+    // Exactly one. The slot is gone, so the idempotent second sweep has
+    // nothing to announce — which is what separates "told once" from "told
+    // on every tick for the life of the daemon".
+    assert_eq!(d.daemon.release_exited_secret_slots(), 0);
+    assert!(
+        rx.try_recv().is_err(),
+        "the closure was re-broadcast on a later sweep"
+    );
 }
 
 #[tokio::test]

@@ -445,6 +445,37 @@ impl Daemon {
     /// §7.5's `cancelled` rather than inventing a third outcome — the
     /// request ended without a value, which is exactly what the two
     /// existing producers of that frame say about the same event.
+    ///
+    /// **A steady state this maintains, not a one-shot — do not read
+    /// "released" as "gone for good".** `Session`'s `awaiting_secret`
+    /// flag is written only from inside the reader's read loop
+    /// (`session/mod.rs:674`) and is **never cleared when the child
+    /// exits**, and §7.5's replay (`attach/conn.rs:198`) is gated on
+    /// `is_awaiting_secret()` with no liveness test and *raises* rather
+    /// than reads. So an attach to an already-dead session re-raises the
+    /// slot this swept, and the next tick sweeps it again. That is
+    /// bounded — one entry per session id either way, and now cleared
+    /// within a tick of the last attach instead of never — so the fix is
+    /// still a fix. The underlying oddity is that the replay offers a
+    /// human a prompt on a corpse, which is a defect in the replay path
+    /// and not in this one; curing it means either clearing the flag at
+    /// exit or gating the replay on liveness, and both shift behaviour on
+    /// the §23.3 attach surface. **Filed rather than folded in here.**
+    ///
+    /// **Its reach is the daemon host only, and there is a real residual
+    /// on the other one.** `reaper_loop` is spawned from `serve_daemon`
+    /// and nowhere else, so nothing calls this under
+    /// `holdfast mcp --no-daemon`. That host is *not* excused by the §3.6
+    /// capability gate: `Capabilities::default` sets
+    /// `out_of_band_secret_input` from `cfg!(unix)` — a **platform** test,
+    /// not a transport one — so on Unix `--no-daemon` the gate passes,
+    /// `request_secret_input` runs against a real hub with no clients,
+    /// and `await_secret`'s Q1 timeout re-raise (`mcp/tools.rs:1663`)
+    /// leaves an unadopted raise that nothing sweeps. GH #24 reproduces
+    /// there. Bounded by the shim's lifetime rather than a daemon's, and
+    /// that host has no periodic maintenance of any kind today (no idle
+    /// reaper either), so closing it means giving it one. **Filed rather
+    /// than folded in here.**
     pub fn release_exited_secret_slots(&self) -> usize {
         let hub = self.attach_hub();
         let mut released = 0;
