@@ -277,6 +277,64 @@ impl OutputProcessor {
             Vec::new()
         };
 
+        // **The window is evidence, and a match can run off the end of it
+        // (GH #14).**
+        //
+        // `find_spans` sees `[window_start, window_end)` and nothing more.
+        // When `redaction_lookahead_bytes` cut that window short of
+        // `buffer.head`, a rule whose match begins inside it and ends
+        // outside it matches *nothing at all* — not partially, not
+        // approximately — and the read hands back the secret's body raw
+        // with `redactions: {}` and no audit entry. `private-key-block`
+        // reaches that on a concatenated `.pem` bundle at `read_output`'s
+        // own default `max_bytes`, on the first read, with no paging
+        // involved.
+        //
+        // Raising the constant is not the fix: any bound is exceeded by
+        // one more byte, and it does not reach a rule with **no indexed
+        // prefix**, which gets no holdback at any window size. What closes
+        // the class is noticing that the evidence ran out mid-candidate
+        // and declining — `unresolved_from` reports the earliest offset
+        // this window cannot vouch for, and the read stops there.
+        //
+        // Three conditions, each load-bearing:
+        //
+        // 1. **`opts.redact`** — the audited hatch disables the holdback
+        //    with the redaction, and this is a holdback (§4.1).
+        // 2. **`window_end < w.head`** — the window really was truncated.
+        //    When it reaches `head` the redactor has seen every byte that
+        //    exists, and the only in-flight question left is the one
+        //    `holdback_boundary` already answers over the tail region.
+        //    Applying this bound there too would decline the trailing
+        //    partial word of every read — `buffer.head` lands mid-word
+        //    constantly — and make `held_back` routine, which is the rev.
+        //    10–14 failure the *targeted* holdback exists to avoid.
+        // 3. **no span already covers it to the window's edge** — an
+        //    unbounded *greedy* rule matches right up to the last byte of
+        //    the window, so `render` emits one marker over the whole
+        //    unjudgeable region and no raw byte escapes. Declining as well
+        //    would trade a correct marker and full progress for a withhold
+        //    that buys nothing.
+        //
+        // No marker is emitted, because nothing is consumed and there is
+        // nothing to substitute; §4.1's `held_back` + `next_cursor` are
+        // how the caller is told, exactly as for an in-flight secret. The
+        // recourse is a larger `max_bytes` — `read_output` clamps to
+        // `MAX_READ_MAX_BYTES`, which puts `head` back inside the window —
+        // or a `tail_*` read, or the audited `redact: false`. The residual
+        // is a secret longer than that ceiling plus the lookahead: it
+        // stays withheld from cursor reads, which is the safe direction
+        // and is what REQ-O-005 already licenses.
+        if opts.redact && window_end < w.head {
+            let unresolved = self
+                .index
+                .unresolved_from(&self.rules, w.window, w.window_start)
+                .filter(|u| !spans.iter().any(|s| s.start <= *u && s.end >= window_end));
+            if let Some(u) = unresolved {
+                safety_end = safety_end.min(u);
+            }
+        }
+
         let mut read_end = safety_end.max(w.req_start).min(w.cap_end);
         let held_back = safety_end < w.cap_end;
         let truncated_for_size = w.front_clipped || (w.cap_end < w.head && w.cap_end <= safety_end);
@@ -853,6 +911,294 @@ mod tests {
             "the reads must have consumed the whole buffer"
         );
         assert!(reads > 30, "expected many reads, got {reads}");
+    }
+
+    // ------------------------------------ the window as evidence (GH #14)
+
+    /// A PEM whose base64 body is at least `body_bytes` long, in 64-column
+    /// lines, each line naming itself so a leak of any single line is
+    /// detectable by name. Returned with its body separately.
+    ///
+    /// `pem_private_key` above is ~1.6 KB and deliberately so: it is sized
+    /// against `lookbehind_bytes` (512). This one is sized against
+    /// `lookahead_bytes` (8192), sixteen times larger, so it is a separate
+    /// fixture rather than a parameter on that one — a `pem_private_key`
+    /// grown to 64 KB would silently change what the cursor tests above
+    /// are measuring.
+    fn pem_longer_than(body_bytes: usize) -> (String, String) {
+        let mut lines: Vec<String> = Vec::new();
+        while lines.len() * 65 < body_bytes {
+            let i = lines.len();
+            let mut line = format!("KEYBODY{i:06}");
+            while line.len() < 64 {
+                line.push_str("MIIEowIBAAKCAQEAy8Dbv8prpJ");
+            }
+            line.truncate(64);
+            lines.push(line);
+        }
+        let body = lines.join("\n");
+        let pem = format!("-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----");
+        (pem, body)
+    }
+
+    /// A processor over the built-in rules plus `extra`, for the one case
+    /// that needs a rule shape the shipped set does not contain.
+    fn processor_with(extra: &str) -> OutputProcessor {
+        let rules = Arc::new(RuleSet::builtin_with_extra(extra).unwrap());
+        let audit = Arc::new(AuditLog::disabled(Arc::clone(&rules)));
+        OutputProcessor::new(rules, audit, ProcessingLimits::default())
+    }
+
+    /// GH #14 — **`redaction_lookahead_bytes` bounds the redactor's
+    /// evidence, and a match can run off the end of it.**
+    ///
+    /// `find_spans` is handed `[req_start − lookbehind, cap_end +
+    /// lookahead)` and nothing more. `private-key-block` is anchored at
+    /// both ends with `[\s\S]*?` between them, so its match is as long as
+    /// the key: a concatenated `.pem` bundle pushes `-----END` past the
+    /// window, the rule matches **nothing at all**, and the read returns
+    /// the key body raw with `redactions: {}` and no audit entry — the
+    /// same no-symptom shape as the cursor defect above, reached on the
+    /// *first* read at `read_output`'s own default `max_bytes`.
+    ///
+    /// Widening the window is not the fix and is not what this pins: any
+    /// bound is exceeded by one more byte, and the next size of key is one
+    /// `cat` away. What the read owes its caller is to notice that its
+    /// evidence ran out mid-candidate and decline — which is what
+    /// `PrefixIndex::unresolved_from` reports and what §4.1 promises
+    /// everywhere else.
+    #[test]
+    fn a_private_key_longer_than_the_lookahead_window_is_never_emitted_raw() {
+        let p = processor();
+        let (pem, body) = pem_longer_than(64 * 1024);
+        let prologue = "$ cat chain.pem\n";
+        let buf = format!("{prologue}{pem}\n$ echo done\n").into_bytes();
+
+        // `read_output`'s own default (`DEFAULT_READ_MAX_BYTES`), so this
+        // is an ordinary call and not a cap contrived to split anything.
+        const CAP: usize = 32 * 1024;
+        assert!(
+            CAP as u64 + p.limits.lookahead_bytes as u64 + 1 < buf.len() as u64,
+            "the fixture must actually truncate the window, or it pins nothing"
+        );
+
+        let w = snapshot(&p, &buf, 0, CAP, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+
+        // THE HARM, stated as bytes: no run of key body may appear in a
+        // response §4.1 says is redacted. Sampled rather than swept —
+        // the body is 64 KB and every 48-byte window of it is unique.
+        for start in (0..body.len() - 48).step_by(251) {
+            assert!(
+                !r.output.contains(&body[start..start + 48]),
+                "key body from offset {start} leaked"
+            );
+        }
+        // …and the exact payload, because the absence check alone passes
+        // against an implementation that returns nothing at all.
+        assert_eq!(r.output, prologue);
+        assert!(r.held_back, "the read stopped because it could not vouch");
+        assert_eq!(r.next_cursor, Some(prologue.len() as u64));
+        assert_eq!(r.bytes_returned, prologue.len());
+        assert!(
+            r.redactions.is_empty(),
+            "nothing was substituted — the bytes were declined, not replaced: {:?}",
+            r.redactions
+        );
+    }
+
+    /// The paired direction, and the reason the withhold above is not a
+    /// dead end: the same buffer read with a window that *does* reach the
+    /// closing anchor resolves to the rule that actually matched, names
+    /// the real kind, and consumes the whole key in one read.
+    ///
+    /// This is the documented recourse — `read_output` clamps `max_bytes`
+    /// to `MAX_READ_MAX_BYTES` (256 KiB), which puts `buffer.head` back
+    /// inside the window for any key a 1 MiB ring buffer can hold most of.
+    /// It is also the control that separates *detecting the truncation*
+    /// from *withholding whenever the window is short*: the cheap wrong
+    /// fix passes the test above and fails this one.
+    #[test]
+    fn the_same_key_resolves_once_the_window_reaches_its_closing_anchor() {
+        let (pem, body) = pem_longer_than(64 * 1024);
+        let prologue = "$ cat chain.pem\n";
+        let buf = format!("{prologue}{pem}\n$ echo done\n").into_bytes();
+
+        let r = read(&buf, 0, 256 * 1024);
+        assert!(!r.held_back, "the window saw the whole key");
+        assert_eq!(
+            r.output,
+            format!("{prologue}[REDACTED:private-key]\n$ echo done\n")
+        );
+        assert_eq!(r.redactions.get("private-key"), Some(&1));
+        assert!(!r.output.contains(&body[..48]));
+        assert_eq!(r.cursor, buf.len() as u64, "the read made full progress");
+    }
+
+    /// GH #14, **the half no lookahead constant reaches.**
+    ///
+    /// A rule whose pattern opens with a character *range* derives no
+    /// literal prefix, and if it declares none it gets no entry in the
+    /// prefix index at all. `earliest_partial` is then structurally blind
+    /// to it — at the buffer head and at the window's edge alike — so it
+    /// has no holdback at any window size, and raising
+    /// `redaction_lookahead_bytes` buys a larger number for the same bug.
+    /// The bound that reaches it needs no prefix: a match running off the
+    /// end of the window covers every byte from its start to that end, so
+    /// for a non-`binary` rule it cannot begin before the maximal trailing
+    /// run of value bytes.
+    ///
+    /// The shipped rule with this shape is `telegram-bot-token`
+    /// (`\b[0-9]{8,10}:AA…{33}`), whose match is capped at 46 bytes and so
+    /// cannot outrun any plausible window. REQ-O-006 puts **user** rules
+    /// in the same index, so the fixture supplies one that can.
+    ///
+    /// **The fixture is envelope-shaped for a measured reason.** An
+    /// unbounded *greedy* rule — `…[A-Za-z0-9]{16,}` with no closing
+    /// anchor — does not leak at a truncated window at all: it simply
+    /// matches to the window's last byte and `render` markers the lot.
+    /// Measured, against this very buffer, before the fix existed. A match
+    /// only escapes when it **cannot satisfy itself inside the window**,
+    /// which means a closing anchor (`private-key-block`'s `-----END`) or
+    /// a fixed length larger than the window. A prefixless rule that only
+    /// exercised the greedy case would be green at BASE and prove nothing.
+    #[test]
+    fn a_prefixless_rules_over_long_match_is_not_emitted_raw_either() {
+        let p = processor_with(
+            r#"
+            [[rule]]
+            name = "gh14-prefixless"
+            kind = "acme-envelope"
+            pattern = '''\b[0-9]{4}-ACMEBOX-[A-Za-z0-9+/=]{16,}-ENDACMEBOX'''
+            positive = ["1234-ACMEBOX-abcdefghijklmnop-ENDACMEBOX"]
+            negative = ["1234-ACMEBOX-short-ENDACMEBOX"]
+            "#,
+        );
+        assert!(
+            p.index.prefixes_for(&p.rules, "gh14-prefixless").is_empty(),
+            "the fixture rule must have NO index entry, or this test \
+             exercises the prefix-anchored half of the fix instead of the \
+             half nothing indexes"
+        );
+
+        let prologue = "$ dump-blob\n";
+        let mut blob = String::from("1234-ACMEBOX-");
+        while blob.len() < 60 * 1024 {
+            blob.push_str("NOPREFIXSECRETBODY0123456789abcdefghij");
+        }
+        blob.push_str("-ENDACMEBOX");
+        // The trailing newline is not decoration: without it the buffer's
+        // last 512 bytes are an unbroken run of value bytes, and §4.1's
+        // ordinary tail holdback — nothing to do with this fix — fires on
+        // whatever indexed prefix the filler happens to contain.
+        let buf = format!("{prologue}{blob}\n").into_bytes();
+
+        const CAP: usize = 32 * 1024;
+        assert!(
+            CAP as u64 + p.limits.lookahead_bytes as u64 + 1 < buf.len() as u64,
+            "the fixture must actually truncate the window, or it pins nothing"
+        );
+
+        let w = snapshot(&p, &buf, 0, CAP, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        // THE HARM: the value's bytes, in a response §4.1 says is redacted.
+        assert!(
+            !r.output.contains("NOPREFIXSECRETBODY"),
+            "a rule with no index entry leaked its value"
+        );
+        assert_eq!(r.output, prologue);
+        assert!(r.held_back);
+        assert_eq!(r.next_cursor, Some(prologue.len() as u64));
+
+        // Paired, as above: a window reaching the end of the blob resolves
+        // it to the rule that matched and names that rule's kind, so the
+        // withhold is a consequence of the missing evidence and not of the
+        // rule being unindexed.
+        let w = snapshot(&p, &buf, 0, 256 * 1024, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert!(!r.held_back);
+        assert_eq!(r.output, format!("{prologue}[REDACTED:acme-envelope]\n"));
+        assert_eq!(r.redactions.get("acme-envelope"), Some(&1));
+        assert_eq!(r.cursor, buf.len() as u64, "the read made full progress");
+    }
+
+    /// The measurement from the note above, kept as a test: an unbounded
+    /// **greedy** rule is self-covering at a truncated window, and must
+    /// keep making progress.
+    ///
+    /// `…[A-Za-z0-9]{16,}` with no closing anchor matches right up to the
+    /// window's last byte, so `find_spans` returns a span reaching
+    /// `window_end`, `render` emits one marker over the whole unjudgeable
+    /// region, and no raw byte escapes without any help from the
+    /// truncation bound. Declining here as well would trade a correct
+    /// marker and a cursor that advances for a withhold that buys nothing
+    /// — so the bound stands down when a span already covers the region to
+    /// the window's edge.
+    #[test]
+    fn a_greedy_match_reaching_the_window_edge_is_markered_and_not_declined() {
+        let p = processor_with(
+            r#"
+            [[rule]]
+            name = "gh14-greedy"
+            kind = "acme-blob"
+            pattern = '''\b[0-9]{4}:ZZ[A-Za-z0-9]{16,}'''
+            positive = ["1234:ZZabcdefghijklmnop"]
+            negative = ["1234:ZZshort"]
+            "#,
+        );
+        let prologue = "$ dump-blob\n";
+        let mut blob = String::from("1234:ZZ");
+        while blob.len() < 60 * 1024 {
+            blob.push_str("GREEDYSECRETBODY0123456789abcdefghij");
+        }
+        let buf = format!("{prologue}{blob}\n").into_bytes();
+
+        const CAP: usize = 32 * 1024;
+        let w = snapshot(&p, &buf, 0, CAP, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert!(!r.output.contains("GREEDYSECRETBODY"), "the value leaked");
+        assert_eq!(r.output, format!("{prologue}[REDACTED:acme-blob]"));
+        assert_eq!(r.redactions.get("acme-blob"), Some(&1));
+        assert!(
+            !r.held_back,
+            "the span covers every byte the window could not judge; there \
+             is nothing left to decline"
+        );
+        assert!(
+            r.cursor > CAP as u64,
+            "the cursor must clear the straddling span, not stop at the cap"
+        );
+    }
+
+    /// The control that keeps the new bound **targeted**, and the one that
+    /// dies if its truncation gate is dropped.
+    ///
+    /// Ordinary output ends mid-word constantly — `buffer.head` lands
+    /// wherever the child's last write did — and a read whose window
+    /// reaches `head` has already seen every byte there is. Declining the
+    /// trailing partial word *there* would make `held_back` routine, which
+    /// §4.1 names as the rev. 10–14 failure the targeted holdback exists
+    /// to avoid. `streaming_ordinary_output_is_never_held_back` above
+    /// cannot catch that: it reads a 1 MiB buffer whose every line ends in
+    /// a newline, so its trailing run is empty at exactly the read where
+    /// the window stops being truncated.
+    #[test]
+    fn a_window_that_reaches_the_buffer_head_never_declines_a_trailing_word() {
+        let mut buf: Vec<u8> = Vec::new();
+        while buf.len() < 40 * 1024 {
+            buf.extend_from_slice(b"   Compiling holdfast-core v0.0.1 (/home/user/src)\n");
+        }
+        // The child's last write stopped mid-word, as writes do.
+        buf.extend_from_slice(b"   Compil");
+        // A cap large enough that `window_end == head`: there is no
+        // unseen byte for the read to be cautious about.
+        let r = read(&buf, 0, 256 * 1024);
+        assert!(
+            !r.held_back,
+            "the window saw everything there is to see; nothing is unresolved"
+        );
+        assert_eq!(r.cursor, buf.len() as u64);
+        assert!(r.output.ends_with("   Compil"), "the tail must survive");
     }
 
     // ------------------------------------------------- ANSI boundary rule
