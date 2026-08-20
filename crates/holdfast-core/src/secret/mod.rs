@@ -19,9 +19,14 @@
 pub mod provider;
 pub mod request;
 
-pub use provider::{
-    resolve, resolve_with, ArgvProvider, ProviderError, ScriptProvider, SecretProvider,
-};
+/// **`resolve_with` and `ScriptProvider` are deliberately absent from
+/// this list.** Between them they spell *"spawn this program with this
+/// argument as a secret provider"*, and re-exporting them would put that
+/// in the published API of the one module whose premise is that no such
+/// signature exists (REQ-SEC-012's structural half). `resolve_with` is
+/// `pub(crate)` in [`provider`] and `ScriptProvider` is `#[cfg(test)]`
+/// there, so a release build does not contain the second one at all.
+pub use provider::{resolve, ArgvProvider, ProviderError, SecretProvider};
 pub use request::{
     buffer_notice, Adopted, CancelReason, Collision, RaisedBy, RaisedRequest, Resolution,
     SecretSlots,
