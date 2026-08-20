@@ -138,7 +138,22 @@ impl AuditLog {
         }
     }
 
-    /// Redact every string in a JSON payload, however deeply nested.
+    /// Redact every string in a JSON payload, however deeply nested —
+    /// **keys included, not just values.**
+    ///
+    /// GH #23: this used to clone map keys untouched while walking values
+    /// at any depth, so a caller-supplied string that landed in a *key*
+    /// position reached the log unredacted — a hole in the file-header
+    /// invariant ("every string that reaches this log goes through the
+    /// redactor first") that no shipped call path demonstrated yet, but
+    /// that 0.0.7 Tasks 9-13's richer per-call audit shapes were expected
+    /// to open. Fixed by redacting the key on the same walk as the value,
+    /// rather than by refusing a key that is not on some fixed allow-list:
+    /// a refusal would turn a caller passing an unanticipated field name
+    /// into a runtime failure on the security-logging path, which is a
+    /// worse failure mode than a code-authored key silently surviving a
+    /// no-op redaction (fixed names like `"command"` or `"tool"` match no
+    /// secret-shaped pattern and pass through `redact_str` unchanged).
     pub fn redact_value(&self, value: &Value) -> Value {
         match value {
             Value::String(s) => Value::String(redact_str(&self.rules, s)),
@@ -147,7 +162,7 @@ impl AuditLog {
             }
             Value::Object(map) => Value::Object(
                 map.iter()
-                    .map(|(k, v)| (k.clone(), self.redact_value(v)))
+                    .map(|(k, v)| (redact_str(&self.rules, k), self.redact_value(v)))
                     .collect(),
             ),
             other => other.clone(),
@@ -156,6 +171,20 @@ impl AuditLog {
 
     /// Append one entry. `fields` supplies the per-`kind` extras from the
     /// §9.4 table; `ts` and `kind` are added here.
+    ///
+    /// **`kind` and `session_id` are redacted too, not just the walked
+    /// `fields`.** Both are `&str` today, not `&'static str`, and every
+    /// current call site happens to pass either a string literal (`kind`)
+    /// or an id minted by `new_session_id()` (a UUID fragment, never
+    /// caller-influenced) — so as of this commit neither can carry a
+    /// secret. But the file-header invariant is "every string that
+    /// reaches this log goes through the redactor first", not "every
+    /// string that reaches this log via a path we have audited today", and
+    /// GH #23 exists precisely because that distinction was being lost
+    /// silently across milestones. Routing both through `redact_str` costs
+    /// nothing observable — neither value matches a secret-shaped pattern
+    /// — and means this invariant does not need re-litigating every time a
+    /// new call site is added.
     pub fn record(&self, kind: &str, session_id: Option<&str>, fields: Value) {
         let mut line: Map<String, Value> = match self.redact_value(&fields) {
             Value::Object(map) => map,
@@ -166,9 +195,12 @@ impl AuditLog {
             }
         };
         line.insert("ts".into(), Value::String(now_rfc3339()));
-        line.insert("kind".into(), Value::String(kind.to_string()));
+        line.insert("kind".into(), Value::String(redact_str(&self.rules, kind)));
         if let Some(id) = session_id {
-            line.insert("session_id".into(), Value::String(id.to_string()));
+            line.insert(
+                "session_id".into(),
+                Value::String(redact_str(&self.rules, id)),
+            );
         }
         let mut text = match serde_json::to_string(&Value::Object(line)) {
             Ok(t) => t,
@@ -500,6 +532,78 @@ mod tests {
             entries[0]["context"]["excerpt"][0]["line"],
             "export TOKEN=[REDACTED:github]"
         );
+    }
+
+    /// GH #23 / mutation P-A: `redact_value` walked values at any depth
+    /// but cloned map **keys** untouched, so a secret-shaped string in a
+    /// key position reached the log verbatim.
+    ///
+    /// **Paired deliberately.** `sibling` carries the identical secret in
+    /// a *value* position at the same depth, and that field is asserted
+    /// redacted too — proving this harness can tell a real redaction from
+    /// one that never ran, so the key-position assertion below is not an
+    /// absence check that would pass against a `redact_value` that does
+    /// nothing at all. Before the fix, `sibling` alone caught P-A; the
+    /// key assertion is what P-A demonstrated missing.
+    #[test]
+    fn a_secret_shaped_key_is_redacted_like_the_identical_secret_in_a_sibling_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        let mut fields = Map::new();
+        fields.insert(SECRET.to_string(), json!("harmless"));
+        fields.insert("sibling".to_string(), json!(SECRET));
+        log.record("panic", None, Value::Object(fields));
+
+        let raw = std::fs::read_to_string(log.path().unwrap()).unwrap();
+        assert!(
+            !raw.contains(SECRET),
+            "the secret reached the audit log, in a key or a value"
+        );
+
+        let entries = lines(&log);
+        let obj = entries[0].as_object().unwrap();
+
+        // The control: the same string in a value position is redacted,
+        // which is already true today and is what makes the next
+        // assertion meaningful rather than accidental.
+        assert_eq!(obj["sibling"], "[REDACTED:github]");
+
+        // The defect: the same string in a key position must be
+        // rewritten by the redactor too, not carried through untouched.
+        assert!(
+            !obj.contains_key(SECRET),
+            "the secret survived as a raw map key"
+        );
+        assert_eq!(
+            obj.get("[REDACTED:github]"),
+            Some(&json!("harmless")),
+            "the key must be rewritten by the redactor (not dropped), and \
+             the value it maps to must survive unchanged"
+        );
+    }
+
+    /// `kind` and `session_id` are inserted after `redact_value` returns,
+    /// so they are not covered by the walk over `fields` at all. Every
+    /// call site today passes either a string literal (`kind`) or a
+    /// `new_session_id()` UUID fragment (`session_id`), neither of which
+    /// can carry a secret — but the file-header invariant is "every
+    /// string that reaches this log goes through the redactor first", not
+    /// "every string reachable from an audited call site today", so both
+    /// are routed through the same redactor as `fields` rather than
+    /// argued exempt.
+    #[test]
+    fn kind_and_session_id_are_redacted_like_every_other_string_on_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record(SECRET, Some(SECRET), json!({}));
+        let raw = std::fs::read_to_string(log.path().unwrap()).unwrap();
+        assert!(
+            !raw.contains(SECRET),
+            "the secret reached the audit log via kind or session_id"
+        );
+        let entries = lines(&log);
+        assert_eq!(entries[0]["kind"], "[REDACTED:github]");
+        assert_eq!(entries[0]["session_id"], "[REDACTED:github]");
     }
 
     /// `record`'s other arm. A `fields` value that is not an object is
