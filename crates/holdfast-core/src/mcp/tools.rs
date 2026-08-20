@@ -1307,9 +1307,17 @@ impl HoldfastServer {
         // `min(binding_approval_timeout_secs, remaining / 2)` below, and
         // `caller_deadline`, which is `await_secret`'s deadline verbatim.
         //
-        // `grep 'from_secs(timeout_secs' tools.rs` is the check, and it
-        // has exactly one hit — the `caller_deadline` line after the
-        // bound is validated.
+        // The check is `grep 'from_secs(timeout_secs' tools.rs |
+        // grep -v '//'`, and it returns **exactly one** line: the
+        // `caller_deadline` assignment after the bound is validated.
+        //
+        // **The second filter is not decoration.** Without it the check
+        // cannot verify anything, because this comment quotes the pattern
+        // and therefore matches it: the grep returns two, a reader
+        // concludes the invariant is broken, and the next reader stops
+        // trusting the comment. A self-verifying check that cannot verify
+        // is worse than no check at all, so the pattern is stated in a
+        // form that excludes the prose stating it.
         let call_start = self.clock.now();
         let security = &self.config.security;
         let timeout_secs = args.timeout_secs.unwrap_or(DEFAULT_SECRET_TIMEOUT_SECS);
