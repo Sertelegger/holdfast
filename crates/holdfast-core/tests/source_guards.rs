@@ -187,6 +187,122 @@ fn the_write_channel_carries_the_secret_as_itself() {
     );
 }
 
+/// REQ-SEC-012's structural half, pinned as a fact about the tree.
+///
+/// **Here because the guarantee is a *visibility*, and no runtime test
+/// can see one.** Task 9's review finding I-2 was that
+/// `resolve_with(&dyn SecretProvider, &str, …)` and
+/// `ScriptProvider::new(name, path)` were both `pub` and both re-exported
+/// from `secret/mod.rs` — together, a published API meaning *"spawn this
+/// program with this argument as a secret provider"*, inside the one
+/// module whose premise is that no such signature exists. The fix was
+/// `pub(crate)` on the first and `#[cfg(test)]` on the second. Nothing
+/// fails if someone widens either back: the crate compiles, every test
+/// stays green, and the only thing that changes is a word in a
+/// declaration. A structural claim enforced solely by review is one
+/// revision from being untrue, so it is enforced here instead.
+///
+/// **Code lines only.** Both files discuss these names at length in prose
+/// — `provider.rs`'s doc on `resolve` names `resolve_with` as the
+/// in-crate seam, and `mod.rs`'s doc on the re-export list explains why
+/// neither name is in it — so a scanner that read comments would match
+/// the explanation and fire on a tree that is correct. That is the same
+/// lesson `calls_a_print_macro` above is written around.
+#[test]
+fn the_arbitrary_program_seam_is_still_out_of_the_published_api() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let provider =
+        std::fs::read_to_string(src.join("secret/provider.rs")).expect("read secret/provider.rs");
+    let module = std::fs::read_to_string(src.join("secret/mod.rs")).expect("read secret/mod.rs");
+
+    // The two files, reduced to the lines that are actually compiled.
+    let code = |text: &str| -> Vec<String> {
+        text.lines()
+            .map(|l| l.trim_start().to_string())
+            .filter(|l| !l.starts_with("//"))
+            .collect()
+    };
+    let provider_code = code(&provider);
+    let module_code = code(&module);
+
+    // The detector's own control: the filter must keep declarations and
+    // drop prose, or every assertion below is satisfied by a stripper
+    // that returned nothing at all.
+    assert!(
+        provider_code
+            .iter()
+            .any(|l| l.starts_with("pub enum ArgvProvider")),
+        "the code-line filter dropped a declaration, so nothing below is being checked"
+    );
+    assert!(
+        !provider_code
+            .iter()
+            .any(|l| l.starts_with("//") || l.starts_with("///")),
+        "the code-line filter kept comment lines, so prose about these names counts as code"
+    );
+
+    let has = |lines: &[String], needle: &str| lines.iter().any(|l| l.contains(needle));
+
+    // 1. `resolve_with` is in-crate and stays in-crate.
+    assert!(
+        has(&provider_code, "pub(crate) fn resolve_with("),
+        "`resolve_with` is no longer declared `pub(crate)`; it takes a bare `&str` \
+         reference and any `&dyn SecretProvider`, which is the signature REQ-SEC-012 \
+         says must not be offered to anyone who is not this crate"
+    );
+    assert!(
+        !has(&provider_code, "pub fn resolve_with("),
+        "`resolve_with` is `pub` again — review finding I-2, re-entering"
+    );
+
+    // 2. `ScriptProvider` is not merely unreachable in a release build,
+    //    it is not *in* one. `#[cfg(test)]` and not `pub(crate)` alone,
+    //    because the type can name any program on the filesystem.
+    let script = provider_code
+        .iter()
+        .position(|l| l.starts_with("pub(crate) struct ScriptProvider"))
+        .expect(
+            "`ScriptProvider` is no longer declared `pub(crate) struct ScriptProvider`; \
+             a type that runs an arbitrary named program must not widen",
+        );
+    assert!(
+        !has(&provider_code, "pub struct ScriptProvider"),
+        "`ScriptProvider` is `pub` again — review finding I-2, re-entering"
+    );
+    let gate = provider_code[script.saturating_sub(3)..script]
+        .iter()
+        .any(|l| l == "#[cfg(test)]");
+    assert!(
+        gate,
+        "`ScriptProvider` is no longer behind `#[cfg(test)]`, so a shipped daemon now \
+         contains a type that spawns an arbitrary program as a secret provider:\n{:?}",
+        &provider_code[script.saturating_sub(3)..=script]
+    );
+
+    // 3. Neither name is re-exported. The list, not the whole file: the
+    //    doc comment above it names both deliberately.
+    let list = module_code
+        .iter()
+        .find(|l| l.starts_with("pub use provider::{"))
+        .expect("`secret/mod.rs` no longer re-exports from `provider` at all");
+    assert!(
+        !list.contains("resolve_with"),
+        "`resolve_with` is re-exported again: {list}"
+    );
+    assert!(
+        !list.contains("ScriptProvider"),
+        "`ScriptProvider` is re-exported again: {list}"
+    );
+    // The anti-vacuity pairing. Without it this guard passes against a
+    // `secret/mod.rs` that exports **nothing** — which is not the module
+    // being correct, it is the module being gone.
+    assert!(
+        list.contains("resolve") && list.contains("ArgvProvider"),
+        "the re-export list no longer carries `resolve` and `ArgvProvider`, so the two \
+         absences above are not evidence of anything: {list}"
+    );
+}
+
 /// §9.6: a submitted secret is *"zeroed immediately after write"*, and
 /// the destructor is what guarantees it.
 ///

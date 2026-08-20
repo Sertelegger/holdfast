@@ -352,21 +352,40 @@ impl SecretProvider for ScriptProvider {
 /// Resolve one binding.
 ///
 /// **This is the module's only public entry point, and its only input is
-/// a `&SecretBinding`** — which is constructed only by config
-/// deserialisation. That is REQ-SEC-012's structural half: outside this
-/// crate there is no signature at all by which an agent-supplied string
-/// reaches a provider subprocess.
+/// a `&SecretBinding`.** Inside the daemon a `SecretBinding` comes from
+/// config deserialisation and from nowhere else, which is REQ-SEC-012's
+/// **agent-facing** half: no MCP argument reaches this function, because
+/// nothing on that path can build one. That claim is about the daemon's
+/// call graph, and Task 10's `binding::select` is where it is enforced.
 ///
-/// **Inside the crate there is one, and it is named rather than implied.**
+/// **What the *signature* closes is the arbitrary-program half, and only
+/// that** — the sentence that used to stand here said the signature
+/// admitted no caller-supplied string at all, and that was wrong.
+/// [`SecretBinding`]'s fields are all `pub` and the struct is not
+/// `#[non_exhaustive]`, so out of the crate
+/// `resolve(&SecretBinding { reference: <any string>, .. }, …)` compiles
+/// and carries that string to a lookup. What no caller can choose is the
+/// **program**: `binding.provider` is matched against §9.6's five
+/// spellings by [`ArgvProvider::from_config`] and anything else is
+/// refused, so a reference can only ever become one argument to one of
+/// five fixed argv templates — never a command line, and never a program
+/// name.
+///
+/// **Naming a program is a separate seam, and it is named rather than
+/// implied.**
 /// [`resolve_with`] takes a `&dyn SecretProvider` and a bare `&str`, and
 /// `ScriptProvider` can name any program on the filesystem. `resolve_with`
-/// is `pub(crate)` and `ScriptProvider` is `#[cfg(test)]`, precisely so
-/// that the sentence above stays literally true of the published API and
-/// of a shipped daemon; the claim is *"nothing outside this crate can
-/// express it, and the arbitrary-program half is not compiled into a
-/// release at all"*, not *"the seam does not exist"*. Whoever wires the
-/// autofill path (Task 10) inherits the obligation that the only string
-/// reaching `resolve_with` is a binding's own `reference`.
+/// is `pub(crate)` and `ScriptProvider` is `#[cfg(test)]`, so the
+/// program half stays closed to the published API and is not compiled
+/// into a release at all; the claim is *"nothing outside this crate can
+/// name a program, and the arbitrary-program half is not in a shipped
+/// daemon"*, not *"the seam does not exist"*. Both visibilities are
+/// pinned by `tests/source_guards.rs`'s
+/// `the_arbitrary_program_seam_is_still_out_of_the_published_api`, because
+/// a structural claim enforced only by review is one revision from being
+/// untrue. Whoever wires the autofill path (Task 10) inherits the
+/// obligation that the only string reaching `resolve_with` is a binding's
+/// own `reference`.
 ///
 /// `append_newline` is the waiting request's own (§5.2), and it is a
 /// parameter rather than a constant because the plan's own test row pins
@@ -469,10 +488,27 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
     // process Holdfast has just decided it cannot control.
     //
     // `process_group(0)` makes the child its own group leader, so the
-    // timeout can signal `-pid` and take the helpers with it. It also
-    // detaches the child from the daemon's group, which is the intended
-    // consequence and not a cost: a provider must not receive the
-    // terminal signals of whatever launched the daemon.
+    // timeout can signal `-pid` and take the helpers with it. Detaching
+    // the child from the daemon's group is the intended consequence: a
+    // provider must not receive the terminal signals of whatever launched
+    // the daemon.
+    //
+    // **It is not pure benefit, and the cost has one shape: the daemon
+    // dying mid-resolve.** The timeout above is the only thing that
+    // reaps this group, and it runs in *this* thread — so a daemon killed
+    // between the spawn and the deadline leaves the provider and
+    // everything it forked running, in a group nothing will ever signal,
+    // because the group is no longer one the daemon's own killer reaches.
+    // Before this call they were in the daemon's group and a
+    // `kill(-daemon_pgid)` swept them for free. **Closing the pipes is no
+    // substitute**: the concrete case is `pass` blocked on `pinentry`,
+    // which is waiting for a human and has written nothing, so it never
+    // reaches a `write` and never takes the `EPIPE`/`SIGPIPE` that would
+    // end it — it sits on the tty or the GUI grab indefinitely. The trade
+    // is still right (an unreapable group after a daemon kill is rarer
+    // and less harmful than an unkillable one on every timeout), but a
+    // daemon-exit sweep of outstanding provider groups is the thing that
+    // would close it, and nothing here is that.
     //
     // §4.4 records that even `killpg` leaks a child that put *itself*
     // into a new group, which is why `terminate` does a session sweep for
