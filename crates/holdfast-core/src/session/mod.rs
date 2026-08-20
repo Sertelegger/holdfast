@@ -217,6 +217,26 @@ pub struct Session {
     /// each response reporting 1 while this reaches 2, and that
     /// difference is the contract.
     redaction_stats: Mutex<BTreeMap<String, u64>>,
+    /// §9.6's `max_uses` budget, `{binding name: resolutions}` — 0.0.7.
+    ///
+    /// **The counter lives with the session and not with the binding**,
+    /// which is the whole of what §9.6's *"bounds blast radius if a
+    /// session is doing something unexpected"* means: two sessions
+    /// matching one binding get one budget each, and a global tally would
+    /// let the first session on the box starve every other one.
+    ///
+    /// It is here, on `Session`, rather than in a map keyed by session id
+    /// somewhere longer-lived, for the reason that shape has already cost
+    /// this project once (GH #24): a per-session tally held anywhere but
+    /// the session is a per-session tally that has to be *cleaned up*, and
+    /// nothing sweeps a session that resolved a binding and then simply
+    /// ended. Here it is freed with the session and there is no lifetime
+    /// to get wrong.
+    ///
+    /// Shaped after `redaction_stats` above — the same `BTreeMap` behind
+    /// the session's own lock, a read-only snapshot getter, and the
+    /// mutation confined to one pair of methods.
+    binding_uses: Mutex<BTreeMap<String, u32>>,
     /// Live output fan-out. `wait_for_pattern` subscribes to this *before*
     /// it snapshots the buffer, which is the ordering that stops a fast
     /// command's output from landing in the gap between the two.
@@ -478,6 +498,7 @@ impl Session {
             shell_integration: config.shell_integration,
             state: Mutex::new(SessionState::Running),
             redaction_stats: Mutex::new(BTreeMap::new()),
+            binding_uses: Mutex::new(BTreeMap::new()),
             output_tx: output_tx.clone(),
             events_tx: events_tx.clone(),
             awaiting_secret: Arc::clone(&awaiting_secret),
@@ -1205,6 +1226,62 @@ impl Session {
     /// truthful zero rather than omitting the key (REQ-O-012).
     pub fn redaction_stats(&self) -> BTreeMap<String, u64> {
         self.redaction_stats.lock().clone()
+    }
+
+    /// A snapshot of this session's §9.6 `max_uses` tally, keyed by
+    /// binding name. Read-only; see [`Session::claim_binding_use`].
+    pub fn binding_uses(&self) -> crate::secret::binding::BindingUses {
+        self.binding_uses.lock().clone()
+    }
+
+    /// Reserve one use of `binding` against this session's budget.
+    ///
+    /// `Some(n)` is a granted claim and `n` is the use count **including
+    /// this one** — `1` on the first resolution, which is what
+    /// `binding_resolved.use_count` carries. `None` means the budget is
+    /// spent and the caller falls through to the prompt path (Decision 18).
+    ///
+    /// **`None` and `Some(0)` both mean unlimited.** §9.6 documents
+    /// `0 = unlimited` and says nothing at all about an omitted knob; an
+    /// omitted knob and an explicitly-zero one must not differ, and
+    /// unlimited is the only reading under which omitting `max_uses`
+    /// leaves a binding usable.
+    ///
+    /// **The test and the increment are one critical section**, which is
+    /// what makes "the third resolution in this session falls through" a
+    /// fact rather than a race between two calls that both read the count
+    /// and then both incremented it. A caller that reserved and then
+    /// failed gives the claim back with
+    /// [`release_binding_use`](Session::release_binding_use).
+    pub fn claim_binding_use(&self, binding: &str, max_uses: Option<u32>) -> Option<u32> {
+        let mut uses = self.binding_uses.lock();
+        // Read rather than `entry(..).or_insert(0)`: a refused claim must
+        // not leave a zero behind, or `binding_uses()` reports a binding
+        // as having been used when it never was.
+        let count = uses.get(binding).copied().unwrap_or(0);
+        if max_uses.is_some_and(|max| max > 0 && count >= max) {
+            return None;
+        }
+        uses.insert(binding.to_string(), count + 1);
+        Some(count + 1)
+    }
+
+    /// Give back a claim [`claim_binding_use`](Session::claim_binding_use)
+    /// granted, for a resolution that then did not happen.
+    ///
+    /// Keeps `max_uses` a bound on **resolutions** rather than on
+    /// attempts: an operator who wrote `max_uses = 2` against a keyring
+    /// that happens to be locked must not find the budget gone with no
+    /// credential ever resolved. Saturating, so a stray release cannot
+    /// wrap the counter into an enormous remaining budget.
+    pub fn release_binding_use(&self, binding: &str) {
+        let mut uses = self.binding_uses.lock();
+        if let Some(count) = uses.get_mut(binding) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                uses.remove(binding);
+            }
+        }
     }
 
     /// Fold one processed read's per-response counts into the session

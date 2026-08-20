@@ -37,7 +37,9 @@ use holdfast_core::platform::Capabilities;
 use holdfast_core::protocol::frame;
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use holdfast_core::pty::{InProcessPty, PtyBackend, PtySpawnConfig, Signal};
-use holdfast_core::secret::{resolve, ArgvProvider, ProviderError, SecretProvider};
+use holdfast_core::secret::{
+    command_line, keychain_step_runs, resolve, select, ArgvProvider, ProviderError, SecretProvider,
+};
 use holdfast_core::session::{new_session_id, Session, SessionConfig};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -2452,4 +2454,106 @@ fn each_provider_builds_the_argv_the_plan_pins() {
         "the config spelling is `onepassword`, and a near miss must be a \
          refusal rather than a silent fall-through"
     );
+}
+
+// ======================================================= §9.6's bindings
+//
+// **Only the rows that execute nothing are here**, for the reason the
+// provider block above gives: `ScriptProvider` is `#[cfg(test)]` and
+// `resolve_with` is `pub(crate)` (review I-2), so every behavioural row —
+// the ones that need a provider to actually run, and therefore a script
+// the test itself wrote (REQ-TST-007) — lives in `secret::binding`'s own
+// `#[cfg(test)] mod tests`. What is left here is the operator-facing
+// half: the block as §9.6 publishes it, loaded rather than read by eye,
+// driven through the public matcher.
+
+/// §9.6's `[[security.secret_bindings]]` block and §10.2's
+/// `secret_provider` line, **copied from the current spec text** and
+/// loaded as a `Config` before anything is asserted about it (Global
+/// Constraint 15).
+///
+/// §10.2 is *"the most copied block in the document and the least
+/// swept"*, and rev. 49 makes an unknown key a load error — so a
+/// remembered fixture no longer merely drifts from the document, it fails
+/// to parse, and the failure looks like a bug in whatever the row was
+/// about. This one is parsed first and asserted second.
+const SPEC_BINDING_BLOCK: &str = r#"
+[security]
+secret_provider = "prompt"
+
+[[security.secret_bindings]]
+name            = "prod-ssh"
+match_command   = "^ssh\\s+(\\S+@)?prod-0[12]\\b"
+match_prompt    = "(?i)password"
+provider        = "secret-service"
+reference       = "service=holdfast,account=prod-ssh"
+max_uses        = 20
+require_confirm = false
+"#;
+
+/// The block an operator actually writes, selecting the session it names
+/// and no other — through the **public** surface of `secret::binding`.
+///
+/// Nothing here runs a provider. `provider = "secret-service"` is matched
+/// and never executed, which is what lets this row run on a machine with
+/// no credential store (Global Constraint 12).
+#[test]
+fn the_published_binding_block_loads_and_selects_the_session_it_names() {
+    let cfg = holdfast_core::config::parse_str(SPEC_BINDING_BLOCK)
+        .expect("§9.6's published binding block must load as a Config");
+    let bindings = &cfg.security.secret_bindings;
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].name, "prod-ssh");
+    assert_eq!(bindings[0].max_uses, Some(20));
+
+    // **The published example leaves §5.2's step 1 off**, and that is the
+    // shipped posture rather than an oversight: `secret_provider` is
+    // `prompt`, so no binding in this file is ever probed and no provider
+    // subprocess is ever spawned.
+    assert!(
+        !keychain_step_runs(&cfg.security.secret_provider),
+        "the published example now enables the credential store by default"
+    );
+
+    // The same file with that one key moved — the only difference — does
+    // probe. Without this pairing the assertion above is satisfied by a
+    // `keychain_step_runs` that answers `false` to everything.
+    let enabled = holdfast_core::config::parse_str(&SPEC_BINDING_BLOCK.replace(
+        r#"secret_provider = "prompt""#,
+        r#"secret_provider = "both""#,
+    ))
+    .expect("the same block in `both` mode must load too");
+    assert!(keychain_step_runs(&enabled.security.secret_provider));
+
+    // The session §9.6's own pattern is written for.
+    let named = command_line("ssh", &["user@prod-01".to_string()]);
+    assert_eq!(named, "ssh user@prod-01");
+    assert_eq!(
+        select(bindings, &named, "[sudo] password for ada:").map(|b| b.name.as_str()),
+        Some("prod-ssh"),
+    );
+
+    // Three negatives, each separating the row above from a different
+    // degenerate matcher.
+    assert!(
+        select(
+            bindings,
+            &command_line("ssh", &["user@staging".to_string()]),
+            "password:"
+        )
+        .is_none(),
+        "a matcher that matches every session is a credential store handed to all of them"
+    );
+    assert!(
+        select(bindings, &named, "$ ").is_none(),
+        "`match_prompt` was ignored: the block selects on the command line alone"
+    );
+    assert!(
+        select(bindings, &named, "").is_none(),
+        "an empty prompt line satisfied a binding that carries a `match_prompt` \
+         (REQ-O-013)"
+    );
+    // And the empty set, so `select` is not answering `Some` from
+    // somewhere other than the slice it was handed.
+    assert!(select(&[], &named, "password:").is_none());
 }

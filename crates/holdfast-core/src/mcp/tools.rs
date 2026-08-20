@@ -14,8 +14,9 @@ use crate::output::rules::RuleSet;
 use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{clamp_geometry, InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
+use crate::secret::binding::{Autofill, Resolved};
 use crate::secret::{CancelReason, RaisedBy, Resolution};
-use crate::session::{new_session_id, wait, Session, SessionConfig};
+use crate::session::{new_session_id, wait, Session, SessionConfig, WriteRequest};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router, ErrorData};
@@ -1362,13 +1363,72 @@ impl HoldfastServer {
             ));
         }
 
+        let append_newline = args.append_newline.unwrap_or(true);
+        let hub = self.attach_hub();
+
+        // ------------------------------------------- §5.2's step 1
+        //
+        // ```text
+        // 1. Keychain — only when `secret_provider` is `keychain` or
+        //               `both` AND a binding matches this session.
+        // 2. Prompt   — broadcast AwaitingSecret and wait for a
+        //               SecretInput.
+        // ```
+        //
+        // **Before `raise_or_adopt`, because it is step 1.** A resolution
+        // that ran after the raise would broadcast a prompt to every
+        // attached human and then answer it from a credential store a
+        // moment later, which is the affordance appearing and vanishing
+        // for no reason a human can see.
+        //
+        // **`args.prompt_text` is not in scope for any of this**, and
+        // that is REQ-SEC-012: nothing under `secret::binding` has a
+        // parameter it could be passed in. The redaction below is
+        // deliberately sited *after* this block so that the agent's
+        // string does not even exist as a local while step 1 runs.
+        //
+        // Skipped when the slot already has a call waiting on it: that is
+        // the collision condition, `raise_or_adopt` answers it below with
+        // the first caller's request untouched, and autofilling here
+        // would put a second value into a PTY that already has one
+        // caller's write on the way.
+        //
+        // **And skipped entirely — no `.await` at all — when step 1
+        // cannot produce anything.** This is not an optimisation, it is
+        // the difference between the default posture costing nothing and
+        // costing a `spawn_blocking` round trip: under `prompt` mode with
+        // no bindings, which is a stock install, `autofill_from_binding`
+        // would hop to the blocking pool only to answer `ModeIsPrompt`.
+        // That hop is a **suspension point ahead of `raise_or_adopt`**,
+        // and it widens the window in which a client can fulfil an
+        // outstanding echo-drop raise before this call has registered its
+        // waiter — measured, on
+        // `a_secret_the_agent_requested_reaches_the_child_and_none_of_the_surfaces`,
+        // which went red the first time this block existed
+        // unconditionally. A call that pays nothing when the feature is
+        // off keeps 0.0.6's timing exactly.
+        //
+        // `keychain_step_runs` is *also* checked inside `autofill`, which
+        // is public and must be correct when called directly. Two copies
+        // of one rule, deliberately, in the shape `take_if_unadopted` and
+        // `unadopted_sessions` already use here: this one is a *guard*
+        // that decides whether to suspend, the other is the rule itself,
+        // and they call the same function so a change to the rule cannot
+        // apply to one and not the other.
+        let step_one_possible =
+            crate::secret::binding::keychain_step_runs(&self.config.security.secret_provider)
+                && !self.config.security.secret_bindings.is_empty();
+        if step_one_possible && !hub.secrets().has_waiter(&session.id) {
+            if let Some(done) = self.autofill_from_binding(&session, append_newline).await {
+                return Ok(done);
+            }
+        }
+
         // Redacted before it reaches anybody. §9.2 names only the audit
         // surface, and redacting the broadcast too costs one call, keeps
         // one rule for the string, and stops a human being shown a
         // secret-shaped value in the modal they are about to type into.
         let prompt_text = redact_str(&self.processor.rules, &args.prompt_text);
-        let append_newline = args.append_newline.unwrap_or(true);
-        let hub = self.attach_hub();
 
         // REQ-SEC-010a. Raise if the slot is vacant, **adopt** if an echo
         // drop already raised one — §16.4 steps 3–7 are an adoption end
@@ -1511,6 +1571,116 @@ impl HoldfastServer {
 }
 
 impl HoldfastServer {
+    /// §5.2's step 1: resolve this session's secret from a credential
+    /// store, or answer `None` and let the caller fall through to the
+    /// prompt.
+    ///
+    /// **The signature is the security property.** It takes the session
+    /// and the request's `append_newline` and nothing else — there is no
+    /// parameter through which `request_secret_input`'s `prompt_text`
+    /// could reach a binding lookup, which is REQ-SEC-012's structural
+    /// half at the one call site that could break it (§9.6: *"There is no
+    /// 'agent asks for a named secret' API at all"*).
+    ///
+    /// **`spawn_blocking`, because [`crate::secret::binding::autofill`]
+    /// waits on an OS process.** A provider taking its full
+    /// `keychain_provider_timeout_secs` would otherwise stall a runtime
+    /// worker for ten seconds — and `op read` blocking on a biometric
+    /// prompt is exactly that case.
+    ///
+    /// Every fall-through is silent to the agent: `None` here is
+    /// indistinguishable from a session with no bindings configured at
+    /// all. An agent that could tell "your binding is exhausted" from "you
+    /// have no binding" could enumerate an operator's bindings from the
+    /// outside.
+    async fn autofill_from_binding(
+        &self,
+        session: &Arc<Session>,
+        append_newline: bool,
+    ) -> Option<CallToolResult> {
+        let security = self.config.security.clone();
+        let processor = Arc::clone(&self.processor);
+        let for_task = Arc::clone(session);
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::secret::binding::autofill(&security, &for_task, append_newline, &processor.audit)
+        })
+        .await;
+
+        let Resolved {
+            binding_name,
+            secret,
+            ..
+        } = match outcome {
+            Ok(Autofill::Resolved(resolved)) => resolved,
+            // Every other answer means the same thing: step 2.
+            Ok(Autofill::FellThrough(_)) => return None,
+            // The blocking task panicked. Falling through is the safe
+            // reading — a human can still answer — and the panic is
+            // already on `daemon.log` through the runtime's own hook.
+            Err(_) => return None,
+        };
+
+        // **Close the raise before the write is queued**, and for the
+        // same reason `attach::conn`'s `SecretInput` arm does: an echo
+        // drop with a client attached has already broadcast
+        // `AwaitingSecret`, and a human typing into that modal while this
+        // write is in flight would put two values into one `getpass`.
+        // `take_if_unadopted` refuses a slot somebody is waiting on, so
+        // this cannot take a request out from under another call.
+        let hub = self.attach_hub();
+        let request_id = hub.secrets().take_if_unadopted(&session.id).map(|raised| {
+            let id = raised.request_id().to_string();
+            drop(raised);
+            hub.broadcast_secret_closed(&session.id, &id, "fulfilled");
+            id
+        });
+
+        // The same write path a client's `SecretInput` takes: the value
+        // moves into the queue as a `SecretBytes` and is zeroed by its own
+        // `Drop` the moment the writer is done with it.
+        let (write, ack) = WriteRequest::secret(secret);
+        if session.write_queue().send(write).await.is_err() {
+            return Some(self.session_died_under_autofill(session));
+        }
+        let bytes_written = match ack.await {
+            Ok(Ok(n)) => n as u64,
+            _ => return Some(self.session_died_under_autofill(session)),
+        };
+        // §4.1 counts a write as activity, or a session idle-reaps while
+        // its own credential is being filled in.
+        session.note_activity();
+
+        let mut data = json!({ "bytes_written": bytes_written });
+        // Present only when there *was* a raised request to close.
+        // §9.6's autofill raises none of its own: there is no prompt, so
+        // there is nothing for an id to name.
+        if let Some(id) = request_id {
+            data["request_id"] = json!(id);
+        }
+        Some(envelope::envelope(
+            Status::SecretProvided,
+            detection::with_detection(data, session, &self.processor),
+            format!(
+                "{bytes_written} byte(s) written to the session from the \
+                 `{binding_name}` binding"
+            ),
+        ))
+    }
+
+    /// The session died under an autofill write.
+    ///
+    /// Same shape as the prompt path's §5.1 answer. The
+    /// `binding_resolved` entry is already written and stays: the binding
+    /// *did* resolve, and the session dying afterwards is a different
+    /// fact.
+    fn session_died_under_autofill(&self, session: &Arc<Session>) -> CallToolResult {
+        envelope::envelope(
+            Status::SessionDied,
+            json!({ "exit_code": session.exit_code() }),
+            "the session exited while its binding was being resolved",
+        )
+    }
+
     /// §9.4's `secret_input_request`.
     ///
     /// **`prompt_text` is handed over raw.** `AuditLog::record` redacts
