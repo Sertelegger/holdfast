@@ -78,11 +78,20 @@ pub struct ControlError {
     /// redactor exactly as before, and a richer error surface must not
     /// become a channel for unredacted bytes.
     ///
-    /// `PROTOCOL_MINOR` is deliberately **not** bumped for it. The
-    /// protocol has never been distributed (0.0.12 is the milestone that
-    /// does that), so there is no `1.0` peer in the world to skew
-    /// against, and bumping now would advertise a released minor that
-    /// does not exist.
+    /// `PROTOCOL_MINOR` was deliberately **not** bumped for it — and
+    /// **this paragraph is history, not precedent.** The field landed in
+    /// `e659d0b`, which is an ancestor of the `v0.0.5` tag: at the time
+    /// the protocol had never been distributed, so there was no `1.0`
+    /// peer in the world to skew against and a bump would have
+    /// advertised a released minor that did not exist.
+    ///
+    /// GH #16 ratified the tag as the boundary, and from it on a wire
+    /// change moves the version. The distinction matters because it is
+    /// invisible from a diff: six pre-tag commits changed the wire
+    /// without a bump, and the seventh would look exactly like them.
+    /// That is why the rule is now asserted rather than only written
+    /// down — `tests/wire_shape.rs` records the wire shape per protocol
+    /// version and fails when one moves without the other (GH #18).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_code: Option<i32>,
 }
