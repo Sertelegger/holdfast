@@ -3566,6 +3566,51 @@ mod tests {
         )
     }
 
+    /// `send_input` as an agent makes it — the non-slot route §5.2 permits
+    /// during `AwaitingSecret` (REQ-SEC-011), with its warning.
+    async fn call_send_input(server: &HoldfastServer, session: &str, data: &str) -> Value {
+        let r = tokio::time::timeout(
+            Duration::from_secs(30),
+            server.send_input(Parameters(crate::mcp::tools::SendInputArgs {
+                session: session.to_string(),
+                data: data.to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("send_input never returned")
+        .expect("send_input");
+        body(&r)
+    }
+
+    /// Wait until §8.3 says the child has **left** its echo-off prompt.
+    ///
+    /// The state a resolved credential must never be written into, and
+    /// waiting for it is what makes a row about that an arrangement rather
+    /// than a race with the child's `stty echo`.
+    async fn await_not_awaiting(s: &Session) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never left its echo-off prompt"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Poll until an audit line of `kind` exists for this session.
+    async fn await_audit_kind(sc: &Scratch, session_id: &str, kind: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !sc.kinds(session_id).iter().any(|k| k == kind) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no `{kind}` line was ever written for {session_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// `[security]` with the keychain step on **and §9.6's autofill knob
     /// set explicitly**.
     fn autofill_mode(bindings: Vec<SecretBinding>, on: bool) -> SecurityConfig {
@@ -3979,6 +4024,361 @@ mod tests {
 
         client.unregister(&server);
         let _ = s.signal(Signal::Kill);
+    }
+
+    /// **C-1: unattached, the write must not go into a child that has
+    /// already moved on.**
+    ///
+    /// Everything GH #35 added observes `SecretSlots`. The child's
+    /// echo-off read can be satisfied by routes that never touch a slot —
+    /// an MCP `send_input` (REQ-SEC-011 allows it during `AwaitingSecret`,
+    /// with a warning), a human typing ordinary input, or the child
+    /// abandoning the read. With a client attached, `forward_events`
+    /// raises on the edge and closes on `AwaitingSecretLeft`, so the
+    /// closure count moves and the write is refused. **With nobody
+    /// attached there is no raise at all**, the count never moves, and the
+    /// slot answers `Vacant` — which is the unattended case
+    /// `autofill_on_echo_off` exists for.
+    ///
+    /// The child here reads **twice**: once with echo off, and once with
+    /// echo restored. Before the fix the credential landed in the second,
+    /// *echoing* read — the line discipline put it straight into the ring
+    /// buffer (`hunter2`, then `next=[hunter2]`), which is exactly what
+    /// `read_output` serves to the agent. Against a shell that read is a
+    /// command line.
+    ///
+    /// **No client is registered, deliberately**: with one, the raise and
+    /// its `AwaitingSecretLeft` close would tick the count and GH #35's
+    /// check would refuse the write for a different reason, masking this
+    /// one entirely.
+    ///
+    /// **The pairing is the same arrangement with nobody interfering**,
+    /// where the child *is* still at its echo-off prompt and the autofill
+    /// does write — without it, `!contains("hunter2")` passes against an
+    /// autofill that stopped writing at all.
+    #[tokio::test]
+    async fn an_unattached_autofill_does_not_write_into_a_child_that_moved_on() {
+        // ---- the child moves on inside the provider window
+        let mut sc = Scratch::new("movedon");
+        let child_gate = sc.path("child.gate");
+        let gate = sc.path("gate");
+        let b = sc.binding(
+            "prod-ssh",
+            "^ssh\\b",
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                gate.display()
+            ),
+        );
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+        // Echo-off read, then an **echoing** read, so a value delivered
+        // after the prompt is over is echoed into the ring buffer rather
+        // than quietly discarded at exit. The second read is not an
+        // echo-off fixture and does not re-spell one (GC14); the whole
+        // thing sits behind `gated_echo_off`'s gate so the listener is
+        // armed before the edge.
+        let child = format!(
+            "{}; read y; printf 'next=[%s]\\n' \"$y\"",
+            gated_echo_off(&child_gate)
+        );
+        let s = session_running("ssh", &["prod-01"], &child);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        server.watch_for_autofill(&s);
+        // **Nobody attached, and nothing raised** — see the doc.
+        assert!(
+            server.attach_hub().outstanding_secret(&s.id).is_none(),
+            "a raise would tick the closure count and mask this row"
+        );
+        std::fs::write(&child_gate, b"go").expect("release the child");
+        await_prompt(&s, b"Password: ").await;
+        // The provider has started and is blocked on **its own** gate, so
+        // everything below happens strictly inside the autofill's window.
+        await_ran(&sc, "prod-ssh").await;
+
+        // A non-slot route satisfies the first read: `send_input`, which
+        // §5.2 permits during `AwaitingSecret` with a warning.
+        let warned = call_send_input(&server, &s.id, "typedbyahuman").await;
+        assert_eq!(
+            warned["data"]["warning"], "session_awaiting_secret",
+            "REQ-SEC-011's warning is what makes this a route the daemon knows \
+             about: {warned}"
+        );
+        buffer_until(&s, b"got=TYPEDBYAHUMAN", 20).await;
+        // The child has restored echo and is on its second read. This is
+        // the state the write below must not go into, and waiting for it
+        // is what makes the row an arrangement rather than a race.
+        await_not_awaiting(&s).await;
+
+        // Only now does the provider answer.
+        std::fs::write(&gate, b"go").expect("the gate is open");
+
+        // **The clock, and it is a positive rather than a sleep.**
+        // `binding_resolved` is written by `resolve_selected` the moment
+        // the provider produces a value, so its arrival says the blocking
+        // hop has returned and `inject_resolved` has run — there is no
+        // `.await` between the two. Then the child's *second* read is
+        // satisfied with a sentinel: if the autofill had written, the child
+        // would have consumed `hunter2` and printed `next=[hunter2]`, and
+        // this sentinel would be the leftover instead.
+        await_audit_kind(&sc, &s.id, "binding_resolved").await;
+        call_send_input(&server, &s.id, "nextline").await;
+        let seen = buffer_until(&s, b"next=[", 20).await;
+        assert!(
+            contains(&seen, b"next=[nextline]"),
+            "the child's second read was answered by something other than the \
+             sentinel:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        let seen = buffered(&s);
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "the resolved credential was written into an echoing read and is in the \
+             ring buffer, which is what `read_output` serves to the agent:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(
+            !contains(&seen, b"next=[hunter2]"),
+            "the autofill answered the child's second read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(
+            contains(&seen, b"got=TYPEDBYAHUMAN"),
+            "the arrangement did not happen: the first read was never satisfied"
+        );
+        let _ = s.signal(Signal::Kill);
+
+        // ---- the pairing: nobody interferes, so the child is still at
+        // its echo-off prompt and the autofill does write
+        let mut sc2 = Scratch::new("movedon-control");
+        let b2 = sc2.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let server2 = server_with(autofill_mode(vec![b2], true), &sc2.audit_log());
+        let gate2 = sc2.path("gate");
+        let s2 = session_running("ssh", &["prod-01"], &gated_echo_off(&gate2));
+        server2.registry.insert(Arc::clone(&s2)).expect("register");
+        server2.watch_for_autofill(&s2);
+        std::fs::write(&gate2, b"go").expect("open the gate");
+        await_prompt(&s2, b"Password: ").await;
+        let seen2 = buffer_until(&s2, b"got=HUNTER2", 20).await;
+        assert!(
+            !contains(&seen2, PROBE.as_bytes()),
+            "echo was off, so the value must not be in the buffer:\n{}",
+            String::from_utf8_lossy(&seen2)
+        );
+        let _ = s2.signal(Signal::Kill);
+    }
+
+    /// `attach::conn::forward_events`' two secret arms, driven off the
+    /// **same** `SessionEvent` stream a real connection subscribes to.
+    ///
+    /// Not the real function — that takes an `Arc<Daemon>`, which this
+    /// target does not build — but the same two hub calls in the same two
+    /// arms, woken by the same `broadcast::send` that wakes the listener.
+    /// That is the point: every other row here raises by hand *before* the
+    /// edge, so the two consumers never actually ride one edge.
+    ///
+    /// `hold` places the raise inside the listener's provider window
+    /// deterministically: with `Some(path)` the arm waits for that file
+    /// before raising, and `Scratch::binding` makes the provider's marker
+    /// its script's first act.
+    fn spawn_forwarder(
+        server: &HoldfastServer,
+        session: &Arc<Session>,
+        hold: Option<PathBuf>,
+    ) -> tokio::task::JoinHandle<()> {
+        let server = server.clone();
+        let session = Arc::clone(session);
+        let mut events = session.subscribe_events();
+        tokio::spawn(async move {
+            use crate::session::SessionEvent;
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match events.recv().await {
+                    Ok(SessionEvent::AwaitingSecretEntered { prompt_text }) => {
+                        if let Some(p) = &hold {
+                            while !p.exists() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        let hub = server.attach_hub();
+                        let (req, _first) = hub.raise_secret(&session.id, &prompt_text);
+                        hub.broadcast_awaiting_secret(
+                            &session.id,
+                            &req.request_id,
+                            &req.prompt_text,
+                        );
+                    }
+                    // §5.2's supersede: echo came back with no submission.
+                    Ok(SessionEvent::AwaitingSecretLeft) => {
+                        let hub = server.attach_hub();
+                        if let Some(raised) = hub.close_secret(&session.id, None) {
+                            let id = raised.request_id().to_string();
+                            raised.answer(crate::secret::Resolution::Cancelled(
+                                crate::secret::CancelReason::UserCancelled,
+                            ));
+                            hub.broadcast_secret_closed(&session.id, &id, "cancelled");
+                        }
+                    }
+                    Ok(SessionEvent::Exited { .. }) | Err(RecvError::Closed) => return,
+                    Err(RecvError::Lagged(_)) => {}
+                }
+            }
+        })
+    }
+
+    /// Poll until this session's slot is empty, or fail.
+    async fn await_slot_empty(server: &HoldfastServer, session_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while server.attach_hub().outstanding_secret(session_id).is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a raise was left outstanding on {session_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// **The listener and a connection's raise on one edge, driven rather
+    /// than argued.**
+    ///
+    /// Every other autofill row raises by hand *before* the edge, and
+    /// `attach_fake` registers an `AttachConn` without running
+    /// `forward_events` — so the ordering the design rests on is never
+    /// exercised. This project's own constraints say a claim of that shape
+    /// must be driven, and this milestone has already had four rows found
+    /// decorative or load-dependent by mutation rather than by reading.
+    ///
+    /// Two halves, because the two orderings are not equally arrangeable:
+    ///
+    /// * **Arranged** — the raise lands *inside* the listener's provider
+    ///   window, which is the order the listener's snapshot cannot have
+    ///   seen. It must still be taken and closed `fulfilled`, because a
+    ///   raise nobody has adopted is this value's to close.
+    /// * **Raced** — the forwarder raises the instant the edge fires, with
+    ///   nothing gated, repeated several times. Which task tokio polls
+    ///   first is genuinely undecided; what is asserted is the invariant
+    ///   that holds either way. (The opposite order — the snapshot seeing a
+    ///   raise that was already there — is what `armed_session`'s rows
+    ///   arrange, so between the three every state is covered.)
+    #[tokio::test]
+    async fn the_listener_and_a_connections_raise_ride_the_same_edge() {
+        // ---- arranged: the raise lands inside the provider window
+        let mut sc = Scratch::new("sameedge");
+        let child_gate = sc.path("child.gate");
+        let gate = sc.path("gate");
+        let b = sc.binding(
+            "prod-ssh",
+            "^ssh\\b",
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                gate.display()
+            ),
+        );
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+        let s = session_running("ssh", &["prod-01"], &gated_echo_off(&child_gate));
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        server.watch_for_autofill(&s);
+        let forwarder = spawn_forwarder(&server, &s, Some(sc.marker("prod-ssh")));
+        std::fs::write(&child_gate, b"go").expect("release the child");
+
+        await_prompt(&s, b"Password: ").await;
+        await_ran(&sc, "prod-ssh").await;
+        // The connection's raise, now provably inside the window.
+        let raised = client.wait_for("AwaitingSecret", is_awaiting).await;
+        let ServerFrame::AwaitingSecret { request_id, .. } = raised else {
+            panic!("wait_for returned the wrong frame");
+        };
+        std::fs::write(&gate, b"go").expect("open the gate");
+
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert_eq!(
+            seen.windows(4).filter(|w| *w == b"got=").count(),
+            1,
+            "the child completed more than one read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        let closed = client
+            .wait_for("SecretRequestClosed", |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { .. })
+            })
+            .await;
+        let ServerFrame::SecretRequestClosed {
+            request_id: closed_id,
+            outcome,
+        } = closed
+        else {
+            panic!("wait_for returned the wrong frame");
+        };
+        assert_eq!(
+            (closed_id.as_str(), outcome.as_str()),
+            (request_id.as_str(), "fulfilled"),
+            "a raise that appeared inside the window is the autofill's to close"
+        );
+        await_slot_empty(&server, &s.id).await;
+        assert_eq!(sc.kinds(&s.id), vec!["binding_resolved".to_string()]);
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+        let _ = forwarder.await;
+
+        // ---- raced: both consumers on one ungated edge
+        let mut fulfilled = 0usize;
+        const PASSES: usize = 6;
+        for pass in 0..PASSES {
+            let mut sc = Scratch::new(&format!("sameedge-race-{pass}"));
+            let child_gate = sc.path("child.gate");
+            let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+            let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+            let s = session_running("ssh", &["prod-01"], &gated_echo_off(&child_gate));
+            server.registry.insert(Arc::clone(&s)).expect("register");
+            let mut client = attach_fake(&server, &s.id);
+            server.watch_for_autofill(&s);
+            let forwarder = spawn_forwarder(&server, &s, None);
+            std::fs::write(&child_gate, b"go").expect("release the child");
+
+            let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+            // **The invariant, whichever task tokio polled first.**
+            assert_eq!(
+                seen.windows(4).filter(|w| *w == b"got=").count(),
+                1,
+                "pass {pass}: the child completed more than one read:\n{}",
+                String::from_utf8_lossy(&seen)
+            );
+            assert!(
+                !contains(&seen, PROBE.as_bytes()),
+                "pass {pass}: the value reached the ring buffer:\n{}",
+                String::from_utf8_lossy(&seen)
+            );
+            assert_eq!(
+                sc.kinds(&s.id),
+                vec!["binding_resolved".to_string()],
+                "pass {pass}: the trail is not one resolution"
+            );
+            // No slot leaks: either the autofill closed the raise, or the
+            // forwarder's `AwaitingSecretLeft` arm did when echo came back.
+            await_slot_empty(&server, &s.id).await;
+            let closed = client
+                .wait_for("SecretRequestClosed", |f| {
+                    matches!(f, ServerFrame::SecretRequestClosed { .. })
+                })
+                .await;
+            if let ServerFrame::SecretRequestClosed { outcome, .. } = closed {
+                if outcome == "fulfilled" {
+                    fulfilled += 1;
+                }
+            }
+            client.unregister(&server);
+            let _ = s.signal(Signal::Kill);
+            let _ = forwarder.await;
+        }
+        // **Anti-vacuity.** Without this the loop passes against a listener
+        // that never satisfies a connection's raise at all — every pass
+        // would then close `cancelled` from the `AwaitingSecretLeft` arm
+        // and every assertion above would still hold.
+        assert!(
+            fulfilled > 0,
+            "not one of {PASSES} passes had the autofill close the connection's raise"
+        );
     }
 
     /// **The production wiring**, which none of the rows above touches.

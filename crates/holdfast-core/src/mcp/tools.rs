@@ -1792,6 +1792,41 @@ impl HoldfastServer {
         // The `binding_resolved` entry and the spent `max_uses` claim
         // stand: the binding *did* resolve, and §9.6 counts resolutions
         // from the store rather than values written to a PTY.
+        //
+        // ## And first, the question the slot cannot answer
+        //
+        // **Everything above observes `SecretSlots`, and the child's read
+        // can be satisfied by routes that never touch a slot**: an MCP
+        // `send_input` (REQ-SEC-011 allows it during `AwaitingSecret`, with
+        // a warning), a human typing ordinary input at an attached
+        // terminal, or the child abandoning the read itself. With a client
+        // attached those all end with `forward_events` closing the raise on
+        // `AwaitingSecretLeft`, so the closure count moves and the checks
+        // below refuse. **With nobody attached there is no raise at all**,
+        // the count never moves, and the slot answers `Vacant` for a child
+        // that has already moved on — which is the unattended case
+        // `autofill_on_echo_off` exists for.
+        //
+        // Driven, before this check existed: the child's first read was
+        // satisfied by `send_input`, `stty echo` restored echo, and the
+        // resolved credential was written into the *next*, echoing read —
+        // where the line discipline put it straight into the ring buffer
+        // (`hunter2`, then `next=[hunter2]`) and `read_output` would hand
+        // it to the agent. That is the failure this milestone exists to
+        // prevent, reached without an agent call and without a human.
+        //
+        // §8.3's own classification is the only authority on *"is this
+        // child still at an echo-off prompt?"* and it is what is consulted
+        // here. **It is not atomic and cannot be** — there is no lock over
+        // a tty — but it turns a window as long as
+        // `keychain_provider_timeout_secs` into the microseconds between
+        // this line and the queued write. Checked **before** the take,
+        // deliberately: taking the slot and then refusing would close a
+        // request a human may still be looking at.
+        if !session.is_awaiting_secret() {
+            drop(secret);
+            return None;
+        }
         let request_id = match hub
             .secrets()
             .take_if_unadopted_matching(&session.id, raised_before)

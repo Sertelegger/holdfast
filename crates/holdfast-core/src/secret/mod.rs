@@ -46,7 +46,13 @@ pub use binding::{
 /// `pub(crate)` in [`provider`] and `ScriptProvider` is `#[cfg(test)]`
 /// there, so a release build does not contain the second one at all.
 pub use provider::{resolve, ArgvProvider, ProviderError, SecretProvider};
+/// **`pub(crate)`, unlike its neighbours above, and deliberately.** Its one
+/// consumer is `crate::mcp::tools`, which threads it from `snapshot` to
+/// `take_if_unadopted_matching` and reads nothing out of it; there is no
+/// external caller and no reason to put it in `holdfast-core`'s published
+/// API. Widening it later is additive, narrowing it is not.
+pub(crate) use request::SlotSnapshot;
 pub use request::{
     buffer_notice, Adopted, CancelReason, Collision, RaisedBy, RaisedRequest, Resolution,
-    SecretSlots, SlotSnapshot, SlotTake,
+    SecretSlots, SlotTake,
 };
