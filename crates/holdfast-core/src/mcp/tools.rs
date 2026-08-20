@@ -15,7 +15,7 @@ use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{clamp_geometry, InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
 use crate::secret::binding::{Autofill, Resolved};
-use crate::secret::{CancelReason, RaisedBy, Resolution};
+use crate::secret::{CancelReason, RaisedBy, Resolution, SlotTake};
 use crate::session::{new_session_id, wait, Session, SessionConfig, WriteRequest};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -1645,31 +1645,36 @@ impl HoldfastServer {
         // — `SecretBytes::drop` zeroes it — and the call falls through to
         // the prompt path like any other non-resolution.
         //
+        // **And the same is true when nothing was outstanding before.** A
+        // raise can appear inside the window and be adopted by *another
+        // tool call*; writing into that is the identical failure reached
+        // from the other side. One three-way answer under one lock covers
+        // both, and it has to be one answer rather than a `has_waiter`
+        // probe afterwards — a check-then-act here is the race being
+        // closed, not a way of closing it.
+        //
         // The `binding_resolved` entry and the spent `max_uses` claim
         // stand: the binding *did* resolve, and §9.6 counts resolutions
         // from the store rather than values written to a PTY.
-        let request_id = match &raised_before {
-            Some(before) => {
-                let Some(raised) = hub
-                    .secrets()
-                    .take_if_unadopted_matching(&session.id, before)
-                else {
-                    drop(secret);
-                    return None;
-                };
+        let request_id = match hub
+            .secrets()
+            .take_if_unadopted_matching(&session.id, raised_before.as_deref())
+        {
+            SlotTake::Taken(raised) => {
                 let id = raised.request_id().to_string();
                 drop(raised);
                 hub.broadcast_secret_closed(&session.id, &id, "fulfilled");
                 Some(id)
             }
-            // Nothing was outstanding when this call began. A raise that
-            // appeared since is unanswered and is this value's to close.
-            None => hub.secrets().take_if_unadopted(&session.id).map(|raised| {
-                let id = raised.request_id().to_string();
-                drop(raised);
-                hub.broadcast_secret_closed(&session.id, &id, "fulfilled");
-                id
-            }),
+            // Nothing outstanding. Safe **only** when nothing was
+            // outstanding when this call began: a raise that was there and
+            // is now gone was answered by somebody else, and the child has
+            // already had a value.
+            SlotTake::Vacant if raised_before.is_none() => None,
+            _ => {
+                drop(secret);
+                return None;
+            }
         };
 
         // The same write path a client's `SecretInput` takes: the value

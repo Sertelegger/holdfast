@@ -38,5 +38,5 @@ pub use binding::{autofill, command_line, keychain_step_runs, select, Autofill, 
 pub use provider::{resolve, ArgvProvider, ProviderError, SecretProvider};
 pub use request::{
     buffer_notice, Adopted, CancelReason, Collision, RaisedBy, RaisedRequest, Resolution,
-    SecretSlots,
+    SecretSlots, SlotTake,
 };

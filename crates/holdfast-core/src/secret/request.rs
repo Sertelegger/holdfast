@@ -218,6 +218,26 @@ impl RaisedRequest {
     }
 }
 
+/// What [`SecretSlots::take_if_unadopted_matching`] found.
+///
+/// **Three, because the §9.6 autofill's decision needs three.** An
+/// `Option` collapses *"nothing is outstanding"* and *"something is
+/// outstanding that is not yours"* into one `None`, and those two require
+/// opposite actions from the one caller that is about to write a
+/// credential into a PTY: write, and do not write.
+#[derive(Debug)]
+pub enum SlotTake {
+    /// The slot held an unadopted request matching what the caller
+    /// expected, and the caller now owns it.
+    Taken(RaisedRequest),
+    /// Nothing is outstanding for this session.
+    Vacant,
+    /// Something is outstanding and it is not the caller's to take —
+    /// a call is waiting on it, or it is a different request from the one
+    /// the caller left there.
+    NotYours,
+}
+
 /// Every session's slot. **Vacant is absence from the map**, so there is
 /// no third state to keep consistent with the other two.
 #[derive(Default, Debug)]
@@ -541,27 +561,41 @@ impl SecretSlots {
     /// was raised in its place, and a value fetched for the first must not
     /// be typed into the second.
     ///
+    /// **Three outcomes and not two**, because the caller's decision needs
+    /// all three and an `Option` collapses two of them. `expect_id` is
+    /// `None` for a caller that found the slot *vacant* before it went
+    /// away, and even that caller must be told [`SlotTake::NotYours`]: a
+    /// raise can appear inside the window and be **adopted by another tool
+    /// call**, and writing into that is the same two-values-in-one-`getpass`
+    /// failure reached from the other side. Answering it here rather than
+    /// with a `has_waiter` probe afterwards is what makes it atomic —
+    /// `take_if_unadopted`'s own doc is where this file records that a
+    /// check-then-`take` outside the lock is exactly the race being closed.
+    ///
     /// **The one thing it cannot see** is a raise that both appeared *and*
-    /// was answered inside the window, starting from a vacant slot — that
+    /// was answered inside the window, starting from a vacant slot: that
     /// leaves the slot vacant again and is indistinguishable from "nothing
-    /// ever happened". Closing it needs a per-session monotonic count of
-    /// closures, which has to outlive the entries it counts and therefore
-    /// needs a home that is swept when a session ends (GH #24's shape).
-    /// Recorded rather than built: it needs a client attached, a session
-    /// the agent called against while it was *not* at a prompt, and a human
-    /// answering a prompt the agent never saw, all inside one provider
-    /// call.
+    /// ever happened", so it answers [`SlotTake::Vacant`] and the caller
+    /// writes. Closing it needs a per-session count of closures that
+    /// outlives the entries it counts; it is filed rather than built, and
+    /// it is **not** exotic — `start_session("ssh prod-01")` followed
+    /// immediately by `request_secret_input`, before the prompt has been
+    /// drawn, is exactly that shape.
     pub fn take_if_unadopted_matching(
         &self,
         session_id: &str,
-        expect_id: &str,
-    ) -> Option<RaisedRequest> {
+        expect_id: Option<&str>,
+    ) -> SlotTake {
         let mut slots = self.inner.lock();
-        match slots.get(session_id) {
-            Some(raised) if !raised.has_waiter() && raised.request.request_id == expect_id => {
-                slots.remove(session_id)
-            }
-            _ => None,
+        let Some(raised) = slots.get(session_id) else {
+            return SlotTake::Vacant;
+        };
+        if raised.has_waiter() || expect_id.is_some_and(|id| raised.request.request_id != id) {
+            return SlotTake::NotYours;
+        }
+        match slots.remove(session_id) {
+            Some(raised) => SlotTake::Taken(raised),
+            None => SlotTake::Vacant,
         }
     }
 
@@ -872,5 +906,123 @@ mod tests {
         }
         assert_eq!(RaisedBy::EchoDrop.as_str(), "echo_drop");
         assert_eq!(RaisedBy::ToolCall.as_str(), "tool_call");
+    }
+
+    /// **The id half of the autofill's take**, which is the whole reason
+    /// [`SecretSlots::take_if_unadopted_matching`] exists rather than the
+    /// caller using `take_if_unadopted`.
+    ///
+    /// Its security argument is that a value fetched for request one must
+    /// not be typed into request two — the first was closed and a second
+    /// raised in its place, and the child is now at a different prompt. It
+    /// is asserted here rather than at the daemon level because the daemon
+    /// row that pins the *fall-through* (`a_human_answering_during_the_provider_call_is_not_overwritten`)
+    /// leaves the slot **vacant** and so never reaches the comparison at
+    /// all: dropping this line left the whole workspace green, which is
+    /// the shape this project treats as a defect in its own right.
+    #[test]
+    fn the_autofills_take_refuses_an_id_that_is_not_the_one_it_left() {
+        let slots = SecretSlots::new();
+        let (first, _) = slots.raise(S, "[sudo] password for ada:", RaisedBy::EchoDrop);
+
+        // The request the autofill left there was superseded: closed, and
+        // a second raised in its place.
+        assert!(slots.take(S, Some(&first.request_id)).is_some());
+        let (second, _) = slots.raise(S, "MySQL password:", RaisedBy::EchoDrop);
+        assert_ne!(second.request_id, first.request_id);
+
+        assert!(
+            matches!(
+                slots.take_if_unadopted_matching(S, Some(&first.request_id)),
+                SlotTake::NotYours
+            ),
+            "a value fetched for the first request was handed the second"
+        );
+        // Refused **and left whole**, or the refusal has merely moved the
+        // damage: the second request must still be answerable by whoever
+        // it belongs to.
+        assert!(slots.matches_outstanding(S, &second.request_id));
+
+        // **The pairing.** The same call with the id that *is* there takes
+        // it — without this the row passes against a method that refuses
+        // everything, which would break every autofill instead.
+        let SlotTake::Taken(got) = slots.take_if_unadopted_matching(S, Some(&second.request_id))
+        else {
+            panic!("the matching id must be taken");
+        };
+        assert_eq!(got.request_id(), second.request_id);
+        assert!(slots.outstanding(S).is_none());
+
+        // And a vacant slot is `Vacant` rather than `NotYours`: those two
+        // are opposite instructions to the one caller that writes a
+        // credential, so collapsing them is the bug this enum exists to
+        // make unrepresentable.
+        assert!(matches!(
+            slots.take_if_unadopted_matching(S, Some(&second.request_id)),
+            SlotTake::Vacant
+        ));
+        assert!(matches!(
+            slots.take_if_unadopted_matching(S, None),
+            SlotTake::Vacant
+        ));
+    }
+
+    /// **The waiter half**, for both callers — the one that left an id
+    /// there and the one that found the slot vacant.
+    ///
+    /// A slot with a call waiting on it is never the autofill's to
+    /// satisfy: that call owns the answer, and a credential written into
+    /// the PTY behind it is a second value in one `getpass`. Dropping the
+    /// `has_waiter` test also left the whole workspace green.
+    #[test]
+    fn the_autofills_take_refuses_a_slot_somebody_is_waiting_on() {
+        let slots = SecretSlots::new();
+        let (raised, _) = slots.raise(S, "[sudo] password for ada:", RaisedBy::EchoDrop);
+        // Before anyone adopts it, it is takeable — the control that makes
+        // the refusal below evidence of the waiter rather than of the id.
+        assert!(matches!(
+            slots.take_if_unadopted_matching(S, Some(&raised.request_id)),
+            SlotTake::Taken(_)
+        ));
+
+        let (raised, _) = slots.raise(S, "[sudo] password for ada:", RaisedBy::EchoDrop);
+        let a = slots
+            .raise_or_adopt(S, "a call", Some(16), true)
+            .expect("a raised slot with no waiter is adopted");
+        assert_eq!(a.request_id, raised.request_id);
+
+        // The id matches and it is still refused, which is what separates
+        // the two conditions.
+        assert!(
+            matches!(
+                slots.take_if_unadopted_matching(S, Some(&raised.request_id)),
+                SlotTake::NotYours
+            ),
+            "the autofill took a slot a waiting call owns"
+        );
+        // **And the vacant-before caller is told the same thing.** It
+        // passes `None`, so the id test cannot be what refuses it; only
+        // the waiter test can, and this is the half that stops an autofill
+        // writing into a raise another tool call adopted inside its window.
+        assert!(
+            matches!(
+                slots.take_if_unadopted_matching(S, None),
+                SlotTake::NotYours
+            ),
+            "a caller that found the slot vacant wrote into somebody else's adoption"
+        );
+
+        // Nothing was disturbed: the waiting call is unanswered and can
+        // still close its own request, which is what proves the refusals
+        // above did not half-take it.
+        assert!(slots.matches_outstanding(S, &raised.request_id));
+        let mut rx = a.rx;
+        assert!(
+            rx.try_recv().is_err(),
+            "the autofill answered a caller it does not own"
+        );
+        assert!(slots
+            .close_on_caller_timeout(S, &raised.request_id)
+            .is_some());
     }
 }

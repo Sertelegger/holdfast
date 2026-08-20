@@ -8,15 +8,29 @@
 //! binding matches → fall through to the human-prompt path. There is no
 //! 'agent asks for a named secret' API at all."* What the agent cannot do
 //! is **name** anything: not the reference, not the provider, not the
-//! binding. `request_secret_input`'s `prompt_text` reaches no function in
-//! this module — nothing in here has a parameter it could be passed in,
-//! which is why that guard is a signature rather than a check.
+//! binding.
 //!
-//! **What the agent *does* control is one of the two match subjects, and
-//! that is by design rather than by oversight.** `Session.command` and
-//! `Session.args` are the agent's own `start_session` arguments, stored
-//! verbatim — so `match_command`'s entire subject is a string the agent
-//! wrote. §9.6 intends exactly this: an operator binding that fires on
+//! **The precise statement is about [`autofill`]'s signature, not about
+//! this module's.** `autofill(security, session, append_newline, audit)`
+//! has no parameter `request_secret_input`'s `prompt_text` could be passed
+//! in, and it is the only entry point the daemon calls. Saying that of the
+//! *module* would be false and is worth not saying: [`select`] is `pub`
+//! and takes `command_line: &str`, as do `matches` and `pattern_matches`
+//! below — bare subjects, supplied by their caller. `autofill` is that
+//! caller everywhere but in tests, and it builds both subjects from the
+//! session.
+//!
+//! **And one of those two subjects is the agent's own string.**
+//! `Session.command` and `Session.args` are the agent's `start_session`
+//! arguments, stored verbatim — so `match_command`'s entire subject is
+//! something the agent wrote. That is **§9.6's design as this
+//! implementation reads it, and §9.6's own text does not say so**: its
+//! bullet reads *"The agent has no input into which entry is selected"*,
+//! which is not true of any implementation that matches on a command line
+//! the agent chose, including the one §9.6 itself describes. The spec line
+//! needs the same correction this header just made; that is recorded here
+//! rather than repaired from this lane. What is defensible, and what this
+//! module relies on, is narrower: an operator binding that fires on
 //! `ssh prod-01` firing for an agent that ran `ssh prod-01` **is** the
 //! feature, and the protection is that to match, the agent must actually
 //! *run* that command line, under a PTY, in a session an operator can
@@ -1667,6 +1681,156 @@ mod tests {
         assert_eq!(
             control["data"]["request_id"], raised2.request_id,
             "the autofill closed a request other than the one it found"
+        );
+        buffer_until(&s2, b"got=HUNTER2", 20).await;
+        let _ = s2.signal(Signal::Kill);
+    }
+
+    /// **A raise that appears inside the provider window and is adopted by
+    /// another tool call is not the autofill's to satisfy either.**
+    ///
+    /// This is the row above seen from the other side. There the slot was
+    /// occupied when the call began; here it is **vacant**, which is the
+    /// ordinary anticipatory pattern — `start_session("ssh prod-01")`
+    /// followed immediately by `request_secret_input`, before the child has
+    /// drawn its prompt — so the echo-drop raise appears inside the window
+    /// by construction. If another call has adopted it by the time the
+    /// provider answers, that call owns the answer, and a credential
+    /// written into the PTY behind it is the same two-values-in-one-`getpass`
+    /// failure.
+    ///
+    /// **The pairing is the same window with nobody waiting**, where the
+    /// autofill *does* write and closes the raise it found — without which
+    /// this row passes against an autofill that stopped writing altogether.
+    #[tokio::test]
+    async fn a_raise_adopted_inside_the_provider_window_is_not_the_autofills() {
+        let two_reads = format!("{ECHO_OFF_FIXTURE}; {ECHO_OFF_FIXTURE}");
+
+        // ---- adopted inside the window: the autofill must not write
+        let mut sc = Scratch::new("adoptedwindow");
+        let gate = sc.path("gate");
+        let b = sc.binding(
+            "slot",
+            "^ssh\\b",
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                gate.display()
+            ),
+        );
+        let server = Arc::new(server_with(keychain_mode(vec![b]), &sc.audit_log()));
+        let s = session_running("ssh", &["prod-01"], &two_reads);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+        // **Vacant**, deliberately: this row is about the other branch.
+        assert!(
+            server.attach_hub().outstanding_secret(&s.id).is_none(),
+            "this row is about a slot that was vacant when the call began"
+        );
+
+        let call = {
+            let server = Arc::clone(&server);
+            let args = secret_args(&s.id, 2);
+            tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
+        };
+        await_ran(&sc, "slot").await;
+
+        // A second tool call arrives and registers its waiter while the
+        // provider is still blocked. Driven through the slot directly
+        // rather than through a second `request_secret_input`, so the row
+        // measures one autofill rather than two racing each other.
+        let other = server
+            .attach_hub()
+            .secrets()
+            .raise_or_adopt(&s.id, "another call", Some(4096), true)
+            .expect("a vacant slot raises");
+        assert!(server.attach_hub().secrets().has_waiter(&s.id));
+
+        std::fs::write(&gate, b"go").expect("open the gate");
+
+        let payload = body(
+            &tokio::time::timeout(Duration::from_secs(60), call)
+                .await
+                .expect("the call never returned")
+                .expect("the call task")
+                .expect("request_secret_input"),
+        );
+        // It fell through, and then collided with the waiter it refused to
+        // write past — which is the correct §5.2 answer for a second call.
+        assert_eq!(
+            payload["status"], "secret_cancelled",
+            "the autofill wrote past a request another call is waiting on: {payload}"
+        );
+        assert_eq!(
+            payload["data"]["reason"], "concurrent_request_pending",
+            "expected the collision the fall-through leads to: {payload}"
+        );
+        let seen = buffered(&s);
+        assert!(
+            !contains(&seen, b"got=HUNTER2"),
+            "the resolved value was written into a request another call owns:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(
+            seen.windows(4).filter(|w| *w == b"got=").count(),
+            0,
+            "the child completed a read on a row where nothing should have been \
+             written to it:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        // The other call's request is untouched — refused, not half-taken.
+        assert!(
+            server
+                .attach_hub()
+                .secrets()
+                .matches_outstanding(&s.id, &other.request_id),
+            "the refusal disturbed the request it refused to take"
+        );
+        drop(other);
+        let _ = s.signal(Signal::Kill);
+
+        // ---- the pairing: the same window, nobody waiting
+        let mut sc2 = Scratch::new("adoptedwindow-control");
+        let gate2 = sc2.path("gate");
+        let b2 = sc2.binding(
+            "slot",
+            "^ssh\\b",
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                gate2.display()
+            ),
+        );
+        let server2 = Arc::new(server_with(keychain_mode(vec![b2]), &sc2.audit_log()));
+        let s2 = session_running("ssh", &["prod-01"], &two_reads);
+        server2.registry.insert(Arc::clone(&s2)).expect("register");
+        await_prompt(&s2, b"Password: ").await;
+
+        let call2 = {
+            let server = Arc::clone(&server2);
+            let args = secret_args(&s2.id, 10);
+            tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
+        };
+        await_ran(&sc2, "slot").await;
+        // A raise with **no** waiter — an echo drop a client announced and
+        // nobody has answered. That one *is* this value's to close.
+        let (appeared, first) = server2.attach_hub().raise_secret(&s2.id, "Password: ");
+        assert!(first);
+        std::fs::write(&gate2, b"go").expect("open the gate");
+
+        let control = body(
+            &tokio::time::timeout(Duration::from_secs(60), call2)
+                .await
+                .expect("the control call never returned")
+                .expect("the control task")
+                .expect("request_secret_input"),
+        );
+        assert_eq!(
+            control["status"], "secret_provided",
+            "an unadopted raise appearing inside the window blocked the autofill, so \
+             the row above is asserting nothing: {control}"
+        );
+        assert_eq!(
+            control["data"]["request_id"], appeared.request_id,
+            "the autofill did not close the raise it found"
         );
         buffer_until(&s2, b"got=HUNTER2", 20).await;
         let _ = s2.signal(Signal::Kill);

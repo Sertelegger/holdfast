@@ -533,9 +533,20 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
     // sited here because this is the only `fork` in the module, and the
     // hazard is a fork racing another thread's *write* — so the guard has
     // to be at the fork, wherever the writing happens.
-    #[cfg(test)]
-    let _no_writer_is_open = exec_guard::spawning();
-    let mut child = cmd.spawn().map_err(|e| ProviderError::NotStarted {
+    //
+    // **Block-scoped, and that is load-bearing rather than style.** Bound
+    // at function scope it would be held across the whole `try_wait`
+    // polling loop below — up to the full budget — and
+    // `parking_lot::RwLock` is task-fair, so one fixture write waiting on
+    // the write lock would then block every fork queued behind it. This
+    // file's own rows deliberately park a provider on a gate file for
+    // about a second each. The lock covers the fork and nothing else.
+    let spawned = {
+        #[cfg(test)]
+        let _no_writer_is_open = exec_guard::spawning();
+        cmd.spawn()
+    };
+    let mut child = spawned.map_err(|e| ProviderError::NotStarted {
         provider: name.to_string(),
         kind: e.kind(),
     })?;
@@ -655,21 +666,60 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
 /// **inode**, and an explicit `drop` + `fsync` before `chmod` only
 /// guarantees *our* fd is closed, which was never the one at fault.
 ///
-/// What does work is making the two operations mutually exclusive:
-/// **writers take the write lock, and the fork takes the read lock.** No
-/// fork can then happen while any fixture write fd is open, while spawns
-/// still run concurrently with each other. Both critical sections are
-/// microseconds — the write is one `fs::write`, and `Command::spawn`
-/// returns once the child has exec'd or reported failure, so the *waiting*
-/// on a provider happens outside the lock and nothing is serialised that
-/// matters.
+/// One refinement to the mechanism, which does not change any of that:
+/// `fork` does not itself bump `i_writecount`. It duplicates the descriptor
+/// table, so the **writer's** write-mode `struct file` outlives the
+/// writer's own `close`, and the count is not released until the last
+/// reference drops. The offending reference is in another process either
+/// way, and cannot be closed from ours.
 ///
-/// Measured, in a standalone reproducer of exactly this shape (32 threads ×
-/// 200 write-then-exec rounds): **600–661 `ETXTBSY` per 6400 unguarded, and
-/// 0 per 19200 guarded across three runs.** In this suite the rate is much
-/// lower — it needs a fixture write to overlap a fork — which is precisely
-/// what makes it a flake rather than a failure, and why it is closed by
-/// construction here rather than by a retry that would only make it rarer.
+/// What does work is making the two operations mutually exclusive:
+/// **writers take the write lock, and forks take the read lock.** Spawns
+/// still run concurrently with each other, and both critical sections are
+/// microseconds — the write is one `fs::write`, and `Command::spawn`
+/// returns once the child has exec'd or reported failure, so the waiting on
+/// a provider is outside the lock (which is why every site here is
+/// **block**-scoped, `run()`'s included).
+///
+/// ## What it guarantees, exactly
+///
+/// **It is a two-sided protocol, and it only protects a pair where both
+/// sides opt in: "no *guarded* fork overlaps a *guarded* write".** Not "no
+/// fork can happen while a fixture write fd is open" — that is false of
+/// this binary and would be an overclaim of the kind this module is
+/// otherwise careful about. An unguarded **writer** is exposed to every
+/// fork in the process, guarded ones included; an unguarded **fork** can
+/// still break a guarded writer.
+///
+/// The four sites that do opt in are `run()`'s `cmd.spawn`, both test
+/// helpers' `InProcessPty::spawn`, and the canary row's `/bin/sh` control.
+/// Named because it is a live gap rather than a theoretical one:
+/// **`daemon::spawn::tests::env_probe` is the same write-then-exec shape
+/// and takes no lock** — a *writer*, which is the more dangerous of the two
+/// roles — and an `ETXTBSY` on its `probe.sh` was observed at ~0.5 % per
+/// full-lib run, at the **same rate with and without this guard**. It is
+/// pre-existing, it is not caused or worsened here, and it is tracked
+/// separately. `pty/in_process.rs`'s three test PTY spawns,
+/// `mcp/tools.rs`'s `start_session` spawn and `diag.rs`'s subprocess row
+/// are forks only.
+///
+/// ## Measured
+///
+/// The claim this carries is *"the `secret::` rows are closed"*, and it is
+/// the suite's own numbers that carry it, not the arithmetic below. In the
+/// configuration the flake was originally reported in — full lib target,
+/// default threads — the `secret::`-attributable count goes **6/200 → 0/200**;
+/// in the hot configuration (`secret::` at 256 threads), **18/250 → 0/250**,
+/// both arms run interleaved under identical load. A standalone reproducer
+/// of the same shape gives 600–661 `ETXTBSY` per 6400 unguarded and 0 per
+/// 19200 guarded, which is corroboration of the kernel behaviour rather
+/// than evidence about this suite: it exercises neither `portable-pty`'s
+/// `forkpty` nor tokio's `spawn_blocking` pool, and those are what the
+/// "a PTY spawn is a fork too" half rests on.
+///
+/// What makes the closure a *construction* rather than a probability is
+/// that the remedy is a mutual exclusion; run counts alone could not
+/// separate zero from a one-percent residual.
 ///
 /// `#[cfg(test)]`, so a release build contains none of it.
 #[cfg(test)]
