@@ -1296,21 +1296,20 @@ impl HoldfastServer {
                 None,
             ));
         }
-        // **§17.5's arithmetic needs a remaining deadline and nothing in
-        // this daemon exposes one**, so this call captures its own.
-        // `timeout_secs` stays a plain `u32` until `await_secret` turns it
-        // into an absolute deadline at the very end of this function
-        // (§5.2: *"the window starts at this call"*), and §5.2's keychain
-        // step — where the approval lives — runs **before** the prompt
-        // fallback. So the start is stamped here, off `self.clock` like
-        // every other deadline in the daemon (REQ-S-005), and the
-        // approval's `min(binding_approval_timeout_secs, remaining / 2)`
-        // is derived from it below.
+        // **§5.2's *"the window starts at this call"*, stamped at the one
+        // line where that is literally true.** This call has two waits in
+        // series — §17.5's binding approval and then the human prompt —
+        // and neither may compute a start of its own: a stage that took
+        // `now + timeout_secs` would hand itself a fresh full window laid
+        // end to end with the previous one. So there is exactly one stamp,
+        // off `self.clock` like every other deadline in the daemon
+        // (REQ-S-005), and both waits are derived from it: the approval's
+        // `min(binding_approval_timeout_secs, remaining / 2)` below, and
+        // `caller_deadline`, which is `await_secret`'s deadline verbatim.
         //
-        // Deliberately **earlier** than `await_secret`'s own start, which
-        // makes the derived `remaining` a slight under-estimate — and the
-        // under-estimate is the safe direction: the prompt path inherits
-        // a little more than half rather than a little less.
+        // `grep 'from_secs(timeout_secs' tools.rs` is the check, and it
+        // has exactly one hit — the `caller_deadline` line after the
+        // bound is validated.
         let call_start = self.clock.now();
         let security = &self.config.security;
         let timeout_secs = args.timeout_secs.unwrap_or(DEFAULT_SECRET_TIMEOUT_SECS);
@@ -1918,12 +1917,12 @@ impl HoldfastServer {
             // `Err`. There is nothing further to read and never will be —
             // the sender is gone — so this arm reads nothing. It clears
             // the slot if anything is still there (there should not be;
-            // whatever dropped the sender took it) and reports a lost
-            // approval, which §17.5 discards and this caller treats as
-            // *not approved*.
+            // whatever dropped the sender took it) and classifies the
+            // loss by [`lost_approval`], **not by the fact that this arm
+            // is the one that woke**.
             ApprovalWoke::Superseded => {
                 hub.approvals().supersede(&session.id);
-                ApprovalEnd::Discarded
+                lost_approval(session)
             }
 
             // The window elapsed. The slot has to be taken under the lock
@@ -1948,21 +1947,25 @@ impl HoldfastServer {
                     // that has already happened is not a deadline.
                     match tokio::time::timeout(SECRET_HANDOVER_GRACE, &mut rx).await {
                         Ok(Ok(d)) => ApprovalEnd::Decided(d),
-                        _ => ApprovalEnd::Discarded,
+                        // **The same classifier**, and this is the second
+                        // producer of a lost approval. Here the child is
+                        // normally alive, which is why the old fold's
+                        // blanket `session_died` was wrong on this path.
+                        _ => lost_approval(session),
                     }
                 }
             }
 
-            // The child ended. Same discipline, different fallback: if
-            // nothing decided, the session really did die and §5.1 has the
-            // answer.
+            // The child ended. Same discipline, and the same classifier:
+            // it answers `SessionExited` here because the session really
+            // is gone, not because this is the arm that woke.
             ApprovalWoke::Exited => {
                 if hub.approvals().supersede(&session.id).is_some() {
-                    ApprovalEnd::SessionExited
+                    lost_approval(session)
                 } else {
                     match tokio::time::timeout(SECRET_HANDOVER_GRACE, &mut rx).await {
                         Ok(Ok(d)) => ApprovalEnd::Decided(d),
-                        _ => ApprovalEnd::SessionExited,
+                        _ => lost_approval(session),
                     }
                 }
             }
@@ -1997,18 +2000,28 @@ impl HoldfastServer {
         match end {
             ApprovalEnd::Decided(d)
                 if d.decision == crate::attach::frames::ApprovalDecision::Approve => {}
-            // REQ-SEC-017's fall-through, for all three ways of not being
-            // approved: a denial, an expiry, and an approval that was
-            // taken away without a decision. **The safe reading of a lost
-            // approval is *not approved*, and the safe answer to it is the
-            // human prompt** — not §5.1's `session_died`, which would be a
-            // claim about a child that may be perfectly alive.
+            // A denial or an expiry: **REQ-SEC-017**, which names exactly
+            // those two and requires the fall-through.
+            //
+            // A `Discarded` approval joins them, and **that is a choice
+            // rather than a requirement — flagged, not cited.**
+            // REQ-SEC-017 says *"denied or expired"*; §17.5's `Superseded`
+            // row says only *"approval discarded; no injection"*, which is
+            // a **prohibition and not a destination** — both candidate
+            // answers satisfy it, and the spec picks neither. The choice
+            // made here is the human prompt, on the same reading every
+            // other non-resolution in §5.2's step 1 already gets: an
+            // approval that was never granted is *not approved*, and the
+            // fall-through is what the agent gets for every other reason
+            // a binding did not resolve. Recorded so the next reader looks
+            // rather than stops.
             ApprovalEnd::Decided(_) | ApprovalEnd::Expired | ApprovalEnd::Discarded => return None,
-            // The child ended under the approval. §5.1's answer is exact
-            // here, and it is **not** a fall-through: that would broadcast
-            // an `AwaitingSecret` affordance pointing at a child that is
-            // already gone, which `await_secret`'s re-raise arm refuses to
-            // do for the same reason.
+            // The session is gone. §5.1's answer is exact, and it is
+            // **not** a fall-through: that would raise a request, write a
+            // `secret_input_request` line, and broadcast an
+            // `AwaitingSecret` affordance pointing at a child that is
+            // already dead — which `await_secret`'s re-raise arm refuses
+            // to do for the same reason.
             ApprovalEnd::SessionExited => {
                 return Some(envelope::envelope(
                     Status::SessionDied,
@@ -2690,11 +2703,42 @@ enum ApprovalEnd {
     /// §17.5's `Superseded`, by the one trigger this milestone can
     /// produce — the child ended. §5.1's `session_died` is exact.
     SessionExited,
-    /// §17.5's `Superseded`, by anything else: the slot was taken without
-    /// a decision while the child is still alive. **Falls through to the
-    /// human prompt**, because "not approved" is the safe reading and
-    /// `session_died` would be a claim about a child that is running.
+    /// §17.5's `Superseded`, with the session still running: the slot was
+    /// taken without a decision and there is still a child, and a human,
+    /// to fall back to. **Falls through to the human prompt.**
     Discarded,
+}
+
+/// Classify a §17.5 approval that ended **without a decision**.
+///
+/// **The question is *"is there still a session and a human to fall back
+/// to?"*, so the test is liveness — never which `select!` branch woke.**
+/// That distinction is the whole of this function and it is not
+/// hypothetical. `BindingApprovals::supersede`'s own doc says its caller
+/// *"arrives from the session… a child that has exited supersedes
+/// whatever is pending on it"*, and Task 13's sweep is
+/// `attach::conn::forward_events`' **`Exited`** arm — so the third party
+/// that will drop the sender **is itself a session exit**. Both the `rx`
+/// branch (as `Err`) and the `exit` branch then become ready on one
+/// event, and `tokio::select!` picks between ready branches at
+/// **random**. Classifying by wake-cause would make one event produce two
+/// different answers, one of which raises a secret request, writes a
+/// `secret_input_request` line and broadcasts an `AwaitingSecret` to
+/// every attached human — for a child that is already gone.
+///
+/// There is no parameter here a wake cause could be passed in through,
+/// which is the structural half of the same statement.
+///
+/// **Both outcomes are §17.5's `Superseded`** for audit purposes — see
+/// [`ApprovalEnd`]'s two variants and `Outcome::audit_value`, which
+/// writes no `binding_approval` line for either (Q13). They differ only
+/// in what this caller can still do.
+fn lost_approval(session: &Arc<Session>) -> ApprovalEnd {
+    if session.is_alive() {
+        ApprovalEnd::Discarded
+    } else {
+        ApprovalEnd::SessionExited
+    }
 }
 
 /// What §5.2's step 1 concluded, for the one caller that acts on it.
@@ -2825,6 +2869,54 @@ mod tests {
     use crate::session::{new_session_id, Session, SessionConfig};
     use serde_json::Value;
     use std::time::Instant;
+
+    /// **A lost §17.5 approval is classified by the session, never by
+    /// which `select!` branch woke.**
+    ///
+    /// The deterministic half of
+    /// `secret::binding::tests::an_exit_that_races_the_supersede_answers_the_same_way`:
+    /// that row drives the real race and has to repeat, because
+    /// `tokio::select!` picks between ready branches at random. This one
+    /// asserts the rule itself, in one line each way, with no scheduler
+    /// involved.
+    ///
+    /// The structural half is [`lost_approval`]'s signature — there is no
+    /// parameter a wake cause could be passed in through — and this is
+    /// the behavioural half.
+    #[tokio::test]
+    async fn a_lost_approval_is_classified_by_the_session_and_not_by_the_wake() {
+        let pty = Arc::new(MockPty::new());
+        let session = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::default(),
+        );
+
+        // A live session still has a human and a child to fall back to.
+        assert!(
+            matches!(lost_approval(&session), ApprovalEnd::Discarded),
+            "a lost approval on a live session must fall through to the prompt"
+        );
+
+        pty.exit(0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.is_alive() {
+            assert!(Instant::now() < deadline, "the fixture's child never died");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // And a dead one has neither, so §5.1's answer is the only honest
+        // one. **The pairing above is what makes this an assertion about
+        // liveness** rather than about a function that always says
+        // `SessionExited`.
+        assert!(
+            matches!(lost_approval(&session), ApprovalEnd::SessionExited),
+            "a lost approval on a dead session must not raise a prompt nobody can answer"
+        );
+    }
 
     /// The set of tools the router actually advertises.
     ///

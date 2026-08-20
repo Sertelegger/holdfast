@@ -2990,8 +2990,18 @@ mod tests {
     /// panic's own text** rather than letting the frame waits time out
     /// and report only that their frame never came.
     ///
-    /// The answer is REQ-SEC-017's fall-through and **not** §5.1's
-    /// `session_died`: the child is alive here, and the row asserts that.
+    /// **The answer here is the human prompt, and that is a choice rather
+    /// than a requirement.** REQ-SEC-017 requires the fall-through for
+    /// *"denied or expired"* and names no third state; §17.5's
+    /// `Superseded` row says only *"approval discarded; no injection"*,
+    /// which is a **prohibition and not a destination**. The choice is
+    /// argued at `run_binding_approval` and flagged in the report; what
+    /// this row pins is that the choice is made **on the session's
+    /// liveness** — the child is alive here, and the row asserts it — and
+    /// not on which `select!` branch happened to wake.
+    /// `an_exit_that_races_the_supersede_answers_the_same_way` is the
+    /// other side of that, and `mcp::tools::tests::a_lost_approval_is_classified_by_the_session_and_not_by_the_wake`
+    /// is the rule itself.
     #[tokio::test]
     async fn an_approval_taken_away_without_a_decision_falls_through_rather_than_panicking() {
         let mut sc = Scratch::new("discarded");
@@ -3059,6 +3069,125 @@ mod tests {
 
         client.unregister(&server);
         let _ = s.signal(Signal::Kill);
+    }
+
+    /// **One event, one answer: a session exit that races the supersede
+    /// must not depend on which `select!` branch wakes.**
+    ///
+    /// This is the case Task 13 creates and nothing in this milestone
+    /// can. `BindingApprovals::supersede`'s own doc says its caller
+    /// *"arrives from the session… a child that has exited supersedes
+    /// whatever is pending on it"*, and Task 13's sweep lands in
+    /// `attach::conn::forward_events`' **`Exited`** arm — so the third
+    /// party that drops the sender **is itself a session exit**. Both the
+    /// `rx` branch (as `Err`) and the `exit` branch then become ready on
+    /// one event, and `tokio::select!` chooses between ready branches at
+    /// **random**.
+    ///
+    /// Classifying on the wake would make that one event produce two
+    /// answers, and the wrong one raises a secret request, writes a
+    /// `secret_input_request` line and broadcasts an `AwaitingSecret` to
+    /// every attached human — for a child that is already gone. So the
+    /// assertions below are not only about the tool's status: **no
+    /// request may be raised at all.**
+    ///
+    /// **Why it repeats.** The branch is the runtime's to pick, so a
+    /// single pass proves one of the two. Twelve passes make covering
+    /// both overwhelmingly likely, and the two assertions that would
+    /// separate them are made on every pass. The *deterministic* statement
+    /// of the same rule is
+    /// `mcp::tools::tests::a_lost_approval_is_classified_by_the_session_and_not_by_the_wake`,
+    /// and the structural one is that `lost_approval` has no parameter a
+    /// wake cause could enter through.
+    ///
+    /// A **quiet** child, because this row is about what is *not*
+    /// broadcast: a fixture that printed would put `Output` frames in the
+    /// client's queue for no reason, and the echo-off prompt this file's
+    /// other rows need plays no part here (the binding carries no
+    /// `match_prompt`).
+    #[tokio::test]
+    async fn an_exit_that_races_the_supersede_answers_the_same_way() {
+        let mut sc = Scratch::new("exitrace");
+        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
+
+        for pass in 1..=12 {
+            let s = session_running("ssh", &["prod-01"], "sleep 30");
+            server.registry.insert(Arc::clone(&s)).expect("register");
+            let mut client = attach_fake(&server, &s.id);
+
+            let call = spawn_call(&server, secret_args(&s.id, 20));
+            await_approval(&server, &s.id).await;
+            client
+                .wait_for("BindingApprovalRequired", is_approval)
+                .await;
+
+            // **No `.await` from here to the supersede, and that is what
+            // makes the race arranged rather than hoped for.**
+            // `#[tokio::test]` is a *current-thread* runtime, so the
+            // spawned call task runs only when this one yields. Blocking
+            // the runtime while the child dies therefore guarantees the
+            // task has **not** been polled since the death, and the
+            // supersede lands with the select still armed — which is the
+            // ordering Task 13's sweep produces and the one that lets the
+            // `rx` branch win at all.
+            //
+            // Measured, and this is why it is spelled this way: with a
+            // `tokio::time::sleep` in this loop the task is polled the
+            // instant the child dies, the `exit` branch wins every time
+            // on an idle machine, and the row went green against the
+            // wake-cause classification in 5 isolated runs while
+            // reddening under a loaded full-workspace run. A guard that
+            // only fires when the box is busy is not a guard.
+            let _ = s.signal(Signal::Kill);
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while s.is_alive() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pass {pass}: the child never died"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // Task 13's sweep, in one line, with the session already dead.
+            server.attach_hub().approvals().supersede(&s.id);
+
+            let payload = joined(call, "the raced call").await;
+            assert_eq!(
+                payload["status"], "session_died",
+                "pass {pass}: one event answered two ways — the classification followed \
+                 the `select!` branch rather than the session: {payload}"
+            );
+
+            // **The half that a status-only assertion misses.** The
+            // fall-through's damage is not to the agent's answer — that
+            // comes out `session_died` either way, because `await_secret`
+            // returns at once for a dead session — it is the request
+            // raised against a corpse: an affordance broadcast to every
+            // attached human, and a `secret_input_request` line in the
+            // trail.
+            client.drain();
+            assert!(
+                !client.has(is_awaiting),
+                "pass {pass}: an AwaitingSecret was broadcast for a child that was \
+                 already gone: {:?}",
+                client.seen
+            );
+            let kinds = sc.kinds(&s.id);
+            assert!(
+                !kinds.iter().any(|k| k == "secret_input_request"),
+                "pass {pass}: a request was raised against a dead session: {kinds:?}"
+            );
+            assert!(
+                !kinds.iter().any(|k| k == "binding_approval"),
+                "pass {pass}: §9.4's `outcome` has no value for `Superseded` (Q13): {kinds:?}"
+            );
+            assert!(
+                !sc.ran("prod-ssh"),
+                "pass {pass}: an approval nobody granted read the credential store"
+            );
+
+            client.unregister(&server);
+        }
     }
 
     /// **`timeout_secs` bounds the whole call, approval included.**
