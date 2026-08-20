@@ -36,3 +36,7 @@ docs/
 # up is not.
 __pycache__/
 *.pyc
+
+# direnv: local environment, may hold credentials — never commit
+.envrc
+.envrc.local
