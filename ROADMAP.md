@@ -130,6 +130,15 @@ launcher that fetches the right binary on demand.
 - **Full process-group enumeration on Unix without `/proc`**, via
   `sysctl(KERN_PROC_SESSION)`. Until then, `terminate` on those platforms can
   leave a background job in a third process group behind.
+- **Signed and notarized macOS builds, and an Authenticode-signed Windows
+  binary.** The first release ships unsigned. The plugin's bootstrap downloads
+  with `curl`, which sets no quarantine attribute, so the install path most
+  people take is unaffected — but a binary fetched by hand from the Releases
+  page in a browser *is* quarantined, and macOS refuses it with a message about
+  an unverified developer. Until this lands, that path is documented rather
+  than smooth. Note that sigstore/cosign signing, listed separately, does not
+  substitute: it attests where an artifact came from, and the operating system
+  does not consult it.
 
 ## Principles
 

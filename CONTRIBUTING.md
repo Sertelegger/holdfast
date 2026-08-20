@@ -13,14 +13,25 @@ appreciated.
 ## Development setup
 
 Requirements: a Unix host (Linux or macOS; WSL counts), the toolchain pinned in
-`rust-toolchain.toml` — Rust 1.97 with `rustfmt` and `clippy`, which `rustup`
-installs for you on first build — and `jq` for the smoke script.
+`rust-toolchain.toml` with `rustfmt` and `clippy`, and `jq` for the smoke
+script.
 
 ```bash
 git clone https://github.com/Sertelegger/holdfast.git
 cd holdfast
+./scripts/preflight.sh
 cargo build --workspace
 ```
+
+`rustup` fetches the pinned toolchain on first build **provided `rustup` itself
+is current**. An older `rustup` cannot, and it does not say so: the build fails
+somewhere inside cargo, with a message about an edition or a feature, and
+nothing points at the installer. That is what `scripts/preflight.sh` is for. It
+installs nothing and writes nothing — it reads the pin from
+`rust-toolchain.toml` and the MSRV from `Cargo.toml`, checks what you have
+against them, and prints the exact command for anything missing. If it reports
+a version older than the MSRV, the fix is almost always `rustup self update`
+first and the toolchain install second, in that order.
 
 To point Claude Code at your build:
 
