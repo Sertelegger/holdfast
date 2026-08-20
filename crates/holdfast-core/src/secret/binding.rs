@@ -13,12 +13,27 @@
 //! **The precise statement is about [`autofill`]'s signature, not about
 //! this module's.** `autofill(security, session, append_newline, audit)`
 //! has no parameter `request_secret_input`'s `prompt_text` could be passed
-//! in, and it is the only entry point the daemon calls. Saying that of the
-//! *module* would be false and is worth not saying: [`select`] is `pub`
-//! and takes `command_line: &str`, as do `matches` and `pattern_matches`
-//! below — bare subjects, supplied by their caller. `autofill` is that
-//! caller everywhere but in tests, and it builds both subjects from the
+//! in. Saying that of the *module* would be false and is worth not saying:
+//! [`select`] is `pub` and takes a bare `command_line: &str` and
+//! `prompt_line: &str`, and so — privately — do `matches` (the same pair)
+//! and `pattern_matches` (one `subject: &str`). What makes those safe is
+//! not their signatures but their caller: `select` has exactly one
+//! non-test caller, `autofill`, which builds both subjects from the
 //! session.
+//!
+//! **`autofill` is not the daemon's only entry point into this module.**
+//! An earlier revision of this header said it was, and the claim was
+//! false; it is replaced with one a reader can falsify in one command
+//! rather than trust. `grep -rn 'secret::binding::' crates/holdfast-core/src`
+//! is the whole of the daemon's use of this module — every other spelling
+//! would have to come through `secret/mod.rs`'s `pub use` list, which
+//! nothing outside this file imports today — and it is **two** functions:
+//! [`autofill`], and [`keychain_step_runs`] from `mcp::tools`, where it is
+//! a guard deciding whether to suspend into `spawn_blocking` at all. That
+//! second one's only argument is `SecurityConfig::secret_provider`, an
+//! operator's config value out of a three-word vocabulary. Neither has a
+//! parameter an agent-supplied string could enter, which is the claim that
+//! was meant and the one that survives the grep.
 //!
 //! **And one of those two subjects is the agent's own string.**
 //! `Session.command` and `Session.args` are the agent's `start_session`
