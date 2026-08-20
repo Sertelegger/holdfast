@@ -449,6 +449,51 @@ impl SecretSlots {
         self.take(session_id, Some(request_id))
     }
 
+    /// Every session holding a raise with **no call waiting on it** —
+    /// the only slots a third party is allowed to release (GH #24).
+    ///
+    /// **A query rather than a sweep taking a predicate**, and the reason
+    /// is lock order. The predicate the one caller needs — *is this
+    /// session over?* — reads the [`crate::session::SessionRegistry`],
+    /// and evaluating it under this mutex would put the slot lock ahead
+    /// of the registry's `RwLock` on one path and behind it on none.
+    /// Two short critical sections instead, and
+    /// [`take_if_unadopted`](Self::take_if_unadopted) re-tests under the
+    /// lock that acts, so a call adopting between the two loses nothing.
+    pub fn unadopted_sessions(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .iter()
+            .filter(|(_, raised)| !raised.has_waiter())
+            .map(|(session_id, _)| session_id.clone())
+            .collect()
+    }
+
+    /// Take the slot, **but only while nothing is waiting on it**.
+    ///
+    /// The waiterless test and the removal are one critical section, and
+    /// that is the whole of this function. §5.1's `session_died` is sited
+    /// in the waiting caller — `await_secret` owns the close through
+    /// [`close_on_caller_timeout`](Self::close_on_caller_timeout) — so a
+    /// janitor able to take an *adopted* slot would leave that caller in
+    /// its handover grace and then report `timeout` for a session that
+    /// died. That is the defect `a2b747f` fixed, re-entering from the
+    /// other side, and a check-then-`take` outside the lock is exactly
+    /// the race that lets it.
+    ///
+    /// **No `expect_id`, unlike [`take`](Self::take).** The caller here
+    /// holds no id: it arrives at the slot from the session, not from a
+    /// request, and any request it finds unadopted is by definition the
+    /// current one. What it must not do is take an id somebody is
+    /// waiting on, and that is the condition this checks.
+    pub fn take_if_unadopted(&self, session_id: &str) -> Option<RaisedRequest> {
+        let mut slots = self.inner.lock();
+        match slots.get(session_id) {
+            Some(raised) if !raised.has_waiter() => slots.remove(session_id),
+            _ => None,
+        }
+    }
+
     /// Mark §9.5's buffer notice written, returning `true` for the caller
     /// that flipped it (Task 7). At most one notice per request.
     pub fn claim_notice(&self, session_id: &str, request_id: &str) -> bool {
@@ -691,6 +736,50 @@ mod tests {
             Some((Some(16), false))
         );
         assert_eq!(slots.submission_bounds(S, "secreq_other"), None);
+    }
+
+    /// GH #24's primitive, and the pairing that stops it becoming
+    /// [`SecretSlots::take`] with extra steps.
+    #[test]
+    fn only_a_slot_with_nobody_waiting_is_a_third_partys_to_take() {
+        let slots = SecretSlots::new();
+        let (raised, _) = slots.raise(S, "[sudo] password for ada:", RaisedBy::EchoDrop);
+        assert_eq!(slots.unadopted_sessions(), vec![S.to_string()]);
+
+        let taken = slots
+            .take_if_unadopted(S)
+            .expect("an unadopted raise is the janitor's to release");
+        assert_eq!(taken.request_id(), raised.request_id);
+        assert!(!taken.has_waiter(), "there was nobody to answer");
+        assert!(slots.outstanding(S).is_none());
+        assert!(slots.unadopted_sessions().is_empty());
+        assert!(
+            slots.take_if_unadopted(S).is_none(),
+            "a vacant slot is not a release"
+        );
+
+        // **The pairing.** The same slot with a call waiting on it is
+        // untouchable: §5.1's answer is that call's, and a janitor that
+        // took this would leave it reporting `timeout` for a session that
+        // died.
+        let a = slots.raise_or_adopt(S, "p", None, true).expect("raise");
+        assert!(
+            slots.unadopted_sessions().is_empty(),
+            "a slot with a waiter was offered to the janitor"
+        );
+        assert!(
+            slots.take_if_unadopted(S).is_none(),
+            "the janitor took a slot §5.1's answer owns"
+        );
+        assert!(slots.matches_outstanding(S, &a.request_id));
+        let mut rx = a.rx;
+        assert!(
+            rx.try_recv().is_err(),
+            "the janitor answered a caller it does not own"
+        );
+        // And the owner can still close it, which is what proves the
+        // refusal above left the request whole rather than half-taken.
+        assert!(slots.close_on_caller_timeout(S, &a.request_id).is_some());
     }
 
     #[test]

@@ -25,11 +25,13 @@ use holdfast_core::clock::Clock;
 use holdfast_core::daemon::attach_server;
 use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::server::{self, Daemon};
+use holdfast_core::mcp::tools::RequestSecretInputArgs;
 use holdfast_core::protocol::client::ControlClient;
 use holdfast_core::protocol::frame::{self, FrameError, MAX_FRAME_BYTES};
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use holdfast_core::pty::{InProcessPty, MockPty, PtyBackend, PtySpawnConfig, Signal};
 use holdfast_core::session::{new_session_id, Reaper, Session, SessionConfig};
+use rmcp::handler::server::wrapper::Parameters;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -3522,6 +3524,193 @@ fn the_attach_protocol_carries_no_confirmation_frame() {
     // this the loop above passes against an empty array.
     assert_eq!(ClientFrameKind::ALL.len(), 6);
     assert_eq!(KNOWN_SERVER_TYPES.len(), 9);
+}
+
+// ------------------------- GH #24: the slot a dead session leaves behind
+//
+// `a2b747f` sited §5.1's `session_died` in `await_secret`, and that arm
+// takes the slot with it — so the *waiting caller* is what notices the
+// exit. The residual is the half with no consumer: a raise **nobody
+// adopted**, which is the ordinary shape of an echo drop a human at an
+// attached client is being asked to answer, on a session that then exits.
+// Nothing notices, and a per-daemon entry keyed by a dead session id
+// survives for the life of the daemon.
+//
+// **The release is sited on `Daemon`, not in session teardown.** There is
+// no session teardown to site it in: `SessionRegistry::remove` has no
+// caller anywhere in the tree and §5.5.1 retains exited sessions for the
+// daemon's lifetime on purpose, so the moment the issue guesses at never
+// arrives. What the `Daemon` has is both halves of the mismatch — the
+// registry, which knows which sessions are over, and the hub, which holds
+// the slots — and the daemon's tick, which is the only periodic sweep in
+// the process. Nothing below drives that tick: these rows call the sweep
+// directly, exactly as the reaper rows above call `scan_once`.
+
+/// One unadopted raise, exactly as `forward_events` makes one: a request
+/// carrying a `prompt_text`, with **no** call waiting on it.
+///
+/// The two assertions are what stop every row below from passing against
+/// a build that simply never allocated a slot.
+fn raise_unadopted(d: &TestDaemon, session_id: &str) -> String {
+    let (req, first) = d
+        .daemon
+        .attach_hub()
+        .raise_secret(session_id, "[sudo] password for ada:");
+    assert!(
+        first,
+        "the fixture adopted an existing request instead of raising one"
+    );
+    assert!(
+        !d.daemon.attach_hub().secrets().has_waiter(session_id),
+        "the fixture registered a waiter — that is the half a2b747f already fixed"
+    );
+    assert_eq!(
+        d.daemon
+            .attach_hub()
+            .outstanding_secret(session_id)
+            .map(|r| r.request_id),
+        Some(req.request_id.clone()),
+        "the slot was never occupied, so nothing below could prove it was freed"
+    );
+    req.request_id
+}
+
+#[tokio::test]
+async fn a_session_that_exits_holding_an_unadopted_raise_releases_its_slot() {
+    let d = TestDaemon::start("gh24free").await;
+    let (s, pty) = d.session(None);
+    let raised = raise_unadopted(&d, &s.id);
+
+    // **The control, and it is not optional.** A sweep that cleared every
+    // slot it found would pass every assertion below this line, and would
+    // take the affordance away from the human the prompt is waiting on.
+    // §7.5's replay is why a live session's unadopted raise has to stay:
+    // a client attaching later is exactly who it is being held for.
+    assert_eq!(
+        d.daemon.release_exited_secret_slots(),
+        0,
+        "a live session's raise was swept away"
+    );
+    assert!(d.daemon.attach_hub().outstanding_secret(&s.id).is_some());
+
+    pty.exit(0);
+    assert!(!s.is_alive(), "the fixture never exited");
+
+    assert_eq!(
+        d.daemon.release_exited_secret_slots(),
+        1,
+        "the slot of a session that exited holding an unadopted raise was not released"
+    );
+    assert!(
+        d.daemon.attach_hub().outstanding_secret(&s.id).is_none(),
+        "a per-daemon entry keyed by a dead session id survived the session"
+    );
+    // Idempotent: a second sweep finds nothing left to do, which is what
+    // separates "released" from "released and re-raised".
+    assert_eq!(d.daemon.release_exited_secret_slots(), 0);
+
+    // **Vacant rather than merely reporting vacant.** The next call on
+    // this slot has to *raise* — `Ok` with `raised_here`, a fresh id —
+    // rather than adopt the dead session's request or be refused for
+    // concurrency, which is the refusal the issue predicts a leaked slot
+    // eventually produces.
+    let next = d
+        .daemon
+        .attach_hub()
+        .secrets()
+        .raise_or_adopt(&s.id, "a credential", Some(4096), true)
+        .expect("a released slot must not refuse the next request for concurrency");
+    assert!(
+        next.raised_here,
+        "the next call adopted the dead session's request instead of raising its own"
+    );
+    assert_ne!(next.request_id, raised, "the released id came back");
+}
+
+/// **The pairing `a2b747f` makes mandatory.** With a call waiting, §5.1's
+/// answer belongs to that call and to nothing else: a janitor that took
+/// the slot from under it would leave the caller in its handover grace
+/// and then report `timeout` for a session that died — the original
+/// defect, re-introduced from the other side.
+#[tokio::test]
+async fn a_call_waiting_on_a_dying_session_still_owns_its_own_session_died() {
+    let d = TestDaemon::start("gh24waiter").await;
+    let (s, pty) = d.session(None);
+
+    // The same fixture as the row above — an unadopted echo-drop raise —
+    // and the only difference is that a call arrives and adopts it.
+    let raised = raise_unadopted(&d, &s.id);
+
+    let server = d.daemon.server.clone();
+    let session = s.id.clone();
+    let call = tokio::spawn(async move {
+        server
+            .request_secret_input(Parameters(RequestSecretInputArgs {
+                session,
+                prompt_text: "a credential".into(),
+                timeout_secs: Some(20),
+                ..Default::default()
+            }))
+            .await
+            .expect("request_secret_input")
+    });
+
+    // The waiter has to be registered before the child dies, or this row
+    // is the unadopted one above wearing a different name.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !d.daemon.attach_hub().secrets().has_waiter(&s.id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the call never registered a waiter"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(d
+        .daemon
+        .attach_hub()
+        .secrets()
+        .matches_outstanding(&s.id, &raised));
+
+    pty.exit(7);
+
+    // The sweep runs *while* the caller is waking on the same exit, and
+    // must report nothing either way: refused because a waiter is
+    // registered, or nothing left because the caller already took it.
+    //
+    // **Measured, and it is the second half that actually happens.**
+    // `take_if_unadopted`'s waiterless guard was deleted and this row
+    // stayed green 5/5: `await_secret` is subscribed to the session's own
+    // event stream and takes the slot before the first sweep below can
+    // reach it, so there is nothing left for a mutated janitor to steal.
+    // **That guard is pinned by `only_a_slot_with_nobody_waiting_is_a_
+    // third_partys_to_take` in `secret::request`, which kills the same
+    // mutation deterministically.** What this row is for is the other
+    // claim — that `a2b747f`'s `session_died` still arrives end to end
+    // with a sweep running against it — and that it does assert.
+    for _ in 0..5 {
+        assert_eq!(
+            d.daemon.release_exited_secret_slots(),
+            0,
+            "the sweep took a slot §5.1's answer owns"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(25), call)
+        .await
+        .expect("the call never returned; its answer was swept out from under it")
+        .expect("the call task");
+    let payload = result.structured_content.expect("structured content");
+    assert_eq!(
+        payload["status"], "session_died",
+        "a2b747f's answer was lost: {payload}"
+    );
+    assert_eq!(
+        payload["data"]["exit_code"], 7,
+        "§5.1 wants the code: {payload}"
+    );
+    // And the caller's own close left nothing behind either.
+    assert!(d.daemon.attach_hub().outstanding_secret(&s.id).is_none());
 }
 
 #[tokio::test]

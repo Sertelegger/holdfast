@@ -406,6 +406,83 @@ impl Daemon {
         true
     }
 
+    /// Release the secret slot of every session that is **over** and has
+    /// **nobody waiting on it**. Returns how many were released (§5.2,
+    /// GH #24).
+    ///
+    /// **The residual `a2b747f` left, and why it needs an owner here.**
+    /// §5.1's `session_died` is sited in `await_secret`, which answers
+    /// the waiting call and takes the slot with it — so the *caller* is
+    /// what notices the exit. With no call waiting, nothing does: the
+    /// raise is an echo drop a human at an attached client was being
+    /// asked to answer, `SessionEvent` is consumed only per attach
+    /// connection, and a session with nobody attached has no consumer at
+    /// all. The entry then outlives the session it names, for the life of
+    /// the daemon.
+    ///
+    /// **Sited on `Daemon` rather than in session teardown, because there
+    /// is no session teardown.** `SessionRegistry::remove` has no caller
+    /// anywhere in the tree and §5.5.1 retains exited sessions
+    /// deliberately, so the moment a teardown hook would run never
+    /// arrives. What the `Daemon` has is both halves of the mismatch —
+    /// the registry, which knows which sessions are over, and the hub,
+    /// which holds the slots — and it is the same reasoning that puts
+    /// [`poll_resource_list_changed`](Self::poll_resource_list_changed)
+    /// here: a child's death is observed by asking, on the one periodic
+    /// tick this process has.
+    ///
+    /// **A sweep and not an edge**, for the same reason that poll is one.
+    /// The set to release is a difference between two things neither of
+    /// which announces a change — slots held, and sessions still live —
+    /// so computing it in full every tick cannot miss a session, where a
+    /// per-session watcher wired at one creation site and forgotten at
+    /// the next silently brings the leak back.
+    ///
+    /// **What it does not do.** It writes **no** §9.4 entry:
+    /// `secret_input_request` / `secret_input_resolved` are written per
+    /// *tool call*, an unadopted raise is not one, and a release with no
+    /// caller must not start a trail nothing opened. And it broadcasts
+    /// §7.5's `cancelled` rather than inventing a third outcome — the
+    /// request ended without a value, which is exactly what the two
+    /// existing producers of that frame say about the same event.
+    pub fn release_exited_secret_slots(&self) -> usize {
+        let hub = self.attach_hub();
+        let mut released = 0;
+        for session_id in hub.secrets().unadopted_sessions() {
+            // **A live session's unadopted raise is not a leak** — it is
+            // a prompt a human has not answered yet, and §7.5's replay is
+            // what hands it to a client that attaches later. Releasing it
+            // would take the affordance away with nothing to put it back.
+            //
+            // Liveness is monotonic, so there is no window here: a
+            // session that reads dead stays dead, and one that dies just
+            // after this line is swept on the next tick. A slot naming a
+            // session the registry cannot resolve is released — nothing
+            // can reach it from either side.
+            if self
+                .server
+                .registry
+                .get(&session_id)
+                .is_ok_and(|s| s.is_alive())
+            {
+                continue;
+            }
+            // Re-tested under the slot's own lock, which is what makes a
+            // call adopting between the two harmless: the take is refused
+            // and §5.1's answer stays that call's.
+            let Some(raised) = hub.secrets().take_if_unadopted(&session_id) else {
+                continue;
+            };
+            let request_id = raised.request_id().to_string();
+            // Dropped rather than answered: `take_if_unadopted` returned
+            // it precisely because there is no waiter to answer.
+            drop(raised);
+            hub.broadcast_secret_closed(&session_id, &request_id, "cancelled");
+            released += 1;
+        }
+        released
+    }
+
     /// Record a client connection for §7.3's window.
     ///
     /// Called **after** the uid gate and the handshake, so a peer that
@@ -1111,6 +1188,10 @@ pub(crate) async fn reaper_loop(daemon: Arc<Daemon>) {
         reaper.scan_once();
         // REQ-R-006's exit half, on the only periodic tick there is.
         daemon.poll_resource_list_changed();
+        // GH #24, beside it and for the same reason: a session's exit is
+        // observed by asking, and the slot of one that died holding a
+        // raise nobody adopted has no other observer.
+        daemon.release_exited_secret_slots();
 
         // §7.3's conjunction, checked after the sweep so a session the
         // reaper just took down counts towards "all sessions have
