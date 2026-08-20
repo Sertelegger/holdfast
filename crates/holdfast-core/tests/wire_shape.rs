@@ -738,9 +738,14 @@ fn the_wire_shape_matches_the_record_for_this_protocol_version() {
         )
     };
 
-    assert_eq!(
-        recorded,
-        current,
+    // `assert!` and not `assert_eq!`: the operands here are two ~110-line
+    // documents, and `assert_eq!` would print both in full as `left:` and
+    // `right:` *underneath* the message — three copies of the document,
+    // with the one-line diff that says what actually moved scrolled off
+    // the top. Measured while proving this guard; the failure message is
+    // the only part of it anyone reads.
+    assert!(
+        recorded == current,
         "\n\nthe daemon's wire shape is not the shape recorded for protocol \
          {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}.\n\n{}\n\n\
          Something on the wire moved. Decide which kind of move it was, and record the \
