@@ -2910,6 +2910,223 @@ mod tests {
         let _ = s.signal(Signal::Kill);
     }
 
+    /// **Task 13's second absence row: every surface, for a value Holdfast
+    /// *resolved* rather than received.**
+    ///
+    /// `tests/secrets.rs` proves the same property for a value a human
+    /// typed, and it cannot prove this one: a `binding_resolved` line is
+    /// written only when a provider **answers**, the only provider a test
+    /// may run is a script the test itself wrote (REQ-TST-007 / Global
+    /// Constraint 12), and `ScriptProvider` is `#[cfg(test)]` — invisible
+    /// from an integration target. So the row lives here, and the module
+    /// header of `tests/secrets.rs` says so where a reader of the seven
+    /// surfaces will look.
+    ///
+    /// The surfaces swept, in that header's numbering: **1** the MCP
+    /// response, **2** the `secret_input_*` kinds (absent here, which is
+    /// the assertion — this call never reaches the prompt path), **3**
+    /// `binding_resolved` and `binding_approval`, **4** the
+    /// `BindingApprovalRequired` frame and every other frame the client
+    /// ever saw, **7** the ring buffer and a `read_output` response.
+    /// **6** (`daemon.log`) is
+    /// `secret::provider::tests::a_failing_providers_stderr_and_reference_reach_no_log`'s,
+    /// which owns the fd-2 capture for this target; **5** (§9.5's notice)
+    /// is not produced by a call that never falls through.
+    ///
+    /// ## The argv and environment clause, stated honestly
+    ///
+    /// The provider child **precedes** the value — it is what produces it
+    /// — so "the value is not in this process's argv" is true of every
+    /// implementation there could be. What the clause actually guards is a
+    /// **second** process handed the value afterwards, and the load-bearing
+    /// assertion is therefore the *count*: the fixture appends one record
+    /// per invocation and exactly one record must exist by the end of the
+    /// flow. The argv and environment contents are asserted beside it,
+    /// with `PATH=` as the witness that a real environment was captured
+    /// rather than an empty file compared against nothing.
+    #[tokio::test]
+    async fn a_keychain_resolved_secret_reaches_none_of_them_either() {
+        let mut sc = Scratch::new("keychainabsent");
+        let dump = sc.path("provider-argv-env.dump");
+        // `$0` and `$@` and not `/proc/self/cmdline`: §11.3 runs this
+        // suite on macOS as well, which has no `/proc`. For a `#!/bin/sh`
+        // script the two are the same argv minus the interpreter, and the
+        // interpreter is not what Holdfast chose.
+        let mut b = sc.binding(
+            "prod-ssh",
+            "^ssh\\b",
+            &format!(
+                "{{ printf 'argv:%s\\n' \"$0\" \"$@\"; env; echo '--invocation-end--'; }} \
+                 >> '{}'\nprintf '{PROBE}\\n'\n",
+                dump.display()
+            ),
+        );
+        b.require_confirm = true;
+        let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
+        let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        await_prompt(&s, b"Password: ").await;
+
+        // **§16.4's ordinary shape — an echo drop raised first — and it is
+        // load-bearing here for the same reason it is in
+        // `the_approval_surface_carries_no_reference_and_no_value`.** With
+        // nothing outstanding the injection closes nothing, the client
+        // sees exactly one frame for the whole flow, and "no value in any
+        // frame" becomes a claim about one pre-resolution frame. The two
+        // lines below are what `attach::conn`'s `forward_events` runs on an
+        // `AwaitingSecretEntered` edge; there is no connection here to run
+        // them.
+        let hub = server.attach_hub();
+        let (raised, first) = hub.raise_secret(&s.id, &s.prompt_last_line_redacted());
+        assert!(first, "the fixture must be the one that raised");
+        hub.broadcast_awaiting_secret(&s.id, &raised.request_id, &raised.prompt_text);
+
+        let call = spawn_call(&server, secret_args(&s.id, 20));
+        let approval = await_approval(&server, &s.id).await;
+        client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+        assert!(
+            !sc.ran("prod-ssh"),
+            "the provider ran before anybody approved"
+        );
+        decide(
+            &server,
+            &s.id,
+            &approval.approval_id,
+            ApprovalDecision::Approve,
+            "cli",
+        );
+
+        // ---- the positive control: the value reached the child.
+        let payload = joined(call, "the approved call").await;
+        assert_eq!(payload["status"], "secret_provided", "{payload}");
+        assert_eq!(
+            payload["data"]["bytes_written"],
+            (PROBE.len() + 1) as u64,
+            "the count is not the resolved value's written length"
+        );
+        assert!(sc.ran("prod-ssh"), "the provider never ran");
+        let buf = buffer_until(&s, b"got=HUNTER2", 20).await;
+
+        // ---- surface 1: the MCP response.
+        assert!(
+            !payload.to_string().contains(PROBE) && !payload.to_string().contains(REFERENCE),
+            "the MCP response carries the value or the reference: {payload}"
+        );
+
+        // ---- surfaces 2 and 3: the audit trail, whole, with the kinds
+        // this flow produces asserted as an exact list. An implementation
+        // that wrote nothing at all satisfies every absence below.
+        assert_eq!(
+            sc.kinds(&s.id),
+            vec![
+                "binding_approval".to_string(),
+                "binding_resolved".to_string()
+            ],
+            "an approved autofill writes the decision and the resolution, and no \
+             prompt path ran"
+        );
+        let trail = sc.audit_text();
+        assert!(
+            !trail.contains(PROBE) && !trail.contains(REFERENCE),
+            "the resolved value or the reference reached the audit trail:\n{trail}"
+        );
+
+        // ---- surface 4: every frame the client ever saw, on both sides
+        // of the decision.
+        client
+            .wait_for("SecretRequestClosed", |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { .. })
+            })
+            .await;
+        let encoded = format!("{:?}", client.seen);
+        assert!(
+            client.has(is_approval) && client.has(is_awaiting),
+            "the flow did not produce frames on both sides of the decision, so \
+             'every frame' is one frame: {encoded}"
+        );
+        assert!(
+            !encoded.contains(PROBE) && !encoded.contains(REFERENCE),
+            "a resolved value or reference reached an attach frame: {encoded}"
+        );
+
+        // ---- surface 7: the ring buffer, and the surface the agent
+        // actually reads a session through.
+        assert!(
+            !contains(&buf, PROBE.as_bytes()),
+            "the resolved value reached the ring buffer:\n{}",
+            String::from_utf8_lossy(&buf)
+        );
+        //
+        // **The raw sweep above is the redactor-independent one and this
+        // one is not, deliberately.** `read_output` redacts, and
+        // `generic-secret-assignment` matches `Password:` followed by any
+        // eight non-space bytes — so a value that *had* leaked into the
+        // buffer right after this child's prompt would come back
+        // `[REDACTED:generic]` and pass this assertion. That is why the
+        // ring buffer is read raw one statement earlier; this one is about
+        // the shape of the surface the agent actually calls.
+        //
+        // The same rule is why the witness is the child's **prompt** and
+        // not its `got=` transform: measured, `Password: got=HUNTER2` is
+        // redacted whole, so a `got=HUNTER2` witness here would be green
+        // or red depending on what happened to sit between the two.
+        let read_body = body(
+            &server
+                .read_output(Parameters(crate::mcp::tools::ReadOutputArgs {
+                    session: s.id.clone(),
+                    since_cursor: Some(0),
+                    ..Default::default()
+                }))
+                .await
+                .expect("read_output"),
+        );
+        assert!(
+            read_body["data"]["output"]
+                .as_str()
+                .is_some_and(|o| o.contains("Password: ")),
+            "the read_output response carries none of this session's output, so \
+             sweeping it proves nothing:\n{read_body}"
+        );
+        let read = read_body.to_string();
+        assert!(
+            !read.contains(PROBE),
+            "the resolved value reached a read_output response:\n{read}"
+        );
+
+        // ---- the provider child's argv and environment.
+        let dumped = std::fs::read_to_string(&dump).expect("the provider wrote its own argv");
+        assert_eq!(
+            dumped.matches("--invocation-end--").count(),
+            1,
+            "the value was resolved by one process and then handed to another:\n{dumped}"
+        );
+        assert!(
+            dumped.contains(&format!("argv:{REFERENCE}")) && dumped.contains("PATH="),
+            "the dump caught neither a real argv nor a real environment, so the \
+             absences below prove nothing:\n{dumped}"
+        );
+        assert!(
+            !dumped.contains(PROBE),
+            "the resolved value reached a provider child's argv or environment:\n{dumped}"
+        );
+
+        // **The anti-vacuity control** for every absence above: neither
+        // string matches a built-in redaction rule, so their absence is
+        // this module's doing and not the redactor's.
+        let rules = &server.processor.rules;
+        assert_eq!(crate::output::redact::redact_str(rules, PROBE), PROBE);
+        assert_eq!(
+            crate::output::redact::redact_str(rules, REFERENCE),
+            REFERENCE
+        );
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
     /// REQ-SEC-017's first clause: a denial **falls through**, it does not
     /// fail.
     ///

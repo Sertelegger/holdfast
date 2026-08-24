@@ -843,6 +843,13 @@ mod tests {
     /// witness is thread-local, so this test observes its own drops and
     /// no other test's.
     ///
+    /// **Half of a pair.** Its twin is
+    /// `secret::request::tests::the_submitted_value_is_zeroed_after_the_write`,
+    /// which asserts the same property for the value a *client* submits.
+    /// The two paths build a `SecretBytes` in two different modules from
+    /// two different sources, so a single-path assertion is green while
+    /// the other path leaks; that is why there are two rows and not one.
+    ///
     /// The other half of the leak — copying the value into a plain
     /// `Vec<u8>` first — is closed structurally rather than here:
     /// `with_bytes` hands out a borrow and is the only accessor, and

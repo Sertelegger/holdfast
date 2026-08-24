@@ -1243,4 +1243,93 @@ mod tests {
             .close_on_caller_timeout(S, &raised.request_id)
             .is_some());
     }
+
+    /// **The zeroing on the client-submitted path**, and the twin of
+    /// `secret::provider::tests::the_resolved_value_is_zeroed_after_the_write`.
+    ///
+    /// The two together are one claim — *"a `SecretBytes` is zeroed after
+    /// the write on **every** path that builds one"* — and it takes two
+    /// rows because the two paths construct the value in two different
+    /// modules from two different sources: a client's frame here, a
+    /// provider's stdout there. A single-path assertion is green while the
+    /// other path leaks, which is the whole reason this row exists beside
+    /// that one.
+    ///
+    /// **Not a raw-pointer read-back, on either path.** `Drop` zeroes the
+    /// `Vec` and then frees it, so reading through a saved pointer
+    /// afterwards is a use-after-free: undefined behaviour, a hard failure
+    /// under Miri or ASAN, and — measured in 0.0.6 — an answer that is
+    /// neither the secret nor zeros, because the allocator has already
+    /// written its freelist bookkeeping into the same bytes.
+    /// `attach::secret::drop_witness` is pushed to by the `Drop` itself,
+    /// *after* the zeroing loop and while the allocation is still ours.
+    ///
+    /// It is a unit test here rather than in `tests/secrets.rs` because
+    /// `#[cfg(test)]` is invisible from an integration target. The witness
+    /// is thread-local, so this row sees its own drops and no other row's
+    /// — which is also why the value is dropped **here** rather than
+    /// handed to a session, whose writer thread would drop it out of
+    /// sight.
+    ///
+    /// The construction is `attach::conn`'s `SecretInput` arm, byte for
+    /// byte: the bounds come from [`SecretSlots::submission_bounds`] and
+    /// the normalisation is [`crate::attach::secret::SecretBytes::normalise`],
+    /// so a change to either is a change to what this row asserts.
+    #[test]
+    fn the_submitted_value_is_zeroed_after_the_write() {
+        use crate::attach::secret::{drop_witness, SecretBytes};
+
+        let slots = SecretSlots::new();
+        let adopted = slots
+            .raise_or_adopt(S, "a credential", Some(4096), true)
+            .expect("a vacant slot raises");
+        let (max, append) = slots
+            .submission_bounds(S, &adopted.request_id)
+            .expect("the waiting call's own bounds");
+        assert_eq!(max, Some(4096));
+        assert!(append, "the bounds are the call's, not a constant");
+
+        drop_witness::reset();
+        let secret = SecretBytes::normalise(b"hunter2".to_vec(), append);
+        let len = secret.len();
+        assert_eq!(len, 8, "seven bytes plus the appended newline");
+
+        // The write, as the writer thread does it: the bytes are lent for
+        // the duration of the call and never escape — asserted *inside*
+        // the closure rather than on a copy it returns, because a copy is
+        // the very thing the type exists to prevent.
+        secret.with_bytes(|b| assert_eq!(b, b"hunter2\n", "the submitted value did not arrive"));
+        assert_eq!(
+            drop_witness::peek_len(),
+            0,
+            "something was dropped before the value under test"
+        );
+
+        drop(secret);
+
+        let seen = drop_witness::taken();
+        assert_eq!(
+            seen.len(),
+            1,
+            "exactly one SecretBytes should have been dropped here, saw {}",
+            seen.len()
+        );
+        assert_eq!(
+            seen[0].len(),
+            len,
+            "the witness saw a buffer of the wrong length: the Drop zeroed \
+             something other than the submitted value"
+        );
+        assert!(
+            seen[0].iter().all(|b| *b == 0),
+            "the submitted value survived its own Drop: {:?}",
+            String::from_utf8_lossy(&seen[0])
+        );
+
+        // The pairing, and the reason the assertion above is not satisfied
+        // by a `Drop` that truncates: the witness is capable of holding a
+        // non-zero buffer, and does when it is handed one.
+        drop_witness::record(b"hunter2");
+        assert_eq!(drop_witness::taken(), vec![b"hunter2".to_vec()]);
+    }
 }

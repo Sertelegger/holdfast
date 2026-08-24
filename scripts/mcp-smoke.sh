@@ -121,7 +121,48 @@ export HOLDFAST_RUNTIME_DIR="$(mktemp -d /tmp/holdfast-smoke-XXXXXX)"
 # `BIN` resolves and before the transcript runs, so a failed check still
 # tears down. `daemon stop` with no daemon exits 0 by §3.2, so the trap
 # is idempotent and its status is ignored.
-trap '"$BIN" daemon stop >/dev/null 2>&1; rm -rf "$HOLDFAST_RUNTIME_DIR"' EXIT
+#
+# **The removal waits for the daemon to be gone, because `daemon stop`
+# returns before it has exited (GH #20).** Measured on this script: the
+# single `rm -rf` this line used to be *succeeded*, and the departing
+# daemon re-created `bind.lock` and `logs/` 15 milliseconds later -- so
+# the directory survived, with no error printed anywhere. That is the
+# exact pattern Global Constraint 11 sweeps for, and a dozen
+# `/tmp/holdfast-smoke-*` directories from earlier milestones had
+# accumulated under /tmp before anybody looked, so this is a race the
+# script has been losing intermittently rather than something 0.0.7
+# introduced. Waiting on the pid is not a fix for GH #20; it is this
+# script cleaning up after it.
+teardown() {
+  # Read the pid BEFORE stopping: the daemon removes its own pid file on
+  # the way out, so afterwards there is nothing left to wait on. A retry
+  # loop around `rm -rf` alone does NOT work and was measured not to --
+  # the removal succeeds, the loop sees the directory gone and returns,
+  # and the daemon re-creates it a moment later.
+  #
+  # `cut -f1` and not `cat`: §7.3's pid file holds `<pid> <version>`, and
+  # `kill -0 "2431264 0.0.6"` is an argument error -- which `|| break`
+  # reads as "the daemon is gone" and returns instantly. Measured, on the
+  # first attempt at this teardown.
+  local pid=""
+  if [ -r "$HOLDFAST_RUNTIME_DIR/holdfast.pid" ]; then
+    pid="$(cut -d' ' -f1 <"$HOLDFAST_RUNTIME_DIR/holdfast.pid" 2>/dev/null)"
+  fi
+  "$BIN" daemon stop >/dev/null 2>&1
+  if [ -n "$pid" ]; then
+    for _ in $(seq 1 60); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.25
+    done
+  fi
+  for _ in 1 2 3 4 5; do
+    rm -rf "$HOLDFAST_RUNTIME_DIR"
+    [ -d "$HOLDFAST_RUNTIME_DIR" ] || return 0
+    sleep 0.3
+  done
+  echo "mcp-smoke: could not remove $HOLDFAST_RUNTIME_DIR (GH #20)" >&2
+}
+trap teardown EXIT
 
 req() { printf '%s\n' "$1"; }
 
@@ -237,15 +278,25 @@ total=0
 # that matches near the start of the transcript (the `capabilities`
 # object is the first thing the server writes) because that is when grep exits
 # earliest. Without `-q`, grep reads to EOF and the race does not exist.
-check() {
+#
+# The `_on` form takes the transcript to assert against, because 0.0.7
+# adds a SECOND `holdfast mcp` transcript that has to be driven
+# concurrently with a real attach client. `check` is that form applied to
+# `$OUT`, so nothing above this line changes and the counting stays in one
+# place.
+check_on() { # check_on <description> <transcript> <literal substring>
   total=$((total + 1))
-  if printf '%s' "$OUT" | grep -F -- "$2" >/dev/null; then
+  if printf '%s' "$2" | grep -F -- "$3" >/dev/null; then
     echo "  ok    $1"
   else
     echo "  FAIL  $1"
-    echo "        (no match for: $2)"
+    echo "        (no match for: $3)"
     fails=$((fails + 1))
   fi
+}
+
+check() {
+  check_on "$1" "$OUT" "$2"
 }
 
 # `absent <description> <forbidden substring> <witness substring>`
@@ -265,19 +316,23 @@ check() {
 # case. `[REDACTED:github]` can only appear if the redactor ran on real
 # session content, so the pair says "the secret is gone AND something
 # removed it" rather than "nothing came back".
-absent() {
+absent_on() { # absent_on <description> <transcript> <forbidden> <witness>
   total=$((total + 1))
-  if printf '%s' "$OUT" | grep -F -- "$2" >/dev/null; then
+  if printf '%s' "$2" | grep -F -- "$3" >/dev/null; then
     echo "  FAIL  $1"
-    echo "        (the transcript contains: $2)"
+    echo "        (the transcript contains: $3)"
     fails=$((fails + 1))
-  elif ! printf '%s' "$OUT" | grep -F -- "$3" >/dev/null; then
+  elif ! printf '%s' "$2" | grep -F -- "$4" >/dev/null; then
     echo "  FAIL  $1"
-    echo "        (nothing to prove it: no match for: $3)"
+    echo "        (nothing to prove it: no match for: $4)"
     fails=$((fails + 1))
   else
     echo "  ok    $1"
   fi
+}
+
+absent() {
+  absent_on "$1" "$OUT" "$2" "$3"
 }
 
 # jq helpers. `-s` slurps the transcript into an array of responses, so a
@@ -296,18 +351,22 @@ def tool($n): tools | map(select(.name == $n)) | first;
 # The expected value is always a concrete non-null JSON literal, so a
 # filter that addresses nothing (`null`), a response that never arrived,
 # or a jq syntax error all fail rather than quietly agreeing.
-jcheck() {
+jcheck_on() { # jcheck_on <description> <transcript> <jq filter> <expected>
   total=$((total + 1))
   local got
-  got="$(printf '%s\n' "$OUT" | jq -c -s "$JQ_HELPERS $2" 2>&1)"
-  if [ "$got" = "$3" ]; then
+  got="$(printf '%s\n' "$2" | jq -c -s "$JQ_HELPERS $3" 2>&1)"
+  if [ "$got" = "$4" ]; then
     echo "  ok    $1"
   else
     echo "  FAIL  $1"
-    echo "        expected: $3"
+    echo "        expected: $4"
     echo "        got:      $got"
     fails=$((fails + 1))
   fi
+}
+
+jcheck() {
+  jcheck_on "$1" "$OUT" "$2" "$3"
 }
 
 total=$((total + 1))
@@ -770,6 +829,109 @@ check_eq "holdfast watch renders the session and exits 0 on SIGINT" \
   "$WATCH_SAW/$WATCH_STATUS" "yes/0"
 check_eq "the session survives the watcher" \
   "$("$BIN" list | grep -c 'smokeattach')" "1"
+
+# ------------------------------------------- 0.0.7: request_secret_input
+#
+# **The only place in this project where "the secret is not on the wire" is
+# asserted against actual protocol bytes.** Every Rust row asserts over an
+# in-process `CallToolResult`; this one greps the JSON-RPC the server
+# really wrote.
+#
+# It needs three processes at once, which is why it is not part of the main
+# transcript: a session (already running -- `smokeattach`), a real
+# `holdfast attach` client to type the answer, and a second `holdfast mcp`
+# shim to make the call. The call BLOCKS until somebody answers it, so the
+# answer has to come from a process that is running while the request is
+# outstanding.
+#
+# The value is a fixture and not a credential, and it deliberately matches
+# no redaction rule: an absence assertion over a redactable string passes
+# because the redactor got there first rather than because nothing carried
+# it. (`generic-secret-assignment` matches a `password`-ish label followed
+# by `:` or `=`; nothing here presents this value that way.)
+SMOKE_SECRET='sm0kesecret'
+# `cksum` and not `sha256sum`: POSIX, and present on macOS as well, where
+# `sha256sum` is not. The point is not cryptographic -- it is that the
+# number below can only be produced by a shell that read these exact bytes,
+# and it is computed here independently of what the session computes.
+SMOKE_DIGEST="$(printf %s "$SMOKE_SECRET" | cksum | cut -d' ' -f1)"
+
+# The human. `script` gives `attach` the tty it needs for raw mode; the
+# keystrokes are written ahead of time, as everywhere else in this file.
+#
+# The client only routes a line into `SecretInput` while an `AwaitingSecret`
+# is outstanding, and that happens either way round: if it is attached when
+# the shell drops ECHO, `forward_events` raises and broadcasts; if it
+# attaches later, the tool call's own raise is broadcast to it. If NEITHER
+# happened the line would go to the child as ordinary input, the request
+# would close `user_cancelled`, and the first check below would go red --
+# which is the loud failure, not a silent pass.
+SECRET_ATTACH_LOG="$HOLDFAST_RUNTIME_DIR/secret-attach.out"
+{
+  sleep 7
+  printf '%s\r' "$SMOKE_SECRET"
+  sleep 3
+  printf '\002d'
+  sleep 1
+} | timeout 40 script -qefc "$BIN attach smokeattach" /dev/null >"$SECRET_ATTACH_LOG" 2>/dev/null &
+SECRET_ATTACH_PID=$!
+sleep 1
+
+SECRET_OUT="$(
+  {
+    req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-secret","version":"0"}}}'
+    req '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    # `read -s -p` under bash, which is this file's standing exception to
+    # the `sh -c 'stty -echo; …'` fixture the Rust rows use: it is what
+    # this script already drives for the 0.0.2 echo-off check, it is green,
+    # and re-spelling it here would be a second fixture for one property.
+    req '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"send_input","arguments":{"session":"smokeattach","data":"read -s -p SMOKEPW2: pw2"}}}'
+    sleep 3
+    req '{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"request_secret_input","arguments":{"session":"smokeattach","prompt_text":"a credential for the smoke session","timeout_secs":20}}}'
+    # Long enough for the human above to type at t+7 and for the response
+    # to come back. `request_secret_input` blocks, so this sleep is what
+    # keeps the shim's stdin open until it has answered.
+    sleep 8
+    # The arrival proof, computed by the shell from what it actually read.
+    # The echoed command line carries `$(printf …` literally, so this
+    # cannot be satisfied by the terminal's echo of the request -- the same
+    # separation `SMOKE_$((6*7))` gets in the main transcript.
+    req '{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"send_input","arguments":{"session":"smokeattach","data":"echo SMOKEDIGEST=$(printf %s \"$pw2\" | cksum | cut -d\" \" -f1)"}}}'
+    sleep 2
+    req '{"jsonrpc":"2.0","id":34,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"smokeattach","since_cursor":0}}}'
+    sleep 1
+  } | "$BIN" mcp
+)"
+wait "$SECRET_ATTACH_PID" 2>/dev/null
+
+echo
+echo "-- 0.0.7 request_secret_input"
+
+jcheck_on "request_secret_input answers secret_provided on the wire" \
+  "$SECRET_OUT" 'resp(32).result.structuredContent.status' '"secret_provided"'
+# The type is asserted beside the value: a filter that addressed nothing
+# returns `null`, and `null` compared against a bare number would already
+# fail -- but the pair also says the field is a NUMBER rather than the
+# value rendered as a string, which is the shape a "return it for
+# confirmation" regression would take. Eleven bytes plus the appended
+# newline.
+jcheck_on "the response carries a byte count and not a value" \
+  "$SECRET_OUT" \
+  'resp(32).result.structuredContent.data | [(.bytes_written | type), .bytes_written]' \
+  '["number",12]'
+check_on "the child received the exact bytes that were submitted" \
+  "$SECRET_OUT" "SMOKEDIGEST=$SMOKE_DIGEST"
+# **The one that runs against protocol bytes.** The witness is the
+# `secreq_` id prefix, which only a daemon that really raised a request can
+# have written -- without it this is an absence check over an empty string,
+# which is the degenerate case the `absent` helper above exists to exclude.
+absent_on "no response in the secret transcript carries the submitted value" \
+  "$SECRET_OUT" "$SMOKE_SECRET" 'secreq_'
+# And the same bytes are absent from what the ATTACH CLIENT rendered: they
+# were typed into a masked line, so no terminal ever drew them. The witness
+# is the prompt the client printed when it entered secret mode.
+absent_on "holdfast attach never renders the line it is collecting" \
+  "$(cat "$SECRET_ATTACH_LOG" 2>/dev/null)" "$SMOKE_SECRET" 'SMOKEPW2:'
 
 echo
 if [ "$fails" -ne 0 ]; then

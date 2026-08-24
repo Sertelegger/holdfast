@@ -24,6 +24,63 @@
 //! **prints its prompt**, because the `AwaitingSecret` edge is computed
 //! per read chunk: a child that drops `ECHO` and writes nothing raises no
 //! request until its next byte of output.
+//!
+//! # The seven surfaces 0.0.7 added or inherited
+//!
+//! Every one of these is a place the value could reach and must not
+//! (REQ-SEC-004). The right-hand column is the row that asserts absence
+//! **over the whole surface** — not field by field, because a field-by-field
+//! check covers only the fields whoever wrote it thought of, which is how
+//! a secret once shipped in `prompt.last_line` while four other fields of
+//! the same response were being asserted redacted.
+//!
+//! | # | Surface | Asserted by |
+//! |---|---|---|
+//! | 1 | the `request_secret_input` **MCP response** (`secret_provided` and `secret_cancelled`) | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`], [`the_response_carries_a_length_and_not_a_value`] |
+//! | 2 | the `secret_input_request` and `secret_input_resolved` audit lines | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] |
+//! | 3 | the `binding_resolved` and `binding_approval` audit lines | `binding_approval` here; `binding_resolved` in `secret::binding::tests::a_keychain_resolved_secret_reaches_none_of_them_either`, which is the only place a provider can run |
+//! | 4 | the `BindingApprovalRequired` broadcast frame | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`], and `the_approval_surface_carries_no_reference_and_no_value` in the library |
+//! | 5 | the §9.5 buffer notice | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] phase A, which writes one and then sweeps the buffer it landed in |
+//! | 6 | `daemon.log`, including any provider-failure context | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] captures fd 2 for the whole flow; the **provider-failure** half is `secret::provider::tests::a_failing_providers_stderr_and_reference_reach_no_log` |
+//! | 7 | the ring buffer, a second attached client's `Output` stream, and any other `read_output` response — unchanged from 0.0.6 | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] |
+//!
+//! **Only the keychain half of surface 3 is absent from this file, and
+//! that is forced rather than chosen.** A `binding_resolved` line is
+//! written only when a provider *answers*, the only provider a test may
+//! run is a script the test itself wrote (REQ-TST-007 / Global Constraint
+//! 12), and the type that runs one — `ScriptProvider` — is `#[cfg(test)]`,
+//! which an integration target cannot see. Every row that resolves a real
+//! value therefore lives in `secret::binding`'s own test module. Writing a
+//! `binding_resolved`-shaped absence here would assert about a line this
+//! target cannot cause to exist, which is the vacuity this whole file is
+//! organised against.
+//!
+//! # §11.2 and §11.4's secret scenarios, mapped
+//!
+//! Spec line numbers are §11's, as of rev. 49. A scenario this milestone
+//! does **not** implement names the milestone that owns it, so a
+//! mechanical sweep finds a row rather than a gap.
+//!
+//! | §11 scenario | Implemented by |
+//! |---|---|
+//! | §11.2 `wait_for_pattern("Enter password")` then `request_secret_input` end to end, typed bytes in no response or log | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] |
+//! | §11.2 `mode` and `role` are independent (REQ-SEC-008a) | **0.0.6's**, in `tests/attach_protocol.rs`: `the_role_is_read_from_the_frame_not_inferred_from_the_mode`, `the_same_bytes_reach_an_interactive_client_raw_and_an_observer_redacted`, `both_attach_audit_rows_carry_the_role` |
+//! | §11.2 Secret-request adoption (REQ-SEC-010a) | [`a_tool_call_adopts_an_echo_raised_request`], [`an_adopted_request_keeps_the_prompt_it_was_raised_with`], [`a_second_caller_collides_and_the_first_still_completes`] |
+//! | §11.2 Audit-log redaction of a secret-shaped command line | **0.0.3's**, `session_start`'s own redaction |
+//! | §11.2 `request_secret_input` via CLI attach, **echo-off** child | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] |
+//! | §11.2 `request_secret_input` via CLI attach, **echo-on** child (documented caveat) | [`the_documented_echo_on_leak_is_asserted_not_assumed`] |
+//! | §11.2 `request_secret_input` via **web UI** | **0.0.10** — there is no bridge, no WebSocket and no masked input field yet |
+//! | §11.2 no-client-attached path: notice written, client attaches mid-window, request completes | [`the_notice_appears_in_the_buffer_when_nobody_is_attached`], [`a_client_attaching_mid_window_can_still_answer`] |
+//! | §11.2 `prompt_text` redaction and the length cap | [`a_secret_shaped_prompt_text_is_redacted_in_the_audit_log`], [`the_512_cap_is_bytes_not_characters`] |
+//! | §11.2 `append_newline` semantics, all four cases | `attach::secret::tests::the_trailing_newline_is_normalised_exactly_once`, and [`the_cap_is_measured_before_normalisation`] for the boundary |
+//! | §11.2 Session-recording round trip, and REQ-AF-003 | **0.0.9** — there is no recorder. 0.0.6 named the assertion; this milestone strengthens the property it rests on (the `Serialize`/`Clone` compile guard) and does not discharge it |
+//! | §11.2 Notification payload hygiene | **0.0.9** — §5.8.3's sinks do not exist |
+//! | §11.2 Binding approval flow (approve, deny, expire, ReadOnly rejection) | [`approve_binding_from_a_readonly_client_is_rejected`] here; approve/deny/expire in `secret::binding`'s test module, where a provider can run. The `GET /api/binding-approvals` half is **0.0.10's** |
+//! | §11.4 Concurrent secret requests | [`a_second_caller_collides_and_the_first_still_completes`] |
+//! | §11.4 Adoption is not `concurrent_request_pending` | [`a_tool_call_adopts_an_echo_raised_request`], in this same file, as §11.4 requires |
+//! | §11.4 The agent cannot aim a secret (adversarial) | [`a_wrong_request_id_writes_nothing_and_the_right_one_still_works`] here; `secret::binding::tests::no_agent_argument_reaches_a_provider_lookup` for the binding half |
+//! | §11.4 Web secret endpoint `request_id` binding (`409 conflict`) | **0.0.10** — `SecretSlots::matches_outstanding` is exported for it to call; the HTTP rendering is not written |
+//! | §11.3 Windows `not_supported_on_platform` on a **Windows runner** | **0.0.11** — [`an_unsupported_platform_returns_before_allocating_anything`] asserts the same code path on Unix through a forced capability, which is the Unix half and not the runner assertion |
 
 use holdfast_core::attach::frames::{
     decode_server_frame, ApprovalDecision, ClientFrame, ServerFrame,
@@ -34,7 +91,7 @@ use holdfast_core::config::{Config, DaemonConfig, SecretBinding, SecurityConfig}
 use holdfast_core::daemon::attach_server;
 use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::server::{self, Daemon};
-use holdfast_core::mcp::tools::RequestSecretInputArgs;
+use holdfast_core::mcp::tools::{ReadOutputArgs, RequestSecretInputArgs, SendInputArgs};
 use holdfast_core::platform::Capabilities;
 use holdfast_core::protocol::frame;
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
@@ -76,6 +133,48 @@ const ECHO_OFF_FIXTURE: &str = "stty -echo; printf 'Password: '; read x; stty ec
 /// see its waiter register before the window it is measuring has closed.
 const ABANDONED_READ_FIXTURE: &str =
     "stty -echo; printf 'Password: '; sleep 3; stty echo; printf 'gave-up\\n'; sleep 30";
+
+/// The **transform**, on its own, so the echo-on fixtures below can be
+/// pinned to [`ECHO_OFF_FIXTURE`] rather than re-typed beside it.
+///
+/// Global Constraint 14 governs the echo-**off** spelling and says nothing
+/// about an echo-on one; §11.2 asks for a *"`read line; echo $line`
+/// style"* child and fixes no text. So the echo-on fixtures are derived
+/// from the echo-off one by substitution, and
+/// [`the_echo_on_fixtures_are_the_echo_off_one_with_the_stty_calls_removed`]
+/// asserts the derivation actually removed something — a `replace` that
+/// silently matched nothing would leave an echo-**off** child standing in
+/// for the documented caveat, and the caveat row would then assert the
+/// opposite of what it claims.
+const TRANSFORM: &str = "printf 'got=%s\\n' \"$(printf %s \"$x\" | tr a-z A-Z)\"";
+
+/// §11.2's documented-caveat child: the same read, the same transform, and
+/// **no `stty`** — so the line discipline echoes what is written to it.
+fn echo_on_fixture() -> String {
+    let out = ECHO_OFF_FIXTURE
+        .replace("stty -echo; ", "")
+        .replace("stty echo; ", "");
+    assert!(
+        !out.contains("stty") && out.contains(TRANSFORM),
+        "the echo-on derivation missed: {out}"
+    );
+    out
+}
+
+/// The same child, in a loop, for the one row that has to send the same
+/// bytes to **one** session three different ways.
+///
+/// No prompt and no `stty`: the leak detector's third path raises its
+/// request from the *tool call*, not from an echo drop, so nothing here
+/// needs to reach `AwaitingSecret`. `while read x` and not `while :`,
+/// because a loop that ignores EOF spins on a closed master.
+fn echo_on_loop_fixture() -> String {
+    assert!(
+        ECHO_OFF_FIXTURE.contains(TRANSFORM),
+        "the transform is no longer shared with the echo-off fixture"
+    );
+    format!("while read x; do {TRANSFORM}; done")
+}
 
 struct TestDaemon {
     daemon: Arc<Daemon>,
@@ -200,6 +299,55 @@ impl TestDaemon {
             .expect("request_secret_input")
     }
 
+    /// `read_output`, the surface the agent actually reads a session
+    /// through, from an explicit cursor.
+    ///
+    /// **The cursor is a parameter and not a hardcoded `0`, and that is a
+    /// mutation result rather than a preference.** With `0` the response
+    /// is the whole buffer, so a leak-detector path asserting *"these
+    /// bytes reach a `read_output` response"* is satisfied by bytes an
+    /// **earlier** path put there. Measured during Task 13's mutation
+    /// ladder: with `send_input` injected to drop its payload entirely,
+    /// the detector's second path stayed green.
+    async fn read_output_since(&self, session: &str, since_cursor: u64) -> Value {
+        body(
+            &self
+                .daemon
+                .server
+                .read_output(Parameters(ReadOutputArgs {
+                    session: session.to_string(),
+                    since_cursor: Some(since_cursor),
+                    ..Default::default()
+                }))
+                .await
+                .expect("read_output"),
+        )
+    }
+
+    /// The whole buffer — for the rows that **sweep** a response rather
+    /// than assert something arrived in it.
+    async fn read_output(&self, session: &str) -> Value {
+        self.read_output_since(session, 0).await
+    }
+
+    /// `send_input` — §16.4 step 4's parenthetical, the write a
+    /// well-behaved agent does **not** make during `AwaitingSecret`
+    /// (REQ-SEC-011). The leak detector makes it on purpose.
+    async fn send_input(&self, session: &str, data: &str) -> Value {
+        body(
+            &self
+                .daemon
+                .server
+                .send_input(Parameters(SendInputArgs {
+                    session: session.to_string(),
+                    data: data.to_string(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("send_input"),
+        )
+    }
+
     /// The same call, for the rows whose subject is the **refusal**.
     ///
     /// Every bound on the arguments is a protocol error and not a status
@@ -318,6 +466,17 @@ async fn stream_until(c: &mut UnixStream, needle: &[u8], secs: u64) -> Vec<u8> {
         match decode_server_frame(&body).expect("a decodable server frame") {
             ServerFrame::Output { bytes, .. } => acc.extend_from_slice(&bytes),
             ServerFrame::AwaitingSecret { .. } | ServerFrame::SecretRequestClosed { .. } => {}
+            // **The child is gone, so no more `Output` is coming — return
+            // what arrived and let the caller's own assertion say what is
+            // missing.** Frames are ordered, so a needle the child really
+            // printed has already been accumulated by the time this
+            // arrives; the only case that reaches here is one where the
+            // needle was never produced. Panicking instead reported "the
+            // helper saw an unexpected frame" for what is always a failure
+            // of the row's own subject — measured, during Task 13's
+            // mutation ladder, on every injection that stopped the value
+            // reaching the child.
+            ServerFrame::SessionExited { .. } => break,
             other => panic!("expected Output, got {other:?}"),
         }
         if acc.windows(needle.len()).any(|w| w == needle) {
@@ -391,6 +550,85 @@ fn body(r: &CallToolResult) -> Value {
     r.structured_content.clone().expect("structured content")
 }
 
+/// The **whole** tool result, serialised — `content[0]`'s text mirror
+/// included, not just `structuredContent`.
+///
+/// A sweep over `structuredContent` alone covers the half of the response
+/// somebody remembered to look at. Both halves cross the MCP wire, and the
+/// mirror is generated from the envelope rather than written by hand,
+/// which is exactly the sort of derived surface a new field arrives on
+/// without anybody deciding it should.
+fn whole_result(r: &CallToolResult) -> String {
+    serde_json::to_string(r).expect("a tool result serialises")
+}
+
+/// fd 2, into a file, for the duration of one row — the only way to reach
+/// `daemon.log`'s content from an integration target.
+///
+/// `diag::emit` writes through `std::io::stderr()` deliberately, to bypass
+/// libtest's capture, and the shipped daemon's `daemon.log` **is** its fd
+/// 2. So the surface is reachable here only by redirecting the descriptor.
+///
+/// **This is the one row in this target that does it, and a second one
+/// cannot simply be added beside it.** The redirect is process-wide while
+/// it is up, and libtest runs this file's rows on threads of one process:
+/// two overlapping captures would each restore the other's saved
+/// descriptor. `secret::provider`'s `with_captured_stderr` carries the
+/// same warning for the library target, which is a different process.
+/// Whoever needs a second one moves both to the subprocess idiom
+/// `diag.rs` already uses.
+///
+/// The restore is a `Drop` and not a statement after the call, so a row
+/// that panics does not leave every other row's stderr pointing at a file
+/// that is about to be deleted.
+struct StderrCapture {
+    path: PathBuf,
+    saved: std::os::raw::c_int,
+    file: Option<std::fs::File>,
+}
+
+impl StderrCapture {
+    fn start(paths: &RuntimePaths, tag: &str) -> Self {
+        use std::os::unix::io::AsRawFd;
+
+        let path = paths.dir().join(format!("{tag}-stderr.log"));
+        let file = std::fs::File::create(&path).expect("create the capture file");
+        let saved = unsafe { libc::dup(2) };
+        assert!(saved >= 0, "dup(2) failed");
+        assert!(
+            unsafe { libc::dup2(file.as_raw_fd(), 2) } >= 0,
+            "dup2 onto fd 2 failed"
+        );
+        Self {
+            path,
+            saved,
+            file: Some(file),
+        }
+    }
+
+    /// Restore fd 2 and hand back everything that was written to it.
+    fn finish(mut self) -> String {
+        self.restore();
+        std::fs::read_to_string(&self.path).expect("read the capture")
+    }
+
+    fn restore(&mut self) {
+        if let Some(file) = self.file.take() {
+            unsafe {
+                libc::dup2(self.saved, 2);
+                libc::close(self.saved);
+            }
+            drop(file);
+        }
+    }
+}
+
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 /// The ordinary call these rows make: everything defaulted except the
 /// session and the deadline being measured.
 fn secret_args(session: &str, timeout_secs: u32) -> RequestSecretInputArgs {
@@ -444,39 +682,277 @@ fn cancelled_reason(payload: &Value) -> String {
         .to_string()
 }
 
-// ------------------------------------------------------- the three layers
+// =================================================== the leak detector
+//
+// **This runs before every absence assertion in this file, and its result
+// is the licence for them.** An assertion that a surface does not contain
+// the secret passes trivially against a system that never produced one —
+// a buffer nothing writes to, a comparison that never matches, a probe
+// misspelled in both places. So the same byte string is first sent to one
+// session three ways that are all *supposed* to leak, and each is asserted
+// to.
+//
+// "Runs first" is literal rather than a hope about libtest's ordering:
+// [`run_leak_detector`] is a function, [`the_leak_detector_sees_every_path_that_is_supposed_to_leak`]
+// is it on its own, and [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`]
+// calls it before it asserts anything. It runs on a daemon and a session
+// of its own, so the bytes it deliberately spills cannot reach the
+// surfaces the row beside it is sweeping.
 
-/// **Layers 2 and 3 in one session, plus layer 1's controls.**
+/// How many times `needle` appears in `hay`.
 ///
-/// The agent asks for a credential, a human at an attached client types
-/// it, the child gets it — and it appears on no surface the agent or any
-/// other client can read. The arrival proof is what makes the absence
-/// proof mean anything: an implementation that dropped the value on the
-/// floor satisfies every "not present" assertion below.
-#[tokio::test]
-async fn a_secret_the_agent_requested_reaches_the_child_and_none_of_the_surfaces() {
-    let d = TestDaemon::start("threelayer").await;
-    let s = d.shell_running(ECHO_OFF_FIXTURE);
+/// A **count** and not a `contains`, because the detector sends one probe
+/// three times to one session: after the first path the buffer already
+/// holds it, and `contains` would then be true of the second and third
+/// whether or not they wrote anything at all.
+fn occurrences(hay: &[u8], needle: &[u8]) -> usize {
+    hay.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+/// The three paths, one session, one byte string — asserted to leak.
+///
+/// | Path | Must appear in |
+/// |---|---|
+/// | `Input { bytes }` from an attached ReadWrite client, echo **on** | the ring buffer, and a second attached client's `Output` stream |
+/// | `send_input(data: …)` | a `read_output` response |
+/// | a `SecretInput` to an **echo-on** child (§11.2's documented-caveat fixture) | the ring buffer — because the *child* echoed it, which is the limitation Holdfast cannot defend against |
+///
+/// **If any of these ever passes by absence, stop**: the detector is
+/// broken and nothing else in this file means anything.
+async fn run_leak_detector(tag: &str) {
+    let d = TestDaemon::start(tag).await;
+    let s = d.shell_running(&echo_on_loop_fixture());
 
     let mut typist = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
     let mut watcher = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
 
-    // The agent's call blocks; the human answers it.
-    let server = d.daemon.server.clone();
-    let id = s.id.clone();
-    let call = tokio::spawn(async move {
-        server
-            .request_secret_input(Parameters(RequestSecretInputArgs {
-                session: id,
-                prompt_text: "the deploy user's sudo password".into(),
-                timeout_secs: Some(30),
-                ..Default::default()
-            }))
-            .await
-            .expect("request_secret_input")
-    });
+    assert_eq!(
+        occurrences(&buffered(&s), PROBE.as_bytes()),
+        0,
+        "the session already held the probe before the detector wrote it"
+    );
 
+    // ---- path 1: an ordinary `Input` frame.
+    send(
+        &mut typist,
+        &ClientFrame::Input {
+            bytes: format!("{PROBE}\n").into_bytes(),
+        },
+    )
+    .await;
+    let seen = stream_until(&mut typist, b"got=HUNTER2", 20).await;
+    assert!(
+        contains(&seen, PROBE.as_bytes()),
+        "path 1 saw nothing on the submitting client's own stream: the harness \
+         could not have caught a leak"
+    );
+    let watched = stream_until(&mut watcher, b"got=HUNTER2", 20).await;
+    assert!(
+        contains(&watched, PROBE.as_bytes()),
+        "path 1 did not reach a second attached client, so every 'not broadcast \
+         to another client' assertion in this file is about a stream nothing \
+         writes to"
+    );
+    let after_one = occurrences(&buffered(&s), PROBE.as_bytes());
+    assert!(
+        after_one > 0,
+        "path 1 did not reach the ring buffer, so every 'not in the buffer' \
+         assertion in this file is about a buffer nothing writes to:\n{}",
+        String::from_utf8_lossy(&buffered(&s))
+    );
+
+    // ---- path 2: `send_input`, the call §16.4 step 4's parenthetical says
+    // a well-behaved agent does *not* make (REQ-SEC-011). It is used here
+    // on purpose: it is the agent-facing write path, and `read_output` is
+    // the agent-facing read path, so the pair is the one round trip an
+    // agent could actually perform.
+    //
+    // **The cursor is sampled before the write, so the response contains
+    // path 2's bytes and nothing path 1 left behind.** Read from `0` this
+    // assertion is green against a `send_input` that discards its payload
+    // outright — measured, on this row, during Task 13's mutation ladder.
+    let cursor = s.buffer_head();
+    let wrote = d.send_input(&s.id, PROBE).await;
+    assert_eq!(
+        wrote["status"], "ok",
+        "the detector's own send_input failed: {wrote}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let rendered = d.read_output_since(&s.id, cursor).await.to_string();
+        if rendered.contains(PROBE) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "path 2 is absent from a read_output response taken from the cursor \
+             its own write started at, so every 'absent from a read_output \
+             response' assertion is about a response that carries \
+             nothing:\n{rendered}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // ---- path 3: a real `SecretInput`, to a child that echoes.
+    //
+    // The request is raised by the **tool call**: this child never drops
+    // ECHO, so no echo-drop raise is coming and none is needed.
+    let call = spawn_call(&d, secret_args(&s.id, 20));
     let (request_id, _) = next_awaiting_secret(&mut typist, 20).await;
+    let before_three = occurrences(&buffered(&s), PROBE.as_bytes());
+    send(
+        &mut typist,
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        joined(call, "the detector's secret call").await["status"],
+        "secret_provided"
+    );
+    // The buffer is written by the reader thread, so the write's ack is
+    // not the echo's arrival.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while occurrences(&buffered(&s), PROBE.as_bytes()) <= before_three {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "path 3 did not reach the ring buffer. Either the write never \
+             happened, or an echo-on child stopped echoing — and REQ-TST-006's \
+             documented limitation is asserted against exactly this:\n{}",
+            String::from_utf8_lossy(&buffered(&s))
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let _ = s.signal(Signal::Kill);
+}
+
+/// [`run_leak_detector`] on its own, so a broken harness is one red row
+/// with a name rather than a confusing failure inside an absence test.
+#[tokio::test]
+async fn the_leak_detector_sees_every_path_that_is_supposed_to_leak() {
+    run_leak_detector("leakdetector").await;
+}
+
+/// The derivation in [`echo_on_fixture`] and [`echo_on_loop_fixture`],
+/// asserted rather than assumed.
+///
+/// A `replace` that matched nothing would hand
+/// [`the_documented_echo_on_leak_is_asserted_not_assumed`] an
+/// echo-**off** child, and that row would then assert the opposite of
+/// what its name claims while staying green.
+#[test]
+fn the_echo_on_fixtures_are_the_echo_off_one_with_the_stty_calls_removed() {
+    assert!(ECHO_OFF_FIXTURE.contains("stty -echo;"));
+    let on = echo_on_fixture();
+    assert!(!on.contains("stty"), "{on}");
+    assert!(on.contains("read x"), "{on}");
+    assert!(on.contains(TRANSFORM), "{on}");
+    assert!(on.contains("printf 'Password: '"), "{on}");
+    let looped = echo_on_loop_fixture();
+    assert!(!looped.contains("stty"), "{looped}");
+    assert!(looped.starts_with("while read x; do "), "{looped}");
+    assert!(looped.contains(TRANSFORM), "{looped}");
+}
+
+// ======================================= the seven surfaces, all absent
+
+/// **Every surface 0.0.7 added or inherited, swept whole, for a value the
+/// agent asked for and a human typed.**
+///
+/// The module header's first table is what this row discharges. Two
+/// phases on **one** session, because the surfaces pull in opposite
+/// directions:
+///
+/// * **Phase A, with nobody attached.** The call times out unanswered, so
+///   §9.5's buffer notice is written (surface 5) and a
+///   `secret_input_request` / `secret_input_resolved` pair is logged
+///   (surface 2). Nothing is submitted yet; the notice simply has to be in
+///   the buffer that gets swept at the end.
+/// * **Phase B, with two clients attached.** `require_confirm` raises a
+///   `BindingApprovalRequired` (surface 4), a human approves it (surface
+///   3's `binding_approval`), `wincred` resolves nothing on every
+///   platform so the call falls through to the human-prompt path, and the
+///   human answers it (surfaces 1 and 7).
+///
+/// **The positive controls, without which all of the above is satisfied by
+/// an implementation that throws the value away:**
+///
+/// 1. [`run_leak_detector`] first, which is the licence for every absence
+///    below;
+/// 2. the child's own `got=HUNTER2` — a *transform* of what it read, so
+///    arrival is asserted on the child's output rather than on our having
+///    sent something;
+/// 3. `bytes_written`, which is the count the agent is given in place of
+///    the value;
+/// 4. a witness per surface that the surface is **non-empty and of the
+///    expected shape** — the notice is in the buffer, the four audit kinds
+///    are on the log, the approval frame arrived, fd 2 caught a
+///    daemon-written line.
+///
+/// **The `daemon.log` witness is a real diagnostic, provoked on purpose.**
+/// `LEAK_CANARY_BINDING` carries an uncompilable `match_command`, which
+/// `secret::binding::pattern_matches` answers by writing the binding's
+/// *name* to `daemon.log` and declining to match. It is first in
+/// configured order, so it costs nothing but the line it exists to
+/// produce. Without it the fd-2 capture could be empty and "the value is
+/// not in `daemon.log`" would be a claim about a file nothing wrote to.
+#[tokio::test]
+async fn a_tool_submitted_secret_reaches_none_of_the_seven_surfaces() {
+    run_leak_detector("sevensurfaces-detector").await;
+
+    let d = TestDaemon::start_with_config("sevensurfaces", canary_and_confirming_config()).await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+
+    let capture = StderrCapture::start(&d.paths, "sevensurfaces");
+
+    // ---- phase A: nobody attached, so §9.5's notice is written.
+    assert_eq!(
+        cancelled_reason(&joined(spawn_call(&d, secret_args(&s.id, 8)), "phase A").await),
+        "timeout"
+    );
+    assert_eq!(
+        notice_count(&s),
+        1,
+        "the §9.5 notice was never written, so sweeping the buffer for it \
+         proves nothing:\n{}",
+        String::from_utf8_lossy(&buffered(&s))
+    );
+
+    // ---- phase B: two clients, an approval, and a human's answer.
+    let mut typist = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut watcher = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+
+    let call = spawn_call(
+        &d,
+        RequestSecretInputArgs {
+            session: s.id.clone(),
+            prompt_text: "the deploy user's sudo password".into(),
+            timeout_secs: Some(30),
+            ..Default::default()
+        },
+    );
+
+    // Surface 4, on both clients: §9.2's role split is about output, so an
+    // observer is *shown* the approval and merely may not answer it.
+    let (approval_id, binding_name, provider) = next_binding_approval(&mut typist, 20).await;
+    assert_eq!(binding_name, "prod-shell");
+    assert_eq!(provider, "wincred");
+    let (observed, _, _) = next_binding_approval(&mut watcher, 20).await;
+    assert_eq!(observed, approval_id);
+
+    send(
+        &mut typist,
+        &ClientFrame::ApproveBinding {
+            approval_id,
+            decision: ApprovalDecision::Approve,
+        },
+    )
+    .await;
+
+    let request_id = await_fall_through(&d, &s.id).await;
     send(
         &mut typist,
         &ClientFrame::SecretInput {
@@ -486,17 +962,30 @@ async fn a_secret_the_agent_requested_reaches_the_child_and_none_of_the_surfaces
     )
     .await;
 
-    // Layer 2 — the positive control. The child transformed what it read.
+    // Positive control 2 — the child transformed what it read.
     let seen = stream_until(&mut typist, b"got=HUNTER2", 20).await;
     assert!(
         contains(&seen, b"got=HUNTER2"),
         "the value never reached the child: {}",
         String::from_utf8_lossy(&seen)
     );
+    let watched = stream_until(&mut watcher, b"got=HUNTER2", 20).await;
+    assert!(
+        contains(&watched, b"got=HUNTER2"),
+        "the second client's stream carries nothing, so sweeping it proves \
+         nothing: {}",
+        String::from_utf8_lossy(&watched)
+    );
 
-    // The agent's answer: a **count**, against the id it was given.
-    let payload = body(&call.await.expect("the waiting call"));
-    assert_eq!(payload["status"], "secret_provided");
+    let result = call.await.expect("the waiting call");
+    let payload = body(&result);
+
+    // ---- surface 1: the MCP response, whole.
+    //
+    // The **whole** `CallToolResult` and not just `structuredContent`:
+    // `content[0]`'s text mirror is on the wire too, and a field-by-field
+    // check is how a secret once shipped in a field nobody was looking at.
+    assert_eq!(payload["status"], "secret_provided", "{payload}");
     assert_eq!(
         payload["data"]["request_id"], request_id,
         "the tool answered against an id nobody broadcast"
@@ -506,70 +995,232 @@ async fn a_secret_the_agent_requested_reaches_the_child_and_none_of_the_surfaces
         (PROBE.len() + 1) as u64,
         "seven bytes plus the appended newline"
     );
-
-    // Layer 3 — the surfaces, all four.
-    let whole = payload.to_string();
+    let whole = whole_result(&result);
     assert!(
         !whole.contains(PROBE),
         "the value reached the MCP response: {whole}"
     );
+
+    // ---- surface 7: the ring buffer, and both clients' streams.
+    //
+    // The buffer is read raw rather than through `read_output`, which
+    // redacts — a redacted read would pass whether or not it was there.
+    // The `read_output` response is swept beside it, because that is the
+    // surface the agent actually reads.
     assert!(
         !contains(&seen, PROBE.as_bytes()),
         "the value came back on the submitting client's own stream"
     );
-    let watched = stream_until(&mut watcher, b"got=HUNTER2", 20).await;
     assert!(
         !contains(&watched, PROBE.as_bytes()),
         "§9.2: the value was broadcast to another attached client"
     );
-    // The ring buffer, read raw rather than through `read_output`, which
-    // redacts — a redacted read would pass whether or not it was there.
-    let buffered = s.buffer_slice(s.buffer_tail(), s.buffer_head());
+    let buf = buffered(&s);
     assert!(
-        !contains(&buffered, PROBE.as_bytes()),
+        !contains(&buf, PROBE.as_bytes()),
         "the value reached the ring buffer: {}",
-        String::from_utf8_lossy(&buffered)
+        String::from_utf8_lossy(&buf)
     );
+    // **The raw sweep above is the redactor-independent one; this one is
+    // not, deliberately.** `read_output` redacts, and
+    // `generic-secret-assignment` matches `Password:` followed by any
+    // eight non-space bytes — so a value that *had* leaked into the buffer
+    // right after this child's prompt would come back `[REDACTED:generic]`
+    // and pass this assertion. The ring buffer is read raw one statement
+    // earlier for exactly that reason; this one is about the shape of the
+    // surface the agent actually calls.
+    //
+    // The same rule is why the witness is the child's **prompt** and not
+    // its `got=` transform: measured, `Password: got=HUNTER2` is redacted
+    // whole, and a `got=HUNTER2` witness here was green only because
+    // §9.5's notice happened to sit between the two.
+    let read_body = d.read_output(&s.id).await;
+    assert!(
+        read_body["data"]["output"]
+            .as_str()
+            .is_some_and(|o| o.contains("Password: ")),
+        "the read_output response carries none of this session's output, so \
+         sweeping it proves nothing:\n{read_body}"
+    );
+    let read = read_body.to_string();
+    assert!(
+        !read.contains(PROBE),
+        "the value reached a read_output response:\n{read}"
+    );
+
+    // ---- surfaces 2 and 3: the audit log, whole, with the four kinds
+    // this flow actually produces named beside it.
     let audit = std::fs::read_to_string(d.paths.audit_log()).unwrap_or_default();
+    assert_eq!(
+        secret_audit_kinds(&d, &s.id),
+        vec![
+            "secret_input_request",
+            "secret_input_resolved",
+            "secret_input_request",
+            "secret_input_resolved",
+        ],
+        "the two §9.4 secret kinds are not on the log, so sweeping it for the \
+         value proves nothing:\n{audit}"
+    );
+    let approvals = audit_entries(&d, &s.id, "binding_approval");
+    assert_eq!(
+        approvals.len(),
+        2,
+        "phase A's expiry and phase B's approval are both binding_approval \
+         lines; without them surface 3 is a kind nothing wrote:\n{audit}"
+    );
+    assert_eq!(approvals[1]["outcome"], "approved");
     assert!(
         !audit.contains(PROBE),
         "the value reached the audit log:\n{audit}"
     );
 
+    // ---- surface 6: `daemon.log`.
+    let log = capture.finish();
+    assert!(
+        log.contains("`leak-canary` has an uncompilable match_command"),
+        "fd 2 caught no daemon diagnostic at all, so sweeping it for the value \
+         proves nothing:\n{log}"
+    );
+    assert!(
+        !log.contains(PROBE),
+        "the value reached the daemon's diagnostic stream:\n{log}"
+    );
+
     let _ = s.signal(Signal::Kill);
 }
 
-/// **The leak-detector control.** The identical bytes, sent to an
-/// identical session as ordinary `Input`, *are* in the ring buffer.
+/// §5.2's answer to the agent is a **count**, and the schema has nowhere
+/// to put anything else.
 ///
-/// Without this row the assertion above passes against a harness that
-/// could not have seen a leak in the first place — a buffer that was
-/// never written, a comparison that never matched, a probe misspelled in
-/// both places.
+/// `bytes_written` is asserted against the length that was actually
+/// written rather than against a literal, in both `append_newline`
+/// directions — a response returning the value "for confirmation" is
+/// caught by the sweep, and a response returning a *wrong* count is caught
+/// by the arithmetic.
 #[tokio::test]
-async fn the_same_bytes_sent_as_ordinary_input_do_reach_the_buffer() {
-    let d = TestDaemon::start("leakcontrol").await;
-    let s = d.shell_running("cat");
+async fn the_response_carries_a_length_and_not_a_value() {
+    for (append_newline, extra) in [(true, 1usize), (false, 0)] {
+        let d = TestDaemon::start(&format!("lengthonly{}", usize::from(append_newline))).await;
+        let s = d.shell_running(ECHO_OFF_FIXTURE);
+        let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
+        let call = spawn_call(
+            &d,
+            RequestSecretInputArgs {
+                session: s.id.clone(),
+                prompt_text: "a credential".into(),
+                append_newline: Some(append_newline),
+                timeout_secs: Some(20),
+                ..Default::default()
+            },
+        );
+        let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
+        send(
+            &mut c,
+            &ClientFrame::SecretInput {
+                request_id,
+                bytes: PROBE.as_bytes().to_vec(),
+            },
+        )
+        .await;
+
+        let result = tokio::time::timeout(Duration::from_secs(25), call)
+            .await
+            .expect("the call never returned")
+            .expect("the call");
+        let payload = body(&result);
+        assert_eq!(payload["status"], "secret_provided", "{payload}");
+        assert_eq!(
+            payload["data"]["bytes_written"],
+            (PROBE.len() + extra) as u64,
+            "append_newline={append_newline}: the count is not the written length"
+        );
+        assert!(
+            !whole_result(&result).contains(PROBE),
+            "append_newline={append_newline}: the response carried the value"
+        );
+        let _ = s.signal(Signal::Kill);
+    }
+}
+
+/// REQ-TST-006, extended from 0.0.6's frame path to the **tool** path:
+/// **this is the documented limitation; if this assertion changes, update
+/// §5.2 and §9.5.**
+///
+/// A child that does not disable echo gets the same treatment from
+/// Holdfast — the value is in no log and in no MCP response — and the
+/// value **does** reach the ring buffer, because the *child* echoed it.
+/// Holdfast cannot defend against that and does not claim to.
+///
+/// The row exists so the limitation cannot drift unnoticed in either
+/// direction: a future change that silently started capturing would break
+/// the two absences, and one that started claiming a protection Holdfast
+/// does not provide would break the presence.
+#[tokio::test]
+async fn the_documented_echo_on_leak_is_asserted_not_assumed() {
+    let d = TestDaemon::start("echoonleak").await;
+    let s = d.shell_running(&echo_on_fixture());
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    // Nothing raises a request here on its own: the child never drops
+    // ECHO, which is the whole point of the fixture. The tool call raises.
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
     send(
         &mut c,
-        &ClientFrame::Input {
-            bytes: format!("{PROBE}\n").into_bytes(),
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: PROBE.as_bytes().to_vec(),
         },
     )
     .await;
-    let seen = stream_until(&mut c, PROBE.as_bytes(), 20).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(25), call)
+        .await
+        .expect("the call never returned")
+        .expect("the call");
+    let payload = body(&result);
+    assert_eq!(payload["status"], "secret_provided", "{payload}");
+
+    // The child read it — asserted on its transform, so this holds even
+    // for a line discipline that echoed nothing.
+    let seen = stream_until(&mut c, b"got=HUNTER2", 20).await;
     assert!(
-        contains(&seen, PROBE.as_bytes()),
-        "the control saw nothing: the harness could not have caught a leak"
+        contains(&seen, b"got=HUNTER2"),
+        "the value never reached the child: {}",
+        String::from_utf8_lossy(&seen)
     );
-    let buffered = s.buffer_slice(s.buffer_tail(), s.buffer_head());
+
+    // **The limitation.** The child echoed it, so it is in the buffer.
+    let buf = buffered(&s);
     assert!(
-        contains(&buffered, PROBE.as_bytes()),
-        "an ordinary write did not reach the ring buffer, so the absence assertion \
-         in the row above is about a buffer nothing writes to"
+        contains(&buf, PROBE.as_bytes()),
+        "an echo-on child's secret did NOT reach the ring buffer. Either the \
+         fixture stopped echoing — in which case this row no longer asserts \
+         REQ-TST-006's caveat — or Holdfast started capturing, in which case \
+         §5.2 and §9.5 need updating rather than this assertion:\n{}",
+        String::from_utf8_lossy(&buf)
     );
+
+    // **And Holdfast's own behaviour is identical.** Nothing it writes
+    // carries the value: not the response, not the audit log.
+    assert!(
+        !whole_result(&result).contains(PROBE),
+        "the value reached the MCP response"
+    );
+    let audit = std::fs::read_to_string(d.paths.audit_log()).unwrap_or_default();
+    assert_eq!(
+        secret_audit_kinds(&d, &s.id),
+        vec!["secret_input_request", "secret_input_resolved"],
+        "the audit log holds no line for this call, so sweeping it proves \
+         nothing:\n{audit}"
+    );
+    assert!(
+        !audit.contains(PROBE),
+        "the value reached the audit log:\n{audit}"
+    );
+
     let _ = s.signal(Signal::Kill);
 }
 
@@ -2728,6 +3379,45 @@ fn confirming_config() -> Config {
         daemon: DaemonConfig::default(),
         ..Config::default()
     }
+}
+
+/// A binding whose only job is to make the daemon write one line to
+/// `daemon.log` on the secret path.
+///
+/// `match_command` is an unclosed group, which `regex::Regex::new` refuses
+/// and `secret::binding::pattern_matches` answers by naming the binding in
+/// a diagnostic and **declining to match**. That is the whole contract:
+/// it never selects, never spends a use and never spawns anything, and it
+/// is what stops `a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`
+/// sweeping an empty capture for the value.
+///
+/// **`Config::validate` would reject this at load and that is correct.**
+/// A daemon built from a `Config` value in Rust does not run the
+/// validator, which is the one way to reach the branch — and the branch is
+/// reachable in production too, because §10.2's example is loaded by
+/// operators who may add a binding a later regex-crate version stops
+/// compiling.
+fn leak_canary_binding() -> SecretBinding {
+    SecretBinding {
+        name: "leak-canary".to_string(),
+        match_command: "(".to_string(),
+        match_prompt: String::new(),
+        provider: "wincred".to_string(),
+        reference: "op://vault/never-read/password".to_string(),
+        max_uses: None,
+        require_confirm: false,
+    }
+}
+
+/// [`confirming_config`] with the canary **first** in configured order.
+///
+/// First, because §9.6 probes in configured order and this one never
+/// matches: it emits its diagnostic and hands the probe on to
+/// `prod-shell`, which is what the row is actually about.
+fn canary_and_confirming_config() -> Config {
+    let mut c = confirming_config();
+    c.security.secret_bindings = vec![leak_canary_binding(), confirming_binding()];
+    c
 }
 
 /// The next frame matching `pred`, skipping the child's output.
