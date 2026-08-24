@@ -498,9 +498,10 @@ pub struct SecurityConfig {
     /// ran**. That second window is wider than "since the credential was
     /// resolved", which is what this sentence used to say: the
     /// `expect_writes` snapshot is taken where the caller *decides* to
-    /// resolve — `autofill_from_binding`, one statement before the
-    /// `spawn_blocking` — so it covers the whole provider round trip and
-    /// not just the interval after the value came back.
+    /// resolve — `autofill_from_binding`'s `AutofillGuard`, built before
+    /// the `spawn_blocking` that runs the provider — so it covers the
+    /// whole provider round trip and not just the interval after the
+    /// value came back.
     /// [`crate::session::WriteRequest::SecretIfUnread`]'s doc on that field
     /// says the same thing from the writer's side, and is where the
     /// reasoning is.

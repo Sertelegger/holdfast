@@ -3025,8 +3025,8 @@ mod tests {
                 "binding_approval".to_string(),
                 "binding_resolved".to_string()
             ],
-            "an approved autofill writes the decision and the resolution, and no \
-             prompt path ran"
+            "an approved step-1 resolution writes the decision and the resolution, \
+             and no prompt path ran"
         );
         let trail = sc.audit_text();
         assert!(
@@ -3061,18 +3061,27 @@ mod tests {
         );
         //
         // **The raw sweep above is the redactor-independent one and this
-        // one is not, deliberately.** `read_output` redacts, and
-        // `generic-secret-assignment` matches `Password:` followed by any
-        // eight non-space bytes — so a value that *had* leaked into the
-        // buffer right after this child's prompt would come back
-        // `[REDACTED:generic]` and pass this assertion. That is why the
-        // ring buffer is read raw one statement earlier; this one is about
-        // the shape of the surface the agent actually calls.
+        // one is not, and the difference is why both are here.**
+        // `read_output` redacts, so an absence assertion over its response
+        // is an assertion about a *redacted* rendering of the buffer.
+        //
+        // **For `PROBE` specifically the two are equivalent, and that is
+        // measured rather than assumed**: `generic-secret-assignment`'s
+        // value group is `[^\s"';,)]{8,}` and `hunter2` is seven bytes, so
+        // `redact_str(rules, "Password: hunter2")` comes back unchanged —
+        // the same fact the `redact_str` control at the end of this row
+        // pins for the bare string. The assertion below is a real one for
+        // this value.
+        //
+        // What the raw sweep buys is the *general* case: any leaked string
+        // of eight or more bytes from that class, landing after a
+        // `password`-ish label, comes back `[REDACTED:generic]` and passes
+        // here.
         //
         // The same rule is why the witness is the child's **prompt** and
-        // not its `got=` transform: measured, `Password: got=HUNTER2` is
-        // redacted whole, so a `got=HUNTER2` witness here would be green
-        // or red depending on what happened to sit between the two.
+        // not its `got=` transform: `got=HUNTER2` *is* eleven bytes of that
+        // class, so measured, `Password: got=HUNTER2` is redacted whole and
+        // a `got=HUNTER2` witness here goes red.
         let read_body = body(
             &server
                 .read_output(Parameters(crate::mcp::tools::ReadOutputArgs {

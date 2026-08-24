@@ -38,28 +38,52 @@
 //! |---|---|---|
 //! | 1 | the `request_secret_input` **MCP response** (`secret_provided` and `secret_cancelled`) | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`], [`the_response_carries_a_length_and_not_a_value`] |
 //! | 2 | the `secret_input_request` and `secret_input_resolved` audit lines | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] |
-//! | 3 | the `binding_resolved` and `binding_approval` audit lines | `binding_approval` here; `binding_resolved` in `secret::binding::tests::a_keychain_resolved_secret_reaches_none_of_them_either`, which is the only place a provider can run |
-//! | 4 | the `BindingApprovalRequired` broadcast frame | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`], and `the_approval_surface_carries_no_reference_and_no_value` in the library |
+//! | 3 | the `binding_resolved` and `binding_approval` audit lines | `binding_approval` here; `binding_resolved` in `secret::binding::tests::a_keychain_resolved_secret_reaches_none_of_them_either`, because a `binding_resolved` line needs a provider that answers and this target cannot reach one |
+//! | 4 | the `BindingApprovalRequired` broadcast frame | **Not here.** `secret::binding::tests::a_keychain_resolved_secret_reaches_none_of_them_either` and `…::the_approval_surface_carries_no_reference_and_no_value`, both of which sweep every frame their client saw |
 //! | 5 | the §9.5 buffer notice | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] phase A, which writes one and then sweeps the buffer it landed in |
-//! | 6 | `daemon.log`, including any provider-failure context | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] captures fd 2 for the whole flow; the **provider-failure** half is `secret::provider::tests::a_failing_providers_stderr_and_reference_reach_no_log` |
+//! | 6 | `daemon.log`, including any provider-failure context | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] captures fd 2 across both its phases, from before the first call to after the last assertion that could leak; the **provider-failure** half is `secret::provider::tests::a_failing_providers_stderr_and_reference_reach_no_log` |
 //! | 7 | the ring buffer, a second attached client's `Output` stream, and any other `read_output` response — unchanged from 0.0.6 | [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] |
 //!
-//! **Only the keychain half of surface 3 is absent from this file, and
-//! that is forced rather than chosen.** A `binding_resolved` line is
-//! written only when a provider *answers*, the only provider a test may
-//! run is a script the test itself wrote (REQ-TST-007 / Global Constraint
-//! 12), and the type that runs one — `ScriptProvider` — is `#[cfg(test)]`,
-//! which an integration target cannot see. Every row that resolves a real
-//! value therefore lives in `secret::binding`'s own test module. Writing a
-//! `binding_resolved`-shaped absence here would assert about a line this
-//! target cannot cause to exist, which is the vacuity this whole file is
-//! organised against.
+//! **Two of the seven are swept somewhere other than this file — the
+//! keychain half of surface 3, and the whole of surface 4 — and each is
+//! elsewhere for its own reason. Stated precisely, because a coverage
+//! table that overstates is worse than one that omits: this task is an
+//! argument that the absence set is complete, and the argument is only
+//! as good as the table.**
 //!
-//! # §11.2 and §11.4's secret scenarios, mapped
+//! * **Surface 3's keychain half is forced out.** A `binding_resolved`
+//!   line is written only when a provider *answers*, the only provider a
+//!   test may run is a script the test itself wrote (REQ-TST-007 / Global
+//!   Constraint 12), and the type that runs one — `ScriptProvider` — is
+//!   `#[cfg(test)]`, which an integration target cannot see. Every row
+//!   that resolves a real value therefore lives in `secret::binding`'s
+//!   own test module. Writing a `binding_resolved`-shaped absence here
+//!   would assert about a line this target cannot cause to exist, which
+//!   is the vacuity this whole file is organised against.
+//! * **Surface 4 is not swept here at all**, and
+//!   [`a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`] does
+//!   not sweep it despite driving the frame:
+//!   [`next_binding_approval`] destructures the three fields the row
+//!   asserts on and **discards the frame**, and [`stream_until`]
+//!   accumulates only `Output`, so the later stream sweeps do not reach
+//!   it either. A sweep here would also be the vacuous kind — on the tool
+//!   path the approval is raised **before** anything has resolved, so at
+//!   that moment no value exists to be absent from it. The rows that
+//!   sweep it do so over *every* frame their client saw, on **both sides**
+//!   of the decision, which is the shape that is not vacuous.
 //!
-//! Spec line numbers are §11's, as of rev. 49. A scenario this milestone
-//! does **not** implement names the milestone that owns it, so a
-//! mechanical sweep finds a row rather than a gap.
+//! # §11's secret scenarios, mapped
+//!
+//! The scenarios are §11.2's and §11.4's, read at rev. 49, plus one row
+//! from **§11.3** — the Windows-runner assertion, which the brief
+//! requires named here and which belongs to no other subsection. Each
+//! cell cites a section and not a line number: §11 is a bulleted list
+//! whose lines move whenever anything above them is edited, and a line
+//! number in a test file is a citation that goes stale without anything
+//! going red.
+//!
+//! A scenario this milestone does **not** implement names the milestone
+//! that owns it, so a mechanical sweep finds a row rather than a gap.
 //!
 //! | §11 scenario | Implemented by |
 //! |---|---|
@@ -470,12 +494,24 @@ async fn stream_until(c: &mut UnixStream, needle: &[u8], secs: u64) -> Vec<u8> {
             // what arrived and let the caller's own assertion say what is
             // missing.** Frames are ordered, so a needle the child really
             // printed has already been accumulated by the time this
-            // arrives; the only case that reaches here is one where the
-            // needle was never produced. Panicking instead reported "the
-            // helper saw an unexpected frame" for what is always a failure
-            // of the row's own subject — measured, during Task 13's
-            // mutation ladder, on every injection that stopped the value
-            // reaching the child.
+            // arrives; reaching here means the needle was never produced.
+            // Panicking instead reported "the helper saw an unexpected
+            // frame" for what, at every *presence*-asserting call site, is
+            // a failure of the row's own subject — measured during Task
+            // 13's mutation ladder on every injection that stopped the
+            // value reaching the child.
+            //
+            // **It is a weakening at one call site and only one**, and it
+            // is named rather than glossed:
+            // `an_oversize_submission_is_rejected_without_reaching_the_child`
+            // is this helper's single absence-only caller, and there an
+            // early `SessionExited` turns what used to be a loud panic
+            // into a silent pass. Nothing regresses today — that child
+            // sits blocked at `read x` for the whole 2 s window and the
+            // row's `secret_cancelled` / `too_large` assertions run before
+            // this helper is called at all — but a future absence-only
+            // caller over a child that *can* exit needs its own liveness
+            // assertion rather than this helper's panic.
             ServerFrame::SessionExited { .. } => break,
             other => panic!("expected Output, got {other:?}"),
         }
@@ -562,8 +598,14 @@ fn whole_result(r: &CallToolResult) -> String {
     serde_json::to_string(r).expect("a tool result serialises")
 }
 
-/// fd 2, into a file, for the duration of one row — the only way to reach
-/// `daemon.log`'s content from an integration target.
+/// fd 2, into a file, from [`start`](Self::start) to
+/// [`finish`](Self::finish) — the only way to reach `daemon.log`'s content
+/// from an integration target.
+///
+/// **It does not cover a row's whole runtime**, and the caller decides
+/// what it does cover: the seven-surface row starts it after its daemon
+/// and its session are already up, because nothing before that point can
+/// hold a value that does not exist yet.
 ///
 /// `diag::emit` writes through `std::io::stderr()` deliberately, to bypass
 /// libtest's capture, and the shipped daemon's `daemon.log` **is** its fd
@@ -859,11 +901,23 @@ fn the_echo_on_fixtures_are_the_echo_off_one_with_the_stty_calls_removed() {
 
 // ======================================= the seven surfaces, all absent
 
-/// **Every surface 0.0.7 added or inherited, swept whole, for a value the
-/// agent asked for and a human typed.**
+/// **Six of the module header's seven surfaces, swept whole, for a value
+/// the agent asked for and a human typed.**
 ///
-/// The module header's first table is what this row discharges. Two
-/// phases on **one** session, because the surfaces pull in opposite
+/// **Six and not seven, and the arithmetic is stated rather than
+/// implied.** This row sweeps surfaces **1, 2, 3's `binding_approval`
+/// half, 5, 6 and 7**. It *drives* surface 4 — `require_confirm` really
+/// does put a `BindingApprovalRequired` on both clients here — but it
+/// does not sweep it: [`next_binding_approval`] destructures the three
+/// fields asserted below and discards the frame, and [`stream_until`]
+/// accumulates only `Output`. A sweep here would be the vacuous kind
+/// anyway, because on the tool path the approval is raised *before*
+/// anything has resolved and there is no value yet to be absent from it.
+/// Surface 4, and surface 3's `binding_resolved` half, are swept by
+/// `secret::binding::tests::a_keychain_resolved_secret_reaches_none_of_them_either`
+/// over every frame its client saw on both sides of the decision.
+///
+/// Two phases on **one** session, because the surfaces pull in opposite
 /// directions:
 ///
 /// * **Phase A, with nobody attached.** The call times out unanswered, so
@@ -872,10 +926,10 @@ fn the_echo_on_fixtures_are_the_echo_off_one_with_the_stty_calls_removed() {
 ///   (surface 2). Nothing is submitted yet; the notice simply has to be in
 ///   the buffer that gets swept at the end.
 /// * **Phase B, with two clients attached.** `require_confirm` raises a
-///   `BindingApprovalRequired` (surface 4), a human approves it (surface
-///   3's `binding_approval`), `wincred` resolves nothing on every
-///   platform so the call falls through to the human-prompt path, and the
-///   human answers it (surfaces 1 and 7).
+///   `BindingApprovalRequired`, a human approves it (surface 3's
+///   `binding_approval`), `wincred` resolves nothing on every platform so
+///   the call falls through to the human-prompt path, and the human
+///   answers it (surfaces 1 and 7).
 ///
 /// **The positive controls, without which all of the above is satisfied by
 /// an implementation that throws the value away:**
@@ -887,13 +941,15 @@ fn the_echo_on_fixtures_are_the_echo_off_one_with_the_stty_calls_removed() {
 ///    sent something;
 /// 3. `bytes_written`, which is the count the agent is given in place of
 ///    the value;
-/// 4. a witness per surface that the surface is **non-empty and of the
-///    expected shape** — the notice is in the buffer, the four audit kinds
-///    are on the log, the approval frame arrived, fd 2 caught a
+/// 4. a witness per swept surface that the surface is **non-empty and of
+///    the expected shape** — the notice is in the buffer, the four audit
+///    kinds are on the log in order, both `binding_approval` lines are
+///    there, both client streams carry `got=HUNTER2`, the `read_output`
+///    response carries the child's prompt, and fd 2 caught a
 ///    daemon-written line.
 ///
 /// **The `daemon.log` witness is a real diagnostic, provoked on purpose.**
-/// `LEAK_CANARY_BINDING` carries an uncompilable `match_command`, which
+/// [`leak_canary_binding`] carries an uncompilable `match_command`, which
 /// `secret::binding::pattern_matches` answers by writing the binding's
 /// *name* to `daemon.log` and declining to match. It is first in
 /// configured order, so it costs nothing but the line it exists to
@@ -1022,18 +1078,27 @@ async fn a_tool_submitted_secret_reaches_none_of_the_seven_surfaces() {
         String::from_utf8_lossy(&buf)
     );
     // **The raw sweep above is the redactor-independent one; this one is
-    // not, deliberately.** `read_output` redacts, and
-    // `generic-secret-assignment` matches `Password:` followed by any
-    // eight non-space bytes — so a value that *had* leaked into the buffer
-    // right after this child's prompt would come back `[REDACTED:generic]`
-    // and pass this assertion. The ring buffer is read raw one statement
-    // earlier for exactly that reason; this one is about the shape of the
-    // surface the agent actually calls.
+    // not, and the difference is why both are here.** `read_output`
+    // redacts, so an absence assertion over its response is an assertion
+    // about a *redacted* rendering of the buffer.
+    //
+    // **For `PROBE` specifically the two are equivalent, and that is
+    // measured rather than assumed**: `generic-secret-assignment`'s value
+    // group is `[^\s"';,)]{8,}` and `hunter2` is seven bytes, so
+    // `redact_str(rules, "Password: hunter2")` comes back unchanged. The
+    // assertion below is a real one for this value.
+    //
+    // What the raw sweep buys is the *general* case: any leaked string of
+    // eight or more bytes from that class, landing after a `password`-ish
+    // label, comes back `[REDACTED:generic]` and passes here. A future
+    // change to `PROBE` would silently move this row into that class, and
+    // the raw read one statement earlier is what stops that mattering.
     //
     // The same rule is why the witness is the child's **prompt** and not
-    // its `got=` transform: measured, `Password: got=HUNTER2` is redacted
-    // whole, and a `got=HUNTER2` witness here was green only because
-    // §9.5's notice happened to sit between the two.
+    // its `got=` transform: `got=HUNTER2` *is* eleven bytes of that class,
+    // so measured, `Password: got=HUNTER2` is redacted whole — and a
+    // `got=HUNTER2` witness here was green only because §9.5's notice
+    // happened to sit between the two.
     let read_body = d.read_output(&s.id).await;
     assert!(
         read_body["data"]["output"]
