@@ -494,8 +494,18 @@ pub struct SecurityConfig {
     ///
     /// The write is refused unless the child is still at an echo-off read
     /// (read from the tty at the moment of writing, not from a cache) and
-    /// nothing has been written to the child since the credential was
-    /// resolved. **One case gets past both**, and it is filed rather than
+    /// nothing has been written to the child since **before the provider
+    /// ran**. That second window is wider than "since the credential was
+    /// resolved", which is what this sentence used to say: the
+    /// `expect_writes` snapshot is taken where the caller *decides* to
+    /// resolve — `autofill_from_binding`, one statement before the
+    /// `spawn_blocking` — so it covers the whole provider round trip and
+    /// not just the interval after the value came back.
+    /// [`crate::session::WriteRequest::SecretIfUnread`]'s doc on that field
+    /// says the same thing from the writer's side, and is where the
+    /// reasoning is.
+    ///
+    /// **One case gets past both**, and it is filed rather than
     /// fixed: a child that drops echo, emits *nothing*, then draws its
     /// prompt, while a byte written earlier still sits unread in the tty
     /// input queue. That byte answers the echo-off read and the credential
