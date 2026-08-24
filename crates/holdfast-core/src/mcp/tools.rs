@@ -16,6 +16,7 @@ use crate::pty::{clamp_geometry, InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
 use crate::secret::binding::{Autofill, Resolved};
 use crate::secret::{CancelReason, RaisedBy, Resolution, SlotSnapshot, SlotTake};
+use crate::session::SecretWrite;
 use crate::session::{new_session_id, wait, Session, SessionConfig, WriteRequest};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -1689,7 +1690,15 @@ impl HoldfastServer {
         // A *snapshot* and not the outstanding id: the id alone cannot see
         // a raise that appeared **and was answered** while the provider
         // ran, because that leaves the slot vacant again (GH #35).
-        let raised_before = hub.secrets().snapshot(&session.id);
+        //
+        // And the session's write count beside it: a credential resolved
+        // for *this* read must not be written if something else has
+        // answered that read in the meantime, and nothing about that
+        // touches a slot.
+        let raised_before = AutofillGuard {
+            slot: hub.secrets().snapshot(&session.id),
+            writes: session.writes_performed(),
+        };
 
         let security = self.config.security.clone();
         let processor = Arc::clone(&self.processor);
@@ -1746,7 +1755,7 @@ impl HoldfastServer {
         &self,
         session: &Arc<Session>,
         resolved: Resolved,
-        raised_before: &SlotSnapshot,
+        raised_before: &AutofillGuard,
     ) -> Option<CallToolResult> {
         let hub = self.attach_hub();
         let Resolved {
@@ -1793,48 +1802,45 @@ impl HoldfastServer {
         // stand: the binding *did* resolve, and §9.6 counts resolutions
         // from the store rather than values written to a PTY.
         //
-        // ## And first, the question the slot cannot answer
+        // ## And the question the slot cannot answer, which is not asked here
         //
         // **Everything above observes `SecretSlots`, and the child's read
         // can be satisfied by routes that never touch a slot**: an MCP
         // `send_input` (REQ-SEC-011 allows it during `AwaitingSecret`, with
         // a warning), a human typing ordinary input at an attached
         // terminal, or the child abandoning the read itself. With a client
-        // attached those all end with `forward_events` closing the raise on
-        // `AwaitingSecretLeft`, so the closure count moves and the checks
-        // below refuse. **With nobody attached there is no raise at all**,
+        // attached those end with `forward_events` closing the raise on
+        // `AwaitingSecretLeft`, so the closure count moves and the check
+        // above refuses. **With nobody attached there is no raise at all**,
         // the count never moves, and the slot answers `Vacant` for a child
         // that has already moved on — which is the unattended case
         // `autofill_on_echo_off` exists for.
         //
-        // Driven, before this check existed: the child's first read was
-        // satisfied by `send_input`, `stty echo` restored echo, and the
-        // resolved credential was written into the *next*, echoing read —
-        // where the line discipline put it straight into the ring buffer
-        // (`hunter2`, then `next=[hunter2]`) and `read_output` would hand
-        // it to the agent. That is the failure this milestone exists to
-        // prevent, reached without an agent call and without a human.
+        // A version of this function asked `session.is_awaiting_secret()`
+        // right here and **it did not close that**, for two measured
+        // reasons: the flag is a cache the reader thread refreshes only
+        // when the child produces output, so a child that is silent
+        // between two reads leaves it reading `true` indefinitely; and
+        // even a correct answer is separated from the write by the write
+        // queue, which `send_input`'s bytes share. Both are stated in full
+        // at [`WriteRequest::SecretIfUnread`], which is where the question
+        // is now asked — on the writer thread, one statement before the
+        // write, against the tty rather than a cache of it.
         //
-        // §8.3's own classification is the only authority on *"is this
-        // child still at an echo-off prompt?"* and it is what is consulted
-        // here. **It is not atomic and cannot be** — there is no lock over
-        // a tty — but it turns a window as long as
-        // `keychain_provider_timeout_secs` into the microseconds between
-        // this line and the queued write. Checked **before** the take,
-        // deliberately: taking the slot and then refusing would close a
-        // request a human may still be looking at.
-        if !session.is_awaiting_secret() {
-            drop(secret);
-            return None;
-        }
+        // **It also asked the wrong question.** §8.3's classification is
+        // narrower than "echo is off": `Fullscreen` and `AtPrompt` preempt
+        // it, so a genuine `getpass` inside an alt-screen TUI is not
+        // `AwaitingSecret` — and `request_secret_input` had no echo-state
+        // precondition before that check existed. The writer gates on the
+        // echo state itself, which is the condition the harm actually
+        // turns on.
         let request_id = match hub
             .secrets()
-            .take_if_unadopted_matching(&session.id, raised_before)
+            .take_if_unadopted_matching(&session.id, &raised_before.slot)
         {
             SlotTake::Taken(raised) => {
                 let id = raised.request_id().to_string();
                 drop(raised);
-                hub.broadcast_secret_closed(&session.id, &id, "fulfilled");
                 Some(id)
             }
             SlotTake::Vacant => None,
@@ -1843,18 +1849,50 @@ impl HoldfastServer {
                 return None;
             }
         };
+        // **The closure is broadcast after the outcome is known, not
+        // before.** The take has to happen first — two answers to one
+        // prompt must produce one write — but the *word* must not: a write
+        // the writer declines would otherwise have told every attached
+        // client `fulfilled` for a value the child never received.
+        let close = |outcome: &str| {
+            if let Some(id) = &request_id {
+                hub.broadcast_secret_closed(&session.id, id, outcome);
+            }
+        };
 
-        // The same write path a client's `SecretInput` takes: the value
-        // moves into the queue as a `SecretBytes` and is zeroed by its own
-        // `Drop` the moment the writer is done with it.
-        let (write, ack) = WriteRequest::secret(secret);
+        // The same write path a client's `SecretInput` takes, plus the two
+        // conditions §9.6's autofill needs and a human's keystroke does
+        // not: the value moves into the queue as a `SecretBytes` and is
+        // zeroed by its own `Drop` whether the writer writes it or refuses
+        // it.
+        let (write, ack) = WriteRequest::secret_if_unread(secret, raised_before.writes);
         if session.write_queue().send(write).await.is_err() {
+            close("cancelled");
             return Some(self.session_died_under_autofill(session));
         }
         let bytes_written = match ack.await {
-            Ok(Ok(n)) => n as u64,
-            _ => return Some(self.session_died_under_autofill(session)),
+            Ok(Ok(SecretWrite::Written(n))) => n as u64,
+            // Refused at the write. **Falls through like every other
+            // non-resolution**, so the agent learns nothing it could not
+            // learn from a session with no bindings at all — and the
+            // reason goes to `daemon.log`, which is where an operator
+            // debugging "my binding never fires" will look. The binding
+            // name is safe there; the reference and the value have no path
+            // to it (REQ-SEC-016).
+            Ok(Ok(SecretWrite::Declined(why))) => {
+                crate::diag!(
+                    "holdfast: the `{binding_name}` binding resolved but the value was \
+                     not written: {why:?}"
+                );
+                close("cancelled");
+                return None;
+            }
+            _ => {
+                close("cancelled");
+                return Some(self.session_died_under_autofill(session));
+            }
         };
+        close("fulfilled");
         // §4.1 counts a write as activity, or a session idle-reaps while
         // its own credential is being filled in.
         session.note_activity();
@@ -1916,7 +1954,7 @@ impl HoldfastServer {
         prompt_text: &str,
         append_newline: bool,
         caller_deadline: Option<std::time::Instant>,
-        raised_before: SlotSnapshot,
+        raised_before: AutofillGuard,
     ) -> Option<CallToolResult> {
         let hub = self.attach_hub();
         let window = crate::secret::approval_window(
@@ -2975,6 +3013,30 @@ fn lost_approval(session: &Arc<Session>) -> ApprovalEnd {
 /// it has no parameter that string could enter (REQ-SEC-012). Carrying
 /// the distinction out as a value is what lets the approval be sited
 /// where the string legitimately lives.
+/// The state §9.6's autofill took its decision against, carried across
+/// everything it waits on and checked again at the write.
+///
+/// **Two halves, because the credential can be invalidated two ways and
+/// neither sees the other.**
+///
+/// * `slot` is the secret slot (GH #35): a raise answered while the
+///   provider ran means a human has already typed a value.
+/// * `writes` is [`Session::writes_performed`]: *anything* written to this
+///   child in the window may have satisfied the read the credential was
+///   resolved for — most obviously an MCP `send_input`, which §5.2 permits
+///   during `AwaitingSecret` (REQ-SEC-011) and which touches no slot at
+///   all.
+///
+/// The first is checked here, under the slot's lock; the second is checked
+/// **in the writer thread**, because a check here is separated from the
+/// write by the write queue and bytes already in that queue are exactly
+/// the case it has to catch. See [`WriteRequest::SecretIfUnread`].
+#[derive(Debug, Clone)]
+struct AutofillGuard {
+    slot: SlotSnapshot,
+    writes: u64,
+}
+
 enum StepOne {
     /// Resolved, written, and this is the caller's answer.
     Done(CallToolResult),
@@ -2990,7 +3052,7 @@ enum StepOne {
         /// [`HoldfastServer::inject_resolved`] covers the human round
         /// trip as well as the provider call. Read off the hub and never
         /// from an argument.
-        raised_before: SlotSnapshot,
+        raised_before: AutofillGuard,
     },
     /// Step 2: broadcast `AwaitingSecret` and wait for a human.
     FellThrough,

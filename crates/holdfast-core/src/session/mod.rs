@@ -25,7 +25,7 @@ use crate::screen::{
 use crate::{HoldfastError, Result};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -250,6 +250,20 @@ pub struct Session {
     /// `PromptDetector` is a pure classifier with no previous mode and an
     /// edge is not computable from its state.
     awaiting_secret: Arc<std::sync::atomic::AtomicBool>,
+    /// How many writes this session's PTY has actually **taken**, bumped
+    /// in [`Session::write_input_acked`] after the backend accepted them.
+    ///
+    /// **A performed count, not a queued one, and that is the whole
+    /// point.** §9.6's autofill decides to write a credential and then
+    /// goes away for as long as `keychain_provider_timeout_secs` while a
+    /// credential store answers. Anything written to the child in that
+    /// window may have satisfied the very read the credential was
+    /// resolved for — after which the credential lands in the child's
+    /// *next* read, which is usually echoing, and the line discipline
+    /// puts it straight into the ring buffer. Sampling this before the
+    /// provider call and comparing it in the writer thread is how that is
+    /// refused; see [`WriteRequest::SecretIfUnread`].
+    writes_performed: Arc<AtomicU64>,
     /// §4.3's write queue — the *push* half of the same fan-out
     /// `output_tx` is the pull half of.
     ///
@@ -336,6 +350,74 @@ pub enum WriteRequest {
         secret: SecretBytes,
         ack: tokio::sync::oneshot::Sender<Result<usize>>,
     },
+    /// §9.6's autofill credential, written **only if** the child is still
+    /// at the echo-off read it was resolved for.
+    ///
+    /// ## Why the decision is here and not at the call site
+    ///
+    /// The autofill decides to write, then goes away for as long as
+    /// `keychain_provider_timeout_secs` while a credential store answers.
+    /// A check taken before that — or even immediately before the enqueue
+    /// — is separated from the write by **this queue**, and two
+    /// interleavings get through it:
+    ///
+    /// 1. **A stale predicate.** `Session::is_awaiting_secret` is a cache
+    ///    the reader thread refreshes only when the child produces output,
+    ///    so a child that restores echo and then prints nothing leaves it
+    ///    reading `true` indefinitely. Driven: `stty -echo; read x;
+    ///    stty echo; read y` leaked the credential into the second,
+    ///    echoing read — and therefore into the ring buffer `read_output`
+    ///    serves to the agent — with the flag still `true`.
+    /// 2. **Bytes already in flight.** `Input` and `Secret` share this one
+    ///    FIFO. A `send_input` queued ahead of the credential satisfies
+    ///    the echo-off read, and the credential lands in the next one. The
+    ///    predicate was *correct when evaluated* and the write still
+    ///    leaked, because the state changed on account of bytes in the
+    ///    very queue the credential was about to join.
+    ///
+    /// Evaluating in the writer closes the first by construction — the
+    /// decision happens at the moment of writing — and `expect_writes`
+    /// closes the second by naming the state the decision was taken
+    /// against, in the same shape `SlotSnapshot` uses for the secret slot.
+    SecretIfUnread {
+        secret: SecretBytes,
+        /// [`Session::writes_performed`] as it stood when the caller
+        /// decided to resolve — **before** the provider ran, not before
+        /// the enqueue. Anything written to this child in between may have
+        /// satisfied the read the credential was resolved for.
+        expect_writes: u64,
+        ack: tokio::sync::oneshot::Sender<Result<SecretWrite>>,
+    },
+}
+
+/// What the writer did with a [`WriteRequest::SecretIfUnread`].
+///
+/// **A named answer rather than `Result<usize>` with a sentinel**: the
+/// caller renders "written" and "declined" as two different outcomes —
+/// one closes a request `fulfilled` and the other falls through to a human
+/// — and a `0` that means "declined" is one careless normalisation away
+/// from meaning "wrote an empty line".
+#[derive(Debug, PartialEq, Eq)]
+pub enum SecretWrite {
+    Written(usize),
+    /// Nothing was written and the value was dropped, which zeroes it.
+    Declined(DeclineReason),
+}
+
+/// Which of [`WriteRequest::SecretIfUnread`]'s two conditions refused.
+///
+/// Two, and they are **not** the same condition seen twice: a child that
+/// abandons its own read moves no counter, and bytes written ahead of the
+/// credential can satisfy the read long before the child gets far enough
+/// to restore echo. Each has its own row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// The child is no longer at an echo-off read — or the backend cannot
+    /// say, which is refused for the same reason.
+    NotEchoOff,
+    /// Something else was written to this child between the decision and
+    /// this write.
+    OtherWriteIntervened,
 }
 
 impl WriteRequest {
@@ -352,6 +434,65 @@ impl WriteRequest {
         let (ack, rx) = tokio::sync::oneshot::channel();
         (Self::Secret { secret, ack }, rx)
     }
+
+    /// A conditional secret write — see [`WriteRequest::SecretIfUnread`].
+    ///
+    /// **Not the default spelling, deliberately.** `attach::conn`'s
+    /// `SecretInput` arm carries a value a human typed *at* the prompt
+    /// they are looking at, with no provider round trip in between, so it
+    /// has nothing to be stale about. This one is for §9.6's autofill,
+    /// which does.
+    pub fn secret_if_unread(
+        secret: SecretBytes,
+        expect_writes: u64,
+    ) -> (Self, tokio::sync::oneshot::Receiver<Result<SecretWrite>>) {
+        let (ack, rx) = tokio::sync::oneshot::channel();
+        (
+            Self::SecretIfUnread {
+                secret,
+                expect_writes,
+                ack,
+            },
+            rx,
+        )
+    }
+}
+
+/// [`WriteRequest::SecretIfUnread`]'s two conditions and the write they
+/// guard, on the writer thread.
+///
+/// **Order matters, and it is the cheap-and-certain one first.**
+/// `expect_writes` is a load of an atomic; the echo test is a syscall.
+/// Both refuse, so the order is not a correctness question — but the
+/// counter is also the condition that can be true while the child is
+/// *still* at its prompt (bytes ahead of the credential have not been
+/// consumed yet), which is the case a termios read cannot see at all.
+///
+/// **`echo != Some(false)` and not `echo == Some(true)`.** A backend that
+/// cannot sample the line discipline reports `None`, and "we cannot
+/// confirm the child is at an echo-off read" is refused for the same
+/// reason "it is not" is. §8.3's own classification requires
+/// `echo == Some(false)`, so a caller that got this far on such a backend
+/// is already impossible; this is the belt to that braces.
+///
+/// The value is dropped — and therefore zeroed — on both refusals,
+/// before returning.
+fn write_secret_if_unread(
+    session: &Arc<Session>,
+    secret: SecretBytes,
+    expect_writes: u64,
+) -> Result<SecretWrite> {
+    if session.writes_performed() != expect_writes {
+        drop(secret);
+        return Ok(SecretWrite::Declined(DeclineReason::OtherWriteIntervened));
+    }
+    if session.line_discipline().echo != Some(false) {
+        drop(secret);
+        return Ok(SecretWrite::Declined(DeclineReason::NotEchoOff));
+    }
+    let result = secret.with_bytes(|b| session.write_input(b));
+    drop(secret);
+    result.map(SecretWrite::Written)
 }
 
 /// What a session tells its attached clients beyond raw output (§7.5).
@@ -466,6 +607,7 @@ impl Session {
         let (events_tx, _) = broadcast::channel(SESSION_EVENT_FRAMES);
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_FRAMES);
         let awaiting_secret = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writes_performed = Arc::new(AtomicU64::new(0));
 
         // Geometry and mode are applied by `set_screen_config` right
         // after construction; the default matches `PtySpawnConfig::new`
@@ -502,6 +644,7 @@ impl Session {
             output_tx: output_tx.clone(),
             events_tx: events_tx.clone(),
             awaiting_secret: Arc::clone(&awaiting_secret),
+            writes_performed: Arc::clone(&writes_performed),
             write_tx,
             last_activity_ms: Arc::clone(&last_activity_ms),
             exited_at_secs: Arc::new(AtomicI64::new(0)),
@@ -835,6 +978,18 @@ impl Session {
                         drop(secret);
                         let _ = ack.send(result);
                     }
+                    // §9.6's autofill. Both conditions are evaluated
+                    // **here**, on the writer thread, one statement before
+                    // the write — which is the only place where "the child
+                    // is at an echo-off read" and "this value is the next
+                    // thing it will receive" are still true together.
+                    WriteRequest::SecretIfUnread {
+                        secret,
+                        expect_writes,
+                        ack,
+                    } => {
+                        let _ = ack.send(write_secret_if_unread(&session, secret, expect_writes));
+                    }
                 }
             }
         });
@@ -1037,6 +1192,27 @@ impl Session {
     /// to be told anyway.
     pub fn is_awaiting_secret(&self) -> bool {
         self.awaiting_secret.load(Ordering::Relaxed)
+    }
+
+    /// The child's line discipline, sampled **now** — one `tcgetattr`.
+    ///
+    /// **Live, unlike [`is_awaiting_secret`](Self::is_awaiting_secret),
+    /// which is a cache.** That flag's only writer is the reader thread,
+    /// and that loop runs only when a chunk arrives from the child — the
+    /// same statement this file already makes about the *entry* edge
+    /// (*"a child that drops `ECHO` and writes nothing raises no request
+    /// until its next byte of output"*) is true of the *exit* edge too.
+    /// So a child that restores echo and then prints nothing leaves the
+    /// flag reading `true` for an unbounded time, and anything that has to
+    /// know whether the child is *still* at an echo-off read must ask
+    /// here instead.
+    pub fn line_discipline(&self) -> crate::pty::LineDiscipline {
+        self.backend.line_discipline()
+    }
+
+    /// How many writes this session's PTY has taken — see the field.
+    pub fn writes_performed(&self) -> u64 {
+        self.writes_performed.load(Ordering::Relaxed)
     }
 
     /// The prompt line the child has drawn, redacted (§9.2).
@@ -1557,6 +1733,11 @@ impl Session {
         }
         let pre_write_head = self.buffer.lock().head();
         self.backend.write(data)?;
+        // **After the backend took it**, so the count is of writes the
+        // child can have seen. A failed write must not move it: §9.6's
+        // autofill refuses a credential when this changed under it, and a
+        // write that never reached the PTY satisfied no read.
+        self.writes_performed.fetch_add(1, Ordering::Relaxed);
         self.touch();
         Ok(WriteAck {
             bytes_written: data.len(),
