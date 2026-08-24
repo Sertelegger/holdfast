@@ -478,7 +478,35 @@ pub struct SecurityConfig {
     /// one's gate, via `secret::binding::keychain_step_runs`.
     #[serde(default = "d_secret_provider")]
     pub secret_provider: String,
-    /// **Unread — 0.0.7.**
+    /// §9.6's silent injection. **Read** — `HoldfastServer::watch_for_autofill`
+    /// arms a listener on §8.3's echo-drop edge when it is set, and arms
+    /// nothing at all when it is not.
+    ///
+    /// **Default `false`, and REQ-SEC-014 makes that default a requirement
+    /// in its own right**: *"silent credential injection is powerful and
+    /// should be opted into per deployment, not inherited."* With it on and
+    /// a matching binding, the daemon resolves a credential and types it
+    /// into the child with no agent tool call and no human in the loop
+    /// (§16.4: *"steps 4–7 collapse"*).
+    ///
+    /// ## What an operator is opting into, stated here rather than only in
+    /// an issue tracker (GH #43)
+    ///
+    /// The write is refused unless the child is still at an echo-off read
+    /// (read from the tty at the moment of writing, not from a cache) and
+    /// nothing has been written to the child since the credential was
+    /// resolved. **One case gets past both**, and it is filed rather than
+    /// fixed: a child that drops echo, emits *nothing*, then draws its
+    /// prompt, while a byte written earlier still sits unread in the tty
+    /// input queue. That byte answers the echo-off read and the credential
+    /// answers the **next** one, which usually echoes — so it reaches the
+    /// ring buffer, and `read_output` serves the ring buffer to the agent.
+    ///
+    /// It is narrow: it needs this flag on, `secret_provider` allowing the
+    /// keychain, a binding that matches the session, and that exact
+    /// silence-with-queued-input shape. It is not theoretical — it has been
+    /// reproduced. The obstacle to closing it is a PTY-lifetime tension
+    /// (see `write_secret_if_unread`), not a missing check here.
     #[serde(default = "d_autofill_on_echo_off")]
     pub autofill_on_echo_off: bool,
     /// **Unread — 0.0.8.**

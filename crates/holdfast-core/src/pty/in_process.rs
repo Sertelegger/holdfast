@@ -109,6 +109,19 @@ impl InProcessPty {
             .spawn_command(cmd)
             .map_err(|e| HoldfastError::Pty(format!("spawn: {e}")))?;
         // Drop the slave so the master sees EOF when the child exits.
+        //
+        // **This line is load-bearing in a second place, and it is not
+        // obvious from here (GH #43).** `TIOCINQ` — *"how many bytes has
+        // this child been sent that it has not read yet"* — answers only
+        // on the **slave** fd; the master returns 0. §9.6's autofill needs
+        // exactly that quantity to know whether a credential it is about
+        // to write will answer the read it was resolved for or the one
+        // after it, and it has no way to ask because of this `drop`. The
+        // trade is deliberate and the EOF is worth more today: keeping a
+        // slave fd alive costs the signal the reader loop ends on, which
+        // is how every session detects its own exit. Recorded so the
+        // tension is visible from both ends rather than rediscovered as a
+        // missing API.
         drop(pair.slave);
 
         let pid = child.process_id();

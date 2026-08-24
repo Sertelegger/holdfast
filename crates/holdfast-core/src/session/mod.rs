@@ -477,6 +477,32 @@ impl WriteRequest {
 ///
 /// The value is dropped — and therefore zeroed — on both refusals,
 /// before returning.
+///
+/// ## What neither condition can see, and why (GH #43)
+///
+/// **Bytes written *before* the decision that the child has not yet
+/// consumed.** Both tests then pass, correctly and on their own terms:
+/// nothing has been written *since* the sample, so the counter matches,
+/// and the child really is still at an echo-off read, so the tty says
+/// `Some(false)`. The queued byte satisfies that read, and the credential
+/// lands in the child's **next** one — which usually echoes, and therefore
+/// reaches the ring buffer `read_output` serves to the agent. Driven: a
+/// child that drops echo, prints nothing, then prompts, with one byte
+/// already queued, gives `Password: next=[hunter2]`.
+///
+/// The missing quantity is *"how many bytes are already queued and
+/// unread"*, which neither a write counter nor a termios read can supply.
+///
+/// **The obstacle is not a missing API, and recording that wrongly is
+/// worse than recording nothing.** `TIOCINQ` answers exactly this, the fd
+/// is already reachable (`in_process.rs`'s `as_raw_fd`, which this very
+/// function's echo test ioctls), and measured on a real pty it returns the
+/// wanted count — **on the slave**; the master answers 0. The obstacle is
+/// that `InProcessPty::spawn` **drops the slave on purpose so the master
+/// sees EOF when the child exits**, and that EOF is what the reader loop
+/// ends on. So this is a design tension between observing the input queue
+/// and detecting child exit, and any repair resolves that tension in the
+/// PTY backend rather than here.
 fn write_secret_if_unread(
     session: &Arc<Session>,
     secret: SecretBytes,

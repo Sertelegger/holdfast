@@ -3003,16 +3003,6 @@ fn lost_approval(session: &Arc<Session>) -> ApprovalEnd {
     }
 }
 
-/// What §5.2's step 1 concluded, for the one caller that acts on it.
-///
-/// **Three answers and not `Option<CallToolResult>`, because §17.5 added
-/// a third.** `None` used to mean *"fall through"* and now has to be told
-/// apart from *"a human has to decide first"* — and the two are handled
-/// in different places on purpose: the approval needs the agent's
-/// `prompt_text`, and `autofill_from_binding`'s security property is that
-/// it has no parameter that string could enter (REQ-SEC-012). Carrying
-/// the distinction out as a value is what lets the approval be sited
-/// where the string legitimately lives.
 /// The state §9.6's autofill took its decision against, carried across
 /// everything it waits on and checked again at the write.
 ///
@@ -3037,6 +3027,16 @@ struct AutofillGuard {
     writes: u64,
 }
 
+/// What §5.2's step 1 concluded, for the one caller that acts on it.
+///
+/// **Three answers and not `Option<CallToolResult>`, because §17.5 added
+/// a third.** `None` used to mean *"fall through"* and now has to be told
+/// apart from *"a human has to decide first"* — and the two are handled
+/// in different places on purpose: the approval needs the agent's
+/// `prompt_text`, and `autofill_from_binding`'s security property is that
+/// it has no parameter that string could enter (REQ-SEC-012). Carrying
+/// the distinction out as a value is what lets the approval be sited
+/// where the string legitimately lives.
 enum StepOne {
     /// Resolved, written, and this is the caller's answer.
     Done(CallToolResult),
