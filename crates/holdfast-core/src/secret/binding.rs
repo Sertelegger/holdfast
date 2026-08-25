@@ -123,15 +123,21 @@
 //!
 //! **`match_command` is matched against `command` and `args` joined with
 //! single spaces and not shell-quoted.** The join is built here, at match
-//! time, and exists nowhere else: §9.4's `session_start` records the two
-//! **element-wise, never joined**, and `mcp::tools`' `session_record`
-//! gives the reason — *"joining with a space and redacting the result
-//! would let a rule match across an argument boundary"*. So an operator
-//! cannot lift a binding regex out of a log line, because no log line
-//! carries this form; the plan claimed otherwise and was wrong. Adding a
-//! joined field to the audit record to make the claim true would trade a
-//! documentation convenience for the redaction hazard that shape was
-//! chosen to avoid.
+//! time, and no *record* carries this form: §9.4's `session_start` records
+//! the two **element-wise, never joined**, and `mcp::tools`'
+//! `session_record` gives the reason — *"joining with a space and redacting
+//! the result would let a rule match across an argument boundary"*. So an
+//! operator cannot lift a binding regex out of a log line; the plan claimed
+//! otherwise and was wrong. Adding a joined field to the audit record to
+//! make the claim true would trade a documentation convenience for the
+//! redaction hazard that shape was chosen to avoid.
+//!
+//! **There is one other producer of the join, and it is not a subject.**
+//! [`redacted_command_line`] renders the same two fields for
+//! `BindingApprovalRequired`, so that a human approves *this command line
+//! receiving this credential* rather than a binding name. It redacts
+//! element-wise and then joins — the order the paragraph above requires —
+//! and nothing matches against its output.
 //!
 //! The un-quoted join means an argument containing a space can straddle a
 //! word boundary in the regex. That is a documented property and not a bug
@@ -189,6 +195,39 @@ pub fn command_line(command: &str, args: &[String]) -> String {
         line.push_str(arg);
     }
     line
+}
+
+/// The same line, for a **human** rather than for a matcher.
+///
+/// §17.5's approval asks somebody to agree that *this command line* may
+/// receive *this credential*, so the line has to be on the frame. It also
+/// has to cross the same boundary every other string does, and
+/// `Session.command`/`args` are agent-authored: an agent that puts a token
+/// in an argument would otherwise have `BindingApprovalRequired` carry it
+/// to every attached client. So this rendering is redacted, on the rule
+/// `AwaitingSecret.prompt_text` already follows.
+///
+/// **Element-wise, then joined — never the other way round.** §9.4's
+/// `session_start` and `mcp::tools`' `session_record` both record the two
+/// separately and give the reason: *"joining with a space and redacting
+/// the result would let a rule match across an argument boundary"*. A rule
+/// that fired across the join would blank out two arguments an operator
+/// needs to read, in the one place they are being asked to make a
+/// decision about them.
+///
+/// **Not what [`select`] matches against, and the two must not be
+/// unified.** The matcher reads the *unredacted* join, for the same reason
+/// `match_prompt` reads the unredacted prompt line: matching a redacted
+/// string would let the redactor silently switch an operator's binding
+/// off — or, worse here, switch a *different* one on.
+pub fn redacted_command_line(
+    rules: &crate::output::rules::RuleSet,
+    command: &str,
+    args: &[String],
+) -> String {
+    use crate::output::redact::redact_str;
+    let redacted: Vec<String> = args.iter().map(|a| redact_str(rules, a)).collect();
+    command_line(&redact_str(rules, command), &redacted)
 }
 
 /// Does §5.2's step 1 run at all?
@@ -2977,14 +3016,16 @@ mod tests {
         let approval = await_approval(&server, &s.id).await;
 
         // The frame reached the client, and it is §7.5's frame: the
-        // binding's name and provider, so a human can see *which*
-        // credential is about to be used.
+        // binding's name, its provider, and **the command line that would
+        // receive the credential**, so a human can see *which* credential
+        // is about to be used and *what for*.
         let frame = client
             .wait_for("BindingApprovalRequired", is_approval)
             .await;
         let ServerFrame::BindingApprovalRequired {
             approval_id,
             binding_name,
+            command_line,
             provider,
             session,
             ..
@@ -2996,6 +3037,14 @@ mod tests {
         assert_eq!(binding_name, b.name);
         assert_eq!(provider, "pass");
         assert_eq!(session, s.id);
+        // GH #45. Without this the human is approving the label
+        // `prod-ssh`, which reads identically for `ssh user@prod-01` and
+        // for a line the agent appended a transport redirect to — and
+        // deciding between those two is the entire purpose of asking.
+        assert_eq!(
+            command_line, "ssh user@prod-01",
+            "the approval frame does not say what the credential would be used for"
+        );
         // Nothing has resolved yet: §9.6's "ask me first" is answered
         // **before** the store is touched, not after.
         assert!(
@@ -3044,6 +3093,94 @@ mod tests {
             line["decided_by"], "cli",
             "decided_by is the deciding connection's handshake client_kind (§9.4, Q11)"
         );
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// The approval frame's `command_line` is **redacted**, and the
+    /// **matcher's** subject is not — one row, because the two rules pull
+    /// in opposite directions and an implementation that unified them
+    /// would break exactly one of them.
+    ///
+    /// The session's argv carries a GitHub token. `command`/`args` are the
+    /// agent's own strings, and this frame fans out to every attached
+    /// client, so the rendering must go through the redactor like every
+    /// other string on the wire. But `select` must **not**: matching a
+    /// redacted line would let the redactor decide which binding fires,
+    /// which is the same defect `match_prompt_is_matched_against_the_unredacted_line`
+    /// pins one layer over.
+    ///
+    /// **The pattern is what makes both halves load-bearing.** It spells
+    /// the token's *shape* out to the end of the line, so a matcher
+    /// reading `[REDACTED:github]` selects nothing, no approval is raised,
+    /// and `await_approval` times out — the row fails at the top rather
+    /// than reporting a redaction it never reached.
+    #[tokio::test]
+    async fn the_approval_command_line_is_redacted_and_the_matchers_subject_is_not() {
+        const TOKEN: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+
+        let mut sc = Scratch::new("apprredact");
+        let b = confirming(
+            &mut sc,
+            "prod-ssh",
+            "^ssh\\s+prod-01\\s+--token\\s+ghp_[0-9A-Za-z]{36}$",
+        );
+        let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
+        let s = session_running("ssh", &["prod-01", "--token", TOKEN], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        await_prompt(&s, b"Password: ").await;
+
+        let call = spawn_call(&server, secret_args(&s.id, 20));
+        // Reaching here at all is the second half: the binding selected,
+        // so `select` saw the token and not a marker.
+        let approval = await_approval(&server, &s.id).await;
+
+        let frame = client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+        let ServerFrame::BindingApprovalRequired { command_line, .. } = frame else {
+            unreachable!()
+        };
+        assert!(
+            !command_line.contains(TOKEN),
+            "the agent's own argument put a token on a frame that fans out to every \
+             attached client: {command_line}"
+        );
+        assert!(
+            command_line.contains("[REDACTED:github]"),
+            "the command line is not redacted, it is merely missing the token — which \
+             a truncation would also produce: {command_line}"
+        );
+        // Redacted **element-wise and then joined**, not joined and then
+        // redacted: the arguments either side of the token are intact, so
+        // an operator can still read what the credential would be used
+        // for. That is the ordering §9.4's `session_record` requires and
+        // the reason this assertion is here rather than only the two
+        // above.
+        assert!(
+            command_line.starts_with("ssh prod-01 --token "),
+            "the redactor ate across an argument boundary: {command_line}"
+        );
+        assert_eq!(approval.command_line, command_line);
+
+        assert_eq!(
+            decide(
+                &server,
+                &s.id,
+                &approval.approval_id,
+                ApprovalDecision::Deny,
+                "cli"
+            ),
+            crate::secret::Decide::Recorded
+        );
+        // Denied, so the call falls through to the prompt path and ends on
+        // its own deadline. Awaited rather than dropped, so the row leaves
+        // nothing running.
+        let payload = joined(call, "the denied call").await;
+        assert_eq!(payload["status"], "secret_cancelled", "{payload}");
+        assert!(!sc.ran("prod-ssh"), "a denied approval ran the provider");
 
         client.unregister(&server);
         let _ = s.signal(Signal::Kill);

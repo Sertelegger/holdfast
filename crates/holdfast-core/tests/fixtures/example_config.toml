@@ -131,7 +131,9 @@ strict_confirmation = false
 # provider        = "secret-service"
 # reference       = "service=holdfast,account=prod-ssh"
 # max_uses        = 20
-# require_confirm = false
+# require_confirm is true by default (§9.6). Setting it false resolves the
+# credential with no human in the loop.
+# require_confirm = true
 
 [ui]
 # No socket-path knob. All three sockets live in the runtime directory

@@ -255,6 +255,7 @@ impl AttachHub {
             let _ = c.tx.try_send(ServerFrame::BindingApprovalRequired {
                 approval_id: approval.approval_id.clone(),
                 binding_name: approval.binding_name.clone(),
+                command_line: approval.command_line.clone(),
                 provider: approval.provider.clone(),
                 session: approval.session_id.clone(),
                 prompt_text: approval.prompt_text.clone(),

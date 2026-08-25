@@ -17,9 +17,11 @@
 //! Nothing in this module has a field, parameter or return type able to
 //! hold a secret. That is the same structural claim [`SecretBytes`] makes
 //! one layer down, applied to the surface REQ-SEC-016 is about: an
-//! approval carries the binding's **name** and **provider** and stops
-//! there, because *"approving is a decision about which credential, not
-//! an exposure of it"* (§9.6). The reference is likewise absent, and its
+//! approval carries the binding's **name**, its **provider** and the
+//! session's **command line** and stops there, because *"approving is a
+//! decision about which credential, not an exposure of it"* (§9.6) — and
+//! because a decision about which credential is not one a human can make
+//! from a label alone (GH #45). The reference is likewise absent, and its
 //! absence is a real omission rather than an accident of ordering — the
 //! reference exists in the daemon's config at the moment [`Approval`] is
 //! built, so leaving it out is a decision. The **value** does not exist
@@ -36,10 +38,11 @@
 //! `expires_at`/`created_at`/`started_at` outright: *"a bare name is a
 //! claim the value does not support"*. Nothing this milestone puts on a
 //! wire carries a timestamp at all — `BindingApprovalRequired` is
-//! `{approval_id, binding_name, provider, session, prompt_text}` — so the
-//! rule binds nothing today. It is applied here anyway, to a field that
-//! is currently daemon-internal, because **this registry is where a later
-//! hand adds one**: 0.0.10 renders this same lifecycle at
+//! `{approval_id, binding_name, command_line, provider, session,
+//! prompt_text}` — so the rule binds nothing today. It is applied here
+//! anyway, to a field that is currently daemon-internal, because **this
+//! registry is where a later hand adds one**: 0.0.10 renders this same
+//! lifecycle at
 //! `GET /api/binding-approvals`, and the field crosses the HTTP API the
 //! moment it does. 0.0.8's revision found exactly this shape on
 //! `confirmation/list_pending`, whose `expires_at` had to become
@@ -132,6 +135,14 @@ pub struct Approval {
     /// shows"*. **Never the reference** (REQ-SEC-016) — there is no field
     /// here able to hold one.
     pub binding_name: String,
+    /// The session's own command line, redacted element-wise and then
+    /// joined (GH #45). **A binding name alone is not enough to approve
+    /// against** — see [`ServerFrame::BindingApprovalRequired`]'s field,
+    /// which this one exists to feed.
+    ///
+    /// It is a *rendering*: `secret::binding::select` matches against the
+    /// unredacted join and never against this.
+    pub command_line: String,
     /// The §9.6 config spelling, as `ArgvProvider::as_str` gives it.
     pub provider: String,
     pub session_id: String,
@@ -149,6 +160,7 @@ impl Approval {
     pub fn new(
         session_id: &str,
         binding_name: &str,
+        command_line: &str,
         provider: &str,
         prompt_text: &str,
         expires_at_unix_secs: u64,
@@ -157,6 +169,7 @@ impl Approval {
         Self {
             approval_id: format!("appr_{}", &id[..12]),
             binding_name: binding_name.to_string(),
+            command_line: command_line.to_string(),
             provider: provider.to_string(),
             session_id: session_id.to_string(),
             prompt_text: prompt_text.to_string(),
@@ -425,7 +438,14 @@ mod tests {
     const S: &str = "sess_1";
 
     fn approval() -> Approval {
-        Approval::new(S, "prod-ssh", "secret-service", "a credential", 0)
+        Approval::new(
+            S,
+            "prod-ssh",
+            "ssh prod-01",
+            "secret-service",
+            "a credential",
+            0,
+        )
     }
 
     #[test]
@@ -455,6 +475,12 @@ mod tests {
         assert!(rendered.contains("binding_name"), "{rendered}");
         assert!(rendered.contains("provider"), "{rendered}");
         assert!(rendered.contains("expires_at_unix_secs"), "{rendered}");
+        // GH #45. The four absences above are all still true of a type
+        // carrying only a *name*, which is the surface a human could not
+        // decide from — so the field that fixed that is pinned here too,
+        // in the one row that reads this type's whole declared shape.
+        assert!(rendered.contains("command_line"), "{rendered}");
+        assert_eq!(a.command_line, "ssh prod-01");
         assert!(a.approval_id.starts_with("appr_"), "{}", a.approval_id);
     }
 
@@ -585,7 +611,7 @@ mod tests {
         let approvals = BindingApprovals::new();
         let first = approval();
         let _rx = approvals.raise(first.clone()).expect("raise");
-        let second = Approval::new(S, "other-binding", "pass", "p", 0);
+        let second = Approval::new(S, "other-binding", "ssh prod-01", "pass", "p", 0);
         assert!(
             approvals.raise(second).is_none(),
             "a second approval on one session was accepted"
@@ -620,7 +646,7 @@ mod tests {
             "an approval that expired must not still be approvable"
         );
 
-        let b = Approval::new(S, "prod-ssh", "secret-service", "p", 0);
+        let b = Approval::new(S, "prod-ssh", "ssh prod-01", "secret-service", "p", 0);
         let rx = approvals.raise(b.clone()).expect("raise");
         assert_eq!(approvals.supersede(S).as_ref(), Some(&b));
         assert!(rx.await.is_err());

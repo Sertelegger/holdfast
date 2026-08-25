@@ -96,6 +96,31 @@ surfaces rather than redacted on them.
   agent is**, and an operator who reaches past the check has chosen to widen
   their own binding.
 
+- **`BindingApprovalRequired` carries the session's command line**, so a human
+  approves *this command line receiving this credential* rather than a binding
+  name. `prod-ssh` reads identically whether the session is `ssh prod-01` or
+  `ssh prod-01 -o ProxyCommand=nc 127.0.0.1 2222`, and telling those apart is
+  the whole of the decision being asked for. `holdfast attach` and `holdfast
+  watch` both print it. The field is `command` and `args` joined with single
+  spaces and **redacted element-wise before the join** — the frame reaches every
+  attached client and those two fields are the agent's own strings.
+
+  This is mitigation and not a fix: it does nothing for
+  `autofill_on_echo_off`, which is the unattended case, and it asks a person to
+  read a long line. It is additive on the attach protocol, and
+  `PROTOCOL_MAJOR.PROTOCOL_MINOR` stays at **1.0** — the shape recorded for a
+  protocol version nothing has yet been distributed speaking is corrected rather
+  than superseded. The argument is in `tests/wire_shape.rs`.
+
+- **`require_confirm` now defaults to `true`.** It defaulted to `false`, which
+  made silent resolution the shape an operator got by leaving a line out. A
+  binding that omits the key now resolves only after a human has seen the
+  command line; write `require_confirm = false` to get the old behaviour back.
+  `autofill_on_echo_off` still defaults `false` and stays there — one key
+  decides whether the credential store is consulted at all, the other whether a
+  human sees the command line first, and both defaults are the position that
+  requires somebody to have decided.
+
 - **What this does not close, stated because the code must not claim more than
   it delivers.** An agent that can start `ssh prod-01` at all still obtains the
   credential's *effect* — an interactive shell on the target — once injection

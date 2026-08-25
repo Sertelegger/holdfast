@@ -1134,12 +1134,26 @@ pub async fn attach(session: &str) -> ExitCode {
                     // §23.3 surface and an exhaustive match must cover
                     // it. Dropping the frame silently would leave a human
                     // watching a session stop with nothing said, so it is
-                    // named — **binding and provider only**, which is all
+                    // named — **binding, provider and the command line
+                    // that would receive the credential**, which is all
                     // the frame carries (REQ-SEC-016).
-                    ServerFrame::BindingApprovalRequired { binding_name, provider, .. } => {
+                    //
+                    // **The command line is the point of the line, not
+                    // decoration** (GH #45): `prod-ssh` reads identically
+                    // whether the session is `ssh prod-01` or `ssh
+                    // prod-01 -o ProxyCommand=nc 127.0.0.1 2222`, and a
+                    // human who cannot see which one it is has nothing to
+                    // decide with. Already redacted by the daemon.
+                    ServerFrame::BindingApprovalRequired {
+                        binding_name,
+                        command_line,
+                        provider,
+                        ..
+                    } => {
                         diag!(
                             "holdfast attach: the session is waiting for approval to use the \
-                             `{binding_name}` binding ({provider}); this build cannot answer it"
+                             `{binding_name}` binding ({provider}) for `{command_line}`; this \
+                             build cannot answer it"
                         );
                     }
                     // Another client resized the session. This terminal
@@ -1368,10 +1382,14 @@ pub async fn watch(session: &str) -> ExitCode {
                     // *"an authorisation decision, not an observation"*.
                     // Reported for the same reason `AwaitingSecret` is,
                     // and with no more than the frame carries.
-                    ServerFrame::BindingApprovalRequired { binding_name, .. } => {
+                    ServerFrame::BindingApprovalRequired {
+                        binding_name,
+                        command_line,
+                        ..
+                    } => {
                         diag!(
                             "holdfast watch: the session is waiting for approval to use the \
-                             `{binding_name}` binding"
+                             `{binding_name}` binding for `{command_line}`"
                         );
                     }
                     ServerFrame::Resize { cols, rows } => {

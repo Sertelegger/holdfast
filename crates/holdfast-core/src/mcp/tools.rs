@@ -1971,9 +1971,21 @@ impl HoldfastServer {
             .saturating_add(window.as_millis() as i64)
             .max(0) as u64
             / 1000;
+        // **What the human is actually approving** (GH #45). A binding
+        // name reads the same for `ssh prod-01` and for `ssh prod-01 -o
+        // ProxyCommand=nc 127.0.0.1 2222`, and the second is the one a
+        // person would refuse — so the line goes on the frame beside the
+        // name. Redacted element-wise before the join, because
+        // `command`/`args` are the agent's own strings and this frame
+        // reaches every attached client.
         let approval = crate::secret::Approval::new(
             &session.id,
             binding_name,
+            &crate::secret::binding::redacted_command_line(
+                &self.processor.rules,
+                &session.command,
+                &session.args,
+            ),
             provider,
             prompt_text,
             expires_at_unix_secs,

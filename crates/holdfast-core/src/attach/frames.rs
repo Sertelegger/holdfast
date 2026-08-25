@@ -272,13 +272,13 @@ pub enum ServerFrame {
     /// §9.6's `require_confirm` approval, raised when a binding that
     /// carries it matches this session (§7.5, §17.5).
     ///
-    /// **The binding's *name* and provider, never the reference and never
-    /// the value** (REQ-SEC-016): *"approving is a decision about which
-    /// credential, not an exposure of it."* The reference exists in the
-    /// daemon's config at the moment this frame is built, so its absence
-    /// here is a real omission and not an accident of ordering; the value
-    /// does not exist yet at all, because resolution happens only *after*
-    /// approval.
+    /// **The binding's *name*, provider and the session's command line —
+    /// never the reference and never the value** (REQ-SEC-016):
+    /// *"approving is a decision about which credential, not an exposure
+    /// of it."* The reference exists in the daemon's config at the moment
+    /// this frame is built, so its absence here is a real omission and not
+    /// an accident of ordering; the value does not exist yet at all,
+    /// because resolution happens only *after* approval.
     ///
     /// **No expiry field, and that is REQ-T-018 rather than an
     /// oversight.** Rev. 47 widened the requirement to this surface and it
@@ -297,6 +297,30 @@ pub enum ServerFrame {
         /// §9.6's override key: *"the only part of a binding any surface
         /// shows"*.
         binding_name: String,
+        /// **The session's actual command line, so the human approves
+        /// *this command line receiving this credential* rather than a
+        /// name** (GH #45, 0.0.7a).
+        ///
+        /// A binding name is a label an operator chose months ago; it says
+        /// nothing about the session in front of them. `prod-ssh` reads
+        /// identically whether the session is `ssh prod-01` or `ssh
+        /// prod-01 -o ProxyCommand=nc 127.0.0.1 2222`, and the second is
+        /// the one a human would refuse. That is the whole reason this
+        /// field exists.
+        ///
+        /// `command` and `args` joined with single spaces, **redacted
+        /// element-wise before the join** — see
+        /// [`crate::secret::binding::redacted_command_line`], which is the
+        /// only thing that builds it. It is a rendering and not a subject:
+        /// nothing matches against it.
+        ///
+        /// **Mitigation, not a fix, and the frame should not be read as
+        /// more.** It does nothing for `autofill_on_echo_off`, which is
+        /// the unattended case, and it asks a person to read a long line.
+        /// What closes the hole is `binding::whole_line` and
+        /// `Config::validate`'s tail check; this is the layer that puts
+        /// the decision in front of somebody who can see what it is about.
+        command_line: String,
         /// The §9.6 config spelling, as `ArgvProvider::as_str` gives it.
         provider: String,
         /// The canonical session id, so a client watching several can put
@@ -788,6 +812,7 @@ mod tests {
         let f = encode(&ServerFrame::BindingApprovalRequired {
             approval_id: "appr_a1b2".into(),
             binding_name: "prod-ssh".into(),
+            command_line: "ssh prod-01".into(),
             provider: "secret-service".into(),
             session: "sess_a1b2".into(),
             prompt_text: "a credential".into(),
@@ -798,14 +823,21 @@ mod tests {
             vec![
                 "approval_id",
                 "binding_name",
+                "command_line",
                 "prompt_text",
                 "provider",
                 "session",
                 "type",
             ],
-            "§7.5's five fields and the tag — no `reference`, no `value`, and no bare \
+            "§7.5's six fields and the tag — no `reference`, no `value`, and no bare \
              `expires_at` (REQ-SEC-016, REQ-T-018)"
         );
+        // `command_line` is a *rendering* for a human and carries no more
+        // than `command` and `args` already do. The pin is that it is
+        // there at all: a frame that lost it would put a human back to
+        // approving a binding name, which is the state GH #45 was filed
+        // against.
+        assert_eq!(field(&f, "command_line").as_text(), Some("ssh prod-01"));
         assert_eq!(field(&f, "type").as_text(), Some("BindingApprovalRequired"));
 
         let f = encode(&ClientFrame::ApproveBinding {
@@ -1024,6 +1056,7 @@ mod tests {
             ServerFrame::BindingApprovalRequired {
                 approval_id: "appr_1".into(),
                 binding_name: "prod-ssh".into(),
+                command_line: "ssh prod-01".into(),
                 provider: "secret-service".into(),
                 session: "s".into(),
                 prompt_text: String::new(),

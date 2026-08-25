@@ -564,7 +564,23 @@ pub struct SecretBinding {
     pub reference: String,
     #[serde(default)]
     pub max_uses: Option<u32>,
-    #[serde(default)]
+    /// **Defaults to `true`** (GH #45).
+    ///
+    /// It defaulted to `false` through 0.0.7, which made silent
+    /// resolution the shape an operator got by omitting a line. That is
+    /// the wrong default for a key whose *on* position is the only thing
+    /// standing between a matched binding and a credential typed into a
+    /// child, and it is the wrong default specifically because the thing
+    /// being matched — the session's command line — is written by the
+    /// agent.
+    ///
+    /// **The asymmetry with `autofill_on_echo_off`, which defaults `false`
+    /// and stays there, is deliberate.** That key decides whether the
+    /// credential store is consulted *at all* without a tool call; this
+    /// one decides whether a human sees the command line first. The safe
+    /// position of the first is *off* and of the second is *on*, and both
+    /// are the position that requires somebody to have decided.
+    #[serde(default = "d_require_confirm")]
     pub require_confirm: bool,
 }
 
@@ -811,6 +827,10 @@ fn d_events() -> Vec<String> {
 }
 fn d_notification_rate_limit_per_min() -> u32 {
     10
+}
+/// See [`SecretBinding::require_confirm`] for why this is `true`.
+fn d_require_confirm() -> bool {
+    true
 }
 fn d_idle_shutdown_after_secs() -> u64 {
     86_400
@@ -1561,6 +1581,41 @@ require_confirm = false
         assert!(!b.require_confirm);
         // Nothing reads any of the seven in 0.0.5 — that is 0.0.7's — so
         // the assertion here is that they *parse*, not that they act.
+    }
+
+    /// **`require_confirm` defaults to `true`** (GH #45).
+    ///
+    /// A binding that omits the key resolves a credential into a child
+    /// **after** a human has seen the command line, not before. It
+    /// defaulted `false` through 0.0.7, which made silent resolution what
+    /// an operator got by leaving a line out — of a key whose whole job is
+    /// to put a person in front of a decision about a command line the
+    /// agent wrote.
+    ///
+    /// **Both directions, because a default is only a default if the
+    /// explicit value still wins.** A validator that ignored the key and
+    /// forced `true` would pass a one-sided row, and would silently
+    /// override every operator who had written `false` on purpose.
+    #[test]
+    fn require_confirm_defaults_on() {
+        let block = |line: &str| {
+            format!(
+                "[[security.secret_bindings]]\nname = \"prod-ssh\"\n\
+                 match_command = '^ssh\\s+prod-01$'\nmatch_prompt = \"\"\n\
+                 provider = \"secret-service\"\nreference = \"r\"\n{line}"
+            )
+        };
+        let omitted = parse_str(&block("")).expect("a binding without the key must load");
+        assert!(
+            omitted.security.secret_bindings[0].require_confirm,
+            "a binding that says nothing about `require_confirm` resolves a credential \
+             with no human in the loop"
+        );
+        // The pairing. An operator who wrote `false` meant `false`.
+        let off = parse_str(&block("require_confirm = false\n")).expect("load");
+        assert!(!off.security.secret_bindings[0].require_confirm);
+        let on = parse_str(&block("require_confirm = true\n")).expect("load");
+        assert!(on.security.secret_bindings[0].require_confirm);
     }
 
     #[test]

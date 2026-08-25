@@ -115,8 +115,8 @@ ServerFrame::SecretRequestClosed
   declared: outcome, request_id
   wire:     {outcome: "<str>", request_id: "<str>", type: "SecretRequestClosed"}
 ServerFrame::BindingApprovalRequired
-  declared: approval_id, binding_name, prompt_text, provider, session
-  wire:     {approval_id: "<str>", binding_name: "<str>", prompt_text: "<str>", provider: "<str>", session: "<str>", type: "BindingApprovalRequired"}
+  declared: approval_id, binding_name, command_line, prompt_text, provider, session
+  wire:     {approval_id: "<str>", binding_name: "<str>", command_line: "<str>", prompt_text: "<str>", provider: "<str>", session: "<str>", type: "BindingApprovalRequired"}
 ServerFrame::ProtocolError
   declared: frame_kind, reason
   wire:     {frame_kind: "<str>", reason: "<str>", type: "ProtocolError"}

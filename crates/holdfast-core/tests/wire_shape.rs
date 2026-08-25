@@ -20,6 +20,13 @@
 //! It stops being available the moment a binary is published, and the
 //! next hand should assume it already has.
 //!
+//! **It was taken a second time, by 0.0.7a, and that one alters an
+//! existing `wire:` line rather than only appending to the document** —
+//! `BindingApprovalRequired` gains `command_line` (GH #45). The argument
+//! is at [`RECORDED_VERSIONS`], where the rule requires it to be, and
+//! includes the part that matters most: two uses of an escape hatch is
+//! where it starts looking like a procedure.
+//!
 //! # What this records
 //!
 //! A text document — [`shape_document`] — built from the **encoded
@@ -129,6 +136,39 @@ const RECORDED_VERSIONS: &[(u32, u32)] = &[
     // "deletions" are `variants:` lines that gained a name inline): no
     // field removed, none renamed, no `type` tag changed, no `wire:` line
     // altered.
+    //
+    // **0.0.7a took the third path a second time, and this one *does*
+    // alter an existing `wire:` line**, so 0.0.7's narrower argument does
+    // not extend to it and the burden lands here as the failure message
+    // says it should. `BindingApprovalRequired` gains `command_line`
+    // (GH #45): a human was being asked to approve a binding *name* for a
+    // command line the agent wrote, and `prod-ssh` reads identically
+    // whether the session is `ssh prod-01` or `ssh prod-01 -o
+    // ProxyCommand=nc 127.0.0.1 2222`.
+    //
+    // The argument, made here and not only in a commit message:
+    //
+    // 1. **The change is additive in the sense the bump rule cares
+    //    about.** One field added to one *server* frame. No field removed,
+    //    none renamed, no type changed, no `type` tag changed, no client
+    //    frame added. A peer built against the older shape skips a key it
+    //    does not know — which is why `frames.rs` carries no
+    //    `deny_unknown_fields`.
+    // 2. **Protocol 1.0 is unreleased.** The `v0.1.0` tag is 0.0.12's, and
+    //    this project's binding event is **first external distribution**,
+    //    which has not happened. There is no peer in the world speaking
+    //    1.0 to skew against, so a `(1, 1)` row would record a
+    //    compatibility promise to nobody and permanently describe 1.0 as a
+    //    shape no binary ever spoke.
+    // 3. **The record is therefore corrected rather than superseded.**
+    //    What ships as protocol 1.0 is what `1.0.golden` describes. That
+    //    is the whole value of the file, and it is worth more than an
+    //    append that would be honest about a history no external consumer
+    //    has.
+    //
+    // **This stops being available the moment a binary is published**, and
+    // the next hand should assume it already has. Two uses of an escape
+    // hatch is where it starts looking like a procedure.
     (1, 0),
 ];
 
@@ -497,6 +537,7 @@ fn server_frames() -> Vec<ServerFrame> {
         ServerFrame::BindingApprovalRequired {
             approval_id: STR.into(),
             binding_name: STR.into(),
+            command_line: STR.into(),
             provider: STR.into(),
             session: STR.into(),
             prompt_text: STR.into(),
