@@ -2449,11 +2449,14 @@ impl HoldfastServer {
         // avoided.
         let mut rx = AnswerOnce(Some(rx));
 
-        // §5.1's third way out, and it is subscribed **before** the first
-        // poll so an exit landing in between is still queued for us.
+        // §5.1's and §5.2's ways out, subscribed **before** the first
+        // poll so an edge landing in between is still queued for us. One
+        // subscription and one future: the two events arrive on the same
+        // ordered broadcast, so whichever comes first is the one that
+        // ended the wait, and there is no tie between them to break.
         let mut events = session.subscribe_events();
-        let exit = session_exit(session, &mut events);
-        tokio::pin!(exit);
+        let ended = secret_condition_ended(session, &mut events);
+        tokio::pin!(ended);
 
         let woke = tokio::select! {
             r = rx.recv() => match r {
@@ -2465,7 +2468,10 @@ impl HoldfastServer {
             },
             // `&mut sleep`, so the receiver is still ours afterwards.
             _ = &mut sleep => Woke::Deadline,
-            code = &mut exit => Woke::Exited(code),
+            end = &mut ended => match end {
+                SecretEnded::Exited(code) => Woke::Exited(code),
+                SecretEnded::EchoReturned => Woke::EchoReturned,
+            },
         };
 
         let hub = self.attach_hub();
@@ -2488,6 +2494,16 @@ impl HoldfastServer {
                         Resolution::SessionDied {
                             exit_code: code.or_else(|| session.exit_code()),
                         }
+                    }
+                    // §5.2's supersede, reached without an attached
+                    // client: the echo-off condition cleared and nothing
+                    // was written. **No re-raise** — the child is not at
+                    // a prompt any more, and an affordance pointing at
+                    // one that has gone is the same defect the exit arm
+                    // refuses above.
+                    Woke::EchoReturned => {
+                        hub.broadcast_secret_closed(&session.id, request_id, "cancelled");
+                        Resolution::Cancelled(CancelReason::UserCancelled)
                     }
                     Woke::Deadline => {
                         hub.broadcast_secret_closed(&session.id, request_id, "timeout");
@@ -2984,6 +3000,8 @@ enum Woke {
     Deadline,
     /// §5.1: the child ended while the call was waiting.
     Exited(Option<i32>),
+    /// §5.2's supersede: echo came back with no value written.
+    EchoReturned,
 }
 
 /// What ended a §17.5 binding-approval wait.
@@ -3124,6 +3142,73 @@ enum StepOne {
     },
     /// Step 2: broadcast `AwaitingSecret` and wait for a human.
     FellThrough,
+}
+
+/// What ended the condition a secret request was waiting on.
+enum SecretEnded {
+    /// §5.1: the child ended.
+    Exited(Option<i32>),
+    /// §5.2's supersede: echo came back with no submission.
+    EchoReturned,
+}
+
+/// Resolve when the child stops being able to answer: it exits, **or**
+/// echo comes back with nothing written.
+///
+/// **The second half is I-1, and it is the same defect `session_exit`
+/// exists for, one event over.** `request.rs` states the property
+/// outright — *"`user_cancelled` has exactly one producer and it is this
+/// line"* — and that line lives in `attach::conn::forward_events`, which
+/// is **one task per attach connection** and is `abort()`ed with it. So
+/// with nobody attached (which is exactly the deployment §9.5's rung-3
+/// buffer notice exists for) a child that abandons its own echo-off read
+/// produced no observer at all: the event went onto the session broadcast
+/// and was consumed by nothing, the slot stayed raised, and the call sat
+/// out its **entire** `timeout_secs` and answered `timeout`. Driven A/B by
+/// the concurrency review: `user_cancelled after 2.0s` attached,
+/// `timeout after 10.0s` unattended — the same child, decided by whether a
+/// human happened to be watching. The mid-wait variant is the same defect
+/// from the other side: a human who detaches takes the only producer with
+/// them.
+///
+/// §5.1's `session_died` got its caller-owned second observer this
+/// milestone; §5.2's supersede did not. This is it.
+///
+/// **The echo half is strictly edge-triggered and deliberately has no
+/// level re-check**, unlike the liveness half below. `!is_awaiting_secret()`
+/// is *also* true of a request the tool raised on a child whose echo was
+/// never off at all — `no_client_attached_still_waits_the_full_window`
+/// drives exactly that against a `cat` — and answering `user_cancelled`
+/// there would invent §5.2's refused `no_client_attached` reason under a
+/// different name. Only the **transition** means what `user_cancelled`
+/// says. The residual is an edge landing between the raise and this
+/// subscription, which is the same window `forward_events` has always had.
+///
+/// Two observers of one edge is the arrangement §5.1 already runs, and it
+/// is safe for the same reason: whichever reaches the slot first answers,
+/// and the loser's `close_on_caller_timeout` returns `None` and reads the
+/// winner's answer off the hand-over channel. They agree.
+async fn secret_condition_ended(
+    session: &Session,
+    events: &mut tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
+) -> SecretEnded {
+    use crate::session::SessionEvent;
+    use tokio::sync::broadcast::error::RecvError;
+
+    if !session.is_alive() {
+        return SecretEnded::Exited(session.exit_code());
+    }
+    loop {
+        match events.recv().await {
+            Ok(SessionEvent::Exited { code }) => return SecretEnded::Exited(Some(code)),
+            Ok(SessionEvent::AwaitingSecretLeft) => return SecretEnded::EchoReturned,
+            Err(RecvError::Closed) => return SecretEnded::Exited(session.exit_code()),
+            Err(RecvError::Lagged(_)) if !session.is_alive() => {
+                return SecretEnded::Exited(session.exit_code())
+            }
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+        }
+    }
 }
 
 /// Resolve when this session's child ends, with the code it ended with.

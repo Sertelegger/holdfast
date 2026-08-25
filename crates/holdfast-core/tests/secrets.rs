@@ -1957,6 +1957,53 @@ async fn the_child_abandoning_its_read_cancels_the_call() {
     let _ = s.signal(Signal::Kill);
 }
 
+/// **The A/B pairing for the row above, and I-1.**
+///
+/// `user_cancelled`'s only producer was `attach::conn::forward_events` —
+/// **one task per attach connection**, `abort()`ed with it. So the same
+/// child gave two different answers depending on whether a human happened
+/// to be watching. Driven by the concurrency review:
+///
+/// ```text
+/// attached:   status=secret_cancelled reason=user_cancelled after 2.0s
+/// unattended: status=secret_cancelled reason=timeout        after 10.0s
+/// ```
+///
+/// Every existing `user_cancelled` row attaches a client first, so the
+/// suite could not see it. This one attaches nothing, and the elapsed
+/// bound is the discriminator: with no second observer the call sits out
+/// its **whole** 20-second window and answers `timeout`.
+///
+/// Nothing is raised by the echo drop here — `SessionEvent` had exactly
+/// one consumer and it is per connection — so the call itself allocates
+/// the request, which is the unattended shape §9.5's rung-3 notice exists
+/// for.
+#[tokio::test]
+async fn an_unattended_child_that_abandons_its_read_cancels_the_call_too() {
+    let d = TestDaemon::start("unattendedabandon").await;
+    let s = d.shell_running(ABANDONED_READ_FIXTURE);
+
+    let t0 = std::time::Instant::now();
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    await_waiter(&d, &s.id, "the unattended call on an abandoned read").await;
+    let payload = joined(call, "the unattended abandoned call").await;
+    let elapsed = t0.elapsed();
+
+    assert_eq!(
+        cancelled_reason(&payload),
+        "user_cancelled",
+        "with nobody attached the echo restore had no observer, so the call waited \
+         out its whole window and reported a timeout for a child that gave up: \
+         {payload}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the answer arrived at the deadline rather than at the echo restore, which \
+         is the same defect wearing the right reason: {elapsed:?}"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
 /// §5.1: a session that exits under a waiting call answers `session_died`
 /// with the code, not `timeout` two minutes later.
 #[tokio::test]
