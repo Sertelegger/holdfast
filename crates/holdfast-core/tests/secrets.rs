@@ -3566,6 +3566,9 @@ fn each_provider_builds_the_argv_the_plan_pins() {
     let unknown = SecretBinding {
         name: "deploy".into(),
         match_command: "ssh *".into(),
+        // Empty on purpose: `match_example` is read by `Config::validate`
+        // and by nothing else, and this row never goes through the loader.
+        match_example: String::new(),
         match_prompt: "password:".into(),
         provider: "1password".into(),
         reference: "op://v/i/f".into(),
@@ -3612,6 +3615,7 @@ secret_provider = "prompt"
 [[security.secret_bindings]]
 name            = "prod-ssh"
 match_command   = "^ssh\\s+(\\S+@)?prod-0[12]$"
+match_example   = "ssh prod-01"
 match_prompt    = "(?i)password"
 provider        = "secret-service"
 reference       = "service=holdfast,account=prod-ssh"
@@ -3836,6 +3840,12 @@ fn confirming_binding() -> SecretBinding {
         // `regex::escape` instead, because the fixture is a shell
         // one-liner made almost entirely of regex metacharacters.
         match_command: format!("^{}$", regex::escape(&format!("sh -c {ECHO_OFF_FIXTURE}"))),
+        // The line the pattern is for, and it is the same line the
+        // fixture actually runs. Unread on this path — `Config::validate`
+        // is the only consumer and these rows build a `Config` in Rust —
+        // but written out rather than left empty, because a reader
+        // comparing this binding with §10.2's should see the same shape.
+        match_example: format!("sh -c {ECHO_OFF_FIXTURE}"),
         match_prompt: String::new(),
         provider: "wincred".to_string(),
         reference: "op://vault/prod-db/password".to_string(),
@@ -3879,6 +3889,10 @@ fn leak_canary_binding() -> SecretBinding {
     SecretBinding {
         name: "leak-canary".to_string(),
         match_command: "(".to_string(),
+        // No example: `Config::validate` would reject this binding at the
+        // compile step long before it looked at one, which is the point
+        // the doc above makes.
+        match_example: String::new(),
         match_prompt: String::new(),
         provider: "wincred".to_string(),
         reference: "op://vault/never-read/password".to_string(),

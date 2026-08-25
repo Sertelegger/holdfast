@@ -324,7 +324,7 @@ pub enum ServerFrame {
         /// more.** It does nothing for `autofill_on_echo_off`, which is
         /// the unattended case, and it asks a person to read a long line.
         /// What closes the hole is `binding::whole_line` and
-        /// `Config::validate`'s tail check; this is the layer that puts
+        /// `config::admits_only_its_example`; this is the layer that puts
         /// the decision in front of somebody who can see what it is about.
         command_line: String,
         /// The §9.6 config spelling, as `ArgvProvider::as_str` gives it.

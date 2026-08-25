@@ -111,15 +111,24 @@
 //! second half lives in `config.rs`.** The first operator whose
 //! legitimate session stops matching writes `.*` under time pressure,
 //! silently, and the hole is back — so `Config::validate` refuses a
-//! `match_command` left open at **either end**.
+//! `match_command` that gives the line back to the agent, at either end.
 //!
 //! Both ends, because the reflex has two spellings and only one of them
 //! is the original issue. A *leading* `.*` is not the lesser case:
 //! `^.*ssh\s+prod-01$` is matched by a session whose command line is
 //! `sh -c "…read x; echo GOT $x; ssh prod-01"`, so the credential is
 //! typed into the agent's own program and `ssh` is never reached at all.
-//! See `unconstrained_end` there for the known misses, and for why that
-//! check is a deliberately shallow heuristic and must stay one.
+//!
+//! **How that refusal works changed in round 3, and the change is worth
+//! knowing before reading `config.rs`.** It used to be a *syntactic*
+//! scanner that peeled anchors and groups off each end looking for `.*`
+//! and its friends; it grew to ~180 lines and a review still drove twenty
+//! accepted spellings past it. It is now *behavioural*: each binding
+//! carries a `match_example`, and the pattern — wrapped by [`whole_line`],
+//! so it is this module's regex being asked — must match that example and
+//! must **not** match it under a fixed corpus of hostile transformations.
+//! `config::admits_only_its_example` carries the reasoning and, more
+//! importantly, what it still does not close.
 //!
 //! Two live holes this header could previously only warn about are closed
 //! by the same line, and both are pinned by rows below. **The
@@ -155,7 +164,7 @@
 //! **And the credential's *effect* is not protected, only its bytes.** An
 //! agent that can start `ssh prod-01` at all still ends up with an
 //! interactive shell on the target once injection succeeds. What the
-//! whole-line rule and the tail check stop is theft of the **value**, for
+//! whole-line rule and the example check stop is theft of the **value**, for
 //! reuse elsewhere and beyond this session's lifetime, which is why byte
 //! theft was the thing closed first. Nothing here should be read as more
 //! than that.
@@ -403,7 +412,14 @@ fn matches(binding: &SecretBinding, command_line: &str, prompt_line: &str) -> bo
 /// **No `(?s)` is added.** Turning `.` into "any byte including newline"
 /// would *widen* every pattern an operator wrote, in the one direction
 /// this change exists to narrow.
-fn whole_line(pattern: &str) -> String {
+///
+/// **`pub(crate)` so `Config::validate` can compile the same string, and
+/// that is the whole of GH #50.** The validator used to compile the
+/// operator's source *bare* while the matcher compiled it wrapped, so the
+/// two could disagree about whether a pattern was even a regex. It now
+/// calls this, which makes disagreement impossible by construction rather
+/// than by both sides remembering the same rule.
+pub(crate) fn whole_line(pattern: &str) -> String {
     format!(r"\A(?:{pattern})\z")
 }
 
@@ -1018,6 +1034,14 @@ mod tests {
         SecretBinding {
             name: name.to_string(),
             match_command: match_command.to_string(),
+            // **Deliberately empty in this module's rows.**
+            // `match_example` is a *load-time* input: `Config::validate`
+            // is the only thing that reads it, and these rows build a
+            // `SecurityConfig` in Rust without going through the loader.
+            // Filling it in here would suggest the matcher consults it,
+            // which it does not and must not — the matcher's subject is
+            // the session's command line and nothing else.
+            match_example: String::new(),
             match_prompt: String::new(),
             provider: "pass".to_string(),
             reference: REFERENCE.to_string(),

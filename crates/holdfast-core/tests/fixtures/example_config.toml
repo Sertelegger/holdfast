@@ -124,9 +124,16 @@ strict_confirmation = false
 # match_command must match the session's WHOLE command line -- `command`
 # and `args` joined with single spaces (§9.6, rev. 52). A pattern that
 # matches only a prefix leaves every argument after it a free parameter,
-# and the agent writes those. A pattern ending in `.*` gives that back
-# and is refused at load.
+# and the agent writes those.
 # match_command   = "^ssh\\s+(\\S+@)?prod-0[12]$"
+# match_example is REQUIRED (§9.6, rev. 53): the command line you are
+# asserting this binding is for. At load, match_command must match it,
+# and must NOT match it with a hostile suffix, prefix or replacement
+# applied -- ` -o ProxyCommand=...`, `; evil`, `sh -c 'evil' ` and the
+# rest. That is what refuses a pattern left open at either end, without
+# anyone having to guess how "anything" might be spelled. A wildcard you
+# scoped to one argument -- "^ssh\\s+prod-01( -X.*)?$" -- still loads.
+# match_example   = "ssh prod-01"
 # match_prompt    = "(?i)password"
 # provider        = "secret-service"
 # reference       = "service=holdfast,account=prod-ssh"
