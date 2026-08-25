@@ -136,10 +136,15 @@
 //! satisfied by `start_session("cat", ["x", "ssh prod-01 y"])`, whose
 //! joined line is `cat x ssh prod-01 y`, so the credential went to `cat`,
 //! which echoed it straight into the ring buffer. It no longer matches,
-//! because the pattern reaches neither end. And **`match_command = ""`**,
-//! which is still config-legal and still read literally, now matches only
-//! the empty subject — and a session's command line always has a command
-//! in it.
+//! because the pattern reaches neither end. And **`match_command = ""`**
+//! now matches only the empty subject — and a session's command line
+//! always has a command in it. It is also **no longer config-legal**: an
+//! earlier revision of this paragraph said it was, which stopped being
+//! true when round 3 made `match_example` required and judged
+//! `match_command` against it, since the empty pattern cannot match a
+//! non-empty example. It reaches [`matches`] only from a `SecurityConfig`
+//! built in Rust, which is what this module's own rows do — see
+//! `every_fixture_pattern_is_one_an_operator_could_actually_load`.
 //!
 //! ## `match_prompt` is **not** a security control
 //!
@@ -1095,10 +1100,139 @@ mod tests {
         }
     }
 
+    /// Every `match_command` this module's fixtures use, paired with a
+    /// `match_example` that justifies it — and asserted to survive the
+    /// real loader by
+    /// [`every_fixture_pattern_is_one_an_operator_could_actually_load`].
+    ///
+    /// See [`plain_binding`] for why the pairing lives here rather than
+    /// on the fixture.
+    const LOADABLE_FIXTURE_PATTERNS: &[(&str, &str)] = &[
+        (SSH_PROD, "ssh prod-01"),
+        (r"^ssh\s+(\S+@)?prod-0[12]\b", "ssh prod-01"),
+        (r"^psql\s+-h\s+prod$", "psql -h prod"),
+        (r"^git\s+push$", "git push"),
+        (r"ssh\s+prod-01", "ssh prod-01"),
+        (r"ssh\s+prod-01|psql\s+-h\s+prod", "ssh prod-01"),
+        (r"(?m)^ssh\s+prod-01$", "ssh prod-01"),
+    ];
+
+    /// The fixture patterns the loader **refuses**, which is the whole
+    /// subject of the rows that use them.
+    ///
+    /// Each entry names the row it belongs to, so "this corpus could not
+    /// exist in a real config" stays a deliberate, enumerated exception
+    /// rather than an accident nobody noticed.
+    const REFUSED_FIXTURE_PATTERNS: &[(&str, &str)] = &[
+        (
+            "",
+            "neither_an_empty_nor_a_partial_match_command_selects_a_real_session",
+        ),
+        ("^ssh(", "an_uncompilable_pattern_matches_nothing"),
+    ];
+
+    /// Patterns a row **built at runtime** and proved loadable by calling
+    /// [`assert_fixture_pattern_loads`].
+    ///
+    /// Two rows here build their `match_command` with `format!` from the
+    /// very command line they are about — a `regex::escape`d shell
+    /// one-liner, and a temporary path — so there is no constant to list
+    /// and no example to write down in advance. Membership cannot
+    /// describe them; validation can, and it is the stronger check, so
+    /// those rows get the real `Config::validate` instead of a list
+    /// entry.
+    ///
+    /// Process-wide rather than per-row, and that is sound: nothing
+    /// reaches this set without `Config::validate` having accepted it, so
+    /// a pattern one row proved is a pattern any row may use.
+    fn validated_generated_patterns(
+    ) -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+        static VALIDATED: std::sync::OnceLock<
+            parking_lot::Mutex<std::collections::HashSet<String>>,
+        > = std::sync::OnceLock::new();
+        VALIDATED.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    /// Put one fixture pattern in front of the **real** `Config::validate`,
+    /// with the command line it is written for as its `match_example`.
+    ///
+    /// Built in Rust rather than as a TOML document on purpose: one of
+    /// these patterns carries a literal `ESC` and a bare `CR`, which TOML
+    /// string syntax cannot round-trip, and a check that could not
+    /// express the corpus's most hostile member would be the wrong check.
+    /// `parse_str("")` supplies serde's defaults for every other key —
+    /// `Config::default()` would not, since a derived `Default` gives
+    /// `""` and `0` where the loader requires a named mode and a nonzero
+    /// bound.
+    fn assert_fixture_pattern_loads(match_command: &str, match_example: &str) {
+        let mut cfg =
+            crate::config::parse_str("").expect("the empty document is the shipped default");
+        cfg.security.secret_provider = "keychain".to_string();
+        cfg.security.secret_bindings = vec![SecretBinding {
+            name: "corpus".to_string(),
+            match_command: match_command.to_string(),
+            match_example: match_example.to_string(),
+            match_prompt: String::new(),
+            provider: "pass".to_string(),
+            reference: REFERENCE.to_string(),
+            max_uses: None,
+            require_confirm: false,
+        }];
+        cfg.validate().unwrap_or_else(|e| {
+            panic!(
+                "the fixture pattern {match_command:?} is one no operator could load against \
+                 the line it is written for ({match_example:?}), so every row using it is \
+                 about a config that cannot exist: {e}"
+            )
+        });
+        validated_generated_patterns()
+            .lock()
+            .insert(match_command.to_string());
+    }
+
     /// A binding with everything defaulted except what a row is about,
     /// and **no provider fixture** — for the rows that match without
     /// resolving.
+    ///
+    /// **The pattern is checked against the loader's corpus (GH #45
+    /// M-7).** These rows build a `SecurityConfig` in Rust, so nothing
+    /// otherwise makes a fixture pattern one an operator could actually
+    /// load — and since GH #45 round 3 the loader refuses whole classes
+    /// of pattern that a Rust literal still constructs happily. A test
+    /// corpus that could not exist in a real config is a corpus proving
+    /// things about a daemon nobody can run.
+    ///
+    /// The check is *membership*, not validation, and that is deliberate:
+    /// `Config::validate` judges `match_command` against a
+    /// `match_example`, which a fixture does not have and must not grow
+    /// one for (see the `match_example` note below). So the example that
+    /// justifies each pattern lives in
+    /// [`LOADABLE_FIXTURE_PATTERNS`], the deliberate exceptions live in
+    /// [`REFUSED_FIXTURE_PATTERNS`] beside the row that owns them, and
+    /// [`every_fixture_pattern_is_one_an_operator_could_actually_load`]
+    /// drives both lists through `Config::validate`. A new fixture
+    /// pattern in neither list fails **here**, at the row that introduced
+    /// it — and a pattern a row builds at runtime clears this by having
+    /// been validated directly, via
+    /// [`assert_fixture_pattern_loads`].
     fn plain_binding(name: &str, match_command: &str) -> SecretBinding {
+        assert!(
+            LOADABLE_FIXTURE_PATTERNS
+                .iter()
+                .any(|(p, _)| *p == match_command)
+                || REFUSED_FIXTURE_PATTERNS
+                    .iter()
+                    .any(|(p, _)| *p == match_command)
+                || validated_generated_patterns()
+                    .lock()
+                    .contains(match_command),
+            "the fixture pattern {match_command:?} is not accounted for, so nothing says \
+             whether an operator could load it. Add it to `LOADABLE_FIXTURE_PATTERNS` with \
+             the `match_example` that justifies it; or, if the row's subject *is* that the \
+             loader refuses it, to `REFUSED_FIXTURE_PATTERNS` naming the row; or, if the \
+             row builds it at runtime, call `assert_fixture_pattern_loads` with the \
+             command line it is built for."
+        );
         SecretBinding {
             name: name.to_string(),
             match_command: match_command.to_string(),
@@ -1681,11 +1815,17 @@ mod tests {
     /// rather than deleted: the cases are still the ones worth stating,
     /// and a reader who greps for the old name should find where it went.
     ///
-    /// 1. **`match_command = ""`.** Still config-legal, still read
-    ///    literally, and the empty regex now matches only the empty
-    ///    subject — which a session's command line never is, because it
-    ///    always has a command in it. Rejecting it at load is therefore no
-    ///    longer load-bearing and is not done.
+    /// 1. **`match_command = ""`.** The empty regex now matches only the
+    ///    empty subject — which a session's command line never is,
+    ///    because it always has a command in it. An earlier revision
+    ///    added that it was "still config-legal" and that "rejecting it
+    ///    at load is therefore no longer load-bearing and is not done";
+    ///    both stopped being true in round 3, which made `match_example`
+    ///    required and judges `match_command` against it. It **is**
+    ///    rejected at load, driven by
+    ///    [`every_fixture_pattern_is_one_an_operator_could_actually_load`].
+    ///    This row is about the other half — that even reached from Rust,
+    ///    where the loader cannot intervene, it selects nothing real.
     /// 2. **The word-boundary straddle.** An unanchored operator pattern
     ///    used to be satisfiable by an agent that never ran the command at
     ///    all, from a space inside one argument.
@@ -1753,6 +1893,65 @@ mod tests {
         // always answers `None`.
         bad.match_prompt = "x".into();
         assert!(select(std::slice::from_ref(&bad), "ssh prod-01", "x").is_some());
+    }
+
+    /// **The fixture corpus, driven through the real loader (GH #45
+    /// M-7).**
+    ///
+    /// Every row in this module builds its `SecurityConfig` in Rust, so
+    /// until now no fixture pattern had ever been seen by
+    /// `Config::validate` — the check that, since round 3, is what stops
+    /// an operator writing a `match_command` admitting more than the
+    /// session it names. The gap that leaves is not hypothetical: a
+    /// corpus of patterns the daemon would refuse to start on is a corpus
+    /// proving things about a configuration nobody can deploy.
+    ///
+    /// Closed in both directions. Every pattern in
+    /// [`LOADABLE_FIXTURE_PATTERNS`] goes into a real document with the
+    /// example that justifies it and must **load**; every pattern in
+    /// [`REFUSED_FIXTURE_PATTERNS`] must be **refused**, which is what
+    /// makes those rows' subject a real property rather than an assumed
+    /// one. [`plain_binding`] asserts membership, so a pattern in neither
+    /// list cannot slip past this row — it fails at the row that
+    /// introduced it, naming both lists.
+    ///
+    /// **`match_command = ""` is refused at load**, and two sentences in
+    /// this file said the opposite until round 4: that it was *"still
+    /// config-legal"* and that *"rejecting it at load is therefore no
+    /// longer load-bearing and is not done"*. Driven here — it is
+    /// rejected, because it cannot match its own required
+    /// `match_example`. The empty pattern reaches `matches` only where
+    /// this module puts it, from Rust.
+    #[test]
+    fn every_fixture_pattern_is_one_an_operator_could_actually_load() {
+        for (pattern, example) in LOADABLE_FIXTURE_PATTERNS {
+            assert_fixture_pattern_loads(pattern, example);
+        }
+        // **The pairing**, or the loop above is satisfied by an
+        // `assert_fixture_pattern_loads` that accepts everything — which
+        // is the shape this row is written against, since the corpus it
+        // guards is a corpus of things that *should* load.
+        for (pattern, row) in REFUSED_FIXTURE_PATTERNS {
+            let mut cfg =
+                crate::config::parse_str("").expect("the empty document is the shipped default");
+            cfg.security.secret_provider = "keychain".to_string();
+            cfg.security.secret_bindings = vec![SecretBinding {
+                match_command: (*pattern).to_string(),
+                match_example: "ssh prod-01".to_string(),
+                ..plain_binding("corpus", SSH_PROD)
+            }];
+            let e = cfg
+                .validate()
+                .expect_err(&format!(
+                    "{pattern:?} now loads, so `{row}` is no longer a row about a pattern \
+                     the loader refuses — move it to `LOADABLE_FIXTURE_PATTERNS`"
+                ))
+                .to_string();
+            assert!(
+                e.contains("match_command"),
+                "the refusal must name the key an operator has to fix: {e}"
+            );
+        }
     }
 
     // ------------------------------------------- §5.2 step 1, end to end
@@ -2030,13 +2229,17 @@ mod tests {
     /// carrying the child's line instead — which is what the approval row
     /// two hundred lines down ends up asserting, and it is not this.
     ///
-    /// The child-derived half of the same field needs no row and has
-    /// none: the reader strips escapes before the detector sees them and
-    /// the line reconstruction collapses `\r`, so `detection().last_line`
-    /// is already free of control characters. Measured, not assumed —
-    /// `WRONG\x08\x08\x08\x08\x08\rPassword: ` reaches the detector as
-    /// exactly `Password: `. The strip on that path is defence in depth
-    /// and is not load-bearing.
+    /// **The child-derived half of the same field has its own row**, and
+    /// it is [`a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act`].
+    /// An earlier revision of this paragraph said that half needed none,
+    /// because `detection().last_line` was "already free of control
+    /// characters". That was a measurement of one subject —
+    /// `WRONG\x08\x08\x08\x08\x08\rPassword: ` does reach the detector as
+    /// exactly `Password: ` — generalised into a claim about control
+    /// characters at large, which is false: `detect::scanner`'s `ground`
+    /// drops only `0x00..=0x1f | 0x7f`, so all 32 C1 controls survive as
+    /// UTF-8 and land in the line. The strip on that path is load-bearing
+    /// and the sibling row is what says so.
     #[tokio::test]
     async fn an_agents_prompt_text_reaches_the_terminal_with_nothing_that_can_act() {
         let hostile = "\u{1b}]0;forged\u{7}\u{1b}[2Kpassword for prod-01:\rall clear";
@@ -2078,6 +2281,116 @@ mod tests {
 
         client.unregister(&server);
         let _ = s.signal(Signal::Kill);
+    }
+
+    /// **The child-derived half of the same field, and the strip a
+    /// previous round called decorative.**
+    ///
+    /// GH #45 K-1, and the sibling of
+    /// [`an_agents_prompt_text_reaches_the_terminal_with_nothing_that_can_act`].
+    /// That row pins the half the *agent* supplies. This one pins the
+    /// half the **child** supplies, which reaches the same field by a
+    /// different route and is stripped by a different call: the reader
+    /// classifies `AwaitingSecret`, sends `SessionEvent::
+    /// AwaitingSecretEntered` carrying `redact_for_display(rules,
+    /// &snap.last_line)`, and `attach::conn`'s `forward_events` turns
+    /// that into the frame `holdfast attach` hands to `render` —
+    /// `write_all` plus `flush`, no filtering anywhere after this point.
+    ///
+    /// **What was believed, and the shape of the mistake.** Round 2
+    /// recorded that `detection().last_line` is *"already free of control
+    /// characters"* and that the strip is *"not load-bearing"*, and
+    /// reported it as measured. The measurement was real: `WRONG\x08…\r
+    /// Password: ` does reach the detector as exactly `Password: `,
+    /// because `\x08` and `\r` are handled by name in `detect::scanner`'s
+    /// `ground`. What was not measured was the generalisation from those
+    /// two bytes to control characters at large — and it is false.
+    /// `ground` drops `0x00..=0x1f | 0x7f` and routes `0x1b` into the
+    /// escape machine; **every byte `>= 0x80` falls to `text()`**, and
+    /// `TailLine::as_string`'s `from_utf8_lossy` reassembles `\xc2\x9b`
+    /// as U+009B. So all 32 C1 controls arrive here, as do U+202E and
+    /// U+200B. Nor is there a strip in the reader to fall back on:
+    /// `detector_guard.feed(&buf[..n], …)` is given the raw chunk.
+    ///
+    /// **Anti-vacuous by construction.** The row asserts the *raw*
+    /// `detection().last_line` still carries all three characters before
+    /// asserting the rendered forms do not. Without that, a future
+    /// scanner change that started dropping C1 would leave this row green
+    /// while it tested nothing — which is precisely the state the
+    /// corrected comments describe, and the reason this row exists.
+    ///
+    /// **Both rendered callers, because they are two calls.**
+    /// `prompt_last_line_redacted` (the replay path) is asserted from the
+    /// line the detector has *after* the whole prompt has landed, so it
+    /// is exact and free of any chunk-boundary question. The frame is
+    /// asserted as it was emitted at the edge.
+    ///
+    /// Delete either strip — swap `redact_for_display` for `redact_str`
+    /// at either site — and this row fails. The sibling above does not,
+    /// because `mcp::tools` strips the agent's argument separately.
+    ///
+    /// U+009B is 8-bit CSI, and whether a given emulator *acts* on a
+    /// UTF-8-encoded C1 varies by emulator. So the claim asserted here is
+    /// the one that does not depend on that: this field is documented as
+    /// one line of plain text a human reads to make a decision, and a
+    /// control character in it is outside what that promises.
+    #[tokio::test]
+    async fn a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act() {
+        // 8-bit CSI as the child's own bytes — `\xc2\x9b` on the wire —
+        // with the `2K` erase-line parameter an emulator honouring C1
+        // would consume, plus the two the round-2 probe also found
+        // surviving. Chosen so the visible residue is unambiguous:
+        // everything hostile is dropped and `Password2K: ` is what is
+        // left.
+        let prompt = "Password\u{9b}2K\u{202e}\u{200b}: ";
+        let shown_expected = "Password2K: ";
+
+        let sc = Scratch::new("childpromptstrip");
+        let server = server_with(keychain_mode(vec![]), &sc.audit_log());
+        let s = session_running("ssh", &["prod-01"], &echo_off_prompting(prompt));
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        let forwarder = spawn_forwarder(&server, &s, None);
+
+        // Anti-vacuity first, and it waits for the **whole** prompt, so
+        // the three assertions below cannot be satisfied by a prefix.
+        let raw = await_detected_prompt(&s, prompt).await;
+        assert!(
+            raw.contains('\u{9b}'),
+            "the scanner no longer delivers C1 to `last_line`; this row is now vacuous \
+             and the comments it pins need re-deriving: {raw:?}"
+        );
+        assert!(
+            raw.contains('\u{202e}') && raw.contains('\u{200b}'),
+            "the scanner no longer delivers U+202E/U+200B to `last_line`: {raw:?}"
+        );
+
+        // Caller one: the replay path, read after the line is complete.
+        assert_eq!(
+            s.prompt_last_line_redacted(),
+            shown_expected,
+            "`prompt_last_line_redacted` handed a human the child's control characters"
+        );
+
+        // Caller two: the frame, as it was emitted at the edge.
+        let frame = client.wait_for("AwaitingSecret", is_awaiting).await;
+        let ServerFrame::AwaitingSecret { prompt_text, .. } = frame else {
+            unreachable!()
+        };
+        assert!(
+            !prompt_text.chars().any(char::is_control),
+            "the child's prompt line reached every attached client with a control \
+             character in it, and `holdfast attach` writes that field to the terminal \
+             unmodified: {prompt_text:?}"
+        );
+        assert_eq!(
+            prompt_text, shown_expected,
+            "the child's prompt was consumed or altered rather than de-fanged"
+        );
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+        let _ = forwarder.await;
     }
 
     /// §9.6: bindings are *"probed in configured order"*, and the first
@@ -3507,14 +3820,15 @@ mod tests {
         const NOISY: &str = "\x1b[2K\rall clear";
 
         let mut sc = Scratch::new("apprredact");
-        let b = confirming(
-            &mut sc,
-            "prod-ssh",
-            &format!(
-                "^ssh\\s+prod-01\\s+--token\\s+ghp_[0-9A-Za-z]{{36}}\\s+{}$",
-                regex::escape(NOISY)
-            ),
+        let pattern = format!(
+            "^ssh\\s+prod-01\\s+--token\\s+ghp_[0-9A-Za-z]{{36}}\\s+{}$",
+            regex::escape(NOISY)
         );
+        // Built at run time, so it is proved loadable rather than listed
+        // (GH #45 M-7) — against the command line it is written for,
+        // which is the one this row's session actually runs.
+        assert_fixture_pattern_loads(&pattern, &format!("ssh prod-01 --token {TOKEN} {NOISY}"));
+        let b = confirming(&mut sc, "prod-ssh", &pattern);
         let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
         let s = session_running(
             "ssh",
@@ -5997,11 +6311,12 @@ mod tests {
         // [`SSH_PROD`].
         let gate = sc.path("gate");
         let script = gated_echo_off(&gate);
-        let b = sc.binding(
-            "shell",
-            &format!("^sh\\s+-c\\s+{}$", regex::escape(&script)),
-            &format!("printf '{PROBE}\\n'\n"),
-        );
+        let pattern = format!("^sh\\s+-c\\s+{}$", regex::escape(&script));
+        // Built at run time from a path unique to this row, so it is
+        // proved loadable rather than listed (GH #45 M-7). The example is
+        // the command line `start_session` is about to be given below.
+        assert_fixture_pattern_loads(&pattern, &format!("sh -c {script}"));
+        let b = sc.binding("shell", &pattern, &format!("printf '{PROBE}\\n'\n"));
         let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
 
         let started = server

@@ -2168,15 +2168,32 @@ async fn a_connection_dropped_mid_submission_still_answers_the_waiting_call() {
 ///
 /// **The connection is ended by §4.3's slow-consumer path and not by
 /// `Daemon::shutdown`, and the difference is the whole row.** `shutdown`
-/// SIGKILLs every live session, and a `Drop` that classifies by
-/// `session.is_alive()` proves nothing on a session that is already dead:
-/// the waiting call would answer `session_died` from its **own** exit
-/// observer — the one
-/// [`a_session_that_exits_mid_wait_returns_session_died`] drives — whether
-/// or not the guard ever ran. Dropping the client socket and letting the
-/// forwarder give up on a queue it cannot put a frame into ends the
-/// connection and leaves the session alone, so `user_cancelled` here has
-/// exactly one possible producer.
+/// SIGKILLs every live session, and `SecretAnswer::drop` classifies by
+/// `session.is_alive()`. On a session that is already dead a **working**
+/// guard answers `session_died` — the case
+/// [`a_session_that_exits_mid_wait_returns_session_died`] already drives
+/// — so the `user_cancelled` branch this row exists to pin would never be
+/// taken at all, and the row would be about a different case than the one
+/// it is named for. Dropping the client socket and letting the forwarder
+/// give up on a queue it cannot put a frame into ends the connection and
+/// leaves the session alone, so `user_cancelled` here has exactly one
+/// possible producer.
+///
+/// **An earlier revision of this paragraph gave a different reason, and
+/// that reason was wrong.** It said a shutdown-ended row would stay
+/// *green* under the neutering mutation, because the waiting call would
+/// answer `session_died` from its own exit observer whether or not the
+/// guard ran. That arrangement was built and driven, and it does not:
+/// under the same mutation it gives `secret_cancelled` /
+/// `reason: "timeout"` in ~5–7 ms, 5 runs out of 5. `close_secret` has
+/// already emptied the slot before shutdown runs, so
+/// `close_on_caller_timeout` finds `None` and falls into `await_secret`'s
+/// `None => rx.take()` branch, re-reading the very oneshot the guard
+/// would have answered — whose sender is dropped either way, because
+/// ordinary field-drop glue still runs when a custom `Drop::drop` body
+/// returns early. A shutdown-ended row would therefore redden too, just
+/// with the wrong string. The arrangement above is the right one; only
+/// the argument for it needed replacing.
 #[tokio::test]
 async fn an_arm_cancelled_on_a_full_write_queue_still_answers_the_waiting_call() {
     /// Ordinary input, used only to occupy the queue — and asserted for at

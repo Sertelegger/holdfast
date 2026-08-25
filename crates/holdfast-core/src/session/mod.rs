@@ -877,16 +877,44 @@ impl Session {
                             // attach` writes that field to the terminal
                             // **unmodified** (GH #45).
                             //
-                            // **Defence in depth rather than a live fix,
-                            // and measured as such.** The reader strips
-                            // escapes before the detector sees them and
-                            // the line reconstruction collapses `\r`, so
-                            // `prompt_line` is already free of control
-                            // characters: `WRONG\x08…\rPassword: ` reaches
-                            // the detector as exactly `Password: `. The
-                            // reachable half of this field is the agent's
-                            // own `prompt_text` argument, stripped in
-                            // `mcp::tools` and pinned there.
+                            // **Load-bearing, and an earlier revision of
+                            // this comment said the opposite.** It said
+                            // `prompt_line` was "already free of control
+                            // characters" and called the strip defence in
+                            // depth. That was a real measurement of
+                            // `WRONG\x08…\rPassword: ` — which does reach
+                            // the detector as exactly `Password: ` —
+                            // generalised to a claim the measurement did
+                            // not support.
+                            //
+                            // What actually reaches here: `detect::
+                            // scanner`'s `ground` drops `0x00..=0x1f |
+                            // 0x7f` and routes `0x1b` into the escape
+                            // machine, so C0 and DEL are gone. But every
+                            // byte `>= 0x80` falls to `text()`, and
+                            // `TailLine::as_string`'s `from_utf8_lossy`
+                            // reassembles `\xc2\x9b` as U+009B — so **all
+                            // 32 C1 controls arrive intact**, as do U+202E
+                            // and U+200B. `char::is_control` is true of
+                            // every one of the 32, and this call is what
+                            // removes them before `holdfast attach` writes
+                            // the field to a terminal.
+                            //
+                            // There is also no strip **in the reader**:
+                            // `detector_guard.feed(&buf[..n], …)` above is
+                            // given the raw chunk. It is the scanner's own
+                            // state machine that keeps escape *sequences*
+                            // out of the tail, and it does that for `\x1b`
+                            // introducers only.
+                            //
+                            // Pinned by `secret::binding`'s
+                            // `a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act`,
+                            // which drives U+009B out of a real child and
+                            // asserts it is gone from the frame. The
+                            // agent-supplied half of this field is the
+                            // `prompt_text` argument, stripped in
+                            // `mcp::tools` and pinned by that row's
+                            // sibling.
                             prompt_text: crate::output::redact::redact_for_display(
                                 &reader_rules,
                                 &prompt_line,
@@ -1268,11 +1296,23 @@ impl Session {
         // the approval prompt (GH #45). See `redact_for_display` for why
         // the strip runs before the redaction.
         //
-        // The strip is **defence in depth here and not load-bearing**:
-        // the detector's line has already been through the reader's ANSI
-        // stripper and its own line reconstruction, so it carries no
-        // control characters to begin with. Kept because this function's
-        // consumers render raw and the cost is one pass.
+        // **The strip is load-bearing here**, and an earlier revision of
+        // this comment said it was not. It claimed the line "carries no
+        // control characters to begin with" because it had "been through
+        // the reader's ANSI stripper" — neither half holds. There is no
+        // stripper in the reader (the detector is fed the raw chunk), and
+        // `detect::scanner`'s `ground` drops only `0x00..=0x1f | 0x7f`:
+        // every byte `>= 0x80` reaches the tail, so a child emitting
+        // `\xc2\x9b` puts U+009B — a C1 control — in `last_line`, along
+        // with the other 31, U+202E and U+200B.
+        //
+        // That matters because both callers render raw:
+        // `AwaitingSecret.prompt_text`, which `holdfast attach` writes to
+        // the terminal unmodified, and the approval prompt (GH #45). See
+        // `redact_for_display` for why the strip runs before the
+        // redaction, and `secret::binding`'s
+        // `a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act`
+        // for the row that fails if this becomes `redact_str`.
         crate::output::redact::redact_for_display(&self.rules, &self.detection().last_line)
     }
 

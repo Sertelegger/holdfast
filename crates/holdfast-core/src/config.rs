@@ -570,6 +570,71 @@ pub struct SecretBinding {
     /// not of the credential, which is the distinction REQ-SEC-016
     /// actually draws.
     pub name: String,
+    /// **The regex that decides whether this binding fires** — the field
+    /// GH #45 was filed against. The rest of this struct describes a
+    /// credential; this describes what may be given it.
+    ///
+    /// **The subject is the session's own command line**: `command` then
+    /// `args`, joined with single spaces and **not shell-quoted**, built
+    /// at match time by `secret::binding::command_line`, and
+    /// **unredacted and unstripped**. The readable rendering
+    /// `BindingApprovalRequired` shows a human is a different function
+    /// (`secret::binding::redacted_command_line`), and the two must stay
+    /// apart: matching the processed string would let the redactor
+    /// silently switch an operator's binding off.
+    ///
+    /// **So the subject is the agent's own string.** `Session.command`
+    /// and `Session.args` are its `start_session` arguments, stored
+    /// verbatim. What protects this is not that the agent has no input —
+    /// it is that to match, the agent has to actually *run* that command
+    /// line, under a PTY, in a session somebody can watch.
+    ///
+    /// **It is matched whole, never as a prefix.** The pattern is
+    /// compiled inside `\A(?:…)\z` by `secret::binding::whole_line` — at
+    /// match time and, since GH #50, by [`Config::validate`] too, so the
+    /// two cannot disagree about whether it is even a regex. Through
+    /// 0.0.7 the matcher was an unanchored `Regex::is_match`, and §9.6's
+    /// *published* `^ssh\s+(\S+@)?prod-0[12]\b` was therefore satisfied
+    /// by `ssh prod-01 -o ProxyCommand=nc 127.0.0.1 2222` — the
+    /// operator's binding firing for a session whose transport the agent
+    /// had repointed at itself. An operator's own `^` and `$` are still
+    /// correct; they are merely redundant now.
+    ///
+    /// **[`Config::validate`] then refuses a pattern that admits more
+    /// than its example, and it judges by behaviour rather than by
+    /// spelling.** [`admits_only_its_example`] runs the wrapped regex
+    /// against [`match_example`](Self::match_example) and against a fixed
+    /// corpus of hostile rewrites of it; the daemon does not start unless
+    /// the pattern matches the example and matches **none** of: the
+    /// example with an agent's arguments appended, the example with a
+    /// whole command of the agent's put in front of it, or an unrelated
+    /// line. An unbounded `.*` at either end is therefore refused — not
+    /// because the text `.*` was recognised, but because the pattern then
+    /// admits a probe. `""` does not load either: it matches only the
+    /// empty subject, and `match_example` is required and non-empty.
+    ///
+    /// **The two neighbouring fields are not peers of this one.**
+    /// [`match_example`](Self::match_example) is not documentation — it
+    /// is the subject those checks run against, so widening the example
+    /// widens what this pattern may admit, and nothing can check that the
+    /// example is the line you meant.
+    /// [`match_prompt`](Self::match_prompt) is a *conjunct* and
+    /// explicitly **not** a security control: it can only narrow a
+    /// selection this field has already made, which is why it gets no
+    /// check of its own. **This is the only field that selects.**
+    ///
+    /// **What selection costs, stated here rather than only in an issue
+    /// tracker.** The first binding in configured order that matches is
+    /// the one whose `reference` is handed to `provider` and whose value
+    /// is written into the child at its echo-off read (§5.2's step 1),
+    /// inside `max_uses`. [`require_confirm`](Self::require_confirm) —
+    /// **`true` by default** — puts a human in front of that and shows
+    /// them this session's command line; with it off the injection is
+    /// silent. What all of the above protects is the credential's
+    /// **bytes**, not its effect: an agent that can legitimately reach
+    /// `ssh prod-01` still gets a shell there. [`admits_only_its_example`]
+    /// and `secret::binding`'s "What this still does not close" carry the
+    /// residuals.
     pub match_command: String,
     /// **A command line the operator asserts this binding is for** (GH #45
     /// round 3), and the subject every load-time check on

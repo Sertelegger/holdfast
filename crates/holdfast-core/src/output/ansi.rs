@@ -234,10 +234,16 @@ pub fn strip(bytes: &[u8]) -> Vec<u8> {
 ///   column of the agent's choosing. `strip` *keeps* those four, because
 ///   "layout survives" is the right rule for a stream and exactly the
 ///   wrong one for a line somebody is reading to make a decision.
+/// * **U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR**, the only
+///   two line terminators `char::is_control` does not cover. See
+///   [`is_line_separator`].
 /// * **The directional-formatting and zero-width characters.** Not
 ///   paranoia by association: U+202E reverses the rendering of everything
 ///   after it, which is the same attack in a different alphabet, and a
-///   zero-width space breaks a word an operator is scanning for.
+///   zero-width space breaks a word an operator is scanning for. What is
+///   and is not on that list is a *rule*, stated in one sentence on
+///   [`is_directional_or_zero_width`]; a reader should be able to predict
+///   the next character they think of without reading the array.
 ///
 /// **Dropped rather than replaced with a marker.** A visible substitute
 /// invites the question of whether the substitute itself can be forged,
@@ -250,22 +256,83 @@ pub fn strip(bytes: &[u8]) -> Vec<u8> {
 /// already on screen; it does not make the remaining text trustworthy.
 pub fn one_line_for_display(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control() && !is_directional_or_zero_width(*c))
+        .filter(|c| !c.is_control() && !is_line_separator(*c) && !is_directional_or_zero_width(*c))
         .collect()
 }
 
-/// The Unicode formatting characters that change how the *rest* of a
-/// string renders without contributing anything visible themselves.
+/// U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR — the only line
+/// terminators in Unicode that `char::is_control` does not already cover.
 ///
-/// Kept as an explicit list rather than "all of category `Cf`", because
-/// `Cf` also contains characters that legitimately appear inside words in
-/// several scripts, and this function's job is not to police text.
+/// They are categories `Zl` and `Zp` rather than `Cc`, so `is_control` is
+/// false for both, while `\n`, `\r`, `\x0b`, `\x0c` and U+0085 NEL are
+/// all `Cc` and are dropped by the control filter. Left in, they were the
+/// one place [`one_line_for_display`] did not deliver its own stated job
+/// of *one line of plain text* (GH #45 K-2).
+///
+/// **No surface shipping today is forgeable through them**, which is why
+/// this is a consistency fix and not a security one: a VT terminal draws
+/// them as a glyph, not a break. The exposure is any renderer that
+/// implements Unicode line breaking, which is exactly what `holdfast ui`
+/// is — so this closes it before it opens rather than after.
+fn is_line_separator(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// The characters that are **invisible in themselves** and act on the
+/// text *around* them.
+///
+/// **The rule, so the array below reads as a consequence of a sentence
+/// rather than as a collection:** a character is on this list when it
+/// draws nothing of its own *and* changes how its neighbours order, join,
+/// split or scan — the bidi controls, the zero-width joins and splits,
+/// the invisible separators, and the annotation delimiters. A character
+/// is **not** on this list when it draws something, however small, or
+/// when its effect is to select how a *base* character it attaches to
+/// renders: variation selectors (U+FE00–U+FE0F), the tag block (U+E0001
+/// and U+E0020–U+E007F, which spell out emoji flag sequences), and
+/// combining marks. Dropping those mangles legitimate text, and none of
+/// them can hide the text beside it — a character that is invisible
+/// *only in itself* cannot forge a shorter or more benign line, which is
+/// the failure [`one_line_for_display`] exists to prevent (GH #45 K-3).
+///
+/// **Two consequences a reader should be able to predict from that
+/// sentence instead of discovering empirically:**
+///
+/// * The `Cf` characters that are absent are the ones that *render*.
+///   U+0600 ARABIC NUMBER SIGN and U+06DD END OF AYAH draw a mark over
+///   the digits that follow; U+070F SYRIAC ABBREVIATION MARK draws a
+///   line. They are visible, so they stay — a reason, not an exception.
+/// * U+3164 HANGUL FILLER and its siblings stay. A filler *adds* a blank
+///   cell; it does not remove one, and adding a cell cannot hide a
+///   character.
+///
+/// **Where the rule costs something, said plainly rather than elided.**
+/// U+200C ZWNJ and U+200D ZWJ carry orthographic meaning in Persian and
+/// several Indic scripts, and joining meaning in emoji sequences;
+/// dropping them changes text that was never an attack. That cost is
+/// accepted **for this field** — a command line an operator is about to
+/// approve — because an invisible split inside `prod-01` matters more
+/// there than a broken ligature does. It is not a licence to drop them
+/// anywhere else.
+///
+/// **Why an enumeration rather than a category test.** `std` exposes
+/// `char::is_control` and no general-category query, so "all of `Cf`"
+/// is not reachable without a new dependency — and per the first
+/// consequence above it would also be the wrong set.
 fn is_directional_or_zero_width(c: char) -> bool {
     matches!(c,
-        '\u{200B}'..='\u{200F}'   // ZWSP, ZWNJ, ZWJ, LRM, RLM
-        | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
-        | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
-        | '\u{FEFF}'              // BOM / zero-width no-break space
+        '\u{00AD}'                  // SOFT HYPHEN
+        | '\u{061C}'                // ARABIC LETTER MARK (bidi)
+        | '\u{180E}'                // MONGOLIAN VOWEL SEPARATOR
+        | '\u{200B}'..='\u{200F}'   // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | '\u{202A}'..='\u{202E}'   // LRE, RLE, PDF, LRO, RLO
+        | '\u{2060}'..='\u{2064}'   // WJ, invisible times/separator/plus
+        | '\u{2066}'..='\u{206F}'   // isolates; deprecated shaping and digit-shape controls
+        | '\u{FEFF}'                // ZWNBSP / BOM
+        | '\u{FFF9}'..='\u{FFFB}'   // interlinear annotation delimiters
+        | '\u{13430}'..='\u{1343F}' // Egyptian hieroglyph format controls
+        | '\u{1BCA0}'..='\u{1BCA3}' // Duployan shorthand format controls
+        | '\u{1D173}'..='\u{1D17A}' // musical beam/slur/phrase/tie controls
     )
 }
 
@@ -391,6 +458,118 @@ mod tests {
             "`strip` consumes the payload — that is correct for a terminal stream and \
              is why `one_line_for_display` does not call it"
         );
+    }
+
+    /// **U+2028 and U+2029 are the only line terminators
+    /// `char::is_control` misses**, and this is the only row that
+    /// touches [`is_line_separator`].
+    ///
+    /// Delete it and `one_line_for_display` quietly goes back to
+    /// emitting a string with a line break in it, from a function whose
+    /// documented job is *one line of plain text*. Nothing on a VT
+    /// surface shows the regression — a terminal draws those two as a
+    /// glyph, not a break — so the suite would stay green while
+    /// `holdfast ui`, a renderer that implements Unicode line breaking,
+    /// gained a forged second line (GH #45 K-2).
+    ///
+    /// The five `Cc` terminators are not padding: they are what makes
+    /// *"every other line terminator was already dropped"* a measurement
+    /// rather than a claim, and they are the reason the fix is one line
+    /// in a predicate rather than a new mechanism.
+    #[test]
+    fn no_line_terminator_survives_not_even_the_two_that_are_not_controls() {
+        for (label, c) in [
+            ("LF", '\n'),
+            ("CR", '\r'),
+            ("VT \\x0b", '\u{0b}'),
+            ("FF \\x0c", '\u{0c}'),
+            ("NEL U+0085", '\u{85}'),
+            ("LINE SEPARATOR U+2028", '\u{2028}'),
+            ("PARAGRAPH SEPARATOR U+2029", '\u{2029}'),
+        ] {
+            assert_eq!(
+                one_line_for_display(&format!("ssh prod-01{c}holdfast attach: all clear")),
+                "ssh prod-01holdfast attach: all clear",
+                "{label}: a line terminator reached a field whose whole job is one \
+                 line, so a renderer that honours it shows the operator a forged \
+                 second line"
+            );
+        }
+
+        // Why the last two need a predicate of their own, asserted so a
+        // later hand does not "simplify" it away: the control filter
+        // cannot see them.
+        assert!(
+            !'\u{2028}'.is_control() && !'\u{2029}'.is_control(),
+            "if these became `Cc`, `is_line_separator` would be redundant — until \
+             then it is the only thing dropping them"
+        );
+    }
+
+    /// **The membership rule on [`is_directional_or_zero_width`], driven
+    /// in both directions.**
+    ///
+    /// Delete this row and the array reverts to a collection: nothing
+    /// then stops the next hand from dropping a variation selector
+    /// (which mangles legitimate text and defends against nothing) or
+    /// from leaving out a word joiner. That second one is not
+    /// hypothetical — it is exactly what GH #45 K-3 found, U+200B
+    /// dropped and U+2060 kept, two spellings of the same zero-width
+    /// word split treated differently for no stated reason.
+    ///
+    /// **The *survives* half is load-bearing, not symmetry for its own
+    /// sake.** Every assertion in the first loop is satisfied by a
+    /// filter that drops everything non-ASCII, which would be a far
+    /// worse function; the second loop is what forbids it.
+    #[test]
+    fn the_invisible_formatter_list_follows_its_stated_rule() {
+        // On the list: invisible in itself, and it acts on the text
+        // around it. Each one splits a word an operator is scanning for
+        // while leaving the line looking untouched.
+        for (label, c) in [
+            ("U+00AD SOFT HYPHEN", '\u{00AD}'),
+            ("U+061C ARABIC LETTER MARK", '\u{061C}'),
+            ("U+180E MONGOLIAN VOWEL SEPARATOR", '\u{180E}'),
+            ("U+200B ZWSP", '\u{200B}'),
+            ("U+200C ZWNJ", '\u{200C}'),
+            ("U+202E RLO", '\u{202E}'),
+            ("U+2060 WORD JOINER", '\u{2060}'),
+            ("U+2063 INVISIBLE SEPARATOR", '\u{2063}'),
+            ("U+206F NOMINAL DIGIT SHAPES", '\u{206F}'),
+            ("U+FEFF ZWNBSP", '\u{FEFF}'),
+            ("U+FFF9 INTERLINEAR ANNOTATION ANCHOR", '\u{FFF9}'),
+            ("U+1D173 MUSICAL BEGIN BEAM", '\u{1D173}'),
+        ] {
+            assert_eq!(
+                one_line_for_display(&format!("pro{c}d-01")),
+                "prod-01",
+                "{label} draws nothing and splits the host the operator is reading, \
+                 so the rule puts it on the list"
+            );
+        }
+
+        // Not on the list: it draws something, or it attaches to a base
+        // character to select how *that* renders. Dropping these mangles
+        // text that was never an attack, and none of them can hide the
+        // character beside it.
+        for (label, subject) in [
+            ("U+FE0F variation selector", "prod-01\u{FE0F}"),
+            ("U+E0041 tag character", "prod-01\u{E0041}"),
+            ("U+0301 combining acute", "prod-01\u{0301}"),
+            (
+                "U+3164 HANGUL FILLER (adds a cell, removes none)",
+                "pro\u{3164}d-01",
+            ),
+            ("U+00A0 NBSP (a visible space)", "prod\u{00A0}01"),
+            ("U+0600 ARABIC NUMBER SIGN (it renders)", "prod-01\u{0600}"),
+        ] {
+            assert_eq!(
+                one_line_for_display(subject),
+                subject,
+                "{label} was dropped: the list has stopped being 'invisible and acts \
+                 on its neighbours' and started being 'anything unfamiliar'"
+            );
+        }
     }
 
     #[test]
