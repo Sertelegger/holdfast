@@ -308,6 +308,27 @@ impl TestDaemon {
         s
     }
 
+    /// [`quiet_session`](Self::quiet_session), plus a handle on the mock
+    /// itself — for the one row whose subject is *when* the writer thread
+    /// is inside `write`, which needs `MockPty::on_write`.
+    fn mock_session(&self) -> (Arc<Session>, Arc<MockPty>) {
+        let pty = Arc::new(MockPty::new());
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(64 * 1024),
+        );
+        self.daemon
+            .server
+            .registry
+            .insert(Arc::clone(&s))
+            .expect("register");
+        (s, pty)
+    }
+
     async fn dial(&self) -> UnixStream {
         UnixStream::connect(self.paths.attach_sock())
             .await
@@ -1957,6 +1978,120 @@ async fn a_session_that_exits_mid_wait_returns_session_died() {
     assert!(
         payload["data"]["exit_code"].is_number(),
         "§5.1 wants the code, and `null` tells an operator nothing: {payload}"
+    );
+}
+
+/// **C-1 / GH #38: the read loop is a future somebody else may drop, and
+/// dropping it must not strand the call it was answering.**
+///
+/// `attach::conn::run` polls `read_loop` as the last branch of a `biased`
+/// `select!`, so the loop is dropped **where it stands** the moment
+/// `shutdown.changed()` fires or the output forwarder returns — a
+/// `daemon/stop`, a SIGTERM, §7.3's client-less exit, a dead socket, or a
+/// client that stopped draining its queue. Its `SecretInput` arm is the
+/// one place that holds a taken `RaisedRequest` across an await, and the
+/// taken request carries the only `oneshot::Sender` the waiting tool call
+/// has.
+///
+/// Dropping it unanswered used to produce all four of these at once: the
+/// tool task **panicked** (`await_secret`'s `Err` arm fell through to a
+/// second poll of a completed receiver — `called after complete`), the
+/// queued write still reached the child, the frame body was left
+/// unzeroed, and no `SecretRequestClosed` was broadcast.
+///
+/// **The arrangement, and why each step is a fact rather than a wait.**
+/// The write is parked *inside* `MockPty::write` by a hook the test
+/// releases, so "the arm is past `close_secret` and the acknowledgement is
+/// outstanding" is observed (`entered`, plus an empty slot) rather than
+/// slept for. The connection is then ended by `Daemon::shutdown`, the
+/// `biased`-first branch, and the test waits for the hub to
+/// **unregister** the client — which `run` does only after its `select!`
+/// has resolved, i.e. only once `read_loop` has actually been dropped.
+/// Only then is the write released. So the drop strictly precedes the
+/// acknowledgement, in every scheduling order.
+///
+/// The answer must still be `secret_provided` with the real count: the
+/// bytes did reach the child, and telling the agent anything else about a
+/// credential that landed is the second of C-1's four consequences.
+#[tokio::test]
+async fn a_connection_dropped_mid_submission_still_answers_the_waiting_call() {
+    let d = TestDaemon::start("cancelsafe").await;
+    let (s, pty) = d.mock_session();
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    await_waiter(&d, &s.id, "the call whose connection is about to go").await;
+    let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    // The writer thread parks here; nothing else does.
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        pty.on_write(move || {
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+    }
+
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id: request_id.clone(),
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+
+    // The arm has taken the slot and its write is on the fd. Both halves
+    // are asserted: the flag says the writer is inside `write`, and the
+    // empty slot says the request left the hub before it got there.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the submission never reached the writer thread"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        d.daemon
+            .server
+            .attach_hub()
+            .secrets()
+            .outstanding(&s.id)
+            .is_none(),
+        "the arm parked without taking the slot; the arrangement is not the one C-1 is about"
+    );
+
+    // End the connection under it — `biased`, so this branch wins.
+    d.daemon.shutdown();
+    while !d.daemon.server.attach_hub().clients_of(&s.id).is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the connection never ended, so the read loop was never dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    let payload = joined(call, "the call whose connection went away").await;
+    assert_eq!(
+        payload["status"], "secret_provided",
+        "the submitting connection was dropped and the call was not told what became of \
+         its request: {payload}"
+    );
+    assert_eq!(
+        payload["data"]["bytes_written"],
+        serde_json::json!(PROBE.len() + 1),
+        "the count is the writer thread's, not a guess made where the drop happened: {payload}"
+    );
+    assert!(
+        contains(&pty.written(), PROBE.as_bytes()),
+        "the value never reached the child, so `secret_provided` would be the wrong answer"
     );
 }
 

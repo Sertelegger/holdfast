@@ -2442,7 +2442,12 @@ impl HoldfastServer {
     ) -> Resolution {
         let sleep = self.clock.sleep_until(deadline);
         tokio::pin!(sleep);
-        tokio::pin!(rx);
+        // **Not `tokio::pin!(rx)`.** See [`AnswerOnce`]: the hand-over
+        // read below must be impossible to express once this `select!`
+        // has resolved the receiver, and an `Option` the read has to
+        // `take` out is what makes it impossible rather than merely
+        // avoided.
+        let mut rx = AnswerOnce(Some(rx));
 
         // §5.1's third way out, and it is subscribed **before** the first
         // poll so an exit landing in between is still queued for us.
@@ -2451,7 +2456,7 @@ impl HoldfastServer {
         tokio::pin!(exit);
 
         let woke = tokio::select! {
-            r = &mut rx => match r {
+            r = rx.recv() => match r {
                 Ok(resolution) => return resolution,
                 // The answering half went away without answering. Fall
                 // through to the close, which reports what really
@@ -2520,9 +2525,28 @@ impl HoldfastServer {
             // The grace is real time rather than `self.clock`: a manual
             // clock that nothing advances would park here forever, and a
             // hand-over that has already happened is not a deadline.
-            None => match tokio::time::timeout(SECRET_HANDOVER_GRACE, rx).await {
-                Ok(Ok(resolution)) => resolution,
-                _ => Resolution::Cancelled(CancelReason::Timeout),
+            //
+            // **`take()`, and the `None` arm is GH #38 closed by
+            // construction.** The `select!` above reaches `Woke::Deadline`
+            // two ways, and on one of them — the receiver completing with
+            // `Err` — there is nothing further to read and never will be.
+            // Re-polling a completed `oneshot::Receiver` is not a stale
+            // answer, it is `panic!("called after complete")`, which
+            // reaches the agent as a `JoinError::Panic` instead of a
+            // status. Remembering which arm woke would work and is
+            // exactly the discipline this file has already been bitten by
+            // (see `run_binding_approval`'s `Superseded` arm), so the
+            // receiver is not left where a second read could name it.
+            None => match rx.take() {
+                Some(rx) => match tokio::time::timeout(SECRET_HANDOVER_GRACE, rx).await {
+                    Ok(Ok(resolution)) => resolution,
+                    _ => Resolution::Cancelled(CancelReason::Timeout),
+                },
+                // The answering half dropped its sender without answering
+                // *and* something else has since taken the slot. No value
+                // was handed over, so the reason the timer would have
+                // given is the truthful one.
+                None => Resolution::Cancelled(CancelReason::Timeout),
             },
         }
     }
@@ -2904,6 +2928,50 @@ pub const DEFAULT_MAX_SECRET_BYTES: u32 = 4096;
 /// wait in this position turns a wedged writer into a hung CI job rather
 /// than a red row.
 const SECRET_HANDOVER_GRACE: Duration = Duration::from_secs(10);
+
+/// A resolution receiver that **cannot be polled after it completes**.
+///
+/// `tokio::sync::oneshot::Receiver` answers a second poll with
+/// `panic!("called after complete")`, and it counts an `Err` — the sender
+/// dropped without sending — as completing. GH #38 is that panic, reached
+/// through a `select!` whose receiver arm falls through to a later
+/// hand-over read of the same receiver: the branch written to handle a
+/// lost answer *defensively* is the one that aborts the tool call, and the
+/// agent gets a `JoinError::Panic` where a status belongs.
+///
+/// The cure is not to remember which arm woke. [`recv`](Self::recv) takes
+/// the receiver **out** of the option on the way to resolving it, so the
+/// arm that completed it leaves nothing behind that a later
+/// [`take`](Self::take) can return, and the second read is a `None` the
+/// compiler makes the caller handle rather than a panic at runtime. A
+/// `select!` whose branches must not disagree about whether a value is
+/// still readable is exactly the shape that should not be held together by
+/// a comment.
+struct AnswerOnce(Option<tokio::sync::oneshot::Receiver<Resolution>>);
+
+impl AnswerOnce {
+    /// Wait for the answer. Cancel-safe: a `recv` future dropped before it
+    /// resolves puts nothing back, because it took nothing out — the
+    /// receiver is only surrendered once it has actually completed.
+    ///
+    /// Parks forever if the receiver is already gone, which is correct for
+    /// a `select!` arm and is why the hand-over read below uses
+    /// [`take`](Self::take) instead of calling this again.
+    async fn recv(&mut self) -> Result<Resolution, tokio::sync::oneshot::error::RecvError> {
+        let Some(rx) = self.0.as_mut() else {
+            return std::future::pending().await;
+        };
+        let answered = rx.await;
+        self.0 = None;
+        answered
+    }
+
+    /// The receiver, if it has **not** already completed. `None` is the
+    /// state in which polling it again would panic.
+    fn take(&mut self) -> Option<tokio::sync::oneshot::Receiver<Resolution>> {
+        self.0.take()
+    }
+}
 
 /// Why [`HoldfastServer::await_secret`] stopped waiting on its receiver.
 ///

@@ -29,10 +29,16 @@ struct MockState {
 /// `MockPty::on_line_discipline_sample`.
 type LineDisciplineSampleHook = Box<dyn Fn() + Send + Sync>;
 
+/// Something to run when `write` is called — see `MockPty::on_write`.
+type WriteHook = Box<dyn Fn() + Send + Sync>;
+
 pub struct MockPty {
     state: Mutex<MockState>,
     /// Run on every `line_discipline` call, with `state` **not** held.
     on_line_discipline_sample: Mutex<Option<LineDisciplineSampleHook>>,
+    /// Run on every `write` call, before the bytes are recorded and with
+    /// `state` **not** held.
+    on_write: Mutex<Option<WriteHook>>,
 }
 
 // Manual, because a boxed `Fn` is not `Debug`. Deliberately does not lock:
@@ -64,6 +70,7 @@ impl MockPty {
                 ..Default::default()
             }),
             on_line_discipline_sample: Mutex::new(None),
+            on_write: Mutex::new(None),
         }
     }
 
@@ -134,6 +141,27 @@ impl MockPty {
     pub fn on_line_discipline_sample(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.on_line_discipline_sample.lock() = Some(Box::new(f));
     }
+
+    /// Run `f` at the instant `write` is called, **before** the bytes are
+    /// recorded and with `state` not held, so a hook may inspect or move
+    /// the rest of the mock while it parks. (It does hold the hook slot
+    /// itself, exactly as `on_line_discipline_sample` does, so a hook must
+    /// not re-register one.)
+    ///
+    /// The sibling of [`on_line_discipline_sample`](Self::on_line_discipline_sample),
+    /// and it exists for the same reason: the one interval a caller of the
+    /// write queue cannot otherwise steer is *how long the writer thread
+    /// spends inside the write*, and that interval is where a `SecretInput`
+    /// sits on the FIFO with its acknowledgement outstanding. A hook that
+    /// parks turns that into something a test drives rather than races
+    /// for.
+    ///
+    /// It runs on the caller's thread — for the write queue, the session's
+    /// own writer `std::thread` — so a hook that blocks blocks the writer
+    /// and nothing else.
+    pub fn on_write(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_write.lock() = Some(Box::new(f));
+    }
 }
 
 impl Default for MockPty {
@@ -144,6 +172,12 @@ impl Default for MockPty {
 
 impl PtyBackend for MockPty {
     fn write(&self, data: &[u8]) -> Result<()> {
+        // Before `state` is taken — a hook that parks here holds up its
+        // own caller and leaves the rest of the mock readable, which is
+        // the point.
+        if let Some(hook) = self.on_write.lock().as_ref() {
+            hook();
+        }
         self.state.lock().written.extend_from_slice(data);
         Ok(())
     }

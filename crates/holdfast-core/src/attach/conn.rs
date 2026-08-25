@@ -641,13 +641,10 @@ async fn read_loop(
                     // agent is told which of the four reasons it was.
                     Some(raised) if over_cap => {
                         super::secret::zero_bytes(&mut body);
-                        let id = raised.request_id().to_string();
-                        raised.answer(crate::secret::Resolution::Cancelled(
-                            crate::secret::CancelReason::TooLarge,
-                        ));
-                        daemon.attach_hub().broadcast_secret_closed(
-                            &conn.session_id,
-                            &id,
+                        SecretAnswer::new(daemon, session, raised).settle(
+                            crate::secret::Resolution::Cancelled(
+                                crate::secret::CancelReason::TooLarge,
+                            ),
                             "cancelled",
                         );
                     }
@@ -661,14 +658,40 @@ async fn read_loop(
                         let (write, ack) = WriteRequest::secret(
                             super::secret::SecretBytes::normalise(bytes, raised.append_newline),
                         );
-                        if session.write_queue().send(write).await.is_err() {
-                            return;
-                        }
                         // The frame body still holds the value in
                         // cleartext and is about to be reused for the
                         // next frame; `SecretBytes` owns only the decoded
                         // copy.
+                        //
+                        // **Before the first await, not after it.** This
+                        // read loop is one branch of `run`'s `select!` and
+                        // is therefore dropped where it stands whenever
+                        // either of the two branches above it completes;
+                        // a `zero_bytes` sited past an await point is a
+                        // `zero_bytes` a cancellation skips, and what it
+                        // skips is a full cleartext copy of the
+                        // credential.
                         super::secret::zero_bytes(&mut body);
+
+                        // **From here the request is owned, and
+                        // `SecretAnswer` is what makes "owned" survive
+                        // this future being dropped.** Taking a
+                        // `RaisedRequest` out of the slot takes the only
+                        // `oneshot::Sender` the waiting tool call has with
+                        // it; dropping it unanswered strands that call and
+                        // leaves every other attached client believing the
+                        // request is still outstanding.
+                        let answer = SecretAnswer::new(daemon, session, raised);
+
+                        if session.write_queue().send(write).await.is_err() {
+                            // `mpsc::Sender::send` is cancel-safe in the
+                            // direction that matters here: a `send` future
+                            // dropped before it completes does not deliver
+                            // the message, so a cancellation on this line
+                            // leaves nothing queued for the child and
+                            // `answer`'s `Drop` reports that truthfully.
+                            return;
+                        }
                         // §4.1 lists a `SecretInput` from a ReadWrite
                         // client as activity — and it must be, or a
                         // session idle-reaps while a human is typing a
@@ -679,20 +702,35 @@ async fn read_loop(
                         // that number is the whole of what a waiting tool
                         // call learns. A dropped sender means the session
                         // died under the write, which is not a `Provided`.
-                        let id = raised.request_id().to_string();
-                        match ack.await {
-                            Ok(Ok(n)) => raised.answer(crate::secret::Resolution::Provided {
-                                bytes_written: n as u64,
-                            }),
-                            _ => raised.answer(crate::secret::Resolution::SessionDied {
-                                exit_code: session.exit_code(),
-                            }),
-                        }
-                        daemon.attach_hub().broadcast_secret_closed(
-                            &conn.session_id,
-                            &id,
-                            "fulfilled",
-                        );
+                        //
+                        // **Waited for in a task this connection's
+                        // `select!` does not own** — the shape `run`
+                        // already uses for `forward_output` and
+                        // `forward_events`. Past the `send` above the
+                        // write is on the FIFO and the writer thread will
+                        // perform it, so a cancellation here would tell
+                        // the agent nothing about a credential that
+                        // *reached the child*. The enqueue itself stays on
+                        // this loop, so a `SecretInput` still orders ahead
+                        // of whatever frame follows it on the same
+                        // connection.
+                        let for_ack = Arc::clone(session);
+                        tokio::spawn(async move {
+                            match ack.await {
+                                Ok(Ok(n)) => answer.settle(
+                                    crate::secret::Resolution::Provided {
+                                        bytes_written: n as u64,
+                                    },
+                                    "fulfilled",
+                                ),
+                                _ => answer.settle(
+                                    crate::secret::Resolution::SessionDied {
+                                        exit_code: for_ack.exit_code(),
+                                    },
+                                    "fulfilled",
+                                ),
+                            }
+                        });
                     }
                     // §18.4: the connection stays open and nothing is
                     // written. A client whose request was superseded
@@ -1249,6 +1287,99 @@ async fn forward_events(
             Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => return,
         }
+    }
+}
+
+/// A [`RaisedRequest`] taken out of its slot, which is answered exactly
+/// once **whether or not the future holding it runs to completion**.
+///
+/// [`RaisedRequest`]: crate::secret::RaisedRequest
+///
+/// **Why a guard and not discipline.** `read_loop` is one branch of
+/// `run`'s `biased` `select!`, so it is a future that gets dropped where
+/// it stands the moment `shutdown.changed()` fires or the output
+/// forwarder returns — and the forwarder returns on a session exit *and*
+/// on a client whose socket died or whose queue overflowed. Its
+/// `SecretInput` arm is the one place in the daemon that holds a taken
+/// request across an await, and taking a request takes the only
+/// `oneshot::Sender` the waiting `request_secret_input` has. Dropping it
+/// unanswered is four separate defects at once: the waiting call's
+/// receiver resolves `Err` (GH #38's double poll, reached through
+/// `await_secret`'s `Err(_)` arm), the queued write still reaches the
+/// child, and no `SecretRequestClosed` is broadcast, so every other
+/// attached client is left with a dialog pointing at nothing.
+///
+/// So the duty lives in a value rather than in a code path: there is no
+/// way to hold the request without also holding the thing that discharges
+/// it, and no way to drop that thing silently.
+///
+/// **`Drop` classifies by the session's liveness, not by where the drop
+/// happened** — the same rule `mcp::tools::lost_approval` applies to a
+/// lost approval, and for the same reason: the place a future was
+/// cancelled says nothing about why the request is over, and a classifier
+/// with no parameter for it cannot be made to lie about it.
+struct SecretAnswer {
+    daemon: Arc<Daemon>,
+    session: Arc<Session>,
+    request_id: String,
+    /// `None` once the request has been answered. Every read is a `take`,
+    /// which is what makes "exactly once" a property of the type.
+    raised: Option<crate::secret::RaisedRequest>,
+}
+
+impl SecretAnswer {
+    fn new(
+        daemon: &Arc<Daemon>,
+        session: &Arc<Session>,
+        raised: crate::secret::RaisedRequest,
+    ) -> Self {
+        Self {
+            daemon: Arc::clone(daemon),
+            session: Arc::clone(session),
+            request_id: raised.request_id().to_string(),
+            raised: Some(raised),
+        }
+    }
+
+    /// Answer deliberately, and tell the other clients which of §7.5's
+    /// outcomes it was. Consumes, so `Drop` finds nothing left to do.
+    fn settle(mut self, outcome: crate::secret::Resolution, wire_outcome: &str) {
+        if let Some(raised) = self.raised.take() {
+            raised.answer(outcome);
+            broadcast_secret_closed(
+                &self.daemon,
+                &self.session.id,
+                &self.request_id,
+                wire_outcome,
+            );
+        }
+    }
+}
+
+impl Drop for SecretAnswer {
+    fn drop(&mut self) {
+        let Some(raised) = self.raised.take() else {
+            return;
+        };
+        // Nothing was written — the only await this guard is held across
+        // before the hand-off is the FIFO `send`, and a cancelled `send`
+        // delivers nothing. What ended the request is therefore the
+        // submitting client going away, or the session going away under
+        // it, and `is_alive()` is what tells the two apart.
+        let outcome = if self.session.is_alive() {
+            crate::secret::Resolution::Cancelled(crate::secret::CancelReason::UserCancelled)
+        } else {
+            crate::secret::Resolution::SessionDied {
+                exit_code: self.session.exit_code(),
+            }
+        };
+        raised.answer(outcome);
+        broadcast_secret_closed(
+            &self.daemon,
+            &self.session.id,
+            &self.request_id,
+            "cancelled",
+        );
     }
 }
 
