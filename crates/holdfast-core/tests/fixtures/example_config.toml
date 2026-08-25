@@ -121,7 +121,12 @@ strict_confirmation = false
 # (§18.7) all carry `binding_name` and nothing else identifying. Four
 # consumers, and until rev. 48 no block defined the field they read.
 # name            = "prod-ssh"
-# match_command   = "^ssh\\s+(\\S+@)?prod-0[12]\\b"
+# match_command must match the session's WHOLE command line -- `command`
+# and `args` joined with single spaces (§9.6, rev. 52). A pattern that
+# matches only a prefix leaves every argument after it a free parameter,
+# and the agent writes those. A pattern ending in `.*` gives that back
+# and is refused at load.
+# match_command   = "^ssh\\s+(\\S+@)?prod-0[12]$"
 # match_prompt    = "(?i)password"
 # provider        = "secret-service"
 # reference       = "service=holdfast,account=prod-ssh"

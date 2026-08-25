@@ -3413,7 +3413,7 @@ secret_provider = "prompt"
 
 [[security.secret_bindings]]
 name            = "prod-ssh"
-match_command   = "^ssh\\s+(\\S+@)?prod-0[12]\\b"
+match_command   = "^ssh\\s+(\\S+@)?prod-0[12]$"
 match_prompt    = "(?i)password"
 provider        = "secret-service"
 reference       = "service=holdfast,account=prod-ssh"
@@ -3482,6 +3482,29 @@ fn the_published_binding_block_loads_and_selects_the_session_it_names() {
         select(bindings, &named, "").is_none(),
         "an empty prompt line satisfied a binding that carries a `match_prompt` \
          (REQ-O-013)"
+    );
+    // **GH #45, against the published block rather than against a
+    // hand-built one.** The unit and end-to-end rows for this live in
+    // `secret::binding`; what this one adds is that the pattern §9.6
+    // *publishes* is the pattern being defeated — the issue's whole
+    // premise was that an operator following the document verbatim got an
+    // exfiltration primitive.
+    assert!(
+        select(
+            bindings,
+            &command_line(
+                "ssh",
+                &[
+                    "prod-01".to_string(),
+                    "-o".to_string(),
+                    "ProxyCommand=nc 127.0.0.1 2222".to_string(),
+                ]
+            ),
+            "[sudo] password for ada:"
+        )
+        .is_none(),
+        "the published block selected a command line the agent appended a transport \
+         redirect to"
     );
     // And the empty set, so `select` is not answering `Some` from
     // somewhere other than the slice it was handed.
@@ -3603,8 +3626,18 @@ fn the_published_security_block_ships_with_autofill_off() {
 fn confirming_binding() -> SecretBinding {
     SecretBinding {
         name: "prod-shell".to_string(),
-        // Every session here is `sh -c <script>` (see `shell_running`).
-        match_command: "^sh\\b".to_string(),
+        // Every session that needs this binding to fire is
+        // `sh -c <ECHO_OFF_FIXTURE>` (see `shell_running`), so the
+        // pattern is that exact joined line and nothing else.
+        //
+        // **It was `^sh\b` until GH #45**, when `match_command` became a
+        // whole-line match rather than a prefix one. The tempting repair
+        // was `^sh\b.*`; that is precisely the permissive tail
+        // `Config::validate` now refuses in an operator's config, and
+        // reaching for it here would be this suite modelling the defect.
+        // `regex::escape` instead, because the fixture is a shell
+        // one-liner made almost entirely of regex metacharacters.
+        match_command: format!("^{}$", regex::escape(&format!("sh -c {ECHO_OFF_FIXTURE}"))),
         match_prompt: String::new(),
         provider: "wincred".to_string(),
         reference: "op://vault/prod-db/password".to_string(),

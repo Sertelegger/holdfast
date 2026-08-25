@@ -1136,6 +1136,27 @@ impl Config {
                     )));
                 }
             }
+            // GH #45's second half. `secret::binding` matches
+            // `match_command` against the **whole** joined command line,
+            // and a pattern ending in `.*` gives that back — the agent
+            // appends whatever it likes and the binding still fires. The
+            // reflex this refuses is a real one: it is what an operator
+            // does when a legitimate session stops matching and the daemon
+            // is down. `match_prompt` is not checked, because it is not
+            // anchored and a permissive tail on it grants nothing.
+            //
+            // See `unconstrained_tail` for why the heuristic is
+            // deliberately shallow and must not be grown or removed.
+            if let Some(tail) = unconstrained_tail(&binding.match_command) {
+                return Err(ConfigError::invalid(format!(
+                    "security.secret_bindings[\"{}\"].match_command = {:?} ends in \
+                     `{tail}`, which matches any arguments an agent appends; \
+                     `match_command` must match the session's whole command line, so \
+                     write out the arguments the binding is for (`^ssh\\s+prod-01$`) \
+                     rather than admitting all of them",
+                    binding.name, binding.match_command
+                )));
+            }
         }
 
         nonzero(
@@ -1246,6 +1267,104 @@ fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<(), ConfigError> {
         )));
     }
     Ok(())
+}
+
+/// Atoms that match **any** character, in the spellings an operator
+/// reaches for. See [`unconstrained_tail`].
+///
+/// `[^\x00]` and its relatives are deliberately absent — they are the
+/// escape hatch, not an oversight.
+const ANY_CHAR_ATOMS: [&str; 7] = [
+    ".", "[\\s\\S]", "[\\S\\s]", "[\\d\\D]", "[\\D\\d]", "[\\w\\W]", "[\\W\\w]",
+];
+
+/// How many `\` a string ends with — the parity that tells a regex
+/// metacharacter from an escaped literal one.
+///
+/// `\.*` is *"zero or more dots"* and is perfectly constrained; `\\.*` is
+/// a literal backslash followed by *"anything"* and is not. The two differ
+/// only in this count.
+fn trailing_backslashes(s: &str) -> usize {
+    s.bytes().rev().take_while(|b| *b == b'\\').count()
+}
+
+/// Drop trailing end-of-text anchors, which say nothing after a
+/// quantifier that already reached the end.
+///
+/// An operator who writes `.*$` means `.*`, and refusing one spelling
+/// while accepting the other would be a check that reads as arbitrary.
+fn strip_end_anchors(mut s: &str) -> &str {
+    loop {
+        let Some(next) = s
+            .strip_suffix('$')
+            .or_else(|| s.strip_suffix("\\z"))
+            .or_else(|| s.strip_suffix("\\Z"))
+        else {
+            return s;
+        };
+        // `a\$` is a literal dollar and `a\\z` is a literal `z`; neither
+        // is an anchor, and stripping it would read the character before
+        // it as the tail.
+        if trailing_backslashes(next) % 2 == 1 {
+            return s;
+        }
+        s = next;
+    }
+}
+
+/// Drop one trailing quantifier that has **no upper bound**.
+///
+/// `?`, `{2}` and `{1,3}` are bounded and are not stripped: a bounded
+/// quantifier is a constraint, which is the whole distinction this check
+/// is about. Lazy spellings are: `*?` still matches to the end of the
+/// subject when that is what it takes to satisfy the rest of the pattern.
+fn strip_open_quantifier(s: &str) -> Option<&str> {
+    if let Some(r) = s.strip_suffix("*?").or_else(|| s.strip_suffix("+?")) {
+        return Some(r);
+    }
+    if let Some(r) = s.strip_suffix('*').or_else(|| s.strip_suffix('+')) {
+        return Some(r);
+    }
+    // `{n,}` and `{n,}?` — a lower bound and no upper one.
+    let braced = s.strip_suffix('?').unwrap_or(s).strip_suffix('}')?;
+    let (head, counts) = braced.rsplit_once('{')?;
+    let (low, high) = counts.split_once(',')?;
+    let open_ended = high.is_empty() && !low.is_empty() && low.bytes().all(|b| b.is_ascii_digit());
+    open_ended.then_some(head)
+}
+
+/// The trailing *"…and then anything"* of a `match_command`, if it has
+/// one (GH #45).
+///
+/// **This is a shallow, syntactic heuristic and it must stay one.** It
+/// does not analyse the regex; it looks at the last few characters. A
+/// determined operator defeats it in one keystroke — `[^\x00]*` is not on
+/// [`ANY_CHAR_ATOMS`] and never will be, and neither is
+/// `^(ssh.*|psql.*)$`, whose tails are inside an alternation this never
+/// opens.
+///
+/// **That is not a gap to close, because the operator is not the
+/// adversary here — the agent is.** The check exists because
+/// `secret::binding`'s whole-line rule has one predictable failure mode:
+/// an operator whose legitimate session stops matching appends `.*` under
+/// time pressure, silently, and the hole GH #45 closed is back. Turning
+/// that specific reflex into a daemon that will not start is the entire
+/// job. An operator who reaches past it has *chosen* to widen their own
+/// binding, which is a different act from not noticing they did.
+///
+/// So: do not grow this into a general regex analysis, and do not delete
+/// it as unsound. It is neither sound nor complete on purpose.
+fn unconstrained_tail(pattern: &str) -> Option<&str> {
+    let body = strip_end_anchors(pattern);
+    let end = body.len();
+    let before_quantifier = strip_open_quantifier(body)?;
+    let before_atom = ANY_CHAR_ATOMS
+        .iter()
+        .find_map(|a| before_quantifier.strip_suffix(a))?;
+    if trailing_backslashes(before_atom) % 2 == 1 {
+        return None;
+    }
+    Some(&pattern[before_atom.len()..end])
 }
 
 /// `value` must leave headroom under a wire cap. See the I-9 comment in
@@ -1744,6 +1863,98 @@ reference = \"db/prod\"
             .expect("a valid binding must load");
         assert_eq!(ok.security.secret_bindings.len(), 1);
         assert_eq!(ok.security.secret_bindings[0].match_prompt, "");
+    }
+
+    /// **GH #45's second half.** A `match_command` ending in *"and then
+    /// anything"* is refused, and the daemon does not start.
+    ///
+    /// `secret::binding` matches `match_command` against the **whole**
+    /// joined command line. That closes the issue on its own — and its
+    /// failure mode is an operator whose legitimate session stops
+    /// matching, appending `.*` at four in the morning, silently putting
+    /// the hole back. This check is what makes that a load error instead.
+    ///
+    /// **The refusals and the acceptances are one row deliberately.** A
+    /// heuristic like this fails in two directions, and the expensive
+    /// direction is the false positive: an operator whose *correct*
+    /// pattern is refused has a daemon that will not start and no way to
+    /// fix it. So every accepted spelling below is a pattern somebody
+    /// would plausibly write.
+    #[test]
+    fn refuses_an_unconstrained_tail() {
+        let binding = |match_command: &str| {
+            format!(
+                "[[security.secret_bindings]]\nname = \"prod-ssh\"\n\
+                 match_command = '{match_command}'\nmatch_prompt = \"\"\n\
+                 provider = \"secret-service\"\nreference = \"r\"\n"
+            )
+        };
+        // Refused. Every one of these matches `ssh prod-01 -o
+        // ProxyCommand=nc 127.0.0.1 2222` end to end, which is the
+        // command line the issue was filed for.
+        for pattern in [
+            "^ssh\\s+prod-01.*",
+            "^ssh\\s+prod-01.*$",
+            "^ssh\\s+prod-01.+",
+            "^ssh\\s+prod-01.*?",
+            "^ssh\\s+prod-01.+?",
+            "^ssh\\s+prod-01.{0,}",
+            "^ssh\\s+prod-01.{1,}",
+            "^ssh\\s+prod-01[\\s\\S]*",
+            "^ssh\\s+prod-01[\\S\\s]+",
+            "^ssh\\s+prod-01[\\w\\W]*",
+            "^ssh\\s+prod-01[\\d\\D]*$",
+            "^ssh\\s+prod-01.*\\z",
+            // The whole pattern being the tail — the two-character
+            // spelling of "every session on the box".
+            ".*",
+        ] {
+            let Err(e) = parse_str(&binding(pattern)) else {
+                panic!("`{pattern}` loaded, and it admits any arguments an agent appends");
+            };
+            let msg = e.to_string();
+            assert!(
+                msg.contains("match_command"),
+                "the error must name the key, in the idiom every other check here \
+                 uses: {msg}"
+            );
+            assert!(
+                msg.contains("prod-ssh"),
+                "the error must name the binding, or an operator with six of them \
+                 cannot find it: {msg}"
+            );
+        }
+
+        // Accepted. Bounded quantifiers, escaped metacharacters and
+        // patterns that simply do not end in a quantifier at all.
+        for pattern in [
+            // §9.6's published example, and the shape it becomes under
+            // the whole-line rule.
+            "^ssh\\s+(\\S+@)?prod-0[12]$",
+            "^ssh\\s+prod-01$",
+            // A trailing optional group is *bounded*: it admits one more
+            // thing, not everything.
+            "^ssh\\s+prod-01(\\s+-v)?$",
+            // Bounded repetition, in all three spellings.
+            "^ssh\\s+prod-0.$",
+            "^ssh\\s+prod-01\\s.{0,8}$",
+            "^ssh\\s+prod-01\\s.{2}$",
+            "^ssh\\s+prod-01\\s.{1,3}$",
+            // `\.*` is *"zero or more dots"* — the escaped literal, whose
+            // only difference from the refused `.*` is a backslash.
+            "^ping\\s+prod\\.*$",
+            // The documented escape hatch. An operator who writes this
+            // has chosen to widen their binding; see `unconstrained_tail`
+            // for why that is a different act from not noticing.
+            "^ssh\\s+prod-01[^\\x00]*$",
+        ] {
+            parse_str(&binding(pattern)).unwrap_or_else(|e| {
+                panic!(
+                    "`{pattern}` is a reasonable pattern and was refused, which is a \
+                     daemon an operator cannot start: {e}"
+                )
+            });
+        }
     }
 
     #[test]
