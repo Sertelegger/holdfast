@@ -260,6 +260,74 @@ fn have_proc() -> bool {
     PathBuf::from("/proc/self/fd").exists()
 }
 
+/// What the daemon's fd table says about its sockets: how many it holds
+/// at all, and any TCP listeners among them.
+///
+/// Two implementations because the question has two spellings, not
+/// because the platforms disagree about the answer. Linux reads
+/// `/proc/<pid>/fd` for socket inodes and intersects them with
+/// `/proc/net/tcp{,6}`. macOS has neither file, and `lsof` answers both
+/// halves directly.
+///
+/// **The macOS arm exists because the guard it replaces returned early.**
+/// That made "the daemon binds no TCP port" — the property 0.0.10's
+/// bridge will be measured against, and the one a reader of this file
+/// would assume is checked everywhere — pass on macOS without ever being
+/// asked. The count is the witness that the scan saw anything at all, so
+/// an empty answer cannot read as a clean result.
+#[cfg(target_os = "linux")]
+fn daemon_sockets(pid: u32) -> (usize, Vec<String>) {
+    let mut inodes = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read the daemon's fd table")
+        .flatten()
+    {
+        if let Ok(target) = std::fs::read_link(entry.path()) {
+            let s = target.to_string_lossy().into_owned();
+            if let Some(i) = s.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')) {
+                inodes.insert(i.to_string());
+            }
+        }
+    }
+    let mut listening = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(contents) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in contents.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            // Field 3 is the state (`0A` = TCP_LISTEN); field 9 is the inode.
+            if f.len() > 9 && f[3] == "0A" && inodes.contains(f[9]) {
+                listening.push(line.to_string());
+            }
+        }
+    }
+    (inodes.len(), listening)
+}
+
+/// The `n` lines of an `lsof -F` report — one path or address per line.
+#[cfg(not(target_os = "linux"))]
+fn lsof_names(args: &[&str]) -> Vec<String> {
+    let Ok(out) = Command::new("lsof").args(args).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix('n').map(str::to_string))
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_sockets(pid: u32) -> (usize, Vec<String>) {
+    let pid = pid.to_string();
+    // `-U` alone for the witness: the daemon's own listener is a Unix
+    // socket, so a zero here means `lsof` answered nothing rather than
+    // that the daemon is clean.
+    let held = lsof_names(&["-a", "-p", &pid, "-U", "-F", "n"]);
+    let listening = lsof_names(&["-a", "-p", &pid, "-iTCP", "-sTCP:LISTEN", "-F", "n"]);
+    (held.len(), listening)
+}
+
 /// Pids of the `holdfast daemon run` processes serving `runtime_dir`.
 ///
 /// Asked differently per platform, because the two expose process
@@ -878,39 +946,15 @@ fn the_running_daemon_holds_no_listening_tcp_socket() {
     assert_eq!(env.run(&["daemon", "start"]).0, 0);
     let pid = env.daemon_pid().expect("pid file");
 
-    if !PathBuf::from("/proc/self/fd").exists() {
-        return; // Linux-only introspection; other platforms skip.
-    }
-
-    let mut inodes = std::collections::HashSet::new();
-    for entry in std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .expect("read the daemon's fd table")
-        .flatten()
-    {
-        if let Ok(target) = std::fs::read_link(entry.path()) {
-            let s = target.to_string_lossy().into_owned();
-            if let Some(i) = s.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')) {
-                inodes.insert(i.to_string());
-            }
-        }
-    }
+    let (held, listening) = daemon_sockets(pid);
     assert!(
-        !inodes.is_empty(),
+        held > 0,
         "the daemon should hold at least the Unix listener; fd scan found none"
     );
-
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(contents) = std::fs::read_to_string(table) else {
-            continue;
-        };
-        for line in contents.lines().skip(1) {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            // Field 3 is the state (`0A` = TCP_LISTEN); field 9 is the inode.
-            if f.len() > 9 && f[3] == "0A" && inodes.contains(f[9]) {
-                panic!("daemon pid {pid} is listening on TCP: {line}");
-            }
-        }
-    }
+    assert!(
+        listening.is_empty(),
+        "daemon pid {pid} is listening on TCP: {listening:?}"
+    );
 }
 
 #[test]

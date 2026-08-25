@@ -364,6 +364,43 @@ async fn the_daemon_binds_only_unix_sockets_and_not_http() {
             }
         }
     }
+
+    // The same cross-check where there is no `/proc`, because the `cfg`
+    // above compiled this assertion out of every non-Linux run — so the
+    // one guard against 0.0.10's TCP bind creeping forward was absent on
+    // a platform the project is routinely developed on. `lsof` reads the
+    // same kernel state by a second route.
+    //
+    // The scope note above applies unchanged: this is the *test* process,
+    // so it sees what `bind_control` + `serve` opened and nothing that
+    // only the real binary opens. `daemon_cli.rs` remains authoritative.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let pid = std::process::id().to_string();
+        let names = |args: &[&str]| -> Vec<String> {
+            let out = std::process::Command::new("lsof")
+                .args(args)
+                .output()
+                .expect("lsof reports this process's open files");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.strip_prefix('n').map(str::to_string))
+                .collect()
+        };
+        // Witness first. Without it an `lsof` that answered nothing at
+        // all would read exactly like a daemon that binds no TCP port,
+        // which is the failure mode the `cfg` above already had.
+        let unix = names(&["-a", "-p", &pid, "-U", "-F", "n"]);
+        assert!(
+            !unix.is_empty(),
+            "lsof saw no Unix socket in this process, so the TCP check below proves nothing"
+        );
+        let listening = names(&["-a", "-p", &pid, "-iTCP", "-sTCP:LISTEN", "-F", "n"]);
+        assert!(
+            listening.is_empty(),
+            "the daemon process holds a listening TCP socket: {listening:?}"
+        );
+    }
 }
 
 #[tokio::test]
