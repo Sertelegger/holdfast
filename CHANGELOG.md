@@ -6,7 +6,68 @@ upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
 ## [Unreleased]
 
-Nothing yet.
+**The agent can ask for a credential it is never allowed to see.**
+`request_secret_input` blocks the calling tool while a human — or, where an
+operator has configured one, a credential store — supplies a value that goes
+from the client straight to the child's PTY. It enters no MCP response, no log
+and no broadcast to other attached clients, so there is no boundary at which a
+redactor could run on it, which is the point: the value is *absent* from those
+surfaces rather than redacted on them.
+
+### Added
+
+- **`request_secret_input`**, the twelfth MCP tool. It blocks until an attached
+  human answers, a configured provider resolves the value, the child stops
+  asking, or the call's own `timeout_secs` elapses. What the agent gets back is
+  a status and a **byte count** — never the value, and never a handle it could
+  exchange for one.
+- **Keychain autofill from operator-declared bindings** (`[[security.secret_bindings]]`).
+  A binding names a command-line pattern, a prompt pattern, a provider
+  (`secret-service`, `security`, `pass`, `op`) and a reference in that provider.
+  The agent supplies no part of the lookup and cannot enumerate what exists:
+  every way a binding fails to resolve falls through silently to the human
+  prompt, so *"your binding is exhausted"* is indistinguishable from *"you have
+  no binding"*.
+- **`require_confirm` on a binding**, with the approval round trip to go with
+  it: a new `BindingApprovalRequired` server frame and `ApproveBinding` client
+  frame. The credential is resolved **after** the human approves and not
+  before — a value fetched speculatively and discarded on denial is a
+  credential read out of a store nobody agreed to read.
+- **A notice in the session buffer when a secret is wanted and nobody is
+  attached**, so an agent reading `read_output` can see why its child stopped.
+  It reaches the buffer only: not the child, not the prompt the detector
+  reports, and not the idle deadline.
+- **`not_supported_on_platform`**, for a build whose platform has no
+  out-of-band secret entry.
+
+### Changed
+
+- **Two config shapes that loaded at 0.0.6 now stop the daemon.** Both keys were
+  documented *"Unread — 0.0.7"* before this milestone, so an operator who set
+  them ahead of time had a config that loaded and did nothing; after upgrade the
+  daemon binds no socket and prints the offending key. Both refusals are
+  deliberate, and the error names what to change:
+
+  - `security.autofill_on_echo_off = true` with `security.secret_provider =
+    "prompt"` (which is the default). Autofill resolves from a credential store
+    and `prompt` has none, so the pair reads *"on"* and behaves *"off"* — for
+    the single most consequential switch in the file. Set `secret_provider` to
+    `"keychain"` or `"both"`, or leave autofill off.
+  - A `[[security.secret_bindings]]` entry whose `match_command` or
+    `match_prompt` is not a valid regex. The whole block was unread at 0.0.6, so
+    a typo'd pattern was inert; it is now a load error, because a binding that
+    never matches is indistinguishable from a credential store that is down.
+
+  §10.2's published example is unaffected: it ships `autofill_on_echo_off =
+  false` alongside `secret_provider = "prompt"`, which passes the new rule.
+
+- **Every tool's `outputSchema` advertises eleven statuses where it advertised
+  eight.** `secret_provided` and `secret_cancelled` join after `session_died`,
+  and `not_supported_on_platform` after `spawn_failed` — inserted at their
+  catalogue positions rather than appended, because that array's order is a wire
+  fact. Enum widening is backward-compatible for a validating client, but the
+  schema is a surface MCP clients cache, and three of the eleven are statuses
+  any given pre-0.0.7 tool can never return.
 
 ## [0.0.6] — 2026-08-19
 

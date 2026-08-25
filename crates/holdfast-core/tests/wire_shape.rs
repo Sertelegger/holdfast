@@ -9,6 +9,17 @@
 //! tag as the boundary), and the diff of the seventh looks exactly like
 //! the diff of the first.
 //!
+//! **The boundary was refined once, by 0.0.7, and the refinement lives
+//! here rather than only in a commit message.** The tag is where the rule
+//! starts being *asserted*; what makes a bump owed is a **peer in the
+//! world** to skew against, and there is none until first external
+//! distribution. 0.0.7 added two attach frames — one of them a *client*
+//! frame, which the failure message below classifies as breaking — and
+//! left `PROTOCOL_MAJOR.PROTOCOL_MINOR` at 1.0, re-recording `1.0.golden`
+//! in place. That is the third path, taken deliberately and additively.
+//! It stops being available the moment a binary is published, and the
+//! next hand should assume it already has.
+//!
 //! # What this records
 //!
 //! A text document — [`shape_document`] — built from the **encoded
@@ -107,9 +118,17 @@ use holdfast_core::protocol::method::{CborValue, ControlError, ErrorCode, Reques
 /// current build must be the last row — you cannot be speaking a protocol
 /// older than one already recorded.
 const RECORDED_VERSIONS: &[(u32, u32)] = &[
-    // 1.0 — 0.0.5's control protocol plus 0.0.6's attach frames. The
-    // first shape recorded at all; everything before it is pre-tag and
-    // has no record, which is the gap GH #18 is about.
+    // 1.0 — 0.0.5's control protocol, 0.0.6's attach frames, and 0.0.7's
+    // two (`BindingApprovalRequired`, `ApproveBinding`). The first shape
+    // recorded at all; everything before it is pre-tag and has no record,
+    // which is the gap GH #18 is about.
+    //
+    // **0.0.7's frames were added to this row rather than to a new one**,
+    // which is the third path the header calls out — see the ruling
+    // recorded there. The golden edit was purely additive (+9/−2, and both
+    // "deletions" are `variants:` lines that gained a name inline): no
+    // field removed, none renamed, no `type` tag changed, no `wire:` line
+    // altered.
     (1, 0),
 ];
 
@@ -779,10 +798,14 @@ fn the_wire_shape_matches_the_record_for_this_protocol_version() {
          new *client* frame the daemon must understand) -> bump PROTOCOL_MAJOR.\n\n\
          Then add the new pair to RECORDED_VERSIONS and write the current document to \
          tests/wire-shape/<major>.<minor>.golden. The full current document is below.\n\n\
-         Editing {} in place is the one fix that is not available: it claims this shape was \
-         always protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}, and every peer built against the \
-         real one disagrees. That rewrite is what this guard exists to make visible \
-         (GH #18).\n\n\
+         Editing {} in place is the third path, and it is the one that has to be argued \
+         rather than taken: it claims this shape was always protocol \
+         {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}, and a peer built against the real one \
+         disagrees. That rewrite is what this guard exists to make visible (GH #18) — \
+         not to prevent, which a checked-in file cannot be. It has been taken exactly \
+         once, by 0.0.7, on the ground that nothing has been externally distributed yet \
+         (see RECORDED_VERSIONS). If you are taking it again, the burden is to say why \
+         here, in this file, and not only in a commit message.\n\n\
          ----- begin current document -----\n{current}----- end -----\n",
         diff(&recorded, &current),
         path.display(),

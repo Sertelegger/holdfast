@@ -1637,12 +1637,22 @@ mod tests {
             other => panic!("a non-zero exit should be `Failed`, got {other:?}"),
         }
 
-        // The failure wrote nothing to the child — the negative half, and
-        // what separates "resolved nothing" from "resolved something
-        // wrong". The child is still sitting on its echo-off read.
+        // **A control, not a guard, and it is labelled as one because it
+        // cannot fail.** `resolve_with` takes no `Session`, so nothing in
+        // this file can write to the child at all (the doc above says as
+        // much: *"nothing in the daemon calls `resolve`"*). What this
+        // asserts is that the **fixture** is in the state the next block
+        // needs — the child still sitting on its echo-off read, having
+        // completed nothing — and the mutation that would move it lives
+        // in another module. It used to read *"the negative half"*, which
+        // is what a guard is called, and in a file whose whole licence is
+        // that every absence sits beside a control **named as such**, one
+        // mislabel is how a decorative assertion survives the next
+        // review.
         assert!(
             !contains(&buffered(&s), b"got="),
-            "the child completed its read on a provider that failed"
+            "fixture precondition: the child had already completed its read before the \
+             submission below, so what follows proves nothing about the write"
         );
 
         // Task 10's `Err(_) => prompt`, at the level where it is

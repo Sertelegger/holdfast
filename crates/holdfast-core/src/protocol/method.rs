@@ -92,6 +92,16 @@ pub struct ControlError {
     /// That is why the rule is now asserted rather than only written
     /// down — `tests/wire_shape.rs` records the wire shape per protocol
     /// version and fails when one moves without the other (GH #18).
+    ///
+    /// **Refined once, by 0.0.7, and recorded here so the two statements
+    /// in this tree do not disagree.** The tag is where the rule starts
+    /// being *asserted*; what makes a bump owed is a peer in the world to
+    /// skew against, and there is none until first external distribution.
+    /// 0.0.7 added two attach frames and left the version at 1.0,
+    /// re-recording `tests/wire-shape/1.0.golden` in place — additively,
+    /// with no field removed, renamed or retyped. `wire_shape.rs`'s module
+    /// header carries the same note beside the guard that fires. The
+    /// latitude ends at the first published binary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_code: Option<i32>,
 }
