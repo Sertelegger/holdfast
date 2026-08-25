@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The full design specification is at `docs/superpowers/specs/2026-05-01-holdfast-design.md`, with per-milestone implementation plans in `docs/superpowers/plans/`. Read the spec for any non-trivial work in this repo. The historical brainstorming notes are at `docs/brainstorming-progress.md` (kept as a record; superseded by the spec).
 
-**`docs/` is deliberately git-ignored and local to the author's machine** — it is absent from the remote and from history. If you are working in a clone that has no `docs/`, say so rather than guessing at the spec: the numbered section references throughout this codebase (§8.3, §5.4, …) all point into that document, and inventing what they say is worse than not having them.
+**`docs/` is deliberately git-ignored and absent from this repository's history.** It is a symlink into a checkout of the private `project-docs` repo, which holds one directory per project — see that repo's `README.md` for the clone-and-symlink setup, and note the ignore rule here has no trailing slash on purpose, because `docs/` would stop matching a symlink. If you are working in a clone that has no `docs/`, say so rather than guessing at the spec: the numbered section references throughout this codebase (§8.3, §5.4, …) all point into that document, and inventing what they say is worse than not having them.
 
 ## Stack and Architecture (decided)
 
