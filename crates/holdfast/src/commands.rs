@@ -1143,7 +1143,10 @@ pub async fn attach(session: &str) -> ExitCode {
                     // whether the session is `ssh prod-01` or `ssh
                     // prod-01 -o ProxyCommand=nc 127.0.0.1 2222`, and a
                     // human who cannot see which one it is has nothing to
-                    // decide with. Already redacted by the daemon.
+                    // decide with. Already redacted **and stripped of
+                    // control characters** by the daemon — without the
+                    // second half an agent could erase this very line as
+                    // it is drawn.
                     ServerFrame::BindingApprovalRequired {
                         binding_name,
                         command_line,

@@ -117,12 +117,122 @@ pub fn redact_str(rules: &RuleSet, text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// [`redact_str`] for a string that will be **shown to a human on one
+/// line** rather than replayed to a terminal: `AwaitingSecret.prompt_text`,
+/// `BindingApprovalRequired.prompt_text` and `.command_line`.
+///
+/// **The order is load-bearing and it is not a preference.** Every one of
+/// these strings is agent-authored or child-authored, so it can carry a
+/// control byte *inside* a credential — and every redaction rule is
+/// anchored on a literal. Redacting first therefore misses the token, and
+/// the strip that follows does not merely fail to help: **it repairs the
+/// credential.** Driven against `RuleSet::builtin()` with one `\x08`
+/// planted in a GitHub token:
+///
+/// ```text
+/// redact only            ghp_0123456789abcdefghij\x08ABCDEFGHIJ012345   not redacted
+/// REDACT then STRIP      ghp_0123456789abcdefghijABCDEFGHIJ012345       a clean, valid, 40-char token on the wire
+/// STRIP then REDACT      [REDACTED:github]
+/// ```
+///
+/// So the wrong order hands every attached client a working credential
+/// that the agent smuggled past the redactor and the daemon reassembled
+/// on its behalf. Stripping first means the redactor sees the same bytes
+/// the human will.
+///
+/// **The residual, so this is not read as more than it is.** A whole
+/// *sequence* planted mid-token (`ghp_…\x1b[0m…`) is not redacted in
+/// either order: stripping leaves `[0m` behind, which still breaks the
+/// rule's anchor. What the shipped order guarantees is that no
+/// **usable** credential leaves — the wreckage is visible and recovering
+/// it needs a reader who already knows what was planted. Defeating a
+/// deliberate obfuscation by a party that already holds the secret is not
+/// something the redactor has ever claimed.
+///
+/// `strip_then_redact_or_the_daemon_repairs_the_credential` fails if the
+/// two are swapped, and pins the residual beside it.
+pub fn redact_for_display(rules: &RuleSet, text: &str) -> String {
+    redact_str(rules, &crate::output::ansi::one_line_for_display(text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rules() -> RuleSet {
         RuleSet::builtin().unwrap()
+    }
+
+    /// **The ordering inside [`redact_for_display`], and why swapping it
+    /// is worse than it looks.**
+    ///
+    /// A control byte planted inside a credential defeats the redaction
+    /// rule's literal anchor. Redact-then-strip does not merely *miss*
+    /// the token — the strip afterwards removes the byte the agent
+    /// planted, so a complete, valid credential reaches every attached
+    /// client, reassembled by the daemon on the agent's behalf.
+    #[test]
+    fn strip_then_redact_or_the_daemon_repairs_the_credential() {
+        let r = rules();
+        const CLEAN: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+
+        // The control that makes the rest mean something: without a
+        // planted byte the rule fires either way round.
+        assert_eq!(redact_str(&r, CLEAN), "[REDACTED:github]");
+
+        // One byte, planted mid-token, in the two spellings an agent has.
+        // The premise, asserted rather than assumed: the rule's literal
+        // anchor does not reach through either of them.
+        let bare = format!("ghp_0123456789abcdefghij{}ABCDEFGHIJ012345", '\u{8}');
+        let seq = format!("ghp_0123456789abcdefghij{}[0mABCDEFGHIJ012345", '\u{1b}');
+        for smuggled in [&bare, &seq] {
+            assert!(
+                redact_str(&r, smuggled).contains("ghp_0123456789abcdefghij"),
+                "the rule matched through the planted byte, so this row is not about \
+                 ordering at all"
+            );
+        }
+
+        // **The property that decides the order: no *usable* credential
+        // leaves under the shipped one.**
+        for smuggled in [&bare, &seq] {
+            assert_ne!(
+                redact_for_display(&r, smuggled),
+                CLEAN,
+                "a complete, valid credential reached a human-facing field"
+            );
+        }
+        assert_eq!(
+            redact_for_display(&r, &bare),
+            "[REDACTED:github]",
+            "stripping first is what lets the rule see the token at all"
+        );
+
+        // **And the wrong order, at its sharpest.** With a bare control
+        // character the strip that runs *afterwards* removes exactly the
+        // byte that defeated the rule, so the daemon hands every attached
+        // client a complete, valid, 40-character credential — reassembled
+        // on the agent's behalf. That is the difference between missing a
+        // secret and manufacturing one.
+        assert_eq!(
+            crate::output::ansi::one_line_for_display(&redact_str(&r, &bare)),
+            CLEAN,
+            "the wrong order is supposed to reassemble the credential; if it no longer \
+             does, this row has stopped describing the hazard it exists for"
+        );
+
+        // **The residual, pinned rather than papered over.** A *sequence*
+        // planted mid-token survives the shipped order too — the token is
+        // not redacted, because `one_line_for_display` drops the `\x1b`
+        // and keeps `[0m` (GH #45 N-3), which still breaks the rule's
+        // anchor. What it is not is a working credential, and that is the
+        // whole of the claim being made here. Recovering it needs a reader
+        // who already knows the shape of what was planted.
+        let shown = redact_for_display(&r, &seq);
+        assert!(
+            shown.starts_with("ghp_") && shown.contains("[0m"),
+            "{shown}"
+        );
     }
 
     /// The rule index of a rule named in the TOML, so a test can talk

@@ -309,9 +309,15 @@ pub enum ServerFrame {
         /// field exists.
         ///
         /// `command` and `args` joined with single spaces, **redacted
-        /// element-wise before the join** — see
+        /// element-wise before the join, and reduced to one line of plain
+        /// text** — no escape sequence, no control character, no
+        /// directional override survives, because a field that exists to
+        /// be *read* is defeated by an argument that can rewrite the line
+        /// it is printed on. See
         /// [`crate::secret::binding::redacted_command_line`], which is the
-        /// only thing that builds it. It is a rendering and not a subject:
+        /// only thing that builds it, and
+        /// [`crate::output::redact::redact_for_display`] for why the strip
+        /// runs before the redaction. It is a rendering and not a subject:
         /// nothing matches against it.
         ///
         /// **Mitigation, not a fix, and the frame should not be read as

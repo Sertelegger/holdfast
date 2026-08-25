@@ -9,7 +9,7 @@ use crate::detect::{
 };
 use crate::output::ansi::AnsiMode;
 use crate::output::encoding::TextEncoding;
-use crate::output::redact::redact_str;
+use crate::output::redact::{redact_for_display, redact_str};
 use crate::output::rules::RuleSet;
 use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{clamp_geometry, InProcessPty, PtyBackend, PtySpawnConfig};
@@ -1484,7 +1484,11 @@ impl HoldfastServer {
                     // rule the `AwaitingSecret` broadcast below follows —
                     // and a *second* redaction rather than a hoisted
                     // one, so that ordering claim above stays true.
-                    let approval_prompt = redact_str(&self.processor.rules, &args.prompt_text);
+                    // The agent's own string, on its way to every
+                    // attached client's approval dialog — so stripped as
+                    // well as redacted (GH #45).
+                    let approval_prompt =
+                        redact_for_display(&self.processor.rules, &args.prompt_text);
                     if let Some(done) = self
                         .run_binding_approval(
                             &session,
@@ -1510,7 +1514,7 @@ impl HoldfastServer {
         // surface, and redacting the broadcast too costs one call, keeps
         // one rule for the string, and stops a human being shown a
         // secret-shaped value in the modal they are about to type into.
-        let prompt_text = redact_str(&self.processor.rules, &args.prompt_text);
+        let prompt_text = redact_for_display(&self.processor.rules, &args.prompt_text);
 
         // REQ-SEC-010a. Raise if the slot is vacant, **adopt** if an echo
         // drop already raised one — §16.4 steps 3–7 are an adoption end
@@ -1975,9 +1979,10 @@ impl HoldfastServer {
         // name reads the same for `ssh prod-01` and for `ssh prod-01 -o
         // ProxyCommand=nc 127.0.0.1 2222`, and the second is the one a
         // person would refuse — so the line goes on the frame beside the
-        // name. Redacted element-wise before the join, because
-        // `command`/`args` are the agent's own strings and this frame
-        // reaches every attached client.
+        // name. Redacted element-wise before the join **and stripped of
+        // every character that could rewrite the line it is printed on**,
+        // because `command`/`args` are the agent's own strings and this
+        // frame reaches every attached client.
         let approval = crate::secret::Approval::new(
             &session.id,
             binding_name,

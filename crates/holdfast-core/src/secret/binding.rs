@@ -42,8 +42,16 @@
 //! * [`redacted_command_line`] — added for GH #45, and **its second and
 //!   third arguments are the agent's own strings**.
 //!
-//! (The grep also finds `session::binding_uses`, which names the
-//! [`BindingUses`] *type* and calls nothing here.)
+//! **The grep returns a good deal more than those four lines, and an
+//! earlier revision of this paragraph excused exactly one of the
+//! extras** — so a reader running the command did not land where it said
+//! they would. What else comes back: a `use` line in `mcp::tools`, one
+//! type reference (`session::binding_uses`, naming [`BindingUses`]), and
+//! mentions inside doc comments across several files, this one included.
+//! **The calls are the lines with a `(` after the function name**, and
+//! they are the four listed above. No count is given for the rest on
+//! purpose: a number in prose here is a number that goes stale on the
+//! next commit, which is the mistake this paragraph has now made twice.
 //!
 //! **Two corrections in one paragraph, and both are the same mistake.**
 //! It said *"two functions"* — omitting `autofill_approved`, which has
@@ -253,11 +261,16 @@ pub fn command_line(command: &str, args: &[String]) -> String {
 /// defeated by an argument containing `\x1b[2K` or `\r`: the agent
 /// rewrites or blanks the very line the operator is being asked to
 /// approve, and can forge the diagnostic text around it. Redaction alone
-/// does not touch them — no rule matches an escape sequence — so
-/// [`one_line_for_display`] runs too, and it runs **first**, because a
-/// control byte parked inside a credential is enough to stop a redaction
-/// rule's literal anchor from matching. Strip, then redact: the redactor
-/// then sees the same bytes a human would.
+/// does not touch them — no rule matches an escape sequence. Both run,
+/// in one place, through [`redact_for_display`], whose doc carries the
+/// argument for the order: stripping **second** would let the daemon
+/// *repair* a credential the agent had smuggled past the redactor.
+///
+/// **Element-wise here too, and that is load-bearing rather than
+/// incidental.** An unterminated escape in one argument must not reach
+/// the next one, which is what a single pass over the joined line would
+/// let it do. Pinned by
+/// `an_unterminated_escape_in_one_argument_does_not_reach_the_next`.
 ///
 /// **Not what [`select`] matches against, and the two must not be
 /// unified.** The matcher reads the *unredacted, unstripped* join, for the
@@ -274,11 +287,9 @@ pub fn redacted_command_line(
     command: &str,
     args: &[String],
 ) -> String {
-    use crate::output::ansi::one_line_for_display;
-    use crate::output::redact::redact_str;
-    let show = |s: &str| redact_str(rules, &one_line_for_display(s));
-    let args: Vec<String> = args.iter().map(|a| show(a)).collect();
-    command_line(&show(command), &args)
+    use crate::output::redact::redact_for_display;
+    let args: Vec<String> = args.iter().map(|a| redact_for_display(rules, a)).collect();
+    command_line(&redact_for_display(rules, command), &args)
 }
 
 /// Does §5.2's step 1 run at all?
@@ -1281,6 +1292,62 @@ mod tests {
         assert!(!command_line("ssh", &["a b".into()]).contains('"'));
     }
 
+    /// **The human-facing rendering cannot be made to lose an argument**,
+    /// and the per-element application is what stops one argument
+    /// reaching into the next.
+    ///
+    /// Both halves are GH #45's re-review. The first is N-3: an earlier
+    /// revision built this through `ansi::strip`, which *consumes*
+    /// OSC/DCS/APC payloads, so `ssh prod-01\x1b]0; -o ProxyCommand=…\x07`
+    /// rendered as exactly `ssh prod-01` — a forged **short** line, which
+    /// is layer D inverted. The second is the good news the re-review
+    /// found and had no row for: because `redacted_command_line` renders
+    /// **element-wise**, an unterminated sequence in one argument cannot
+    /// swallow the one after it. A single pass over the joined string
+    /// would let it.
+    #[test]
+    fn an_unterminated_escape_in_one_argument_does_not_reach_the_next() {
+        let rules = crate::output::rules::RuleSet::builtin().expect("the built-in rules");
+        let show = |args: &[&str]| {
+            redacted_command_line(
+                &rules,
+                "ssh",
+                &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            )
+        };
+
+        // N-3's four subjects, on the real field. Each argument's text
+        // must survive; only its power to act is removed.
+        for opener in ["\u{1b}]0;", "\u{1b}_", "\u{1b}P"] {
+            let shown = show(&[
+                "prod-01",
+                &format!("{opener} -o ProxyCommand=nc 1.2.3.4 22"),
+            ]);
+            assert!(
+                shown.contains("-o ProxyCommand=nc 1.2.3.4 22"),
+                "an argument was consumed rather than de-fanged, so the operator is \
+                 shown a command line with a piece missing: {shown:?}"
+            );
+            assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        }
+
+        // **The boundary.** The unterminated OSC is in argument two; the
+        // `-o` in argument three must still be there. Rendering the join
+        // in one pass would eat it.
+        let shown = show(&["prod-01", "\u{1b}]0;label", "-o", "ProxyCommand=nc 1 2"]);
+        assert_eq!(
+            shown, "ssh prod-01 ]0;label -o ProxyCommand=nc 1 2",
+            "an unterminated sequence in one argument reached into the next"
+        );
+
+        // The pairing: ordinary arguments render unchanged, so the rows
+        // above are not satisfied by a function that returns its input.
+        assert_eq!(
+            show(&["user@prod-01", "-o", "StrictHostKeyChecking=no"]),
+            "ssh user@prod-01 -o StrictHostKeyChecking=no"
+        );
+    }
+
     /// The mode gate, both ways, before any row relies on it.
     #[test]
     fn only_keychain_and_both_let_step_one_run() {
@@ -1854,6 +1921,70 @@ mod tests {
         );
         buffer_until(&s, b"got=HUNTER2", 20).await;
 
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **`AwaitingSecret.prompt_text` reaches the worst surface in the
+    /// tree, and the agent writes it.**
+    ///
+    /// GH #45 J-3. `holdfast attach` hands that field to `render`, which
+    /// is documented as *"write bytes to the local terminal,
+    /// unmodified"* — so an escape sequence in it is not displayed
+    /// oddly, it is **executed** by the operator's terminal. The string
+    /// is `request_secret_input`'s own `prompt_text` argument.
+    ///
+    /// **The session deliberately does not drop echo.** A child that had
+    /// would raise its own request first and this call would *adopt* it,
+    /// carrying the child's line instead — which is what the approval row
+    /// two hundred lines down ends up asserting, and it is not this.
+    ///
+    /// The child-derived half of the same field needs no row and has
+    /// none: the reader strips escapes before the detector sees them and
+    /// the line reconstruction collapses `\r`, so `detection().last_line`
+    /// is already free of control characters. Measured, not assumed —
+    /// `WRONG\x08\x08\x08\x08\x08\rPassword: ` reaches the detector as
+    /// exactly `Password: `. The strip on that path is defence in depth
+    /// and is not load-bearing.
+    #[tokio::test]
+    async fn an_agents_prompt_text_reaches_the_terminal_with_nothing_that_can_act() {
+        let hostile = "\u{1b}]0;forged\u{7}\u{1b}[2Kpassword for prod-01:\rall clear";
+
+        let sc = Scratch::new("promptstrip");
+        let server = server_with(keychain_mode(vec![]), &sc.audit_log());
+        let s = session_running("ssh", &["prod-01"], "sleep 30");
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+
+        let payload = call(
+            &server,
+            RequestSecretInputArgs {
+                prompt_text: hostile.to_string(),
+                ..secret_args(&s.id, 1)
+            },
+        )
+        .await;
+        assert_eq!(payload["status"], "secret_cancelled", "{payload}");
+
+        let frame = client.wait_for("AwaitingSecret", is_awaiting).await;
+        let ServerFrame::AwaitingSecret { prompt_text, .. } = frame else {
+            unreachable!()
+        };
+        assert!(
+            !prompt_text.chars().any(char::is_control),
+            "the agent's `prompt_text` reached every attached client with a control \
+             character in it, and `holdfast attach` writes it to the terminal \
+             unmodified: {prompt_text:?}"
+        );
+        // De-fanged, not deleted. A field that dropped the OSC payload
+        // would pass the assertion above while showing the operator a
+        // shorter, more innocent prompt than the agent actually sent —
+        // which is the forged-short-line failure in its other spelling.
+        assert!(
+            prompt_text.contains("forged") && prompt_text.ends_with("all clear"),
+            "the agent's prompt was consumed rather than de-fanged: {prompt_text:?}"
+        );
+
+        client.unregister(&server);
         let _ = s.signal(Signal::Kill);
     }
 
@@ -3302,7 +3433,19 @@ mod tests {
         let mut client = attach_fake(&server, &s.id);
         await_prompt(&s, b"Password: ").await;
 
-        let call = spawn_call(&server, secret_args(&s.id, 20));
+        // **The agent's `prompt_text` is the frame's other agent-authored
+        // string**, and the re-review found it unstripped on the very
+        // frame this work hardened (GH #45 J-3). It rides along here
+        // rather than in a row of its own: the same call raises
+        // `BindingApprovalRequired` with it and then, on the denial below,
+        // `AwaitingSecret` with it too — so one row covers both frames.
+        let call = spawn_call(
+            &server,
+            RequestSecretInputArgs {
+                prompt_text: "\u{1b}]0;forged\u{7}password for prod-01:\rall clear".into(),
+                ..secret_args(&s.id, 20)
+            },
+        );
         // Reaching here at all is the second half: the binding selected,
         // so `select` saw the token and not a marker.
         let approval = await_approval(&server, &s.id).await;
@@ -3347,12 +3490,15 @@ mod tests {
             !command_line.contains("\x1b["),
             "an escape sequence survived as text: {command_line:?}"
         );
-        // The payload's *text* stays — only its power to overwrite is
-        // gone. A field that silently dropped the argument would pass the
-        // two assertions above and would be hiding the thing the operator
-        // most needs to see.
+        // **The payload's text stays — only its power to overwrite is
+        // gone.** A field that silently *dropped* the argument would pass
+        // the two assertions above while hiding the thing the operator
+        // most needs to see, which is a forged **short** line and is layer
+        // D inverted. That was a live defect for one revision, when this
+        // was built through `ansi::strip`; `ansi::a_string_sequence_cannot_forge_a_short_line`
+        // is the unit half.
         assert!(
-            command_line.ends_with("all clear"),
+            command_line.ends_with("[2Kall clear"),
             "the argument was dropped rather than de-fanged, which hides it from the \
              human instead of showing it: {command_line:?}"
         );
@@ -3374,6 +3520,49 @@ mod tests {
         let payload = joined(call, "the denied call").await;
         assert_eq!(payload["status"], "secret_cancelled", "{payload}");
         assert!(!sc.ran("prod-ssh"), "a denied approval ran the provider");
+
+        // **Both frames, both `prompt_text`s.** The denial falls through
+        // to the prompt path, so this client has seen a
+        // `BindingApprovalRequired` and an `AwaitingSecret`, each carrying
+        // the agent's own string.
+        client.drain();
+        assert!(
+            client.has(is_approval) && client.has(is_awaiting),
+            "the flow did not produce both frames, so this assertion is about one of \
+             them: {:?}",
+            client.seen
+        );
+        for f in &client.seen {
+            let (which, text) = match f {
+                ServerFrame::BindingApprovalRequired { prompt_text, .. } => {
+                    ("BindingApprovalRequired", prompt_text)
+                }
+                ServerFrame::AwaitingSecret { prompt_text, .. } => ("AwaitingSecret", prompt_text),
+                _ => continue,
+            };
+            assert!(
+                !text.chars().any(char::is_control),
+                "{which}.prompt_text carries a control character to every attached \
+                 client, and `holdfast attach` writes that field to the terminal \
+                 unmodified: {text:?}"
+            );
+            // De-fanged, not deleted — the OSC payload is the
+            // forged-short-line case (N-3) on this field rather than on
+            // `command_line`.
+            //
+            // **Only on the approval frame.** The `AwaitingSecret` here
+            // carries the *child's* prompt line (`Password: `) rather than
+            // the agent's: the echo drop raised the request first and this
+            // call adopted it, which is §5.2's ordinary path. That line
+            // goes through the same `redact_for_display`, which is what
+            // the control-character assertion above covers for it.
+            if which == "BindingApprovalRequired" {
+                assert!(
+                    text.contains("forged") && text.ends_with("all clear"),
+                    "the agent's prompt was consumed rather than de-fanged: {text:?}"
+                );
+            }
+        }
 
         client.unregister(&server);
         let _ = s.signal(Signal::Kill);

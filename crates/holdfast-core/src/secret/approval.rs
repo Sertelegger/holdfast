@@ -136,9 +136,10 @@ pub struct Approval {
     /// here able to hold one.
     pub binding_name: String,
     /// The session's own command line, redacted element-wise and then
-    /// joined (GH #45). **A binding name alone is not enough to approve
-    /// against** — see [`ServerFrame::BindingApprovalRequired`]'s field,
-    /// which this one exists to feed.
+    /// joined, and stripped of everything that could rewrite the line it
+    /// is printed on (GH #45). **A binding name alone is not enough to
+    /// approve against** — see [`ServerFrame::BindingApprovalRequired`]'s
+    /// field, which this one exists to feed.
     ///
     /// It is a *rendering*: `secret::binding::select` matches against the
     /// unredacted join and never against this.

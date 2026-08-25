@@ -202,39 +202,54 @@ pub fn strip(bytes: &[u8]) -> Vec<u8> {
 /// text**, for a field whose whole purpose is to be read by a human
 /// making a decision.
 ///
-/// **[`strip`] is not enough on its own, and the gap is deliberate on
-/// both sides.** `strip` serves a terminal *stream*, so it keeps `\t`,
-/// `\n`, `\r` and `\x08` — "layout survives" is the right rule there and
-/// exactly the wrong one here. A `\r` rewrites the line from its start, a
-/// `\x08` rubs out the character before it, and a `\n` forges a second
-/// line of whatever the surrounding diagnostic looks like. On a field
-/// that exists so an operator can tell `ssh prod-01` from `ssh prod-01 -o
-/// ProxyCommand=nc 127.0.0.1 2222`, any of the three hands the difference
-/// back to whoever wrote the string (GH #45).
+/// **This deliberately does *not* use [`strip`], and an earlier revision
+/// that did was wrong in the one direction that matters.** `strip` is a
+/// terminal-stream stripper: it parses sequences and **consumes their
+/// payloads**, which is correct for a stream and catastrophic here.
+/// Driven, before the change:
 ///
-/// So: escape sequences go through [`strip`], then **every remaining
-/// control character is dropped**, then the directional-formatting and
-/// zero-width characters are dropped too. The second group is not
-/// paranoia by association — U+202E reverses the rendering of everything
-/// after it, which is the same attack in a different alphabet, and a
-/// zero-width space breaks a word an operator is scanning for.
+/// ```text
+/// "ssh prod-01\x1b]0; -o ProxyCommand=nc 1.2.3.4 22\x07"  ->  "ssh prod-01"
+/// ```
+///
+/// That is a forged **short** line — the operator is shown a command line
+/// with an argument *missing*, which is layer D inverted: they approve a
+/// line that is not the line. OSC, DCS and APC all do it, terminated or
+/// not. `strip` is not at fault; it is answering a different question.
+///
+/// **The rule here is simpler and has no payload to lose: keep every
+/// character that cannot *do* anything, drop every character that can.**
+/// No state machine, no sequence grammar. An escape sequence loses its
+/// `\x1b` and what is left — `[2K`, `]0; -o ProxyCommand=…` — stays on
+/// screen as the visible nonsense it is. That is the intended outcome:
+/// **a longer, stranger line, never a shorter innocent one.**
+///
+/// What is dropped:
+///
+/// * **Every control character** (`char::is_control`, so C0, DEL and C1).
+///   `\x1b` is one of them, which is what defuses every escape sequence at
+///   a stroke. `\r` rewrites the line from its start, `\x08` rubs out the
+///   character before it, `\n` forges a second line of whatever the
+///   surrounding diagnostic looks like, and `\t` moves the cursor to a
+///   column of the agent's choosing. `strip` *keeps* those four, because
+///   "layout survives" is the right rule for a stream and exactly the
+///   wrong one for a line somebody is reading to make a decision.
+/// * **The directional-formatting and zero-width characters.** Not
+///   paranoia by association: U+202E reverses the rendering of everything
+///   after it, which is the same attack in a different alphabet, and a
+///   zero-width space breaks a word an operator is scanning for.
 ///
 /// **Dropped rather than replaced with a marker.** A visible substitute
 /// invites the question of whether the substitute itself can be forged,
-/// and the bytes around a control character stay visible either way — an
-/// agent that inserts `\r` gets a longer, stranger-looking line, which is
-/// the honest outcome.
+/// and the text around a control character stays visible either way.
 ///
 /// **What this does not do**, so nothing downstream reads it as more: it
 /// is not a "safe to print anywhere" guarantee. A homoglyph is still a
 /// homoglyph, `rn` still looks like `m` in some fonts, and a very long
-/// line still scrolls. It removes the characters that let a string
-/// *rewrite* what is already on screen; it does not make the remaining
-/// text trustworthy.
+/// line still scrolls. It removes a string's power to *rewrite* what is
+/// already on screen; it does not make the remaining text trustworthy.
 pub fn one_line_for_display(s: &str) -> String {
-    let stripped = strip(s.as_bytes());
-    String::from_utf8_lossy(&stripped)
-        .chars()
+    s.chars()
         .filter(|c| !c.is_control() && !is_directional_or_zero_width(*c))
         .collect()
 }
@@ -270,6 +285,10 @@ mod tests {
     /// are layout. `one_line_for_display` serves a single line a human is
     /// reading to make a decision, where each of them is a way for whoever
     /// wrote the string to change what that human sees (GH #45).
+    ///
+    /// The string-sequence half of the pairing is
+    /// [`a_string_sequence_cannot_forge_a_short_line`], which is the case
+    /// that made `one_line_for_display` stop calling `strip` at all.
     #[test]
     fn one_line_for_display_removes_what_strip_keeps() {
         // The pairing first: `strip` keeps all four, on purpose.
@@ -288,7 +307,9 @@ mod tests {
         );
         assert_eq!(
             one_line_for_display("ssh prod-01 -o ProxyCommand=nc 1 2\x1b[2K\rssh prod-01"),
-            "ssh prod-01 -o ProxyCommand=nc 1 2ssh prod-01"
+            "ssh prod-01 -o ProxyCommand=nc 1 2[2Kssh prod-01",
+            "the CSI's parameters stay on screen as visible nonsense — only the \
+             `\\x1b` that made them a command is gone"
         );
         // A forged second diagnostic line.
         assert!(!one_line_for_display("x\nholdfast attach: all clear").contains('\n'));
@@ -310,6 +331,66 @@ mod tests {
         // Non-ASCII that is not a formatting character survives: an
         // operator's hostname may legitimately carry one.
         assert_eq!(one_line_for_display("ssh naïve-01"), "ssh naïve-01");
+    }
+
+    /// **A forged *short* line is the failure this function exists to
+    /// prevent, and for one revision it produced them.**
+    ///
+    /// `one_line_for_display` used to call [`strip`], which parses
+    /// OSC/DCS/APC sequences and **consumes their payloads** — correct for
+    /// a terminal stream, and here it deleted an argument outright. The
+    /// operator was shown `ssh prod-01` for a command line that carried
+    /// `-o ProxyCommand=nc 1.2.3.4 22`, which is layer D inverted: they
+    /// approve a line that is not the line.
+    ///
+    /// The four subjects are the ones the re-review drove. Each asserts
+    /// the payload is **present**, not merely that the string changed —
+    /// "shorter" is exactly the outcome under test, so a
+    /// `!contains('\x1b')` row would have passed against the bug.
+    #[test]
+    fn a_string_sequence_cannot_forge_a_short_line() {
+        const PAYLOAD: &str = "-o ProxyCommand=nc 1.2.3.4 22";
+        for (label, subject) in [
+            (
+                "OSC, BEL-terminated",
+                format!("ssh prod-01\x1b]0; {PAYLOAD}\x07"),
+            ),
+            (
+                "APC, ST-terminated",
+                format!("ssh prod-01\x1b_ {PAYLOAD}\x1b\\"),
+            ),
+            (
+                "DCS, ST-terminated",
+                format!("ssh prod-01\x1bP {PAYLOAD}\x1b\\"),
+            ),
+            ("OSC, unterminated", format!("ssh prod-01\x1b]0; {PAYLOAD}")),
+        ] {
+            let shown = one_line_for_display(&subject);
+            assert!(
+                shown.contains(PAYLOAD),
+                "{label}: the payload was consumed, so the operator is shown a command \
+                 line with an argument missing — a forged *short* line, which is the \
+                 whole of what this field defends against. Got {shown:?}"
+            );
+            assert!(
+                !shown.chars().any(char::is_control),
+                "{label}: a control character survived: {shown:?}"
+            );
+            assert!(
+                shown.starts_with("ssh prod-01"),
+                "{label}: the operator's own text was disturbed: {shown:?}"
+            );
+        }
+
+        // **The pairing, and it is `strip`'s own behaviour rather than a
+        // hypothetical.** Without it a reader cannot tell whether the rows
+        // above are asserting a fix or a tautology.
+        assert_eq!(
+            strip_str(&format!("ssh prod-01\x1b]0; {PAYLOAD}\x07")),
+            "ssh prod-01",
+            "`strip` consumes the payload — that is correct for a terminal stream and \
+             is why `one_line_for_display` does not call it"
+        );
     }
 
     #[test]
