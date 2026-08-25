@@ -191,6 +191,11 @@ impl TailLine {
         self.truncated = false;
     }
 
+    /// How many printable bytes the current line holds.
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// A backspace un-draws the last cell; it does not un-evict the front,
     /// so `truncated` deliberately stays set. Those bytes are gone.
     fn backspace(&mut self) {
@@ -280,6 +285,17 @@ pub struct ModeScanner {
     /// `resolve_capture_return`; zero means the capture holds everything
     /// that was ever on the line.
     capture_debt: usize,
+    /// How wide the prompt row was when OSC 133 `B` arrived — the column
+    /// the *command* starts at. `0` means unknown (no prompt was drawn, or
+    /// the tail line had already evicted bytes off its front), and the
+    /// unknown case falls back to the length test. See
+    /// `settle_capture_debt`.
+    prompt_columns: usize,
+    /// Net cursor motion, in columns, between a bare `\r` inside a capture
+    /// and the first byte it repaints: `+n` for `CSI n C`, `-n` for
+    /// `CSI n D`. Re-zeroed at every `\r`, so it describes one repaint and
+    /// never accumulates across them.
+    repaint_columns: isize,
     /// Last OSC 133 marker letter seen (`A`/`B`/`C`/`D`), for the T1 state.
     last_marker: Option<u8>,
     /// Per marker letter (`A`, `B`, `C`, `D`), whether a **foreign** marker
@@ -326,6 +342,8 @@ impl ModeScanner {
             capture: None,
             capture_return_pending: false,
             capture_debt: 0,
+            prompt_columns: 0,
+            repaint_columns: 0,
             last_marker: None,
             foreign_letters: [false; 4],
             holdfast_letters: [false; 4],
@@ -588,6 +606,10 @@ impl ModeScanner {
             b'\r' => {
                 self.tail.reset();
                 self.pending_cr = true;
+                // One `\r`, one repaint. The count describes the motion
+                // *this* return is followed by and must not inherit the
+                // last one's.
+                self.repaint_columns = 0;
             }
             0x08 => {
                 self.tail.backspace();
@@ -685,16 +707,62 @@ impl ModeScanner {
         }
     }
 
-    /// Clear the debt once the capture is at least as long as the discard
-    /// that opened it — the repaint the `\r` promised has arrived.
+    /// Clear the debt once the repaint has demonstrably put the front of
+    /// the line back.
     ///
-    /// Length rather than content: the discarded bytes are not kept, and
-    /// keeping them to compare would hold a copy of the secret this exists
-    /// to withhold. Erring toward "still owed" costs one best-effort
-    /// field; erring the other way emits the half of a secret redaction
-    /// can no longer see.
+    /// **The question is *where the repaint resumed*, not how much it
+    /// wrote.** 0.0.7 shipped the length test alone — *"the capture is at
+    /// least as long as the discard"* — and that predicate is not the one
+    /// it was standing in for. It fires on every edit that makes a line
+    /// **shorter** while leaving it complete: a line-kill, a word-kill, a
+    /// recall of a shorter command from history. Measured against a real
+    /// `bash --norc --noprofile -i`, typing `echo this is a long command`,
+    /// then `Ctrl-U`, then `ls` emits `\r\x1b[C\x1b[C\x1b[Kls`; the
+    /// repaint is 2 bytes against a 26-byte discard, and
+    /// `get_command_history` answered `[REDACTED:unresolved]` for a
+    /// command that was reported correctly at 0.0.6.
+    ///
+    /// The two shapes differ in which screen row is being repainted, and
+    /// the byte stream says so:
+    ///
+    /// * a **wrap redraw** repaints a *continuation* row. It carries no
+    ///   prompt, so the shell writes from column 0 with no cursor-forward
+    ///   — and the front of the logical line really is missing.
+    /// * a **kill or a shorter recall** repaints the line's *first* row,
+    ///   which carries the prompt, so the shell has to step past it:
+    ///   `CSI n C` of exactly the prompt's width. bash's `\x1b[C\x1b[C`
+    ///   against a two-column `$ ` and fish's `\x1b[21C` against its
+    ///   21-column prompt are the same move.
+    ///
+    /// So: a repaint that resumed at or past the column the command starts
+    /// at has the whole command after it, whatever its length.
+    /// `prompt_columns` is the width of the prompt row as it stood at OSC
+    /// 133 `B`, and `repaint_columns` is the net `CSI C`/`CSI D` motion
+    /// since the `\r`.
+    ///
+    /// **The length test stays, as the fallback for an unknown prompt
+    /// width** — no OSC 133 `A`, a prompt row that lost bytes off the
+    /// front of the tail line, or a prompt of zero width. Every stream in
+    /// this tree's fish, bash and zsh corpora that settled by length before
+    /// still settles.
+    ///
+    /// Two residuals, named rather than implied. A shell that repaints
+    /// from column 0 by **re-echoing the prompt** is not recognised and
+    /// keeps its debt — the fail-safe direction, and no shell in the
+    /// measured corpus does it. And a wrapped line whose *first* row is
+    /// the one repainted settles even though later rows hold the rest;
+    /// that is the same best-effort class `CommandEntry::command` already
+    /// documents.
+    ///
+    /// Length rather than content throughout: the discarded bytes are not
+    /// kept, and keeping them to compare would hold a copy of the secret
+    /// this exists to withhold.
     fn settle_capture_debt(&mut self) {
         if self.capture_debt == 0 {
+            return;
+        }
+        if self.prompt_columns > 0 && self.repaint_columns >= self.prompt_columns as isize {
+            self.capture_debt = 0;
             return;
         }
         if let Some(cap) = self.capture.as_ref() {
@@ -773,6 +841,26 @@ impl ModeScanner {
         // `?9…9;20041h` cut at the cap ends in `;2004` and would forge the
         // availability flag §8.4 gates on. Consume, do not interpret.
         if self.params_overflowed {
+            return;
+        }
+        // **CUF/CUB, and only inside one specific window**: between a bare
+        // `\r` that landed inside a capture and the first byte the repaint
+        // writes. That is the whole of the cursor arithmetic this scanner
+        // does, and `settle_capture_debt` is the only reader. Outside the
+        // window nothing is counted, so no ordinary cursor motion reaches
+        // it.
+        if self.capture_return_pending && (final_byte == b'C' || final_byte == b'D') {
+            // An omitted parameter is 1, and ECMA-48 reads an explicit 0
+            // as 1 too.
+            let n = match std::str::from_utf8(&self.params) {
+                Ok("") => Some(1),
+                Ok(p) => p.parse::<isize>().ok(),
+                Err(_) => None,
+            };
+            if let Some(n) = n {
+                let n = n.max(1);
+                self.repaint_columns += if final_byte == b'C' { n } else { -n };
+            }
             return;
         }
         if final_byte != b'h' && final_byte != b'l' {
@@ -915,15 +1003,31 @@ impl ModeScanner {
         // may inherit an armed `\r` — or an unpaid discard — from the span
         // before it.
         self.capture_return_pending = false;
+        self.repaint_columns = 0;
         let marker = match kind {
             b'A' => {
                 self.capture = None;
                 self.capture_debt = 0;
+                self.prompt_columns = 0;
                 Osc133::PromptStart
             }
             b'B' => {
                 self.capture = Some(String::new());
                 self.capture_debt = 0;
+                // **The column the command starts at.** `tail` holds the
+                // printable bytes since the last `\r`/`\n`, which at `B`
+                // is the prompt's final row — exactly the width a repaint
+                // has to step past to be repainting the command rather
+                // than a continuation row. A tail that has already evicted
+                // bytes off its front understates it, so that case reports
+                // *unknown* (`0`) and `settle_capture_debt` falls back to
+                // the length test rather than settling on a number it
+                // knows is short.
+                self.prompt_columns = if self.tail.truncated {
+                    0
+                } else {
+                    self.tail.len()
+                };
                 Osc133::CommandStart
             }
             b'C' => {

@@ -377,6 +377,62 @@ mod tests {
     /// carries its own text, and a *complete* secret in one still comes
     /// back as its own kind — which is the more useful of the two true
     /// things §9.2 can say.
+    /// **The false-positive direction, which the debt shipped without.**
+    ///
+    /// 0.0.7 cleared the debt when *"the repaint wrote back at least as
+    /// many bytes as went away"*. That is not the predicate it was
+    /// standing in for — *"the front of the line is present"* — and the
+    /// two diverge on every edit that makes a line **shorter** while
+    /// leaving it complete. A correct, complete command came back as
+    /// `[REDACTED:unresolved]`, on a field that carried it at 0.0.6.
+    ///
+    /// Row 1 is **measured**, not constructed: against a real
+    /// `bash --norc --noprofile -i` on this machine, typing
+    /// `echo this is a long command`, then `Ctrl-U`, then `ls`, emits
+    /// exactly `\r\x1b[C\x1b[C\x1b[Kls` — two columns of cursor-forward
+    /// for a two-column `$ ` prompt, then a 2-byte repaint against a
+    /// 26-byte discard.
+    ///
+    /// **Rows 3 and 4 are what make rows 1 and 2 mean something.** A
+    /// predicate that simply stopped refusing would pass the first two and
+    /// fail the third, and the third is the whole reason the debt exists:
+    /// a wrap redraw repaints a *continuation* row, from column 0, with no
+    /// cursor-forward, and the front of the logical line really is gone.
+    #[test]
+    fn a_repaint_that_stepped_past_the_prompt_keeps_its_command() {
+        for (what, stream, want) in [
+            (
+                "bash Ctrl-U, then `ls` (measured)",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07echo this is a long command\
+                   \r\x1b[C\x1b[C\x1b[Kls\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07"[..],
+                "ls",
+            ),
+            (
+                "recall of a shorter command past a ten-column prompt",
+                &b"\x1b]133;A\x07me@box:~$ \x1b]133;B\x07git log --oneline --graph --all\
+                   \r\x1b[10C\x1b[Kls -la\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07"[..],
+                "ls -la",
+            ),
+            (
+                "a wrap redraw: column 0, no cursor-forward, front genuinely gone",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07export K=AKIAIOSF\rODNN7EXAMPLE\
+                   \r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07"[..],
+                "[REDACTED:unresolved]",
+            ),
+            (
+                "no redraw at all",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\x1b]133;C\x07hi\r\n\
+                   \x1b]133;D;0\x07"[..],
+                "echo hi",
+            ),
+        ] {
+            let h = replay(stream, 100);
+            let e = h.entries(0, 50);
+            assert_eq!(e.len(), 1, "{what}: the fixture must record one command");
+            assert_eq!(as_emitted(&e[0]), want, "{what}");
+        }
+    }
+
     #[test]
     fn a_capture_the_scanner_saw_whole_keeps_its_text_and_its_own_redaction() {
         let h = replay(
