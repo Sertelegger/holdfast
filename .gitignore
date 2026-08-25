@@ -28,7 +28,12 @@ graphify-out/
 # consumer of this repository needs. Kept on the author's machine and
 # stripped from history rather than merely untracked, so they are absent from
 # the remote entirely.
-docs/
+# Local working documentation, consumed from the private `project-docs` repo by
+# symlink. **No trailing slash**: `docs/` matches a directory, and git treats a
+# symlink as neither a directory nor a regular file for that purpose — so the
+# rule silently stops applying the moment the link replaces the directory, and
+# the next `git add -A` commits a path that resolves on one machine.
+docs
 
 # Python bytecode from the checks in scripts/. Untracked and swept up by an
 # `git add -A` exactly like the zz_ scratch tests were, and for the same
