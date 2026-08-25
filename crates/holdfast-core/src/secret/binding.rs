@@ -141,11 +141,48 @@
 //! the empty subject — and a session's command line always has a command
 //! in it.
 //!
-//! **`match_prompt` is deliberately *not* anchored.** Its subject is the
+//! ## `match_prompt` is **not** a security control
+//!
+//! It sits beside `match_command` in the config, in §9.6 and in this
+//! header, and structural proximity reads as equivalent purpose. It is
+//! not equivalent, and this section exists because earlier revisions of
+//! all three let a reader infer that it was. **`match_prompt` is an
+//! operator convenience for disambiguating between prompts *inside a
+//! session that has already matched*** — *"this credential is for the
+//! login prompt, not the sudo prompt"* — and explicitly **not** a defence
+//! against an agent.
+//!
+//! Three reasons, and they are why it gets no `match_example`-style check
+//! (`config::admits_only_its_example` carries the same list at the site
+//! that would have had to implement one):
+//!
+//! 1. **It cannot widen a selection, only narrow one.** [`matches`]
+//!    requires `match_command` to match **and**, when `match_prompt` is
+//!    non-empty, the prompt. An agent that satisfies `match_prompt` has
+//!    already had to satisfy `match_command`, so the prompt clause only
+//!    ever removes candidates. GH #45 was a *selection* hole; this field
+//!    cannot produce one.
+//! 2. **An open `match_prompt` is the documented default.** `""` already
+//!    means "does not select on the prompt", so `.*` means what a
+//!    permitted value means.
+//! 3. **There is no hostile-probe corpus to write.** The agent chooses
+//!    the child, therefore chooses the prompt: any pattern over prompt
+//!    text is satisfied by an agent that has already passed
+//!    `match_command`, because it prints whatever the pattern asks for.
+//!
+//! **A field presented as protective while providing none is the same
+//! defect class that produced GH #45** — §9.6's *"to match, the agent
+//! must actually run that command line"* was true and load-bearing in the
+//! wrong direction. So nothing here describes `match_prompt` as
+//! tightening anything.
+//!
+//! **It is deliberately *not* anchored**, and that follows from the above
+//! rather than from symmetry with `match_command`. Its subject is the
 //! child's own output rather than the agent's argument list, and an
 //! operator's `(?i)password` is meant to find a word inside a line like
 //! `ada@prod-01's password: `. Anchoring it would break every prompt
-//! pattern §9.6 publishes and close nothing.
+//! pattern §9.6 publishes and close nothing, because there is nothing
+//! here to close.
 //!
 //! ## What this still does not close
 //!
@@ -207,6 +244,23 @@
 //! of that; §20.6 states outright that the emptying rule belongs to that
 //! builder and **nowhere upstream**, so the matcher reads the detector's
 //! line even when the response reports `""`.
+//!
+//! **One consequence, recorded and deliberately not fixed.** Resolution
+//! success is observable by the agent — a credential arrives or it does
+//! not. So an operator who wrote a `match_prompt` that *discriminates on
+//! secret content* — `"(?i)password for ghp_[0-9A-Za-z]{36}"` — would
+//! turn resolve/no-resolve into a **one-bit oracle over text the redactor
+//! exists to hide**, and in principle an agent could binary-search
+//! redacted prompt content through it. It is bounded because it takes the
+//! **operator** to author the discriminating pattern, and the operator is
+//! not the adversary here.
+//!
+//! It is written down chiefly as a warning to whoever later proposes
+//! matching `match_prompt` against the **redacted** line "for safety".
+//! That change reintroduces exactly the defect the paragraph above
+//! prevents — a redactor silently switching an operator's binding off —
+//! and it trades a hazard the operator has to build for one that arrives
+//! by itself.
 //!
 //! ## `require_confirm` is two calls, not one
 //!
@@ -346,6 +400,13 @@ pub fn select<'a>(
 }
 
 /// One binding against one session's two subjects.
+///
+/// **The two subjects are not two gates**, and the `&&` below is where
+/// that is visible: `match_command` is what *selects*, and `match_prompt`
+/// — when an operator wrote one — only removes candidates it had already
+/// selected. See the module header for why that makes it an operator
+/// convenience rather than a security control, and why it gets no
+/// load-time check of its own.
 fn matches(binding: &SecretBinding, command_line: &str, prompt_line: &str) -> bool {
     // **The subject here is agent-authored** — see the module header — so
     // it is matched **whole** (GH #45). A pattern that constrains only a
@@ -365,6 +426,13 @@ fn matches(binding: &SecretBinding, command_line: &str, prompt_line: &str) -> bo
     // the prompt" — `config.rs` says so at the validation site and
     // deliberately does not special-case the empty regex there, which
     // leaves the reading to be applied here, at match time.
+    //
+    // **This early return is also the argument that `match_prompt` cannot
+    // widen anything.** The command-line clause above has already run and
+    // already said yes; everything from here can only turn a `true` into
+    // a `false`. An operator's `.*` here means what `""` means, which is
+    // why refusing `.*` at load would be refusing the default in a
+    // different spelling.
     if binding.match_prompt.is_empty() {
         return true;
     }

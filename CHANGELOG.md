@@ -135,6 +135,36 @@ surfaces rather than redacted on them.
   still accepted**, because no probe can reach the middle of a line whose two
   ends the pattern pins.
 
+- **`match_prompt` is documented as what it is: an operator convenience, not a
+  security control.** No behaviour changed and none needed to; what changed is
+  every place that let a reader infer otherwise. It sits beside `match_command`
+  in the config, in §9.6 and in `binding.rs`, and structural proximity reads as
+  equivalent purpose.
+
+  It is a *conjunct*: a binding needs `match_command` **and**, when
+  `match_prompt` is non-empty, the prompt — so it can only narrow a selection
+  `match_command` already made, never widen one. It gets no `match_example`-style
+  check for three reasons: it cannot produce a selection hole; `""` (the
+  documented default) already means "does not select on the prompt", so `.*`
+  means what a permitted value means; and there is no hostile-probe corpus to
+  write, because **the agent chooses the child and therefore chooses the
+  prompt** — any pattern over prompt text is satisfied by an agent that has
+  already passed `match_command`, since it prints whatever the pattern asks for.
+
+  What it is *for* is disambiguating between prompts inside a session that has
+  already matched: "this credential is for the login prompt, not the sudo
+  prompt".
+
+  **One oddity is recorded and not fixed.** `match_prompt` matches the
+  **unredacted** prompt line — deliberately, so the redactor cannot silently
+  switch an operator's binding off — and resolution success is observable by the
+  agent. An operator who wrote a `match_prompt` discriminating on *secret
+  content* would turn resolve/no-resolve into a one-bit oracle over text the
+  redactor exists to hide. It takes the operator to author it, so it is bounded;
+  it is written down chiefly as a warning to anyone who later proposes matching
+  the **redacted** line "for safety", which reintroduces the exact defect the
+  unredacted match prevents.
+
 - **`BindingApprovalRequired` carries the session's command line**, so a human
   approves *this command line receiving this credential* rather than a binding
   name. `prod-ssh` reads identically whether the session is `ssh prod-01` or

@@ -104,9 +104,13 @@ autofill_on_echo_off = false
 strict_confirmation = false
 
 # Operator-configured secret bindings (§9.6). The agent supplies only
-# the session id and the prompt text -- it cannot name a secret. Holdfast
-# matches the session's own command line AND the observed prompt, so
-# there is no "fetch me arbitrary credential" API.
+# the session id and the prompt text -- it cannot name a secret. What
+# stops a "fetch me an arbitrary credential" API is that selection runs
+# off the session's own command line against match_command, which
+# match_example then bounds. match_prompt is an operator convenience and
+# carries none of that weight: it can only narrow a selection
+# match_command already made, and the agent chooses the child and
+# therefore the prompt. Do not read the two keys as a pair of gates.
 #
 # This array-of-tables is LAST in [security] deliberately. Uncommenting
 # it opens a sub-table, and every bare key that followed would belong to
@@ -134,6 +138,13 @@ strict_confirmation = false
 # anyone having to guess how "anything" might be spelled. A wildcard you
 # scoped to one argument -- "^ssh\\s+prod-01( -X.*)?$" -- still loads.
 # match_example   = "ssh prod-01"
+# match_prompt is OPTIONAL and is NOT a security control (§9.6, rev. 53).
+# It disambiguates between prompts inside a session that has ALREADY
+# matched -- "this credential is for the login prompt, not the sudo
+# prompt". It is not a defence against an agent: the agent selects the
+# child and therefore the prompt text, so any match_prompt an agent needs
+# to satisfy, it can satisfy. "" (the default) means "does not select on
+# the prompt", and it gets no match_example-style check for that reason.
 # match_prompt    = "(?i)password"
 # provider        = "secret-service"
 # reference       = "service=holdfast,account=prod-ssh"
