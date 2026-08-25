@@ -85,6 +85,16 @@ use crate::config::{SecretBinding, SecurityConfig};
 /// 10 s default costs a few thousand `waitpid` calls rather than a spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
+/// How much room each pipe reader allocates **before** it reads anything.
+///
+/// 64 KiB, which is `[security] max_secret_bytes_ceiling`'s default — the
+/// largest value this daemon will accept from any submission path — and
+/// also the size of a Linux pipe buffer, so a provider that fits in the
+/// pipe fits in this. The number is a *capacity* and not a limit: nothing
+/// here refuses a longer answer, it only stops the ordinary one from
+/// being copied through a doubling `Vec` and left in freed blocks.
+const PROVIDER_READ_CAPACITY: usize = 65_536;
+
 /// Why a binding did not resolve.
 ///
 /// **No variant can carry a `reference` or a provider's stderr, and that
@@ -553,13 +563,26 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
 
     let mut out_pipe = child.stdout.take().expect("stdout was piped");
     let mut err_pipe = child.stderr.take().expect("stderr was piped");
+    // **`with_capacity`, not `Vec::new`, and it is the F-2 class rather
+    // than a micro-optimisation.** `read_to_end` on an empty `Vec` grows
+    // by doubling, and every doubling copies what has been read so far
+    // into a new block and frees the old one **without zeroing it** —
+    // one un-zeroed copy of the credential per reallocation, in memory
+    // nothing in this process can reach again. A provider's answer is a
+    // credential, so the buffer is sized once, up front, for the largest
+    // answer this daemon will accept.
+    //
+    // `read_to_end` may still grow it if a provider prints more than the
+    // ceiling. That output is over the limit and is refused downstream;
+    // what matters here is that the ordinary case never reallocates.
+    let capacity = PROVIDER_READ_CAPACITY;
     let out_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(capacity);
         let _ = out_pipe.read_to_end(&mut buf);
         buf
     });
     let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(capacity);
         let _ = err_pipe.read_to_end(&mut buf);
         buf
     });
@@ -602,15 +625,32 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
         kill_group(&child);
         let _ = child.kill();
         let _ = child.wait();
-        // The two readers are **not** joined. They are blocked on pipes
-        // the killed child has just released, so they finish on their
-        // own; joining would reintroduce an unbounded wait on the one
-        // path whose entire purpose is to be bounded — a provider that
-        // left a grandchild holding the pipe would hang the session slot
-        // exactly as if there had been no timeout. Their buffers are
-        // discarded either way.
-        drop(out_reader);
-        drop(err_reader);
+        // The two readers are **not** joined *here*. They are blocked on
+        // pipes the killed child has just released, so they finish on
+        // their own; joining would reintroduce an unbounded wait on the
+        // one path whose entire purpose is to be bounded — a provider
+        // that left a grandchild holding the pipe would hang the session
+        // slot exactly as if there had been no timeout.
+        //
+        // **But discarded is not zeroed.** A provider that answered a
+        // millisecond after the deadline has a complete credential in
+        // that buffer, and `drop`ping the `JoinHandle` detaches the
+        // thread and leaves the buffer to an ordinary `Vec::drop` — which
+        // does not zero. The success path is careful to `zero_bytes` both
+        // pipes and the failure path zeroes stdout; this path zeroed
+        // neither (security review, F-2).
+        //
+        // So the join is moved off this thread rather than dropped: two
+        // detached threads that wait for the readers and zero what they
+        // produced. The bound this path exists to keep is unaffected —
+        // nothing here waits on them — and a reader that never finishes
+        // costs the same parked thread it already costs today.
+        for reader in [out_reader, err_reader] {
+            std::thread::spawn(move || {
+                let mut buf = reader.join().unwrap_or_default();
+                zero_bytes(&mut buf);
+            });
+        }
         let secs = budget.as_secs();
         crate::diag!(
             "holdfast: secret provider `{name}` did not answer within {secs}s and was killed"

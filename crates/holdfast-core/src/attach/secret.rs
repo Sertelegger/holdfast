@@ -109,16 +109,48 @@ impl SecretBytes {
     /// does not depend on which client submitted: strip exactly one
     /// trailing `\r\n` or `\n`, then append `\n` when `append_newline`.
     /// Clients must not add the newline themselves.
+    ///
+    /// **The source buffer is zeroed and never grown.** See
+    /// [`normalise_from`](Self::normalise_from) for why that is a
+    /// correctness property of this type rather than tidiness at the call
+    /// site.
     pub fn normalise(mut raw: Vec<u8>, append_newline: bool) -> Self {
-        if raw.ends_with(b"\r\n") {
-            raw.truncate(raw.len() - 2);
+        Self::normalise_from(&mut raw, append_newline)
+    }
+
+    /// [`normalise`](Self::normalise) with the source buffer left in the
+    /// caller's hands, so a test can assert what became of it.
+    ///
+    /// **The zeroing discipline is not closed under `Vec` growth, and
+    /// this is where it was open.** The earlier form stripped in place and
+    /// then did `raw.push(b'\n')`. `append_newline` defaults to `true`,
+    /// and the buffer handed in on the attach path is the CBOR-decoded
+    /// `SecretInput.bytes`, which has `len == capacity` — so the push
+    /// reallocated: the allocator copied the plaintext to a new block and
+    /// freed the old one **without zeroing it**, somewhere `Drop` can
+    /// never reach. Driven on pointer inequality by the security review
+    /// (F-2).
+    ///
+    /// **Reserving before the push is not the fix** — `reserve` is the
+    /// same copy-and-free. The buffer is built at its final capacity from
+    /// the start, so the one allocation it ever has is the one `Drop`
+    /// zeroes, and the source is zeroed here rather than left to an
+    /// ordinary `Vec::drop`, which does not.
+    pub(crate) fn normalise_from(raw: &mut [u8], append_newline: bool) -> Self {
+        let keep = if raw.ends_with(b"\r\n") {
+            raw.len() - 2
         } else if raw.ends_with(b"\n") {
-            raw.truncate(raw.len() - 1);
-        }
+            raw.len() - 1
+        } else {
+            raw.len()
+        };
+        let mut out = Vec::with_capacity(keep + usize::from(append_newline));
+        out.extend_from_slice(&raw[..keep]);
         if append_newline {
-            raw.push(b'\n');
+            out.push(b'\n');
         }
-        Self(raw)
+        zero_bytes(raw);
+        Self(out)
     }
 
     /// The only reader: a **scoped** accessor. The bytes are borrowed for
@@ -156,6 +188,16 @@ impl SecretBytes {
 
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// The allocation's capacity, for the one row whose subject is that
+    /// the buffer was built at its final size and cannot grow.
+    ///
+    /// `#[cfg(test)]`: a capacity is not something any caller has business
+    /// branching on, and a public accessor would invite one to.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.0.capacity()
     }
 
     /// Paired with `len` because clippy's `len_without_is_empty` fires
@@ -309,6 +351,75 @@ mod tests {
                 "the value survived zeroing: {b:?}"
             )
         });
+    }
+
+    /// **F-2: normalisation must not leave the plaintext in a block
+    /// `Drop` can never reach.**
+    ///
+    /// The fixture is the shape the attach path actually hands in — a
+    /// CBOR-decoded `Vec` with `len == capacity` — and the assertion is
+    /// the pair that separates "no copy escaped" from "the value happened
+    /// to be short": the source's allocation **did not move**, so there is
+    /// no freed block holding it, and what is left in the one allocation
+    /// that did exist is zeros.
+    ///
+    /// The output's capacity is asserted for the other half of the same
+    /// rule: a buffer built at its final size cannot grow later, so the
+    /// allocation `Drop` zeroes is the only one it ever had. Reading the
+    /// old block back instead would be reading freed memory, which is the
+    /// trap `zeroize`'s own doc comment records.
+    #[test]
+    fn normalisation_leaves_no_cleartext_in_a_block_drop_cannot_reach() {
+        let mut raw = Vec::with_capacity(21);
+        raw.extend_from_slice(b"hunter2-correct-horse");
+        assert_eq!(
+            raw.len(),
+            raw.capacity(),
+            "the fixture must be exact-capacity, or it proves nothing about a decode"
+        );
+        let before = raw.as_ptr();
+
+        let s = SecretBytes::normalise_from(&mut raw, true);
+
+        assert_eq!(
+            raw.as_ptr(),
+            before,
+            "the source buffer was reallocated; the plaintext is in a freed block"
+        );
+        assert!(
+            raw.iter().all(|b| *b == 0),
+            "the source buffer still holds the value: {raw:?}"
+        );
+        s.with_bytes(|b| assert_eq!(b, b"hunter2-correct-horse\n"));
+        assert_eq!(
+            s.capacity(),
+            22,
+            "the normalised buffer has slack, so a later push would move it"
+        );
+    }
+
+    /// The pairing: the same discipline when there is nothing to append,
+    /// and when a terminator is stripped — the two other shapes the
+    /// attach and provider paths produce.
+    #[test]
+    fn the_stripping_shapes_zero_their_source_too() {
+        for (raw_bytes, append, want) in [
+            (&b"hunter2"[..], false, &b"hunter2"[..]),
+            (&b"hunter2\n"[..], true, &b"hunter2\n"[..]),
+            (&b"hunter2\r\n"[..], false, &b"hunter2"[..]),
+        ] {
+            let mut raw = Vec::with_capacity(raw_bytes.len());
+            raw.extend_from_slice(raw_bytes);
+            let before = raw.as_ptr();
+            let s = SecretBytes::normalise_from(&mut raw, append);
+            assert_eq!(raw.as_ptr(), before, "{raw_bytes:?} moved its source");
+            assert!(
+                raw.iter().all(|b| *b == 0),
+                "{raw_bytes:?} left its source unzeroed: {raw:?}"
+            );
+            s.with_bytes(|b| assert_eq!(b, want, "{raw_bytes:?} normalised wrong"));
+            assert_eq!(s.capacity(), want.len(), "{raw_bytes:?} has slack");
+        }
     }
 
     #[test]

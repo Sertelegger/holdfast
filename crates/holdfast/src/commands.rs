@@ -1187,8 +1187,24 @@ pub async fn attach(session: &str) -> ExitCode {
                         Some((id, line)) => match line.feed(&forward) {
                             crate::attach_tty::SecretKeys::Pending => {}
                             crate::attach_tty::SecretKeys::Line(bytes) => {
-                                let f = ClientFrame::SecretInput { request_id: id.clone(), bytes };
+                                let mut f =
+                                    ClientFrame::SecretInput { request_id: id.clone(), bytes };
                                 let sent = frame::write_frame(&mut wr, &f).await;
+                                // **The frame still owns the cleartext**,
+                                // and `ClientFrame` has no zeroing `Drop`
+                                // — it is a wire type. `SecretLine` now
+                                // *moves* its buffer here rather than
+                                // cloning it, so this is the last copy
+                                // this process holds that it can reach,
+                                // and this is where it stops existing.
+                                // (The CBOR encoder's own scratch and the
+                                // kernel's socket buffer are outside
+                                // anything a client can zero, exactly as
+                                // `zero_bytes`'s own doc records for the
+                                // daemon side.)
+                                if let ClientFrame::SecretInput { bytes, .. } = &mut f {
+                                    holdfast_core::attach::secret::zero_bytes(bytes);
+                                }
                                 secret = None;
                                 render(b"\r\n");
                                 if sent.is_err() {

@@ -175,9 +175,52 @@ impl DetachKey {
 ///
 /// The buffer is zeroed when it is taken, when it is abandoned, and
 /// again when it is dropped.
-#[derive(Debug, Default)]
+///
+/// **It is also never grown by `Vec`'s own doubling, and never cloned.**
+/// This is the *client* half of §9.2's "client → daemon → PTY", and the
+/// zeroing above is only worth as much as the set of blocks it can reach.
+/// A `Vec::default()` pushed one keystroke at a time reallocates at 4, 8,
+/// 16 …, and each reallocation copies the partial password into a new
+/// block and frees the old one un-zeroed — so a twelve-character password
+/// left prefixes in two blocks nothing could reach again. `take` cloning
+/// the buffer left a third, full copy in a plain `Vec` with no zeroing
+/// `Drop` at all, which is precisely the shape `SecretBytes`'s `NotClone`
+/// guard exists to make impossible one layer down. Both are closed
+/// below; security review F-2.
+#[derive(Debug)]
 pub struct SecretLine {
     buf: Vec<u8>,
+    /// `#[cfg(test)]`: the buffer as it stood **after** each hand-growth
+    /// zeroed it, newest last.
+    ///
+    /// The block a growth leaves behind is freed the moment `self.buf` is
+    /// reassigned, and reading it back through a saved pointer is a
+    /// use-after-free — the same trap `SecretBytes`'s own doc records,
+    /// where `hunter2` came back as allocator bookkeeping rather than as
+    /// either answer. So the zeroing is witnessed from inside the one
+    /// instant the allocation is still ours, exactly as
+    /// `holdfast_core::attach::secret::drop_witness` does one layer down.
+    /// Without it, deleting the hand-growth for a plain `Vec::push` is a
+    /// mutation nothing turns red on.
+    #[cfg(test)]
+    grown_away: Vec<Vec<u8>>,
+}
+
+/// The capacity a [`SecretLine`] starts with, so an ordinary line never
+/// reallocates at all.
+///
+/// `request_secret_input.max_secret_bytes`'s default, which is the
+/// largest submission a waiting call accepts without saying otherwise.
+const SECRET_LINE_CAPACITY: usize = 4096;
+
+impl Default for SecretLine {
+    fn default() -> Self {
+        Self {
+            buf: Vec::with_capacity(SECRET_LINE_CAPACITY),
+            #[cfg(test)]
+            grown_away: Vec::new(),
+        }
+    }
 }
 
 /// What a chunk of keystrokes did to a [`SecretLine`].
@@ -225,16 +268,40 @@ impl SecretLine {
                 0x08 | 0x7f => {
                     self.buf.pop();
                 }
-                other => self.buf.push(other),
+                other => self.push(other),
             }
         }
         SecretKeys::Pending
     }
 
+    /// One keystroke, **without** `Vec`'s reallocation.
+    ///
+    /// `Vec::push` at capacity allocates a new block, copies, and frees
+    /// the old one; the copy it leaves behind is a prefix of the password
+    /// and no `zero_bytes` can reach it. Growing by hand means the old
+    /// block is still ours at the moment it stops being needed, which is
+    /// the only moment it can be zeroed.
+    fn push(&mut self, b: u8) {
+        if self.buf.len() == self.buf.capacity() {
+            let mut grown = Vec::with_capacity((self.buf.capacity() * 2).max(SECRET_LINE_CAPACITY));
+            grown.extend_from_slice(&self.buf);
+            holdfast_core::attach::secret::zero_bytes(&mut self.buf);
+            #[cfg(test)]
+            self.grown_away.push(self.buf.clone());
+            self.buf = grown;
+        }
+        self.buf.push(b);
+    }
+
+    /// The line, **moved** rather than cloned.
+    ///
+    /// The clone this replaces produced a second full cleartext copy in a
+    /// plain `Vec` — moved into `ClientFrame::SecretInput`, CBOR-encoded,
+    /// and dropped un-zeroed. Moving leaves exactly one copy, and the
+    /// caller owns it; `commands::attach` zeroes it once the frame is
+    /// written.
     fn take(&mut self) -> Vec<u8> {
-        let line = self.buf.clone();
-        self.zero();
-        line
+        std::mem::replace(&mut self.buf, Vec::with_capacity(SECRET_LINE_CAPACITY))
     }
 
     fn zero(&mut self) {
@@ -373,5 +440,94 @@ mod tests {
             SecretKeys::Cancelled(vec![CANCEL_KEY])
         );
         assert_eq!(s.feed(b"second\n"), SecretKeys::Line(b"second".to_vec()));
+    }
+
+    /// **F-2, the client half: the zeroing is only worth the blocks it
+    /// can reach.**
+    ///
+    /// A `Vec::default()` pushed one keystroke at a time reallocates at
+    /// 4, 8, 16 … and each reallocation frees a block holding a prefix of
+    /// the password with no way left to zero it. The buffer therefore
+    /// starts at its working size, and the assertion is that the
+    /// allocation does not move while a human types into it.
+    #[test]
+    fn an_ordinary_line_never_reallocates_while_it_is_being_typed() {
+        let mut s = SecretLine::default();
+        let before = s.buf.as_ptr();
+        for _ in 0..64 {
+            assert_eq!(s.feed(b"x"), SecretKeys::Pending);
+        }
+        assert_eq!(s.buf.len(), 64);
+        assert_eq!(
+            s.buf.as_ptr(),
+            before,
+            "the buffer moved while the password was being typed; every move leaves a \
+             prefix of it in a block nothing can zero"
+        );
+    }
+
+    /// The other half of the same rule: when the buffer genuinely has to
+    /// grow, it is grown **by hand** so the block it leaves is still ours
+    /// at the moment it stops being needed — and the growth is correct.
+    #[test]
+    fn growing_past_the_initial_capacity_zeroes_the_block_it_leaves_behind() {
+        let mut s = SecretLine::default();
+        let typed = vec![b'p'; SECRET_LINE_CAPACITY + 17];
+        assert_eq!(s.feed(&typed), SecretKeys::Pending);
+        assert!(
+            s.buf.capacity() > SECRET_LINE_CAPACITY,
+            "the fixture did not actually force a growth"
+        );
+        assert_eq!(
+            s.grown_away.len(),
+            1,
+            "the growth went through `Vec`'s own reallocation, which frees the old block \
+             holding the password with no chance to zero it"
+        );
+        assert_eq!(s.grown_away[0].len(), SECRET_LINE_CAPACITY);
+        assert!(
+            s.grown_away[0].iter().all(|b| *b == 0),
+            "the block the growth left behind still held the value"
+        );
+        // And the growth is *correct*, not merely careful.
+        match s.feed(b"\r") {
+            SecretKeys::Line(line) => assert_eq!(line, typed),
+            other => panic!("expected the line, got {other:?}"),
+        }
+    }
+
+    /// **The clone `NotClone` exists to prevent, one layer up.**
+    ///
+    /// `take` used to hand back `self.buf.clone()` — a second, full,
+    /// cleartext copy in a plain `Vec` that is moved into
+    /// `ClientFrame::SecretInput`, CBOR-encoded and dropped un-zeroed,
+    /// while the original was zeroed and the copy was not. Moving means
+    /// there is one copy and the caller owns it, which is what makes
+    /// `commands::attach`'s `zero_bytes` after the write the *last* word
+    /// rather than one of two.
+    ///
+    /// Pointer identity is the only way to tell a move from a copy from
+    /// outside, and it is exact: a clone allocates.
+    #[test]
+    fn taking_the_line_moves_the_buffer_rather_than_copying_it() {
+        let mut s = SecretLine::default();
+        assert_eq!(s.feed(b"hunter2"), SecretKeys::Pending);
+        let before = s.buf.as_ptr();
+        match s.feed(b"\r") {
+            SecretKeys::Line(line) => {
+                assert_eq!(line, b"hunter2");
+                assert_eq!(
+                    line.as_ptr(),
+                    before,
+                    "the line was copied out; the copy has no zeroing `Drop` and the \
+                     original's zeroing does not reach it"
+                );
+            }
+            other => panic!("expected the line, got {other:?}"),
+        }
+        // And the collector is usable again, at its working size, without
+        // inheriting the buffer it just handed over.
+        assert!(s.buf.is_empty());
+        assert_eq!(s.buf.capacity(), SECRET_LINE_CAPACITY);
     }
 }
