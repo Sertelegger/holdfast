@@ -3256,6 +3256,112 @@ mod tests {
         let _ = s.signal(Signal::Kill);
     }
 
+    /// **REQ-SEC-017's verification column, on shipped defaults.**
+    ///
+    /// §20 names this case by name: *"the expire case runs on default
+    /// config (`binding_approval_timeout_secs` and `timeout_secs` both
+    /// 120, nobody approves) and asserts the fall-through `AwaitingSecret`
+    /// is broadcast **and** a human submission still returns
+    /// `secret_provided` before the call's deadline — an implementation
+    /// using the configured window unconditionally passes a deny-only
+    /// suite and fails this."* Rev. 44 amended the requirement
+    /// specifically to force it, and nothing in the tree ran it: the two
+    /// expiry rows use `timeout_secs` 60 and 10, and no test anywhere put
+    /// both knobs at 120.
+    ///
+    /// **The equality is the whole point.** `min(120, 120 / 2)` is the
+    /// degenerate case, it is what an operator meets out of the box, and a
+    /// guard that only ever runs with unequal knobs cannot see a
+    /// regression that reappears only when they are equal. `min(configured,
+    /// remaining)` without the halving gives 10 at 10/120 — which
+    /// `the_approval_window_leaves_time_for_the_fall_through` is sensitive
+    /// to — and 120 at the defaults, which is precisely the defect rev. 44
+    /// named and which no existing row can see.
+    ///
+    /// Neither number is written out. `timeout_secs` is **omitted** from
+    /// the arguments, so what is under test is
+    /// `unwrap_or(DEFAULT_SECRET_TIMEOUT_SECS)`; the window comes from
+    /// `DaemonConfig::default()`. A row that restated `120` twice would
+    /// keep passing after somebody changed a default.
+    #[tokio::test]
+    async fn the_shipped_defaults_still_leave_room_for_the_fall_through() {
+        let mut sc = Scratch::new("defaultexpire");
+        let b = confirming(&mut sc, "prod-ssh", "^ssh\\b");
+        let clock = Clock::manual(std::time::Instant::now());
+        let configured = DaemonConfig::default().binding_approval_timeout_secs;
+        let server = server_full(
+            keychain_mode(vec![b.clone()]),
+            &sc.audit_log(),
+            configured,
+            clock.clone(),
+        );
+        let s = session_running("ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        await_prompt(&s, b"Password: ").await;
+
+        // The two knobs, equal, both off the shipped defaults — and the
+        // window they produce, as a *value*, before anything is driven.
+        let default_timeout =
+            Duration::from_secs(u64::from(crate::mcp::tools::DEFAULT_SECRET_TIMEOUT_SECS));
+        assert_eq!(Duration::from_secs(configured), default_timeout);
+        let window = crate::secret::approval_window(configured, Some(default_timeout));
+        assert_eq!(
+            window,
+            default_timeout / 2,
+            "with both knobs equal the halving is the only thing leaving room for \
+             the fall-through"
+        );
+
+        // No `timeout_secs`: the default is what is under test.
+        let call = spawn_call(
+            &server,
+            RequestSecretInputArgs {
+                session: s.id.clone(),
+                prompt_text: "a credential".into(),
+                ..Default::default()
+            },
+        );
+        let approval = await_approval(&server, &s.id).await;
+        client
+            .wait_for("BindingApprovalRequired", is_approval)
+            .await;
+        let started_at = clock.now_ms().max(0) as u64 / 1000;
+        assert_eq!(
+            approval.expires_at_unix_secs,
+            started_at + window.as_secs(),
+            "the recorded expiry is not half the caller's deadline"
+        );
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // Nobody approves; the window elapses.
+        clock.advance(window);
+
+        // REQ-SEC-017's first clause: the fall-through is broadcast.
+        client.wait_for("AwaitingSecret", is_awaiting).await;
+        assert!(
+            server.attach_hub().approvals().outstanding(&s.id).is_none(),
+            "the window elapsed and the approval is still pending"
+        );
+        // And its second: the caller still has half its deadline left, so
+        // a human can answer and the call returns a value.
+        answer_as_a_human(&server, &s, b"typedbyahuman").await;
+        let payload = joined(call, "the call on shipped defaults").await;
+        assert_eq!(
+            payload["status"], "secret_provided",
+            "the approval consumed the caller's whole deadline, which is what the \
+             halving exists to prevent: {payload}"
+        );
+        assert!(!sc.ran("prod-ssh"), "an expired approval ran the provider");
+        let line = approval_line(&sc, &s.id).expect("a binding_approval line");
+        assert_eq!(line["outcome"], "expired");
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+    }
+
     /// **Q10, and the arithmetic is asserted rather than only its
     /// consequence.**
     ///
