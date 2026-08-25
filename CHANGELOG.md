@@ -58,10 +58,11 @@ surfaces rather than redacted on them.
     `match_prompt` is not a valid regex. The whole block was unread at 0.0.6, so
     a typo'd pattern was inert; it is now a load error, because a binding that
     never matches is indistinguishable from a credential store that is down.
-  - A `[[security.secret_bindings]]` entry whose `match_command` is left open at
-    **either end** — `^ssh\s+prod-01.*` or `^.*ssh\s+prod-01$`, and the obvious
-    spellings of both (`.+`, `[\s\S]*`, `(.*)$`, `.*(?i)`, `(?:.)*`). See
-    **Security** below for why this one is a refusal and not a warning.
+  - A `[[security.secret_bindings]]` entry with no `match_example`, or one whose
+    `match_command` admits anything beyond it — including `^ssh\s+prod-01.*` and
+    `^.*ssh\s+prod-01$`, but not because either is *spelled* that way. See
+    **Security** below for the rule and for why this one is a refusal and not a
+    warning.
 
   §10.2's published example is unaffected: it ships `autofill_on_echo_off =
   false` alongside `secret_provider = "prompt"`, which passes the new rule.
@@ -88,32 +89,51 @@ surfaces rather than redacted on them.
   for a session that takes arguments has to name them. §9.6's published example
   changes from `…prod-0[12]\b` to `…prod-0[12]$` for the same reason.
 
-- **A `match_command` left open at *either end* is refused at load, and the
-  daemon does not start.** Anchoring alone has one failure mode and it is
-  silent: the first operator whose legitimate session stops matching writes `.*`
-  at four in the morning, and the hole is back with nothing to see.
+- **Every binding now carries a required `match_example`, and a `match_command`
+  that admits anything beyond it is refused at load.** Anchoring alone has one
+  failure mode and it is silent: the first operator whose legitimate session
+  stops matching writes `.*` at four in the morning, and the hole is back with
+  nothing to see.
+
+  `match_example` is the command line you are asserting the binding is for. At
+  load the pattern — wrapped exactly as the matcher wraps it — must match that
+  example, and must **not** match it with any of nine hostile transformations
+  applied: six suffixes an agent appends (` -o ProxyCommand=nc 127.0.0.1 2222`,
+  ` -E /tmp/steal`, ` -tt cat`, `; evil`, ` && evil`, ` | evil`), two prefixes
+  that put a command of its own in front (`sh -c 'evil' `,
+  `env LD_PRELOAD=/tmp/x `), and one unrelated command line.
 
   **Both ends, because the reflex has two spellings and the trailing one is only
   the more obvious.** `^.*ssh\s+prod-01$` is matched by a session whose command
   line is `sh -c "…read x; echo GOT $x; ssh prod-01"` — the agent's own program,
-  reading the credential and echoing it, with `ssh` never reached at all. Same
-  primitive, other end of the pattern.
+  reading the credential and echoing it, with `ssh` never reached at all. The
+  prefix probes are what refuse it.
 
-  The check is a shallow syntactic heuristic and is **nowhere near complete.**
-  It peels anchors, inline flag setters and wrapping groups off each end and
-  looks at what is under them; it does not analyse the regex. Spellings that
-  load and still admit an agent-chosen line include any negated class
-  (`[^\x00]*`), an open end that is not at an end (`^ssh.*prod-01$`), any-char
-  atoms it does not know (`\p{Any}*`, `[\x00-\x{10FFFF}]*`), a nested group
-  under an outer quantifier (`((.))*`), an alternation inside a quantified group
-  (`(?:.|x)*`), and `(?x)` free-spacing. **That list is the ones that have been
-  found, not the ones that exist** — an earlier draft named two and read as an
-  inventory, and a review drove twenty more past it in an afternoon.
+  **This replaced a syntactic scanner, and that is the change worth reading.**
+  The first version of this check read the pattern's *text*, peeling anchors and
+  wrapping groups off each end looking for `.*` and its friends. It grew to ~180
+  lines and a review that attacked it still drove **twenty** accepted spellings
+  past it — `\p{Any}*`, `[\x00-\x{10FFFF}]*`, `((.))*`, `(?:.|x)*`, `(.*)*`,
+  `^(a|.*|b)$`, three `(?x)` free-spacing forms and more — each one still
+  admitting a line of the agent's own choosing. Asking what a pattern *admits*,
+  with the regex engine as the oracle, refuses all twenty without naming any of
+  them.
 
-  It is accepted rather than overlooked: **the operator is not the adversary
-  here, the agent is**, and every one of these requires an operator to type it.
-  The check exists to catch the reflex — writing `.*` when a legitimate session
-  stops matching — not to be a regex analyser.
+  **A wildcard you scoped to one argument still loads.**
+  `^ssh\s+prod-01( -X.*)?$` matches its example, survives every probe, and is
+  accepted: that is an operator widening one argument deliberately, which is a
+  different act from appending `.*` because a session stopped matching. The
+  check is relative to the example, so the same pattern with
+  `match_example = "ssh prod-01 -X -v"` *is* refused.
+
+  **Operators upgrading from the first cut must add `match_example`, and two
+  previously-accepted patterns now fail.** `[^\x00]*` and `[^q]*` were accepted
+  as escape hatches on the reasoning that a negated class says something
+  specific about what an operator will not admit. `ssh prod-01; evil` contains
+  neither a NUL nor a `q`, so both are now refused. Use the scoped-wildcard form
+  above instead. **`^ssh.*prod-01$` — an open end that is not at an end — is
+  still accepted**, because no probe can reach the middle of a line whose two
+  ends the pattern pins.
 
 - **`BindingApprovalRequired` carries the session's command line**, so a human
   approves *this command line receiving this credential* rather than a binding
