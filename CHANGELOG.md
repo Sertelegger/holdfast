@@ -58,8 +58,9 @@ surfaces rather than redacted on them.
     `match_prompt` is not a valid regex. The whole block was unread at 0.0.6, so
     a typo'd pattern was inert; it is now a load error, because a binding that
     never matches is indistinguishable from a credential store that is down.
-  - A `[[security.secret_bindings]]` entry whose `match_command` ends in an
-    unconstrained tail — `.*`, `.+`, `[\s\S]*` and the obvious spellings. See
+  - A `[[security.secret_bindings]]` entry whose `match_command` is left open at
+    **either end** — `^ssh\s+prod-01.*` or `^.*ssh\s+prod-01$`, and the obvious
+    spellings of both (`.+`, `[\s\S]*`, `(.*)$`, `.*(?i)`, `(?:.)*`). See
     **Security** below for why this one is a refusal and not a warning.
 
   §10.2's published example is unaffected: it ships `autofill_on_echo_off =
@@ -87,14 +88,24 @@ surfaces rather than redacted on them.
   for a session that takes arguments has to name them. §9.6's published example
   changes from `…prod-0[12]\b` to `…prod-0[12]$` for the same reason.
 
-- **A `match_command` ending in `.*` is refused at load, and the daemon does not
-  start.** Anchoring alone has one failure mode and it is silent: the first
-  operator whose legitimate session stops matching appends `.*` at four in the
-  morning, and the hole is back with nothing to see. The check is a shallow
-  syntactic heuristic and is not airtight — `[^\x00]*` passes it. That is
-  accepted rather than overlooked: **the operator is not the adversary here, the
-  agent is**, and an operator who reaches past the check has chosen to widen
-  their own binding.
+- **A `match_command` left open at *either end* is refused at load, and the
+  daemon does not start.** Anchoring alone has one failure mode and it is
+  silent: the first operator whose legitimate session stops matching writes `.*`
+  at four in the morning, and the hole is back with nothing to see.
+
+  **Both ends, because the reflex has two spellings and the trailing one is only
+  the more obvious.** `^.*ssh\s+prod-01$` is matched by a session whose command
+  line is `sh -c "…read x; echo GOT $x; ssh prod-01"` — the agent's own program,
+  reading the credential and echoing it, with `ssh` never reached at all. Same
+  primitive, other end of the pattern.
+
+  The check is a shallow syntactic heuristic and is **not** airtight. It peels
+  anchors, inline flag setters and wrapping groups off each end and looks at
+  what is under them; it does not analyse the regex. Two known misses stay
+  accepted: any negated class (`[^\x00]*`, `[^q]*`), and an open end that is not
+  at an end (`^ssh.*prod-01$`). That is accepted rather than overlooked: **the
+  operator is not the adversary here, the agent is**, and an operator who
+  reaches past the check has chosen to widen their own binding.
 
 - **`BindingApprovalRequired` carries the session's command line**, so a human
   approves *this command line receiving this credential* rather than a binding
@@ -102,8 +113,16 @@ surfaces rather than redacted on them.
   `ssh prod-01 -o ProxyCommand=nc 127.0.0.1 2222`, and telling those apart is
   the whole of the decision being asked for. `holdfast attach` and `holdfast
   watch` both print it. The field is `command` and `args` joined with single
-  spaces and **redacted element-wise before the join** — the frame reaches every
-  attached client and those two fields are the agent's own strings.
+  spaces, **redacted element-wise before the join, and stripped of every
+  character that could rewrite the line it is printed on** — the frame reaches
+  every attached client and those two fields are the agent's own strings.
+
+  The strip is not tidying. An argument containing `\x1b[2K` or `\r` lets the
+  agent erase or overwrite the very line the operator is being asked to decide
+  from, and forge the text around it — which defeats the field rather than
+  weakening it. Escape sequences, control characters, and the directional-override
+  and zero-width characters all go. The payload's *text* stays, so an operator
+  sees a longer, stranger line rather than a forged short one.
 
   This is mitigation and not a fix: it does nothing for
   `autofill_on_echo_off`, which is the unattended case, and it asks a person to

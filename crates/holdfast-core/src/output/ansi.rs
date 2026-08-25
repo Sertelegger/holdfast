@@ -198,12 +198,118 @@ pub fn strip(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Reduce a string to something that renders as **one line of plain
+/// text**, for a field whose whole purpose is to be read by a human
+/// making a decision.
+///
+/// **[`strip`] is not enough on its own, and the gap is deliberate on
+/// both sides.** `strip` serves a terminal *stream*, so it keeps `\t`,
+/// `\n`, `\r` and `\x08` — "layout survives" is the right rule there and
+/// exactly the wrong one here. A `\r` rewrites the line from its start, a
+/// `\x08` rubs out the character before it, and a `\n` forges a second
+/// line of whatever the surrounding diagnostic looks like. On a field
+/// that exists so an operator can tell `ssh prod-01` from `ssh prod-01 -o
+/// ProxyCommand=nc 127.0.0.1 2222`, any of the three hands the difference
+/// back to whoever wrote the string (GH #45).
+///
+/// So: escape sequences go through [`strip`], then **every remaining
+/// control character is dropped**, then the directional-formatting and
+/// zero-width characters are dropped too. The second group is not
+/// paranoia by association — U+202E reverses the rendering of everything
+/// after it, which is the same attack in a different alphabet, and a
+/// zero-width space breaks a word an operator is scanning for.
+///
+/// **Dropped rather than replaced with a marker.** A visible substitute
+/// invites the question of whether the substitute itself can be forged,
+/// and the bytes around a control character stay visible either way — an
+/// agent that inserts `\r` gets a longer, stranger-looking line, which is
+/// the honest outcome.
+///
+/// **What this does not do**, so nothing downstream reads it as more: it
+/// is not a "safe to print anywhere" guarantee. A homoglyph is still a
+/// homoglyph, `rn` still looks like `m` in some fonts, and a very long
+/// line still scrolls. It removes the characters that let a string
+/// *rewrite* what is already on screen; it does not make the remaining
+/// text trustworthy.
+pub fn one_line_for_display(s: &str) -> String {
+    let stripped = strip(s.as_bytes());
+    String::from_utf8_lossy(&stripped)
+        .chars()
+        .filter(|c| !c.is_control() && !is_directional_or_zero_width(*c))
+        .collect()
+}
+
+/// The Unicode formatting characters that change how the *rest* of a
+/// string renders without contributing anything visible themselves.
+///
+/// Kept as an explicit list rather than "all of category `Cf`", because
+/// `Cf` also contains characters that legitimately appear inside words in
+/// several scripts, and this function's job is not to police text.
+fn is_directional_or_zero_width(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}'   // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+        | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+        | '\u{FEFF}'              // BOM / zero-width no-break space
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn strip_str(s: &str) -> String {
         String::from_utf8(strip(s.as_bytes())).unwrap()
+    }
+
+    /// **The characters [`strip`] deliberately keeps are the ones
+    /// [`one_line_for_display`] must not**, and the pairing is the whole
+    /// content of this row.
+    ///
+    /// `strip` serves a terminal stream, where `\r`, `\n`, `\t` and `\x08`
+    /// are layout. `one_line_for_display` serves a single line a human is
+    /// reading to make a decision, where each of them is a way for whoever
+    /// wrote the string to change what that human sees (GH #45).
+    #[test]
+    fn one_line_for_display_removes_what_strip_keeps() {
+        // The pairing first: `strip` keeps all four, on purpose.
+        assert_eq!(strip_str("a\rb\nc\td\x08e"), "a\rb\nc\td\x08e");
+
+        // And the display form keeps none of them.
+        assert_eq!(one_line_for_display("a\rb\nc\td\x08e"), "abcde");
+
+        // The attack the field exists to defeat: a `\r` that rewrites the
+        // line, and a CSI that erases it. Either one makes a hostile
+        // command line render as a benign one.
+        assert_eq!(
+            one_line_for_display("ssh prod-01 -o ProxyCommand=nc 1 2\rssh prod-01"),
+            "ssh prod-01 -o ProxyCommand=nc 1 2ssh prod-01",
+            "the payload must stay visible; only its power to overwrite is removed"
+        );
+        assert_eq!(
+            one_line_for_display("ssh prod-01 -o ProxyCommand=nc 1 2\x1b[2K\rssh prod-01"),
+            "ssh prod-01 -o ProxyCommand=nc 1 2ssh prod-01"
+        );
+        // A forged second diagnostic line.
+        assert!(!one_line_for_display("x\nholdfast attach: all clear").contains('\n'));
+
+        // Directional overrides render the *rest* of the string
+        // right-to-left, which is the same attack in another alphabet.
+        assert_eq!(
+            one_line_for_display("ssh \u{202E}10-dorp\u{202C}"),
+            "ssh 10-dorp"
+        );
+        assert_eq!(one_line_for_display("pro\u{200B}d-01"), "prod-01");
+
+        // Ordinary text is untouched, or the assertions above are
+        // satisfied by a function that returns nothing.
+        assert_eq!(
+            one_line_for_display("ssh user@prod-01 -o ProxyCommand=nc 127.0.0.1 2222"),
+            "ssh user@prod-01 -o ProxyCommand=nc 127.0.0.1 2222"
+        );
+        // Non-ASCII that is not a formatting character survives: an
+        // operator's hostname may legitimately carry one.
+        assert_eq!(one_line_for_display("ssh naïve-01"), "ssh naïve-01");
     }
 
     #[test]

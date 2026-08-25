@@ -552,11 +552,20 @@ pub struct SecurityConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretBinding {
-    /// The override key, and the only part of a binding any surface
+    /// The override key, and the only part of **the binding** any surface
     /// shows: `BindingApprovalRequired` (§7.5), `GET
     /// /api/binding-approvals` (§7.6.3) and the `binding_resolved` /
     /// `binding_approval` audit kinds (§18.7) all carry `binding_name`
-    /// and nothing else identifying.
+    /// and never the `reference` or the resolved value (REQ-SEC-016).
+    ///
+    /// **It is no longer the only identifying thing on those surfaces**,
+    /// and the earlier wording that said so has been corrected rather than
+    /// left to be believed: `BindingApprovalRequired` and the HTTP mirror
+    /// also carry the **session's** command line (GH #45), because a name
+    /// an operator chose months ago is not something a human can decide
+    /// from. That is identifying by construction — of the session, not of
+    /// the credential, which is the distinction REQ-SEC-016 actually
+    /// draws.
     pub name: String,
     pub match_command: String,
     pub match_prompt: String,
@@ -1158,23 +1167,27 @@ impl Config {
             }
             // GH #45's second half. `secret::binding` matches
             // `match_command` against the **whole** joined command line,
-            // and a pattern ending in `.*` gives that back — the agent
-            // appends whatever it likes and the binding still fires. The
-            // reflex this refuses is a real one: it is what an operator
-            // does when a legitimate session stops matching and the daemon
-            // is down. `match_prompt` is not checked, because it is not
-            // anchored and a permissive tail on it grants nothing.
+            // and a pattern open at *either* end gives that back — the
+            // agent appends whatever it likes, or puts a whole command of
+            // its own in front, and the binding still fires. The reflex
+            // this refuses is a real one: it is what an operator does when
+            // a legitimate session stops matching and the daemon is down.
+            // `match_prompt` is not checked, because it is not anchored
+            // and an open end on it grants nothing.
             //
-            // See `unconstrained_tail` for why the heuristic is
-            // deliberately shallow and must not be grown or removed.
-            if let Some(tail) = unconstrained_tail(&binding.match_command) {
+            // See `unconstrained_end` for both ends, for the known misses,
+            // and for why the heuristic is deliberately shallow and must
+            // not be grown or removed.
+            if let Some((end, open)) = unconstrained_end(&binding.match_command) {
                 return Err(ConfigError::invalid(format!(
-                    "security.secret_bindings[\"{}\"].match_command = {:?} ends in \
-                     `{tail}`, which matches any arguments an agent appends; \
-                     `match_command` must match the session's whole command line, so \
+                    "security.secret_bindings[\"{}\"].match_command = {:?} {} `{open}`, \
+                     {}; `match_command` must match the session's whole command line, so \
                      write out the arguments the binding is for (`^ssh\\s+prod-01$`) \
                      rather than admitting all of them",
-                    binding.name, binding.match_command
+                    binding.name,
+                    binding.match_command,
+                    end.verb(),
+                    end.consequence(),
                 )));
             }
         }
@@ -1290,13 +1303,48 @@ fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<(), ConfigError> {
 }
 
 /// Atoms that match **any** character, in the spellings an operator
-/// reaches for. See [`unconstrained_tail`].
+/// reaches for. See [`unconstrained_end`].
 ///
-/// `[^\x00]` and its relatives are deliberately absent — they are the
-/// escape hatch, not an oversight.
+/// **Every negated character class is deliberately absent** — `[^\x00]`,
+/// `[^q]`, `[^\r]` and the rest. They are the escape hatch, not an
+/// oversight: an operator who writes one has said something specific about
+/// what they will not admit, which is a different act from writing `.*`.
 const ANY_CHAR_ATOMS: [&str; 7] = [
     ".", "[\\s\\S]", "[\\S\\s]", "[\\d\\D]", "[\\D\\d]", "[\\w\\W]", "[\\W\\w]",
 ];
+
+/// Which end of a `match_command` is open, for the message and for the
+/// two different things being said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenEnd {
+    /// `^.*ssh\s+prod-01$` — the agent chooses what comes **before** the
+    /// operator's text, which lets it run a program of its own with the
+    /// operator's command line trailing harmlessly behind.
+    Head,
+    /// `^ssh\s+prod-01.*` — the agent chooses what comes **after**, which
+    /// is GH #45's original `-o ProxyCommand=…`.
+    Tail,
+}
+
+impl OpenEnd {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Head => "begins with",
+            Self::Tail => "ends in",
+        }
+    }
+
+    fn consequence(self) -> &'static str {
+        match self {
+            Self::Head => {
+                "which matches anything an agent puts in front of the text you wrote — \
+                 including a whole command of its own, with your command line trailing \
+                 after it"
+            }
+            Self::Tail => "which matches any arguments an agent appends",
+        }
+    }
+}
 
 /// How many `\` a string ends with — the parity that tells a regex
 /// metacharacter from an escaped literal one.
@@ -1304,32 +1352,87 @@ const ANY_CHAR_ATOMS: [&str; 7] = [
 /// `\.*` is *"zero or more dots"* and is perfectly constrained; `\\.*` is
 /// a literal backslash followed by *"anything"* and is not. The two differ
 /// only in this count.
+///
+/// **Only the tail needs this.** At the *front* of a pattern an escape
+/// always precedes what it escapes, so `\.` simply does not start with
+/// `.` and a prefix test is already unambiguous.
 fn trailing_backslashes(s: &str) -> usize {
     s.bytes().rev().take_while(|b| *b == b'\\').count()
 }
 
-/// Drop trailing end-of-text anchors, which say nothing after a
-/// quantifier that already reached the end.
+/// Drop trailing text that constrains nothing: end-of-text anchors, and
+/// inline flag setters.
 ///
 /// An operator who writes `.*$` means `.*`, and refusing one spelling
 /// while accepting the other would be a check that reads as arbitrary.
-fn strip_end_anchors(mut s: &str) -> &str {
+/// `.*(?i)` is the same case with a no-op flag change parked on the end.
+///
+/// **`\Z` is not stripped, because it does not exist here.** `regex`
+/// 1.13.1 has no `\Z` escape and `Regex::new` rejects it, so the
+/// compile check one loop earlier in [`Config::validate`] refuses such a
+/// pattern before this function ever sees it. An earlier revision stripped
+/// it, on a belief about `$` that
+/// `this_crates_dollar_is_end_of_text_not_end_of_line` now pins as false.
+fn strip_inert_tail(mut s: &str) -> &str {
     loop {
-        let Some(next) = s
+        let next = s
             .strip_suffix('$')
             .or_else(|| s.strip_suffix("\\z"))
-            .or_else(|| s.strip_suffix("\\Z"))
-        else {
-            return s;
-        };
-        // `a\$` is a literal dollar and `a\\z` is a literal `z`; neither
-        // is an anchor, and stripping it would read the character before
-        // it as the tail.
-        if trailing_backslashes(next) % 2 == 1 {
-            return s;
+            .filter(|rest| {
+                // `a\$` is a literal dollar and `a\\z` a literal `z`;
+                // neither is an anchor, and stripping one would read the
+                // character before it as the end.
+                trailing_backslashes(rest).is_multiple_of(2)
+            })
+            .or_else(|| strip_trailing_flag_setter(s));
+        match next {
+            Some(rest) => s = rest,
+            None => return s,
         }
-        s = next;
     }
+}
+
+/// Drop leading text that constrains nothing — the mirror of
+/// [`strip_inert_tail`].
+fn strip_inert_head(mut s: &str) -> &str {
+    loop {
+        let next = s
+            .strip_prefix('^')
+            .or_else(|| s.strip_prefix("\\A"))
+            .or_else(|| strip_leading_flag_setter(s));
+        match next {
+            Some(rest) => s = rest,
+            None => return s,
+        }
+    }
+}
+
+/// `(?i)`, `(?ms)`, `(?u-i)` — a flag *setter*, which is not a group and
+/// matches nothing.
+///
+/// Distinguished from a flag-carrying group `(?s:…)` by the absence of a
+/// `:`; that one is a real group and is handled by [`group_contents`].
+fn flag_setter_body(inner: &str) -> Option<&str> {
+    let flags = inner.strip_prefix('?')?;
+    let ok = !flags.is_empty()
+        && flags
+            .bytes()
+            .all(|b| matches!(b, b'i' | b'm' | b's' | b'U' | b'u' | b'x' | b'R' | b'-'));
+    ok.then_some(flags)
+}
+
+fn strip_trailing_flag_setter(s: &str) -> Option<&str> {
+    let inner = s.strip_suffix(')')?;
+    let (head, group) = inner.rsplit_once('(')?;
+    flag_setter_body(group)?;
+    trailing_backslashes(head).is_multiple_of(2).then_some(head)
+}
+
+fn strip_leading_flag_setter(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('(')?;
+    let (group, tail) = rest.split_once(')')?;
+    flag_setter_body(group)?;
+    Some(tail)
 }
 
 /// Drop one trailing quantifier that has **no upper bound**.
@@ -1348,25 +1451,213 @@ fn strip_open_quantifier(s: &str) -> Option<&str> {
     // `{n,}` and `{n,}?` — a lower bound and no upper one.
     let braced = s.strip_suffix('?').unwrap_or(s).strip_suffix('}')?;
     let (head, counts) = braced.rsplit_once('{')?;
-    let (low, high) = counts.split_once(',')?;
-    let open_ended = high.is_empty() && !low.is_empty() && low.bytes().all(|b| b.is_ascii_digit());
-    open_ended.then_some(head)
+    open_ended_counts(counts).then_some(head)
 }
 
-/// The trailing *"…and then anything"* of a `match_command`, if it has
-/// one (GH #45).
+/// The leading mirror of [`strip_open_quantifier`].
+fn strip_leading_open_quantifier(s: &str) -> Option<&str> {
+    if let Some(r) = s.strip_prefix("*?").or_else(|| s.strip_prefix("+?")) {
+        return Some(r);
+    }
+    if let Some(r) = s.strip_prefix('*').or_else(|| s.strip_prefix('+')) {
+        return Some(r);
+    }
+    let (counts, rest) = s.strip_prefix('{')?.split_once('}')?;
+    open_ended_counts(counts).then(|| rest.strip_prefix('?').unwrap_or(rest))
+}
+
+/// `2,` yes; `2`, `2,5` and `x,` no. The body of `{…}` with a lower bound
+/// and no upper one.
+fn open_ended_counts(counts: &str) -> bool {
+    let Some((low, high)) = counts.split_once(',') else {
+        return false;
+    };
+    high.is_empty() && !low.is_empty() && low.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// If `s` ends with a group, the byte index of its `(` and the group's
+/// contents with the opener and `)` removed.
+///
+/// Hand-rolled rather than a regex parse, and it tracks exactly the two
+/// places a parenthesis is a literal: after a backslash, and inside a
+/// character class. `regex` rejects `[]]`, so there is no "a `]` first in
+/// a class is literal" rule to model.
+fn trailing_group(s: &str) -> Option<(usize, &str)> {
+    let bytes = s.as_bytes();
+    if bytes.last() != Some(&b')') {
+        return None;
+    }
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut depth = 0usize;
+    let mut opened_at = 0usize;
+    for (i, &c) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            b'\\' => escaped = true,
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => {
+                if depth == 0 {
+                    opened_at = i;
+                }
+                depth += 1;
+            }
+            b')' if !in_class => {
+                // An unbalanced `)` is not a pattern this function has
+                // anything to say about; `Regex::new` already refused it.
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && i + 1 == bytes.len() {
+                    return group_contents(&s[opened_at..]).map(|contents| (opened_at, contents));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `(x)` → `x`, `(?:x)` → `x`, `(?<n>x)` → `x`, `(?s:x)` → `x`.
+///
+/// `None` for `(?i)`, which is a flag setter rather than a group and has
+/// no contents to look at.
+fn group_contents(group: &str) -> Option<&str> {
+    let inner = group.strip_prefix('(')?.strip_suffix(')')?;
+    let Some(rest) = inner.strip_prefix('?') else {
+        return Some(inner);
+    };
+    if let Some(r) = rest.strip_prefix(':') {
+        return Some(r);
+    }
+    if let Some(r) = rest.strip_prefix("P<").or_else(|| rest.strip_prefix('<')) {
+        return r.split_once('>').map(|(_, body)| body);
+    }
+    // `(?flags:…)`. A `?flags` with no `:` is a setter, not a group.
+    rest.split_once(':').map(|(_, body)| body)
+}
+
+/// Is the whole of `s` an atom that matches any character?
+///
+/// Used for the case where the quantifier is *outside* a group —
+/// `(?:.)*`, `(?s:.)*` — where the question is not *"does this end in an
+/// any-atom"* but *"is this nothing but one"*.
+fn is_any_char(s: &str) -> bool {
+    let s = strip_leading_flag_setter(s).unwrap_or(s);
+    ANY_CHAR_ATOMS.contains(&s)
+}
+
+/// Where `s`'s open-ended tail starts, as a byte index into `s`.
+fn open_ended_tail_start(s: &str) -> Option<usize> {
+    if let Some(before_quantifier) = strip_open_quantifier(s) {
+        // `…ssh prod-01.*`
+        if let Some(before_atom) = ANY_CHAR_ATOMS
+            .iter()
+            .find_map(|a| before_quantifier.strip_suffix(a))
+        {
+            if trailing_backslashes(before_atom).is_multiple_of(2) {
+                return Some(before_atom.len());
+            }
+        }
+        // `…(?:.)*`, `…(?s:.)*` — the quantifier applies to a group whose
+        // whole content is "any character".
+        let (open, inner) = trailing_group(before_quantifier)?;
+        return is_any_char(inner).then_some(open);
+    }
+    // `…(.*)`, `…(?:.*)$` — the quantifier is inside a trailing group.
+    // This is the "capture the rest" idiom, and it is the *reflex* case
+    // rather than a reach past the check, which is why it is caught.
+    let (open, inner) = trailing_group(s)?;
+    open_ended_tail_start(strip_inert_tail(inner)).map(|_| open)
+}
+
+/// Where `s`'s open-ended head ends, as a byte index into `s`.
+fn open_ended_head_end(s: &str) -> Option<usize> {
+    if let Some(after_atom) = ANY_CHAR_ATOMS.iter().find_map(|a| s.strip_prefix(a)) {
+        if let Some(after_quantifier) = strip_leading_open_quantifier(after_atom) {
+            return Some(s.len() - after_quantifier.len());
+        }
+    }
+    // `(.*)ssh…`, `(?:.)*ssh…` — the mirror of the two group cases above.
+    let (after_group, inner) = leading_group(s)?;
+    if let Some(after_quantifier) = strip_leading_open_quantifier(&s[after_group..]) {
+        return is_any_char(inner).then_some(s.len() - after_quantifier.len());
+    }
+    open_ended_head_end(strip_inert_head(inner)).map(|_| after_group)
+}
+
+/// The leading mirror of [`trailing_group`]: the byte index just past the
+/// group's `)`, and its contents.
+fn leading_group(s: &str) -> Option<(usize, &str)> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut depth = 0usize;
+    for (i, &c) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            b'\\' => escaped = true,
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => depth += 1,
+            b')' if !in_class => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return group_contents(&s[..=i]).map(|contents| (i + 1, contents));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A `match_command` that is open at either end — *"and then anything"*
+/// after the operator's text, or *"anything and then"* before it (GH #45).
+///
+/// **Both ends, and the symmetry is the point.** `secret::binding` matches
+/// `match_command` against the whole command line, so an unconstrained
+/// tail hands the agent every argument (`ssh prod-01 -o ProxyCommand=…`,
+/// the original issue) and an unconstrained *head* hands it a whole
+/// command of its own — `sh -c "read x; echo GOT $x; ssh prod-01"` matches
+/// `^.*ssh\s+prod-01$`, and the credential is typed into the agent's
+/// program with `ssh` never reached. An earlier revision of this check
+/// looked only at the tail; the head is the same reflex spelled at the
+/// other end, and an operator whose newly-anchored pattern stops matching
+/// is as likely to prepend `.*` as to append it.
 ///
 /// **This is a shallow, syntactic heuristic and it must stay one.** It
-/// does not analyse the regex; it looks at the last few characters. A
-/// determined operator defeats it in one keystroke — `[^\x00]*` is not on
-/// [`ANY_CHAR_ATOMS`] and never will be, and neither is
-/// `^(ssh.*|psql.*)$`, whose tails are inside an alternation this never
-/// opens.
+/// does not analyse the regex; it peels anchors, inline flag setters and
+/// wrapping groups off each end and looks at what is under them. A
+/// determined operator defeats it in one keystroke, and these are the
+/// known ways, neither of which is refused:
+///
+/// * **any negated class** — `[^\x00]*`, `[^q]*`. See [`ANY_CHAR_ATOMS`].
+/// * **an open end that is not at an end** — `^ssh.*prod-01$` constrains
+///   both ends and admits everything between them, and `^ssh\s+(a|.*x)$`
+///   hides the same thing inside a branch that does not reach the end of
+///   its group.
+///
+/// **An alternation *is* opened when it is the thing at the end**, which
+/// an earlier revision of this comment said it was not: peeling a
+/// wrapping group and testing its contents refuses `^(ssh.*|psql.*)$` and
+/// `^ssh\s+prod-01(?:a|.*)$` for free. That is not a widening of the
+/// heuristic — it is the same suffix test one layer down — and it is
+/// recorded here because the *previous* sentence was wrong and a reader
+/// checking the claim would find it so.
 ///
 /// **That is not a gap to close, because the operator is not the
 /// adversary here — the agent is.** The check exists because
 /// `secret::binding`'s whole-line rule has one predictable failure mode:
-/// an operator whose legitimate session stops matching appends `.*` under
+/// an operator whose legitimate session stops matching writes `.*` under
 /// time pressure, silently, and the hole GH #45 closed is back. Turning
 /// that specific reflex into a daemon that will not start is the entire
 /// job. An operator who reaches past it has *chosen* to widen their own
@@ -1374,17 +1665,16 @@ fn strip_open_quantifier(s: &str) -> Option<&str> {
 ///
 /// So: do not grow this into a general regex analysis, and do not delete
 /// it as unsound. It is neither sound nor complete on purpose.
-fn unconstrained_tail(pattern: &str) -> Option<&str> {
-    let body = strip_end_anchors(pattern);
-    let end = body.len();
-    let before_quantifier = strip_open_quantifier(body)?;
-    let before_atom = ANY_CHAR_ATOMS
-        .iter()
-        .find_map(|a| before_quantifier.strip_suffix(a))?;
-    if trailing_backslashes(before_atom) % 2 == 1 {
-        return None;
+fn unconstrained_end(pattern: &str) -> Option<(OpenEnd, &str)> {
+    // The tail first, because it is the one GH #45 was filed for and the
+    // one an operator is likelier to have written.
+    let tail = strip_inert_tail(pattern);
+    if let Some(start) = open_ended_tail_start(tail) {
+        return Some((OpenEnd::Tail, &tail[start..]));
     }
-    Some(&pattern[before_atom.len()..end])
+    let head = strip_inert_head(pattern);
+    let end = open_ended_head_end(head)?;
+    Some((OpenEnd::Head, &head[..end]))
 }
 
 /// `value` must leave headroom under a wire cap. See the I-9 comment in
@@ -1920,14 +2210,31 @@ reference = \"db/prod\"
         assert_eq!(ok.security.secret_bindings[0].match_prompt, "");
     }
 
-    /// **GH #45's second half.** A `match_command` ending in *"and then
-    /// anything"* is refused, and the daemon does not start.
+    /// A `[[security.secret_bindings]]` block carrying one
+    /// `match_command`, for the rows that are about the pattern alone.
+    fn binding_with(match_command: &str) -> String {
+        format!(
+            "[[security.secret_bindings]]\nname = \"prod-ssh\"\n\
+             match_command = '{match_command}'\nmatch_prompt = \"\"\n\
+             provider = \"secret-service\"\nreference = \"r\"\n"
+        )
+    }
+
+    /// **GH #45's second half.** A `match_command` left open at **either
+    /// end** is refused, and the daemon does not start.
     ///
     /// `secret::binding` matches `match_command` against the **whole**
     /// joined command line. That closes the issue on its own — and its
     /// failure mode is an operator whose legitimate session stops
-    /// matching, appending `.*` at four in the morning, silently putting
-    /// the hole back. This check is what makes that a load error instead.
+    /// matching, writing `.*` at four in the morning, silently putting the
+    /// hole back. This check is what makes that a load error instead.
+    ///
+    /// **Both ends, because the reflex has two spellings and the review
+    /// found only one of them refused.** A *leading* `.*` is not a lesser
+    /// version of the trailing one: `^.*ssh\s+prod-01$` is matched by a
+    /// session whose command line is `sh -c "…read x; echo GOT $x; ssh
+    /// prod-01"`, so the credential goes into the agent's own program and
+    /// `ssh` is never reached at all. Same primitive, other end.
     ///
     /// **The refusals and the acceptances are one row deliberately.** A
     /// heuristic like this fails in two directions, and the expensive
@@ -1936,18 +2243,13 @@ reference = \"db/prod\"
     /// fix it. So every accepted spelling below is a pattern somebody
     /// would plausibly write.
     #[test]
-    fn refuses_an_unconstrained_tail() {
-        let binding = |match_command: &str| {
-            format!(
-                "[[security.secret_bindings]]\nname = \"prod-ssh\"\n\
-                 match_command = '{match_command}'\nmatch_prompt = \"\"\n\
-                 provider = \"secret-service\"\nreference = \"r\"\n"
-            )
-        };
-        // Refused. Every one of these matches `ssh prod-01 -o
-        // ProxyCommand=nc 127.0.0.1 2222` end to end, which is the
-        // command line the issue was filed for.
+    fn refuses_a_match_command_that_is_open_at_either_end() {
+        // Refused. Every one of these selects `ssh prod-01 -o
+        // ProxyCommand=nc 127.0.0.1 2222` — the command line the issue was
+        // filed for — or, in the leading group, a whole command line of
+        // the agent's own with the operator's text trailing after it.
         for pattern in [
+            // ---- the tail, in the spellings a quantifier can take
             "^ssh\\s+prod-01.*",
             "^ssh\\s+prod-01.*$",
             "^ssh\\s+prod-01.+",
@@ -1960,12 +2262,46 @@ reference = \"db/prod\"
             "^ssh\\s+prod-01[\\w\\W]*",
             "^ssh\\s+prod-01[\\d\\D]*$",
             "^ssh\\s+prod-01.*\\z",
+            // ---- the tail behind something that constrains nothing.
+            // `(.*)$` is what somebody writes to *capture* the rest; it is
+            // the reflex case rather than a reach past the check, which is
+            // why it is refused and `[^\x00]*` is not.
+            "^ssh\\s+prod-01(.*)",
+            "^ssh\\s+prod-01(.*)$",
+            "^ssh\\s+prod-01(?:.*)$",
+            "^ssh\\s+prod-01(?<rest>.*)$",
+            // The quantifier *outside* the group, which is the same thing
+            // written the other way round.
+            "^ssh\\s+prod-01(?:.)*",
+            "^ssh\\s+prod-01(?s:.)*$",
+            // An alternation at the end **is** opened, because peeling a
+            // wrapping group is the same suffix test one layer down. The
+            // review expected these two to slip through and they do not.
+            "^(ssh.*|psql.*)$",
+            "^ssh\\s+prod-01(?:a|.*)$",
+            // A trailing inline flag setter matches nothing and must not
+            // hide the tail in front of it.
+            "^ssh\\s+prod-01.*(?i)",
+            "^ssh\\s+prod-01.*(?m)$",
             // The whole pattern being the tail — the two-character
             // spelling of "every session on the box".
             ".*",
+            // ---- the head
+            "^.*ssh\\s+prod-01$",
+            ".*ssh\\s+prod-01$",
+            "\\A.*ssh\\s+prod-01\\z",
+            "^.+ssh\\s+prod-01$",
+            "^.{0,}ssh\\s+prod-01$",
+            "^[\\s\\S]*ssh\\s+prod-01$",
+            "^(.*)ssh\\s+prod-01$",
+            "^(?:.)*ssh\\s+prod-01$",
+            "(?i)^.*ssh\\s+prod-01$",
         ] {
-            let Err(e) = parse_str(&binding(pattern)) else {
-                panic!("`{pattern}` loaded, and it admits any arguments an agent appends");
+            let Err(e) = parse_str(&binding_with(pattern)) else {
+                panic!(
+                    "`{pattern}` loaded, and it admits a command line of the agent's \
+                     own choosing"
+                );
             };
             let msg = e.to_string();
             assert!(
@@ -1980,6 +2316,18 @@ reference = \"db/prod\"
             );
         }
 
+        // The message says **which** end, because the two have different
+        // repairs and an operator reading `begins with` when they wrote a
+        // trailing `.*` learns nothing.
+        let head = parse_str(&binding_with("^.*ssh\\s+prod-01$"))
+            .unwrap_err()
+            .to_string();
+        assert!(head.contains("begins with"), "{head}");
+        let tail = parse_str(&binding_with("^ssh\\s+prod-01.*$"))
+            .unwrap_err()
+            .to_string();
+        assert!(tail.contains("ends in"), "{tail}");
+
         // Accepted. Bounded quantifiers, escaped metacharacters and
         // patterns that simply do not end in a quantifier at all.
         for pattern in [
@@ -1990,26 +2338,100 @@ reference = \"db/prod\"
             // A trailing optional group is *bounded*: it admits one more
             // thing, not everything.
             "^ssh\\s+prod-01(\\s+-v)?$",
-            // Bounded repetition, in all three spellings.
+            // A capture group is not by itself suspicious — only one
+            // wrapped around an open end is.
+            "^ssh\\s+(prod-01)$",
+            "^(ssh)\\s+prod-01$",
+            // Bounded repetition, in all three spellings, at both ends.
             "^ssh\\s+prod-0.$",
             "^ssh\\s+prod-01\\s.{0,8}$",
             "^ssh\\s+prod-01\\s.{2}$",
             "^ssh\\s+prod-01\\s.{1,3}$",
+            "^.{0,8}ssh\\s+prod-01$",
+            "^.ssh\\s+prod-01$",
             // `\.*` is *"zero or more dots"* — the escaped literal, whose
-            // only difference from the refused `.*` is a backslash.
+            // only difference from the refused `.*` is a backslash. Both
+            // ends, since the head has no backslash-parity rule to get
+            // wrong and this is what proves it does not need one.
             "^ping\\s+prod\\.*$",
-            // The documented escape hatch. An operator who writes this
-            // has chosen to widen their binding; see `unconstrained_tail`
-            // for why that is a different act from not noticing.
+            "^\\.*ping\\s+prod$",
+            // A `(` that is a literal, so the "trailing group" scan must
+            // not read it as one.
+            "^ssh\\s+prod-01\\s+\\(a\\)$",
+            // A parenthesis inside a character class is a literal too.
+            "^ssh\\s+prod-01[()]$",
+            // The documented escape hatches, which stay accepted. An
+            // operator who writes one has chosen to widen their binding;
+            // see `unconstrained_end` for why that is a different act from
+            // not noticing.
             "^ssh\\s+prod-01[^\\x00]*$",
+            "^ssh\\s+prod-01[^q]*$",
+            // An open end that is not at an end. Refusing these would mean
+            // opening the pattern up, which is the analysis
+            // `unconstrained_end` exists not to be.
+            "^ssh.*prod-01$",
+            "^ssh\\s+(a|.*x)$",
         ] {
-            parse_str(&binding(pattern)).unwrap_or_else(|e| {
+            parse_str(&binding_with(pattern)).unwrap_or_else(|e| {
                 panic!(
                     "`{pattern}` is a reasonable pattern and was refused, which is a \
                      daemon an operator cannot start: {e}"
                 )
             });
         }
+    }
+
+    /// The `regex` behaviour `secret::binding::whole_line` is built on,
+    /// asserted here so a crate upgrade that changes it fails **loudly**
+    /// rather than silently widening every operator's binding.
+    ///
+    /// **This row exists because the thing it pins cannot be pinned any
+    /// other way.** `whole_line` wraps an operator's pattern in
+    /// `\A(?:…)\z` rather than `^(?:…)$`, and in `regex` 1.13.1 those two
+    /// are *behaviourally identical* — `$` is end-of-haystack with
+    /// multi-line off, not Perl's "before a final newline". So no
+    /// behavioural test can tell the two spellings apart, and a review
+    /// that mutated one into the other correctly found the whole suite
+    /// still green.
+    ///
+    /// `\A`/`\z` is still the right spelling: it says what it means
+    /// whatever flags an operator sets inside the group, and it does not
+    /// depend on a crate default that could move. This row is what makes
+    /// the second half of that sentence checkable.
+    #[test]
+    fn this_crates_dollar_is_end_of_text_not_end_of_line() {
+        let dollar = regex::Regex::new("^abc$").expect("compiles");
+        assert!(dollar.is_match("abc"));
+        assert!(
+            !dollar.is_match("abc\n"),
+            "`$` now matches before a trailing newline, as Perl's does. \
+             `secret::binding::whole_line` uses `\\A`/`\\z` and is unaffected — but \
+             anything in this tree that anchors with `^`/`$` needs re-reading, and \
+             `config::strip_inert_tail` no longer covers every end-anchor spelling."
+        );
+        assert!(!dollar.is_match("abc\nx"));
+        // The pairing: `\z` agrees with `$` today, which is the fact that
+        // makes the two wrappings indistinguishable by behaviour.
+        let z = regex::Regex::new(r"\Aabc\z").expect("compiles");
+        assert!(z.is_match("abc"));
+        assert!(!z.is_match("abc\n"));
+        // And `\Z` is not a thing here, which is why `strip_inert_tail`
+        // does not strip it: a pattern carrying one is refused by the
+        // compile check one loop earlier.
+        //
+        // **Assembled at run time rather than written as a literal**, and
+        // that is not obfuscation for its own sake: clippy's
+        // `invalid_regex` lint reads literal arguments and refuses to
+        // compile the very expression this row exists to evaluate. Two
+        // independent checkers agreeing that `\Z` is not valid here is
+        // the finding, so the row keeps the run-time half and this
+        // comment keeps the compile-time one.
+        let upper_z = format!(r"\Aabc\{}", 'Z');
+        assert!(
+            regex::Regex::new(&upper_z).is_err(),
+            "`\\Z` compiles now, so a `match_command` can end in one and \
+             `strip_inert_tail` will not see it as an anchor"
+        );
     }
 
     #[test]

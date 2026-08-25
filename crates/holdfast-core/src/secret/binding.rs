@@ -27,15 +27,42 @@
 //! rather than trust. `grep -rn 'secret::binding::' crates/holdfast-core/src`
 //! is the whole of the daemon's use of this module — every other spelling
 //! would have to come through `secret/mod.rs`'s `pub use` list, which
-//! nothing outside this file imports today — and it is **two** functions:
-//! [`autofill`], and [`keychain_step_runs`] from `mcp::tools`, where it is
-//! a guard deciding whether to suspend into `spawn_blocking` at all. That
-//! second one's only argument is `SecurityConfig::secret_provider`, an
-//! operator's config value out of a three-word vocabulary. Neither has a
-//! parameter an agent-supplied string could enter, which is the claim that
-//! was meant and the one that survives the grep.
+//! nothing outside this file imports today — and it is **four** functions,
+//! every one of them called from `mcp::tools`:
 //!
-//! **And one of those two subjects is the agent's own string.**
+//! * [`autofill`] — §5.2's step 1. Parameters: the operator's config and
+//!   the session, and nothing else.
+//! * [`autofill_approved`] — §17.5's `Approved` arm. Its one extra
+//!   parameter is the binding **name** a human approved, which came from
+//!   the operator's config by way of [`Approval`].
+//! * [`keychain_step_runs`] — a guard deciding whether to suspend into
+//!   `spawn_blocking` at all. Its only argument is
+//!   `SecurityConfig::secret_provider`, an operator's config value out of
+//!   a three-word vocabulary.
+//! * [`redacted_command_line`] — added for GH #45, and **its second and
+//!   third arguments are the agent's own strings**.
+//!
+//! (The grep also finds `session::binding_uses`, which names the
+//! [`BindingUses`] *type* and calls nothing here.)
+//!
+//! **Two corrections in one paragraph, and both are the same mistake.**
+//! It said *"two functions"* — omitting `autofill_approved`, which has
+//! been called from `mcp::tools` since 0.0.7 — and it said *"neither has
+//! a parameter an agent-supplied string could enter"*, which the commit
+//! that added `redacted_command_line` falsified without touching the
+//! sentence. A paragraph that invites a grep has to survive it.
+//!
+//! **The claim that does survive is about *selection*, and it is the one
+//! REQ-SEC-012 rests on**: nothing an agent writes may choose which
+//! binding fires or what is looked up. `redacted_command_line` chooses
+//! nothing and looks nothing up — it takes the session's command line and
+//! hands back a string to *show a human*. It is a sink, not a subject,
+//! and the two are kept apart deliberately; see its own doc for why
+//! unifying them would break the matcher.
+//!
+//! [`Approval`]: crate::secret::Approval
+//!
+//! **And one of the matcher's two subjects is the agent's own string.**
 //! `Session.command` and `Session.args` are the agent's `start_session`
 //! arguments, stored verbatim — so `match_command`'s entire subject is
 //! something the agent wrote. That is **§9.6's design as this
@@ -74,11 +101,17 @@
 //!
 //! **Anchoring alone would have been the wrong shape of fix, and its
 //! second half lives in `config.rs`.** The first operator whose
-//! legitimate session stops matching appends `.*` under time pressure,
+//! legitimate session stops matching writes `.*` under time pressure,
 //! silently, and the hole is back — so `Config::validate` refuses a
-//! `match_command` that ends in an unconstrained tail. See
-//! `refuses_an_unconstrained_tail` there for why that check is a
-//! deliberately shallow heuristic and must stay one.
+//! `match_command` left open at **either end**.
+//!
+//! Both ends, because the reflex has two spellings and only one of them
+//! is the original issue. A *leading* `.*` is not the lesser case:
+//! `^.*ssh\s+prod-01$` is matched by a session whose command line is
+//! `sh -c "…read x; echo GOT $x; ssh prod-01"`, so the credential is
+//! typed into the agent's own program and `ssh` is never reached at all.
+//! See `unconstrained_end` there for the known misses, and for why that
+//! check is a deliberately shallow heuristic and must stay one.
 //!
 //! Two live holes this header could previously only warn about are closed
 //! by the same line, and both are pinned by rows below. **The
@@ -215,19 +248,37 @@ pub fn command_line(command: &str, args: &[String]) -> String {
 /// needs to read, in the one place they are being asked to make a
 /// decision about them.
 ///
+/// **Control characters are removed as well as secrets, and that is not
+/// tidying.** A field whose entire purpose is to be *read* by a human is
+/// defeated by an argument containing `\x1b[2K` or `\r`: the agent
+/// rewrites or blanks the very line the operator is being asked to
+/// approve, and can forge the diagnostic text around it. Redaction alone
+/// does not touch them — no rule matches an escape sequence — so
+/// [`one_line_for_display`] runs too, and it runs **first**, because a
+/// control byte parked inside a credential is enough to stop a redaction
+/// rule's literal anchor from matching. Strip, then redact: the redactor
+/// then sees the same bytes a human would.
+///
 /// **Not what [`select`] matches against, and the two must not be
-/// unified.** The matcher reads the *unredacted* join, for the same reason
-/// `match_prompt` reads the unredacted prompt line: matching a redacted
-/// string would let the redactor silently switch an operator's binding
-/// off — or, worse here, switch a *different* one on.
+/// unified.** The matcher reads the *unredacted, unstripped* join, for the
+/// same reason `match_prompt` reads the unredacted prompt line: matching a
+/// processed string would let the redactor silently switch an operator's
+/// binding off — or, worse here, switch a *different* one on. It is also
+/// what keeps the two honest about each other: an operator's pattern that
+/// admits an argument containing an escape sequence still selects, and the
+/// human is still shown a line they can read.
+///
+/// [`one_line_for_display`]: crate::output::ansi::one_line_for_display
 pub fn redacted_command_line(
     rules: &crate::output::rules::RuleSet,
     command: &str,
     args: &[String],
 ) -> String {
+    use crate::output::ansi::one_line_for_display;
     use crate::output::redact::redact_str;
-    let redacted: Vec<String> = args.iter().map(|a| redact_str(rules, a)).collect();
-    command_line(&redact_str(rules, command), &redacted)
+    let show = |s: &str| redact_str(rules, &one_line_for_display(s));
+    let args: Vec<String> = args.iter().map(|a| show(a)).collect();
+    command_line(&show(command), &args)
 }
 
 /// Does §5.2's step 1 run at all?
@@ -308,18 +359,31 @@ fn matches(binding: &SecretBinding, command_line: &str, prompt_line: &str) -> bo
 /// An operator's `match_command`, rewritten so it must cover the **whole**
 /// joined command line (GH #45).
 ///
-/// **`\A` and `\z` rather than `^` and `$`**, and that is the difference
-/// between a fix and the appearance of one. In this crate's `regex`, `^`
-/// and `$` become *line* anchors under an inline `(?m)`, and the pattern
-/// being wrapped is the operator's — it may carry any flag it likes. `\A`
-/// and `\z` are absolute whatever is set inside the group, so an argument
-/// carrying a newline cannot buy back the prefix match this function
-/// exists to take away. `\z` and not `\Z` for the same reason: `\Z` would
-/// let a trailing newline through.
+/// **Wrapped in `(?:…)`, and that group is the load-bearing half.**
+/// Without it an operator's top-level alternation loses its meaning:
+/// `ssh\s+prod-01|psql\s+-h\s+prod` anchored as `\Aa|b\z` reads *"`a` at
+/// the start, or `b` at the end"* — which is neither of the two things
+/// they wrote, and the first branch is a prefix match again, so
+/// `ssh prod-01 -o ProxyCommand=…` selects the binding. Pinned by
+/// `an_alternation_needs_the_group_or_the_prefix_match_comes_back`;
+/// deleting the group leaves the rest of this module's suite green.
 ///
-/// **Wrapped in `(?:…)`**, so an operator's top-level alternation keeps
-/// its meaning: `a|b` anchored as `\Aa|b\z` is *"`a` at the start, or `b`
-/// at the end"*, which is neither of the two things they wrote.
+/// **`\A` and `\z` rather than `^` and `$`, and the honest reason is not
+/// the one an earlier revision of this comment gave.** It claimed `$`
+/// would let a trailing newline through, as Perl's does. **It does not**:
+/// in `regex` 1.13.1 `$` is exactly `\z` with multi-line off, and `\Z`
+/// does not compile at all. So `\A(?:p)\z` and `^(?:p)$` are
+/// *behaviourally identical here*, no test can tell them apart, and a
+/// review that mutated one into the other correctly found the whole suite
+/// green. `config::tests::this_crates_dollar_is_end_of_text_not_end_of_line`
+/// pins that fact so a crate upgrade that changes it fails loudly.
+///
+/// The spelling is still the right one, for two reasons that survive:
+/// `\A`/`\z` mean end-of-*text* whatever flags the operator sets inside
+/// the group, so nothing here depends on reading the scoping rules
+/// correctly; and they do not depend on a crate default that could move.
+/// That is a defensive choice, not a behavioural one, and it should not
+/// be sold as a behavioural one.
 ///
 /// The operator's own `^` and `$` are left in place and remain correct —
 /// they are simply redundant now, which is why §9.6's published example
@@ -1344,9 +1408,13 @@ mod tests {
             vec!["prod-01", "-o", "ProxyCommand=nc 127.0.0.1 2222"],
             vec!["prod-01", "-o", "ProxyCommand=nc 127.0.0.1 2222", "-v"],
             vec!["prod-01", "-tt", "cat"],
-            // A newline in an argument, which is what would buy the prefix
-            // match back if `whole_line` had reached for `^`/`$` instead
-            // of `\A`/`\z`.
+            // A newline in an argument. **This does not discriminate
+            // `\A`/`\z` from `^`/`$`** — an earlier version of this
+            // comment said it did, and it is false: in `regex` 1.13.1 `$`
+            // is already end-of-text, so both spellings reject this line.
+            // It is kept because a multi-line command line is a shape
+            // worth having a row for at all, and `whole_line`'s doc now
+            // carries the real argument for the anchor spelling.
             vec!["prod-01\nrm -rf /"],
         ] {
             let line = command_line(
@@ -1361,6 +1429,87 @@ mod tests {
                  {line:?}"
             );
         }
+    }
+
+    /// **The `(?:…)` in `whole_line` is load-bearing, and this is the row
+    /// that dies without it.**
+    ///
+    /// Review finding I-2: mutating `\A(?:p)\z` to `\Ap\z` left every
+    /// other row in this module green, so a later hand could delete the
+    /// group — which reads like tidying — and ship a real regression
+    /// against a clean suite.
+    ///
+    /// The mechanism is precedence. `|` binds looser than concatenation,
+    /// so an operator's bare top-level alternation `a|b`, wrapped without
+    /// a group, becomes `\Aa|b\z` — *"`a` at the start, **or** `b` at the
+    /// end"*. The first branch is a prefix match again, which is GH #45
+    /// exactly.
+    ///
+    /// The pattern here carries **no anchors of its own**, which is what
+    /// makes it discriminating: §9.6's published example starts with `^`,
+    /// and that `^` would mask the missing group for the first branch.
+    #[test]
+    fn an_alternation_needs_the_group_or_the_prefix_match_comes_back() {
+        let b = plain_binding("two-hosts", "ssh\\s+prod-01|psql\\s+-h\\s+prod");
+        let one = std::slice::from_ref(&b);
+
+        // Both branches select the lines they were written for. First, so
+        // the negative below is not passing against a matcher that matches
+        // nothing.
+        assert!(select(one, "ssh prod-01", "").is_some());
+        assert!(select(one, "psql -h prod", "").is_some());
+
+        // Without the group this is `\Assh\s+prod-01` — a prefix match —
+        // and returns the binding.
+        assert_eq!(
+            select(one, "ssh prod-01 -o ProxyCommand=nc 127.0.0.1 2222", ""),
+            None,
+            "the first branch matched as a prefix, so `whole_line` lost its `(?:…)`"
+        );
+        // The mirror on the second branch, which a missing group leaves
+        // *suffix*-matched rather than prefix-matched. One row cannot be
+        // green with the group gone.
+        assert_eq!(
+            select(one, "sudo -u postgres psql -h prod", ""),
+            None,
+            "the last branch matched as a suffix, so `whole_line` lost its `(?:…)`"
+        );
+    }
+
+    /// **The anchors have to be end-of-*text*, and an operator's inline
+    /// `(?m)` is what tells the two apart.**
+    ///
+    /// The other half of review finding I-2. This row does not
+    /// discriminate `\A(?:p)\z` from `^(?:p)$` — nothing can, because in
+    /// `regex` 1.13.1 those are the same thing, which
+    /// `config::tests::this_crates_dollar_is_end_of_text_not_end_of_line`
+    /// pins. What it does discriminate is the fully-degraded
+    /// `^{pattern}$`, where the operator's `(?m)` escapes into the
+    /// wrapper's own anchors and turns them into line anchors: the wrapper
+    /// then accepts `ssh prod-01\nrm -rf /`, matching the operator's line
+    /// and leaving the agent a second line to do as it likes with.
+    ///
+    /// A binding that legitimately carries `(?m)` is odd but legal, and an
+    /// argument containing a newline needs no privilege at all.
+    #[test]
+    fn an_operators_inline_multiline_flag_cannot_reach_the_wrappers_anchors() {
+        let b = plain_binding("prod-ssh", "(?m)^ssh\\s+prod-01$");
+        let one = std::slice::from_ref(&b);
+
+        // The line the operator wrote it for.
+        assert!(select(one, "ssh prod-01", "").is_some());
+
+        // The operator's own text, on its own line, with the agent's
+        // payload on the next one.
+        assert_eq!(
+            select(one, "ssh prod-01\nrm -rf /", ""),
+            None,
+            "an inline `(?m)` reached the wrapper's anchors, so a newline in an \
+             argument buys back everything after it"
+        );
+        // And the same shape the other way up, so the row is not about
+        // which side of the newline the payload sits on.
+        assert_eq!(select(one, "evil\nssh prod-01", ""), None);
     }
 
     /// The two patterns the whole-line rule turns from live holes into
@@ -3098,36 +3247,57 @@ mod tests {
         let _ = s.signal(Signal::Kill);
     }
 
-    /// The approval frame's `command_line` is **redacted**, and the
-    /// **matcher's** subject is not — one row, because the two rules pull
-    /// in opposite directions and an implementation that unified them
-    /// would break exactly one of them.
+    /// The approval frame's `command_line` is **redacted and
+    /// control-character-stripped**, and the **matcher's** subject is
+    /// neither — one row, because the rules pull in opposite directions
+    /// and an implementation that unified them would break exactly one.
     ///
-    /// The session's argv carries a GitHub token. `command`/`args` are the
-    /// agent's own strings, and this frame fans out to every attached
-    /// client, so the rendering must go through the redactor like every
-    /// other string on the wire. But `select` must **not**: matching a
-    /// redacted line would let the redactor decide which binding fires,
-    /// which is the same defect `match_prompt_is_matched_against_the_unredacted_line`
+    /// The session's argv carries a GitHub token *and* an argument built
+    /// out of `\x1b[2K` and `\r`. `command`/`args` are the agent's own
+    /// strings and this frame fans out to every attached client, so:
+    ///
+    /// * the **token** must not reach the wire — the ordinary redaction
+    ///   rule every other string on this socket follows; and
+    /// * the **control characters** must not reach a human's terminal.
+    ///   `\x1b[2K\r` erases the line and returns the cursor to its start,
+    ///   so an agent can make `ssh prod-01 -o ProxyCommand=…` render as
+    ///   `ssh prod-01` — which is the exact distinction this field was
+    ///   added to make visible. Redaction alone does not touch them: no
+    ///   rule matches an escape sequence.
+    ///
+    /// But `select` must see **neither** transformation: matching a
+    /// processed line would let the redactor decide which binding fires,
+    /// which is the defect `match_prompt_is_matched_against_the_unredacted_line`
     /// pins one layer over.
     ///
-    /// **The pattern is what makes both halves load-bearing.** It spells
-    /// the token's *shape* out to the end of the line, so a matcher
-    /// reading `[REDACTED:github]` selects nothing, no approval is raised,
-    /// and `await_approval` times out — the row fails at the top rather
-    /// than reporting a redaction it never reached.
+    /// **The pattern is what makes every half load-bearing.** It spells
+    /// the token's *shape* and the control bytes out to the end of the
+    /// line, so a matcher reading either a `[REDACTED:github]` or a
+    /// stripped argument selects nothing, no approval is raised, and
+    /// `await_approval` times out — the row fails at the top rather than
+    /// reporting a rendering it never reached.
     #[tokio::test]
-    async fn the_approval_command_line_is_redacted_and_the_matchers_subject_is_not() {
+    async fn the_approval_command_line_is_rendered_for_a_human_and_the_matchers_subject_is_not() {
         const TOKEN: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        // Erase-line, then carriage return: on a terminal, everything
+        // before it disappears and what follows is drawn over it.
+        const NOISY: &str = "\x1b[2K\rall clear";
 
         let mut sc = Scratch::new("apprredact");
         let b = confirming(
             &mut sc,
             "prod-ssh",
-            "^ssh\\s+prod-01\\s+--token\\s+ghp_[0-9A-Za-z]{36}$",
+            &format!(
+                "^ssh\\s+prod-01\\s+--token\\s+ghp_[0-9A-Za-z]{{36}}\\s+{}$",
+                regex::escape(NOISY)
+            ),
         );
         let server = server_with(keychain_mode(vec![b.clone()]), &sc.audit_log());
-        let s = session_running("ssh", &["prod-01", "--token", TOKEN], ECHO_OFF_FIXTURE);
+        let s = session_running(
+            "ssh",
+            &["prod-01", "--token", TOKEN, NOISY],
+            ECHO_OFF_FIXTURE,
+        );
         server.registry.insert(Arc::clone(&s)).expect("register");
         let mut client = attach_fake(&server, &s.id);
         await_prompt(&s, b"Password: ").await;
@@ -3162,6 +3332,29 @@ mod tests {
         assert!(
             command_line.starts_with("ssh prod-01 --token "),
             "the redactor ate across an argument boundary: {command_line}"
+        );
+
+        // **Not one control character reaches the human's terminal.** The
+        // whole set, not just the two this row inserted: a field that
+        // survives `\x1b` and `\r` but passes `\x08` is a field an agent
+        // rubs out one character at a time.
+        assert!(
+            !command_line.chars().any(char::is_control),
+            "a control character reached the line a human is asked to approve, so the \
+             agent can rewrite it: {command_line:?}"
+        );
+        assert!(
+            !command_line.contains("\x1b["),
+            "an escape sequence survived as text: {command_line:?}"
+        );
+        // The payload's *text* stays — only its power to overwrite is
+        // gone. A field that silently dropped the argument would pass the
+        // two assertions above and would be hiding the thing the operator
+        // most needs to see.
+        assert!(
+            command_line.ends_with("all clear"),
+            "the argument was dropped rather than de-fanged, which hides it from the \
+             human instead of showing it: {command_line:?}"
         );
         assert_eq!(approval.command_line, command_line);
 
