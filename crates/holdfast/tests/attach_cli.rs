@@ -286,6 +286,16 @@ fn termios_of(fd: RawFd) -> libc::termios {
 /// Widened through `u64::from` rather than an `as` cast: `tcflag_t` is
 /// `u32` on Linux and `u64` on macOS, and `as` would be a no-op cast on
 /// one of them — which `-D warnings` rejects.
+///
+/// **The same trap closes on `from` from the other side, which is what
+/// the `allow` is for.** On macOS the widening reads `u64::from(u64)` and
+/// `useless_conversion` fires, so there is no spelling of this that is
+/// clean on both targets: whichever way it is written, one of the two
+/// lints objects on one of the two platforms. The `allow` is inert on
+/// Linux, where the conversion is real, and load-bearing on macOS, where
+/// it is not. Scoped to this function rather than the file so that it
+/// cannot quietly cover a genuinely useless conversion added later.
+#[allow(clippy::useless_conversion)]
 fn termios_fields(t: &libc::termios) -> (u64, u64, u64, u64, Vec<u8>) {
     (
         u64::from(t.c_iflag),
