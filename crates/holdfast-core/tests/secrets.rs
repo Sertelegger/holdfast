@@ -123,7 +123,9 @@ use holdfast_core::pty::{InProcessPty, MockPty, PtyBackend, PtySpawnConfig, Sign
 use holdfast_core::secret::{
     command_line, keychain_step_runs, resolve, select, ArgvProvider, ProviderError, SecretProvider,
 };
-use holdfast_core::session::{new_session_id, Session, SessionConfig};
+use holdfast_core::session::{
+    new_session_id, Session, SessionConfig, WriteRequest, WRITE_QUEUE_FRAMES,
+};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use serde_json::Value;
@@ -2139,6 +2141,202 @@ async fn a_connection_dropped_mid_submission_still_answers_the_waiting_call() {
     assert!(
         contains(&pty.written(), PROBE.as_bytes()),
         "the value never reached the child, so `secret_provided` would be the wrong answer"
+    );
+}
+
+/// **C-1's other side — the arm cancelled *before* the FIFO took the
+/// write, which is the only path that reaches `SecretAnswer::drop` at
+/// all.**
+///
+/// The row above ends the connection with the value already on the queue,
+/// so by then the guard has been moved into the acknowledgement task and
+/// its `Drop` finds nothing left to do. Neutering `SecretAnswer::drop`
+/// therefore leaves the **whole workspace** green — measured, 1223/0 — and
+/// the RAII owner that is the entire reason the arm is cancel-safe has no
+/// row. That is this milestone's cardinal defect appearing inside the fix
+/// for it: a guard nothing can falsify.
+///
+/// **The arrangement is the write queue's own bound, and every step of it
+/// is observed rather than slept for.** §4.3's queue holds
+/// [`WRITE_QUEUE_FRAMES`] items and `MockPty::on_write` parks the writer
+/// thread *inside* `write`, so it drains nothing: filling the queue to its
+/// bound leaves the arm's `session.write_queue().send(write).await` on a
+/// permit that will never be granted, with the request already out of the
+/// slot and the guard already live. The empty slot says the arm is past
+/// `close_secret`; a queue still reporting no capacity says it has not got
+/// past the `send`. Both are read, not waited out.
+///
+/// **The connection is ended by §4.3's slow-consumer path and not by
+/// `Daemon::shutdown`, and the difference is the whole row.** `shutdown`
+/// SIGKILLs every live session, and a `Drop` that classifies by
+/// `session.is_alive()` proves nothing on a session that is already dead:
+/// the waiting call would answer `session_died` from its **own** exit
+/// observer — the one
+/// [`a_session_that_exits_mid_wait_returns_session_died`] drives — whether
+/// or not the guard ever ran. Dropping the client socket and letting the
+/// forwarder give up on a queue it cannot put a frame into ends the
+/// connection and leaves the session alone, so `user_cancelled` here has
+/// exactly one possible producer.
+#[tokio::test]
+async fn an_arm_cancelled_on_a_full_write_queue_still_answers_the_waiting_call() {
+    /// Ordinary input, used only to occupy the queue — and asserted for at
+    /// the end, so "the credential is absent from the child" is not the
+    /// absence of a writer thread that never ran.
+    const FILLER: &[u8] = b"filler\n";
+
+    let d = TestDaemon::start("dropguard").await;
+    let (s, pty) = d.mock_session();
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    await_waiter(&d, &s.id, "the call whose arm is about to be cancelled").await;
+    let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    // The writer parks inside `write` and drains nothing from here on.
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        pty.on_write(move || {
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+    }
+
+    // One write to get the writer thread into the hook, and its permit is
+    // back the moment it is received — so what follows fills the queue
+    // from empty and stops at exactly its bound.
+    let queue = s.write_queue();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let (first, _first_ack) = WriteRequest::input(FILLER.to_vec());
+    queue
+        .send(first)
+        .await
+        .expect("the write queue accepts the first write");
+    while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the writer thread never entered `write`, so nothing is holding the queue"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut acks = Vec::new();
+    loop {
+        let (req, ack) = WriteRequest::input(FILLER.to_vec());
+        match queue.try_send(req) {
+            Ok(()) => {
+                acks.push(ack);
+                assert!(
+                    acks.len() <= WRITE_QUEUE_FRAMES,
+                    "the queue took more than §4.3's bound without filling, so the writer \
+                     is draining it and this arrangement is not the one C-1 is about"
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+            Err(e) => panic!("the write queue closed under the fixture: {e}"),
+        }
+    }
+    assert_eq!(
+        acks.len(),
+        WRITE_QUEUE_FRAMES,
+        "the queue filled somewhere other than its declared bound"
+    );
+
+    // The submission. The arm takes the slot, zeroes the frame body,
+    // builds the guard — and parks on a queue with no room.
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id: request_id.clone(),
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while d
+        .daemon
+        .server
+        .attach_hub()
+        .secrets()
+        .outstanding(&s.id)
+        .is_some()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the submission never reached the arm, so no request was ever taken"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        queue.capacity(),
+        0,
+        "the queue drained, so the arm is not parked on the `send` and this row is \
+         measuring some other cancellation"
+    );
+
+    // End the connection **without touching the session**: nothing drains
+    // this client any more, and §4.3's forwarder gives up on a queue it
+    // cannot put a frame into. The output is what makes it try.
+    let t0 = std::time::Instant::now();
+    drop(c);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !d.daemon.server.attach_hub().clients_of(&s.id).is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the connection never ended, so the read loop was never dropped"
+        );
+        pty.queue_output(b"........");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        s.is_alive(),
+        "the session died under the fixture, so `session_died` and `user_cancelled` are \
+         no longer distinguishable and the assertion below would not mean what it says"
+    );
+
+    let payload = joined(call, "the call whose arm was cancelled on the FIFO").await;
+    let elapsed = t0.elapsed();
+    assert_eq!(
+        cancelled_reason(&payload),
+        "user_cancelled",
+        "the read loop was dropped with the request already taken out of the slot; \
+         `SecretAnswer::drop` is the only thing that can answer that call, and a \
+         `timeout` here is the four-consequence defect C-1 is about: {payload}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the call sat out its own window instead of being answered where the drop \
+         happened, which is the same defect wearing the right reason: {elapsed:?}"
+    );
+
+    // Let the writer go and drain the queue. What comes out of it is the
+    // filler and only the filler: a `send` future dropped before it
+    // completes delivers nothing, which is the fact `Drop`'s "nothing was
+    // written" classification rests on.
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while queue.capacity() < WRITE_QUEUE_FRAMES {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the write queue never drained after the writer was released"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let written = pty.written();
+    assert!(
+        contains(&written, FILLER),
+        "the writer thread never wrote anything, so the absence below is not evidence \
+         of anything"
+    );
+    assert!(
+        !contains(&written, PROBE.as_bytes()),
+        "the cancelled `send` delivered the credential to the child after all, and the \
+         call was told it was cancelled"
     );
 }
 

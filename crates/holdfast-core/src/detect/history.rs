@@ -372,11 +372,6 @@ mod tests {
         assert!(e[0].output_end_cursor.is_some());
     }
 
-    /// The paired arm, and the reason the one above cannot be satisfied by
-    /// refusing every command: a capture the scanner saw whole still
-    /// carries its own text, and a *complete* secret in one still comes
-    /// back as its own kind — which is the more useful of the two true
-    /// things §9.2 can say.
     /// **The false-positive direction, which the debt shipped without.**
     ///
     /// 0.0.7 cleared the debt when *"the repaint wrote back at least as
@@ -433,6 +428,19 @@ mod tests {
         }
     }
 
+    /// The paired arm, and the reason
+    /// `a_secret_whose_anchor_the_redraw_discarded_never_reaches_the_command_field`
+    /// cannot be satisfied by refusing every command: a capture the
+    /// scanner saw whole still carries its own text, and a *complete*
+    /// secret in one still comes back as its own kind — which is the more
+    /// useful of the two true things §9.2 can say.
+    ///
+    /// **The cross-reference is by name and not by "the one above",**
+    /// because this doc has already been separated from its function once:
+    /// `2f47381` inserted a new test between the two, so the paragraph
+    /// headed a row it was not written for and this one was left with no
+    /// doc at all. A relative reference is a claim about line order, and
+    /// line order is exactly what an insertion changes.
     #[test]
     fn a_capture_the_scanner_saw_whole_keeps_its_text_and_its_own_redaction() {
         let h = replay(

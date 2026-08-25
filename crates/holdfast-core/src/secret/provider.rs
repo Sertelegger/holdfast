@@ -643,8 +643,21 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
         // So the join is moved off this thread rather than dropped: two
         // detached threads that wait for the readers and zero what they
         // produced. The bound this path exists to keep is unaffected —
-        // nothing here waits on them — and a reader that never finishes
-        // costs the same parked thread it already costs today.
+        // nothing here waits on them.
+        //
+        // **The cost is stated exactly, because it is not free.** A reader
+        // that never finishes used to park one thread; it now parks
+        // **two**, that reader plus the joiner waiting on it, since before
+        // this change the `JoinHandle` was simply dropped and no second
+        // thread existed. Two per hung provider call, bounded by nothing
+        // in this function — the same unboundedness the un-joined version
+        // had, doubled. And `join().unwrap_or_default()` means a reader
+        // thread that *panicked* hands back an empty `Vec`: its own buffer
+        // went with the unwind and is zeroed by nobody. Both are accepted
+        // here rather than glossed — a `read_to_end` into a `Vec<u8>` has
+        // no panicking path short of an allocation failure, and the
+        // alternative to the second thread is the unbounded wait this
+        // whole path exists to avoid.
         for reader in [out_reader, err_reader] {
             std::thread::spawn(move || {
                 let mut buf = reader.join().unwrap_or_default();

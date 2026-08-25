@@ -396,3 +396,234 @@ fn secret_bytes_still_zeroes_itself_in_drop() {
          or not anything derives Clone — a crate that does not compile, not a guard"
     );
 }
+
+/// C-1's third consequence: `read_loop`'s `SecretInput` arm zeroes the
+/// frame body **before** its first await, so a cancellation cannot skip it.
+///
+/// **Here because the buffer is a local of a future nothing else can
+/// reach.** `body` is the decoded frame, re-created per iteration and
+/// dropped with the loop; there is no vantage point on it from an
+/// integration target, from another task, or from the type system. Moving
+/// `zero_bytes(&mut body)` back past `write_queue().send(write).await` is
+/// **workspace-green** — measured — which is what leaves this consequence
+/// undriven while the other three have rows.
+///
+/// What the siting is worth: `read_loop` is the last branch of `run`'s
+/// `biased` `select!`, so it is dropped where it stands whenever a
+/// shutdown fires or the output forwarder returns. A `zero_bytes` past the
+/// await is a `zero_bytes` a cancellation skips, and what it skips is a
+/// full cleartext copy of the credential in a `Vec` whose ordinary `Drop`
+/// does not zero.
+///
+/// **Two facts, not one.** That the call is there at all, and that it is
+/// *before* the await — the second is the whole finding, and a scan that
+/// only looked for the call would pass against the defect.
+///
+/// **Code lines only**, for the reason the scans above give: the arm's own
+/// comment explains the siting in prose and names both the call and the
+/// await point, so a scanner that read comments would match the
+/// explanation and pass against a tree that had lost the line.
+#[test]
+fn the_secret_frame_body_is_zeroed_before_the_arm_can_be_cancelled() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let text = std::fs::read_to_string(src.join("attach/conn.rs")).expect("read attach/conn.rs");
+
+    let arm = text
+        .split_once("ClientDecode::Frame(ClientFrame::SecretInput { request_id, bytes }) => {")
+        .expect("`read_loop` no longer has a SecretInput arm at all")
+        .1;
+    // **The submitting branch only.** The over-cap branch above it and the
+    // superseded branch below it each zero their own body, and neither
+    // holds a taken request across an await — so neither is the case this
+    // guard is about, and including them would let one of their
+    // `zero_bytes` calls stand in for the one that matters.
+    let submit = arm
+        .split_once("Some(raised) => {")
+        .expect("the SecretInput arm no longer has a branch that accepts a submission")
+        .1;
+    let submit = submit
+        .split_once("None => {")
+        .expect("the submitting branch no longer ends where the superseded branch begins")
+        .0;
+
+    let code: Vec<&str> = submit
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("//"))
+        .collect();
+
+    // The detector's own control, both directions — the filter must keep
+    // statements and drop prose, or every assertion below is satisfied by
+    // a stripper that returned nothing.
+    assert!(
+        code.iter()
+            .any(|l| l.starts_with("let answer = SecretAnswer::new(")),
+        "the code-line filter dropped a statement, so nothing below is being checked"
+    );
+    assert!(
+        !code.iter().any(|l| l.starts_with("//")),
+        "the code-line filter kept comment lines, so the prose explaining the siting \
+         counts as code"
+    );
+
+    let zeroed = code
+        .iter()
+        .position(|l| l.contains("zero_bytes(&mut body)"))
+        .expect(
+            "the submitting branch no longer zeroes the frame body at all; the decoded \
+             cleartext is left in a buffer the next frame reuses",
+        );
+    let first_await = code.iter().position(|l| l.contains(".await")).expect(
+        "the submitting branch has no await left in it, so there is no cancellation \
+         point and this guard is guarding nothing",
+    );
+    assert!(
+        zeroed < first_await,
+        "`zero_bytes(&mut body)` is sited past the arm's first await, so a `read_loop` \
+         dropped there — a `daemon/stop`, a SIGTERM, a dead client socket — skips it \
+         and leaves a full cleartext copy of the credential behind:\n{:?}",
+        &code[zeroed.min(first_await)..=zeroed.max(first_await)]
+    );
+
+    // And the await it is before is the FIFO `send`. `SecretAnswer::drop`
+    // reasons from *"the only await this guard is held across before the
+    // hand-off is the FIFO `send`, and a cancelled `send` delivers
+    // nothing"* — which is what licenses its "nothing was written"
+    // classification. A new await inserted ahead of the send would leave
+    // that sentence untrue with nothing going red.
+    assert!(
+        code[first_await].contains("write_queue().send(write).await"),
+        "the arm's first await is no longer the FIFO enqueue, so `SecretAnswer::drop`'s \
+         \"nothing was written\" no longer follows from where the cancellation happened: \
+         {:?}",
+        code[first_await]
+    );
+}
+
+/// F-2's two sites that no runtime row can reach: the provider's pipe
+/// buffers are sized once, and the timeout path zeroes what its readers
+/// produced rather than detaching them.
+///
+/// **Here because the fix wave's own argument for leaving these undriven
+/// stops one option short.** Its behavioural half is right — `drop_witness`
+/// is thread-local by design so it cannot see a detached joiner's buffer,
+/// and a process-wide counter shared across parallel tests is a row that
+/// fails under load, which is worse than no row. But the dichotomy it then
+/// offers ("a load-sensitive row, or nothing") omits this file, the tree's
+/// own idiom for a guarantee that is invisible from inside the program —
+/// and the same wave reached for it one commit later, to pin the
+/// `NotClone` impls. A source scan is load-insensitive.
+///
+/// What the two sites are worth. `read_to_end` on an empty `Vec` grows by
+/// doubling, and every doubling copies the credential read so far into a
+/// new block and frees the old one **without zeroing it**: one un-zeroed
+/// copy per reallocation, in memory nothing in this process can reach
+/// again. And on the timeout path `drop(out_reader); drop(err_reader);`
+/// detaches two threads that may be holding a *complete* credential — a
+/// provider that answered a millisecond after the deadline — and leaves it
+/// to an ordinary `Vec::drop`, which does not zero.
+///
+/// **Code lines only, and paired with what must be present**, for the
+/// reason the scans above give: this module discusses `Vec::new` and the
+/// `drop` it replaced in its own prose, and an absence assertion over a
+/// file that lost everything is not evidence of anything.
+#[test]
+fn the_providers_credential_buffers_are_sized_once_and_zeroed_on_the_timeout_path() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let text =
+        std::fs::read_to_string(src.join("secret/provider.rs")).expect("read secret/provider.rs");
+    let code: Vec<&str> = text
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("//"))
+        .collect();
+
+    // The detector's own control, both directions.
+    assert!(
+        code.iter()
+            .any(|l| l.starts_with("const PROVIDER_READ_CAPACITY: usize =")),
+        "the code-line filter dropped a declaration, so nothing below is being checked"
+    );
+    assert!(
+        !code.iter().any(|l| l.starts_with("//")),
+        "the code-line filter kept comment lines, so this module's prose about `Vec::new` \
+         and about the `drop` it replaced counts as code"
+    );
+
+    // ------------------------------------ 1. both readers size, then fill
+    //
+    // Asserted as *adjacency* rather than as two counts: a file with one
+    // `with_capacity` and two `read_to_end`s satisfies "there are two of
+    // each" and still has a doubling reader in it.
+    let reads: Vec<usize> = code
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("read_to_end(&mut buf)"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        reads.len(),
+        2,
+        "the provider no longer has exactly two `read_to_end` pipe readers, so the \
+         pairing below is not checking what it was written for: {reads:?}"
+    );
+    for i in reads {
+        assert_eq!(
+            code[i - 1],
+            "let mut buf = Vec::with_capacity(capacity);",
+            "a pipe reader fills a buffer it did not size, so `read_to_end` grows it by \
+             doubling and every doubling frees an un-zeroed copy of the credential:\n{:?}",
+            &code[i - 1..=i]
+        );
+    }
+    assert!(
+        code.iter()
+            .any(|l| l.starts_with("let capacity = PROVIDER_READ_CAPACITY;")),
+        "the readers' capacity is no longer `PROVIDER_READ_CAPACITY`; the size is the \
+         whole of the guarantee, and a smaller one is a doubling reader with extra steps"
+    );
+
+    // ------------------- 2. the timeout path zeroes rather than detaches
+    let timeout = text
+        .split_once("let Some(status) = exited else {")
+        .expect("the provider no longer has a timeout branch at all")
+        .1;
+    let timeout = timeout
+        .split_once("return Err(ProviderError::TimedOut {")
+        .expect("the timeout branch no longer ends in a `TimedOut` error")
+        .0;
+    let tcode: Vec<&str> = timeout
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("//"))
+        .collect();
+
+    // The anti-vacuity pairing, and it is what makes the absence below
+    // mean something: this really is rule 5's kill-and-reap branch, and it
+    // really does still name both readers.
+    assert!(
+        tcode.iter().any(|l| l.starts_with("kill_group(&child);")),
+        "the region scanned is not the timeout branch any more: {tcode:?}"
+    );
+    assert!(
+        tcode
+            .iter()
+            .any(|l| l.contains("for reader in [out_reader, err_reader]")),
+        "the timeout path no longer disposes of both readers by name, so a later edit \
+         that dropped one of them would be invisible here: {tcode:?}"
+    );
+    assert!(
+        tcode.iter().any(|l| l.contains("reader.join()"))
+            && tcode.iter().any(|l| l.contains("zero_bytes(&mut buf)")),
+        "the timeout path no longer waits for its readers and zeroes what they read; a \
+         provider that answered a millisecond late leaves a complete credential to an \
+         ordinary `Vec::drop`, which does not zero: {tcode:?}"
+    );
+    assert!(
+        !tcode
+            .iter()
+            .any(|l| l.contains("drop(out_reader)") || l.contains("drop(err_reader)")),
+        "the timeout path detaches its readers again — F-2's fourth site, re-entering: \
+         {tcode:?}"
+    );
+}
