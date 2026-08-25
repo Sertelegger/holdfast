@@ -717,53 +717,30 @@ fn every_tool_declares_the_annotations_5_3_assigns_it() {
 /// `unavailable` did make this go red. A variant added to the *emitting*
 /// side was invisible.
 ///
+/// **The walk itself moved into `mcp::envelope`** as `Status::all()`, and
+/// this is now a one-line delegation. It used to be a second copy of the
+/// same `successor` chain, living in a test crate — which is how the
+/// *other* consumer of that enumeration,
+/// `envelope::tests::the_wire_status_table_agrees_with_the_status_enum`,
+/// came to be a hand-written array of eight that 0.0.7's three new
+/// variants never reached. One enumeration, in the file that owns the
+/// enum, is what stops the next hand repeating it.
+///
 /// `successor` is a walk over every variant rather than a `match` beside a
 /// list, because a `match` beside a list can be satisfied by adding an arm
 /// and forgetting the list — which is the same hole one level in. Here the
-/// walk **is** the list: adding a variant to `envelope::Status` makes this
-/// `match` non-exhaustive and this file stops compiling, and the arm the
-/// compiler then demands can only be written by linking the new variant
-/// into the chain.
+/// walk **is** the list: adding a variant to `envelope::Status` makes that
+/// `match` non-exhaustive and `holdfast-core` stops compiling, and the arm
+/// the compiler then demands can only be written by linking the new
+/// variant into the chain.
 ///
 /// Residual, stated so it is not mistaken for airtightness: a *deliberate*
 /// dead-end arm (`Cancelled => None` while `Unavailable => None` stays) is
 /// unreachable and would not be walked. Nothing short of reflection closes
-/// that, and the `assert!(!seen.contains(..))` below at least makes a
+/// that, and the revisit assertion inside `all()` at least makes a
 /// mis-linked chain fail loudly rather than loop.
 fn every_envelope_status() -> Vec<envelope::Status> {
-    use envelope::Status as S;
-
-    fn successor(s: S) -> Option<S> {
-        match s {
-            S::Ok => Some(S::Timeout),
-            S::Timeout => Some(S::SessionDied),
-            // §18.1's order, and these are *insertions*: the three 0.0.7
-            // variants land at their catalogued positions rather than at
-            // the end of the chain. `Unavailable => None` not moving is
-            // the visible difference between splicing and appending.
-            S::SessionDied => Some(S::SecretProvided),
-            S::SecretProvided => Some(S::SecretCancelled),
-            S::SecretCancelled => Some(S::SessionNotFound),
-            S::SessionNotFound => Some(S::NameTaken),
-            S::NameTaken => Some(S::LimitReached),
-            S::LimitReached => Some(S::SpawnFailed),
-            S::SpawnFailed => Some(S::NotSupportedOnPlatform),
-            S::NotSupportedOnPlatform => Some(S::Unavailable),
-            S::Unavailable => None,
-        }
-    }
-
-    let mut walk = vec![S::Ok];
-    while let Some(next) = successor(*walk.last().expect("the walk starts non-empty")) {
-        assert!(
-            !walk.contains(&next),
-            "the status walk revisits {:?}; the chain in `successor` is \
-             mis-linked and is not enumerating every variant",
-            next.as_str()
-        );
-        walk.push(next);
-    }
-    walk
+    envelope::Status::all()
 }
 
 #[test]

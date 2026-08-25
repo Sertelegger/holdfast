@@ -50,6 +50,68 @@ impl Status {
         }
     }
 
+    /// Every variant, in §18.1's catalogue order.
+    ///
+    /// **A walk over the enum, not a list beside it.** A list beside it
+    /// can be satisfied by adding a variant and forgetting the list, and
+    /// that is precisely what happened: 0.0.7 added `SecretProvided`,
+    /// `SecretCancelled` and `NotSupportedOnPlatform` and left
+    /// `the_wire_status_table_agrees_with_the_status_enum`'s hand-written
+    /// array at the pre-0.0.7 eight, so the three newest statuses — the
+    /// ones a hand-kept table forgets, which is the argument that array's
+    /// own comment makes for including `Timeout` and `Unavailable` — were
+    /// the three it did not check. Sixth of the six places the milestone's
+    /// Definition of done named, and the only one that was missed.
+    ///
+    /// `successor` is an **exhaustive match**, so a variant added to this
+    /// enum stops *this file* compiling, and the arm the compiler then
+    /// demands can only be written by linking the new variant into the
+    /// chain. That is a red build at the moment the variant lands rather
+    /// than a red test whenever somebody next runs the suite.
+    ///
+    /// Residual, stated so it is not mistaken for airtightness: a
+    /// *deliberate* dead-end arm (`Foo => None` while `Unavailable => None`
+    /// stays) is unreachable and would not be walked. Nothing short of
+    /// reflection closes that; the revisit assertion below at least makes
+    /// a mis-linked chain fail loudly rather than loop.
+    ///
+    /// This is the single enumeration: `tests/schema.rs` walked its own
+    /// copy of the same chain and now reads this one.
+    pub fn all() -> Vec<Self> {
+        fn successor(s: Status) -> Option<Status> {
+            match s {
+                Status::Ok => Some(Status::Timeout),
+                Status::Timeout => Some(Status::SessionDied),
+                // §18.1's order, and these are *insertions*: the three
+                // 0.0.7 variants land at their catalogued positions rather
+                // than at the end of the chain. `Unavailable => None` not
+                // moving is the visible difference between splicing and
+                // appending.
+                Status::SessionDied => Some(Status::SecretProvided),
+                Status::SecretProvided => Some(Status::SecretCancelled),
+                Status::SecretCancelled => Some(Status::SessionNotFound),
+                Status::SessionNotFound => Some(Status::NameTaken),
+                Status::NameTaken => Some(Status::LimitReached),
+                Status::LimitReached => Some(Status::SpawnFailed),
+                Status::SpawnFailed => Some(Status::NotSupportedOnPlatform),
+                Status::NotSupportedOnPlatform => Some(Status::Unavailable),
+                Status::Unavailable => None,
+            }
+        }
+
+        let mut walk = vec![Status::Ok];
+        while let Some(next) = successor(*walk.last().expect("the walk starts non-empty")) {
+            assert!(
+                !walk.contains(&next),
+                "the status walk revisits {}; the chain in `successor` is \
+                 mis-linked and is not enumerating every variant",
+                next.as_str()
+            );
+            walk.push(next);
+        }
+        walk
+    }
+
     /// Whether this status should surface as an MCP tool error.
     ///
     /// `Timeout` is deliberately absent: §18.1 lists it with
@@ -361,16 +423,16 @@ mod tests {
         // (`get_command_history` returns it), and it is the second
         // `isError: false` row — so it is exactly as easy to lose as
         // `Timeout` and belongs in this loop for the same reason.
-        for s in [
-            Status::Ok,
-            Status::Timeout,
-            Status::SessionDied,
-            Status::SessionNotFound,
-            Status::NameTaken,
-            Status::LimitReached,
-            Status::SpawnFailed,
-            Status::Unavailable,
-        ] {
+        //
+        // **Driven from `Status::all()` rather than from a literal**, and
+        // that is this row's own history: it was a hand-written array of
+        // eight, 0.0.7 inserted three variants at their §18.1 positions,
+        // and the array was the one of the six named places that did not
+        // move. Adding three names to it would have left the next hand
+        // free to repeat exactly that. `all()` is an exhaustive-match
+        // walk, so a twelfth variant stops the crate compiling until it is
+        // linked in, and this loop grows with it.
+        for s in Status::all() {
             assert_eq!(
                 status_is_error(s.as_str()),
                 s.is_error(),
