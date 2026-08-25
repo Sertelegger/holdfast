@@ -363,4 +363,36 @@ fn secret_bytes_still_zeroes_itself_in_drop() {
          build whether or not anything derives Serialize — a crate that does not \
          compile, not a guard"
     );
+
+    // ------------------------------------------------- the `Clone` half
+    //
+    // **0.0.7 added the `NotClone` guard and not its pin**, and the
+    // omission was found the only way it can be: by deleting both impls
+    // and watching `cargo test --workspace` stay green while
+    // `#[derive(Clone)] SecretBytes` became legal. `Clone` is the sharper
+    // of the two for this milestone — the type gained three producers
+    // (provider, binding, autofill), and a second live copy is a second
+    // `Drop` with no write to account for it.
+    //
+    // Two assertions and not one, for the same reason as the pair above.
+    // The `const _` pin in `attach/secret.rs` already makes deleting
+    // either impl a **compile** error; what a trait bound cannot see is
+    // the blanket impl being widened to the unbounded form while the
+    // `SecretBytes` impl goes away with it — both bounds still hold and
+    // the guard is gone. That is what this half is here for.
+    assert!(
+        text.contains("impl<T: Clone> NotClone for T {}"),
+        "the conflicting-impl guard against `#[derive(Clone)] SecretBytes` is gone; \
+         §9.6's one-owner-one-write-one-drop is back to being a comment"
+    );
+    let unbounded_clone = text
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("//"))
+        .any(|l| l.contains("impl<T> NotClone for T {}"));
+    assert!(
+        !unbounded_clone,
+        "the guard lost its `Clone` bound, which makes it fire on every build whether \
+         or not anything derives Clone — a crate that does not compile, not a guard"
+    );
 }

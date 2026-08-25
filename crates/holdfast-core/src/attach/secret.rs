@@ -287,6 +287,45 @@ mod secret_is_not_serializable {
     // `Clone: Sized`, so a `T: Clone` bound already implies `T: Sized`.
     impl<T: Clone> NotClone for T {}
     impl NotClone for SecretBytes {}
+    // ------------------------------------------- the guard for the guard
+    //
+    // **A guard that fires only when somebody writes the mistake is
+    // invisible to a suite that nobody writes the mistake in**, and both
+    // impls above could be deleted with the whole workspace staying
+    // green: `#[derive(Clone)]` on `SecretBytes` would then compile, and
+    // the review that found this deleted them to prove it.
+    // `NotSerialize`'s half has been pinned since 0.0.6 —
+    // `source_guards::secret_bytes_still_zeroes_itself_in_drop` reads the
+    // text of this file — and 0.0.7 added the `Clone` half without adding
+    // its pin.
+    //
+    // This is the compile-time half, and it needs no dependency
+    // (`trybuild` is out under the Tech Stack, which is why the
+    // `E0119` observations for this module are a manual procedure
+    // recorded in a commit message rather than a `#[test]`). A generic
+    // function body is type-checked at its *definition*, so both bounds
+    // below have to be provable from what is in scope:
+    //
+    //   * `SecretBytes: NotClone` — deleting `impl NotClone for
+    //     SecretBytes {}` stops this compiling;
+    //   * `T: Clone` implies `T: NotClone` — deleting the blanket impl,
+    //     or narrowing its bound (to `Copy`, say), stops this compiling.
+    //
+    // What it cannot see is the blanket impl being *widened* to the
+    // unbounded `impl<T> NotClone for T {}` with the `SecretBytes` impl
+    // deleted alongside it — that form satisfies both bounds and guards
+    // nothing. `source_guards` carries that half, as a scan for the
+    // unbounded spelling, exactly as it already does for `NotSerialize`.
+    const _: () = {
+        #[allow(dead_code)]
+        fn is_not_clone<T: NotClone + ?Sized>() {}
+
+        #[allow(dead_code)]
+        fn pin<T: Clone>() {
+            is_not_clone::<SecretBytes>();
+            is_not_clone::<T>();
+        }
+    };
 }
 
 /// The one outstanding secret request on a session (§5.2: *"fixed at 1
