@@ -1436,8 +1436,21 @@ fn line_discipline_tracks_the_slaves_line_discipline() {
     );
 
     pty.write(b"sleep 3\n").unwrap();
+    // **Drain the echo before polling, or the shell never runs the line.**
+    // macOS gives a pty a far smaller output buffer than Linux does, and
+    // a session nobody reads from fills it: the shell then blocks part
+    // way through echoing the command it was handed, never reaches the
+    // fork, and the property under test never changes — for a reason
+    // that has nothing to do with the property. Reading the echo back
+    // unblocks the shell and doubles as proof the line was accepted.
+    // Inert on Linux, where the buffer swallows a whole session's chatter.
+    read_until(&pty, "sleep 3", Duration::from_secs(5));
     assert_eq!(
-        poll_line_discipline(&pty, Some(true), Duration::from_secs(5)),
+        draining(&pty, || poll_line_discipline(
+            &pty,
+            Some(true),
+            Duration::from_secs(5)
+        )),
         LineDiscipline {
             echo: Some(true),
             canonical: Some(true),
@@ -1542,6 +1555,43 @@ fn line_discipline_separates_a_line_editor_from_a_secret_prompt() {
 }
 
 /// Poll `foreground_group` until `pred` holds, then return the last value.
+/// Run `body` while the master is drained continuously.
+///
+/// **Required on macOS, inert on Linux, and not optional where it is
+/// used.** macOS gives a pty a far smaller output buffer than Linux
+/// does, and a session nobody reads from fills it — at which point the
+/// shell blocks part way through echoing the line it was handed, never
+/// reaches the fork, and whatever property is being polled for never
+/// changes. The failure looks exactly like the property being broken,
+/// which is what made it worth a named helper rather than a stray read:
+/// three tests here polled an undrained session and reported macOS
+/// defects that were entirely their own.
+///
+/// One read is not enough — the buffer refills from the shell's own
+/// prompt chatter — so this drains for as long as `body` runs. The
+/// trailing newline is how the reader is retired: it is parked in
+/// `read`, which returns for bytes or EOF and nothing else, so it is
+/// given bytes.
+fn draining<T>(pty: &InProcessPty, body: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut buf = [0u8; 4096];
+            while !stop.load(Ordering::Relaxed) {
+                match pty.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let out = body();
+        stop.store(true, Ordering::Relaxed);
+        let _ = pty.write(b"\n");
+        out
+    })
+}
+
 fn poll_foreground(
     pty: &dyn PtyBackend,
     mut pred: impl FnMut(Option<i32>) -> bool,
@@ -1565,7 +1615,18 @@ fn the_foreground_group_changes_for_an_external_command_and_not_for_a_builtin() 
     let at_prompt = poll_foreground(&pty, |g| g.is_some(), Duration::from_secs(5));
     assert!(at_prompt.is_some(), "the shell never took the terminal");
     pty.write(b"sleep 3\n").unwrap();
-    let running = poll_foreground(&pty, |g| g != at_prompt, Duration::from_secs(5));
+    // **Drain the echo before polling, or the shell never runs the line.**
+    // macOS gives a pty a far smaller output buffer than Linux does, and
+    // a session nobody reads from fills it: the shell then blocks part
+    // way through echoing the command it was handed, never reaches the
+    // fork, and the property under test never changes — for a reason
+    // that has nothing to do with the property. Reading the echo back
+    // unblocks the shell and doubles as proof the line was accepted.
+    // Inert on Linux, where the buffer swallows a whole session's chatter.
+    read_until(&pty, "sleep 3", Duration::from_secs(5));
+    let running = draining(&pty, || {
+        poll_foreground(&pty, |g| g != at_prompt, Duration::from_secs(5))
+    });
     assert_ne!(
         running, at_prompt,
         "an external command must get its own group"
