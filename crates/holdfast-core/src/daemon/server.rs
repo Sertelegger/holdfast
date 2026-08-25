@@ -3429,8 +3429,13 @@ mod tests {
     // workspace calls, so deleting the spawn — or any single statement
     // inside the loop — left the entire workspace green while disabling
     // the idle reaper (§16.7), REQ-R-006's exit half, §7.3's client-less
-    // exit and §19.1's retention sweep in production. These four rows
-    // are the actuation.
+    // exit and §19.1's retention sweep in production. These rows are the
+    // actuation, **one per statement in the loop body** — and that is the
+    // invariant rather than a count: 0.0.7 added a fifth statement
+    // (GH #24's slot sweep) without adding a fifth row, and commenting the
+    // new statement out left the whole workspace green. A statement added
+    // here without a row beside it is a feature that can be deleted
+    // silently.
 
     /// The spawn site itself, over a real socket.
     ///
@@ -3600,6 +3605,77 @@ mod tests {
             .expect("the resource-event channel closed");
         // §5.5.1's ruling survives the loop as well as the bare sweep.
         assert!(daemon.server.registry.get("sess_tickreap").is_ok());
+    }
+
+    /// **The fifth statement, and the one 0.0.7 added without extending
+    /// this set.**
+    ///
+    /// Commenting out `daemon.release_exited_secret_slots()` in
+    /// [`reaper_loop`] left the **whole workspace** green. GH #24's three
+    /// rows in `tests/attach_protocol.rs` call the sweep *themselves*, so
+    /// they assert the function and not that the daemon ever runs it —
+    /// verbatim the defect this module's header records against its own
+    /// history, one milestone later. Two independent reviewers found it.
+    ///
+    /// **The raise is made after the loop's first pass, on purpose.** The
+    /// loop sweeps once on entry, so a slot raised beforehand would be
+    /// released by that pass and the row would be green with the *tick*
+    /// deleted. Here the loop is already parked on
+    /// `wait_for_next_tick()` — a manual hand, so it cannot proceed until
+    /// this test moves it — and the pre-advance assertion says so.
+    #[tokio::test]
+    async fn the_periodic_tick_releases_the_slot_of_a_session_that_died_holding_a_raise() {
+        let paths = scratch("tickslot");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        // `0` disables §7.3's exit, so the loop stays up long enough to
+        // take a second tick.
+        let daemon = Daemon::with_config_and_clock(paths, configured(0), clock.clone());
+
+        let s = mock_session_idle("sess_tickslot", &clock, 0);
+        daemon.server.registry.insert(Arc::clone(&s)).unwrap();
+
+        tokio::spawn(reaper_loop(Arc::clone(&daemon)));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // An echo drop nobody is waiting on — `raise`, not
+        // `raise_or_adopt`, so the slot has no waiter and is a third
+        // party's to take.
+        let hub = daemon.attach_hub();
+        let (request, first) = hub.secrets().raise(
+            "sess_tickslot",
+            "Password: ",
+            crate::secret::RaisedBy::EchoDrop,
+        );
+        assert!(first, "the fixture did not allocate the raise");
+        // …and the child dies with it outstanding.
+        s.signal(crate::pty::Signal::Kill).unwrap();
+        assert!(!s.is_alive(), "the fixture left the session alive");
+
+        // The premise: nothing has swept it yet, because the loop is
+        // parked on a hand that has not moved. Without this the row
+        // cannot tell "the tick released it" from "the entry pass did".
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            hub.secrets()
+                .outstanding("sess_tickslot")
+                .map(|r| r.request_id),
+            Some(request.request_id.clone()),
+            "something other than the tick released the slot"
+        );
+
+        clock.advance(crate::session::reaper::SCAN_INTERVAL + Duration::from_secs(1));
+        assert!(
+            yield_until(|| hub.secrets().outstanding("sess_tickslot").is_none()).await,
+            "the tick never ran GH #24's sweep: a session that died holding an \
+             unadopted raise pins its slot for the daemon's whole life, and every \
+             later call on that id answers concurrent_request_pending"
+        );
     }
 
     /// §19.1's periodic half, and the `AuditLog::reopen` inside it.
