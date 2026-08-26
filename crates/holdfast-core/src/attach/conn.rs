@@ -1251,7 +1251,9 @@ async fn forward_events(
                     raised.answer(crate::secret::Resolution::Cancelled(
                         crate::secret::CancelReason::UserCancelled,
                     ));
-                    broadcast_secret_closed(&daemon, &session_id, &id, "cancelled");
+                    daemon
+                        .attach_hub()
+                        .broadcast_secret_closed(&session_id, &id, "cancelled");
                 }
             }
             // **The exit is `forward_output`'s, not this task's**, and
@@ -1278,7 +1280,9 @@ async fn forward_events(
                     raised.answer(crate::secret::Resolution::SessionDied {
                         exit_code: Some(code),
                     });
-                    broadcast_secret_closed(&daemon, &session_id, &id, "cancelled");
+                    daemon
+                        .attach_hub()
+                        .broadcast_secret_closed(&session_id, &id, "cancelled");
                 }
             }
             // An edge is not a stream: a connection that fell behind has
@@ -1346,8 +1350,7 @@ impl SecretAnswer {
     fn settle(mut self, outcome: crate::secret::Resolution, wire_outcome: &str) {
         if let Some(raised) = self.raised.take() {
             raised.answer(outcome);
-            broadcast_secret_closed(
-                &self.daemon,
+            self.daemon.attach_hub().broadcast_secret_closed(
                 &self.session.id,
                 &self.request_id,
                 wire_outcome,
@@ -1374,30 +1377,11 @@ impl Drop for SecretAnswer {
             }
         };
         raised.answer(outcome);
-        broadcast_secret_closed(
-            &self.daemon,
+        self.daemon.attach_hub().broadcast_secret_closed(
             &self.session.id,
             &self.request_id,
             "cancelled",
         );
-    }
-}
-
-/// Tell every client on this session that the request is over.
-///
-/// `try_send`, like the output path: a client that stopped draining is on
-/// its way out, and a closure notice is not worth parking the sender.
-fn broadcast_secret_closed(
-    daemon: &Arc<Daemon>,
-    session_id: &str,
-    request_id: &str,
-    outcome: &str,
-) {
-    for c in daemon.attach_hub().clients_of(session_id) {
-        let _ = c.tx.try_send(ServerFrame::SecretRequestClosed {
-            request_id: request_id.to_string(),
-            outcome: outcome.to_string(),
-        });
     }
 }
 
