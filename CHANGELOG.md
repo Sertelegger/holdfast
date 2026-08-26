@@ -59,10 +59,10 @@ surfaces rather than redacted on them.
     a typo'd pattern was inert; it is now a load error, because a binding that
     never matches is indistinguishable from a credential store that is down.
   - A `[[security.secret_bindings]]` entry with no `match_example`, or one whose
-    `match_command` admits anything beyond it — including `^ssh\s+prod-01.*` and
-    `^.*ssh\s+prod-01$`, but not because either is *spelled* that way. See
-    **Security** below for the rule and for why this one is a refusal and not a
-    warning.
+    `match_command` admits anything beyond it — including `^ssh\s+prod-01.*`,
+    `^.*ssh\s+prod-01$` and `^ssh.*prod-01$`, but not because any of them is
+    *spelled* that way. See **Security** below for the rule and for why this one
+    is a refusal and not a warning.
 
   §10.2's published example is unaffected: it ships `autofill_on_echo_off =
   false` alongside `secret_provider = "prompt"`, which passes the new rule.
@@ -97,17 +97,25 @@ surfaces rather than redacted on them.
 
   `match_example` is the command line you are asserting the binding is for. At
   load the pattern — wrapped exactly as the matcher wraps it — must match that
-  example, and must **not** match it with any of nine hostile transformations
-  applied: six suffixes an agent appends (` -o ProxyCommand=nc 127.0.0.1 2222`,
-  ` -E /tmp/steal`, ` -tt cat`, `; evil`, ` && evil`, ` | evil`), two prefixes
-  that put a command of its own in front (`sh -c 'evil' `,
-  `env LD_PRELOAD=/tmp/x `), and one unrelated command line.
+  example, and must **not** match it under a corpus of hostile transformations:
+  an agent's argument **appended**, the same argument **spliced in at any of the
+  example's token boundaries**, a command of the agent's own put **in front**,
+  or an **unrelated** line entirely. The texts are capabilities rather than
+  punctuation — `-o ProxyCommand`, `-F` (an entire alternate `ssh_config`),
+  `-i`, `-E`, `-J`/`-W`/`-L`, `-e ^]`, `StrictHostKeyChecking=no`, `-S`, `--`,
+  `psql --set= -c '\! …'` and `COPY … FROM PROGRAM`, alongside the shell
+  operators that put a second command on one line.
 
   **Both ends, because the reflex has two spellings and the trailing one is only
   the more obvious.** `^.*ssh\s+prod-01$` is matched by a session whose command
   line is `sh -c "…read x; echo GOT $x; ssh prod-01"` — the agent's own program,
   reading the credential and echoing it, with `ssh` never reached at all. The
   prefix probes are what refuse it.
+
+  **And the middle, which is where an `ssh` command line actually takes its
+  options.** `^ssh.*prod-01$` pins both ends and admits
+  `ssh -o ProxyCommand=nc 127.0.0.1 2222 prod-01` — this issue's own
+  reproduction line. The insertion probes are what refuse it.
 
   **This replaced a syntactic scanner, and that is the change worth reading.**
   The first version of this check read the pattern's *text*, peeling anchors and
@@ -119,21 +127,37 @@ surfaces rather than redacted on them.
   with the regex engine as the oracle, refuses all twenty without naming any of
   them.
 
-  **A wildcard you scoped to one argument still loads.**
-  `^ssh\s+prod-01( -X.*)?$` matches its example, survives every probe, and is
-  accepted: that is an operator widening one argument deliberately, which is a
-  different act from appending `.*` because a session stopped matching. The
-  check is relative to the example, so the same pattern with
-  `match_example = "ssh prod-01 -X -v"` *is* refused.
+  **If some arguments really are optional, enumerate them.**
+  `^ssh\s+prod-01( -4| -6)?$` admits exactly the two lines it names. What the
+  refusal message used to recommend instead — `^ssh\s+prod-01( -X.*)?$`, "a
+  wildcard scoped to one argument" — is **refused now**, and it should never
+  have been suggested: `( -X.*)?` is not one argument, it is a two-character
+  gate in front of an unbounded tail, and it admits
+  `ssh prod-01 -X -o ProxyCommand=nc 127.0.0.1 2222`. The guard was handing its
+  own bypass to every operator it refused.
 
-  **Operators upgrading from the first cut must add `match_example`, and two
-  previously-accepted patterns now fail.** `[^\x00]*` and `[^q]*` were accepted
-  as escape hatches on the reasoning that a negated class says something
-  specific about what an operator will not admit. `ssh prod-01; evil` contains
-  neither a NUL nor a `q`, so both are now refused. Use the scoped-wildcard form
-  above instead. **`^ssh.*prod-01$` — an open end that is not at an end — is
-  still accepted**, because no probe can reach the middle of a line whose two
-  ends the pattern pins.
+  **Operators upgrading must add `match_example`, and six previously-accepted
+  patterns now fail.** `[^\x00]*` and `[^q]*` went first: they were accepted as
+  escape hatches on the reasoning that a negated class says something specific
+  about what an operator will not admit, and `ssh prod-01; evil` contains
+  neither a NUL nor a `q`. Four more go with this release —
+  `^ssh\s+prod-01( -X.*)?$` and `^psql\s+-h\s+prod( --set=.*)?$` (above),
+  `^ssh.*prod-01$` (the open middle), and `^ssh\s+(a|.*x)$`, whose `.*x` admits
+  any line ending in `x` and therefore `ssh a -oProxyCommand=/tmp/x` — the
+  space-free spelling of the same attack. Write the arguments out, name several
+  programs with an alternation, or enumerate the optional ones.
+
+  **What the corpus is, and what it is not.** It is a finite sample of the
+  question "what does this pattern admit". A pattern can always be tailored to
+  reject a known probe set and admit everything else — gate a `.*` behind a flag
+  no probe happens to use. Widening the corpus, as this release does, raises the
+  cost of finding such a gate; **it does not remove it, and no version of this
+  check removes it.** The previous release said the opposite about the open
+  middle — "no probe can reach the middle of a line whose two ends the pattern
+  pins" — and that sentence is how `^ssh.*prod-01$` stayed accepted for a
+  release while admitting the reproduction line. What removes the question is
+  **GH #46**, operator-declared session profiles: the agent fills slots and
+  never authors a command line, so there is no language to approximate.
 
 - **`match_prompt` is documented as what it is: an operator convenience, not a
   security control.** No behaviour changed and none needed to; what changed is
