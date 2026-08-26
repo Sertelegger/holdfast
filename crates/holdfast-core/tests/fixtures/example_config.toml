@@ -103,53 +103,72 @@ autofill_on_echo_off = false
 # is four lines of preamble and carries neither).
 strict_confirmation = false
 
-# Operator-configured secret bindings (§9.6). The agent supplies only
-# the session id and the prompt text -- it cannot name a secret. What
-# stops a "fetch me an arbitrary credential" API is that selection runs
-# off the session's own command line against match_command, which
-# match_example then bounds. match_prompt is an operator convenience and
-# carries none of that weight: it can only narrow a selection
-# match_command already made, and the agent chooses the child and
-# therefore the prompt. Do not read the two keys as a pair of gates.
+# Operator-declared session profiles (§9.6, rev. 55). THE OPERATOR
+# WRITES THE COMMAND LINE; the agent supplies values into named slots and
+# never writes a command line at all. A session started with
+# `command`/`args` can never receive a keychain credential -- that is the
+# safety property, and it is also a real capability loss: an agent can
+# only run credentialed sessions the operator anticipated.
 #
-# This array-of-tables is LAST in [security] deliberately. Uncommenting
-# it opens a sub-table, and every bare key that followed would belong to
-# that sub-table instead of to [security]. strict_confirmation used to
-# sit below it: an operator who uncommented the example and set it true
-# got security.secret_bindings[0].strict_confirmation -- valid TOML, a
-# daemon not in strict mode, and no error at any layer.
+# These two array-of-tables are LAST in [security] deliberately.
+# Uncommenting either opens a sub-table, and every bare key that followed
+# would belong to that sub-table instead of to [security].
+# strict_confirmation used to sit below them: an operator who
+# uncommented the example and set it true got
+# security.secret_bindings[0].strict_confirmation -- valid TOML, a daemon
+# not in strict mode, and no error at any layer.
+# [[security.profiles]]
+# `name` is the override key: start_session(profile:) names it and a
+# binding attaches to it. Unique; a binding naming an unknown one is a
+# load error.
+# name    = "prod-ssh"
+# `program` is a LITERAL and admits no {...}. A slot here would let the
+# agent choose the binary, which is the one choice no pattern over an
+# argument can bound. Refused at load, with the message naming the key.
+# program = "ssh"
+# The argument template. `{name}` is a slot; `{{` and `}}` are literal
+# braces. SUBSTITUTION HAPPENS WITHIN ONE ARGV ELEMENT: args is an array,
+# so a value containing a space, a quote, a `;` or a leading `-` stays one
+# argument and can never become a second one. Nothing here joins or
+# re-splits.
+# args    = ["{user}@{host}"]
+#
+# Every slot in `args` needs an entry here and every entry needs a slot;
+# both directions are load errors, because a slot with no pattern is
+# unguarded and a pattern with no slot is a typo. Each pattern is matched
+# against the agent's value WHOLE, wrapped \A(?:...)\z -- the same
+# function at load and at render, so the two cannot disagree.
+#   [security.profiles.vars]
+#   user = "^[a-z][a-z0-9_-]{0,30}$"
+#   host = "^prod-0[12]$"
+
+# Operator-configured secret bindings (§9.6). The agent supplies only
+# the session id and the prompt text -- it cannot name a secret, and
+# since rev. 55 it cannot author the command line a binding attaches to
+# either. A binding names a PROFILE. match_prompt is an operator
+# convenience and carries none of that weight: it can only narrow a
+# selection the profile already made, and the agent chooses the child and
+# therefore the prompt. Do not read the two keys as a pair of gates.
 # [[security.secret_bindings]]
 # `name` is the override key and the only part of a binding any surface
 # shows: BindingApprovalRequired (§7.5), GET /api/binding-approvals
 # (§7.6.3), and the binding_resolved / binding_approval audit kinds
 # (§18.7) all carry `binding_name` and nothing else identifying. Four
 # consumers, and until rev. 48 no block defined the field they read.
-# name            = "prod-ssh"
-# match_command must match the session's WHOLE command line -- `command`
-# and `args` joined with single spaces (§9.6, rev. 52). A pattern that
-# matches only a prefix leaves every argument after it a free parameter,
-# and the agent writes those.
-# match_command   = "^ssh\\s+(\\S+@)?prod-0[12]$"
-# match_example is REQUIRED (§9.6, rev. 53): the command line you are
-# asserting this binding is for. At load, match_command must match it,
-# and must NOT match it with any of a corpus of hostile transformations
-# applied -- an agent's argument appended, the same argument SPLICED IN
-# between two of yours, a command of the agent's own put in front, or an
-# unrelated line. That is what refuses a pattern left open, without
-# anyone having to guess how "anything" might be spelled.
-# An open middle is a hole as much as an open end (§9.6, rev. 54):
-# options precede the host on an ssh command line, so "^ssh.*prod-01$"
-# admits "ssh -o ProxyCommand=nc 127.0.0.1 2222 prod-01". It no longer
-# loads. If some arguments really are optional, ENUMERATE them --
-# "^ssh\\s+prod-01( -4| -6)?$" -- rather than leaving a gap where they go.
-# match_example   = "ssh prod-01"
+# name            = "prod-ssh-cred"
+# `profile` is the session profile this credential is for (§9.6, rev.
+# 55). It replaced match_command/match_example, which were a regex over a
+# string the agent wrote in full: four guard shapes failed at bounding
+# that, and the last round made the guard larger and weaker at once --
+# the cheapest bypass fell from six characters to one.
+# profile         = "prod-ssh"
 # match_prompt is OPTIONAL and is NOT a security control (§9.6, rev. 53).
 # It disambiguates between prompts inside a session that has ALREADY
 # matched -- "this credential is for the login prompt, not the sudo
 # prompt". It is not a defence against an agent: the agent selects the
 # child and therefore the prompt text, so any match_prompt an agent needs
 # to satisfy, it can satisfy. "" (the default) means "does not select on
-# the prompt", and it gets no match_example-style check for that reason.
+# the prompt", and it gets no load-time check of its own for that reason.
 # match_prompt    = "(?i)password"
 # provider        = "secret-service"
 # reference       = "service=holdfast,account=prod-ssh"

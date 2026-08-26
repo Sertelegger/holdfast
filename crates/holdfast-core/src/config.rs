@@ -529,6 +529,19 @@ pub struct SecurityConfig {
     /// operator who uncomments it must not get a rejected config.
     #[serde(default)]
     pub secret_bindings: Vec<SecretBinding>,
+    /// §9.6's operator-declared session profiles (GH #46). **Read** by
+    /// `start_session` and named by every [`SecretBinding`].
+    ///
+    /// **This is what retires GH #45's bypass class rather than
+    /// mitigating it.** Through 0.0.7 the agent authored the whole command
+    /// line and this file tried to decide whether that string was one the
+    /// operator meant; four guard shapes failed at it, and the last round
+    /// made the guard larger and weaker at once. A profile inverts the
+    /// direction: the operator writes the command line, the agent fills
+    /// named slots, and `crate::secret::profile` carries the argument for
+    /// why a slot is a different problem from a command line.
+    #[serde(default)]
+    pub profiles: Vec<SessionProfile>,
 
     // ---- 0.0.7's three. None of them appears in §4.2 or §10.2 (Q2, Q3,
     // Q4), so they are additive: a config written against the published
@@ -546,6 +559,60 @@ pub struct SecurityConfig {
     /// Ceiling on `request_secret_input`'s `timeout_secs` argument.
     #[serde(default = "d_secret_input_max_timeout_secs")]
     pub secret_input_max_timeout_secs: u32,
+}
+
+/// One operator-declared session profile (§9.6, GH #46).
+///
+/// ```toml
+/// [[security.profiles]]
+/// name    = "prod-ssh"
+/// program = "ssh"                       # a literal. NO substitution.
+/// args    = ["{user}@{host}"]
+///
+///   [security.profiles.vars]
+///   user = "^[a-z][a-z0-9_-]{0,30}$"
+///   host = "^prod-0[12]$"
+/// ```
+///
+/// **The agent supplies values into the slots and never writes a command
+/// line.** `crate::secret::profile` holds the rules, the substitution and —
+/// more importantly — the argument for why a slot is a different problem
+/// from a regex over a command line. Read it before adding a knob here.
+///
+/// Every rule is refused at load by [`Config::validate`], with the message
+/// naming the key.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionProfile {
+    /// The override key. A [`SecretBinding`] attaches to a profile by this
+    /// name, and `start_session(profile:)` names it. Unique, and a binding
+    /// naming an unknown one is a load error.
+    pub name: String,
+    /// **A literal program name, and it admits no `{…}`.** If the agent
+    /// could influence the program it would choose the binary, and no
+    /// pattern over an *argument* can bound that. Refused at load.
+    pub program: String,
+    /// The argument template. `{name}` is a slot; `{{` and `}}` are
+    /// literal braces.
+    ///
+    /// **A `Vec<String>`, and that is the structural guarantee rather than
+    /// a serde convenience.** Substitution happens *within* one element, so
+    /// a value containing a space, a quote, a `;` or a leading `-` stays
+    /// one argument and can never become a second one. Nothing joins these
+    /// and nothing re-splits them.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// `{slot name: regex}`. Each pattern is matched against the agent's
+    /// value **whole**, through `secret::binding::whole_line` — the same
+    /// anchoring, compiled by the same function at load and at render, so
+    /// the two cannot disagree (GH #50).
+    ///
+    /// Every slot in [`args`](Self::args) needs an entry here and every
+    /// entry needs a slot; both directions are refused at load, because a
+    /// slot with no pattern is unguarded and a pattern with no slot is a
+    /// typo the operator should learn about at startup.
+    #[serde(default)]
+    pub vars: std::collections::BTreeMap<String, String>,
 }
 
 /// One operator-configured secret binding (§9.6). **Unread in 0.0.5.**
@@ -1028,7 +1095,7 @@ table_default!(SecurityConfig {
     keychain_provider_timeout_secs: d_keychain_provider_timeout_secs,
     max_secret_bytes_ceiling: d_max_secret_bytes_ceiling,
     secret_input_max_timeout_secs: d_secret_input_max_timeout_secs,
-}; extra_redaction_patterns, secret_bindings);
+}; extra_redaction_patterns, secret_bindings, profiles);
 
 table_default!(UiConfig {
     ui_bridge_pinned_port: d_ui_bridge_pinned_port,
@@ -1240,11 +1307,46 @@ impl Config {
                  which resolves no credential and would leave autofill silently off",
             ));
         }
+        // §9.6's session profiles (GH #46). **Before the bindings**,
+        // because a binding names a profile and the name check below has
+        // nothing to check against until this loop has established what
+        // the declared set is.
+        //
+        // Every rule lives in `secret::profile::validate` beside the
+        // substitution it constrains — one function, so the thing checked
+        // at load is the thing rendered at `start_session` (GH #50's
+        // lesson, generalised). What is checked *here* is the pair of
+        // properties only this loop can see: the name is non-empty, and it
+        // is unique.
+        let mut profile_names: BTreeSet<&str> = BTreeSet::new();
+        for profile in &self.security.profiles {
+            if profile.name.trim().is_empty() {
+                return Err(ConfigError::invalid(
+                    "security.profiles[].name must not be empty",
+                ));
+            }
+            if !profile_names.insert(profile.name.as_str()) {
+                // Refused rather than last-wins: with two profiles of one
+                // name, a binding attaches to whichever the loader kept,
+                // and an operator reading the file cannot tell which that
+                // was.
+                return Err(ConfigError::invalid(format!(
+                    "security.profiles[\"{}\"] is declared twice; a profile name is what a \
+                     binding and a start_session call name, so it must identify one profile",
+                    profile.name
+                )));
+            }
+            if let Err(fault) = crate::secret::profile::validate(profile) {
+                return Err(ConfigError::invalid(format!(
+                    "security.profiles[\"{}\"]{fault}",
+                    profile.name
+                )));
+            }
+        }
         // A typo'd binding that never matches is indistinguishable from a
         // credential store that is down, so an uncompilable pattern stops
         // the daemon rather than becoming a binding that quietly does
-        // nothing. Both patterns, because either one failing to compile
-        // makes the whole binding unselectable.
+        // nothing.
         for binding in &self.security.secret_bindings {
             // §9.6 reads an empty `match_prompt` as "this binding does not
             // select on the prompt"; the empty regex compiles and matches
@@ -2035,6 +2137,247 @@ require_confirm = false
         assert!(!b.require_confirm);
         // Nothing reads any of the seven in 0.0.5 — that is 0.0.7's — so
         // the assertion here is that they *parse*, not that they act.
+    }
+
+    // ------------------------------------------ §9.6's session profiles
+    //
+    // GH #46. The substitution and its rules live in
+    // `crate::secret::profile`, with its own rows; what is asserted here
+    // is the **config surface** — that §10.2's published block loads, and
+    // that each rule reaches `Config::validate` and refuses with a
+    // message naming the key.
+
+    /// §10.2's `[[security.profiles]]` block, **uncommented out of the
+    /// published example rather than re-typed** (Global Constraint 15).
+    ///
+    /// §10.2 is *"the most copied block in the document and the least
+    /// swept"*, and a remembered fixture drifts silently. This one cannot:
+    /// it is the bytes of `example_config.toml`, which
+    /// `the_published_example_config_loads` already pins against the
+    /// document, with the comment markers taken off exactly as an operator
+    /// takes them off.
+    ///
+    /// The selection rule is *"a line that is TOML after uncommenting"* —
+    /// a table header or a `key =`. The prose lines between the keys are
+    /// what the operator skips, and the guard against a mis-selection is
+    /// that the result is **parsed and its values asserted**, so a
+    /// heuristic that swallowed a sentence fails here rather than
+    /// producing a fixture nobody checked.
+    fn spec_profile_block() -> String {
+        let mut out: Vec<String> = Vec::new();
+        let mut inside = false;
+        for line in EXAMPLE.lines() {
+            let Some(bare) = line.strip_prefix('#') else {
+                continue;
+            };
+            let bare = bare.strip_prefix(' ').unwrap_or(bare);
+            if bare.trim() == "[[security.profiles]]" {
+                inside = true;
+            }
+            if !inside {
+                continue;
+            }
+            let t = bare.trim_start();
+            let is_toml = t.starts_with('[')
+                || t.split('=').next().is_some_and(|k| {
+                    !k.is_empty()
+                        && k.trim() == k.trim_end()
+                        && k.trim_end()
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && !k.trim_end().is_empty()
+                        && k.contains(char::is_alphabetic)
+                        && t.contains('=')
+                });
+            if is_toml {
+                out.push(bare.to_string());
+            }
+            if t.starts_with("host") {
+                break;
+            }
+        }
+        assert!(
+            out.iter().any(|l| l.trim() == "[[security.profiles]]"),
+            "the published example no longer carries a `[[security.profiles]]` block"
+        );
+        out.join("\n")
+    }
+
+    /// The block an operator actually uncomments, loaded rather than read
+    /// by eye.
+    #[test]
+    fn the_published_profile_block_loads() {
+        let src = spec_profile_block();
+        let cfg = parse_str(&src)
+            .unwrap_or_else(|e| panic!("§10.2's profile block must load; got {e}\n---\n{src}"));
+        assert_eq!(cfg.security.profiles.len(), 1, "{src}");
+        let p = &cfg.security.profiles[0];
+        assert_eq!(p.name, "prod-ssh");
+        assert_eq!(p.program, "ssh");
+        assert_eq!(p.args, vec!["{user}@{host}"]);
+        assert_eq!(p.vars.len(), 2, "{:?}", p.vars);
+        assert_eq!(p.vars["host"], "^prod-0[12]$");
+        assert_eq!(p.vars["user"], "^[a-z][a-z0-9_-]{0,30}$");
+        cfg.validate().expect("and it must validate");
+    }
+
+    /// A `[[security.profiles]]` block for the rows below, spelled with
+    /// TOML **multi-line literal** strings so a row may carry `'`, `"` and
+    /// a backslash without an escaping scheme of its own.
+    fn profile_block(name: &str, program: &str, args: &[&str], vars: &[(&str, &str)]) -> String {
+        let args = args
+            .iter()
+            .map(|a| format!("'''{a}'''"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut src = format!(
+            "[[security.profiles]]\nname = '''{name}'''\nprogram = '''{program}'''\n\
+             args = [{args}]\n"
+        );
+        if !vars.is_empty() {
+            src.push_str("\n[security.profiles.vars]\n");
+            for (k, v) in vars {
+                src.push_str(&format!("{k} = '''{v}'''\n"));
+            }
+        }
+        src
+    }
+
+    /// `parse_str` runs `Config::validate` itself, so a refusal is
+    /// whatever the loader an operator's daemon uses would have said.
+    fn profile_refusal(src: &str) -> String {
+        parse_str(src)
+            .map(|_| ())
+            .expect_err("this profile must not load")
+            .to_string()
+    }
+
+    /// **Rule 1.** If the agent could influence the program it chooses the
+    /// binary, and no pattern over an *argument* can bound that.
+    #[test]
+    fn a_slot_in_program_is_a_load_error_naming_the_key() {
+        let msg = profile_refusal(&profile_block(
+            "prod-ssh",
+            "{prog}",
+            &["{host}"],
+            &[("host", "^prod-0[12]$")],
+        ));
+        assert!(msg.contains("program"), "{msg}");
+        assert!(
+            msg.contains("prod-ssh"),
+            "the message must name the profile: {msg}"
+        );
+        // The pairing that keeps the rule from being "refuse everything":
+        // the same block with a literal program loads.
+        let ok = profile_block("prod-ssh", "ssh", &["{host}"], &[("host", "^prod-0[12]$")]);
+        parse_str(&ok).expect("parses").validate().expect("loads");
+    }
+
+    /// **Rule 2, first direction.** A slot with no `vars` entry could never
+    /// be filled, so the profile could never start — and nothing would
+    /// bound what filled it if it could.
+    #[test]
+    fn a_slot_with_no_vars_entry_is_a_load_error_naming_the_key() {
+        let msg = profile_refusal(&profile_block(
+            "prod-ssh",
+            "ssh",
+            &["{user}@{host}"],
+            &[("host", "^prod-0[12]$")],
+        ));
+        assert!(msg.contains("user"), "{msg}");
+        assert!(msg.contains("prod-ssh"), "{msg}");
+    }
+
+    /// **Rule 2, second direction.** An unused var is a typo, and the
+    /// operator should learn it at startup rather than at 3am.
+    #[test]
+    fn a_vars_entry_no_slot_uses_is_a_load_error_naming_the_key() {
+        let msg = profile_refusal(&profile_block(
+            "prod-ssh",
+            "ssh",
+            &["{host}"],
+            &[("host", "^prod-0[12]$"), ("hsot", "^x$")],
+        ));
+        assert!(msg.contains("hsot"), "{msg}");
+        assert!(msg.contains("prod-ssh"), "{msg}");
+    }
+
+    /// **Rule 3.** Compiled through `secret::binding::whole_line`, the
+    /// same wrap the renderer applies — GH #50 was two compiles that could
+    /// disagree about whether the operator had written a regex at all.
+    #[test]
+    fn a_slot_pattern_that_does_not_compile_is_a_load_error_naming_the_key() {
+        let msg = profile_refusal(&profile_block(
+            "prod-ssh",
+            "ssh",
+            &["{host}"],
+            &[("host", "^prod-0(")],
+        ));
+        assert!(msg.contains("host"), "{msg}");
+        assert!(msg.contains("prod-ssh"), "{msg}");
+        assert!(msg.contains("regex"), "{msg}");
+    }
+
+    /// **Rule 5, first half.** A profile name is what a binding and a
+    /// `start_session` call name, so it has to identify one profile.
+    #[test]
+    fn two_profiles_with_one_name_are_refused() {
+        let mut src = profile_block("prod-ssh", "ssh", &["{host}"], &[("host", "^prod-01$")]);
+        src.push_str(&profile_block(
+            "prod-ssh",
+            "psql",
+            &["{host}"],
+            &[("host", "^prod-02$")],
+        ));
+        let msg = profile_refusal(&src);
+        assert!(msg.contains("prod-ssh"), "{msg}");
+        assert!(msg.contains("twice"), "{msg}");
+        // And two *differently* named profiles load, so the rule is about
+        // the collision rather than about there being two.
+        let mut ok = profile_block("prod-ssh", "ssh", &["{host}"], &[("host", "^prod-01$")]);
+        ok.push_str(&profile_block(
+            "prod-db",
+            "psql",
+            &["{host}"],
+            &[("host", "^prod-02$")],
+        ));
+        parse_str(&ok).expect("parses").validate().expect("loads");
+    }
+
+    #[test]
+    fn an_empty_profile_name_is_refused() {
+        let msg = profile_refusal(&profile_block(
+            "   ",
+            "ssh",
+            &["{host}"],
+            &[("host", "^prod-01$")],
+        ));
+        assert!(msg.contains("security.profiles[].name"), "{msg}");
+    }
+
+    /// A brace that opens nothing is a typo in a slot name. Treating it as
+    /// a literal would leave the operator with a template whose slot never
+    /// gets filled and a `vars` pattern nothing consults.
+    #[test]
+    fn a_malformed_slot_is_a_load_error_naming_the_argument() {
+        let msg = profile_refusal(&profile_block(
+            "prod-ssh",
+            "ssh",
+            &["{host"],
+            &[("host", "^prod-01$")],
+        ));
+        assert!(msg.contains("args[0]"), "{msg}");
+        assert!(msg.contains("prod-ssh"), "{msg}");
+    }
+
+    /// An unknown key inside a profile is a load error like every other
+    /// unknown key (§10.1) — so a `match_command` an operator carried over
+    /// from rev. 54 fails loudly rather than sitting there doing nothing.
+    #[test]
+    fn an_unknown_key_inside_a_profile_is_rejected() {
+        let src = "[[security.profiles]]\nname = \"p\"\nprogram = \"ssh\"\nargz = []\n";
+        let e = parse_str(src).expect_err("an unmodelled key must not be ignored");
+        assert!(e.to_string().contains("argz"), "{e}");
     }
 
     /// **`require_confirm` defaults to `true`** (GH #45).

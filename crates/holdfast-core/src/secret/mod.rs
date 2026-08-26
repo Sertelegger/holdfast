@@ -18,6 +18,7 @@
 
 pub mod approval;
 pub mod binding;
+pub mod profile;
 pub mod provider;
 pub mod request;
 
@@ -37,6 +38,15 @@ pub use approval::{
 pub use binding::{
     autofill, autofill_approved, command_line, keychain_step_runs, select, Autofill, FellThrough,
 };
+
+/// §9.6's operator-declared session profiles (GH #46). **The operator
+/// writes the command line and the agent fills named slots in it** — so
+/// there is no signature here by which an agent could author a
+/// credential-bearing command line, the same move that already stops it
+/// *naming* a secret. [`profile::render`]'s two arguments are the
+/// operator's template and the agent's values, and it returns exactly one
+/// argv element per template element.
+pub use profile::{render, ProfileFault, VarFault};
 
 /// **`resolve_with` and `ScriptProvider` are deliberately absent from
 /// this list.** Between them they spell *"spawn this program with this
