@@ -32,9 +32,11 @@ pub use approval::{
 /// §9.6's operator bindings. **No item here takes an agent-supplied
 /// string**, which is REQ-SEC-012's structural half stated as a set of
 /// signatures: `command_line` takes a session's own `command`/`args`,
-/// `select` takes those plus the child's own prompt line, and `autofill`
-/// takes the operator's config and a `&Session`. There is nowhere to put
-/// a `prompt_text` even by accident.
+/// `select` takes the session's **operator-declared profile name** plus
+/// the child's own prompt line, and `autofill` takes the operator's config
+/// and a `&Session`. There is nowhere to put a `prompt_text` even by
+/// accident — and since GH #46 there is nowhere to put a command line
+/// either, because `select` no longer has a parameter shaped like one.
 pub use binding::{
     autofill, autofill_approved, command_line, keychain_step_runs, select, Autofill, FellThrough,
 };

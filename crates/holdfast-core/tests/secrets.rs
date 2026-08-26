@@ -121,7 +121,7 @@ use holdfast_core::protocol::frame;
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use holdfast_core::pty::{InProcessPty, MockPty, PtyBackend, PtySpawnConfig, Signal};
 use holdfast_core::secret::{
-    command_line, keychain_step_runs, resolve, select, ArgvProvider, ProviderError, SecretProvider,
+    keychain_step_runs, resolve, select, ArgvProvider, ProviderError, SecretProvider,
 };
 use holdfast_core::session::{
     new_session_id, Session, SessionConfig, WriteRequest, WRITE_QUEUE_FRAMES,
@@ -144,6 +144,17 @@ const PROBE: &str = "hunter2";
 /// value ever being printed).
 const ECHO_OFF_FIXTURE: &str = "stty -echo; printf 'Password: '; read x; stty echo; \
      printf 'got=%s\\n' \"$(printf %s \"$x\" | tr a-z A-Z)\"";
+
+/// The §9.6 session profile every `shell_running` session carries, and
+/// the one every binding in this file attaches to (GH #46).
+///
+/// **Selection runs off this and off nothing else.** Before GH #46 each
+/// binding here carried a whole-line `match_command` built with
+/// `regex::escape` from the shell one-liner the fixture runs, plus a
+/// `match_example` for the loader to judge it against; a name replaces
+/// both. `quiet_session` and the other `command`/`args` fixtures carry no
+/// profile at all, which is why they resolve nothing.
+const SHELL_PROFILE: &str = "echo-off-shell";
 
 /// A child that drops `ECHO`, prints its prompt — and then restores echo
 /// **without ever reading**. `user_cancelled`'s only producer (Q6): §7.5's
@@ -280,7 +291,15 @@ impl TestDaemon {
             "sh".into(),
             cfg.args.clone(),
             Arc::new(pty) as Arc<dyn PtyBackend>,
-            SessionConfig::with_buffer_capacity(256 * 1024),
+            SessionConfig {
+                // §9.6, GH #46: the session's **profile** is what a
+                // binding selects on, so a fixture that left this `None`
+                // would resolve no credential however its command line
+                // reads. `quiet_session` below deliberately leaves it
+                // `None`, which is the ordinary `command`/`args` shape.
+                profile: Some(SHELL_PROFILE.to_string()),
+                ..SessionConfig::with_buffer_capacity(256 * 1024)
+            },
         );
         self.daemon
             .server
@@ -543,6 +562,30 @@ async fn stream_until(c: &mut UnixStream, needle: &[u8], secs: u64) -> Vec<u8> {
         }
     }
     acc
+}
+
+/// Block until the **detector** has the child's prompt line, and hand it
+/// back.
+///
+/// Not the ring buffer: the two are fed on the same reader path but not in
+/// the same instant, and the line `secret::binding::autofill` reads is the
+/// detector's. The one row that needs this is the seven-surfaces sweep,
+/// whose `daemon.log` witness comes from a binding declining on its
+/// `match_prompt` — and `matches` returns before compiling anything when
+/// the line is still empty.
+async fn await_detected_prompt(s: &Session, needle: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let line = s.detection().last_line;
+        if line.contains(needle) {
+            return line;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the detector never saw {needle:?}; its line is {line:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Block until the tool call has really registered its waiter.
@@ -972,18 +1015,28 @@ fn the_echo_on_fixtures_are_the_echo_off_one_with_the_stty_calls_removed() {
 ///    daemon-written line.
 ///
 /// **The `daemon.log` witness is a real diagnostic, provoked on purpose.**
-/// [`leak_canary_binding`] carries an uncompilable `match_command`, which
+/// [`leak_canary_binding`] carries an uncompilable `match_prompt`, which
 /// `secret::binding::pattern_matches` answers by writing the binding's
 /// *name* to `daemon.log` and declining to match. It is first in
 /// configured order, so it costs nothing but the line it exists to
 /// produce. Without it the fd-2 capture could be empty and "the value is
 /// not in `daemon.log`" would be a claim about a file nothing wrote to.
+///
+/// **It was an uncompilable `match_command` until GH #46 retired that
+/// field**, and the move costs one wait: `matches` reads an empty prompt
+/// line as *"no prompt observed"* and returns before compiling anything,
+/// so the canary only declines once the detector has the child's line.
+/// [`await_detected_prompt`] below is that wait, and it is what keeps the
+/// diagnostic deterministic rather than a race with the reader thread.
 #[tokio::test]
 async fn a_tool_submitted_secret_reaches_none_of_the_seven_surfaces() {
     run_leak_detector("sevensurfaces-detector").await;
 
     let d = TestDaemon::start_with_config("sevensurfaces", canary_and_confirming_config()).await;
     let s = d.shell_running(ECHO_OFF_FIXTURE);
+    // The canary's diagnostic needs a non-empty prompt line, and this is
+    // the line `autofill` actually reads.
+    await_detected_prompt(&s, "Password: ").await;
 
     let capture = StderrCapture::start(&d.paths, "sevensurfaces");
 
@@ -1166,7 +1219,7 @@ async fn a_tool_submitted_secret_reaches_none_of_the_seven_surfaces() {
     // ---- surface 6: `daemon.log`.
     let log = capture.finish();
     assert!(
-        log.contains("`leak-canary` has an uncompilable match_command"),
+        log.contains("`leak-canary` has an uncompilable match_prompt"),
         "fd 2 caught no daemon diagnostic at all, so sweeping it for the value \
          proves nothing:\n{log}"
     );
@@ -3582,10 +3635,7 @@ fn each_provider_builds_the_argv_the_plan_pins() {
     // installed on the runner, which Global Constraint 12 forbids.
     let unknown = SecretBinding {
         name: "deploy".into(),
-        match_command: "ssh *".into(),
-        // Empty on purpose: `match_example` is read by `Config::validate`
-        // and by nothing else, and this row never goes through the loader.
-        match_example: String::new(),
+        profile: "prod-ssh".into(),
         match_prompt: "password:".into(),
         provider: "1password".into(),
         reference: "op://v/i/f".into(),
@@ -3629,10 +3679,18 @@ const SPEC_BINDING_BLOCK: &str = r#"
 [security]
 secret_provider = "prompt"
 
+[[security.profiles]]
+name    = "prod-ssh"
+program = "ssh"
+args    = ["{user}@{host}"]
+
+  [security.profiles.vars]
+  user = "^[a-z][a-z0-9_-]{0,30}$"
+  host = "^prod-0[12]$"
+
 [[security.secret_bindings]]
-name            = "prod-ssh"
-match_command   = "^ssh\\s+(\\S+@)?prod-0[12]$"
-match_example   = "ssh prod-01"
+name            = "prod-ssh-cred"
+profile         = "prod-ssh"
 match_prompt    = "(?i)password"
 provider        = "secret-service"
 reference       = "service=holdfast,account=prod-ssh"
@@ -3641,7 +3699,8 @@ require_confirm = false
 "#;
 
 /// The block an operator actually writes, selecting the session it names
-/// and no other — through the **public** surface of `secret::binding`.
+/// and no other — through the **public** surface of `secret::binding` and
+/// `secret::profile`.
 ///
 /// Nothing here runs a provider. `provider = "secret-service"` is matched
 /// and never executed, which is what lets this row run on a machine with
@@ -3652,8 +3711,39 @@ fn the_published_binding_block_loads_and_selects_the_session_it_names() {
         .expect("§9.6's published binding block must load as a Config");
     let bindings = &cfg.security.secret_bindings;
     assert_eq!(bindings.len(), 1);
-    assert_eq!(bindings[0].name, "prod-ssh");
+    assert_eq!(bindings[0].name, "prod-ssh-cred");
+    assert_eq!(bindings[0].profile, "prod-ssh");
     assert_eq!(bindings[0].max_uses, Some(20));
+
+    // §9.6's published **profile**, rendered: the argv an agent naming it
+    // would get, and the argv it could not get.
+    let profile = &cfg.security.profiles[0];
+    let filled = |user: &str, host: &str| {
+        holdfast_core::secret::render(
+            profile,
+            &[
+                ("user".to_string(), user.to_string()),
+                ("host".to_string(), host.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
+    assert_eq!(
+        filled("ada", "prod-01").expect("the operator's own values must render"),
+        vec!["ada@prod-01"]
+    );
+    // One element, and a value that would be four arguments if anything
+    // here joined or split.
+    let wide = filled("ada", "prod-01 -o ProxyCommand=nc 127.0.0.1 2222");
+    assert!(
+        wide.is_err(),
+        "§9.6's published `host` pattern admitted a transport redirect: {wide:?}"
+    );
+    assert!(
+        filled("ada", "staging-01").is_err(),
+        "§9.6's published `host` pattern admits a host it does not name"
+    );
 
     // **The published example leaves §5.2's step 1 off**, and that is the
     // shipped posture rather than an oversight: `secret_provider` is
@@ -3674,60 +3764,41 @@ fn the_published_binding_block_loads_and_selects_the_session_it_names() {
     .expect("the same block in `both` mode must load too");
     assert!(keychain_step_runs(&enabled.security.secret_provider));
 
-    // The session §9.6's own pattern is written for.
-    let named = command_line("ssh", &["user@prod-01".to_string()]);
-    assert_eq!(named, "ssh user@prod-01");
+    // The session §9.6's own block is written for.
     assert_eq!(
-        select(bindings, &named, "[sudo] password for ada:").map(|b| b.name.as_str()),
-        Some("prod-ssh"),
+        select(bindings, Some("prod-ssh"), "[sudo] password for ada:").map(|b| b.name.as_str()),
+        Some("prod-ssh-cred"),
     );
 
-    // Three negatives, each separating the row above from a different
+    // Four negatives, each separating the row above from a different
     // degenerate matcher.
     assert!(
-        select(
-            bindings,
-            &command_line("ssh", &["user@staging".to_string()]),
-            "password:"
-        )
-        .is_none(),
+        select(bindings, Some("staging-ssh"), "password:").is_none(),
         "a matcher that matches every session is a credential store handed to all of them"
     );
     assert!(
-        select(bindings, &named, "$ ").is_none(),
-        "`match_prompt` was ignored: the block selects on the command line alone"
+        select(bindings, Some("prod-ssh"), "$ ").is_none(),
+        "`match_prompt` was ignored: the block selects on the profile alone"
     );
     assert!(
-        select(bindings, &named, "").is_none(),
+        select(bindings, Some("prod-ssh"), "").is_none(),
         "an empty prompt line satisfied a binding that carries a `match_prompt` \
          (REQ-O-013)"
     );
-    // **GH #45, against the published block rather than against a
-    // hand-built one.** The unit and end-to-end rows for this live in
-    // `secret::binding`; what this one adds is that the pattern §9.6
-    // *publishes* is the pattern being defeated — the issue's whole
-    // premise was that an operator following the document verbatim got an
-    // exfiltration primitive.
+    // **GH #45's premise, against the published block (GH #46).** The
+    // issue was that an operator following the document verbatim got an
+    // exfiltration primitive, because the published `match_command` was
+    // satisfied by a command line the agent shaped. There is no published
+    // `match_command` now, and this is the assertion that replaces it: a
+    // session that was *not* started from the operator's profile selects
+    // nothing, whatever its command line reads.
     assert!(
-        select(
-            bindings,
-            &command_line(
-                "ssh",
-                &[
-                    "prod-01".to_string(),
-                    "-o".to_string(),
-                    "ProxyCommand=nc 127.0.0.1 2222".to_string(),
-                ]
-            ),
-            "[sudo] password for ada:"
-        )
-        .is_none(),
-        "the published block selected a command line the agent appended a transport \
-         redirect to"
+        select(bindings, None, "[sudo] password for ada:").is_none(),
+        "the published block selected a session started with `command`/`args`"
     );
     // And the empty set, so `select` is not answering `Some` from
     // somewhere other than the slice it was handed.
-    assert!(select(&[], &named, "password:").is_none());
+    assert!(select(&[], Some("prod-ssh"), "password:").is_none());
 }
 
 /// §10.2's `[security]` knobs for §9.6, **copied from the current spec
@@ -3845,24 +3916,18 @@ fn the_published_security_block_ships_with_autofill_off() {
 fn confirming_binding() -> SecretBinding {
     SecretBinding {
         name: "prod-shell".to_string(),
-        // Every session that needs this binding to fire is
-        // `sh -c <ECHO_OFF_FIXTURE>` (see `shell_running`), so the
-        // pattern is that exact joined line and nothing else.
+        // Every session that needs this binding to fire is started from
+        // [`SHELL_PROFILE`] (see `shell_running`), which is the whole of
+        // the selection rule since GH #46.
         //
-        // **It was `^sh\b` until GH #45**, when `match_command` became a
-        // whole-line match rather than a prefix one. The tempting repair
-        // was `^sh\b.*`; that is precisely the permissive tail
-        // `Config::validate` now refuses in an operator's config, and
-        // reaching for it here would be this suite modelling the defect.
-        // `regex::escape` instead, because the fixture is a shell
-        // one-liner made almost entirely of regex metacharacters.
-        match_command: format!("^{}$", regex::escape(&format!("sh -c {ECHO_OFF_FIXTURE}"))),
-        // The line the pattern is for, and it is the same line the
-        // fixture actually runs. Unread on this path — `Config::validate`
-        // is the only consumer and these rows build a `Config` in Rust —
-        // but written out rather than left empty, because a reader
-        // comparing this binding with §10.2's should see the same shape.
-        match_example: format!("sh -c {ECHO_OFF_FIXTURE}"),
+        // **It was a `match_command` until GH #46**, and before that a
+        // whole-line rewrite of a `^sh\b` that GH #45 broke: at one point
+        // this fixture carried
+        // `format!("^{}$", regex::escape(&format!("sh -c {ECHO_OFF_FIXTURE}")))`
+        // plus a `match_example` to be judged against, because the
+        // tempting repair — `^sh\b.*` — was the permissive tail
+        // `Config::validate` refused. A profile name needs none of that.
+        profile: SHELL_PROFILE.to_string(),
         match_prompt: String::new(),
         provider: "wincred".to_string(),
         reference: "op://vault/prod-db/password".to_string(),
@@ -3889,12 +3954,25 @@ fn confirming_config() -> Config {
 /// A binding whose only job is to make the daemon write one line to
 /// `daemon.log` on the secret path.
 ///
-/// `match_command` is an unclosed group, which `regex::Regex::new` refuses
+/// `match_prompt` is an unclosed group, which `regex::Regex::new` refuses
 /// and `secret::binding::pattern_matches` answers by naming the binding in
 /// a diagnostic and **declining to match**. That is the whole contract:
 /// it never selects, never spends a use and never spawns anything, and it
 /// is what stops `a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`
 /// sweeping an empty capture for the value.
+///
+/// **It carries [`SHELL_PROFILE`], and that is load-bearing (GH #46).**
+/// Selection now runs off the profile, so a canary on a *different*
+/// profile would be skipped before `pattern_matches` was reached and
+/// would emit no diagnostic at all. It has to be a candidate in order to
+/// decline — and it declines on the prompt clause, which is the one
+/// remaining pattern a binding carries.
+///
+/// **The prompt line must be non-empty for that clause to run**, since
+/// `matches` reads an empty line as "no prompt observed" and returns
+/// before compiling anything. `a_tool_submitted_secret_reaches_none_of_the_seven_surfaces`
+/// waits for the child's `Password: ` to reach the **detector** before it
+/// calls, which is exactly the line `autofill` reads.
 ///
 /// **`Config::validate` would reject this at load and that is correct.**
 /// A daemon built from a `Config` value in Rust does not run the
@@ -3905,12 +3983,8 @@ fn confirming_config() -> Config {
 fn leak_canary_binding() -> SecretBinding {
     SecretBinding {
         name: "leak-canary".to_string(),
-        match_command: "(".to_string(),
-        // No example: `Config::validate` would reject this binding at the
-        // compile step long before it looked at one, which is the point
-        // the doc above makes.
-        match_example: String::new(),
-        match_prompt: String::new(),
+        profile: SHELL_PROFILE.to_string(),
+        match_prompt: "(".to_string(),
         provider: "wincred".to_string(),
         reference: "op://vault/never-read/password".to_string(),
         max_uses: None,

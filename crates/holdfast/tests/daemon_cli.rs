@@ -1290,28 +1290,34 @@ fn an_unknown_key_in_the_config_stops_the_daemon_and_names_it() {
 
 #[test]
 fn a_binding_whose_regex_does_not_compile_stops_the_daemon() {
-    // §9.6, 0.0.7. An operator's typo'd binding must not become a
-    // binding that silently never matches — which from the outside is
+    // §9.6, 0.0.7. An operator's typo'd regex must not become a binding
+    // that silently never matches — which from the outside is
     // indistinguishable from a credential store that is down.
+    //
+    // **The regex is a profile's slot pattern since GH #46.** It used to
+    // be `match_command`; that field is retired, and a `[security.profiles.vars]`
+    // entry is where an operator's regex lives now. The property is
+    // unchanged and so is the daemon's answer: refuse, name the key, bind
+    // no socket.
     let env = TestEnv::new("badbinding");
     env.write_config(
-        "[[security.secret_bindings]]\n\
+        "[[security.profiles]]\n\
          name = \"prod-ssh\"\n\
-         match_command = \"^ssh (\"\n\
-         match_prompt = \"\"\n\
-         provider = \"secret-service\"\n\
-         reference = \"service=holdfast,account=prod-ssh\"\n",
+         program = \"ssh\"\n\
+         args = [\"{host}\"]\n\
+         [security.profiles.vars]\n\
+         host = \"^prod-0(\"\n",
     );
 
     let (code, _, err) = env.run(&["daemon", "run"]);
-    assert_ne!(code, 0, "an uncompilable binding must not start a daemon");
+    assert_ne!(code, 0, "an uncompilable pattern must not start a daemon");
     assert!(
-        err.contains("match_command"),
+        err.contains("host"),
         "the error names the offending key; got: {err}"
     );
     assert!(
         err.contains("prod-ssh"),
-        "and the binding, or an operator with six of them cannot find it; got: {err}"
+        "and the profile, or an operator with six of them cannot find it; got: {err}"
     );
     // The assertion that separates rejecting from warning: both print.
     assert!(

