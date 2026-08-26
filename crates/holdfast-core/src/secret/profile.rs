@@ -47,6 +47,42 @@
 //! the row, and it asserts the resulting argv length is exactly what the
 //! template declared.
 //!
+//! ## The operator writes the **process**, not only the command line
+//!
+//! The first cut of this module applied the inversion to exactly one of
+//! the two things `start_session` takes from the agent, and GH #55 drove
+//! the other one twice:
+//!
+//! 1. `env: {PATH: …}` on a profile-started session. The operator's
+//!    literal `program` — `ssh` — resolved to the agent's binary. The
+//!    credential came back out of `read_output` in cleartext, with
+//!    `redactions: {}`.
+//! 2. `env: {LD_PRELOAD: …}` with `program` an **absolute path**, which is
+//!    the obvious fix for the first. The operator's binary, the operator's
+//!    argv, and the credential captured anyway.
+//!
+//! **`require_confirm` is not a mitigation for either.** The human was
+//! shown `command_line: "ssh prod-01"` — the legitimate line, because it
+//! *is* the legitimate line. The redirection lives in the environment,
+//! which `BindingApprovalRequired` does not carry.
+//!
+//! **The class is the whole environment, not a list of dangerous names.**
+//! An allowlist or a blocklist of variables is the wrong shape here for
+//! exactly the reason the `match_command` scanner was: it enumerates the
+//! ways an adversary can influence a process, and there is no complete
+//! list. So `env` and `cwd` are **mutually exclusive with `profile`**,
+//! precisely as `command` already is, and a profile declares its own —
+//! operator-written and literal, because a slot there is the `program`
+//! hole again ([`ProfileFault::NotALiteral`]).
+//!
+//! `mcp::tools`' `Launch` is where that becomes structural rather than
+//! remembered: it carries the command, the argv, the environment and the
+//! working directory, and `start_session` reads nothing else. An edit that
+//! reached back for `args.env` on the profile arm is a compile error, not
+//! a review catch — which is the argument that type's own doc already
+//! made for the command line, applied to the second thing the agent
+//! supplies.
+//!
 //! ## What this does not do, stated plainly
 //!
 //! **A session started with `command`/`args` can never receive a keychain
@@ -180,15 +216,36 @@ fn pieces(arg: &str) -> Result<Vec<Piece>, TemplateFault> {
 /// rule every other message in `Config::validate` already follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileFault {
-    /// Rule 1. **`program` is a literal and admits no `{…}`.** If the agent
-    /// could influence the program it chooses the binary, and every other
-    /// rule here is irrelevant — a slot pattern bounds an argument, and an
-    /// argument to a program of the agent's choosing bounds nothing.
+    /// Rule 1. **`program`, `env` and `cwd` are literals and admit no
+    /// `{…}`.** `site` names which one — `program`, `env.<NAME>`,
+    /// `env.<NAME> (key)` or `cwd`.
+    ///
+    /// **One rule over three sites, because they are one hole.** If the
+    /// agent could influence the program it chooses the binary, and every
+    /// other rule here is irrelevant: a slot pattern bounds an argument,
+    /// and an argument to a program of the agent's choosing bounds
+    /// nothing. **The environment chooses the binary just as
+    /// effectively**, and that is not an analogy — it was driven twice (GH
+    /// #55). `PATH` decides which file a literal `program` of `ssh`
+    /// resolves to. `LD_PRELOAD` decides what an *absolute* `program`
+    /// executes once it has resolved, which is the obvious fix for the
+    /// first and does not work. `cwd` joins them because a `program` may
+    /// be relative, and because even an absolute one reads its
+    /// configuration relative to where it runs.
+    ///
+    /// **So the class is the whole environment, not a list of names**, and
+    /// there is deliberately no allowlist or blocklist of variables here.
+    /// Enumerating the ways an adversary can influence a process is the
+    /// shape that failed four times over `match_command`; the module
+    /// header is the argument, and this is the same argument one level
+    /// out. What replaces it is the same inversion: the operator writes
+    /// the environment, and `start_session` refuses an agent-supplied
+    /// `env` or `cwd` alongside a `profile` outright.
     ///
     /// Any brace at all is refused, not merely a well-formed slot: a
     /// program named `foo{bar}` is not a real case, and refusing the whole
     /// character is one rule instead of two.
-    ProgramIsNotATemplate,
+    NotALiteral { site: String },
     /// A template argument whose braces do not spell a slot.
     BadTemplate { arg: usize, fault: TemplateFault },
     /// Rule 2, first direction: a `{name}` in `args` with no `vars` entry.
@@ -209,10 +266,11 @@ pub enum ProfileFault {
 impl std::fmt::Display for ProfileFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ProgramIsNotATemplate => f.write_str(
-                ".program must be a literal program name and carries no `{…}`: a slot there \
-                 would let the agent choose the binary, which is the one choice no argument \
-                 pattern can bound",
+            Self::NotALiteral { site } => write!(
+                f,
+                ".{site} must be a literal and carries no `{{…}}`: a slot in `program`, in \
+                 `env` or in `cwd` would let the agent choose which binary actually runs, \
+                 which is the one choice no argument pattern can bound"
             ),
             Self::BadTemplate { arg, fault } => {
                 write!(f, ".args[{arg}] {fault}")
@@ -276,14 +334,39 @@ impl std::fmt::Display for VarFault {
     }
 }
 
+/// Rule 1 at one site: the operator wrote this, and it is a literal.
+fn literal(site: &str, text: &str) -> Result<(), ProfileFault> {
+    if text.contains('{') || text.contains('}') {
+        return Err(ProfileFault::NotALiteral {
+            site: site.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Every rule under §9.6's profile block, checked at load.
 ///
 /// The name and its uniqueness are checked by the caller, which is the one
 /// place that can see the other profiles.
 pub fn validate(profile: &SessionProfile) -> Result<(), ProfileFault> {
     // Rule 1, and it is first because nothing below matters if it fails.
-    if profile.program.contains('{') || profile.program.contains('}') {
-        return Err(ProfileFault::ProgramIsNotATemplate);
+    //
+    // **Three sites, one rule** (GH #55). `program` was the whole of it
+    // until an agent-supplied `env` was driven past a profile twice — a
+    // `PATH` that repointed a literal `ssh`, and an `LD_PRELOAD` that
+    // captured the credential from an *absolute* `program` running the
+    // operator's own argv. `cwd` is here for the same reason and not by
+    // symmetry: a `program` may be relative.
+    literal("program", &profile.program)?;
+    if let Some(cwd) = &profile.cwd {
+        literal("cwd", cwd)?;
+    }
+    for (name, value) in &profile.env {
+        // The key as well as the value: `{k}` as a variable *name* chooses
+        // which variable the agent sets, which is the same hole reached
+        // from the other side.
+        literal(&format!("env.{name} (key)"), name)?;
+        literal(&format!("env.{name}"), value)?;
     }
     let mut used: BTreeSet<String> = BTreeSet::new();
     for (i, arg) in profile.args.iter().enumerate() {
@@ -407,6 +490,8 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            env: BTreeMap::new(),
+            cwd: None,
         }
     }
 
@@ -633,15 +718,53 @@ mod tests {
 
     // ------------------------------------------------------ load-time
 
+    fn not_a_literal(site: &str) -> Result<(), ProfileFault> {
+        Err(ProfileFault::NotALiteral {
+            site: site.to_string(),
+        })
+    }
+
+    /// **Rule 1 at all three sites the operator writes literally**, and
+    /// the three are one rule because they are one hole (GH #55).
+    ///
+    /// A slot in `program` lets the agent choose the binary. So does a
+    /// slot in `env`: `PATH` decides which file a literal `ssh` resolves
+    /// to, and `LD_PRELOAD` decides what an absolute `program` executes
+    /// once it has — both driven end to end. `cwd` joins them because a
+    /// `program` may be relative to it.
+    ///
+    /// **The accept half is what makes this a rule rather than a ban.**
+    /// Each site is asserted to load with a brace-free value, so a
+    /// `validate` that refused every profile could not pass.
     #[test]
-    fn a_program_carrying_a_slot_is_refused() {
+    fn a_slot_in_program_env_or_cwd_is_refused() {
         let mut p = profile(&["{host}"], &[("host", "prod-0[12]")]);
         p.program = "{prog}".to_string();
-        assert_eq!(validate(&p), Err(ProfileFault::ProgramIsNotATemplate));
+        assert_eq!(validate(&p), not_a_literal("program"));
         p.program = "ssh{x}".to_string();
-        assert_eq!(validate(&p), Err(ProfileFault::ProgramIsNotATemplate));
-        p.program = "ssh".to_string();
+        assert_eq!(validate(&p), not_a_literal("program"));
+        p.program = "/usr/bin/ssh".to_string();
+        assert_eq!(validate(&p), Ok(()), "a literal program must still load");
+
+        // The environment, by value — GH #55's first probe is a `PATH`
+        // the agent chose, and a slot here is that hole with the
+        // operator's own hand on it.
+        p.env.insert("PATH".to_string(), "{p}".to_string());
+        assert_eq!(validate(&p), not_a_literal("env.PATH"));
+        p.env.insert("PATH".to_string(), "/usr/bin".to_string());
+        assert_eq!(validate(&p), Ok(()), "a literal env value must still load");
+
+        // And by **key**: `{k}` as a variable name chooses which variable
+        // the agent sets, which is the same hole from the other side.
+        p.env.insert("{k}".to_string(), "x".to_string());
+        assert_eq!(validate(&p), not_a_literal("env.{k} (key)"));
+        p.env.remove("{k}");
         assert_eq!(validate(&p), Ok(()));
+
+        p.cwd = Some("/srv/{where}".to_string());
+        assert_eq!(validate(&p), not_a_literal("cwd"));
+        p.cwd = Some("/srv/deploy".to_string());
+        assert_eq!(validate(&p), Ok(()), "a literal cwd must still load");
     }
 
     #[test]
@@ -709,6 +832,8 @@ mod tests {
             program: "psql".to_string(),
             args: vec!["-h".to_string(), "prod".to_string()],
             vars: BTreeMap::new(),
+            env: BTreeMap::new(),
+            cwd: None,
         };
         assert_eq!(validate(&p), Ok(()));
         assert_eq!(

@@ -27,20 +27,40 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// What §5.2's mutually exclusive pair resolved to: the program and argv
-/// the child will actually be spawned with, and the operator's profile
-/// name when there was one.
+/// What §5.2's mutually exclusive pair resolved to: **the whole process**
+/// the child will be spawned as — program, argv, environment and working
+/// directory — and the operator's profile name when there was one.
 ///
-/// **It exists so there is exactly one place `start_session` reads a
-/// command line from.** With `command`/`args` and `profile`/`vars` both on
-/// the argument struct, a later edit that reached for `args.command`
-/// somewhere below would silently reintroduce the agent-authored
-/// command line for that one surface — the audit record, the spawn, the
-/// `details` string. Resolving once, into a type with no `Option<String>`
-/// command, makes that a compile error rather than a review catch.
+/// **It exists so there is exactly one place `start_session` reads any of
+/// them from.** With `command`/`args`/`env`/`cwd` and `profile`/`vars`
+/// both on the argument struct, a later edit that reached for
+/// `args.command` somewhere below would silently reintroduce the
+/// agent-authored command line for that one surface — the audit record,
+/// the spawn, the `details` string. Resolving once, into a type with no
+/// `Option<String>` command, makes that a compile error rather than a
+/// review catch.
+///
+/// **`env` and `cwd` are on this type because that argument was made for
+/// the command line and applied to nothing else (GH #55).** A
+/// profile-started session took the agent's `env` unfiltered, so
+/// `PATH` repointed the operator's literal `ssh` and `LD_PRELOAD`
+/// captured the credential out of an *absolute* `program` running the
+/// operator's own argv — both driven, both with `require_confirm` showing
+/// the human the legitimate command line, because it was the legitimate
+/// command line. The environment chooses the binary as effectively as the
+/// argv does, and it is now resolved in the same place, once.
 struct Launch {
     command: String,
     args: Vec<String>,
+    /// Extra environment, **sorted**, exactly as `start_session` used to
+    /// sort the agent's own map — so the `env_keys` audit field and the
+    /// child's environment compare between runs.
+    env: Vec<(String, String)>,
+    /// The directory *requested*, not the effective one:
+    /// `start_session` canonicalises it and rejects a non-directory, and
+    /// both sources go through that one check so an operator's typo is
+    /// the same refusal an agent's would have been.
+    cwd: Option<String>,
     profile: Option<String>,
 }
 
@@ -250,9 +270,10 @@ impl HoldfastServer {
         Parameters(args): Parameters<StartSessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         // §5.2's mutually exclusive pair, resolved **before** anything
-        // else looks at a command line. Everything below reads `launch`
-        // and not `args.command`/`args.args`, so there is one place the
-        // child's argv comes from.
+        // else looks at the process. Everything below reads `launch` and
+        // not `args.command`/`args.args`/`args.env`/`args.cwd`, so there
+        // is one place the child's program, argv, environment and working
+        // directory come from (GH #46, GH #55).
         let launch = self.resolve_launch(&args)?;
         let mut cfg = PtySpawnConfig::new(&launch.command);
         cfg.args = launch.args.clone();
@@ -270,7 +291,13 @@ impl HoldfastServer {
         // `canonicalize` also fails outright on a path that does not
         // exist, which subsumes half the check; `is_dir` still matters
         // because an existing *file* canonicalises perfectly well.
-        cfg.cwd = match &args.cwd {
+        //
+        // **`launch.cwd`, so an operator's profile `cwd` takes exactly
+        // this path** — the same existence check, the same
+        // canonicalisation, the same `invalid_params`. One resolution
+        // function for both sources is what keeps the directory that is
+        // approved, reported and actually run in from diverging.
+        cfg.cwd = match &launch.cwd {
             Some(cwd) => {
                 let resolved = std::path::Path::new(cwd)
                     .canonicalize()
@@ -295,13 +322,13 @@ impl HoldfastServer {
                 .map(|p| p.to_string_lossy().into_owned()),
         };
 
-        if let Some(env) = &args.env {
-            cfg.env = env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<Vec<_>>();
-            cfg.env.sort();
-        }
+        // **`launch.env`, and there is no `args.env` read anywhere below
+        // this line** (GH #55). On a profile-started session this is the
+        // operator's own map and the agent supplied none, because
+        // `resolve_launch` refused the call outright if it tried. Already
+        // sorted by whichever arm built it, so `env_keys` compares between
+        // runs.
+        cfg.env = launch.env.clone();
 
         if let Some(c) = args.cols {
             cfg.cols = c;
@@ -602,9 +629,23 @@ impl HoldfastServer {
                         None,
                     ));
                 }
+                let mut env: Vec<(String, String)> = args
+                    .env
+                    .iter()
+                    .flatten()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                env.sort();
                 Ok(Launch {
                     command: command.clone(),
                     args: args.args.clone(),
+                    // **Unchanged for an ordinary session, deliberately.**
+                    // Nothing is at stake in a session that cannot receive
+                    // a credential: an agent that can name the program can
+                    // already name any program, so its environment adds no
+                    // capability. GH #55 is about the *other* arm.
+                    env,
+                    cwd: args.cwd.clone(),
                     profile: None,
                 })
             }
@@ -624,6 +665,42 @@ impl HoldfastServer {
                         "`args` is only meaningful with `command`: a profile's arguments come \
                          from the operator's template, and supplying more would be the thing \
                          profiles exist to prevent"
+                            .to_string(),
+                        None,
+                    ));
+                }
+                // **`env` and `cwd` are refused for the same reason, and
+                // GH #55 is what taught this arm that (driven twice).**
+                // Profiles stopped the agent authoring the command line
+                // and left it authoring the *process*: `env: {PATH: …}`
+                // repointed the operator's literal `ssh` at the agent's
+                // own binary, and `env: {LD_PRELOAD: …}` — with `program`
+                // an absolute path, which is the obvious fix for the
+                // first — captured the credential out of the operator's
+                // binary running the operator's argv. In both,
+                // `require_confirm` showed the human `ssh prod-01`,
+                // because that *is* the line.
+                //
+                // **Refused wholesale rather than filtered.** The class is
+                // the environment, not a list of names, and an allowlist
+                // or blocklist of variables is the shape that failed four
+                // times over `match_command`: it enumerates the ways an
+                // adversary can influence a process, and there is no
+                // complete list. A profile declares its own `env`/`cwd`,
+                // literal, and that is the whole of what the child gets.
+                if args.env.is_some() {
+                    return Err(ErrorData::invalid_params(
+                        "`env` is only meaningful with `command`: a profile's environment is \
+                         the operator's, and an agent-supplied one chooses which binary the \
+                         profile's `program` actually runs"
+                            .to_string(),
+                        None,
+                    ));
+                }
+                if args.cwd.is_some() {
+                    return Err(ErrorData::invalid_params(
+                        "`cwd` is only meaningful with `command`: a profile's working \
+                         directory is the operator's, and a `program` may be relative to it"
                             .to_string(),
                         None,
                     ));
@@ -651,6 +728,15 @@ impl HoldfastServer {
                 Ok(Launch {
                     command: profile.program.clone(),
                     args: rendered,
+                    // **All four come off the profile on this arm**, and
+                    // none of them off `args`. `BTreeMap` iterates sorted,
+                    // so this matches the ordering the other arm imposes.
+                    env: profile
+                        .env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    cwd: profile.cwd.clone(),
                     // The **profile's** name and not the argument's, so a
                     // session can only ever carry a name the config
                     // declares. They are equal here; taking it from the
@@ -3780,6 +3866,8 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
+            env: BTreeMap::new(),
+            cwd: None,
         }
     }
 

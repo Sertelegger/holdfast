@@ -613,6 +613,42 @@ pub struct SessionProfile {
     /// typo the operator should learn about at startup.
     #[serde(default)]
     pub vars: std::collections::BTreeMap<String, String>,
+    /// Extra environment for the child, **written by the operator** and
+    /// **literal on both sides** — no `{…}` in a key or a value (GH #55).
+    ///
+    /// **A profile-started session takes no `env` from the agent at all**;
+    /// `start_session(env:)` alongside `profile` is an argument error.
+    /// This is where the environment a credentialed session runs under is
+    /// decided, and the whole of it.
+    ///
+    /// **Why a slot here would be the [`program`](Self::program) hole
+    /// again**: `PATH` chooses which binary a literal `program` resolves
+    /// to, and `LD_PRELOAD` chooses what an *absolute* `program` executes
+    /// once it has. Both were driven end to end (GH #55). See
+    /// `crate::secret::profile::ProfileFault::NotALiteral`.
+    ///
+    /// Additive to the environment the **daemon** was started with, on
+    /// `start_session(env:)`'s existing semantics. That inherited
+    /// environment is the operator's or the user's; it is not a surface
+    /// the agent reaches.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Working directory for the child, **written by the operator** and
+    /// **literal** — no `{…}` (GH #55). `None` means the directory the
+    /// daemon itself was started in, exactly as an `env`-less
+    /// `command`/`args` session gets.
+    ///
+    /// **A profile-started session takes no `cwd` from the agent**;
+    /// `start_session(cwd:)` alongside `profile` is an argument error. A
+    /// slot here would be the `program` hole once more: a `program` may be
+    /// relative, and even an absolute one reads its configuration relative
+    /// to where it runs.
+    ///
+    /// It is validated and canonicalised on exactly the path
+    /// `start_session(cwd:)` takes, so an operator's typo is the same
+    /// refusal an agent's would have been.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// One operator-configured secret binding (§9.6). **Unread in 0.0.5.**
@@ -1744,7 +1780,11 @@ require_confirm = false
             if is_toml {
                 out.push(bare.to_string());
             }
-            if t.starts_with("host") {
+            // The last key in §10.2's profile block. Moved from `host` at
+            // rev. 56, when `[security.profiles.env]` was appended below
+            // it — an end marker that stops one sub-table early yields a
+            // fixture that parses and is *not* the published one.
+            if t.starts_with("SSH_AUTH_SOCK") {
                 break;
             }
         }
@@ -1770,6 +1810,12 @@ require_confirm = false
         assert_eq!(p.vars.len(), 2, "{:?}", p.vars);
         assert_eq!(p.vars["host"], "^prod-0[12]$");
         assert_eq!(p.vars["user"], "^[a-z][a-z0-9_-]{0,30}$");
+        // rev. 56's two, and they are the reason the extractor's end
+        // marker moved: a block that stopped at `host` would parse
+        // perfectly and be a different profile from the published one.
+        assert_eq!(p.cwd.as_deref(), Some("/srv/deploy"), "{src}");
+        assert_eq!(p.env.len(), 1, "{:?}", p.env);
+        assert_eq!(p.env["SSH_AUTH_SOCK"], "/run/holdfast/agent.sock");
         cfg.validate().expect("and it must validate");
     }
 
@@ -1823,6 +1869,57 @@ require_confirm = false
         // the same block with a literal program loads.
         let ok = profile_block("prod-ssh", "ssh", &["{host}"], &[("host", "^prod-0[12]$")]);
         parse_str(&ok).expect("parses").validate().expect("loads");
+    }
+
+    /// **Rule 1 at the other two sites (GH #55).** The environment and the
+    /// working directory choose which binary the operator's `program`
+    /// actually is, so a slot in either is the `program` hole again — and
+    /// the message names the key an operator has to fix, `env.<NAME>` and
+    /// all.
+    ///
+    /// Driven through the **real loader**, so this is the daemon an
+    /// operator would start rather than `secret::profile::validate` called
+    /// directly (which has its own row).
+    #[test]
+    fn a_slot_in_a_profiles_env_or_cwd_is_a_load_error_naming_the_key() {
+        let with = |extra: &str| {
+            format!(
+                "{}\n[security.profiles.env]\n{extra}\n",
+                profile_block("prod-ssh", "ssh", &["{host}"], &[("host", "^prod-0[12]$")])
+            )
+        };
+        let value = profile_refusal(&with("PATH = '''{p}'''"));
+        assert!(value.contains("env.PATH"), "{value}");
+        assert!(value.contains("prod-ssh"), "{value}");
+
+        let key = profile_refusal(&with("'{k}' = '''x'''"));
+        assert!(key.contains("env.{k}"), "{key}");
+
+        // `cwd` is a **bare** key on the profile, so it has to precede the
+        // sub-tables; appending it after `[security.profiles.vars]` would
+        // declare a *var* called `cwd`, which is the §10.2 hazard the
+        // published example's own comment warns about.
+        let with_cwd = |dir: &str| {
+            format!(
+                "[[security.profiles]]\nname = \"prod-ssh\"\nprogram = \"ssh\"\n\
+                 args = ['''{{host}}''']\ncwd = '''{dir}'''\n\
+                 [security.profiles.vars]\nhost = '''^prod-0[12]$'''\n"
+            )
+        };
+        let cwd = profile_refusal(&with_cwd("/srv/{where}"));
+        assert!(cwd.contains("cwd"), "{cwd}");
+        assert!(cwd.contains("prod-ssh"), "{cwd}");
+
+        // **The pairing**, without which the three refusals above are
+        // satisfied by a loader that refuses every `env` and every `cwd`:
+        // the same keys with literal values load, and carry their values.
+        let ok = parse_str(&format!(
+            "{}[security.profiles.env]\nPATH = '''/usr/bin'''\n",
+            with_cwd("/tmp")
+        ))
+        .expect("a literal env and cwd must load");
+        assert_eq!(ok.security.profiles[0].cwd.as_deref(), Some("/tmp"));
+        assert_eq!(ok.security.profiles[0].env["PATH"], "/usr/bin");
     }
 
     /// **Rule 2, first direction.** A slot with no `vars` entry could never

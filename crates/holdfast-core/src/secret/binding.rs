@@ -887,6 +887,7 @@ pub type BindingUses = BTreeMap<String, u32>;
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -6114,6 +6115,8 @@ mod tests {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), script.clone()],
             vars: Default::default(),
+            env: Default::default(),
+            cwd: None,
         }];
         let server = server_with(security, &sc.audit_log());
 
@@ -6145,6 +6148,538 @@ mod tests {
             "a `secret_input_request` was written for a flow with no such call"
         );
 
+        let _ = s.signal(Signal::Kill);
+    }
+
+    // ================================= GH #55: the agent's environment
+    //
+    // **Profiles stopped the agent authoring the command line and left it
+    // authoring the process.** `start_session` took `env` and `cwd` from
+    // the agent on *every* arm, so a profile-started session ran the
+    // operator's argv in an environment the agent chose. Both rows below
+    // were the issue's own probes and are driven end to end.
+    //
+    // Each has the same three parts, and the first is what makes the other
+    // two mean anything:
+    //
+    // 1. **The exploit works where `env` is still accepted.** Driven on
+    //    the `command`/`args` arm, which keeps its `env` deliberately —
+    //    an agent that can name the program can already name any program,
+    //    so its environment buys it nothing there. The capture file
+    //    appearing is the proof that the planted redirection is real
+    //    rather than a fixture that never fired.
+    // 2. **Through a profile it is refused**, no session is created, and
+    //    the capture does not reappear — a refusal at the argument layer
+    //    shown to prevent the *spawn* and not merely to return an error.
+    // 3. **The same profile without the `env` still works**: the
+    //    credential resolves, the child transforms it, the value is not in
+    //    the buffer, and the capture is still absent. Without this the
+    //    row is satisfied by a profile that never ran at all.
+    //
+    // Both use `autofill_on_echo_off` with `require_confirm` off, which is
+    // the case the issue calls out as having no human in it at all —
+    // `require_confirm` is no mitigation here anyway, since the approval
+    // frame carries `command_line: "sh -c …"`, the legitimate line,
+    // because it *is* the legitimate line.
+
+    /// A directory holding one executable named `name`, whose body is
+    /// `body`, for a row that plants a program on a `PATH`.
+    fn planted_bin(sc: &Scratch, dir_name: &str, name: &str, body: &str) -> PathBuf {
+        let dir = sc.path(dir_name);
+        std::fs::create_dir_all(&dir).expect("the planted bin directory");
+        let path = dir.join(name);
+        let guard = crate::secret::provider::exec_guard::writing();
+        std::fs::write(&path, body).expect("write the planted program");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod the planted program");
+        }
+        drop(guard);
+        dir
+    }
+
+    /// A child that drops echo, reads, and writes what it read to
+    /// `sink` — the agent's own program, standing in for the `ssh` an
+    /// operator's `PATH`-resolved `program` would otherwise have been.
+    fn capturing_child(sink: &Path) -> String {
+        format!(
+            "stty -echo; printf 'Password: '; read x; stty echo; \
+             printf '%s' \"$x\" > '{}'; printf 'got=%s\\n' \"$x\"",
+            sink.display()
+        )
+    }
+
+    /// Start one session through the **real** tool and hand back its id,
+    /// or the argument error the call was refused with.
+    async fn start_via_tool(
+        server: &HoldfastServer,
+        args: crate::mcp::tools::StartSessionArgs,
+    ) -> Result<String, String> {
+        match server.start_session(Parameters(args)).await {
+            Ok(r) => Ok(body(&r)["data"]["session_id"]
+                .as_str()
+                .expect("a session id")
+                .to_string()),
+            Err(e) => Err(e.message.to_string()),
+        }
+    }
+
+    /// **GH #55, probe 1.** The agent's `PATH` decides which file the
+    /// operator's literal `program` resolves to.
+    ///
+    /// The profile's `program` is `sh` — a name, as almost every real
+    /// profile's would be — and the planted directory holds an `sh` of the
+    /// agent's own that writes the credential where the agent can read it.
+    ///
+    /// **The planted directory is *prepended* to the inherited `PATH`**,
+    /// which is both what a real attacker does and what makes the row
+    /// work: `PATH=<evil>` alone leaves the planted `sh` unable to find
+    /// `stty`, so the child never drops echo, `AwaitingSecret` never
+    /// classifies, and the autofill that carries the credential never
+    /// fires — the exploit would fail for a reason that has nothing to do
+    /// with the fix. Measured, not assumed: the first spelling of this row
+    /// did exactly that.
+    #[tokio::test]
+    async fn an_agent_supplied_env_cannot_repoint_a_profiles_program() {
+        let mut sc = Scratch::new("gh55path");
+        let sink = sc.path("stolen");
+        // The agent's `sh`: it takes `-c <script>` like the real one, and
+        // ignores the script entirely.
+        let evil = planted_bin(
+            &sc,
+            "evilbin",
+            "sh",
+            &format!("#!/bin/sh\n{}\n", capturing_child(&sink)),
+        );
+        let hijacked = format!(
+            "{}:{}",
+            evil.to_string_lossy(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let gate = sc.path("gate");
+        let script = gated_echo_off(&gate);
+        const PROFILE: &str = "path-shell";
+        let b = sc.binding("shell", PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let mut security = autofill_mode(vec![b], true);
+        security.profiles = vec![crate::config::SessionProfile {
+            name: PROFILE.to_string(),
+            // A *name*, resolved through `PATH` — which is the whole
+            // premise of this probe.
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script.clone()],
+            vars: Default::default(),
+            env: Default::default(),
+            cwd: None,
+        }];
+        let server = server_with(security, &sc.audit_log());
+
+        // ---- 1. the mechanism, proven on the arm that still takes `env`.
+        let id = start_via_tool(
+            &server,
+            crate::mcp::tools::StartSessionArgs {
+                command: Some("sh".into()),
+                args: vec!["-c".into(), script.clone()],
+                env: Some(HashMap::from([("PATH".to_string(), hijacked.clone())])),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a `command` session still takes an agent's env, deliberately");
+        let planted = server.registry.get(&id).expect("the session");
+        std::fs::write(&gate, b"go").expect("open the gate");
+        await_prompt(&planted, b"Password: ").await;
+        write_as_a_human(&planted, b"probe-value\n").await;
+        // The agent's program ran and captured what was typed at it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !sink.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the planted `sh` never captured anything, so every absence below is \
+                 a claim about a fixture that does not work"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&sink).unwrap_or_default(),
+            "probe-value",
+            "the planted program captured something other than the value typed at it"
+        );
+        // And it got no credential: a `command`/`args` session carries no
+        // profile, so no binding selects it.
+        assert!(
+            !sc.ran("shell"),
+            "a `command`/`args` session reached the operator's provider"
+        );
+        let _ = planted.signal(Signal::Kill);
+        std::fs::remove_file(&sink).expect("clear the capture");
+
+        // ---- 2. the exploit, through the profile. The outcome is held,
+        // not unwrapped: what this row is about is that nothing *ran*, and
+        // that is asserted below against a real clock rather than a sleep.
+        let outcome = start_via_tool(
+            &server,
+            crate::mcp::tools::StartSessionArgs {
+                profile: Some(PROFILE.into()),
+                env: Some(HashMap::from([("PATH".to_string(), hijacked.clone())])),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // ---- 3. the same profile, unmolested — **and it is part 2's
+        // clock.** A negative about something that did not happen needs a
+        // bound on how long it was given to happen, and a fixed sleep is a
+        // load-dependent guess. This session completes the whole round
+        // trip the exploit would have needed and more: provider, PTY
+        // write, and the child's own transform.
+        let gate2 = sc.path("gate2");
+        let script2 = gated_echo_off(&gate2);
+        if let Ok(s) = server.registry.get(&id) {
+            let _ = s.signal(Signal::Kill);
+        }
+        let mut security2 = autofill_mode(
+            vec![sc.binding("shell2", PROFILE, &format!("printf '{PROBE}\\n'\n"))],
+            true,
+        );
+        security2.profiles = vec![crate::config::SessionProfile {
+            name: PROFILE.to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script2.clone()],
+            vars: Default::default(),
+            env: Default::default(),
+            cwd: None,
+        }];
+        let server2 = server_with(security2, &sc.audit_log());
+        let good = start_via_tool(
+            &server2,
+            crate::mcp::tools::StartSessionArgs {
+                profile: Some(PROFILE.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the operator's own profile must still start");
+        let s = server2.registry.get(&good).expect("the session");
+        std::fs::write(&gate2, b"go").expect("open the gate");
+        await_prompt(&s, b"Password: ").await;
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert!(sc.ran("shell2"), "the binding's provider never ran");
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "the resolved value reached the ring buffer"
+        );
+
+        // ---- and now part 2's assertions, in the order that puts the
+        // security failure first. **The capture is the exploit
+        // succeeding**; the absent session is the refusal having prevented
+        // the spawn; the message is only how an agent learns why.
+        assert!(
+            !sink.exists(),
+            "the agent's `PATH` reached the profile's `program`: the planted `sh` ran and \
+             captured {:?}",
+            std::fs::read_to_string(&sink).unwrap_or_default()
+        );
+        assert_eq!(
+            server.registry.all().len(),
+            1,
+            "the refused call created a session, so the refusal did not prevent the spawn"
+        );
+        let refused =
+            outcome.expect_err("an agent-supplied `env` alongside a profile must be refused");
+        assert!(
+            refused.contains("`env` is only meaningful with `command`"),
+            "{refused}"
+        );
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **GH #55, probe 2 — the one that matters.** An **absolute**
+    /// `program` is the obvious fix for probe 1 and it does not work: the
+    /// operator's binary runs the operator's argv, and the agent's
+    /// environment changes what that binary *does*.
+    ///
+    /// The issue drove `LD_PRELOAD`, which needs a compiler this suite
+    /// does not pin (REQ-TST-007). `BASH_ENV` is the same class in a form
+    /// this test can write for itself: `bash -c` sources it before the
+    /// command, so the redirection is inside a binary named by absolute
+    /// path. **That is the point rather than a weakening** — the class is
+    /// the whole environment, and `LD_PRELOAD`, `BASH_ENV`, `ENV`,
+    /// `PERL5OPT`, `PYTHONSTARTUP` and `SSH_ASKPASS` are members of it,
+    /// not the list of it. An allowlist would be enumerating them.
+    ///
+    /// Skips, loudly and as *skipped*, on a runner with no `bash`.
+    #[tokio::test]
+    async fn an_absolute_program_does_not_save_a_profile_from_an_agents_env() {
+        let Some(bash) = absolute_bash() else {
+            // **`diag!` and not `eprintln!`.** Every diagnostic in this
+            // crate goes through the redactor —
+            // `tests/source_guards.rs::no_module_in_this_crate_can_print_around_the_redactor`
+            // is the guard, and it caught the first spelling of this line.
+            crate::diag!(
+                "SKIPPED an_absolute_program_does_not_save_a_profile_from_an_agents_env: \
+                 no `bash` at /usr/bin, /bin or /usr/local/bin, and this row needs one to \
+                 drive `BASH_ENV` (REQ-TST-007)"
+            );
+            return;
+        };
+        assert!(
+            bash.is_absolute(),
+            "the premise of this row is an absolute `program`; got {bash:?}"
+        );
+
+        let mut sc = Scratch::new("gh55preload");
+        let sink = sc.path("stolen");
+        // The agent's redirection: sourced by `bash` *before* the
+        // operator's script, and it replaces `stty`/`read` with its own.
+        let preload = sc.path("preload.sh");
+        std::fs::write(
+            &preload,
+            format!(
+                "read() {{ builtin read \"$@\"; printf '%s' \"${{!1}}\" > '{}'; }}\n",
+                sink.display()
+            ),
+        )
+        .expect("write the preload");
+
+        let gate = sc.path("gate");
+        let script = gated_echo_off(&gate);
+        const PROFILE: &str = "absolute-shell";
+        let b = sc.binding("abs", PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let mut security = autofill_mode(vec![b], true);
+        security.profiles = vec![crate::config::SessionProfile {
+            name: PROFILE.to_string(),
+            // **Absolute**, so no `PATH` the agent sets can repoint it.
+            program: bash.to_string_lossy().into_owned(),
+            args: vec![
+                "--norc".to_string(),
+                "--noprofile".to_string(),
+                "-c".to_string(),
+                script.clone(),
+            ],
+            vars: Default::default(),
+            env: Default::default(),
+            cwd: None,
+        }];
+        let server = server_with(security, &sc.audit_log());
+
+        // ---- 1. the mechanism, on the arm that still takes `env`.
+        let id = start_via_tool(
+            &server,
+            crate::mcp::tools::StartSessionArgs {
+                command: Some(bash.to_string_lossy().into_owned()),
+                args: vec![
+                    "--norc".into(),
+                    "--noprofile".into(),
+                    "-c".into(),
+                    script.clone(),
+                ],
+                env: Some(HashMap::from([(
+                    "BASH_ENV".to_string(),
+                    preload.to_string_lossy().into_owned(),
+                )])),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a `command` session still takes an agent's env, deliberately");
+        let planted = server.registry.get(&id).expect("the session");
+        std::fs::write(&gate, b"go").expect("open the gate");
+        await_prompt(&planted, b"Password: ").await;
+        write_as_a_human(&planted, b"probe-value\n").await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !sink.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "`BASH_ENV` captured nothing, so every absence below is a claim about a \
+                 fixture that does not work — the operator's binary ran unmodified"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&sink).unwrap_or_default(),
+            "probe-value",
+            "the redirection captured something other than the value typed at it"
+        );
+        let _ = planted.signal(Signal::Kill);
+        std::fs::remove_file(&sink).expect("clear the capture");
+
+        // ---- 2. the exploit, through the profile. Held rather than
+        // unwrapped: part 3 is the clock the absence below is measured
+        // against.
+        let outcome = start_via_tool(
+            &server,
+            crate::mcp::tools::StartSessionArgs {
+                profile: Some(PROFILE.into()),
+                env: Some(HashMap::from([(
+                    "BASH_ENV".to_string(),
+                    preload.to_string_lossy().into_owned(),
+                )])),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // ---- 3. the same profile, unmolested, still resolves — and this
+        // is part 2's clock, for the reason the twin in
+        // `autofill_is_off_by_default` is: a fixed sleep is a
+        // load-dependent guess and this is a whole round trip.
+        let gate2 = sc.path("gate2");
+        let script2 = gated_echo_off(&gate2);
+        let mut security2 = autofill_mode(
+            vec![sc.binding("abs2", PROFILE, &format!("printf '{PROBE}\\n'\n"))],
+            true,
+        );
+        security2.profiles = vec![crate::config::SessionProfile {
+            name: PROFILE.to_string(),
+            program: bash.to_string_lossy().into_owned(),
+            args: vec![
+                "--norc".to_string(),
+                "--noprofile".to_string(),
+                "-c".to_string(),
+                script2.clone(),
+            ],
+            vars: Default::default(),
+            env: Default::default(),
+            cwd: None,
+        }];
+        let server2 = server_with(security2, &sc.audit_log());
+        let good = start_via_tool(
+            &server2,
+            crate::mcp::tools::StartSessionArgs {
+                profile: Some(PROFILE.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the operator's own profile must still start");
+        let s = server2.registry.get(&good).expect("the session");
+        std::fs::write(&gate2, b"go").expect("open the gate");
+        await_prompt(&s, b"Password: ").await;
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert!(sc.ran("abs2"), "the binding's provider never ran");
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "the resolved value reached the ring buffer"
+        );
+
+        // ---- part 2's assertions, security failure first.
+        assert!(
+            !sink.exists(),
+            "the agent's `BASH_ENV` reached an *absolute* `program`: the redirection ran \
+             and captured {:?} — an absolute path is not an alternative fix",
+            std::fs::read_to_string(&sink).unwrap_or_default()
+        );
+        assert_eq!(
+            server.registry.all().len(),
+            1,
+            "the refused call created a session, so the refusal did not prevent the spawn"
+        );
+        let refused =
+            outcome.expect_err("an agent-supplied `env` alongside a profile must be refused");
+        assert!(
+            refused.contains("`env` is only meaningful with `command`"),
+            "{refused}"
+        );
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// `bash`, by absolute path, or `None` on a runner without one.
+    ///
+    /// REQ-TST-007: a row whose subject is *"an absolute `program` does
+    /// not save you"* needs a real absolute path, and inventing
+    /// `/bin/bash` on a machine where it is `/usr/bin/bash` is a row that
+    /// tests its own guess.
+    fn absolute_bash() -> Option<PathBuf> {
+        ["/usr/bin/bash", "/bin/bash", "/usr/local/bin/bash"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+    }
+
+    /// The **argument-layer** half of GH #55, without a PTY: `env` and
+    /// `cwd` alongside a `profile` are refused, and a profile's own are
+    /// used in their place.
+    ///
+    /// The two rows above prove the refusal stops a real spawn; this one
+    /// pins the contract cheaply and covers the `cwd` half, which has no
+    /// exploit of its own in the issue but is the same hole (a `program`
+    /// may be relative to it, and an absolute one still reads its
+    /// configuration from where it runs).
+    #[tokio::test]
+    async fn a_profile_supplies_its_own_env_and_cwd_and_the_agent_supplies_neither() {
+        let sc = Scratch::new("gh55args");
+        let dir = sc.path("workdir");
+        std::fs::create_dir_all(&dir).expect("the profile's cwd");
+        const PROFILE: &str = "with-env";
+        let mut security = keychain_mode(vec![]);
+        security.profiles = vec![crate::config::SessionProfile {
+            name: PROFILE.to_string(),
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf 'HERE=%s\\n' \"$PWD$MARK\"".to_string(),
+            ],
+            vars: Default::default(),
+            env: [("MARK".to_string(), "-marked".to_string())]
+                .into_iter()
+                .collect(),
+            cwd: Some(dir.to_string_lossy().into_owned()),
+        }];
+        let server = server_with(security, &sc.audit_log());
+
+        for (key, args) in [
+            (
+                "`env` is only meaningful with `command`",
+                crate::mcp::tools::StartSessionArgs {
+                    profile: Some(PROFILE.into()),
+                    env: Some(HashMap::from([("X".to_string(), "y".to_string())])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "`cwd` is only meaningful with `command`",
+                crate::mcp::tools::StartSessionArgs {
+                    profile: Some(PROFILE.into()),
+                    cwd: Some("/tmp".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let e = start_via_tool(&server, args)
+                .await
+                .expect_err("an agent-supplied process is not a profile's process");
+            assert!(e.contains(key), "{e}");
+            assert!(
+                server.registry.all().is_empty(),
+                "a refused call left a child behind"
+            );
+        }
+
+        // **The pairing**, without which the two refusals above are
+        // satisfied by a profile that cannot start at all: the operator's
+        // own `env` and `cwd` reach the child.
+        let id = start_via_tool(
+            &server,
+            crate::mcp::tools::StartSessionArgs {
+                profile: Some(PROFILE.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the operator's own profile must start");
+        let s = server.registry.get(&id).expect("the session");
+        let want = format!(
+            "HERE={}-marked",
+            dir.canonicalize().expect("canonical").display()
+        );
+        let seen = buffer_until(&s, want.as_bytes(), 20).await;
+        assert!(
+            contains(&seen, want.as_bytes()),
+            "the child did not run in the profile's `cwd` with the profile's `env`: {}",
+            String::from_utf8_lossy(&seen)
+        );
         let _ = s.signal(Signal::Kill);
     }
 }

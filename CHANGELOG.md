@@ -22,9 +22,10 @@ surfaces rather than redacted on them.
   a status and a **byte count** — never the value, and never a handle it could
   exchange for one.
 - **Operator-declared session profiles** (`[[security.profiles]]`) and
-  `start_session(profile:, vars:)`. The operator writes the command line with
-  named slots; the agent supplies values into them and never writes a command
-  line. See **Security** for the whole of it.
+  `start_session(profile:, vars:)`. The operator writes the **process** — the
+  program, the argument template, the environment and the working directory —
+  and the agent supplies values into named slots. See **Security** for the
+  whole of it.
 - **`profile` on the session record and on `session_start`.** `status`,
   `list_sessions` and the audit log now say **where a session's command line
   came from** — the name of the `[[security.profiles]]` entry it was started
@@ -50,6 +51,14 @@ surfaces rather than redacted on them.
   every way a binding fails to resolve falls through silently to the human
   prompt, so *"your binding is exhausted"* is indistinguishable from *"you have
   no binding"*.
+
+  **What it *can* do, said plainly rather than overstated:** naming a profile
+  is naming a binding, so an agent with three credentialed profiles available
+  to it chooses among three credentials. The bound is that the operator wrote
+  the set, not that the agent is absent from the choice. Earlier drafts of
+  §9.6 said the agent had *"no input into which entry is selected"*; that was
+  false then and is false now, and this section has already been bitten once by
+  a §9.6 sentence that read as protective and was load-bearing the other way.
 - **`require_confirm` on a binding**, with the approval round trip to go with
   it: a new `BindingApprovalRequired` server frame and `ApproveBinding` client
   frame. The credential is resolved **after** the human approves and not
@@ -104,10 +113,14 @@ surfaces rather than redacted on them.
   name    = "prod-ssh"
   program = "ssh"                       # a literal; no {…}
   args    = ["{user}@{host}"]
+  cwd     = "/srv/deploy"               # literal, optional
 
     [security.profiles.vars]
     user = "^[a-z][a-z0-9_-]{0,30}$"
     host = "^prod-0[12]$"
+
+    [security.profiles.env]             # literal on both sides
+    SSH_AUTH_SOCK = "/run/holdfast/agent.sock"
 
   [[security.secret_bindings]]
   name    = "prod-ssh-cred"
@@ -115,8 +128,9 @@ surfaces rather than redacted on them.
   ```
 
   `start_session` gains `profile` and `vars`, mutually exclusive with
-  `command`/`args`. `command`/`args` is **unchanged** — nothing is at stake in a
-  session that cannot receive a credential.
+  `command`/`args` **and with `env`/`cwd`**. `command`/`args` sessions are
+  **unchanged** in every respect, `env` and `cwd` included — nothing is at
+  stake in a session that cannot receive a credential.
 
   **Why the shape changed rather than the check.** Four guard shapes over
   `match_command` were tried and each was defeated by someone who attacked it
@@ -146,14 +160,45 @@ surfaces rather than redacted on them.
   — it is **not expressible**: `ssh prod-01 -o ProxyCommand=…` is a four-element
   argv, and `program = "ssh"` with `args = ["{user}@{host}"]` is two.
 
-  **The rules, each a load error naming the key.** `program` is a literal and
-  admits no `{…}` — a slot there would let the agent choose the binary, which no
-  pattern over an *argument* can bound. Every `{name}` in `args` has a `vars`
-  entry and every `vars` entry is used by a slot: a slot with no pattern is
-  unguarded, and a pattern with no slot is a typo the operator should learn at
-  startup rather than at 3am. Each var pattern compiles wrapped exactly as the
-  renderer wraps it (`\A(?:…)\z`, by the same function at both ends). Profile
-  names are unique, and a binding naming an unknown profile is refused.
+  **The rules, each a load error naming the key.** `program`, `env` (keys
+  **and** values) and `cwd` are literals and admit no `{…}` — a slot in any of
+  them lets the agent choose which binary actually runs, which no pattern over
+  an *argument* can bound, and they are one rule because they are one hole.
+  Every `{name}` in `args` has a `vars` entry and every `vars` entry is used by
+  a slot: a slot with no pattern is unguarded, and a pattern with no slot is a
+  typo the operator should learn at startup rather than at 3am. Each var
+  pattern compiles wrapped exactly as the renderer wraps it (`\A(?:…)\z`, by
+  the same function at both ends). Profile names are unique, and a binding
+  naming an unknown profile is refused.
+
+- **The operator writes the *process*, not only the command line** (GH #55).
+  Profiles stopped the agent authoring the command line and left it authoring
+  the process: `start_session` took `env` and `cwd` from the agent on every
+  arm. **Driven twice.** `env: {PATH: …}` repointed a profile whose literal
+  `program` was `ssh` at the agent's own binary — the credential came back out
+  of `read_output` in cleartext, `redactions: {}`. `env: {LD_PRELOAD: …}`, with
+  `program` an **absolute path** and therefore the obvious fix for the first,
+  captured the credential out of the operator's binary running the operator's
+  argv.
+
+  **`require_confirm` is no mitigation.** The human is shown
+  `command_line: "ssh prod-01"` — the legitimate line, because it *is* the
+  legitimate line. The redirection lives in the environment, which the approval
+  frame does not carry; and with `autofill_on_echo_off = true` there is no tool
+  call and no human at all.
+
+  **The class is the whole environment, not a list of dangerous names.**
+  `LD_PRELOAD`, `BASH_ENV`, `ENV`, `PERL5OPT`, `PYTHONSTARTUP`, `SSH_ASKPASS`
+  and `LESSOPEN` are members of it and not the list of it, so an allowlist or a
+  blocklist of variables is the wrong shape here for exactly the reason the
+  `match_command` scanner was: it enumerates the ways an adversary can
+  influence a process, and there is no complete list. So **`env` and `cwd` are
+  mutually exclusive with `profile`**, and a profile declares its own.
+
+  **Operators upgrading:** `start_session(profile:, env:)` and `(profile:,
+  cwd:)` are argument errors where both worked before. If a credentialed
+  workflow genuinely needs an environment, write it into
+  `[security.profiles.env]`, where the agent cannot reach it.
 
   **What this does not close, stated plainly.** A profile bounds *which* command
   line a credential can reach and *which* credential an agent can obtain. It

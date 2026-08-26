@@ -132,6 +132,9 @@ strict_confirmation = false
 # argument and can never become a second one. Nothing here joins or
 # re-splits.
 # args    = ["{user}@{host}"]
+# The child's working directory. LITERAL and optional; a {...} here is
+# the `program` hole again, since a program may be relative to it.
+# cwd     = "/srv/deploy"
 #
 # Every slot in `args` needs an entry here and every entry needs a slot;
 # both directions are load errors, because a slot with no pattern is
@@ -141,6 +144,17 @@ strict_confirmation = false
 #   [security.profiles.vars]
 #   user = "^[a-z][a-z0-9_-]{0,30}$"
 #   host = "^prod-0[12]$"
+#
+# Extra environment for the child, LITERAL on both sides (§9.6, rev. 56,
+# GH #55). A profile-started session takes NO env from the agent at all
+# -- start_session(env:) alongside a profile is an argument error --
+# because the environment chooses which binary the profile's `program`
+# actually runs: PATH picks the file, and LD_PRELOAD picks what an
+# absolute path executes once it has. Both were driven. The class is the
+# whole environment rather than a list of names, so there is no
+# allowlist here and there will not be one.
+#   [security.profiles.env]
+#   SSH_AUTH_SOCK = "/run/holdfast/agent.sock"
 
 # Operator-configured secret bindings (§9.6). The agent supplies only
 # the session id and the prompt text -- it cannot name a secret, and
