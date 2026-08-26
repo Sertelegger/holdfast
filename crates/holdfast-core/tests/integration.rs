@@ -72,21 +72,19 @@ fn spawns_a_shell_and_reads_output() {
     pty.signal(Signal::Kill).unwrap();
 }
 
-// Linux-only, and the narrowing is §4.4's rather than a convenience.
-// The assertion is about a *descendant* pid outliving the sweep, probed
-// with `kill(pid, 0)`; Windows job objects are 0.0.7's, and get their own
-// test rather than a contorted version of this one.
+// Unix-wide again, because macOS now enumerates the session rather than
+// degrading to `{pgid, tcgetpgrp(master)}`. The assertion is about a
+// *descendant* pid outliving the sweep, probed with `kill(pid, 0)`;
+// Windows job objects are 0.0.7's and get their own test rather than a
+// contorted version of this one.
 //
-// **Why not `#[cfg(unix)]`, which is what this was.** §4.4 specifies the
-// full session enumeration for Linux alone: off Linux the sweep degrades
-// to `{pgid, tcgetpgrp(master)}`, a set that by construction cannot name
-// a job the shell backgrounded into its own group. So on macOS this
-// asserted a guarantee the spec does not make, and failed for the reason
-// the spec gives. What §4.4 *does* promise there is asserted directly
-// below, which is why this gate narrows rather than the assertion
-// loosening: a test that passed on both platforms by weakening to
-// "either outcome is fine" would stop guarding either one.
-#[cfg(target_os = "linux")]
+// **This gate has moved twice, and the second move is the interesting
+// one.** It was `#[cfg(unix)]`, narrowed to Linux when macOS failed it,
+// and is Unix-wide once more now that the failure has been read
+// correctly: the sweep was never the thing that was broken. The test
+// polled a session nobody was draining, which on macOS stalls the shell
+// mid-echo before it forks (see `draining`), so the descendant the sweep
+// was blamed for missing had not been started yet.
 #[test]
 fn terminate_kills_the_whole_process_group() {
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
@@ -110,7 +108,7 @@ fn terminate_kills_the_whole_process_group() {
     assert!(pid_alive(child_pid), "descendant never started");
 
     pty.signal(Signal::Kill).unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    draining(&pty, || std::thread::sleep(Duration::from_millis(500)));
 
     assert!(
         !pid_alive(child_pid),
@@ -126,7 +124,15 @@ fn terminate_kills_the_whole_process_group() {
     );
 }
 
-/// §4.4's documented off-Linux limitation, asserted rather than assumed.
+/// §4.4's documented off-Linux limitation, asserted rather than assumed,
+/// on the platforms where it still applies.
+///
+/// **Updated rather than deleted, which is what this test was for.** It
+/// was written to fail the day the full enumeration landed off Linux,
+/// and that day came for macOS: the `cfg` now excludes it, and
+/// `terminate_kills_the_whole_process_group` covers it instead. What is
+/// left is the BSDs, where `kinfo_proc` is a different struct than the
+/// one the macOS arm reads and no enumeration is written.
 ///
 /// Where there is no `/proc` the sweep degrades to the distinct set
 /// `{pgid, tcgetpgrp(master)}`, so a job the shell backgrounded into its
@@ -146,7 +152,7 @@ fn terminate_kills_the_whole_process_group() {
 /// Both halves of the assertion matter. The leader having died is what
 /// makes the surviving descendant a *leak* rather than the unremarkable
 /// result of a sweep that did nothing at all.
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 #[test]
 fn the_off_linux_sweep_leaks_exactly_what_section_4_4_says_it_does() {
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
@@ -2156,8 +2162,18 @@ async fn env_session_lifecycle(
 
     let session = server.registry.get(&id).unwrap();
     let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+    // One `printenv` per name, not `printenv A B C`. GNU's takes a list;
+    // **BSD's takes a single operand and silently ignores the rest**,
+    // exiting 0 — so on macOS the multi-name form printed only the first
+    // value and this helper's own non-vacuity check then failed, reporting
+    // env that had in fact reached the child perfectly well.
+    let probe = names
+        .iter()
+        .map(|n| format!("printenv {n}"))
+        .collect::<Vec<_>>()
+        .join("; ");
     session
-        .write_input(format!("printenv {}\n", names.join(" ")).as_bytes())
+        .write_input(format!("{probe}\n").as_bytes())
         .unwrap();
     // Wait for the *last* value to appear, so every one of them has been
     // through the PTY before the log is read.

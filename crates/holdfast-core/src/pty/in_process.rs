@@ -77,6 +77,42 @@ fn killpg(pgid: i32, signum: i32) -> std::io::Result<()> {
     }
 }
 
+/// Every pid on the machine, from `libproc`.
+///
+/// `sysctl(KERN_PROC_ALL)` answers the same question, but as an array of
+/// `kinfo_proc` — a struct `libc` does not define for Apple at all, so
+/// reading it would mean re-declaring a 648-byte layout here and owning
+/// it across OS releases. `proc_listallpids` hands back plain pids, and
+/// the two fields this sweep wants are one POSIX call each.
+///
+/// Sized, then filled. The size is an over-estimate on purpose — it pads
+/// for a table that grows between the calls — so the count that matters
+/// is the one the *second* call returns.
+#[cfg(target_os = "macos")]
+fn all_pids() -> Vec<i32> {
+    // SAFETY: a null buffer of length zero asks for the count and writes
+    // nothing.
+    let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if estimate <= 0 {
+        return Vec::new();
+    }
+    let mut pids = vec![0i32; estimate as usize];
+    let bytes = std::mem::size_of_val(pids.as_slice()) as libc::c_int;
+    // SAFETY: `pids` owns `bytes` bytes, which is exactly what the call
+    // is told it may fill; it returns the number of pids it wrote.
+    let written = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    if written <= 0 {
+        return Vec::new();
+    }
+    // `min` because a return larger than the buffer would be a kernel
+    // that ignored the length, and truncate would then hand out
+    // uninitialised entries as pids.
+    pids.truncate((written as usize).min(pids.len()));
+    // libproc leaves holes: a live table reliably carries a 0 entry.
+    pids.retain(|pid| *pid > 0);
+    pids
+}
+
 impl InProcessPty {
     pub fn spawn(cfg: &PtySpawnConfig) -> Result<Self> {
         let sys = native_pty_system();
@@ -305,21 +341,44 @@ impl InProcessPty {
         }
     }
 
-    /// Degraded sweep for Unix platforms without `/proc` (§4.4).
+    /// Every distinct process group in the child's session (REQ-P-006),
+    /// by the same predicate as the Linux arm rather than an
+    /// approximation of it — so the job-control clause of REQ-P-006 holds
+    /// here too, and §4.4's degraded `{pgid, tcgetpgrp(master)}` set is no
+    /// longer what macOS gets.
     ///
-    /// Full enumeration off Linux does **not** go through
-    /// `sysctl(KERN_PROC_SESSION)`, which this comment named until it was
-    /// measured: XNU registers no such OID, so the call fails `ENOENT`
-    /// outright — `kern.proc` skips `3`, going `PGRP` (2) straight to
-    /// `TTY` (4), and libc exporting the constant says only that it is in
-    /// the BSD headers. `kinfo_proc`'s `e_sess` is NULL on every process
-    /// besides, and libc declares no `kinfo_proc` for Apple at all, so
-    /// both of the other BSD routes are shut too. The one that answers is
-    /// `proc_listallpids` plus `getsid(2)`; it stays post-v0.1.0, and
-    /// §4.4 carries the measurement and the reason it did not land here.
-    #[cfg(all(unix, not(target_os = "linux")))]
+    /// The route is `proc_listallpids` plus `getsid(2)` and **not**
+    /// `sysctl(KERN_PROC_SESSION)`, which §4.4 named until it was
+    /// measured: XNU registers no such OID and the call answers `ENOENT`.
+    /// `kinfo_proc`'s `e_sess` is NULL on every process besides, and libc
+    /// declares no `kinfo_proc` for Apple at all, so both of the other
+    /// BSD-shaped routes are shut.
+    #[cfg(target_os = "macos")]
     fn session_pgids(&self) -> Vec<i32> {
-        self.fallback_pgids()
+        let Some(sid) = self.pgid() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for pid in all_pids() {
+            // SAFETY: `getsid` takes no pointers. A pid that exited
+            // between the enumeration and here answers -1, which is no
+            // session's id — the race resolves to "not mine", which is
+            // the safe direction.
+            if unsafe { libc::getsid(pid) } != sid {
+                continue;
+            }
+            // SAFETY: as above. Asked only of the session's own members,
+            // so this is one syscall per hit, not one per process.
+            let pgrp = unsafe { libc::getpgid(pid) };
+            if pgrp > 0 && !out.contains(&pgrp) {
+                out.push(pgrp);
+            }
+        }
+        if out.is_empty() {
+            self.fallback_pgids()
+        } else {
+            out
+        }
     }
 
     #[cfg(unix)]
