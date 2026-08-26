@@ -440,7 +440,7 @@ async fn start(server: &HoldfastServer, args: StartSessionArgs) -> String {
 /// configuration of any kind (REQ-PD-003).
 fn bash() -> StartSessionArgs {
     StartSessionArgs {
-        command: "bash".into(),
+        command: Some("bash".into()),
         args: vec!["--norc".into(), "--noprofile".into()],
         env: term(),
         ..Default::default()
@@ -451,7 +451,7 @@ fn bash() -> StartSessionArgs {
 /// — used for the rows that need a program with no shell around it.
 fn bash_c(command: &str) -> StartSessionArgs {
     StartSessionArgs {
-        command: "bash".into(),
+        command: Some("bash".into()),
         args: vec![
             "--norc".into(),
             "--noprofile".into(),
@@ -491,7 +491,7 @@ fn already_marking_bash() -> StartSessionArgs {
     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
     .collect();
     StartSessionArgs {
-        command: "bash".into(),
+        command: Some("bash".into()),
         args: vec!["--norc".into(), "--noprofile".into()],
         env: Some(env),
         ..Default::default()
@@ -500,7 +500,7 @@ fn already_marking_bash() -> StartSessionArgs {
 
 fn program(command: &str, args: &[&str]) -> StartSessionArgs {
     StartSessionArgs {
-        command: command.into(),
+        command: Some(command.into()),
         args: args.iter().map(|a| (*a).to_string()).collect(),
         env: term(),
         ..Default::default()
@@ -1361,7 +1361,7 @@ async fn matrix_rows_7_and_7b_a_readline_repl_answers_the_same_either_way() {
     let own = start(
         &server,
         StartSessionArgs {
-            command: "python3".into(),
+            command: Some("python3".into()),
             args: vec!["-q".into()],
             env: Some(env.clone()),
             ..Default::default()
@@ -1895,7 +1895,7 @@ async fn fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes(
     let id = start(
         &server,
         StartSessionArgs {
-            command: "fish".into(),
+            command: Some("fish".into()),
             args: fish_args(),
             env: term(),
             ..Default::default()

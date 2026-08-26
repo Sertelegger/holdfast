@@ -178,7 +178,7 @@ fn bash_args() -> Vec<String> {
 async fn start_bash(server: &HoldfastServer) -> (String, CallToolResult) {
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             ..Default::default()
         }))
@@ -940,7 +940,7 @@ async fn start_session_spawn_failed_response_matches_its_schema() {
     let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "holdfast-no-such-program-9f2a".into(),
+            command: Some("holdfast-no-such-program-9f2a".into()),
             ..Default::default()
         }))
         .await
@@ -983,7 +983,7 @@ async fn start_session_name_taken_response_matches_its_schema() {
     let before = server.registry.all().len();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             name: Some("taken".into()),
             ..Default::default()
@@ -1022,7 +1022,7 @@ async fn start_session_limit_reached_response_matches_its_schema() {
 
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             ..Default::default()
         }))
@@ -3033,7 +3033,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
     for _ in 0..2 {
         let r = server
             .start_session(Parameters(StartSessionArgs {
-                command: "bash".into(),
+                command: Some("bash".into()),
                 args: bash_args(),
                 name: Some("taken".into()),
                 ..Default::default()
@@ -3047,7 +3047,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
     note(&body(
         &server
             .start_session(Parameters(StartSessionArgs {
-                command: "holdfast-no-such-binary-anywhere".into(),
+                command: Some("holdfast-no-such-binary-anywhere".into()),
                 ..Default::default()
             }))
             .await
@@ -3084,7 +3084,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
         note(&body(
             &server_one
                 .start_session(Parameters(StartSessionArgs {
-                    command: "bash".into(),
+                    command: Some("bash".into()),
                     args: bash_args(),
                     ..Default::default()
                 }))
@@ -3100,7 +3100,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
     {
         let r = server
             .start_session(Parameters(StartSessionArgs {
-                command: "bash".into(),
+                command: Some("bash".into()),
                 args: bash_args(),
                 shell_integration: Some(false),
                 ..Default::default()

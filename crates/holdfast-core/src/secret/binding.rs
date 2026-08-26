@@ -6332,7 +6332,7 @@ mod tests {
 
         let started = server
             .start_session(Parameters(crate::mcp::tools::StartSessionArgs {
-                command: "sh".into(),
+                command: Some("sh".into()),
                 args: vec!["-c".into(), script.clone()],
                 ..Default::default()
             }))

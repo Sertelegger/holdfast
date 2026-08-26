@@ -242,7 +242,7 @@ async fn start_session_returns_a_session_id() {
     let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             name: Some("t1".into()),
             cwd: None,
@@ -277,7 +277,7 @@ async fn start_session_returns_a_session_id() {
 async fn duplicate_name_is_rejected() {
     let server = HoldfastServer::new();
     let mk = |name: &str| StartSessionArgs {
-        command: "bash".into(),
+        command: Some("bash".into()),
         args: bash_args(),
         name: Some(name.into()),
         cwd: None,
@@ -304,7 +304,7 @@ async fn start_session_rejects_a_nonexistent_cwd() {
     let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             name: None,
             cwd: Some("/no/such/directory/anywhere".into()),
@@ -324,7 +324,7 @@ async fn start_session_reports_spawn_failed_without_leaking_the_path() {
     let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "holdfast_definitely_not_a_real_program".into(),
+            command: Some("holdfast_definitely_not_a_real_program".into()),
             args: vec![],
             name: None,
             cwd: None,
@@ -364,7 +364,7 @@ async fn start_session_runs_in_the_requested_cwd_and_passes_env() {
 
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             name: None,
             cwd: Some(dir.to_string_lossy().into_owned()),
@@ -428,7 +428,7 @@ async fn read_until_contains(
 async fn start_bash(server: &HoldfastServer) -> String {
     let started = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             name: None,
             cwd: None,
@@ -447,7 +447,7 @@ async fn start_bash(server: &HoldfastServer) -> String {
 async fn start_script(server: &HoldfastServer, script: &str) -> String {
     let started = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec![
                 "--norc".into(),
                 "--noprofile".into(),
@@ -587,7 +587,7 @@ async fn read_output_tail_lines_respects_max_bytes() {
     let server = HoldfastServer::new();
     let started = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec![
                 "--norc".into(),
                 "--noprofile".into(),
@@ -866,7 +866,7 @@ async fn terminate_without_force_delivers_sigterm_first() {
     let server = HoldfastServer::new();
     let started = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec![
                 "--norc".into(),
                 "--noprofile".into(),
@@ -907,7 +907,7 @@ async fn send_input_to_an_exited_session_reports_session_died() {
     let server = HoldfastServer::new();
     let started = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec!["-c".into(), "exit 0".into()],
             name: None,
             cwd: None,
@@ -1233,7 +1233,7 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
 
     let relative = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             name: None,
             cwd: Some(".".into()),
@@ -1272,7 +1272,7 @@ async fn start_session_returns_the_effective_cwd_not_the_requested_one() {
 
     let symlinked = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             name: None,
             cwd: Some(link.to_string_lossy().into_owned()),
@@ -1560,7 +1560,7 @@ async fn start_session_rejects_a_bad_prompt_pattern() {
     let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             prompt_patterns: Some(vec![PromptPatternArg {
                 regex: "(unclosed".into(),
@@ -1591,7 +1591,7 @@ async fn start_session_rejects_a_bad_prompt_pattern() {
     // 200,044-byte `invalid_params` message.
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             prompt_patterns: Some(vec![PromptPatternArg {
                 regex: "(".repeat(200_000),
@@ -1611,7 +1611,7 @@ async fn start_session_rejects_a_bad_prompt_pattern() {
     // anything is compiled at all.
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             prompt_patterns: Some(
                 (0..500)
@@ -1632,7 +1632,7 @@ async fn start_session_rejects_a_bad_prompt_pattern() {
     // rejected everything.
     let ok = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             prompt_patterns: Some(vec![PromptPatternArg {
                 regex: "(closed)".into(),
@@ -1660,7 +1660,7 @@ async fn start_session_honours_prompt_patterns_and_replace() {
         let server = HoldfastServer::new();
         let started = server
             .start_session(Parameters(StartSessionArgs {
-                command: "bash".into(),
+                command: Some("bash".into()),
                 args: bash_args(),
                 prompt_patterns: Some(vec![PromptPatternArg {
                     regex: "$".into(),
@@ -1695,7 +1695,7 @@ async fn start_session_honours_settle_threshold_ms() {
     let server = HoldfastServer::new();
     let slow = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             settle_threshold_ms: Some(3_600_000),
             ..Default::default()
@@ -1734,7 +1734,7 @@ async fn start_session_reports_and_can_disable_shell_integration() {
 
     let on = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             ..Default::default()
         }))
@@ -1748,7 +1748,7 @@ async fn start_session_reports_and_can_disable_shell_integration() {
 
     let off = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             shell_integration: Some(false),
             ..Default::default()
@@ -1984,7 +1984,7 @@ async fn env_session_lifecycle(
         .collect();
     let started = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             env: Some(map),
             ..Default::default()
@@ -2104,7 +2104,7 @@ async fn session_start_records_the_field_set_9_4_names() {
 
     let started = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: bash_args(),
             cwd: Some(cwd.to_string_lossy().into_owned()),
             ..Default::default()
@@ -2428,7 +2428,7 @@ async fn started_session(server: &HoldfastServer) -> String {
     // today and a re-break every milestone after.
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec!["--norc".into(), "--noprofile".into()],
             // Explicitly OFF, and not a style choice. `start_session`
             // defaults `shell_integration` to true and injects the OSC 133
@@ -2870,7 +2870,7 @@ async fn status_redacts_the_command_that_started_the_session() {
     let key = aws_key();
     let started = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec![
                 "--norc".into(),
                 "--noprofile".into(),
@@ -2935,7 +2935,7 @@ async fn list_sessions_redacts_args_element_wise() {
     let token = format!("ghp_{TOKEN_TAIL}");
     let started = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec![
                 "--norc".into(),
                 "--noprofile".into(),

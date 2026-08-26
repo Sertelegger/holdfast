@@ -139,6 +139,19 @@ pub struct SessionConfig {
     /// wall-clock fact reported to a caller, not a deadline — the same
     /// rule `daemon::server::unix_secs_now` follows.
     pub clock: Clock,
+    /// §9.6's operator-declared session profile this session was started
+    /// from, if any (GH #46). **This is what a `SecretBinding` selects
+    /// on**, and it is `None` for every session started with
+    /// `command`/`args` — which is the whole of *"a session started with
+    /// `command`/`args` can never receive a keychain credential"*.
+    ///
+    /// It is a **name the operator wrote**, copied from
+    /// `SecurityConfig::profiles` by `start_session` after the profile was
+    /// looked up. The agent supplies a name to look one *up* by; it
+    /// cannot supply the value that lands here, because a name that
+    /// matches no profile is an argument error and the call never reaches
+    /// a spawn.
+    pub profile: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -152,6 +165,10 @@ impl Default for SessionConfig {
             terminal_query_replies_per_min: DEFAULT_TERMINAL_QUERY_REPLIES_PER_MIN,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             clock: Clock::system(),
+            // The default is *no profile*, which is the shape that
+            // resolves no credential. A session has to be given one
+            // deliberately.
+            profile: None,
         }
     }
 }
@@ -175,6 +192,10 @@ pub struct Session {
     pub name: Option<String>,
     pub command: String,
     pub args: Vec<String>,
+    /// §9.6's session profile this session was started from, or `None` for
+    /// a `command`/`args` session. See [`SessionConfig::profile`]; it is
+    /// the **only** thing `secret::binding::select` selects on.
+    pub profile: Option<String>,
     backend: Arc<dyn PtyBackend>,
     buffer: Arc<Mutex<OutputBuffer>>,
     /// Tier-B terminal state (spec §4.5). Locked *before* `buffer` on the
@@ -650,6 +671,7 @@ impl Session {
             name,
             command,
             args,
+            profile: config.profile.clone(),
             backend: Arc::clone(&backend),
             buffer: Arc::clone(&buffer),
             screen: Arc::clone(&screen),
@@ -2963,6 +2985,10 @@ mod tests {
                 terminal_query_replies_per_min: 1,
                 idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
                 clock: Clock::system(),
+                // Named for the same reason: `Option<String>` beside
+                // `Option<Shell>` is another same-shaped neighbour, and
+                // `None` here is the ordinary `command`/`args` session.
+                profile: None,
             },
         );
         pty.queue_output(&bytes);

@@ -36,7 +36,7 @@ async fn start_bash(server: &HoldfastServer, screen_tracking: Option<&str>) -> S
         // more. Naming them all is `error[E0063]` today and a re-break
         // every milestone after.
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec!["--norc".into(), "--noprofile".into()],
             cols: Some(COLS),
             rows: Some(ROWS),
@@ -602,7 +602,7 @@ async fn a_single_cell_change_diffs_small_and_replays_to_the_new_screen() {
     let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec![
                 "--norc".into(),
                 "--noprofile".into(),
@@ -700,7 +700,7 @@ async fn a_secret_on_screen_is_redacted_in_both_the_grid_and_the_diff() {
     let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec![
                 "--norc".into(),
                 "--noprofile".into(),
@@ -795,7 +795,7 @@ async fn disabling_redaction_on_a_screen_read_returns_the_secret_and_is_audited(
 
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec![
                 "--norc".into(),
                 "--noprofile".into(),
@@ -931,7 +931,7 @@ async fn an_unknown_screen_tracking_mode_is_a_protocol_error() {
     let server = HoldfastServer::new();
     let r = server
         .start_session(Parameters(StartSessionArgs {
-            command: "bash".into(),
+            command: Some("bash".into()),
             args: vec!["--norc".into(), "--noprofile".into()],
             screen_tracking: Some("sometimes".into()),
             ..Default::default()

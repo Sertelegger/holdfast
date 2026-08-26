@@ -23,9 +23,26 @@ use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router, ErrorData};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// What §5.2's mutually exclusive pair resolved to: the program and argv
+/// the child will actually be spawned with, and the operator's profile
+/// name when there was one.
+///
+/// **It exists so there is exactly one place `start_session` reads a
+/// command line from.** With `command`/`args` and `profile`/`vars` both on
+/// the argument struct, a later edit that reached for `args.command`
+/// somewhere below would silently reintroduce the agent-authored
+/// command line for that one surface — the audit record, the spawn, the
+/// `details` string. Resolving once, into a type with no `Option<String>`
+/// command, makes that a compile error rather than a review catch.
+struct Launch {
+    command: String,
+    args: Vec<String>,
+    profile: Option<String>,
+}
 
 /// Hard cap on a single `send_input` payload.
 ///
@@ -134,11 +151,25 @@ fn unix_secs(t: std::time::SystemTime) -> u64 {
 /// each time are pure churn.
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct StartSessionArgs {
-    /// Program to run, e.g. "bash".
-    pub command: String,
-    /// Arguments passed to the program.
+    /// Program to run, e.g. "bash". Mutually exclusive with `profile`;
+    /// supply exactly one.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments passed to the program. Only with `command`.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Name of an operator-declared session profile to start (spec §9.6).
+    /// The operator wrote the command line; supply values for its slots in
+    /// `vars`. Mutually exclusive with `command`/`args`. **Only a
+    /// profile-started session can be given a keychain credential.**
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Values for the named slots in `profile`'s argument template. Every
+    /// slot needs one, no other key is accepted, and each value must match
+    /// the pattern the operator declared for that slot. Only with
+    /// `profile`.
+    #[serde(default)]
+    pub vars: Option<BTreeMap<String, String>>,
     /// Optional human-readable alias, unique among live sessions.
     #[serde(default)]
     pub name: Option<String>,
@@ -218,8 +249,13 @@ impl HoldfastServer {
         &self,
         Parameters(args): Parameters<StartSessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let mut cfg = PtySpawnConfig::new(&args.command);
-        cfg.args = args.args.clone();
+        // §5.2's mutually exclusive pair, resolved **before** anything
+        // else looks at a command line. Everything below reads `launch`
+        // and not `args.command`/`args.args`, so there is one place the
+        // child's argv comes from.
+        let launch = self.resolve_launch(&args)?;
+        let mut cfg = PtySpawnConfig::new(&launch.command);
+        cfg.args = launch.args.clone();
 
         // `portable-pty` silently *discards* a cwd that is not an existing
         // directory and falls back to $HOME, so an unvalidated cwd means
@@ -328,7 +364,7 @@ impl HoldfastServer {
                 patterns,
             },
             shell_integration: if args.shell_integration.unwrap_or(true) {
-                detect_shell(&args.command, &args.args)
+                detect_shell(&launch.command, &launch.args)
             } else {
                 None
             },
@@ -343,6 +379,15 @@ impl HoldfastServer {
             // `idle_timeout_secs` here — and unifying them would delete
             // the distinction the precedence rule is about.
             idle_timeout_secs: idle_timeout_secs_resolved,
+            // §9.6, GH #46. **The name the operator wrote**, taken off the
+            // profile that was looked up rather than off the argument that
+            // looked it up — so a session can only carry a profile the
+            // config declares. It is the only thing `secret::binding`
+            // selects on, and it is `None` for a `command`/`args` session,
+            // which is what makes *"a session started with `command`/`args`
+            // can never receive a keychain credential"* a property of the
+            // data rather than a check.
+            profile: launch.profile.clone(),
             // §16.7's other half. `..SessionConfig::default()` supplies
             // `Clock::system()`, so leaving this unset stamps the
             // session's deadline from wall time while the reaper decides
@@ -360,7 +405,7 @@ impl HoldfastServer {
                 // the whole $PATH, which would land in the transcript.
                 return Ok(envelope::envelope(
                     Status::SpawnFailed,
-                    json!({ "command": args.command }),
+                    json!({ "command": launch.command }),
                     format!("spawn failed: {}", envelope::brief(&e)),
                 ));
             }
@@ -369,8 +414,8 @@ impl HoldfastServer {
         let session = Session::new(
             new_session_id(),
             args.name.clone(),
-            args.command.clone(),
-            args.args.clone(),
+            launch.command.clone(),
+            launch.args.clone(),
             backend,
             config,
         );
@@ -486,8 +531,111 @@ impl HoldfastServer {
                 "shell_integration": session.shell_integration.map(|s| s.as_str()),
                 "started_at_unix_secs": unix_secs(session.created_at),
             }),
-            format!("started `{}` as {}", args.command, session.id),
+            format!("started `{}` as {}", launch.command, session.id),
         ))
+    }
+
+    /// §5.2's mutually exclusive pair: `command`/`args`, or `profile`/`vars`.
+    ///
+    /// **Every refusal here is an input violation (§5.1) and therefore
+    /// `invalid_params`, not a `Status`.** That is this tool's own habit —
+    /// `cwd is not an existing directory` and `screen_tracking must be off,
+    /// adaptive or on` are the two already in this function — and
+    /// `request_secret_input` states the rule outright: *"an input-schema
+    /// violation is `invalid_params`"*. No new `Status` variant was added
+    /// and none of the existing eleven describes an argument the caller
+    /// could fix, so this adds nothing to §18.1's ordering, its six
+    /// enumeration sites, or
+    /// `every_declared_status_is_returned_by_a_real_response`.
+    ///
+    /// **A refusal for a failed slot pattern names the *var* and never
+    /// echoes the value** — it may be a hostname the operator considers
+    /// sensitive, and §9.2's habit is to name the field rather than the
+    /// content. `secret::profile::VarFault`'s `Display` is where that is
+    /// enforced, so this function cannot leak a value by forgetting to.
+    fn resolve_launch(&self, args: &StartSessionArgs) -> Result<Launch, ErrorData> {
+        match (&args.command, &args.profile) {
+            (Some(_), Some(_)) => Err(ErrorData::invalid_params(
+                "`command` and `profile` are mutually exclusive: supply `command`/`args` for \
+                 an ordinary session, or `profile`/`vars` for an operator-declared one"
+                    .to_string(),
+                None,
+            )),
+            (None, None) => Err(ErrorData::invalid_params(
+                "start_session needs either `command` or `profile`".to_string(),
+                None,
+            )),
+            (Some(command), None) => {
+                // **`vars` without a `profile` is refused rather than
+                // ignored.** An agent that believes it constrained a
+                // session and did not is an agent acting on a session that
+                // is not the one it asked for.
+                if args.vars.is_some() {
+                    return Err(ErrorData::invalid_params(
+                        "`vars` is only meaningful with `profile`; a `command` session has no \
+                         slots to fill"
+                            .to_string(),
+                        None,
+                    ));
+                }
+                Ok(Launch {
+                    command: command.clone(),
+                    args: args.args.clone(),
+                    profile: None,
+                })
+            }
+            (None, Some(name)) => {
+                // **`args` alongside a `profile` is refused, and this is
+                // the one refusal in this function that is load-bearing
+                // rather than tidy.** The whole property is that arguments
+                // come from the operator's template, so an agent-supplied
+                // `args` appended to the rendered argv would hand back
+                // exactly the capability profiles exist to remove. It is
+                // *also* structurally impossible — nothing below reads
+                // `args.args` on this arm — and refusing as well means an
+                // agent that passed some is told so rather than silently
+                // running a session it did not ask for.
+                if !args.args.is_empty() {
+                    return Err(ErrorData::invalid_params(
+                        "`args` is only meaningful with `command`: a profile's arguments come \
+                         from the operator's template, and supplying more would be the thing \
+                         profiles exist to prevent"
+                            .to_string(),
+                        None,
+                    ));
+                }
+                let Some(profile) = self
+                    .config
+                    .security
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == *name)
+                else {
+                    // The **name**, which the agent supplied, and no list
+                    // of the profiles that do exist: an operator's profile
+                    // names are their configuration, and enumerating them
+                    // for a caller that guessed wrong is a surface §9.6
+                    // does not give the agent anywhere else.
+                    return Err(ErrorData::invalid_params(
+                        format!("no session profile named `{name}` is configured"),
+                        None,
+                    ));
+                };
+                let supplied = args.vars.clone().unwrap_or_default();
+                let rendered = crate::secret::profile::render(profile, &supplied)
+                    .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+                Ok(Launch {
+                    command: profile.program.clone(),
+                    args: rendered,
+                    // The **profile's** name and not the argument's, so a
+                    // session can only ever carry a name the config
+                    // declares. They are equal here; taking it from the
+                    // profile is what keeps that true if the lookup ever
+                    // stops being an exact-name comparison.
+                    profile: Some(profile.name.clone()),
+                })
+            }
+        }
     }
 
     /// Read output from a session. Supply exactly one of since_cursor,
@@ -3321,6 +3469,7 @@ pub struct GetCommandHistoryArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SessionProfile;
     use crate::pty::MockPty;
     use crate::session::{new_session_id, Session, SessionConfig};
     use serde_json::Value;
@@ -3456,7 +3605,7 @@ mod tests {
             .start_session(Parameters(StartSessionArgs {
                 // Reads its PTY and stays alive, so the session is live
                 // when the reaper looks at it.
-                command: "cat".into(),
+                command: Some("cat".into()),
                 ..Default::default()
             }))
             .await
@@ -3517,7 +3666,7 @@ mod tests {
             .start_session(Parameters(StartSessionArgs {
                 // Reads its PTY and stays alive, so nothing races the
                 // log write with an exit.
-                command: "cat".into(),
+                command: Some("cat".into()),
                 ..Default::default()
             }))
             .await
@@ -3564,6 +3713,422 @@ mod tests {
             session_start_entry(&on).await["redaction_enabled"],
             serde_json::json!(true),
             "a row hardcoded to `false` satisfies the assertion above perfectly"
+        );
+    }
+
+    // ============================== §9.6's session profiles (GH #46)
+    //
+    // **The adversarial pairing is the first two rows**, deliberately: a
+    // positive that fails at the top if the wiring resolves nothing, and
+    // then the negatives.
+    //
+    // The rows that would *render successfully* drive `echo-host`, whose
+    // `program` is `echo`. The ones whose subject is GH #45 drive
+    // `prod-ssh`, whose `program` is `ssh` — through [`resolve_launch`]
+    // rather than through the tool, because the whole point of those rows
+    // is the argv, and running them through `start_session` would mean
+    // actually executing `ssh` at a `ProxyCommand` an agent chose. The
+    // link between the two — that `start_session`'s session carries
+    // exactly what `resolve_launch` returned — is itself an assertion, in
+    // `a_profile_started_session_carries_the_operators_own_argv`.
+
+    fn profile(name: &str, program: &str, args: &[&str], vars: &[(&str, &str)]) -> SessionProfile {
+        SessionProfile {
+            name: name.to_string(),
+            program: program.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            vars: vars
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
+    /// The three profiles these rows use — **validated through the real
+    /// loader**, so none of them is a profile no operator could write.
+    ///
+    /// `wide` is deliberately as sloppy as a profile gets: `host` admits
+    /// literally anything. It loads, which is §9.6's stated asymmetry —
+    /// a slot is bounded, so a wide slot pattern is bounded damage, where
+    /// `match_command = ".*"` was a load error because it was not.
+    fn profiles_config() -> crate::config::Config {
+        let mut cfg =
+            crate::config::parse_str("").expect("the empty document is the shipped default");
+        cfg.security.profiles = vec![
+            profile(
+                "prod-ssh",
+                "ssh",
+                &["{user}@{host}"],
+                &[
+                    ("user", "^[a-z][a-z0-9_-]{0,30}$"),
+                    ("host", "^prod-0[12]$"),
+                ],
+            ),
+            profile("wide", "ssh", &["{host}"], &[("host", "(?s).*")]),
+            profile(
+                "echo-host",
+                "echo",
+                &["--", "{host}"],
+                &[("host", "^prod-0[12]$")],
+            ),
+        ];
+        cfg.validate()
+            .expect("these fixtures must be profiles an operator could actually load");
+        cfg
+    }
+
+    fn server_with_profiles() -> HoldfastServer {
+        HoldfastServer::with_audit_path_and_config(None, &profiles_config())
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> Option<BTreeMap<String, String>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+    }
+
+    fn refusal(server: &HoldfastServer, args: StartSessionArgs) -> String {
+        server
+            .resolve_launch(&args)
+            .map(|l| format!("{} {:?}", l.command, l.args))
+            .expect_err("this call shape must not resolve to an argv")
+            .to_string()
+    }
+
+    /// **The positive, first.** A profile-started session runs the
+    /// operator's program with the operator's argument template, carries
+    /// the operator's profile name, and — the link every row below leans
+    /// on — carries exactly what [`resolve_launch`] resolved.
+    #[tokio::test]
+    async fn a_profile_started_session_carries_the_operators_own_argv() {
+        let server = server_with_profiles();
+        let args = StartSessionArgs {
+            profile: Some("echo-host".into()),
+            vars: vars(&[("host", "prod-02")]),
+            ..Default::default()
+        };
+        let resolved = server
+            .resolve_launch(&args)
+            .expect("the operator's own profile must resolve");
+        server
+            .start_session(Parameters(args))
+            .await
+            .expect("start_session");
+
+        let all = server.registry.all();
+        assert_eq!(all.len(), 1, "no session was created");
+        let s = &all[0];
+        assert_eq!(s.command, "echo");
+        assert_eq!(s.args, vec!["--".to_string(), "prod-02".to_string()]);
+        assert_eq!(
+            s.profile.as_deref(),
+            Some("echo-host"),
+            "the session must carry the profile a binding selects on"
+        );
+        // The wiring, pinned: the session is what `resolve_launch` said,
+        // so every row below that drives `resolve_launch` is a row about
+        // the session `start_session` would have created.
+        assert_eq!(s.command, resolved.command);
+        assert_eq!(s.args, resolved.args);
+        assert_eq!(s.profile, resolved.profile);
+
+        for s in server.registry.all() {
+            let _ = s.signal(crate::pty::Signal::Kill);
+        }
+    }
+
+    /// The negative that separates the row above from a `start_session`
+    /// that stamps a profile on everything: an ordinary `command` session
+    /// carries **no** profile, which is the whole of *"a session started
+    /// with `command`/`args` can never receive a keychain credential"*.
+    #[tokio::test]
+    async fn a_command_started_session_carries_no_profile() {
+        let server = server_with_profiles();
+        server
+            .start_session(Parameters(StartSessionArgs {
+                command: Some("cat".into()),
+                args: vec!["-".into()],
+                ..Default::default()
+            }))
+            .await
+            .expect("start_session");
+        let all = server.registry.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].command, "cat");
+        assert_eq!(all[0].args, vec!["-".to_string()]);
+        assert_eq!(all[0].profile, None);
+        for s in server.registry.all() {
+            let _ = s.signal(crate::pty::Signal::Kill);
+        }
+    }
+
+    /// **GH #45's reproduction is not expressible through a profile**, and
+    /// this row asserts that the attack cannot be *stated* rather than
+    /// that it is caught.
+    ///
+    /// The reproduction is `start_session("ssh", ["prod-01", "-o",
+    /// "ProxyCommand=nc 127.0.0.1 2222"])` — a **four-element** argv whose
+    /// third and fourth elements are the agent's, resolving an operator's
+    /// binding. Every call shape that could aim at it is enumerated below,
+    /// and each one lands in exactly one of two places: an argument error,
+    /// or an argv the operator's template shaped. Neither produces the
+    /// line, and the last case is the interesting one — even with a slot
+    /// pattern that admits the whole payload, the payload arrives as **one
+    /// argument**, which `ssh` reads as a hostname.
+    ///
+    /// The `command`/`args` shape produces the four-element argv, because
+    /// of course it does — that is an agent running `ssh` and it always
+    /// could. What it cannot do is carry a profile, so no binding selects
+    /// it and no credential is typed into it; that half is asserted here
+    /// as `profile: None` and driven end to end in `secret::binding`.
+    #[test]
+    fn gh_45s_reproduction_is_not_expressible_through_a_profile() {
+        let server = server_with_profiles();
+        const PAYLOAD: &str = "-o ProxyCommand=nc 127.0.0.1 2222";
+        let reproduction = vec![
+            "prod-01".to_string(),
+            "-o".to_string(),
+            "ProxyCommand=nc 127.0.0.1 2222".to_string(),
+        ];
+
+        // 1. The agent tries to append its own arguments to the profile.
+        assert!(refusal(
+            &server,
+            StartSessionArgs {
+                profile: Some("prod-ssh".into()),
+                args: vec!["-o".into(), "ProxyCommand=nc 127.0.0.1 2222".into()],
+                vars: vars(&[("user", "ada"), ("host", "prod-01")]),
+                ..Default::default()
+            }
+        )
+        .contains("`args` is only meaningful with `command`"));
+
+        // 2. The agent smuggles the payload into a slot the operator
+        //    bounded. Refused by the pattern, naming the var.
+        let msg = refusal(
+            &server,
+            StartSessionArgs {
+                profile: Some("prod-ssh".into()),
+                vars: vars(&[("user", "ada"), ("host", &format!("prod-01 {PAYLOAD}"))]),
+                ..Default::default()
+            },
+        );
+        assert!(msg.contains("host"), "{msg}");
+
+        // 3. The agent invents a slot to carry it.
+        assert!(refusal(
+            &server,
+            StartSessionArgs {
+                profile: Some("prod-ssh".into()),
+                vars: vars(&[("user", "ada"), ("host", "prod-01"), ("opts", PAYLOAD)]),
+                ..Default::default()
+            }
+        )
+        .contains("opts"));
+
+        // 4. The agent supplies both halves and hopes one wins.
+        assert!(refusal(
+            &server,
+            StartSessionArgs {
+                command: Some("ssh".into()),
+                args: reproduction.clone(),
+                profile: Some("prod-ssh".into()),
+                ..Default::default()
+            }
+        )
+        .contains("mutually exclusive"));
+
+        // 5. **The one that actually renders**, and the row's real
+        //    subject. `wide`'s `host` admits the entire payload, so the
+        //    operator has given the agent everything a pattern can give.
+        //    The argv is still `["ssh", "<one argument>"]` — two elements,
+        //    where the reproduction is four — because substitution happens
+        //    inside one element and `args` is a `Vec<String>`.
+        let wide = server
+            .resolve_launch(&StartSessionArgs {
+                profile: Some("wide".into()),
+                vars: vars(&[("host", &format!("prod-01 {PAYLOAD}"))]),
+                ..Default::default()
+            })
+            .expect("`.*` admits it — that is the operator's choice to make");
+        assert_eq!(wide.command, "ssh");
+        assert_eq!(wide.args.len(), 1, "{:?}", wide.args);
+        assert_ne!(wide.args, reproduction);
+        assert_eq!(wide.profile.as_deref(), Some("wide"));
+
+        // 6. And the shape that *does* produce the line produces it
+        //    without a profile, so nothing selects a binding for it.
+        let plain = server
+            .resolve_launch(&StartSessionArgs {
+                command: Some("ssh".into()),
+                args: reproduction.clone(),
+                ..Default::default()
+            })
+            .expect("an agent running `ssh` itself is not what profiles refuse");
+        assert_eq!(plain.args, reproduction);
+        assert_eq!(
+            plain.profile, None,
+            "a `command` session that carried a profile would hand the whole feature back"
+        );
+    }
+
+    /// The structural guarantee, driven through the surface the agent
+    /// actually calls: no `vars` value can introduce a second argv
+    /// element.
+    ///
+    /// `secret::profile`'s own row asserts this of `render`; this one
+    /// asserts it of the argv `start_session` resolves, so a future
+    /// `start_session` that split, joined or shell-quoted on the way past
+    /// reddens here rather than in a module nobody changed.
+    #[test]
+    fn no_vars_value_can_introduce_a_second_argv_element() {
+        let server = server_with_profiles();
+        let template_len = 1; // `wide` is `args = ["{host}"]`.
+        for value in [
+            "prod-01 -o ProxyCommand=nc 127.0.0.1 2222",
+            "prod-01; evil",
+            "prod-01 && evil",
+            "prod-01 | evil",
+            "-oProxyCommand=/tmp/x",
+            "--",
+            "'quoted' \"twice\"",
+            "a\tb",
+            "a\nb",
+            "$(evil) `evil`",
+            "",
+        ] {
+            let launch = server
+                .resolve_launch(&StartSessionArgs {
+                    profile: Some("wide".into()),
+                    vars: vars(&[("host", value)]),
+                    ..Default::default()
+                })
+                .unwrap_or_else(|e| panic!("{value:?} should resolve: {e}"));
+            assert_eq!(
+                launch.args.len(),
+                template_len,
+                "{value:?} produced {:?}, which is not the shape `args = [\"{{host}}\"]` \
+                 declares; a value may never add an argument",
+                launch.args
+            );
+            assert_eq!(launch.args[0], value);
+            assert_eq!(
+                launch.command, "ssh",
+                "the program is the operator's literal"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_command_nor_profile_is_an_argument_error() {
+        let server = server_with_profiles();
+        assert!(
+            refusal(&server, StartSessionArgs::default()).contains("either `command` or `profile`")
+        );
+    }
+
+    #[test]
+    fn vars_alongside_a_command_is_an_argument_error() {
+        let server = server_with_profiles();
+        assert!(refusal(
+            &server,
+            StartSessionArgs {
+                command: Some("cat".into()),
+                vars: vars(&[("host", "prod-01")]),
+                ..Default::default()
+            }
+        )
+        .contains("`vars` is only meaningful with `profile`"));
+    }
+
+    /// The name the agent supplied, and **not** a list of the ones that
+    /// exist: an operator's profile names are their configuration.
+    #[test]
+    fn an_unknown_profile_name_is_an_argument_error_that_enumerates_nothing() {
+        let server = server_with_profiles();
+        let msg = refusal(
+            &server,
+            StartSessionArgs {
+                profile: Some("prod-sshh".into()),
+                ..Default::default()
+            },
+        );
+        assert!(msg.contains("prod-sshh"), "{msg}");
+        assert!(
+            !msg.contains("echo-host") && !msg.contains("wide"),
+            "the refusal enumerated the operator's other profiles: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_slot_with_no_value_is_an_argument_error_naming_the_key() {
+        let server = server_with_profiles();
+        let msg = refusal(
+            &server,
+            StartSessionArgs {
+                profile: Some("prod-ssh".into()),
+                vars: vars(&[("host", "prod-01")]),
+                ..Default::default()
+            },
+        );
+        assert!(msg.contains("user"), "{msg}");
+    }
+
+    /// §9.2's habit: name the field, never the content. A var value may be
+    /// a hostname the operator considers sensitive, and a refusal that
+    /// quoted it would put it in the agent's transcript — which is the one
+    /// place §9.6 is trying to keep operator configuration out of.
+    #[test]
+    fn a_value_failing_its_pattern_is_refused_without_being_echoed() {
+        let server = server_with_profiles();
+        let sensitive = "bastion.internal.example.invalid";
+        let msg = refusal(
+            &server,
+            StartSessionArgs {
+                profile: Some("prod-ssh".into()),
+                vars: vars(&[("user", "ada"), ("host", sensitive)]),
+                ..Default::default()
+            },
+        );
+        assert!(msg.contains("host"), "the refusal must name the var: {msg}");
+        assert!(
+            !msg.contains(sensitive),
+            "the refusal echoed the value back to the agent: {msg}"
+        );
+        // The pairing: the same call with a value the operator admits
+        // resolves, so the row above is about the pattern rather than
+        // about `host` never working.
+        server
+            .resolve_launch(&StartSessionArgs {
+                profile: Some("prod-ssh".into()),
+                vars: vars(&[("user", "ada"), ("host", "prod-01")]),
+                ..Default::default()
+            })
+            .expect("the operator's own value must resolve");
+    }
+
+    /// Mutual exclusion through the **real tool**, so the pair is refused
+    /// where an agent meets it and not only in a private helper — and with
+    /// no session left behind, because the refusal precedes the spawn.
+    #[tokio::test]
+    async fn profile_and_command_are_mutually_exclusive_at_the_tool() {
+        let server = server_with_profiles();
+        let e = server
+            .start_session(Parameters(StartSessionArgs {
+                command: Some("cat".into()),
+                profile: Some("echo-host".into()),
+                vars: vars(&[("host", "prod-01")]),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("supplying both must be an argument error");
+        assert!(e.message.contains("mutually exclusive"), "{e:?}");
+        assert!(
+            server.registry.all().is_empty(),
+            "an argument error must not leave a child behind"
         );
     }
 
@@ -4109,7 +4674,7 @@ mod tests {
             &server,
             &id,
             StartSessionArgs {
-                command: "bash".into(),
+                command: Some("bash".into()),
                 args: vec![
                     "--norc".into(),
                     "--noprofile".into(),
@@ -4277,7 +4842,7 @@ mod tests {
             &server,
             &id,
             StartSessionArgs {
-                command: "bash".into(),
+                command: Some("bash".into()),
                 args: vec!["--norc".into(), "--noprofile".into()],
                 shell_integration: Some(false),
                 ..Default::default()
