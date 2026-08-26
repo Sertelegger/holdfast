@@ -960,8 +960,12 @@ SMOKE_SECRET='sm0kesecret'
 # and it is computed here independently of what the session computes.
 SMOKE_DIGEST="$(printf %s "$SMOKE_SECRET" | cksum | cut -d' ' -f1)"
 
-# The human. `script` gives `attach` the tty it needs for raw mode; the
-# keystrokes are written ahead of time, as everywhere else in this file.
+# The human. `pty_run` gives `attach` the tty it needs for raw mode and
+# caps it; the keystrokes are written ahead of time, as everywhere else in
+# this file. **Through the helper and not `timeout … script -qefc` direct**:
+# both of those are GNU-only spellings, and off Linux they exit 127 before
+# `attach` starts — which surfaces here as `secret_cancelled` and three
+# more red rows, describing a credential path that is in fact fine.
 #
 # The client only routes a line into `SecretInput` while an `AwaitingSecret`
 # is outstanding, and that happens either way round: if it is attached when
@@ -977,7 +981,7 @@ SECRET_ATTACH_LOG="$HOLDFAST_RUNTIME_DIR/secret-attach.out"
   sleep 3
   printf '\002d'
   sleep 1
-} | timeout 40 script -qefc "$BIN attach smokeattach" /dev/null >"$SECRET_ATTACH_LOG" 2>/dev/null &
+} | pty_run 40 "$BIN" attach smokeattach >"$SECRET_ATTACH_LOG" 2>/dev/null &
 SECRET_ATTACH_PID=$!
 sleep 1
 
