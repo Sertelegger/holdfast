@@ -1022,13 +1022,26 @@ PROFILE_OUT="$(
     req '{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"status","arguments":{"session":"smokeprof"}}}'
     # The four refusals. Each is an `invalid_params` on the profile arm,
     # and each is a route an agent would actually take.
-    # `PATH` is PREPENDED and not replaced, and that is not cosmetic. A
-    # bare `PATH=/evil` cannot resolve `bash` at all, so with the refusal
-    # deleted the spawn fails and the session count stays at one -- the
-    # refusal would look enforced when it was not, which is the exact
-    # wrong-reason pass a review caught on this feature. Prepending keeps
-    # the profile's `program` resolvable, so the only thing standing
-    # between the agent and a child of its choosing is the refusal itself.
+    # `PATH` is PREPENDED and not replaced, and the reason is narrower
+    # than an earlier version of this comment claimed -- it names the
+    # mutation it is for, because the obvious one does not need it.
+    #
+    # Deleting the refusal ALONE does not need the prepend: `args.env` is
+    # structurally unread on this arm (`cfg.env = launch.env`, and the
+    # profile arm builds `Launch.env` from `profile.env`), so the agent's
+    # `PATH` never reaches the child whatever it says. The child spawns on
+    # the operator's env, and the session count below catches it at 2
+    # either way. Measured, both spellings.
+    #
+    # The prepend earns its place under the FULL rev.-55 revert -- the
+    # refusal deleted *and* `args.env` merged into this arm's `Launch`,
+    # which is the state the fix actually replaced. There the agent's
+    # `PATH` does reach `portable-pty`'s program resolution, and a bare
+    # `PATH=/evil` cannot resolve `bash` at all: the spawn fails, no
+    # session is created, and the count stays at one. The refusal then
+    # looks enforced when it is not -- the wrong-reason pass a review
+    # caught on this feature. Measured: full revert + replaced = 1 of 58
+    # (blind); full revert + prepended = 2 of 58 (caught).
     req '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","vars":{"host":"smoke-01"},"env":{"PATH":"/evil:/usr/bin:/bin"}}}}'
     req '{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","command":"bash"}}}'
     req '{"jsonrpc":"2.0","id":56,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","vars":{"host":"prod-99"}}}}'

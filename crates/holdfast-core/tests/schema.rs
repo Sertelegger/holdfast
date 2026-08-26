@@ -646,8 +646,20 @@ fn start_session_advertises_profile_and_vars_and_no_required_command() {
     );
 
     // The prose that now carries the whole constraint.
+    //
+    // **Two phrases per argument where two are load-bearing, and that is
+    // not redundancy.** "Mutually exclusive" says the two cannot be
+    // supplied *together*; "supply exactly one" says one of them must be
+    // supplied *at all*. With `required` gone from the schema, an
+    // advertised surface carrying only the first would tell a caller it
+    // may omit both — which is the `-32602` case, and the half a reader
+    // is most likely to get wrong. An earlier revision of this row pinned
+    // only the first, and `CHANGELOG.md` claimed both were pinned;
+    // deleting "; supply exactly one" left it green, which is what put
+    // the second phrase here.
     for (name, phrase) in [
         ("command", "Mutually exclusive with `profile`"),
+        ("command", "supply exactly one"),
         ("profile", "Mutually exclusive with `command`"),
         ("vars", "Only with `profile`"),
         ("args", "Only with `command`"),

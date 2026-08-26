@@ -147,8 +147,8 @@ surfaces rather than redacted on them.
   **It is a control-character filter and not an ANSI-sequence stripper**, and
   that distinction is the whole of the paragraph below: `one_line_for_display`
   drops the ESC byte and leaves the `[2K` that followed it. The module's real
-  sequence stripper, `strip_str`, is a different function and is not on this
-  path.
+  sequence stripper is `ansi::strip` — the `AnsiStripper` state machine — and
+  it is a different function that is not on this path.
 
   The part worth writing down is a **side effect nobody would predict from
   either change alone**. Dropping a control byte joins the text on each side
