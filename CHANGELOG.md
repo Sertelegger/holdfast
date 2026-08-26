@@ -101,6 +101,62 @@ surfaces rather than redacted on them.
   why a deprecation window on those two keys would have been a deprecation
   window on the bypass class.
 
+- **`start_session`'s `inputSchema` no longer marks `command` required, and a
+  call that omits it now returns a JSON-RPC error instead of a tool result.**
+  This is the one 0.0.6-facing difference in the milestone that is not a
+  behaviour change, and it is on the wire.
+
+  | | 0.0.6 | 0.0.7 |
+  |---|---|---|
+  | `inputSchema.required` | `["command"]` | **absent** |
+  | `inputSchema.properties.command` | `{"type":"string"}` | `{"type":["string","null"],"default":null}` |
+  | `start_session {"args":["x"]}` | `result.isError: true`, text *"failed to deserialize parameters: missing field `command`"* | `error.code: -32602`, *"start_session needs either `command` or `profile`"* |
+
+  **Why.** `command` and `profile` are mutually exclusive and exactly one must
+  be supplied. That is a `oneOf`, and there is no way to derive one — so
+  `command` became `Option<String>`, the `required` array lost its only entry,
+  and the constraint moved into the tool body, which refuses the
+  neither-supplied and both-supplied cases by name.
+
+  **What it costs a client.** The *schema* no longer tells a caller — or a
+  model reading `tools/list` — that a command is needed; only the `command`
+  and `profile` descriptions say *"supply exactly one"*, so those two
+  sentences now carry the whole contract. And a client that branches on
+  `result.isError` takes its transport-error path for this one input instead.
+  Not a new class — a bad `cwd` or a bad `screen_tracking` was already
+  `invalid_params` at 0.0.6 — but `command` moved into it.
+
+- **`AwaitingSecret.prompt_text` can now be redacted where 0.0.6 left it
+  intact.** `Session::prompt_last_line_redacted` moved from `redact_str` to
+  `redact_for_display`, which **strips ANSI escapes before** redacting rather
+  than redacting the raw line. The frame is 0.0.6's (§7.5) and its field is
+  unchanged in shape; what it carries can differ.
+
+  Intended, and the reason for the change: an escape sequence between a label
+  and a credential let a prompt line reassemble on a human's screen into
+  something the redactor never saw as one token. Stripping first closes that.
+
+  The part worth writing down is a **side effect nobody would predict from
+  either change alone**. Stripping an escape can join the text on each side of
+  it, and the joined token can match a rule that neither side matched:
+
+  ```
+  0.0.6:  "Password: \x1b[2K\rholdfast attach: all clear"   (unchanged)
+  0.0.7:  "Password: [REDACTED:generic] attach: all clear"
+  ```
+
+  Removing the `\x1b` glues `[2K` onto `holdfast`, and a **pre-existing,
+  unchanged** generic rule then matches the result — confirmed by feeding the
+  post-strip text to 0.0.6's own `redact_str`, which produces the identical
+  marker. The rule did not change; the strip newly hands it a token that was
+  not in the source.
+
+  The direction is safe — a human-facing display field over-redacts, and
+  over-redaction on a prompt label is not a leak — but it does qualify the
+  property this strip is otherwise described by, *"the payload must stay
+  visible; only its power to overwrite is removed"*: for a prompt where a
+  stripped escape abuts adjacent text, some payload may not stay visible.
+
 ### Security
 
 - **The operator writes the command line and the agent fills named slots in it**
@@ -128,9 +184,12 @@ surfaces rather than redacted on them.
   ```
 
   `start_session` gains `profile` and `vars`, mutually exclusive with
-  `command`/`args` **and with `env`/`cwd`**. `command`/`args` sessions are
-  **unchanged** in every respect, `env` and `cwd` included — nothing is at
-  stake in a session that cannot receive a credential.
+  `command`/`args` **and with `env`/`cwd`**. A `command`/`args` session
+  *behaves* exactly as it did at 0.0.6, `env` and `cwd` included — nothing is
+  at stake in a session that cannot receive a credential — but the tool's
+  **advertised schema did change**, and a call that omits `command` now fails
+  through a different channel. See *`start_session`'s `inputSchema` no longer
+  marks `command` required* under **Changed**.
 
   **Why the shape changed rather than the check.** Four guard shapes over
   `match_command` were tried and each was defeated by someone who attacked it

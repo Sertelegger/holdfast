@@ -2182,7 +2182,11 @@ mod tests {
         let _ = s.signal(Signal::Kill);
     }
 
-    /// §9.6's `max_uses`, which is **per session**.
+    /// **REQ-SEC-013's `max_uses` clause.** §9.6's `max_uses`, which is
+    /// **per session**. (The row's other two clauses are elsewhere:
+    /// `require_confirm` is the approval round trip in this module, and
+    /// the audit clause is
+    /// `binding_resolved_records_the_name_and_never_the_reference`.)
     ///
     /// `max_uses = 2`: the third resolution in one session falls through
     /// to the human path, while a **second** session matching the same
@@ -2945,6 +2949,9 @@ mod tests {
 
     // ------------------------------------------------- §9.4's audit row
 
+    /// **REQ-SEC-013's audit clause** — *"every resolution is audit-logged
+    /// with binding name and use count, never the value"*.
+    ///
     /// §9.4's `binding_resolved`: `{binding_name, provider, session_id,
     /// use_count}` — and **neither the reference nor the value**, anywhere
     /// in the file.
@@ -3831,6 +3838,12 @@ mod tests {
         let _ = s.signal(Signal::Kill);
     }
 
+    /// **REQ-SEC-015's delivery-and-absence clause** — *"resolved keychain
+    /// values reach the PTY through the `SecretInput` path"*, with §20's
+    /// verification column, *"assert value absent from buffer and all
+    /// logs"*, taken literally below. Its zeroing clause is
+    /// `secret::provider::tests::the_resolved_value_is_zeroed_after_the_write`.
+    ///
     /// **Task 13's second absence row: every surface, for a value Holdfast
     /// *resolved* rather than received.**
     ///
@@ -5189,6 +5202,11 @@ mod tests {
     }
 
     /// **Autofill is not "skip every gate".**
+    ///
+    /// **REQ-SEC-013's `require_confirm` clause**, on the path that would
+    /// otherwise have no human on it at all. (The row's other two clauses
+    /// are `max_uses_is_per_session_and_bounded` and
+    /// `binding_resolved_records_the_name_and_never_the_reference`.)
     ///
     /// §9.6's `require_confirm` keeps a human in the loop, and it applies
     /// on this path exactly as it does to a tool call: the daemon

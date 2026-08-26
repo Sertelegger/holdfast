@@ -879,6 +879,16 @@ mod tests {
     /// attribute-addressed templates against.
     const ATTR_REFERENCE: &str = "service=holdfast,account=prod-ssh";
 
+    /// **REQ-SEC-015's zeroing clause** — *"resolved keychain values …
+    /// are zeroed immediately after write"*. The value here comes from a
+    /// **provider**, which is what makes this the requirement's own
+    /// subject rather than its twin's: `secret::request::tests::
+    /// the_submitted_value_is_zeroed_after_the_write` asserts the same
+    /// property for a value a *client* submitted, which is REQ-SEC-004's.
+    /// The other clause — that a resolved value reaches the PTY through
+    /// the `SecretInput` path and no other surface — is
+    /// `secret::binding::tests::a_keychain_resolved_secret_reaches_none_of_them_either`.
+    ///
     /// **The zeroing, asserted from inside the `Drop` while the buffer is
     /// still alive.**
     ///

@@ -629,13 +629,29 @@ pub struct SessionProfile {
     ///
     /// Additive to the environment the **daemon** was started with, on
     /// `start_session(env:)`'s existing semantics. That inherited
-    /// environment is the operator's or the user's; it is not a surface
-    /// the agent reaches.
+    /// environment is the operator's or the user's; **it is not a surface
+    /// `start_session` gives the agent.**
+    ///
+    /// That scoping is deliberate and the wider claim would be false. The
+    /// child inherits the daemon's whole environment — `portable_pty`'s
+    /// `CommandBuilder::new` seeds from `std::env::vars_os()` and these
+    /// pairs override on top — and an agent holding an ordinary
+    /// `command`/`args` session runs as the same user, so it can rewrite
+    /// `config.toml`, or stop the daemon and start one under an
+    /// environment of its choosing, after which every later profile
+    /// session inherits it. That is the *"the agent has a shell as this
+    /// user"* premise Holdfast is built on rather than a hole in this
+    /// field, and it is out of scope here for the same reason
+    /// `profile.rs`'s *"What this does not do, stated plainly"* is: a
+    /// profile bounds which **process** a credentialed session is, not
+    /// what an already-granted session can do. Written out because this
+    /// section has been bitten before by a sentence that read as
+    /// protective and was load-bearing the other way (GH #55).
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     /// Working directory for the child, **written by the operator** and
     /// **literal** — no `{…}` (GH #55). `None` means the directory the
-    /// daemon itself was started in, exactly as an `env`-less
+    /// daemon itself was started in, exactly as a `cwd`-less
     /// `command`/`args` session gets.
     ///
     /// **A profile-started session takes no `cwd` from the agent**;
@@ -647,6 +663,18 @@ pub struct SessionProfile {
     /// It is validated and canonicalised on exactly the path
     /// `start_session(cwd:)` takes, so an operator's typo is the same
     /// refusal an agent's would have been.
+    ///
+    /// **Which means the two halves of this field are checked at
+    /// different times, and that is deliberate.** Being a *literal* is a
+    /// load error, like every other profile rule. *Existing* is checked at
+    /// **session start**, because that path is where the check lives — so
+    /// a profile with a mistyped `cwd` loads cleanly and fails every
+    /// session start. Moving the existence check to [`Config::validate`]
+    /// would buy an earlier message and no guarantee (the directory is
+    /// resolved again at spawn regardless), would put two checks on one
+    /// path where GH #50 argues for one, and would take the whole daemon
+    /// down over a directory a mount or a deploy step has not created
+    /// yet. Spec §9.6 records the trade under *"The exception"*.
     #[serde(default)]
     pub cwd: Option<String>,
 }
