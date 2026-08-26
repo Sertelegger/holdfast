@@ -29,10 +29,32 @@
 name: CI
 
 on:
+  # `paths-ignore` is REPEATED under both triggers rather than shared: the
+  # workflow parser does not support YAML anchors, and a workflow that
+  # fails to parse is a repository with no CI at all.
+  #
+  # **Checked before adding, because the usual trap is a permanent
+  # pending.** `paths-ignore` makes a skipped job report nothing rather
+  # than success, so a required status check on it leaves every docs-only
+  # PR pending forever. This repository has no branch protection at all —
+  # the API answers 403, "upgrade to GitHub Pro or make this repository
+  # public" — so there are no required checks to strand. **Re-check this
+  # the day the repository goes public or gains protection.**
+  #
+  # Nothing in CI reads these paths: `ci-hygiene.sh` does not police
+  # markdown, and the only `*.md` glob in `scripts/` is
+  # `artifact-deletion-check.py` scanning the git-ignored `plans/` tree,
+  # which is absent from a CI checkout.
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
 
 permissions:
   contents: read

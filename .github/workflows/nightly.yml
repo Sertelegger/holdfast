@@ -32,7 +32,21 @@ on:
     #
     # A scheduled workflow only fires from the DEFAULT BRANCH. This file
     # does nothing until it is merged there.
-    - cron: "17 10 * * *"
+    #
+    # **Weekly, not nightly, and the name now overstates the cadence on
+    # purpose.** The tier keeps its name because REQ-TST-004's tier-4
+    # content still belongs here; what changed is the bill. At ~14 min a
+    # run, daily was ~417 min/month against an account-wide 2000 min free
+    # tier that this repository exhausted on the 25th. Weekly is ~60.
+    #
+    # **The trade-off is real and is not a drift argument.** Most of what
+    # a scheduled job re-runs on an unchanged tree can only catch runner
+    # or toolchain drift, for which weekly is plenty — but a flake hunt is
+    # the exception, because repetition IS the measurement. Monthly
+    # samples drop from ~600 to ~87. If that sensitivity is worth more
+    # than the minutes, raise the repetition count below rather than the
+    # cadence: it is the cheaper knob, since each run pays the setup once.
+    - cron: "17 10 * * 0"
   # So the job can be exercised on demand during Task 7 without waiting a
   # day. This is NOT a substitute for the schedule -- a workflow_dispatch-
   # only job nobody dispatches is a job that cannot fail.

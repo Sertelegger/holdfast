@@ -1,4 +1,4 @@
-# Holdfast weekly mutation sweep.
+# Holdfast monthly mutation sweep.
 # Plan: docs/superpowers/plans/2026-08-12-holdfast-ci-and-verification-harness.md Task 6.
 #
 # holdfast-core AND holdfast -- see the shard-calibration comment below for why
@@ -22,9 +22,28 @@ name: Mutants
 
 on:
   schedule:
-    # 11:41 UTC on Saturdays. UTC only; see nightly.yml for the note.
-    - cron: "41 11 * * 6"
+    # 11:41 UTC on the FIRST Saturday of the month. UTC only; see
+    # nightly.yml for the note.
+    #
+    # **Monthly, not weekly, and the reason is the bill rather than the
+    # engineering.** At ~175 min a run this job cost 43% of the account's
+    # entire 2000 min/month free tier and exhausted it on the 25th, taking
+    # every other repository's CI down with it. Weekly was 4.33 runs =
+    # ~759 min/month; monthly is ~175.
+    #
+    # **What that costs in coverage, stated rather than glossed.** One
+    # shard of eight runs per invocation, so a full sweep went from 8
+    # weeks to 8 months. That is only acceptable because the value of a
+    # sweep is in *reading* the survivors, and an unread sweep is spend
+    # with no return. Before a milestone, dispatch the shards deliberately
+    # with the input below rather than waiting for the calendar.
+    - cron: "41 11 1-7 * 6"
   workflow_dispatch:
+    inputs:
+      shard:
+        description: "Shard to sweep, 0-7. Empty rotates by month."
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -183,12 +202,27 @@ jobs:
       # do. Sharding keeps that property; `--in-diff` would have made the
       # job a slower duplicate of work already done.
       #
-      # The rotation is by ISO week so it needs no state. `--no-shuffle` and
+      # The rotation is by MONTH so it needs no state. `--no-shuffle` and
       # the pinned tool version keep shard membership stable between runs,
-      # so week N+8 re-runs the same ~224 mutants unless the code moved.
+      # so month N+8 re-runs the same ~224 mutants unless the code moved.
+      #
+      # **Was ISO week, and the change is not cosmetic.** `date +%V % 8`
+      # under a first-Saturday cron is badly distributed -- measured over
+      # 24 months it picks shard 5 six times and shard 3 once, because the
+      # ISO week of a first Saturday is not uniform mod 8. The month index
+      # is exactly uniform: every shard three times in 24 months, a full
+      # sweep every eight.
+      #
+      # An explicit `shard` input wins, so a milestone sweep can walk 0..7
+      # without waiting eight months for the calendar to do it.
       - run: |
-          shard=$(( $(date -u +%V) % 8 ))
-          echo "ISO week $(date -u +%V) -> shard ${shard}/8"
+          shard="${{ inputs.shard }}"
+          if [ -z "${shard}" ]; then
+            shard=$(( ($(date -u +%-m) - 1) % 8 ))
+            echo "month $(date -u +%-m) -> shard ${shard}/8"
+          else
+            echo "dispatched shard ${shard}/8"
+          fi
           cargo mutants --package holdfast-core --package holdfast --no-shuffle \
             --jobs 2 --shard "${shard}/8" -- --locked
       # mutants.out/ is the only durable evidence this job produced anything.
