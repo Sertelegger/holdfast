@@ -72,11 +72,21 @@ fn spawns_a_shell_and_reads_output() {
     pty.signal(Signal::Kill).unwrap();
 }
 
-// Unix-only: the assertion is about a *descendant* pid outliving the sweep,
-// probed with `kill(pid, 0)`. Windows job objects are 0.0.7's, and get
-// their own test rather than a contorted version of this one. Gated at the
-// test rather than at `pid_alive`, so the Linux run still carries it.
-#[cfg(unix)]
+// Linux-only, and the narrowing is §4.4's rather than a convenience.
+// The assertion is about a *descendant* pid outliving the sweep, probed
+// with `kill(pid, 0)`; Windows job objects are 0.0.7's, and get their own
+// test rather than a contorted version of this one.
+//
+// **Why not `#[cfg(unix)]`, which is what this was.** §4.4 specifies the
+// full session enumeration for Linux alone: off Linux the sweep degrades
+// to `{pgid, tcgetpgrp(master)}`, a set that by construction cannot name
+// a job the shell backgrounded into its own group. So on macOS this
+// asserted a guarantee the spec does not make, and failed for the reason
+// the spec gives. What §4.4 *does* promise there is asserted directly
+// below, which is why this gate narrows rather than the assertion
+// loosening: a test that passed on both platforms by weakening to
+// "either outcome is fine" would stop guarding either one.
+#[cfg(target_os = "linux")]
 #[test]
 fn terminate_kills_the_whole_process_group() {
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
@@ -113,6 +123,93 @@ fn terminate_kills_the_whole_process_group() {
     assert!(
         pty.signal_deliveries() > 0,
         "a live sweep must actually reach the OS"
+    );
+}
+
+/// §4.4's documented off-Linux limitation, asserted rather than assumed.
+///
+/// Where there is no `/proc` the sweep degrades to the distinct set
+/// `{pgid, tcgetpgrp(master)}`, so a job the shell backgrounded into its
+/// **own** process group is never named and outlives `terminate`. That is
+/// the specified behaviour today rather than a defect, and REQ-SPTY-005
+/// binds it from the other side: the documented §4.4 limitations may not
+/// widen. This test is the guard on both directions at once — it fails if
+/// the leak grows, and it fails if the leak silently closes.
+///
+/// **Updated, never deleted.** The day the full enumeration lands off
+/// Linux this is the test that has to be edited, which is the point. That
+/// enumeration is `proc_listallpids` plus `getsid(2)`, *not* the
+/// `sysctl(KERN_PROC_SESSION)` this limitation was written around: XNU
+/// registers no such OID and the call fails `ENOENT`. §4.4 carries the
+/// measurement.
+///
+/// Both halves of the assertion matter. The leader having died is what
+/// makes the surviving descendant a *leak* rather than the unremarkable
+/// result of a sweep that did nothing at all.
+#[cfg(all(unix, not(target_os = "linux")))]
+#[test]
+fn the_off_linux_sweep_leaks_exactly_what_section_4_4_says_it_does() {
+    let pty = InProcessPty::spawn(&bash()).expect("spawn");
+
+    // Backgrounded, so shell job control puts it in a group of its own —
+    // the one `{pgid, tcgetpgrp(master)}` cannot reach. A *foreground*
+    // command would be `tcgetpgrp(master)` and would therefore be swept,
+    // which is why the leak has to be probed with `&`.
+    pty.write(b"sleep 300 & echo CHILD''_PID=$!\n").unwrap();
+    let out = read_until(&pty, "CHILD_PID=", Duration::from_secs(5));
+    let child_pid: i32 = out
+        .split("CHILD_PID=")
+        .nth(1)
+        .map(|s| {
+            s.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no child pid in: {out:?}"));
+    assert!(pid_alive(child_pid), "descendant never started");
+
+    pty.signal(Signal::Kill).unwrap();
+    wait_for_exit(&pty, Duration::from_secs(5));
+
+    // Non-vacuity is carried by the delivery counter and **not** by
+    // `!pty.is_alive()`, which is the assertion this test wants and
+    // cannot have. Measured on macOS 27.0 (Darwin 27.0.0): with a
+    // backgrounded job in the session, the leader is still unreaped 5 s
+    // after its own group was SIGKILLed in roughly 6 runs out of 10,
+    // while the same sequence driven from a standalone harness retired
+    // it 5 times out of 5. That difference is not understood, and §4.4
+    // records it as open rather than as a limitation with a known
+    // shape. Asserting the leader's death here would import the
+    // coin-flip into CI; asserting that the sweep reached the OS is the
+    // same control the Linux counterpart uses, and it is exactly as
+    // strong against the failure this test exists to catch — a sweep
+    // that quietly stopped sweeping.
+    assert!(
+        pty.signal_deliveries() > 0,
+        "a live sweep must actually reach the OS"
+    );
+    let leaked = pid_alive(child_pid);
+
+    // Retire the leak before asserting on it. This test asserts that a
+    // descendant *survives*, so unlike its Linux counterpart it is the
+    // one thing in the suite that leaves a live process behind on
+    // purpose — and `sleep 300` means five minutes of them, one per run,
+    // each still holding an fd on a slave whose session leader is gone.
+    // Cleaning up after the assertion value is taken, not before, so a
+    // panic cannot skip it.
+    if leaked {
+        // SAFETY: `kill` takes no pointers, and `child_pid` was read from
+        // this session's own shell moments ago.
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+    }
+
+    assert!(
+        leaked,
+        "descendant {child_pid} was swept off Linux — §4.4's limitation has \
+         closed. That is good news and this test is how it gets recorded: \
+         update §4.4, §25 and REQ-P-006's platform note, then rewrite this \
+         test to assert the descendant dies"
     );
 }
 

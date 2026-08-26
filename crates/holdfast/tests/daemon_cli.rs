@@ -23,7 +23,7 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Barrier;
@@ -258,6 +258,99 @@ fn signal(pid: u32, sig: i32) -> bool {
 /// `the_running_daemon_holds_no_listening_tcp_socket` does.
 fn have_proc() -> bool {
     PathBuf::from("/proc/self/fd").exists()
+}
+
+/// Pids of the `holdfast daemon run` processes serving `runtime_dir`.
+///
+/// Asked differently per platform, because the two expose process
+/// identity differently:
+///
+/// * Linux reads the command from `/proc/<pid>/cmdline` and the
+///   instance from the `HOLDFAST_RUNTIME_DIR` in `/proc/<pid>/environ`.
+/// * macOS has no `/proc`, and no route to another process's
+///   environment at all: that goes through `KERN_PROCARGS2`, which
+///   stopped handing out the environment portion in Catalina — `ps -E`
+///   prints nothing even for a process this very user owns. So the
+///   instance is confirmed from the `control.sock` the daemon has
+///   **bound**, which is the stronger claim of the two: it says the
+///   process is serving this runtime dir, not merely that it was
+///   pointed at one when it started.
+///
+/// Matched on the runtime dir's own directory name rather than its full
+/// path, because `/tmp` is a symlink to `/private/tmp` on macOS and
+/// `lsof` may report either side of it. `TestEnv::new` builds that name
+/// from the pid and a nanosecond count, so it is unique per test.
+#[cfg(target_os = "linux")]
+fn daemons_for(runtime_dir: &Path) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if !String::from_utf8_lossy(&cmdline)
+            .replace('\0', " ")
+            .contains("daemon run")
+        {
+            continue;
+        }
+        let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&environ)
+            .replace('\0', "\n")
+            .contains(&format!("HOLDFAST_RUNTIME_DIR={}", runtime_dir.display()))
+        {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemons_for(runtime_dir: &Path) -> Vec<u32> {
+    let marker = format!(
+        "{}/control.sock",
+        runtime_dir
+            .file_name()
+            .expect("the runtime dir has a final component")
+            .to_string_lossy()
+    );
+    // `-ww` because `ps` otherwise clamps the argv column and the `run`
+    // being matched on is what would be cut.
+    let listing = Command::new("ps")
+        .args(["-A", "-ww", "-o", "pid=,args="])
+        .output()
+        .expect("ps enumerates processes");
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let Some((pid, args)) = line.trim_start().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if !args.contains("daemon run") {
+            continue;
+        }
+        // `-U` restricts the report to Unix sockets and `-F n` asks for
+        // the parsable form: one field per line, `n` carrying the path.
+        let Ok(open) = Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-U", "-F", "n"])
+            .output()
+        else {
+            continue;
+        };
+        if String::from_utf8_lossy(&open.stdout)
+            .lines()
+            .any(|l| l.strip_prefix('n').is_some_and(|s| s.ends_with(&marker)))
+        {
+            pids.push(pid);
+        }
+    }
+    pids
 }
 
 /// The state letter from `/proc/<pid>/stat` — `T` stopped, `Z` zombie —
@@ -881,33 +974,11 @@ fn two_shims_racing_to_start_share_one_daemon() {
     assert!(alive(pid));
 
     // Exactly one `daemon run` process is pointed at this runtime dir.
-    let mut daemons = 0;
-    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
-        let Ok(pid_n) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(cmdline) = std::fs::read(format!("/proc/{pid_n}/cmdline")) else {
-            continue;
-        };
-        if !String::from_utf8_lossy(&cmdline)
-            .replace('\0', " ")
-            .contains("daemon run")
-        {
-            continue;
-        }
-        let Ok(environ) = std::fs::read(format!("/proc/{pid_n}/environ")) else {
-            continue;
-        };
-        if String::from_utf8_lossy(&environ)
-            .replace('\0', "\n")
-            .contains(&format!("HOLDFAST_RUNTIME_DIR={}", env.dir.display()))
-        {
-            daemons += 1;
-        }
-    }
+    let daemons = daemons_for(&env.dir);
     assert_eq!(
-        daemons, 1,
-        "expected exactly one daemon for this runtime dir"
+        daemons.len(),
+        1,
+        "expected exactly one daemon for this runtime dir, found {daemons:?}"
     );
 
     // The load-bearing assertion: a session created through one shim is

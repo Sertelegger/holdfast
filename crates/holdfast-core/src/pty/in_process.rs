@@ -305,8 +305,18 @@ impl InProcessPty {
         }
     }
 
-    /// Degraded sweep for Unix platforms without `/proc`. Full
-    /// enumeration there needs `sysctl(KERN_PROC_SESSION)` — post-v0.1.0.
+    /// Degraded sweep for Unix platforms without `/proc` (§4.4).
+    ///
+    /// Full enumeration off Linux does **not** go through
+    /// `sysctl(KERN_PROC_SESSION)`, which this comment named until it was
+    /// measured: XNU registers no such OID, so the call fails `ENOENT`
+    /// outright — `kern.proc` skips `3`, going `PGRP` (2) straight to
+    /// `TTY` (4), and libc exporting the constant says only that it is in
+    /// the BSD headers. `kinfo_proc`'s `e_sess` is NULL on every process
+    /// besides, and libc declares no `kinfo_proc` for Apple at all, so
+    /// both of the other BSD routes are shut too. The one that answers is
+    /// `proc_listallpids` plus `getsid(2)`; it stays post-v0.1.0, and
+    /// §4.4 carries the measurement and the reason it did not land here.
     #[cfg(all(unix, not(target_os = "linux")))]
     fn session_pgids(&self) -> Vec<i32> {
         self.fallback_pgids()
