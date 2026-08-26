@@ -178,10 +178,17 @@ trap teardown EXIT
 # sockets, pid and `logs/` in there, so an extra subdirectory is inert.
 #
 # **Written BEFORE the first `holdfast mcp` below, and that ordering is
-# load-bearing.** `config::load()` runs once at daemon startup (and the
-# first `mcp` invocation is what auto-spawns the daemon), so a config
-# written later would be read by nothing and the profile phase at the
-# bottom would fail with `unknown profile` -- green tooling, useless test.
+# load-bearing.** On the transport this script drives -- bare `$BIN mcp`,
+# i.e. hybrid mode -- the shim holds no config of its own and the DAEMON
+# is what loads it, once, at startup; and the first `mcp` invocation is
+# what auto-spawns that daemon. So a config written later would be read by
+# nothing and the profile phase at the bottom would fail with `unknown
+# profile` -- green tooling, useless test.
+#
+# (Not a general statement about the code: `holdfast mcp --no-daemon`
+# calls `config::load()` per process, so ordering does not bite there.
+# This script deliberately does not use that flag -- see the note above
+# about not retreating onto the non-default transport.)
 export XDG_CONFIG_HOME="$HOLDFAST_RUNTIME_DIR/xdg"
 mkdir -p "$XDG_CONFIG_HOME/holdfast"
 # §9.6's operator-declared session profile, in the shape the published
@@ -1013,13 +1020,38 @@ PROFILE_OUT="$(
     sleep 3
     req '{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"smokeprof","since_cursor":0}}}'
     req '{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"status","arguments":{"session":"smokeprof"}}}'
-    req '{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}'
     # The four refusals. Each is an `invalid_params` on the profile arm,
     # and each is a route an agent would actually take.
-    req '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","vars":{"host":"smoke-01"},"env":{"PATH":"/evil"}}}}'
+    # `PATH` is PREPENDED and not replaced, and that is not cosmetic. A
+    # bare `PATH=/evil` cannot resolve `bash` at all, so with the refusal
+    # deleted the spawn fails and the session count stays at one -- the
+    # refusal would look enforced when it was not, which is the exact
+    # wrong-reason pass a review caught on this feature. Prepending keeps
+    # the profile's `program` resolvable, so the only thing standing
+    # between the agent and a child of its choosing is the refusal itself.
+    req '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","vars":{"host":"smoke-01"},"env":{"PATH":"/evil:/usr/bin:/bin"}}}}'
     req '{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","command":"bash"}}}'
     req '{"jsonrpc":"2.0","id":56,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","vars":{"host":"prod-99"}}}}'
     req '{"jsonrpc":"2.0","id":57,"method":"tools/call","params":{"name":"start_session","arguments":{"args":["x"]}}}'
+    # **Deliberately LAST**, so it can see the consequence of the four
+    # calls above rather than the state before them. A refusal that
+    # reported `invalid_params` *after* spawning the child would satisfy
+    # every error assertion in this phase and still have run the agent's
+    # binary -- and that exact wrong-reason pass is what a review caught on
+    # this feature once already, on a probe whose absence proved nothing.
+    # Counting the profile-started sessions afterwards is what separates
+    # "the call was refused" from "the call was refused in time".
+    #
+    # **The sleep is what makes it last**, not the line order. Requests are
+    # written ahead and responses are never read, so rmcp dispatches a task
+    # per request and completion order is the runtime's choice -- without
+    # this, `list_sessions` races the four calls above and counts the
+    # registry as it was before them, which is green whether they spawned
+    # or not. The same hazard the `terminate` sleep in the main transcript
+    # documents, and it was measured here: the clause failed to catch a
+    # deleted refusal until this line existed.
+    sleep 2
+    req '{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}'
     sleep 3
   } | "$BIN" mcp
 )"
@@ -1045,11 +1077,19 @@ jcheck_on "start_session accepts a profile and starts the operator's program" \
 # four-element template with the agent's value substituted INTO ONE
 # ELEMENT. A `render` that joined and re-split would show a different
 # element count here, which is the structural guarantee §9.6 rests on.
-jcheck_on "status and list_sessions carry the profile and the operator's argv" \
+#
+# The `list_sessions` clause is a COUNT and not a lookup, and that is the
+# third thing this row asserts: request 53 is the last one in the
+# transcript, so exactly one session carrying this profile means the four
+# refusals below created no child. `select(.profile == …)` rather than
+# `select(.name == …)` because the refused calls named no session, so a
+# session they spawned would be invisible to a name filter -- which is
+# precisely how it would go unnoticed.
+jcheck_on "status and list_sessions carry the profile, and the refusals spawned nothing" \
   "$PROFILE_OUT" \
   '[(data(52) | [.profile, .command, .args, .state]),
-    (data(53).sessions | map(select(.name == "smokeprof")) | first | .profile)]' \
-  '[["smokeprofile","bash",["--norc","--noprofile","-c","echo SMOKEPROF host=smoke-01 env=$SMOKE_PROFILE_ENV; sleep 30"],"Running"],"smokeprofile"]'
+    (data(53).sessions | map(select(.profile == "smokeprofile")) | length)]' \
+  '[["smokeprofile","bash",["--norc","--noprofile","-c","echo SMOKEPROF host=smoke-01 env=$SMOKE_PROFILE_ENV; sleep 30"],"Running"],1]'
 
 # The child really ran, with the agent's value in the slot and the
 # OPERATOR's environment around it. Both halves in one string: `smoke-01`
