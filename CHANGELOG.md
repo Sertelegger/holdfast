@@ -25,6 +25,24 @@ surfaces rather than redacted on them.
   `start_session(profile:, vars:)`. The operator writes the command line with
   named slots; the agent supplies values into them and never writes a command
   line. See **Security** for the whole of it.
+- **`profile` on the session record and on `session_start`.** `status`,
+  `list_sessions` and the audit log now say **where a session's command line
+  came from** — the name of the `[[security.profiles]]` entry it was started
+  from, or `null` for one started with `command`/`args`.
+
+  It is there because `command` and `args` cannot say it. A profile-started
+  session and an agent-authored one that produced the same argv were otherwise
+  **byte-identical** on both surfaces, and only the first can ever receive a
+  keychain credential — so an operator reading the trail could not tell which
+  they were looking at. `null` is affirmative rather than an absent key,
+  because *"this session could not have received a credential"* is the fact
+  being looked for and a missing field cannot be told from a forgotten one.
+
+  It carries the **name and nothing more**, on `binding_resolved`'s rule: not
+  the operator's argument template, and not the `vars` the agent supplied. It
+  is the one string on the record that is **not** redacted, and deliberately:
+  it comes out of the operator's own config file, and running a built-in rule
+  over it would let the redactor blank out a name the operator chose.
 - **Keychain autofill from operator-declared bindings** (`[[security.secret_bindings]]`).
   A binding names a **profile**, an optional prompt pattern, a provider
   (`secret-service`, `security`, `pass`, `op`) and a reference in that provider.
@@ -221,14 +239,19 @@ surfaces rather than redacted on them.
   requires somebody to have decided.
 
 - **What this does not close, stated because the code must not claim more than
-  it delivers.** An agent that can start `ssh prod-01` at all still obtains the
-  credential's *effect* — an interactive shell on the target — once injection
-  succeeds. What these rules take away is theft of the **bytes**, for replay
-  elsewhere and beyond the session's lifetime. And because the joined line is
-  not shell-quoted, `start_session("ssh prod-01", [])` still presents the same
-  subject as `start_session("ssh", ["prod-01"])`. The move that retires the
-  class — operator-declared session profiles, where the agent fills slots and
-  writes no command line at all — is filed for a later milestone (GH #46).
+  it delivers.** An agent that can start the `prod-ssh` profile at all still
+  obtains the credential's *effect* — an interactive shell on the target — once
+  injection succeeds. What these rules take away is theft of the **bytes**, for
+  replay elsewhere and beyond the session's lifetime.
+
+  **The un-quoted-join straddle is gone with the join.** An earlier draft of
+  this entry recorded that `start_session("ssh prod-01", [])` presented the same
+  matching subject as `start_session("ssh", ["prod-01"])`, and named profiles as
+  a later milestone that would retire it. Profiles landed in this same release,
+  so nothing matches a joined command line any more and that residual is not a
+  residual — it is unrepresentable. The join survives only as
+  `BindingApprovalRequired.command_line`, which is a rendering shown to a human
+  and is matched against by nothing.
 
 - **Every tool's `outputSchema` advertises eleven statuses where it advertised
   eight.** `secret_provided` and `secret_cancelled` join after `session_died`,

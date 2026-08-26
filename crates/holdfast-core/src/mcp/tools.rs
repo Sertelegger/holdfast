@@ -479,6 +479,30 @@ impl HoldfastServer {
             json!({
                 "command": cfg.command,
                 "args": cfg.args,
+                // §9.4's `profile` (rev. 55, GH #46). **The one field on
+                // this row that says where `command`/`args` came from.**
+                // Without it a profile-started session and an
+                // agent-authored one that happens to produce the same argv
+                // write byte-identical records — and only the first can
+                // ever receive a keychain credential, which is the
+                // distinction the whole feature exists to create. It is
+                // recorded for the same reason `binding_resolved` records
+                // the binding *name*: an operator reading the trail is
+                // reconstructing which decisions were theirs.
+                //
+                // **`null`, not an absent key**, when the session was
+                // started with `command`/`args`. An omitted field cannot
+                // be told from one a writer forgot, and the negative case
+                // — *"this session could not have received a credential"*
+                // — is the fact an operator is looking for.
+                //
+                // **The name and nothing more.** Not the operator's
+                // template and not the `vars` the agent supplied: the
+                // argv that actually ran is already on this row, redacted
+                // element-wise, and a slot value keyed by the operator's
+                // own slot name would be a second copy of agent text on a
+                // surface that does not need one.
+                "profile": launch.profile,
                 "cwd": cfg.cwd,
                 "env_keys": env_keys,
                 // The **resolved** value, not the argument: §9.4 wants to
@@ -2905,6 +2929,21 @@ fn session_record(session: &Session, rules: &RuleSet) -> serde_json::Value {
         // the result would let a rule match across an argument boundary
         // and return one string where the agent expects an array.
         "args": session.args.iter().map(|a| redact_str(rules, a)).collect::<Vec<_>>(),
+        // §9.6, GH #46. **Where the two fields above came from**, which
+        // they cannot say themselves: a profile-started session and an
+        // agent-authored one that produced the same argv are otherwise
+        // identical on this record, and only the first can ever receive a
+        // keychain credential.
+        //
+        // **Not redacted, and that is not an omission.** Every other
+        // string here is agent-authored or child-authored; this one is a
+        // name out of the operator's own config file, reached only by
+        // having matched one. Running it through `redact_str` would let a
+        // built-in rule blank out an operator's chosen name — the same
+        // shape as a redactor switching off a binding (§20.6) — for a
+        // value that cannot carry a secret unless the operator put one in
+        // their own profile name.
+        "profile": session.profile,
         "state": state.as_str(),
         "pid": session.pid(),
         "exit_code": session.exit_code(),
@@ -4108,6 +4147,131 @@ mod tests {
                 ..Default::default()
             })
             .expect("the operator's own value must resolve");
+    }
+
+    /// Start one session under `args` and hand back its `session_start`
+    /// audit entry and its `status` record.
+    ///
+    /// The log goes to a temporary directory, never to the invoking user's
+    /// `~/.holdfast/logs/audit.log`.
+    async fn start_and_record(
+        config: &crate::config::Config,
+        args: StartSessionArgs,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.log");
+        let server = HoldfastServer::with_audit_path_and_config(Some(path.clone()), config);
+        // **The control that makes every assertion below mean something.**
+        // A server whose audit log did not open writes no rows at all, and
+        // "the two rows differ" is then a statement about two absences.
+        assert!(
+            server.processor.audit.path().is_some(),
+            "the audit trail is disabled, so comparing rows proves nothing"
+        );
+        server
+            .start_session(Parameters(args))
+            .await
+            .expect("start_session");
+        let id = server.registry.all()[0].id.clone();
+        let record = server
+            .status(Parameters(StatusArgs {
+                session: id.clone(),
+            }))
+            .await
+            .expect("status")
+            .structured_content
+            .clone()
+            .expect("every tool returns a structured envelope")["data"]
+            .clone();
+        let text = std::fs::read_to_string(&path).expect("the audit log must exist");
+        let entry = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("one JSON object a line"))
+            .find(|e| e["kind"] == "session_start")
+            .expect("§9.4 writes a `session_start` row");
+        for s in server.registry.all() {
+            let _ = s.signal(crate::pty::Signal::Kill);
+        }
+        (entry, record)
+    }
+
+    /// **§9.4's `profile`, and the case that motivated it.**
+    ///
+    /// Two sessions with the **same argv**, one started from an operator's
+    /// profile and one written by the agent. Only the first can ever
+    /// receive a keychain credential (`secret::binding::matches` selects
+    /// on `Session.profile`), so an operator reading the trail has to be
+    /// able to tell them apart — and without this field they could not,
+    /// because every other value on the row is identical by construction.
+    ///
+    /// The row asserts that in the strong form: strip `profile` and the
+    /// two `session_start` entries are **equal** once the three
+    /// per-session values are removed. That is the finding, driven, rather
+    /// than a `assert_ne!` that a single unrelated difference would
+    /// satisfy.
+    #[tokio::test]
+    async fn the_trail_tells_a_profile_started_session_from_an_agent_authored_one() {
+        let cfg = profiles_config();
+        let (from_profile, profile_record) = start_and_record(
+            &cfg,
+            StartSessionArgs {
+                profile: Some("echo-host".into()),
+                vars: vars(&[("host", "prod-01")]),
+                ..Default::default()
+            },
+        )
+        .await;
+        let (from_command, command_record) = start_and_record(
+            &cfg,
+            StartSessionArgs {
+                // Byte for byte what `echo-host` renders.
+                command: Some("echo".into()),
+                args: vec!["--".into(), "prod-01".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // The premise: the argv really is the same on both rows, so the
+        // field below is the only thing that can separate them.
+        assert_eq!(from_profile["command"], from_command["command"]);
+        assert_eq!(from_profile["args"], from_command["args"]);
+        assert_eq!(from_profile["args"], serde_json::json!(["--", "prod-01"]));
+
+        assert_eq!(from_profile["profile"], serde_json::json!("echo-host"));
+        assert_eq!(
+            from_command["profile"],
+            serde_json::Value::Null,
+            "a `command`/`args` session must say so affirmatively; an absent key cannot \
+             be told from one a writer forgot"
+        );
+        assert!(
+            from_command.get("profile").is_some(),
+            "`profile` is null on this row, not missing from it"
+        );
+
+        // **The finding itself.** Remove `profile` and the two rows are
+        // the same row.
+        let strip = |mut e: serde_json::Value| {
+            let o = e.as_object_mut().expect("an object");
+            for volatile in ["ts", "session_id", "pid", "profile"] {
+                o.remove(volatile);
+            }
+            e
+        };
+        assert_eq!(
+            strip(from_profile.clone()),
+            strip(from_command.clone()),
+            "the two rows differ somewhere other than `profile`, so this row is no \
+             longer about the field it names"
+        );
+
+        // And the same distinction on §5.2's record, which `status` and
+        // `list_sessions` share.
+        assert_eq!(profile_record["command"], command_record["command"]);
+        assert_eq!(profile_record["args"], command_record["args"]);
+        assert_eq!(profile_record["profile"], serde_json::json!("echo-host"));
+        assert_eq!(command_record["profile"], serde_json::Value::Null);
     }
 
     /// Mutual exclusion through the **real tool**, so the pair is refused

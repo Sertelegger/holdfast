@@ -345,6 +345,12 @@ fn session_record_keys() -> BTreeSet<String> {
         "name",
         "command",
         "args",
+        // §9.6's session profile, or `null` (GH #46). On the *shared*
+        // record and not on `status`'s alone, for the same reason
+        // `redaction_stats` is: `list_sessions` builds from the same
+        // `session_record`, and a field on only one of the two is
+        // REQ-T-015's fault.
+        "profile",
         "state",
         "pid",
         "exit_code",

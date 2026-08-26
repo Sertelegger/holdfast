@@ -382,6 +382,20 @@ pub struct SessionRecord {
     pub name: Option<String>,
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
+    /// The `[[security.profiles]]` entry this session was started from,
+    /// or **`null`** for one started with `command`/`args` (§9.6, GH #46).
+    ///
+    /// `command` and `args` above are the argv that ran and say nothing
+    /// about where it came from: a profile-started session and an
+    /// agent-authored one that produced the same argv are otherwise
+    /// indistinguishable on this record, and only the first can ever
+    /// receive a keychain credential. `null` is affirmative rather than an
+    /// omitted key, because the negative case is the one an operator is
+    /// looking for.
+    ///
+    /// The **name** and nothing more, on `binding_resolved`'s rule: not
+    /// the operator's template and not the `vars` the agent supplied.
+    pub profile: Option<String>,
     pub state: Option<SessionState>,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,

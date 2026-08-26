@@ -2135,6 +2135,12 @@ async fn session_start_records_the_field_set_9_4_names() {
             "idle_timeout_secs",
             "kind",
             "pid",
+            // §9.4's `profile` (rev. 55, GH #46) — the operator's session
+            // profile, or `null` for a `command`/`args` session like this
+            // one. Present on **every** row, because an absent key cannot
+            // be told from one a writer forgot and the negative case is
+            // what an operator is reading for.
+            "profile",
             "redaction_enabled",
             "session_id",
             "ts",
@@ -2152,6 +2158,11 @@ async fn session_start_records_the_field_set_9_4_names() {
         "the *canonical* cwd the child was spawned in"
     );
     assert_eq!(entries[0]["env_keys"], json!([]));
+    // `null` and not a missing key: this call supplied `command`/`args`,
+    // and the row has to say so rather than leave it to be inferred from
+    // a field's absence. `mcp::tools::tests::the_trail_tells_a_profile_started_session_from_an_agent_authored_one`
+    // is the paired positive.
+    assert_eq!(entries[0]["profile"], serde_json::Value::Null);
     assert_eq!(entries[0]["redaction_enabled"], true);
     // The **resolved** timeout, not the argument. This asserted `null`
     // through 0.0.4, with a comment saying a number would be "a promise
