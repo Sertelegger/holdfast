@@ -132,11 +132,16 @@ strict_confirmation = false
 # match_command   = "^ssh\\s+(\\S+@)?prod-0[12]$"
 # match_example is REQUIRED (§9.6, rev. 53): the command line you are
 # asserting this binding is for. At load, match_command must match it,
-# and must NOT match it with a hostile suffix, prefix or replacement
-# applied -- ` -o ProxyCommand=...`, `; evil`, `sh -c 'evil' ` and the
-# rest. That is what refuses a pattern left open at either end, without
-# anyone having to guess how "anything" might be spelled. A wildcard you
-# scoped to one argument -- "^ssh\\s+prod-01( -X.*)?$" -- still loads.
+# and must NOT match it with any of a corpus of hostile transformations
+# applied -- an agent's argument appended, the same argument SPLICED IN
+# between two of yours, a command of the agent's own put in front, or an
+# unrelated line. That is what refuses a pattern left open, without
+# anyone having to guess how "anything" might be spelled.
+# An open middle is a hole as much as an open end (§9.6, rev. 54):
+# options precede the host on an ssh command line, so "^ssh.*prod-01$"
+# admits "ssh -o ProxyCommand=nc 127.0.0.1 2222 prod-01". It no longer
+# loads. If some arguments really are optional, ENUMERATE them --
+# "^ssh\\s+prod-01( -4| -6)?$" -- rather than leaving a gap where they go.
 # match_example   = "ssh prod-01"
 # match_prompt is OPTIONAL and is NOT a security control (§9.6, rev. 53).
 # It disambiguates between prompts inside a session that has ALREADY

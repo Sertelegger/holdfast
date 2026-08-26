@@ -111,13 +111,20 @@
 //! second half lives in `config.rs`.** The first operator whose
 //! legitimate session stops matching writes `.*` under time pressure,
 //! silently, and the hole is back — so `Config::validate` refuses a
-//! `match_command` that gives the line back to the agent, at either end.
+//! `match_command` that gives the line back to the agent — at either end
+//! and, since round 4, anywhere in between.
 //!
 //! Both ends, because the reflex has two spellings and only one of them
 //! is the original issue. A *leading* `.*` is not the lesser case:
 //! `^.*ssh\s+prod-01$` is matched by a session whose command line is
 //! `sh -c "…read x; echo GOT $x; ssh prod-01"`, so the credential is
 //! typed into the agent's own program and `ssh` is never reached at all.
+//!
+//! **And the middle, which is where an `ssh` command line takes its
+//! options.** `^ssh.*prod-01$` pins both ends and admits `ssh -o
+//! ProxyCommand=nc 127.0.0.1 2222 prod-01` — GH #45's own reproduction
+//! line. It loaded through round 3, whose corpus had no probe that
+//! reached past either end.
 //!
 //! **How that refusal works changed in round 3, and the change is worth
 //! knowing before reading `config.rs`.** It used to be a *syntactic*
@@ -126,9 +133,13 @@
 //! accepted spellings past it. It is now *behavioural*: each binding
 //! carries a `match_example`, and the pattern — wrapped by [`whole_line`],
 //! so it is this module's regex being asked — must match that example and
-//! must **not** match it under a fixed corpus of hostile transformations.
+//! must **not** match it under a corpus of hostile transformations
+//! (appended, spliced in at a token boundary, prepended, replaced).
 //! `config::admits_only_its_example` carries the reasoning and, more
-//! importantly, what it still does not close.
+//! importantly, what it still does not close — including the part that
+//! **cannot** be closed by a corpus, since a corpus is a finite
+//! approximation of "what does this pattern admit" and a pattern can be
+//! tailored around any known set of probes.
 //!
 //! Two live holes this header could previously only warn about are closed
 //! by the same line, and both are pinned by rows below. **The
