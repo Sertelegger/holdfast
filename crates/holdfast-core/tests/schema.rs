@@ -565,6 +565,112 @@ fn no_tool_advertises_an_env_field_to_echo() {
     );
 }
 
+/// GH #46's two new `start_session` arguments, pinned on the surface a
+/// client actually reads.
+///
+/// **Why this exists.** `profile` and `vars` are the mechanism that
+/// retired GH #45's bypass class — a binding names an operator-declared
+/// profile, so no agent-authored string reaches a credential lookup — and
+/// until this row they were asserted only *behaviourally*, over
+/// in-process `CallToolResult`s in `mcp::tools`. The advertised schema of
+/// the tool whose contract changed was pinned by nothing on either
+/// surface, which is the exact gap this file's module header describes:
+/// a serialisation-only defect is invisible to every in-process test.
+///
+/// **The `required` clause is the load-bearing one, and it is asserting an
+/// absence on purpose.** At 0.0.6 this schema carried `required:
+/// ["command"]`. `command` became `Option<String>` because `command` and
+/// `profile` are mutually exclusive and schemars cannot express that —
+/// there is no `oneOf` to derive — so the array lost its only entry and
+/// the whole constraint moved into `resolve_launch` at runtime. The
+/// consequence is a real 0.0.6-facing change: a call with no `command` now
+/// comes back as JSON-RPC `-32602` where it used to be a tool-level
+/// `isError` result. That is documented in `CHANGELOG.md`; this row is
+/// what keeps it a *decision* rather than a thing that drifted. If a later
+/// milestone finds a way to express the exclusion in the schema, this
+/// assertion goes red and the CHANGELOG entry gets revisited — which is
+/// the correct outcome, not a nuisance.
+///
+/// **And the descriptions are asserted, because they are the only carrier
+/// left.** With `required` gone, the sole thing telling a caller — or a
+/// model reading `tools/list` — that exactly one of the two is needed is
+/// the prose on the two properties. Dropping a word there is a silent
+/// contract change, so the two phrases are pinned by name.
+#[test]
+fn start_session_advertises_profile_and_vars_and_no_required_command() {
+    let input = advertised("start_session").input_schema;
+    let props = input
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("start_session advertises no `properties`");
+
+    // Presence, and the *types* beside it. `profile` being present says
+    // nothing on its own; it is nullable-string because omitting it is
+    // legal, and `vars` is a nullable object whose values are strings —
+    // that last clause is not decoration, it is what stops an agent
+    // supplying a nested structure where the renderer expects one
+    // substitutable scalar per slot.
+    for (name, expected_type) in [("profile", "string"), ("vars", "object")] {
+        let body = props
+            .get(name)
+            .unwrap_or_else(|| panic!("start_session does not advertise `{name}` (GH #46)"));
+        assert_eq!(
+            body.get("type"),
+            Some(&json!([expected_type, "null"])),
+            "`{name}` is advertised, but not as a nullable {expected_type}: {body}"
+        );
+    }
+    assert_eq!(
+        props["vars"].get("additionalProperties"),
+        Some(&json!({"type": "string"})),
+        "`vars` values must be advertised as strings: a slot takes one \
+         rendered scalar, and a schema that admits a nested object \
+         advertises a shape `render` cannot consume"
+    );
+
+    // The absence, argued in the doc comment above.
+    assert!(
+        input.get("required").is_none(),
+        "`start_session` advertises `required: {:?}`. The mutual exclusion \
+         between `command` and `profile` is not expressible in schemars, \
+         so `command` is `Option<String>` and the array is empty — if that \
+         has changed, `CHANGELOG.md`'s 0.0.7 note about `-32602` versus \
+         `isError` needs revisiting with it",
+        input.get("required")
+    );
+    assert_eq!(
+        props["command"].get("type"),
+        Some(&json!(["string", "null"])),
+        "`command` is advertised as non-nullable again; the `required` \
+         assertion above and this one are the same fact from two sides"
+    );
+
+    // The prose that now carries the whole constraint.
+    for (name, phrase) in [
+        ("command", "Mutually exclusive with `profile`"),
+        ("profile", "Mutually exclusive with `command`"),
+        ("vars", "Only with `profile`"),
+        ("args", "Only with `command`"),
+    ] {
+        let raw = props[name]
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("`{name}` advertises no description"));
+        // The doc comment reaches the wire with its source line breaks
+        // intact, so `vars`'s phrase really does arrive as "Only with\n
+        // `profile`". Collapsing whitespace asserts the sentence rather
+        // than where rustfmt happened to wrap it — the wrapping is not a
+        // contract and pinning it would make this row go red on a reflow.
+        let description = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            description.contains(phrase),
+            "`{name}`'s description no longer says {phrase:?}. With \
+             `required` empty, this prose is the only thing on the wire \
+             that tells a caller which arguments combine: {description:?}"
+        );
+    }
+}
+
 #[test]
 fn every_tool_declares_the_annotations_5_3_assigns_it() {
     // Four same-typed booleans per tool: transposing two of them compiles,

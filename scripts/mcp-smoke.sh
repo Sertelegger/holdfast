@@ -164,6 +164,54 @@ teardown() {
 }
 trap teardown EXIT
 
+# A private config for this run, for the same reason the runtime directory
+# is private: without it every check below runs against whatever the
+# invoking user happens to have in `~/.config/holdfast/config.toml`, and a
+# developer who has turned redaction off locally gets a red smoke run that
+# says nothing about the tree. CI has no config file at all, so isolating
+# here also makes a local run and a CI run the same run.
+#
+# It lives INSIDE $HOLDFAST_RUNTIME_DIR so the one EXIT trap above reaps it
+# too -- a second `mktemp -d` would need a second thing to clean up, and
+# the "exactly one trap" rule this file already documents makes that a
+# hazard rather than a tidy-up. The daemon only ever looks for its own
+# sockets, pid and `logs/` in there, so an extra subdirectory is inert.
+#
+# **Written BEFORE the first `holdfast mcp` below, and that ordering is
+# load-bearing.** `config::load()` runs once at daemon startup (and the
+# first `mcp` invocation is what auto-spawns the daemon), so a config
+# written later would be read by nothing and the profile phase at the
+# bottom would fail with `unknown profile` -- green tooling, useless test.
+export XDG_CONFIG_HOME="$HOLDFAST_RUNTIME_DIR/xdg"
+mkdir -p "$XDG_CONFIG_HOME/holdfast"
+# §9.6's operator-declared session profile, in the shape the published
+# example ships. THE OPERATOR WRITES THE COMMAND LINE: `program` is a
+# literal, `args` is a template, and `{host}` is the one thing the agent
+# gets to fill -- bounded by a pattern the operator wrote, matched whole.
+# The profile phase at the bottom of this file drives it and drives four
+# refusals against it.
+#
+# `sleep 30` so the session is still `Running` when `status` asks; the
+# EXIT trap's `daemon stop` is what reaps it, as it does for `smokeattach`.
+#
+# `$SMOKE_PROFILE_ENV` is expanded by the child, not by this heredoc --
+# the quoted delimiter keeps it literal here. It is what proves
+# `[security.profiles.env]` reached the process, which is the operator's
+# half of GH #55: the agent may supply no `env` at all on this arm, so the
+# only environment a credentialed session can have is this one.
+cat >"$XDG_CONFIG_HOME/holdfast/config.toml" <<'SMOKECONFIG'
+[[security.profiles]]
+name    = "smokeprofile"
+program = "bash"
+args    = ["--norc", "--noprofile", "-c", "echo SMOKEPROF host={host} env=$SMOKE_PROFILE_ENV; sleep 30"]
+
+  [security.profiles.vars]
+  host = "^smoke-0[12]$"
+
+  [security.profiles.env]
+  SMOKE_PROFILE_ENV = "operator-value"
+SMOKECONFIG
+
 req() { printf '%s\n' "$1"; }
 
 OUT="$(
@@ -932,6 +980,125 @@ absent_on "no response in the secret transcript carries the submitted value" \
 # is the prompt the client printed when it entered secret mode.
 absent_on "holdfast attach never renders the line it is collecting" \
   "$(cat "$SECRET_ATTACH_LOG" 2>/dev/null)" "$SMOKE_SECRET" 'SMOKEPW2:'
+
+# ------------------------------------------------- 0.0.7: session profiles
+#
+# **The mechanism that retired GH #45's bypass class, on the wire.**
+# `profile` and `vars` are what make "the agent cannot author a
+# credential-bearing command line" true: a binding names a profile, so
+# there is no agent-written string left for a credential lookup to attach
+# to. Thirteen rows in `mcp::tools` cover the behaviour, and until this
+# phase existed the *advertised and transmitted* shape of the changed tool
+# was asserted by nothing on either surface -- the exact gap this file's
+# header describes, on the feature with the largest security claim in the
+# milestone. `tests/schema.rs::start_session_advertises_profile_and_vars_
+# and_no_required_command` is the other half; it pins what `tools/list`
+# says, and this pins what a real call actually does.
+#
+# It runs in its own transcript rather than in the main one for the same
+# reason the secret phase does: the main transcript's `list_sessions` check
+# asserts the registry holds exactly one session, and a second one started
+# up there would turn a real assertion into an arithmetic accident.
+#
+# A separate `holdfast mcp` against the same runtime dir reaches the same
+# daemon, which is the process that read `config.toml` at startup.
+PROFILE_OUT="$(
+  {
+    req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke-profile","version":"0"}}}'
+    req '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    # The agent names a profile and fills its one slot. It writes no
+    # command line: `bash --norc --noprofile -c '...'` is the operator's.
+    req '{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","vars":{"host":"smoke-01"},"name":"smokeprof"}}}'
+    # Long enough for the child to have run its `echo` and reached `sleep`.
+    sleep 3
+    req '{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"smokeprof","since_cursor":0}}}'
+    req '{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"status","arguments":{"session":"smokeprof"}}}'
+    req '{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}'
+    # The four refusals. Each is an `invalid_params` on the profile arm,
+    # and each is a route an agent would actually take.
+    req '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","vars":{"host":"smoke-01"},"env":{"PATH":"/evil"}}}}'
+    req '{"jsonrpc":"2.0","id":55,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","command":"bash"}}}'
+    req '{"jsonrpc":"2.0","id":56,"method":"tools/call","params":{"name":"start_session","arguments":{"profile":"smokeprofile","vars":{"host":"prod-99"}}}}'
+    req '{"jsonrpc":"2.0","id":57,"method":"tools/call","params":{"name":"start_session","arguments":{"args":["x"]}}}'
+    sleep 3
+  } | "$BIN" mcp
+)"
+
+echo
+echo "-- 0.0.7 session profiles"
+
+# The session exists and it is the OPERATOR's program that ran. `details`
+# names `bash` because that is the profile's `program`; the agent's call
+# carried no program name at all.
+jcheck_on "start_session accepts a profile and starts the operator's program" \
+  "$PROFILE_OUT" \
+  '[data(50).session_id != null,
+    (resp(50).result.structuredContent.details | contains("`bash`"))]' \
+  '[true,true]'
+
+# **The field the milestone added to the session record, asserted on both
+# tools that carry it.** `profile` rides the SHARED `session_record`, so a
+# field on `status` and not on `list_sessions` is REQ-T-015's fault -- one
+# check over both is what says they agree.
+#
+# `args` rides along and is the load-bearing half: it is the operator's
+# four-element template with the agent's value substituted INTO ONE
+# ELEMENT. A `render` that joined and re-split would show a different
+# element count here, which is the structural guarantee §9.6 rests on.
+jcheck_on "status and list_sessions carry the profile and the operator's argv" \
+  "$PROFILE_OUT" \
+  '[(data(52) | [.profile, .command, .args, .state]),
+    (data(53).sessions | map(select(.name == "smokeprof")) | first | .profile)]' \
+  '[["smokeprofile","bash",["--norc","--noprofile","-c","echo SMOKEPROF host=smoke-01 env=$SMOKE_PROFILE_ENV; sleep 30"],"Running"],"smokeprofile"]'
+
+# The child really ran, with the agent's value in the slot and the
+# OPERATOR's environment around it. Both halves in one string: `smoke-01`
+# is the agent's contribution and `operator-value` can only come from
+# `[security.profiles.env]`, which is the only environment a profile
+# session can have now that `start_session(env:)` is refused on this arm.
+jcheck_on "the profile's child ran with the agent's slot value and the operator's env" \
+  "$PROFILE_OUT" \
+  'data(51).output | contains("SMOKEPROF host=smoke-01 env=operator-value")' \
+  'true'
+
+# GH #55, on the real wire. `PATH` chooses which binary a literal
+# `program` resolves to, so an agent-supplied environment is an
+# agent-chosen binary -- the one choice no argument pattern can bound.
+# The refusal is in `resolve_launch`, before `PtySpawnConfig` exists, so
+# nothing is spawned.
+jcheck_on "an agent-supplied env is refused on the profile arm" \
+  "$PROFILE_OUT" \
+  '[resp(54).error.code,
+    (resp(54).error.message | contains("only meaningful with `command`"))]' \
+  '[-32602,true]'
+
+jcheck_on "command and profile are mutually exclusive at the tool" \
+  "$PROFILE_OUT" \
+  '[resp(55).error.code,
+    (resp(55).error.message | contains("mutually exclusive"))]' \
+  '[-32602,true]'
+
+# **The value is refused AND is not echoed back**, which is the second
+# clause and the one an error message written the obvious way would fail.
+# A slot value can be a credential -- an operator is free to declare one --
+# so naming the var is the diagnostic and quoting the value is a leak.
+jcheck_on "a var failing its pattern is refused by name, without echoing the value" \
+  "$PROFILE_OUT" \
+  '[resp(56).error.code,
+    (resp(56).error.message | contains("vars.host")),
+    (resp(56).error.message | contains("prod-99"))]' \
+  '[-32602,true,false]'
+
+# The 0.0.6-facing consequence of `command` becoming `Option<String>`.
+# `required: ["command"]` left the advertised schema because the
+# `command`/`profile` exclusion is not expressible in schemars, so this
+# case moved from a tool-level `isError` result to a JSON-RPC error.
+# Asserted here because it is a channel change a client branches on, and
+# `CHANGELOG.md` documents it.
+jcheck_on "a call naming neither command nor profile is a JSON-RPC error" \
+  "$PROFILE_OUT" \
+  '[resp(57).error.code, resp(57).error.message]' \
+  '[-32602,"start_session needs either `command` or `profile`"]'
 
 echo
 if [ "$fails" -ne 0 ]; then
