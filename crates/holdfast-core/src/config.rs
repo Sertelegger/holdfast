@@ -668,8 +668,10 @@ pub struct SessionProfile {
     /// different times, and that is deliberate.** Being a *literal* is a
     /// load error, like every other profile rule. *Existing* is checked at
     /// **session start**, because that path is where the check lives — so
-    /// a profile with a mistyped `cwd` loads cleanly and fails every
-    /// session start. Moving the existence check to [`Config::validate`]
+    /// a profile with a mistyped `cwd` loads cleanly and then fails every
+    /// session start **of that profile** (other profiles, and ordinary
+    /// `command`/`args` sessions, are untouched). Moving it to
+    /// [`Config::validate`]
     /// would buy an earlier message and no guarantee (the directory is
     /// resolved again at spawn regardless), would put two checks on one
     /// path where GH #50 argues for one, and would take the whole daemon

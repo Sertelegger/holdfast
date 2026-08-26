@@ -103,8 +103,8 @@ surfaces rather than redacted on them.
 
 - **`start_session`'s `inputSchema` no longer marks `command` required, and a
   call that omits it now returns a JSON-RPC error instead of a tool result.**
-  This is the one 0.0.6-facing difference in the milestone that is not a
-  behaviour change, and it is on the wire.
+  A 0.0.6-facing difference that is not a behaviour change, and it is on the
+  wire. (The entry below it is the other one.)
 
   | | 0.0.6 | 0.0.7 |
   |---|---|---|
@@ -119,37 +119,57 @@ surfaces rather than redacted on them.
   neither-supplied and both-supplied cases by name.
 
   **What it costs a client.** The *schema* no longer tells a caller — or a
-  model reading `tools/list` — that a command is needed; only the `command`
-  and `profile` descriptions say *"supply exactly one"*, so those two
-  sentences now carry the whole contract. And a client that branches on
-  `result.isError` takes its transport-error path for this one input instead.
-  Not a new class — a bad `cwd` or a bad `screen_tracking` was already
-  `invalid_params` at 0.0.6 — but `command` moved into it.
+  model reading `tools/list` — that a command is needed. What is left is the
+  prose on the properties: `command`'s description says *"Mutually exclusive
+  with `profile`; supply exactly one"* and `profile`'s says *"Mutually
+  exclusive with `command`/`args`"*. Those two sentences now carry the whole
+  contract, so `tests/schema.rs::start_session_advertises_profile_and_vars_and_no_required_command`
+  pins both phrases by name — dropping a word there is a silent contract
+  change with nothing else to catch it.
+
+  And a client that branches on `result.isError` takes its transport-error
+  path for this one input instead. Not a new class — a bad `cwd` or a bad
+  `screen_tracking` was already `invalid_params` at 0.0.6 — but `command`
+  moved into it.
 
 - **`AwaitingSecret.prompt_text` can now be redacted where 0.0.6 left it
   intact.** `Session::prompt_last_line_redacted` moved from `redact_str` to
-  `redact_for_display`, which **strips ANSI escapes before** redacting rather
-  than redacting the raw line. The frame is 0.0.6's (§7.5) and its field is
-  unchanged in shape; what it carries can differ.
+  `redact_for_display`, which **strips control characters before** redacting
+  rather than redacting the raw line. `AwaitingSecret` is 0.0.6's frame (§7.5)
+  and its field is unchanged in shape; what it carries can differ. (The
+  function's other consumer, `BindingApprovalRequired.prompt_text`, is new in
+  0.0.7 and has no 0.0.6 behaviour to differ from.)
 
-  Intended, and the reason for the change: an escape sequence between a label
-  and a credential let a prompt line reassemble on a human's screen into
-  something the redactor never saw as one token. Stripping first closes that.
+  Intended, and the reason for the change: a control byte between a label and
+  a credential let a prompt line reassemble on a human's screen into something
+  the redactor never saw as one token. Stripping first closes that.
+
+  **It is a control-character filter and not an ANSI-sequence stripper**, and
+  that distinction is the whole of the paragraph below: `one_line_for_display`
+  drops the ESC byte and leaves the `[2K` that followed it. The module's real
+  sequence stripper, `strip_str`, is a different function and is not on this
+  path.
 
   The part worth writing down is a **side effect nobody would predict from
-  either change alone**. Stripping an escape can join the text on each side of
-  it, and the joined token can match a rule that neither side matched:
+  either change alone**. Dropping a control byte joins the text on each side
+  of it, and the joined token can match a rule that neither side matched:
 
   ```
   0.0.6:  "Password: \x1b[2K\rholdfast attach: all clear"   (unchanged)
   0.0.7:  "Password: [REDACTED:generic] attach: all clear"
   ```
 
-  Removing the `\x1b` glues `[2K` onto `holdfast`, and a **pre-existing,
-  unchanged** generic rule then matches the result — confirmed by feeding the
-  post-strip text to 0.0.6's own `redact_str`, which produces the identical
-  marker. The rule did not change; the strip newly hands it a token that was
-  not in the source.
+  Dropping the `\x1b` **and the `\r`** glues `[2K` onto `holdfast`, and a
+  **pre-existing, unchanged** generic rule then matches the result. The
+  mechanism, since "a rule started matching" is not an explanation:
+  `generic-secret-assignment` requires a value of eight characters or more
+  after a `password`-ish label. In the raw line the `\r` ends the value after
+  four (`\x1b[2K`), below the floor; once both control bytes are gone the
+  value group is `[2Kholdfast`, eleven characters, and it matches. Confirmed
+  by feeding the post-strip text to 0.0.6's own `redact_str`, which produces
+  the identical marker, and by `git diff v0.0.6 HEAD -- data/redaction_default.toml`
+  being empty. The rule did not change; the strip newly hands it a token that
+  was not in the source.
 
   The direction is safe — a human-facing display field over-redacts, and
   over-redaction on a prompt label is not a leak — but it does qualify the

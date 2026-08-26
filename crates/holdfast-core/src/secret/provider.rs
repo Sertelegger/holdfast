@@ -879,14 +879,25 @@ mod tests {
     /// attribute-addressed templates against.
     const ATTR_REFERENCE: &str = "service=holdfast,account=prod-ssh";
 
-    /// **REQ-SEC-015's zeroing clause** — *"resolved keychain values …
-    /// are zeroed immediately after write"*. The value here comes from a
-    /// **provider**, which is what makes this the requirement's own
-    /// subject rather than its twin's: `secret::request::tests::
-    /// the_submitted_value_is_zeroed_after_the_write` asserts the same
-    /// property for a value a *client* submitted, which is REQ-SEC-004's.
-    /// The other clause — that a resolved value reaches the PTY through
-    /// the `SecretInput` path and no other surface — is
+    /// **REQ-SEC-015's zeroing clause, on the primitive.** The row reads
+    /// *"resolved keychain values reach the PTY through the `SecretInput`
+    /// path and are zeroed immediately after write"*. The value here comes
+    /// from a **provider**, so it is the requirement's own subject; what
+    /// this row proves is that `SecretBytes::Drop` zeroes, which is the
+    /// mechanism the clause rests on.
+    ///
+    /// **It does not assert the sequencing**, and the citation is scoped
+    /// so nobody reads it as though it did: this test lends the bytes
+    /// through `with_bytes` the way the writer thread does and then drops,
+    /// rather than driving a real PTY write and observing the drop after
+    /// it. *"Immediately after write"* is held structurally instead —
+    /// `SecretBytes` has no owning accessor, so the writer cannot outlive
+    /// its own `Drop` with a copy, and
+    /// `source_guards::the_write_channel_carries_the_secret_as_itself`
+    /// makes reintroducing one a mutation target.
+    ///
+    /// The row's other clause — that a resolved value reaches the PTY
+    /// through the `SecretInput` path and no other surface — is
     /// `secret::binding::tests::a_keychain_resolved_secret_reaches_none_of_them_either`.
     ///
     /// **The zeroing, asserted from inside the `Drop` while the buffer is
