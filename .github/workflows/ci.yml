@@ -41,6 +41,13 @@ on:
   # public" — so there are no required checks to strand. **Re-check this
   # the day the repository goes public or gains protection.**
   #
+  # `**.md` and NOT `**/*.md`: GitHub documents the former as matching
+  # every Markdown file in the repository, root included, and does not
+  # list the latter at all. 8 of this repository's 9 tracked `.md` files
+  # are at the root, so the stricter reading would have made this rule
+  # near-inert — a filter that looks like it saves a run per docs-only
+  # push and saves almost none.
+  #
   # Nothing in CI reads these paths: `ci-hygiene.sh` does not police
   # markdown, and the only `*.md` glob in `scripts/` is
   # `artifact-deletion-check.py` scanning the git-ignored `plans/` tree,
@@ -48,12 +55,12 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - "**/*.md"
+      - "**.md"
       - "LICENSE"
   pull_request:
     branches: [main]
     paths-ignore:
-      - "**/*.md"
+      - "**.md"
       - "LICENSE"
 
 permissions:
