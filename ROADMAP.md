@@ -127,9 +127,13 @@ launcher that fetches the right binary on demand.
   process is the priority follow-up — an in-process PTY means one session's
   pathology is the whole server's, which is a lesson already paid for once (see
   the wedged-writer fix in the changelog).
-- **Full process-group enumeration on Unix without `/proc`**, via
-  `sysctl(KERN_PROC_SESSION)`. Until then, `terminate` on those platforms can
-  leave a background job in a third process group behind.
+- **Full process-group enumeration on the BSDs.** macOS is done — it enumerates
+  via `proc_listallpids` plus `getsid(2)`, which yields the same predicate Linux
+  reads out of `/proc/<pid>/stat`. It is **not** `sysctl(KERN_PROC_SESSION)`,
+  which this roadmap named until somebody tried the call: XNU registers no such
+  OID and answers `ENOENT`, `kinfo_proc`'s `e_sess` is NULL on every process,
+  and libc does not declare `kinfo_proc` for Apple at all. On the remaining BSDs
+  `terminate` can still leave a background job in a third process group behind.
 - **Signed and notarized macOS builds, and an Authenticode-signed Windows
   binary.** The first release ships unsigned. The plugin's bootstrap downloads
   with `curl`, which sets no quarantine attribute, so the install path most
