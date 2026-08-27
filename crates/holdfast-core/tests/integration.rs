@@ -1448,7 +1448,10 @@ fn line_discipline_tracks_the_slaves_line_discipline() {
     // way through echoing the command it was handed, never reaches the
     // fork, and the property under test never changes — for a reason
     // that has nothing to do with the property. Reading the echo back
-    // unblocks the shell and doubles as proof the line was accepted.
+    // unblocks the shell. It is NOT proof the line was accepted:
+    // `read_until` returns on its deadline too and the value is
+    // discarded, so a silent shell and an accepted line look identical
+    // here. The assertions below are what distinguish them.
     // Inert on Linux, where the buffer swallows a whole session's chatter.
     read_until(&pty, "sleep 3", Duration::from_secs(5));
     assert_eq!(
@@ -1591,10 +1594,27 @@ fn draining<T>(pty: &InProcessPty, body: impl FnOnce() -> T) -> T {
                 }
             }
         });
-        let out = body();
-        stop.store(true, Ordering::Relaxed);
-        let _ = pty.write(b"\n");
-        out
+        // **Retire the reader even if `body` panics**, which is the whole
+        // reason this is a guard and not two statements. A failing
+        // assertion inside `body` unwinds; `thread::scope` then waits for
+        // the reader before propagating it; and the reader is parked in a
+        // blocking `read` that only bytes or EOF return. The test would
+        // hang instead of failing — turning a red assertion into a job
+        // that has to be killed by a timeout, which is the failure mode
+        // this suite's "nothing may block without a deadline" rule exists
+        // to forbid.
+        struct Retire<'a>(&'a AtomicBool, &'a InProcessPty);
+        impl Drop for Retire<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+                // Bytes, not EOF: the session is still alive on the happy
+                // path, so nothing else will wake the reader. A dead one
+                // errors out of `read` on its own and this is a no-op.
+                let _ = self.1.write(b"\n");
+            }
+        }
+        let _retire = Retire(&stop, pty);
+        body()
     })
 }
 
@@ -1627,7 +1647,10 @@ fn the_foreground_group_changes_for_an_external_command_and_not_for_a_builtin() 
     // way through echoing the command it was handed, never reaches the
     // fork, and the property under test never changes — for a reason
     // that has nothing to do with the property. Reading the echo back
-    // unblocks the shell and doubles as proof the line was accepted.
+    // unblocks the shell. It is NOT proof the line was accepted:
+    // `read_until` returns on its deadline too and the value is
+    // discarded, so a silent shell and an accepted line look identical
+    // here. The assertions below are what distinguish them.
     // Inert on Linux, where the buffer swallows a whole session's chatter.
     read_until(&pty, "sleep 3", Duration::from_secs(5));
     let running = draining(&pty, || {

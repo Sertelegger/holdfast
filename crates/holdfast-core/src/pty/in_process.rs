@@ -381,6 +381,26 @@ impl InProcessPty {
         }
     }
 
+    /// Degraded sweep for the Unixes that are neither: the BSDs and
+    /// illumos, where there is no `/proc` and `kinfo_proc` is a different
+    /// struct than the one the macOS arm reads.
+    ///
+    /// **This arm is what keeps the crate compiling there at all.**
+    /// `sweep` is `#[cfg(unix)]`, so a `session_pgids` defined only for
+    /// Linux and macOS is a build failure on every other Unix — and the
+    /// documented-limitation guard, gated to exactly those platforms,
+    /// then cannot be compiled and so can never fail. A guard that cannot
+    /// fail while the tree still reads as guarded is worse than no guard.
+    ///
+    /// It returns the weak set deliberately. Restoring a two-arm split
+    /// would have these platforms assert the *strong* process-group
+    /// guarantee they cannot keep, which is the error this file already
+    /// corrected once (§4.4).
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    fn session_pgids(&self) -> Vec<i32> {
+        self.fallback_pgids()
+    }
+
     #[cfg(unix)]
     fn fallback_pgids(&self) -> Vec<i32> {
         let mut v = Vec::new();
