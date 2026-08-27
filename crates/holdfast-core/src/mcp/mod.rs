@@ -38,9 +38,16 @@ use std::sync::Arc;
 pub const INSTRUCTIONS: &str = "Holdfast gives you PTY-backed shell sessions. start_session spawns a \
      shell or program; send_input types into it; read_output reads what \
      it printed using a cursor you carry between calls; \
-     wait_for_pattern blocks until a regex matches new output, which \
-     is how you wait for a command to finish or for a prompt to \
-     appear; interrupt sends Ctrl+C to the foreground process group, \
+     wait_for_pattern blocks until a regex matches new output. Use it \
+     for a PROGRAM's prompt -- `Password:`, `(gdb)`, `>>>` -- and NOT \
+     for the shell's own: a shell-prompt regex is a guess about the \
+     operator's $PS1, and against a customised prompt it simply never \
+     matches, so the call reports a timeout for a command that finished \
+     long ago. To know whether a command has finished, read \
+     interaction_mode; to know whether it succeeded, read \
+     get_command_history's exit code. A wait that expires against a \
+     session already back at a measured prompt says so, in warning; \
+     interrupt sends Ctrl+C to the foreground process group, \
      which stops the running command without killing the shell, and \
      terminate stops the session and its whole process group. \
      get_screen_state returns the rendered terminal grid rather than \

@@ -1133,9 +1133,16 @@ impl HoldfastServer {
             .get("matched")
             .and_then(|m| m.as_bool())
             .unwrap_or(false);
+        let mut data =
+            detection::with_detection(serde_json::Value::Object(fields), &session, &self.processor);
+        // After `with_detection`, not before: the warning is read out of
+        // the detection fields this response is about to carry.
+        if let Some(w) = detection::unmatched_at_prompt(&data) {
+            data["warning"] = json!(w);
+        }
         Ok(envelope::envelope(
             status,
-            detection::with_detection(serde_json::Value::Object(fields), &session, &self.processor),
+            data,
             if matched {
                 "pattern matched".to_string()
             } else {
@@ -1299,9 +1306,21 @@ impl HoldfastServer {
             .get("matched")
             .and_then(|m| m.as_bool())
             .unwrap_or(false);
+        let mut data =
+            detection::with_detection(serde_json::Value::Object(fields), &session, &self.processor);
+        // REQ-SEC-011's warning outranks this one: a write into an
+        // echo-off session is a security event, and a mis-written regex
+        // is a usability one. They cannot both apply anyway — a session
+        // that is `AwaitingSecret` is not `AtPrompt` — so this is a
+        // precedence rule against future modes rather than today's.
+        if warning.is_none() {
+            if let Some(w) = detection::unmatched_at_prompt(&data) {
+                data["warning"] = json!(w);
+            }
+        }
         Ok(envelope::envelope(
             status,
-            detection::with_detection(serde_json::Value::Object(fields), &session, &self.processor),
+            data,
             if matched {
                 format!("wrote {written} bytes; pattern matched")
             } else {

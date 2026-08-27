@@ -155,6 +155,35 @@ fn safe_last_line(processor: &OutputProcessor, session: &Session, d: &Detection)
 /// payload with nothing evicted from it, and an over-long one is discarded
 /// wholesale by the scanner rather than truncated — so the redactor sees
 /// the whole of whatever it sees. It was simply not being run.
+/// `"pattern_did_not_match_but_session_is_at_prompt"` when a wait expired
+/// against a session detection already knew was back at a prompt.
+///
+/// **The mistake this exists to catch is writing the shell's prompt as a
+/// regex.** An agent asked to wait for a command to finish reaches for
+/// `\$ $` or `> $`, which is a guess about somebody else's `$PS1` — and
+/// against a customised prompt (`❯`, a Starship segment line, a colour
+/// escape) it simply never matches. The call then reports `timeout` and
+/// `matched: false` beside `interaction_mode: AtPrompt` and
+/// `confidence: 1`, which is the truth and the false thing in one
+/// payload. Without this the agent has to notice that contradiction by
+/// eye; with it, the tool says so at the call that got it wrong.
+///
+/// **Read out of the payload rather than recomputed**, so the warning
+/// cannot disagree with the detection fields printed beside it.
+///
+/// Restricted to the tiers that *measured* the prompt. At `heuristic`,
+/// `AtPrompt` is itself a guess from quiescence, and warning that a guess
+/// contradicts a guess would be noise.
+pub fn unmatched_at_prompt(data: &Value) -> Option<&'static str> {
+    let matched = data.get("matched")?.as_bool()?;
+    let at_prompt = data.get("interaction_mode")?.as_str()? == "AtPrompt";
+    let measured = matches!(
+        data.get("detection_tier").and_then(Value::as_str),
+        Some("semantic" | "terminal_mode")
+    );
+    (!matched && at_prompt && measured).then_some("pattern_did_not_match_but_session_is_at_prompt")
+}
+
 pub fn with_detection(mut data: Value, session: &Session, processor: &OutputProcessor) -> Value {
     let d = session.detection();
     let Some(map) = data.as_object_mut() else {

@@ -271,6 +271,11 @@ pub struct WaitForPattern {
     /// Set **only** when the daemon clamped the requested deadline
     /// (REQ-T-008). A field that is always present carries no information.
     pub clamped_timeout_secs: Option<u64>,
+    /// `"pattern_did_not_match_but_session_is_at_prompt"` when the wait
+    /// expired against a session already back at a measured prompt — the
+    /// signature of a regex written for somebody else's `$PS1`. Null
+    /// otherwise, for the same reason `clamped_timeout_secs` is.
+    pub warning: Option<String>,
     pub exit_code: Option<i32>,
     pub interaction_mode: Option<InteractionMode>,
     pub detection_tier: Option<DetectionTier>,
