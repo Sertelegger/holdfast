@@ -39,13 +39,24 @@ on:
     # run, daily was ~417 min/month against an account-wide 2000 min free
     # tier that this repository exhausted on the 25th. Weekly is ~60.
     #
-    # **The trade-off is real and is not a drift argument.** Most of what
-    # a scheduled job re-runs on an unchanged tree can only catch runner
-    # or toolchain drift, for which weekly is plenty — but a flake hunt is
-    # the exception, because repetition IS the measurement. Monthly
-    # samples drop from ~600 to ~87. If that sensitivity is worth more
-    # than the minutes, raise the repetition count below rather than the
-    # cadence: it is the cheaper knob, since each run pays the setup once.
+    # **The trade-off is real and is not a drift argument, and it is paid
+    # rather than accepted.** Most of what a scheduled job re-runs on an
+    # unchanged tree can only catch runner or toolchain drift, for which
+    # weekly is plenty — but a flake hunt is the exception, because
+    # repetition IS the measurement. Weekly at the old count would have
+    # dropped monthly samples from ~600 to ~87, and the sensitivity that
+    # buys is currently pointed at GH #42, which is NOT believed to be a
+    # simple flake: the hypothesis is that a rescan reads the session
+    # buffer rather than confirming the reader has caught up, which would
+    # make `wait_for_pattern` answer `SessionDied` over output a real
+    # child produced. Cutting the sampling rate 7x on the one job that
+    # would catch that is the wrong direction.
+    #
+    # So the repetition count rises with the cadence and the monthly
+    # sample count stays flat: 4.33 runs x 140 = ~606, against 30 x 20 =
+    # ~600. Each run pays the setup once instead of thirty times, which is
+    # where the saving comes from — ~346 min/month against ~423, smaller
+    # than the cadence alone would suggest and honest about it.
     - cron: "17 10 * * 0"
   # So the job can be exercised on demand during Task 7 without waiting a
   # day. This is NOT a substitute for the schedule -- a workflow_dispatch-
@@ -114,4 +125,8 @@ jobs:
           key: nightly
           save-if: false
       - run: ./scripts/ci-probe.sh
-      - run: ./scripts/ci-flake-hunt.sh 20
+      # 140, not the script's default 20: see the sampling note on the
+      # schedule above. At the measured ~0.5 min an iteration this lands
+      # near 80 min, inside the 180 min cap with room for the suite to
+      # keep growing.
+      - run: ./scripts/ci-flake-hunt.sh 140

@@ -22,8 +22,8 @@ name: Mutants
 
 on:
   schedule:
-    # 11:41 UTC on the FIRST Saturday of the month. UTC only; see
-    # nightly.yml for the note.
+    # 11:41 UTC on the 1st of each month. UTC only; see nightly.yml
+    # for the note.
     #
     # **Monthly, not weekly, and the reason is the bill rather than the
     # engineering.** At ~175 min a run this job cost 43% of the account's
@@ -31,13 +31,26 @@ on:
     # every other repository's CI down with it. Weekly was 4.33 runs =
     # ~759 min/month; monthly is ~175.
     #
+    # **Day-of-month, and NOT `1-7 * 6` for "first Saturday".** POSIX cron
+    # ORs a restricted day-of-month with a restricted day-of-week instead
+    # of ANDing them, and GitHub follows POSIX. `41 11 1-7 * 6` therefore
+    # fires on days 1-7 *and* on every Saturday — enumerated, 10 runs in
+    # 2026-09, 11 in 2026-10 — which is ~1800 min/month, a 2.4x INCREASE
+    # over the weekly schedule it was written to replace. It read as a
+    # saving and was a regression.
+    #
+    # A true first-Saturday needs day-of-month `*` and the day filter in
+    # the job, which pays a runner start every week to skip. The weekday
+    # was never load-bearing for a sweep nobody watches live, so this
+    # picks a fixed date instead and gets exactly one run.
+    #
     # **What that costs in coverage, stated rather than glossed.** One
     # shard of eight runs per invocation, so a full sweep went from 8
     # weeks to 8 months. That is only acceptable because the value of a
     # sweep is in *reading* the survivors, and an unread sweep is spend
     # with no return. Before a milestone, dispatch the shards deliberately
     # with the input below rather than waiting for the calendar.
-    - cron: "41 11 1-7 * 6"
+    - cron: "41 11 1 * *"
   workflow_dispatch:
     inputs:
       shard:
@@ -215,8 +228,19 @@ jobs:
       #
       # An explicit `shard` input wins, so a milestone sweep can walk 0..7
       # without waiting eight months for the calendar to do it.
-      - run: |
-          shard="${{ inputs.shard }}"
+      # Through `env:` rather than `${{ }}` interpolation into the script
+      # body: an expression is pasted in before the shell sees the line, so
+      # a crafted input would be shell syntax rather than a value. Only a
+      # dispatcher with write access can set it, which lowers the severity
+      # and does not change the shape.
+      - env:
+          SHARD_INPUT: ${{ inputs.shard }}
+        run: |
+          shard="${SHARD_INPUT}"
+          case "${shard}" in
+            "" | [0-7]) ;;
+            *) echo "shard must be 0-7 or empty, got: ${shard}" >&2; exit 1 ;;
+          esac
           if [ -z "${shard}" ]; then
             shard=$(( ($(date -u +%-m) - 1) % 8 ))
             echo "month $(date -u +%-m) -> shard ${shard}/8"
