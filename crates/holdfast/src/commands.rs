@@ -1105,26 +1105,43 @@ pub async fn attach(session: &str) -> ExitCode {
     // that answers `SIGWINCH` with silence — a program that ignores it,
     // or a session with nothing to redraw — so a quiet session still
     // gets told it is attached.
-    // **Wrapped in DECSC/DECRC, because this terminal belongs to the
-    // child.** `attach` is a pass-through: `render` writes the session's
-    // bytes straight out, and the child tracks its own cursor. Writing a
-    // line without putting the cursor back leaves the child's next output
-    // starting wherever the banner ended — measured, halfway along the
-    // following line. Save (`ESC 7`), draw, restore (`ESC 8`).
+    // **Inserted above the prompt, not printed below it.**
     //
-    // The leading `\r\n` is for raw mode, where `ONLCR` is off and a bare
-    // newline moves down without returning to column zero.
+    // The first version wrote `\r\n` + text and restored the cursor with
+    // DECSC/DECRC. That put the bar under the prompt, and the restore
+    // landed a row off whenever the prompt sat on the last line: the
+    // newline scrolled the screen, every absolute row moved up one, and
+    // the saved position then named the bar's own line. The operator saw
+    // the cursor sitting on the bar with no prompt under it.
     //
-    // Colour is SGR 256, background 61 with a near-white foreground, and
-    // the line is padded to the terminal width so it reads as a bar
-    // rather than a sentence. It is a **one-shot** bar: a persistent one
-    // at the bottom of the screen would need `attach` to stop being a
-    // pass-through and start rendering, since a full-screen child
-    // addresses the last row absolutely and its bytes go straight to the
-    // terminal.
+    // `ESC[L` avoids the newline entirely. At column zero it inserts a
+    // blank line *at* the prompt's row, pushing the prompt and everything
+    // below it down; the bar is written into the gap, so it lands above
+    // the prompt.
+    //
+    // **`ESC8` alone puts the cursor back, with no compensating move.**
+    // The obvious reading is that the restore lands on the bar and needs
+    // a `ESC[B` after it, since the prompt moved down a row — measured,
+    // that overshoots by one and leaves the cursor a line below the
+    // prompt. The terminal adjusts the saved position when lines are
+    // inserted above it, so the restore already follows the prompt.
+    //
+    // `attach` is a pass-through and the child tracks its own cursor, so
+    // leaving it anywhere else starts the child's next write in the wrong
+    // column — which is the bug this replaces rather than a refinement of
+    // it.
+    //
+    // **Known edge:** a prompt already on the last row is pushed off the
+    // bottom by the insert. Nothing here can prevent that — making room
+    // requires scrolling, and scrolling is what broke the first version.
+    // The bar is a one-shot notice; a persistent one that owns a row is
+    // GH #68, which needs `attach` to render rather than forward.
+    //
+    // Colour is SGR 256, background 61, padded to the terminal width so
+    // it reads as a bar rather than a sentence.
     let mut banner = Some(match crate::attach_tty::window_size(tty) {
         // A zero dimension is dropped rather than printed. `TIOCGWINSZ`
-        // answers `0x0` on a pty nobody sized, and a banner claiming the
+        // answers `0x0` on a pty nobody sized, and a bar claiming the
         // session is `0x0` reads as a defect in the thing added to
         // reassure the reader.
         Ok((cols, rows)) if cols > 0 && rows > 0 => {
@@ -1132,13 +1149,13 @@ pub async fn attach(session: &str) -> ExitCode {
                 format!(" holdfast: attached to {session} ({cols}x{rows}) — Ctrl-B d to detach ");
             let pad = (cols as usize).saturating_sub(text.chars().count());
             format!(
-                "\x1b7\r\n\x1b[48;5;61m\x1b[38;5;231m{text}{:pad$}\x1b[0m\x1b8",
+                "\x1b7\r\x1b[L\x1b[48;5;61m\x1b[38;5;231m{text}{:pad$}\x1b[0m\x1b8",
                 "",
                 pad = pad
             )
         }
         _ => format!(
-            "\x1b7\r\n\x1b[48;5;61m\x1b[38;5;231m holdfast: attached to {session} — Ctrl-B d to detach \x1b[0m\x1b8"
+            "\x1b7\r\x1b[L\x1b[48;5;61m\x1b[38;5;231m holdfast: attached to {session} — Ctrl-B d to detach \x1b[0m\x1b8"
         ),
     });
     let banner_fallback = tokio::time::sleep(BANNER_AFTER_REPAINT);
