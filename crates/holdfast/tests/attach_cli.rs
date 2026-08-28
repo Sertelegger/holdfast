@@ -1598,7 +1598,7 @@ async fn attach_says_it_attached_and_how_to_leave() {
         String::from_utf8_lossy(&seen)
     );
     assert!(
-        contains(&seen, b"Ctrl-B then d"),
+        contains(&seen, b"Ctrl-B d"),
         "the banner must name the detach key:\n{}",
         String::from_utf8_lossy(&seen)
     );
@@ -1611,34 +1611,39 @@ async fn attach_says_it_attached_and_how_to_leave() {
         String::from_utf8_lossy(&seen)
     );
 
-    // **Ordering, because presence alone was not enough and shipped a
-    // banner nobody could see.** The startup `Resize` raises `SIGWINCH`,
-    // the child repaints, and a `zsh` prompt repaints by erasing from two
-    // lines up to the end of the screen. A banner written before that
-    // lands inside the erased region: present in the byte stream, absent
-    // from the terminal. This snapshot accumulates bytes rather than
-    // rendering them, so it cannot see the erasure — what it *can* see is
-    // that the banner comes after the repaint rather than before it,
-    // which is the property that makes the erasure impossible.
     let pos = |needle: &[u8]| {
         seen.windows(needle.len())
             .position(|w| w == needle)
             .unwrap_or(usize::MAX)
     };
-    let banner_at = pos(b"attached to");
-    let repaint_at = pos(b"\x1b[");
+
+    // **Ordering, because presence alone shipped a banner nobody could
+    // see.** The startup `Resize` raises `SIGWINCH`, the child repaints,
+    // and a prompt repaint erases from above the cursor to the end of the
+    // screen — so a banner written first lands in the erased region:
+    // present in the byte stream, absent from the terminal.
+    //
+    // Anchored on the child's prompt rather than on "the first escape
+    // sequence", which was the first version of this assertion and was
+    // useless the moment the banner itself gained colour: its own SGR
+    // codes then satisfied "an escape came first".
     assert!(
-        repaint_at < banner_at,
-        "the banner must follow the child's repaint, not precede it \
-         (banner at {banner_at}, first escape at {repaint_at}):\n{}",
+        pos(b"$") < pos(b"\x1b7"),
+        "the banner must follow the child's own output, not precede it:\n{}",
         String::from_utf8_lossy(&seen)
     );
-    // And on its own line: raw mode leaves `ONLCR` off, so without the
-    // carriage return it is appended to whatever column the repaint left
-    // the cursor in, which reads as corruption.
+
+    // Cursor save/restore around it. `attach` is a pass-through and the
+    // child tracks its own cursor, so a banner that does not put it back
+    // leaves the child's next write starting mid-line.
     assert!(
-        contains(&seen, b"\r\nholdfast attach: attached to"),
-        "the banner needs a carriage return to start at column zero:\n{}",
+        contains(&seen, b"\x1b7") && contains(&seen, b"\x1b8"),
+        "the banner must save and restore the cursor:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        pos(b"\x1b7") < pos(b"attached to") && pos(b"attached to") < pos(b"\x1b8"),
+        "save must precede the text and restore must follow it:\n{}",
         String::from_utf8_lossy(&seen)
     );
 

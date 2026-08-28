@@ -38,15 +38,23 @@ use std::sync::Arc;
 pub const INSTRUCTIONS: &str = "Holdfast gives you PTY-backed shell sessions. start_session spawns a \
      shell or program; send_input types into it; read_output reads what \
      it printed using a cursor you carry between calls; \
-     wait_for_pattern blocks until a regex matches new output. Use it \
-     for a PROGRAM's prompt -- `Password:`, `(gdb)`, `>>>` -- and NOT \
-     for the shell's own: a shell-prompt regex is a guess about the \
-     operator's $PS1, and against a customised prompt it simply never \
-     matches, so the call reports a timeout for a command that finished \
-     long ago. To know whether a command has finished, read \
-     interaction_mode; to know whether it succeeded, read \
-     get_command_history's exit code. A wait that expires against a \
-     session already back at a measured prompt says so, in warning; \
+     wait_for_pattern blocks until a regex matches new output, and \
+     **its pattern is optional**. Omit it to wait until the session \
+     stops executing: that answers `has the command finished` from the \
+     detector instead of from text, and the response carries \
+     interaction_mode, detection_tier and prompt.reason so you can tell \
+     a measured prompt from a guessed one. It returns as soon as the \
+     session is anything but Executing, so Fullscreen, AwaitingSecret \
+     and Exited come back at once rather than at the deadline -- read \
+     interaction_mode, because those three need different actions. \
+     Supply a pattern only for a PROGRAM's prompt -- `Password:`, \
+     `(gdb)`, `>>>` -- and NEVER for the shell's own: a shell-prompt \
+     regex is a guess about the operator's $PS1, and against a \
+     customised prompt it simply never matches, so the call reports a \
+     timeout for a command that finished long ago. To know whether a \
+     command succeeded, read get_command_history's exit code. A wait \
+     that ends unmatched against a session already back at a measured \
+     prompt says so, in warning; \
      interrupt sends Ctrl+C to the foreground process group, \
      which stops the running command without killing the shell, and \
      terminate stops the session and its whole process group. \

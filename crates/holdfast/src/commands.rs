@@ -1105,20 +1105,41 @@ pub async fn attach(session: &str) -> ExitCode {
     // that answers `SIGWINCH` with silence — a program that ignores it,
     // or a session with nothing to redraw — so a quiet session still
     // gets told it is attached.
-    // Leading `\r\n`, not `\n`: the terminal is in raw mode, so `ONLCR`
-    // is off and a bare newline moves down without returning to column
-    // zero. Without the carriage return the banner lands wherever the
-    // repainted prompt left the cursor — measured, appended to the end of
-    // the `❯` line — which reads as corruption rather than as a notice.
+    // **Wrapped in DECSC/DECRC, because this terminal belongs to the
+    // child.** `attach` is a pass-through: `render` writes the session's
+    // bytes straight out, and the child tracks its own cursor. Writing a
+    // line without putting the cursor back leaves the child's next output
+    // starting wherever the banner ended — measured, halfway along the
+    // following line. Save (`ESC 7`), draw, restore (`ESC 8`).
+    //
+    // The leading `\r\n` is for raw mode, where `ONLCR` is off and a bare
+    // newline moves down without returning to column zero.
+    //
+    // Colour is SGR 256, background 61 with a near-white foreground, and
+    // the line is padded to the terminal width so it reads as a bar
+    // rather than a sentence. It is a **one-shot** bar: a persistent one
+    // at the bottom of the screen would need `attach` to stop being a
+    // pass-through and start rendering, since a full-screen child
+    // addresses the last row absolutely and its bytes go straight to the
+    // terminal.
     let mut banner = Some(match crate::attach_tty::window_size(tty) {
         // A zero dimension is dropped rather than printed. `TIOCGWINSZ`
         // answers `0x0` on a pty nobody sized, and a banner claiming the
         // session is `0x0` reads as a defect in the thing added to
         // reassure the reader.
-        Ok((cols, rows)) if cols > 0 && rows > 0 => format!(
-            "\r\nholdfast attach: attached to {session} ({cols}x{rows}) — detach with Ctrl-B then d"
+        Ok((cols, rows)) if cols > 0 && rows > 0 => {
+            let text =
+                format!(" holdfast: attached to {session} ({cols}x{rows}) — Ctrl-B d to detach ");
+            let pad = (cols as usize).saturating_sub(text.chars().count());
+            format!(
+                "\x1b7\r\n\x1b[48;5;61m\x1b[38;5;231m{text}{:pad$}\x1b[0m\x1b8",
+                "",
+                pad = pad
+            )
+        }
+        _ => format!(
+            "\x1b7\r\n\x1b[48;5;61m\x1b[38;5;231m holdfast: attached to {session} — Ctrl-B d to detach \x1b[0m\x1b8"
         ),
-        _ => format!("\r\nholdfast attach: attached to {session} — detach with Ctrl-B then d"),
     });
     let banner_fallback = tokio::time::sleep(BANNER_AFTER_REPAINT);
     tokio::pin!(banner_fallback);
