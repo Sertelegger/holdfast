@@ -352,6 +352,13 @@ mapfile -t invoked < <(grep -hoE '(\./)?scripts/[A-Za-z0-9_.-]+\.sh' "${stripped
 # ordinary sentences and fails on a correct tree. A count written any other
 # way is NOT checked and this rule will not see it. Widen the pattern in the
 # same commit that introduces a fourth phrasing.
+#
+# **A count tied to a version is skipped**, because it is a claim about scope
+# and not about the tree: "13 MCP tools at v0.1.0 -- 12 implemented today" is
+# correct prose that this rule would otherwise fail. The pinned list can
+# adjudicate what exists; it cannot adjudicate what is planned. The skip is
+# keyed on a `v0.N` marker on the same line, so a scope sentence has to say
+# which release it is scoping in order to earn the exemption.
 echo
 echo "--- tool count in prose matches the pinned list ---"
 
@@ -381,11 +388,11 @@ else
         fails=$((fails + 1))
       fi
     done <<EOF
-$(sed -nE \
+$(grep -vE 'v0\.[0-9]' "$f" | sed -nE \
     -e 's/.*\b([0-9]+|[A-Za-z]+)[[:space:]]+MCP[[:space:]]+tools\b.*/\1/p' \
     -e 's/.*exactly the[[:space:]]+([0-9]+|[A-Za-z]+)[[:space:]]+tools\b.*/\1/p' \
     -e 's/.*\b([0-9]+|[A-Za-z]+)[[:space:]]+tools exist\b.*/\1/p' \
-    "$f" | tr 'A-Z' 'a-z')
+    | tr 'A-Z' 'a-z')
 EOF
   done
 fi
