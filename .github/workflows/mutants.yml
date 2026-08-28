@@ -219,12 +219,16 @@ jobs:
       # the pinned tool version keep shard membership stable between runs,
       # so month N+8 re-runs the same ~224 mutants unless the code moved.
       #
-      # **Was ISO week, and the change is not cosmetic.** `date +%V % 8`
-      # under a first-Saturday cron is badly distributed -- measured over
-      # 24 months it picks shard 5 six times and shard 3 once, because the
-      # ISO week of a first Saturday is not uniform mod 8. The month index
-      # is exactly uniform: every shard three times in 24 months, a full
-      # sweep every eight.
+      # **Months since epoch, and the naked month index it replaced was
+      # worse than the ISO week it replaced.** `date +%V % 8` under a
+      # first-Saturday cron picks shard 5 six times and shard 3 once over
+      # 24 months. But `(month - 1) % 8` is not a fix: a calendar month
+      # wraps at 12 against a modulus of 8, so driven once a month it
+      # NEVER completes a cycle — shards 0-3 land four times in 24 months
+      # and 4-7 twice, half the mutation surface swept once a year, and a
+      # September start covers four shards in eight months. `year * 12 +
+      # month` does not wrap, and is exactly uniform: every shard three
+      # times in 24 months, a full sweep every eight.
       #
       # An explicit `shard` input wins, so a milestone sweep can walk 0..7
       # without waiting eight months for the calendar to do it.
@@ -242,8 +246,8 @@ jobs:
             *) echo "shard must be 0-7 or empty, got: ${shard}" >&2; exit 1 ;;
           esac
           if [ -z "${shard}" ]; then
-            shard=$(( ($(date -u +%-m) - 1) % 8 ))
-            echo "month $(date -u +%-m) -> shard ${shard}/8"
+              shard=$(( ( $(date -u +%Y) * 12 + $(date -u +%-m) - 1 ) % 8 ))
+            echo "$(date -u +%Y-%m) -> shard ${shard}/8"
           else
             echo "dispatched shard ${shard}/8"
           fi

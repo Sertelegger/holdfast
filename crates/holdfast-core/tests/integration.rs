@@ -50,6 +50,13 @@ fn wait_for_exit(pty: &dyn PtyBackend, timeout: Duration) {
 /// and 0.0.2, and reported in task reports as "clippy clean on
 /// x86_64-pc-windows-gnu", was lib + bin only. A gated helper with unguarded
 /// callers is what made a guard whose name is broader than its reach.
+///
+/// **Its callers are no longer all `#[cfg(unix)]`, and that is
+/// deliberate.** The two that assert the strong process-group guarantee
+/// gate to `any(linux, macos)`, because the third sweep arm cannot keep
+/// that promise. `unix` stays correct for *this* helper — `kill(pid, 0)`
+/// is on every Unix — so the relationship is now "every caller is at
+/// least as narrow as this", not "every caller carries the same".
 #[cfg(unix)]
 fn pid_alive(pid: i32) -> bool {
     // kill(pid, 0) probes existence without signalling.
@@ -85,6 +92,15 @@ fn spawns_a_shell_and_reads_output() {
 // polled a session nobody was draining, which on macOS stalls the shell
 // mid-echo before it forks (see `draining`), so the descendant the sweep
 // was blamed for missing had not been started yet.
+//
+// **`any(linux, macos)` and not `unix`.** Those are the two arms that
+// enumerate the session; the third returns `{pgid, tcgetpgrp(master)}`
+// and cannot reach a backgrounded job, so on a BSD this assertion and
+// `the_off_linux_sweep_leaks_…` would run the identical scenario and
+// demand opposite outcomes. `#[cfg(unix)]` is as wrong as no gate — it
+// merely fails on fewer platforms — and no gate at all also breaks the
+// windows-gnu test compile, since `pid_alive` is `#[cfg(unix)]`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn terminate_kills_the_whole_process_group() {
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
@@ -3873,7 +3889,10 @@ async fn interrupt(server: &HoldfastServer, id: &str) -> Value {
 /// **Unix-only, and the reason is the assertion rather than the API**: the
 /// discriminating half probes a *descendant* pid with `kill(pid, 0)`.
 /// Windows job objects are 0.0.11's and get their own test.
-#[cfg(unix)]
+// The cleanup half asserts the sweep retires the backgrounded job, so
+// this carries the strong guarantee too, and gates with it (see
+// `terminate_kills_the_whole_process_group`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn interrupt_stops_a_running_command_and_leaves_the_shell_alive() {
     let server = HoldfastServer::new();

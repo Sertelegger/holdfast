@@ -41,12 +41,16 @@ on:
   # public" — so there are no required checks to strand. **Re-check this
   # the day the repository goes public or gains protection.**
   #
-  # `**.md` and NOT `**/*.md`: GitHub documents the former as matching
-  # every Markdown file in the repository, root included, and does not
-  # list the latter at all. 8 of this repository's 9 tracked `.md` files
-  # are at the root, so the stricter reading would have made this rule
-  # near-inert — a filter that looks like it saves a run per docs-only
-  # push and saves almost none.
+  # `**.md` is the spelling GitHub's own cheat sheet uses for "every
+  # Markdown file in the repository". **It is not a fix for `**/*.md`,
+  # which this rule used first and which was never broken** — `**`
+  # matches any character including `/`, so `**/` collapses to zero path
+  # segments and the old glob already matched `README.md` and the other
+  # seven root files. The commit that changed it argued otherwise from
+  # the true observation that 8 of 9 tracked `.md` files sit at the root,
+  # and the inference was one step too wide. Kept because it is the
+  # documented spelling, recorded because the reasoning was wrong and a
+  # wrong reason outlives the line it justified.
   #
   # Nothing in CI reads these paths: `ci-hygiene.sh` does not police
   # markdown, and the only `*.md` glob in `scripts/` is

@@ -1356,6 +1356,43 @@ async fn send_input_response_matches_its_schema() {
     kill(&server, &id).await;
 }
 
+/// `send_input`'s `wait_for` shares `wait_for_pattern`'s warning, and
+/// shared code is exactly what goes untested twice.
+///
+/// Deleting the assignment on *this* path left the suite green while the
+/// `wait_for_pattern` one was covered, because the two sites are separate
+/// statements over the same helper. The tier and mode are pinned beside
+/// the warning for the same reason as there: without them a session that
+/// never reached a measured prompt would satisfy this vacuously.
+#[tokio::test]
+async fn a_send_input_wait_that_expires_at_a_prompt_warns_like_wait_for_pattern() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for_at_prompt(&server, &id).await;
+
+    let r = server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "echo WAITED''X".into(),
+            wait_for: Some("NEVER_EVER_MATCHES".into()),
+            timeout_secs: Some(2),
+            ..Default::default()
+        }))
+        .await
+        .expect("send_input must not be a protocol error");
+    let payload = assert_matches_schema("send_input", &r);
+    assert_eq!(payload["status"], "timeout", "{payload}");
+    assert_eq!(payload["data"]["matched"], false, "{payload}");
+    assert_eq!(payload["data"]["detection_tier"], "semantic", "{payload}");
+    assert_eq!(payload["data"]["interaction_mode"], "AtPrompt", "{payload}");
+    assert_eq!(
+        payload["data"]["warning"], "pattern_did_not_match_but_session_is_at_prompt",
+        "the write path must warn on the same condition as the wait path: {payload}"
+    );
+
+    kill(&server, &id).await;
+}
+
 #[tokio::test]
 async fn send_input_to_an_echo_off_session_warns_and_still_matches_its_schema() {
     // REQ-SEC-011. `warning` is the one `data` field whose *string* form
@@ -2239,6 +2276,28 @@ async fn wait_for_pattern_response_matches_its_schema() {
         "one second is inside the cap; nothing was clamped: {payload}"
     );
 
+    // **The warning, asserted here because nothing else asserted it.**
+    // This call is already the firing condition — a wait that expires
+    // against a session back at a measured prompt — and drove straight
+    // through it while claiming nothing about it. Measured with ten
+    // injected mutations: deleting the assignment, changing the string,
+    // swapping `AtPrompt` for `Executing`, and widening the tier
+    // allowlist to `heuristic` ALL left the suite green, because every
+    // kill was negative — an unexpected key tripping the set assert
+    // above. Nothing said the warning must ever be *present*, which is
+    // the difference between a feature and a feature that happens to
+    // work today.
+    //
+    // The tier and mode are asserted beside it so the precondition is
+    // pinned too: a future change that stopped this session reaching a
+    // semantic prompt would otherwise turn this into a vacuous pass.
+    assert_eq!(payload["data"]["detection_tier"], "semantic", "{payload}");
+    assert_eq!(payload["data"]["interaction_mode"], "AtPrompt", "{payload}");
+    assert_eq!(
+        payload["data"]["warning"], "pattern_did_not_match_but_session_is_at_prompt",
+        "a wait that expired at a measured prompt must say so: {payload}"
+    );
+
     // The third population: the clamp field, which appears only when a
     // clamp happened. Driven against a pattern that is already in the
     // buffer, so the hour-long deadline is never waited on.
@@ -2254,6 +2313,60 @@ async fn wait_for_pattern_response_matches_its_schema() {
         .expect("wait_for_pattern must not be a protocol error");
     let payload = assert_matches_schema("wait_for_pattern", &clamped);
     assert_eq!(payload["data"]["clamped_timeout_secs"], 3600);
+
+    kill(&server, &id).await;
+}
+
+/// The other half of the warning: it must **not** fire at `heuristic`.
+///
+/// At that tier `AtPrompt` is itself a guess — quiescence times the max
+/// of the pattern and cursor scores — so warning that a guess contradicts
+/// a guess is noise, and the allowlist exists to prevent it. Without this
+/// test, adding `"heuristic"` to that allowlist changes nothing visible,
+/// which was measured: it was one of six mutations that left the suite
+/// green.
+///
+/// `sh` rather than `bash`: shell integration is injected for bash, zsh
+/// and fish only, so this is a session with no OSC 133 markers at all and
+/// therefore no route to a measured prompt.
+#[tokio::test]
+async fn a_wait_that_expires_at_a_guessed_prompt_carries_no_warning() {
+    let server = HoldfastServer::new();
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("sh".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session must not be a protocol error");
+    let id = body(&r)["data"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    // Substring, not a regex — `wait_for` is `contains`.
+    wait_for(&server, &id, "$").await;
+
+    let timed_out = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: "NEVER_EVER_MATCHES".into(),
+            timeout_secs: Some(1),
+            since_cursor: Some(0),
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let payload = assert_matches_schema("wait_for_pattern", &timed_out);
+
+    // Both halves of the precondition, or the absence below proves
+    // nothing: a session that was never at a prompt would also carry no
+    // warning, for an entirely different reason.
+    assert_eq!(payload["data"]["detection_tier"], "heuristic", "{payload}");
+    assert_eq!(payload["data"]["interaction_mode"], "AtPrompt", "{payload}");
+    assert!(
+        payload["data"].get("warning").is_none(),
+        "a guessed prompt must not produce the warning: {payload}"
+    );
 
     kill(&server, &id).await;
 }
