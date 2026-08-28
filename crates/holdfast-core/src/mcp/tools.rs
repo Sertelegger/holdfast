@@ -109,6 +109,13 @@ pub const WAIT_FOR_PATTERN_MAX_TIMEOUT_SECS: u64 = 3600;
 /// waits for the in-flight secret to finish arriving.
 const HOLDBACK_RELEASE_POLL: Duration = Duration::from_millis(50);
 
+/// How often a pattern-less wait re-reads `interaction_mode`.
+///
+/// The same 50 ms as the holdback poll, for the same reason: it is short
+/// against any human-scale deadline and long against the detector's own
+/// settle threshold, so it neither reports a transition late nor spins.
+const IDLE_WAIT_POLL: Duration = Duration::from_millis(50);
+
 /// REQ-T-008. Returns the deadline to wait for, and the cap to report in
 /// `clamped_timeout_secs` — **only** when a clamp actually happened, so an
 /// agent that asked for 30 s never sees the field and one that asked for
@@ -1102,7 +1109,11 @@ impl HoldfastServer {
         Parameters(args): Parameters<WaitForPatternArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         // Argument validation before resolution, as everywhere (§5.1).
-        let pattern = compile_pattern(&args.pattern)?;
+        // `None` is the pattern-less wait and is not an error.
+        let pattern = match args.pattern.as_deref() {
+            Some(p) => Some(compile_pattern(p)?),
+            None => None,
+        };
         if args.max_bytes == Some(0) {
             return Err(ErrorData::invalid_params(
                 "max_bytes must be at least 1",
@@ -1119,20 +1130,22 @@ impl HoldfastServer {
             .min(MAX_READ_MAX_BYTES);
         let (timeout, clamped) = resolve_wait_timeout(args.timeout_secs);
 
-        let (status, fields) = self
-            .run_wait(
-                &session,
-                &pattern,
-                args.since_cursor,
-                max_bytes,
-                timeout,
-                clamped,
-            )
-            .await;
-        let matched = fields
+        let (status, fields) = match &pattern {
+            Some(p) => {
+                self.run_wait(&session, p, args.since_cursor, max_bytes, timeout, clamped)
+                    .await
+            }
+            None => self.run_wait_for_idle(&session, timeout, clamped).await,
+        };
+        // `matched` for a pattern wait, `reached` for a pattern-less one:
+        // the two answer different questions and are not spelled the same
+        // so that a caller cannot read one as the other.
+        let satisfied = fields
             .get("matched")
+            .or_else(|| fields.get("reached"))
             .and_then(|m| m.as_bool())
             .unwrap_or(false);
+        let matched = satisfied;
         let mut data =
             detection::with_detection(serde_json::Value::Object(fields), &session, &self.processor);
         // After `with_detection`, not before: the warning is read out of
@@ -2867,6 +2880,48 @@ impl HoldfastServer {
     /// here, and that is the requirement rather than tidiness**: §5.2 says
     /// the two share holdback semantics *verbatim*, and a second
     /// implementation is what makes "verbatim" drift.
+    /// Wait until the session stops executing, for a caller that gave no
+    /// pattern.
+    ///
+    /// **Returns as soon as `interaction_mode` is anything but
+    /// `Executing`, and that is the whole contract.** `AtPrompt` is the
+    /// expected answer; the other three are returned just as promptly and
+    /// on purpose. A `Fullscreen` session never reaches a prompt while
+    /// the TUI is up, so blocking would burn the deadline to learn
+    /// something knowable now. `AwaitingSecret` *is* a prompt, but one
+    /// the caller must answer with `request_secret_input` and never
+    /// `send_input` — stalling there would hide the one action that
+    /// makes progress. `Exited` has no prompt to reach at all.
+    ///
+    /// So the caller must read `interaction_mode`, not just `reached`.
+    /// That is why §8.3's tier rule applies here: `with_detection`
+    /// attaches `detection_tier` and `prompt.reason` to this response,
+    /// and at `heuristic` an `AtPrompt` is a guess from quiescence rather
+    /// than an OSC 133 marker. A bare boolean would have replaced a
+    /// visible wrong answer — the timeout beside `AtPrompt` this whole
+    /// feature exists to retire — with an invisible one.
+    async fn run_wait_for_idle(
+        &self,
+        session: &Arc<Session>,
+        timeout: Duration,
+        clamped: Option<u64>,
+    ) -> (Status, serde_json::Map<String, serde_json::Value>) {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut reached = session.detection().interaction_mode != InteractionMode::Executing;
+        while !reached && std::time::Instant::now() < deadline {
+            tokio::time::sleep(IDLE_WAIT_POLL).await;
+            reached = session.detection().interaction_mode != InteractionMode::Executing;
+        }
+
+        let mut fields = serde_json::Map::new();
+        fields.insert("reached".into(), json!(reached));
+        if let Some(c) = clamped {
+            fields.insert("clamped_timeout_secs".into(), json!(c));
+        }
+        let status = if reached { Status::Ok } else { Status::Timeout };
+        (status, fields)
+    }
+
     async fn run_wait(
         &self,
         session: &Arc<Session>,
@@ -3152,7 +3207,15 @@ pub struct WaitForPatternArgs {
     /// Session id or live session name.
     pub session: String,
     /// Rust regex matched against the session's raw output bytes.
-    pub pattern: String,
+    ///
+    /// **Omit it to wait for the session to stop executing instead.** A
+    /// shell-prompt regex is a guess about the operator's `$PS1` and
+    /// silently never matches a customised one, so "wait until the
+    /// command finishes" is answered from the detector rather than from
+    /// text. Supply this only for a *program's* prompt — `Password:`,
+    /// `(gdb)`, `>>>` — which is text no detector knows about.
+    #[serde(default)]
+    pub pattern: Option<String>,
     /// Deadline in seconds. Defaults to 30. 0 means "no caller deadline"
     /// and is capped at 3600, reported back as clamped_timeout_secs.
     #[serde(default)]
@@ -4749,7 +4812,7 @@ mod tests {
             &server
                 .wait_for_pattern(Parameters(WaitForPatternArgs {
                     session: session(id),
-                    pattern: pattern.to_string(),
+                    pattern: Some(pattern.to_string()),
                     timeout_secs: Some(1),
                     since_cursor: Some(0),
                     max_bytes: None,

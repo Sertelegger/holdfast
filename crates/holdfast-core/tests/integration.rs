@@ -3496,7 +3496,7 @@ fn mock_session_in(server: &HoldfastServer, name: &str) -> (String, Arc<MockPty>
 fn wait_args(session: &str, pattern: &str) -> WaitForPatternArgs {
     WaitForPatternArgs {
         session: session.to_string(),
-        pattern: pattern.to_string(),
+        pattern: Some(pattern.to_string()),
         timeout_secs: Some(2),
         since_cursor: Some(0),
         max_bytes: None,

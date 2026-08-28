@@ -2221,7 +2221,7 @@ async fn wait_for_pattern_response_matches_its_schema() {
     let matched = server
         .wait_for_pattern(Parameters(WaitForPatternArgs {
             session: id.clone(),
-            pattern: "SCHEMA_READY".into(),
+            pattern: Some("SCHEMA_READY".into()),
             timeout_secs: Some(10),
             since_cursor: Some(0),
             max_bytes: None,
@@ -2260,7 +2260,7 @@ async fn wait_for_pattern_response_matches_its_schema() {
     let timed_out = server
         .wait_for_pattern(Parameters(WaitForPatternArgs {
             session: id.clone(),
-            pattern: "NEVER_EVER_MATCHES".into(),
+            pattern: Some("NEVER_EVER_MATCHES".into()),
             timeout_secs: Some(1),
             since_cursor: Some(0),
             max_bytes: None,
@@ -2304,7 +2304,7 @@ async fn wait_for_pattern_response_matches_its_schema() {
     let clamped = server
         .wait_for_pattern(Parameters(WaitForPatternArgs {
             session: id.clone(),
-            pattern: "SCHEMA_READY".into(),
+            pattern: Some("SCHEMA_READY".into()),
             timeout_secs: Some(0),
             since_cursor: Some(0),
             max_bytes: None,
@@ -2349,7 +2349,7 @@ async fn a_wait_that_expires_at_a_guessed_prompt_carries_no_warning() {
     let timed_out = server
         .wait_for_pattern(Parameters(WaitForPatternArgs {
             session: id.clone(),
-            pattern: "NEVER_EVER_MATCHES".into(),
+            pattern: Some("NEVER_EVER_MATCHES".into()),
             timeout_secs: Some(1),
             since_cursor: Some(0),
             max_bytes: None,
@@ -2366,6 +2366,127 @@ async fn a_wait_that_expires_at_a_guessed_prompt_carries_no_warning() {
     assert!(
         payload["data"].get("warning").is_none(),
         "a guessed prompt must not produce the warning: {payload}"
+    );
+
+    kill(&server, &id).await;
+}
+
+/// A wait with no pattern resolves when the command finishes, without
+/// anyone having to guess the operator's `$PS1`.
+#[tokio::test]
+async fn a_pattern_less_wait_resolves_when_the_command_finishes() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for_at_prompt(&server, &id).await;
+
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "sleep 1".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("send_input");
+
+    let r = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: None,
+            timeout_secs: Some(20),
+            since_cursor: None,
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let payload = assert_matches_schema("wait_for_pattern", &r);
+    assert_eq!(payload["status"], "ok", "{payload}");
+    assert_eq!(payload["data"]["reached"], true, "{payload}");
+    assert_eq!(payload["data"]["interaction_mode"], "AtPrompt", "{payload}");
+    // `matched` answers a question this call did not ask.
+    assert!(
+        payload["data"].get("matched").is_none(),
+        "a pattern-less wait must not report `matched`: {payload}"
+    );
+    // §8.3's rule: the caller must be able to tell a measured prompt from
+    // a guessed one, so the tier travels with the verdict.
+    assert_eq!(payload["data"]["detection_tier"], "semantic", "{payload}");
+    assert!(payload["data"]["prompt"]["reason"].is_string(), "{payload}");
+
+    kill(&server, &id).await;
+}
+
+/// **`AwaitingSecret` returns promptly rather than blocking**, which is
+/// the decision this shape was chosen for.
+///
+/// That session *is* at a prompt, but one the caller must answer with
+/// `request_secret_input` and never `send_input`. Blocking to the
+/// deadline would stall while the only action that makes progress sat
+/// available, so the wait returns at once and the mode says why. The
+/// generous timeout is the assertion: it is what makes "returned
+/// promptly" mean something rather than "the deadline was short".
+#[tokio::test]
+async fn a_pattern_less_wait_returns_at_once_from_awaiting_secret() {
+    let server = HoldfastServer::new();
+    let (id, _pty) = mock_session(&server, Some(false));
+
+    let started = Instant::now();
+    let r = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: None,
+            timeout_secs: Some(30),
+            since_cursor: None,
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let elapsed = started.elapsed();
+    let payload = assert_matches_schema("wait_for_pattern", &r);
+    assert_eq!(payload["status"], "ok", "{payload}");
+    assert_eq!(payload["data"]["reached"], true, "{payload}");
+    assert_eq!(
+        payload["data"]["interaction_mode"], "AwaitingSecret",
+        "{payload}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "it blocked for {elapsed:?} against a 30s deadline; the point of \
+         returning on any non-Executing mode is that this is immediate"
+    );
+}
+
+/// The timeout half: a session still running a command answers
+/// `reached: false`, and says what it is still doing.
+#[tokio::test]
+async fn a_pattern_less_wait_times_out_while_the_command_runs() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for_at_prompt(&server, &id).await;
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "sleep 30".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("send_input");
+
+    let r = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: None,
+            timeout_secs: Some(2),
+            since_cursor: None,
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let payload = assert_matches_schema("wait_for_pattern", &r);
+    assert_eq!(payload["status"], "timeout", "{payload}");
+    assert_eq!(payload["data"]["reached"], false, "{payload}");
+    assert_eq!(
+        payload["data"]["interaction_mode"], "Executing",
+        "{payload}"
     );
 
     kill(&server, &id).await;
@@ -3365,7 +3486,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
         &server
             .wait_for_pattern(Parameters(WaitForPatternArgs {
                 session: id.clone(),
-                pattern: "NEVER_MATCHES_ANYTHING".into(),
+                pattern: Some("NEVER_MATCHES_ANYTHING".into()),
                 timeout_secs: Some(1),
                 since_cursor: Some(0),
                 max_bytes: None,

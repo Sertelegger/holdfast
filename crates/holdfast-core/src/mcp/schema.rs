@@ -257,7 +257,20 @@ pub struct Match {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WaitForPattern {
+    /// Present for a wait that was given a pattern; absent for one that
+    /// was not.
     pub matched: Option<bool>,
+    /// Present **only** for a pattern-less wait: the session left
+    /// `Executing` before the deadline.
+    ///
+    /// Spelled differently from `matched` on purpose. The two answer
+    /// different questions — "your regex appeared" and "the session
+    /// stopped running a command" — and a single field would let a caller
+    /// read one as the other. Neither is the whole answer on its own:
+    /// `interaction_mode` beside it says *what* the session reached, and
+    /// `Fullscreen`, `AwaitingSecret` and `Exited` all satisfy this while
+    /// meaning something the caller must act on differently.
+    pub reached: Option<bool>,
     pub r#match: Option<Match>,
     /// Output from the scan start through the match, redacted through the
     /// same pipeline as `read_output`, and clipped before `match.offset`

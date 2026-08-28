@@ -1582,7 +1582,13 @@ async fn watching_an_already_exited_session_ends_instead_of_hanging() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attach_says_it_attached_and_how_to_leave() {
     let d = TestDaemon::start("attachbanner").await;
-    let (s, _pty) = d.session(None);
+    // A **real** shell, not the mock: the ordering assertion below needs a
+    // child that answers the startup `SIGWINCH` by repainting, which is
+    // the thing the banner has to come after. A `MockPty` emits nothing,
+    // so the banner would arrive from the fallback timer and the ordering
+    // would be untested — which is how the first version of this test
+    // passed against a banner no human could see.
+    let s = d.real_session("bash", &["--norc", "--noprofile"]);
 
     let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 80, 24);
     let seen = term.wait_for(b"attached to", 15);
@@ -1602,6 +1608,37 @@ async fn attach_says_it_attached_and_how_to_leave() {
     assert!(
         contains(&seen, b"80x24"),
         "the banner should carry the real geometry:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // **Ordering, because presence alone was not enough and shipped a
+    // banner nobody could see.** The startup `Resize` raises `SIGWINCH`,
+    // the child repaints, and a `zsh` prompt repaints by erasing from two
+    // lines up to the end of the screen. A banner written before that
+    // lands inside the erased region: present in the byte stream, absent
+    // from the terminal. This snapshot accumulates bytes rather than
+    // rendering them, so it cannot see the erasure — what it *can* see is
+    // that the banner comes after the repaint rather than before it,
+    // which is the property that makes the erasure impossible.
+    let pos = |needle: &[u8]| {
+        seen.windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap_or(usize::MAX)
+    };
+    let banner_at = pos(b"attached to");
+    let repaint_at = pos(b"\x1b[");
+    assert!(
+        repaint_at < banner_at,
+        "the banner must follow the child's repaint, not precede it \
+         (banner at {banner_at}, first escape at {repaint_at}):\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    // And on its own line: raw mode leaves `ONLCR` off, so without the
+    // carriage return it is appended to whatever column the repaint left
+    // the cursor in, which reads as corruption.
+    assert!(
+        contains(&seen, b"\r\nholdfast attach: attached to"),
+        "the banner needs a carriage return to start at column zero:\n{}",
         String::from_utf8_lossy(&seen)
     );
 

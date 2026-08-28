@@ -340,7 +340,7 @@ impl RuntimePaths {
         xdg_runtime_dir: Option<PathBuf>,
         home: Option<PathBuf>,
         is_linux: bool,
-        is_macos: bool,
+        _is_macos: bool,
     ) -> io::Result<Self> {
         // §7.1: an explicit instance takes everything with it, logs
         // included.
@@ -372,11 +372,28 @@ impl RuntimePaths {
             }
         }
         let home = home?;
-        let dir = if is_macos {
-            home.join("Library/Application Support/holdfast")
-        } else {
-            home.join(".holdfast")
-        };
+        // `~/.holdfast` on every platform without `XDG_RUNTIME_DIR`,
+        // macOS included.
+        //
+        // **It was `~/Library/Application Support/holdfast` on macOS, and
+        // that was wrong in three ways.** It contradicted §19.1 and §9.4,
+        // which name `~/.holdfast/logs/audit.log` — and the `log_dir`
+        // computed ten lines above was then overridden by `dir.join`
+        // below, so the very comment describing the rule was violated by
+        // the branch beneath it. It left a 0-byte `audit.log` at the
+        // documented path, which reads as "the audit trail is broken"
+        // rather than "wrong directory"; that cost a false security
+        // finding. And `Application Support` is the macOS convention for
+        // GUI applications — this tool's neighbours there are AddressBook
+        // and Animoji — while every developer CLI on the same machine,
+        // Claude Code's own `~/.claude` included, uses a dotfile or XDG.
+        // Holdfast already resolved its *config* the Unix way, so the
+        // runtime directory was the odd one out in its own codebase.
+        //
+        // It is also shorter, which is not cosmetic: `sun_path` is about
+        // 104 bytes and this project has already been bitten by socket
+        // paths that overran it.
+        let dir = home.join(".holdfast");
         Ok(Self {
             log_dir: dir.join("logs"),
             dir,
@@ -384,8 +401,7 @@ impl RuntimePaths {
     }
 
     /// Spec §7.1: `$HOLDFAST_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/holdfast`
-    /// (Linux), else `~/Library/Application Support/holdfast` (macOS), else
-    /// `~/.holdfast`.
+    /// (Linux), else `~/.holdfast`.
     pub fn discover() -> io::Result<Self> {
         Self::resolve(
             std::env::var_os(RUNTIME_DIR_ENV).map(PathBuf::from),
@@ -1477,15 +1493,22 @@ mod tests {
             PathBuf::from("/home/u/.holdfast/logs/daemon.log")
         );
 
+        // macOS resolves like every other non-XDG platform. It used to
+        // answer `~/Library/Application Support/holdfast`, which
+        // contradicted §9.4 and §19.1 and put a 0-byte `audit.log` at the
+        // documented path — a state that reads as a broken audit trail
+        // rather than a misplaced one, and was filed as one.
         let mac = RuntimePaths::resolve(None, None, Some("/Users/u".into()), false, true).unwrap();
-        assert_eq!(
-            mac.dir(),
-            Path::new("/Users/u/Library/Application Support/holdfast")
-        );
+        assert_eq!(mac.dir(), Path::new("/Users/u/.holdfast"));
         assert_eq!(
             mac.daemon_log(),
-            PathBuf::from("/Users/u/Library/Application Support/holdfast/logs/daemon.log")
+            PathBuf::from("/Users/u/.holdfast/logs/daemon.log")
         );
+        // The macOS flag no longer changes the answer, and this pins that
+        // rather than leaving it to the reader of the `_is_macos` name.
+        let not_mac =
+            RuntimePaths::resolve(None, None, Some("/Users/u".into()), false, false).unwrap();
+        assert_eq!(not_mac.dir(), mac.dir());
     }
 
     #[test]

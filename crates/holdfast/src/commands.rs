@@ -43,6 +43,11 @@ pub const EXIT_USAGE: u8 = 64;
 /// the user's terminal in raw mode. Having caught them it reports what
 /// a shell would have reported had it not, so nothing downstream loses
 /// the distinction the catch was buying back.
+/// How long the attach banner waits for the child's repaint before
+/// printing anyway. Long enough for a shell to answer `SIGWINCH`, short
+/// enough that a silent session is not left wondering.
+const BANNER_AFTER_REPAINT: Duration = Duration::from_millis(400);
+
 pub const EXIT_SIGHUP: u8 = 128 + 1;
 pub const EXIT_SIGTERM: u8 = 128 + 15;
 
@@ -1078,42 +1083,45 @@ pub async fn attach(session: &str) -> ExitCode {
         }
     }
 
-    // **Say that the attach worked.** Nothing else here does: every other
-    // diagnostic in this function reports an error, an exit, a detach, a
-    // resize or a secret request, and attach replays no scrollback — only
-    // a pending `AwaitingSecret`. So attaching to a session idling at a
-    // prompt rendered an empty pane, and when the session is a shell
-    // wearing the operator's own prompt, an attached terminal was
-    // indistinguishable from an unattached one.
+    // **Say that the attach worked, but not yet.** Nothing else here
+    // does: every other diagnostic in this function reports an error, an
+    // exit, a detach, a resize or a secret request, and attach replays no
+    // scrollback — only a pending `AwaitingSecret`. So attaching to a
+    // session idling at a prompt rendered an empty pane, and when the
+    // session is a shell wearing the operator's own prompt, an attached
+    // terminal was indistinguishable from an unattached one (GH #67).
     //
-    // That is not cosmetic: it caused a real incident. An operator
-    // concluded the attach had failed, attached a second time, and the
-    // two clients reflowed each other into a resize loop that pegged two
-    // processes and outlived the detach.
+    // **Printing it here, before the loop, does not work — measured.**
+    // The startup `Resize` above raises `SIGWINCH` in the child, and a
+    // shell repaints its prompt in response: `zsh` with a two-line
+    // prompt emits `\r\r ESC[A ESC[A … ESC[J`, which is *erase from two
+    // lines up to the end of the screen*. The banner sits inside that
+    // region and is wiped before a human sees it. The first version of
+    // this shipped that way and read as "the banner does nothing",
+    // because the byte stream contained it and the screen did not.
     //
-    // **The detach key belongs in it, not just the session name.** `Ctrl-B`
-    // then `d` is not guessable and lives in `--help` and the runbook;
-    // somebody who cannot tell they are attached also cannot tell how to
-    // leave. This is the tmux lesson at a fraction of tmux's cost — a
-    // status bar would have to reserve a row, repaint on every resize and
-    // negotiate with full-screen programs for the alternate screen, and
-    // the point is only ever to answer "am I in it, and how do I get out".
-    //
-    // A zero dimension is dropped rather than printed. `TIOCGWINSZ`
-    // answers `0x0` on a pty nobody sized — `script`'s, for one, which is
-    // how this file's own tests drive `attach` — and a banner claiming
-    // the session is `0x0` reads as a defect in the thing it was added to
-    // reassure the reader about. The size is a nicety; the fact of
-    // attachment and the way out are not, and those two are printed
-    // whatever the terminal says about its geometry.
-    match crate::attach_tty::window_size(tty) {
-        Ok((cols, rows)) if cols > 0 && rows > 0 => diag!(
-            "holdfast attach: attached to {session} ({cols}x{rows}) — detach with Ctrl-B then d"
+    // So it is held until after the first output frame has been
+    // rendered, which is the repaint. The fallback timer covers a child
+    // that answers `SIGWINCH` with silence — a program that ignores it,
+    // or a session with nothing to redraw — so a quiet session still
+    // gets told it is attached.
+    // Leading `\r\n`, not `\n`: the terminal is in raw mode, so `ONLCR`
+    // is off and a bare newline moves down without returning to column
+    // zero. Without the carriage return the banner lands wherever the
+    // repainted prompt left the cursor — measured, appended to the end of
+    // the `❯` line — which reads as corruption rather than as a notice.
+    let mut banner = Some(match crate::attach_tty::window_size(tty) {
+        // A zero dimension is dropped rather than printed. `TIOCGWINSZ`
+        // answers `0x0` on a pty nobody sized, and a banner claiming the
+        // session is `0x0` reads as a defect in the thing added to
+        // reassure the reader.
+        Ok((cols, rows)) if cols > 0 && rows > 0 => format!(
+            "\r\nholdfast attach: attached to {session} ({cols}x{rows}) — detach with Ctrl-B then d"
         ),
-        _ => {
-            diag!("holdfast attach: attached to {session} — detach with Ctrl-B then d")
-        }
-    }
+        _ => format!("\r\nholdfast attach: attached to {session} — detach with Ctrl-B then d"),
+    });
+    let banner_fallback = tokio::time::sleep(BANNER_AFTER_REPAINT);
+    tokio::pin!(banner_fallback);
 
     let mut detach = crate::attach_tty::DetachKey::default();
     // `Some` while an `AwaitingSecret` is outstanding: the request id to
@@ -1141,7 +1149,14 @@ pub async fn attach(session: &str) -> ExitCode {
                     }
                 };
                 match f {
-                    ServerFrame::Output { bytes, .. } => render(&bytes),
+                    ServerFrame::Output { bytes, .. } => {
+                        render(&bytes);
+                        // After the repaint, not before it. See the
+                        // banner's comment above the loop.
+                        if let Some(b) = banner.take() {
+                            diag!("{b}");
+                        }
+                    }
                     ServerFrame::SessionExited { code } => {
                         diag!("holdfast attach: the session exited ({code})");
                     }
@@ -1320,6 +1335,13 @@ pub async fn attach(session: &str) -> ExitCode {
                 let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
                 diag!("holdfast attach: SIGHUP — detaching; the session keeps running");
                 return ExitCode::from(EXIT_SIGHUP);
+            }
+            // A child that met `SIGWINCH` with silence still gets to
+            // tell the operator they are attached.
+            _ = &mut banner_fallback, if banner.is_some() => {
+                if let Some(b) = banner.take() {
+                    diag!("{b}");
+                }
             }
             _ = winch.recv() => {
                 if let Ok((cols, rows)) = crate::attach_tty::window_size(tty) {
