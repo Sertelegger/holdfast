@@ -17,7 +17,7 @@ still ahead.
 
 ## Where it is now
 
-Eleven MCP tools, Unix only, in **hybrid mode**: a background `holdfast daemon`
+Twelve MCP tools, Unix only, in **hybrid mode**: a background `holdfast daemon`
 owns the sessions and a `holdfast mcp` shim proxies to it over a Unix socket, so
 sessions outlive the MCP client rather than dying with it. Output is
 ANSI-stripped and **secret-redacted by default**, with `--raw` and

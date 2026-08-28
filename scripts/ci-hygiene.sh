@@ -333,6 +333,63 @@ mapfile -t invoked < <(grep -hoE '(\./)?scripts/[A-Za-z0-9_.-]+\.sh' "${stripped
 # Same vacuous-pass guard as above, one layer down: if the derivation ever
 # matches nothing -- a renamed directory, an invocation spelled some other
 # way -- this section would silently check zero files and report clean.
+# --------------------------------------------------------------------------
+# A tool count written in prose must match the list mcp-smoke.sh pins
+# --------------------------------------------------------------------------
+#
+# `CLAUDE.md` said "11 MCP tools" and `ROADMAP.md` "Eleven MCP tools" while
+# twelve were advertised. CLAUDE.md is loaded into every agent session, so a
+# wrong count there is read as fact and propagated: a review of the 0.0.7
+# branch proposed adding "a twelfth tool" that would have been the
+# thirteenth, sourced straight from that line.
+#
+# The count is pinned once already, by mcp-smoke.sh's jcheck array. This makes
+# every prose restatement derive from that array instead of from memory --
+# the `F == N` move applied to documentation.
+#
+# **Only three phrasings are checked**, and they are listed below rather than
+# inferred, because a rule that scans free prose for "<word> tools" matches
+# ordinary sentences and fails on a correct tree. A count written any other
+# way is NOT checked and this rule will not see it. Widen the pattern in the
+# same commit that introduces a fourth phrasing.
+echo
+echo "--- tool count in prose matches the pinned list ---"
+
+tool_json="$(grep -oE '\["[a-z_]+"(,"[a-z_]+")*\]' scripts/mcp-smoke.sh | head -1)"
+if [ -z "$tool_json" ]; then
+  printf '  FAIL  no pinned tool array found in scripts/mcp-smoke.sh\n'
+  fails=$((fails + 1))
+else
+  # `grep -c .` and not `wc -l`: the last field carries no trailing newline.
+  pinned=$(printf '%s' "$tool_json" | tr ',' '\n' | grep -c .)
+  case "$pinned" in
+    10) word=ten ;;      11) word=eleven ;;   12) word=twelve ;;
+    13) word=thirteen ;; 14) word=fourteen ;; 15) word=fifteen ;;
+    *)  word="__unspelled__" ;;
+  esac
+  printf '  ok    mcp-smoke.sh pins %s tools\n' "$pinned"
+
+  for f in CLAUDE.md ROADMAP.md README.md scripts/mcp-smoke.sh; do
+    [ -f "$f" ] || continue
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      if [ "$n" = "$pinned" ] || [ "$n" = "$word" ]; then
+        printf '  ok    %s: "%s" agrees\n' "$f" "$n"
+      else
+        printf '  FAIL  %s claims "%s" tools; mcp-smoke.sh pins %s (%s)\n' \
+          "$f" "$n" "$pinned" "$word"
+        fails=$((fails + 1))
+      fi
+    done <<EOF
+$(sed -nE \
+    -e 's/.*\b([0-9]+|[A-Za-z]+)[[:space:]]+MCP[[:space:]]+tools\b.*/\1/p' \
+    -e 's/.*exactly the[[:space:]]+([0-9]+|[A-Za-z]+)[[:space:]]+tools\b.*/\1/p' \
+    -e 's/.*\b([0-9]+|[A-Za-z]+)[[:space:]]+tools exist\b.*/\1/p' \
+    "$f" | tr 'A-Z' 'a-z')
+EOF
+  done
+fi
+
 if [ "${#invoked[@]}" -eq 0 ]; then
   printf '  FAIL  no scripts/*.sh invocation found in any workflow — the derivation matched nothing\n'
   fails=$((fails + 1))
