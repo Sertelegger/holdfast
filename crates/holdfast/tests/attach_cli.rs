@@ -1564,6 +1564,51 @@ async fn watching_an_already_exited_session_ends_instead_of_hanging() {
     );
 }
 
+/// The attach banner, which exists because its absence caused an incident.
+///
+/// `attach` printed nothing on a successful connect and replays no
+/// scrollback, so attaching to a session idling at a prompt rendered an
+/// empty pane. When the session is a shell wearing the operator's own
+/// prompt, that is indistinguishable from the attach having failed — and
+/// an operator who drew that conclusion attached a second time, at which
+/// point two clients reflowed each other into a resize loop that pegged
+/// two processes.
+///
+/// **The detach key is asserted, not just the session name.** `Ctrl-B`
+/// then `d` is not guessable, and somebody who cannot tell they are
+/// attached also cannot tell how to leave; a banner that named the
+/// session but not the way out would satisfy a weaker test and leave half
+/// the incident reachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attach_says_it_attached_and_how_to_leave() {
+    let d = TestDaemon::start("attachbanner").await;
+    let (s, _pty) = d.session(None);
+
+    let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 80, 24);
+    let seen = term.wait_for(b"attached to", 15);
+    assert!(
+        contains(&seen, b"attached to"),
+        "attach never said it attached:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        contains(&seen, b"Ctrl-B then d"),
+        "the banner must name the detach key:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    // The geometry `Term` gave it, so a banner that prints `0x0` — what
+    // `TIOCGWINSZ` answers on an unsized pty — fails rather than passing
+    // as "a size was printed".
+    assert!(
+        contains(&seen, b"80x24"),
+        "the banner should carry the real geometry:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    term.type_keys(b"\x02d");
+    assert_eq!(term.wait_exit(15), 0, "detach is an ordinary ending");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attaching_to_an_already_exited_session_ends_instead_of_hanging() {
     // The same daemon-side edge seen from the other client, which has

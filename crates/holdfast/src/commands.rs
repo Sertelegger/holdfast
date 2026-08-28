@@ -1078,6 +1078,43 @@ pub async fn attach(session: &str) -> ExitCode {
         }
     }
 
+    // **Say that the attach worked.** Nothing else here does: every other
+    // diagnostic in this function reports an error, an exit, a detach, a
+    // resize or a secret request, and attach replays no scrollback — only
+    // a pending `AwaitingSecret`. So attaching to a session idling at a
+    // prompt rendered an empty pane, and when the session is a shell
+    // wearing the operator's own prompt, an attached terminal was
+    // indistinguishable from an unattached one.
+    //
+    // That is not cosmetic: it caused a real incident. An operator
+    // concluded the attach had failed, attached a second time, and the
+    // two clients reflowed each other into a resize loop that pegged two
+    // processes and outlived the detach.
+    //
+    // **The detach key belongs in it, not just the session name.** `Ctrl-B`
+    // then `d` is not guessable and lives in `--help` and the runbook;
+    // somebody who cannot tell they are attached also cannot tell how to
+    // leave. This is the tmux lesson at a fraction of tmux's cost — a
+    // status bar would have to reserve a row, repaint on every resize and
+    // negotiate with full-screen programs for the alternate screen, and
+    // the point is only ever to answer "am I in it, and how do I get out".
+    //
+    // A zero dimension is dropped rather than printed. `TIOCGWINSZ`
+    // answers `0x0` on a pty nobody sized — `script`'s, for one, which is
+    // how this file's own tests drive `attach` — and a banner claiming
+    // the session is `0x0` reads as a defect in the thing it was added to
+    // reassure the reader about. The size is a nicety; the fact of
+    // attachment and the way out are not, and those two are printed
+    // whatever the terminal says about its geometry.
+    match crate::attach_tty::window_size(tty) {
+        Ok((cols, rows)) if cols > 0 && rows > 0 => diag!(
+            "holdfast attach: attached to {session} ({cols}x{rows}) — detach with Ctrl-B then d"
+        ),
+        _ => {
+            diag!("holdfast attach: attached to {session} — detach with Ctrl-B then d")
+        }
+    }
+
     let mut detach = crate::attach_tty::DetachKey::default();
     // `Some` while an `AwaitingSecret` is outstanding: the request id to
     // answer, and the line being typed. While this is set, keystrokes go
