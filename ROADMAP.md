@@ -105,6 +105,29 @@ validation. The default has to stay "not reachable from the network", because a
 web view of a shell an agent is typing into is exactly the thing that must not
 be accidentally exposed.
 
+## Session panel
+
+**One place that answers "what needs me?"** A persistent rollup of every
+session and the reason it is in the state it is in, rather than a grid of panes
+a human has to read one at a time. The daemon already computes the answer —
+`interaction_mode`, `detection_tier`, `confidence` and `reason` are on every
+prompt-bearing response (§8.3, §18.2a) — and nothing puts them side by side.
+
+**What it shows is the part worth arguing about, because the obvious design is
+the wrong one.** A tiled terminal grid is a solved problem with mature
+implementations, and holdfast would be a late entrant to it. The rows that earn
+this panel are the ones only this daemon can produce: which sessions are
+`AwaitingSecret` and how long they have been waiting, what has been redacted and
+how often, which **profile** a session was launched from — or that it was
+agent-authored `command`/`args` and therefore can never receive a credential
+(§9.6) — and what is pending a strict-mode confirmation. Ranking sessions by
+*needs a human* is a different product from tiling terminals, and it is the one
+that follows from what holdfast already knows.
+
+Surface is undecided and deliberately so: the `attach`/`watch` TUI, the web UI,
+or one model rendered by both. The state is specified and shipped; only the view
+is missing, which is why this is a design question rather than a detection one.
+
 ## Windows
 
 **Native Windows support.** ConPTY, job objects in place of process groups (the
