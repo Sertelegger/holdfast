@@ -1674,3 +1674,75 @@ async fn attaching_to_an_already_exited_session_ends_instead_of_hanging() {
         String::from_utf8_lossy(&seen)
     );
 }
+
+/// **A resize drag prints one line, not one per frame** (GH #66).
+///
+/// The report caught `holdfast attach` printing `107x56, 115x58, 104x55, …`
+/// — thirteen widths from one drag — into a raw-mode terminal, and the
+/// operator detaching to escape it. Every `Resize` here is a frame the
+/// daemon genuinely sends: it fans one out to each *other* client per
+/// `SIGWINCH`, and a drag is many.
+///
+/// **The last geometry is the asserted one, not merely "some" geometry.**
+/// A rate limiter would also collapse the flood to one line, while printing
+/// whichever size happened to arrive first — a number the session no longer
+/// has by the time it is read. Coalescing is what makes the surviving line
+/// true.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_flood_is_coalesced_into_one_notice_naming_the_final_size() {
+    let mut replies = vec![enc(&ServerFrame::Attached {
+        session_id: "sess_stub66".into(),
+        name: None,
+        cols: 80,
+        rows: 24,
+        state: "Running".into(),
+        exit_code: None,
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: 0,
+    })];
+    // The widths from the report, in the order it recorded them.
+    for (cols, rows) in [
+        (107u16, 56u16),
+        (115, 58),
+        (114, 57),
+        (113, 57),
+        (117, 59),
+        (112, 56),
+        (119, 60),
+        (116, 59),
+        (118, 60),
+        (110, 55),
+        (108, 55),
+        (106, 54),
+        (104, 55),
+    ] {
+        replies.push(enc(&ServerFrame::Resize { cols, rows }));
+    }
+
+    let stub = StubDaemon::start("resizeflood", replies, Duration::from_secs(3)).await;
+    // A pty, not `run_plain`: `attach` refuses a pipe, and the diagnostics
+    // under test are written to the terminal it insists on.
+    let term = Term::spawn(stub.paths.dir(), &["attach", "sess_stub66"], 80, 24);
+    // Longer than `RESIZE_SETTLE` by a wide margin, so a failure here is
+    // the count being wrong and not the timer not having fired.
+    term.wait_for(b"the session is now", 10);
+    std::thread::sleep(Duration::from_millis(600));
+    let seen = String::from_utf8_lossy(&term.snapshot()).to_string();
+
+    let notices: Vec<&str> = seen
+        .lines()
+        .filter(|l| l.contains("the session is now"))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "thirteen Resize frames produced {} notices; all output:\n{seen}",
+        notices.len()
+    );
+    assert!(
+        notices[0].contains("104x55"),
+        "the surviving notice must name where the drag landed, not where it \
+         started — a stale geometry is worse than none:\n{}",
+        notices[0]
+    );
+}

@@ -127,6 +127,23 @@ fn fit_to_width(s: &str, cols: usize) -> String {
 /// enough that a silent session is not left wondering.
 const BANNER_AFTER_REPAINT: Duration = Duration::from_millis(400);
 
+/// How long a `Resize` notice waits for the geometry to stop moving before
+/// it is printed (GH #66).
+///
+/// **Coalesced rather than rate-limited, and the difference matters.** A
+/// window drag delivers a `SIGWINCH` per frame, and each one reaches every
+/// *other* attached client as a `Resize`; the report caught a drag printing
+/// `107x56, 115x58, 104x55, …` — thirteen distinct widths — into a raw-mode
+/// terminal. A rate limit would have printed one of those intermediate
+/// sizes and then stopped, which is a number the session no longer has. A
+/// debounce prints the geometry the drag actually settled on, once.
+///
+/// Shorter than [`BANNER_AFTER_REPAINT`] because this one is answering a
+/// question the operator just asked with their mouse: at 150ms a release is
+/// reported before the hand leaves the trackpad, while a drag at any
+/// plausible frame rate keeps resetting it.
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
+
 pub const EXIT_SIGHUP: u8 = 128 + 1;
 pub const EXIT_SIGTERM: u8 = 128 + 15;
 
@@ -1242,6 +1259,13 @@ pub async fn attach(session: &str) -> ExitCode {
     let banner_fallback = tokio::time::sleep(BANNER_AFTER_REPAINT);
     tokio::pin!(banner_fallback);
 
+    // The geometry a `Resize` last reported, held until it stops moving —
+    // see `RESIZE_SETTLE`. The timer is armed only while this is `Some`, so
+    // an attach that never sees a resize never wakes for one.
+    let mut pending_resize: Option<(u16, u16)> = None;
+    let resize_settle = tokio::time::sleep(RESIZE_SETTLE);
+    tokio::pin!(resize_settle);
+
     let mut detach = crate::attach_tty::DetachKey::default();
     // `Some` while an `AwaitingSecret` is outstanding: the request id to
     // answer, and the line being typed. While this is set, keystrokes go
@@ -1332,9 +1356,16 @@ pub async fn attach(session: &str) -> ExitCode {
                     }
                     // Another client resized the session. This terminal
                     // cannot be resized from here, so the view is simply
-                    // reported rather than silently wrong.
+                    // reported rather than silently wrong — but **not on
+                    // this frame** (GH #66). Held until the geometry
+                    // settles, because a drag delivers one of these per
+                    // frame and printing each was a flood the operator had
+                    // to detach to escape.
                     ServerFrame::Resize { cols, rows } => {
-                        diag!("holdfast attach: the session is now {cols}x{rows}");
+                        pending_resize = Some((cols, rows));
+                        resize_settle
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RESIZE_SETTLE);
                     }
                     ServerFrame::ProtocolError { reason, frame_kind } => {
                         match frame_kind {
@@ -1462,6 +1493,15 @@ pub async fn attach(session: &str) -> ExitCode {
                     diag!("{b}");
                 }
             }
+            // The geometry stopped moving: report where it landed, once.
+            // Guarded on `is_some` so the timer is inert until a `Resize`
+            // arms it — an unguarded elapsed `Sleep` is permanently ready
+            // and would spin this loop.
+            _ = &mut resize_settle, if pending_resize.is_some() => {
+                if let Some((cols, rows)) = pending_resize.take() {
+                    diag!("holdfast attach: the session is now {cols}x{rows}");
+                }
+            }
             _ = winch.recv() => {
                 if let Ok((cols, rows)) = crate::attach_tty::window_size(tty) {
                     if frame::write_frame(&mut wr, &ClientFrame::Resize { cols, rows })
@@ -1525,6 +1565,14 @@ pub async fn watch(session: &str) -> ExitCode {
 
     let mut frames = spawn_frame_reader(rd);
 
+    // Same coalescing as `attach`, for the same reason (GH #66): a watcher
+    // receives a `Resize` per frame of somebody else's window drag, and it
+    // has no keyboard to escape the flood with — only `Ctrl+C`, which ends
+    // the session view entirely.
+    let mut pending_resize: Option<(u16, u16)> = None;
+    let resize_settle = tokio::time::sleep(RESIZE_SETTLE);
+    tokio::pin!(resize_settle);
+
     loop {
         tokio::select! {
             body = frames.recv() => {
@@ -1574,7 +1622,10 @@ pub async fn watch(session: &str) -> ExitCode {
                         );
                     }
                     ServerFrame::Resize { cols, rows } => {
-                        diag!("holdfast watch: the session is now {cols}x{rows}");
+                        pending_resize = Some((cols, rows));
+                        resize_settle
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RESIZE_SETTLE);
                     }
                     ServerFrame::ProtocolError { reason, frame_kind } => {
                         match frame_kind {
@@ -1586,6 +1637,12 @@ pub async fn watch(session: &str) -> ExitCode {
                     ServerFrame::Attached { .. } | ServerFrame::AttachReject { .. } => {
                         diag!("holdfast watch: a second handshake frame arrived; ignoring it");
                     }
+                }
+            }
+            // The geometry stopped moving: report where it landed, once.
+            _ = &mut resize_settle, if pending_resize.is_some() => {
+                if let Some((cols, rows)) = pending_resize.take() {
+                    diag!("holdfast watch: the session is now {cols}x{rows}");
                 }
             }
             r = tokio::signal::ctrl_c() => {

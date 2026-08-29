@@ -93,12 +93,26 @@ pub(crate) fn render(message: &str) -> String {
 /// thing under test in more than one place here, and a capture that eats
 /// them makes those tests lie.
 pub fn emit(message: &str) {
-    let line = render(message);
+    // **One buffer, one `write_all`, and deliberately not `writeln!`** (GH
+    // #66). `writeln!` is `write_fmt`, which hands the formatter the line
+    // and the newline as separate pieces and therefore reaches the fd
+    // twice. The `StderrLock` orders those two writes against other
+    // *threads* and does nothing about other *processes*, so two `holdfast
+    // attach` clients sharing one terminal shredded each other mid-token:
+    // the report carries `holdholdfast attach: the session is now
+    // 116xholdfast attach: ...`, which is two interleaved writers and not
+    // one loop printing fast.
+    //
+    // A single `write` is not a portable atomicity guarantee on a tty — no
+    // such guarantee exists — but it is the difference between interleaving
+    // at line granularity and interleaving mid-word, and it costs nothing.
+    let mut line = render(message).into_bytes();
+    line.push(b'\n');
     let mut err = std::io::stderr().lock();
     // Deliberately dropped — see the module docs. This function is
     // reachable from inside the panic hook, where a panicking write
     // aborts the process.
-    let _ = writeln!(err, "{line}");
+    let _ = err.write_all(&line);
 }
 
 /// `eprintln!`, redacted. The only sanctioned diagnostic producer.
@@ -369,5 +383,114 @@ mod tests {
         install_panic_hook();
         crate::diag!("holdfast daemon: cannot read the config: token = {DIAG_SECRET}");
         panic!("the reaper died holding {PANIC_SECRET}");
+    }
+
+    const SHRED_ENV: &str = "HOLDFAST_TEST_DIAG_SHRED_CHILD";
+    const SHRED_LINES: usize = 400;
+    /// Padded so a line is substantial but stays far under `PIPE_BUF`
+    /// (4096, the size POSIX makes atomic). A line longer than that would
+    /// be split by the kernel no matter how many `write` calls it took, and
+    /// the test would then be asserting something untrue.
+    const SHRED_PAD: &str = "----------------------------------------";
+
+    /// **Two processes, one pipe** — the shape from GH #66.
+    ///
+    /// The report's evidence was `holdholdfast attach: the session is now
+    /// 116xholdfast attach: ...`: not one loop printing fast, but two
+    /// `holdfast attach` clients sharing a terminal and shredding each
+    /// other mid-token. `StderrLock` cannot help — it orders threads within
+    /// a process and knows nothing about a second process on the same fd.
+    ///
+    /// **A pipe is the medium on purpose.** POSIX makes a write of at most
+    /// `PIPE_BUF` atomic, so one `write` per line cannot interleave and two
+    /// can. A regular file would have made this pass either way, because
+    /// `O_APPEND` gives atomicity back in the kernel and would have hidden
+    /// the very defect being tested.
+    ///
+    /// What it would still pass against: an `emit` that builds the line
+    /// correctly and then writes it somewhere other than fd 2 — that is
+    /// what `nothing_reaches_daemon_log_unredacted_not_even_a_panic`
+    /// covers. It does **not** pass against a return to `writeln!`, which
+    /// hands the fd the line and the newline separately.
+    #[test]
+    #[cfg(unix)]
+    fn two_processes_emitting_at_once_never_shred_a_line() {
+        use std::io::Read;
+        use std::os::unix::io::FromRawFd;
+
+        if std::env::var_os(SHRED_ENV).is_some() {
+            return;
+        }
+
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let spawn = || {
+            // Each child needs its own descriptor for the same pipe;
+            // `Stdio::from_raw_fd` takes ownership and closes on drop, so
+            // handing the same number to both would close it twice.
+            let dup = unsafe { libc::dup(write_fd) };
+            assert!(dup >= 0, "dup() failed");
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("diag::tests::the_child_that_emits_many_lines")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(SHRED_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(unsafe { std::process::Stdio::from_raw_fd(dup) })
+                .spawn()
+                .unwrap()
+        };
+        let mut a = spawn();
+        let mut b = spawn();
+
+        // The parent's own write end must go before the read can ever see
+        // EOF, and it must go *after* both children have inherited theirs.
+        assert_eq!(unsafe { libc::close(write_fd) }, 0);
+
+        // Read to EOF rather than waiting first: the pipe holds 64K and two
+        // children emit more than that, so a parent that waited would
+        // deadlock against children blocked in `write`.
+        let mut out = String::new();
+        unsafe { std::fs::File::from_raw_fd(read_fd) }
+            .read_to_string(&mut out)
+            .unwrap();
+        assert!(a.wait().unwrap().success(), "child a failed");
+        assert!(b.wait().unwrap().success(), "child b failed");
+
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("shred-probe")).collect();
+        let shredded: Vec<&&str> = lines
+            .iter()
+            .filter(|l| !(l.starts_with("holdfast shred-probe ") && l.ends_with(SHRED_PAD)))
+            .collect();
+        assert!(
+            shredded.is_empty(),
+            "{} of {} lines were interleaved mid-line; first three: {:?}",
+            shredded.len(),
+            lines.len(),
+            &shredded[..shredded.len().min(3)]
+        );
+        // Guards the guard: if the children emitted nothing, every line
+        // above is vacuously intact and the assertion proves nothing.
+        assert_eq!(
+            lines.len(),
+            SHRED_LINES * 2,
+            "expected both children's output"
+        );
+    }
+
+    /// The writer half of the test above; a no-op unless re-entered.
+    #[test]
+    fn the_child_that_emits_many_lines() {
+        if std::env::var_os(SHRED_ENV).is_none() {
+            return;
+        }
+        let pid = std::process::id();
+        for i in 0..SHRED_LINES {
+            crate::diag!("holdfast shred-probe {pid} {i} {SHRED_PAD}");
+        }
     }
 }
