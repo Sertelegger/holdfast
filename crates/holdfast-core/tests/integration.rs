@@ -50,6 +50,13 @@ fn wait_for_exit(pty: &dyn PtyBackend, timeout: Duration) {
 /// and 0.0.2, and reported in task reports as "clippy clean on
 /// x86_64-pc-windows-gnu", was lib + bin only. A gated helper with unguarded
 /// callers is what made a guard whose name is broader than its reach.
+///
+/// **Its callers are no longer all `#[cfg(unix)]`, and that is
+/// deliberate.** The two that assert the strong process-group guarantee
+/// gate to `any(linux, macos)`, because the third sweep arm cannot keep
+/// that promise. `unix` stays correct for *this* helper — `kill(pid, 0)`
+/// is on every Unix — so the relationship is now "every caller is at
+/// least as narrow as this", not "every caller carries the same".
 #[cfg(unix)]
 fn pid_alive(pid: i32) -> bool {
     // kill(pid, 0) probes existence without signalling.
@@ -72,11 +79,28 @@ fn spawns_a_shell_and_reads_output() {
     pty.signal(Signal::Kill).unwrap();
 }
 
-// Unix-only: the assertion is about a *descendant* pid outliving the sweep,
-// probed with `kill(pid, 0)`. Windows job objects are 0.0.7's, and get
-// their own test rather than a contorted version of this one. Gated at the
-// test rather than at `pid_alive`, so the Linux run still carries it.
-#[cfg(unix)]
+// Unix-wide again, because macOS now enumerates the session rather than
+// degrading to `{pgid, tcgetpgrp(master)}`. The assertion is about a
+// *descendant* pid outliving the sweep, probed with `kill(pid, 0)`;
+// Windows job objects are 0.0.7's and get their own test rather than a
+// contorted version of this one.
+//
+// **This gate has moved twice, and the second move is the interesting
+// one.** It was `#[cfg(unix)]`, narrowed to Linux when macOS failed it,
+// and is Unix-wide once more now that the failure has been read
+// correctly: the sweep was never the thing that was broken. The test
+// polled a session nobody was draining, which on macOS stalls the shell
+// mid-echo before it forks (see `draining`), so the descendant the sweep
+// was blamed for missing had not been started yet.
+//
+// **`any(linux, macos)` and not `unix`.** Those are the two arms that
+// enumerate the session; the third returns `{pgid, tcgetpgrp(master)}`
+// and cannot reach a backgrounded job, so on a BSD this assertion and
+// `the_off_linux_sweep_leaks_…` would run the identical scenario and
+// demand opposite outcomes. `#[cfg(unix)]` is as wrong as no gate — it
+// merely fails on fewer platforms — and no gate at all also breaks the
+// windows-gnu test compile, since `pid_alive` is `#[cfg(unix)]`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn terminate_kills_the_whole_process_group() {
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
@@ -100,7 +124,7 @@ fn terminate_kills_the_whole_process_group() {
     assert!(pid_alive(child_pid), "descendant never started");
 
     pty.signal(Signal::Kill).unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    draining(&pty, || std::thread::sleep(Duration::from_millis(500)));
 
     assert!(
         !pid_alive(child_pid),
@@ -113,6 +137,101 @@ fn terminate_kills_the_whole_process_group() {
     assert!(
         pty.signal_deliveries() > 0,
         "a live sweep must actually reach the OS"
+    );
+}
+
+/// §4.4's documented off-Linux limitation, asserted rather than assumed,
+/// on the platforms where it still applies.
+///
+/// **Updated rather than deleted, which is what this test was for.** It
+/// was written to fail the day the full enumeration landed off Linux,
+/// and that day came for macOS: the `cfg` now excludes it, and
+/// `terminate_kills_the_whole_process_group` covers it instead. What is
+/// left is the BSDs, where `kinfo_proc` is a different struct than the
+/// one the macOS arm reads and no enumeration is written.
+///
+/// Where there is no `/proc` the sweep degrades to the distinct set
+/// `{pgid, tcgetpgrp(master)}`, so a job the shell backgrounded into its
+/// **own** process group is never named and outlives `terminate`. That is
+/// the specified behaviour today rather than a defect, and REQ-SPTY-005
+/// binds it from the other side: the documented §4.4 limitations may not
+/// widen. This test is the guard on both directions at once — it fails if
+/// the leak grows, and it fails if the leak silently closes.
+///
+/// **Updated, never deleted.** The day the full enumeration lands off
+/// Linux this is the test that has to be edited, which is the point. That
+/// enumeration is `proc_listallpids` plus `getsid(2)`, *not* the
+/// `sysctl(KERN_PROC_SESSION)` this limitation was written around: XNU
+/// registers no such OID and the call fails `ENOENT`. §4.4 carries the
+/// measurement.
+///
+/// Both halves of the assertion matter. The leader having died is what
+/// makes the surviving descendant a *leak* rather than the unremarkable
+/// result of a sweep that did nothing at all.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[test]
+fn the_off_linux_sweep_leaks_exactly_what_section_4_4_says_it_does() {
+    let pty = InProcessPty::spawn(&bash()).expect("spawn");
+
+    // Backgrounded, so shell job control puts it in a group of its own —
+    // the one `{pgid, tcgetpgrp(master)}` cannot reach. A *foreground*
+    // command would be `tcgetpgrp(master)` and would therefore be swept,
+    // which is why the leak has to be probed with `&`.
+    pty.write(b"sleep 300 & echo CHILD''_PID=$!\n").unwrap();
+    let out = read_until(&pty, "CHILD_PID=", Duration::from_secs(5));
+    let child_pid: i32 = out
+        .split("CHILD_PID=")
+        .nth(1)
+        .map(|s| {
+            s.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("no child pid in: {out:?}"));
+    assert!(pid_alive(child_pid), "descendant never started");
+
+    pty.signal(Signal::Kill).unwrap();
+    wait_for_exit(&pty, Duration::from_secs(5));
+
+    // Non-vacuity is carried by the delivery counter and **not** by
+    // `!pty.is_alive()`, which is the assertion this test wants and
+    // cannot have. Measured on macOS 27.0 (Darwin 27.0.0): with a
+    // backgrounded job in the session, the leader is still unreaped 5 s
+    // after its own group was SIGKILLed in roughly 6 runs out of 10,
+    // while the same sequence driven from a standalone harness retired
+    // it 5 times out of 5. That difference is not understood, and §4.4
+    // records it as open rather than as a limitation with a known
+    // shape. Asserting the leader's death here would import the
+    // coin-flip into CI; asserting that the sweep reached the OS is the
+    // same control the Linux counterpart uses, and it is exactly as
+    // strong against the failure this test exists to catch — a sweep
+    // that quietly stopped sweeping.
+    assert!(
+        pty.signal_deliveries() > 0,
+        "a live sweep must actually reach the OS"
+    );
+    let leaked = pid_alive(child_pid);
+
+    // Retire the leak before asserting on it. This test asserts that a
+    // descendant *survives*, so unlike its Linux counterpart it is the
+    // one thing in the suite that leaves a live process behind on
+    // purpose — and `sleep 300` means five minutes of them, one per run,
+    // each still holding an fd on a slave whose session leader is gone.
+    // Cleaning up after the assertion value is taken, not before, so a
+    // panic cannot skip it.
+    if leaked {
+        // SAFETY: `kill` takes no pointers, and `child_pid` was read from
+        // this session's own shell moments ago.
+        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+    }
+
+    assert!(
+        leaked,
+        "descendant {child_pid} was swept off Linux — §4.4's limitation has \
+         closed. That is good news and this test is how it gets recorded: \
+         update §4.4, §25 and REQ-P-006's platform note, then rewrite this \
+         test to assert the descendant dies"
     );
 }
 
@@ -1339,8 +1458,24 @@ fn line_discipline_tracks_the_slaves_line_discipline() {
     );
 
     pty.write(b"sleep 3\n").unwrap();
+    // **Drain the echo before polling, or the shell never runs the line.**
+    // macOS gives a pty a far smaller output buffer than Linux does, and
+    // a session nobody reads from fills it: the shell then blocks part
+    // way through echoing the command it was handed, never reaches the
+    // fork, and the property under test never changes — for a reason
+    // that has nothing to do with the property. Reading the echo back
+    // unblocks the shell. It is NOT proof the line was accepted:
+    // `read_until` returns on its deadline too and the value is
+    // discarded, so a silent shell and an accepted line look identical
+    // here. The assertions below are what distinguish them.
+    // Inert on Linux, where the buffer swallows a whole session's chatter.
+    read_until(&pty, "sleep 3", Duration::from_secs(5));
     assert_eq!(
-        poll_line_discipline(&pty, Some(true), Duration::from_secs(5)),
+        draining(&pty, || poll_line_discipline(
+            &pty,
+            Some(true),
+            Duration::from_secs(5)
+        )),
         LineDiscipline {
             echo: Some(true),
             canonical: Some(true),
@@ -1445,6 +1580,60 @@ fn line_discipline_separates_a_line_editor_from_a_secret_prompt() {
 }
 
 /// Poll `foreground_group` until `pred` holds, then return the last value.
+/// Run `body` while the master is drained continuously.
+///
+/// **Required on macOS, inert on Linux, and not optional where it is
+/// used.** macOS gives a pty a far smaller output buffer than Linux
+/// does, and a session nobody reads from fills it — at which point the
+/// shell blocks part way through echoing the line it was handed, never
+/// reaches the fork, and whatever property is being polled for never
+/// changes. The failure looks exactly like the property being broken,
+/// which is what made it worth a named helper rather than a stray read:
+/// three tests here polled an undrained session and reported macOS
+/// defects that were entirely their own.
+///
+/// One read is not enough — the buffer refills from the shell's own
+/// prompt chatter — so this drains for as long as `body` runs. The
+/// trailing newline is how the reader is retired: it is parked in
+/// `read`, which returns for bytes or EOF and nothing else, so it is
+/// given bytes.
+fn draining<T>(pty: &InProcessPty, body: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut buf = [0u8; 4096];
+            while !stop.load(Ordering::Relaxed) {
+                match pty.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        // **Retire the reader even if `body` panics**, which is the whole
+        // reason this is a guard and not two statements. A failing
+        // assertion inside `body` unwinds; `thread::scope` then waits for
+        // the reader before propagating it; and the reader is parked in a
+        // blocking `read` that only bytes or EOF return. The test would
+        // hang instead of failing — turning a red assertion into a job
+        // that has to be killed by a timeout, which is the failure mode
+        // this suite's "nothing may block without a deadline" rule exists
+        // to forbid.
+        struct Retire<'a>(&'a AtomicBool, &'a InProcessPty);
+        impl Drop for Retire<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+                // Bytes, not EOF: the session is still alive on the happy
+                // path, so nothing else will wake the reader. A dead one
+                // errors out of `read` on its own and this is a no-op.
+                let _ = self.1.write(b"\n");
+            }
+        }
+        let _retire = Retire(&stop, pty);
+        body()
+    })
+}
+
 fn poll_foreground(
     pty: &dyn PtyBackend,
     mut pred: impl FnMut(Option<i32>) -> bool,
@@ -1468,7 +1657,21 @@ fn the_foreground_group_changes_for_an_external_command_and_not_for_a_builtin() 
     let at_prompt = poll_foreground(&pty, |g| g.is_some(), Duration::from_secs(5));
     assert!(at_prompt.is_some(), "the shell never took the terminal");
     pty.write(b"sleep 3\n").unwrap();
-    let running = poll_foreground(&pty, |g| g != at_prompt, Duration::from_secs(5));
+    // **Drain the echo before polling, or the shell never runs the line.**
+    // macOS gives a pty a far smaller output buffer than Linux does, and
+    // a session nobody reads from fills it: the shell then blocks part
+    // way through echoing the command it was handed, never reaches the
+    // fork, and the property under test never changes — for a reason
+    // that has nothing to do with the property. Reading the echo back
+    // unblocks the shell. It is NOT proof the line was accepted:
+    // `read_until` returns on its deadline too and the value is
+    // discarded, so a silent shell and an accepted line look identical
+    // here. The assertions below are what distinguish them.
+    // Inert on Linux, where the buffer swallows a whole session's chatter.
+    read_until(&pty, "sleep 3", Duration::from_secs(5));
+    let running = draining(&pty, || {
+        poll_foreground(&pty, |g| g != at_prompt, Duration::from_secs(5))
+    });
     assert_ne!(
         running, at_prompt,
         "an external command must get its own group"
@@ -1998,8 +2201,18 @@ async fn env_session_lifecycle(
 
     let session = server.registry.get(&id).unwrap();
     let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+    // One `printenv` per name, not `printenv A B C`. GNU's takes a list;
+    // **BSD's takes a single operand and silently ignores the rest**,
+    // exiting 0 — so on macOS the multi-name form printed only the first
+    // value and this helper's own non-vacuity check then failed, reporting
+    // env that had in fact reached the child perfectly well.
+    let probe = names
+        .iter()
+        .map(|n| format!("printenv {n}"))
+        .collect::<Vec<_>>()
+        .join("; ");
     session
-        .write_input(format!("printenv {}\n", names.join(" ")).as_bytes())
+        .write_input(format!("{probe}\n").as_bytes())
         .unwrap();
     // Wait for the *last* value to appear, so every one of them has been
     // through the PTY before the log is read.
@@ -3283,7 +3496,7 @@ fn mock_session_in(server: &HoldfastServer, name: &str) -> (String, Arc<MockPty>
 fn wait_args(session: &str, pattern: &str) -> WaitForPatternArgs {
     WaitForPatternArgs {
         session: session.to_string(),
-        pattern: pattern.to_string(),
+        pattern: Some(pattern.to_string()),
         timeout_secs: Some(2),
         since_cursor: Some(0),
         max_bytes: None,
@@ -3676,7 +3889,10 @@ async fn interrupt(server: &HoldfastServer, id: &str) -> Value {
 /// **Unix-only, and the reason is the assertion rather than the API**: the
 /// discriminating half probes a *descendant* pid with `kill(pid, 0)`.
 /// Windows job objects are 0.0.11's and get their own test.
-#[cfg(unix)]
+// The cleanup half asserts the sweep retires the backgrounded job, so
+// this carries the strong guarantee too, and gates with it (see
+// `terminate_kills_the_whole_process_group`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn interrupt_stops_a_running_command_and_leaves_the_shell_alive() {
     let server = HoldfastServer::new();

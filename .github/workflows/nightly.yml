@@ -32,7 +32,42 @@ on:
     #
     # A scheduled workflow only fires from the DEFAULT BRANCH. This file
     # does nothing until it is merged there.
-    - cron: "17 10 * * *"
+    #
+    # **Weekly, not nightly, and the name now overstates the cadence on
+    # purpose.** The tier keeps its name because REQ-TST-004's tier-4
+    # content still belongs here; what changed is the bill. At ~14 min a
+    # run, daily was ~426 min/month against an account-wide 2000 min free
+    # tier that this repository exhausted on the 25th. The new cost is
+    # below, with the iteration count that drives it — deliberately NOT
+    # quoted twice, because the first draft of this file gave one schedule
+    # two different costs eighteen lines apart.
+    #
+    # **The trade-off is real and is not a drift argument, and it is paid
+    # rather than accepted.** Most of what a scheduled job re-runs on an
+    # unchanged tree can only catch runner or toolchain drift, for which
+    # weekly is plenty — but a flake hunt is the exception, because
+    # repetition IS the measurement. Weekly at the old count would have
+    # dropped monthly samples from ~600 to ~87, and the sensitivity that
+    # buys is currently pointed at GH #42, which `KNOWN-INTERMITTENTS.md`
+    # records as *possibly* not a simple flake: the hypothesis is that a rescan reads the session
+    # buffer rather than confirming the reader has caught up, which would
+    # make `wait_for_pattern` answer `SessionDied` over output a real
+    # child produced. Cutting the sampling rate 7x on the one job that
+    # would catch that is the wrong direction.
+    #
+    # So the repetition count rises with the cadence, though not far
+    # enough to hold the sample count flat: 4.33 runs x 100 = ~433 a
+    # month, against daily@20's ~608. **That shortfall is deliberate and
+    # is the cheaper half of a trade against the runtime cap** — see the
+    # headroom note on the step below.
+    #
+    # The cost derives rather than being asserted: 14 min at 20 iterations
+    # implies ~0.5 min an iteration over ~4 min of fixed setup, so 100
+    # iterations is 4 + 50 = ~54 min a run and 4.333 x 54 =
+    # **~234 min/month**, against daily's ~426. Each run pays the setup
+    # once instead of thirty times, which is where most of that comes
+    # from.
+    - cron: "17 10 * * 0"
   # So the job can be exercised on demand during Task 7 without waiting a
   # day. This is NOT a substitute for the schedule -- a workflow_dispatch-
   # only job nobody dispatches is a job that cannot fail.
@@ -100,4 +135,22 @@ jobs:
           key: nightly
           save-if: false
       - run: ./scripts/ci-probe.sh
-      - run: ./scripts/ci-flake-hunt.sh 20
+      # 100, not the script's default 20, and not the 140 this file
+      # carried first: see the sampling note on the schedule above.
+      #
+      # **140 was sized on a single measurement against a hard cap, which
+      # is precisely what `mutants.yml` refuses to do** — that file has
+      # two rates disagreeing by 2.1x and deliberately sizes against the
+      # slower. Applying the same 2.1x to 140 gave ~151 min against
+      # `timeout-minutes: 180`, a 16% margin, and 2.5x reached the cap.
+      # A cancelled flake hunt yields no verdict at all and, unlike a
+      # cancelled sweep, uploads no partial artifact — so the failure is
+      # total rather than partial, and it costs the full 180 minutes to
+      # learn nothing.
+      #
+      # 100 buys the margin back: ~54 min measured, ~109 at 2.1x (39%),
+      # ~129 at 2.5x (28%). The price is ~433 samples a month against
+      # daily@20's ~608 — a real reduction in flake sensitivity, taken
+      # knowingly, because a hunt that runs is worth more than a longer
+      # one that gets killed.
+      - run: ./scripts/ci-flake-hunt.sh 100

@@ -39,6 +39,30 @@ which is not built, along with `start_session`'s two-phase preflight. Tool annot
 
 See spec §12.6 for the full ship-list and §14 for the post-v0.1.0 roadmap.
 
+## Working on a Mac (or any non-Linux Unix)
+
+Every CI job is `ubuntu-24.04`, so nothing here is caught by CI and all of it
+has already cost someone a wrong diagnosis. Full detail and measurements:
+`docs/runbooks/2026-08-19-macos-verification.md` §8.
+
+- **A session nobody reads from stalls its shell.** macOS gives a pty a far
+  smaller output buffer than Linux; undrained it fills, and the shell blocks
+  part way through echoing the line it was handed — before the fork. The
+  command never runs, so whatever you were polling for never changes, and it
+  looks exactly like the thing under test being broken. If a test polls a
+  session, drain it for as long as it polls. One read will not do.
+- **BSD tools are not GNU tools and fail silently.** `printenv A B` prints only
+  `A` and exits 0. `stat -c '%a'` is GNU; BSD wants `-f '%Lp'`. `script -qefc`
+  is GNU's calling convention. `timeout` is absent entirely. `ps -o comm=`
+  omits arguments, so matching a command line against it never hits.
+- **Check the other Unixes before pushing.** `cargo check --target
+  x86_64-unknown-freebsd` catches a `#[cfg]` split that deletes an arm — which
+  has happened, and which compiled fine on both platforms anyone tested.
+- **Do not wait on a shell prompt with a regex.** It is a guess about the
+  operator's `$PS1` and it silently never matches a customised one. Read
+  `interaction_mode` for whether a command finished and `get_command_history`
+  for whether it succeeded.
+
 ## graphify
 
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.

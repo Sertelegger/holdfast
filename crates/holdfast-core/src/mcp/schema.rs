@@ -257,7 +257,20 @@ pub struct Match {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WaitForPattern {
+    /// Present for a wait that was given a pattern; absent for one that
+    /// was not.
     pub matched: Option<bool>,
+    /// Present **only** for a pattern-less wait: the session left
+    /// `Executing` before the deadline.
+    ///
+    /// Spelled differently from `matched` on purpose. The two answer
+    /// different questions — "your regex appeared" and "the session
+    /// stopped running a command" — and a single field would let a caller
+    /// read one as the other. Neither is the whole answer on its own:
+    /// `interaction_mode` beside it says *what* the session reached, and
+    /// `Fullscreen`, `AwaitingSecret` and `Exited` all satisfy this while
+    /// meaning something the caller must act on differently.
+    pub reached: Option<bool>,
     pub r#match: Option<Match>,
     /// Output from the scan start through the match, redacted through the
     /// same pipeline as `read_output`, and clipped before `match.offset`
@@ -271,6 +284,16 @@ pub struct WaitForPattern {
     /// Set **only** when the daemon clamped the requested deadline
     /// (REQ-T-008). A field that is always present carries no information.
     pub clamped_timeout_secs: Option<u64>,
+    /// `"pattern_did_not_match_but_session_is_at_prompt"` when the wait
+    /// expired against a session already back at a measured prompt — the
+    /// signature of a regex written for somebody else's `$PS1`.
+    ///
+    /// **Absent when it does not fire, not null** — the same convention
+    /// as `clamped_timeout_secs` above, and the opposite of
+    /// `SendInput.warning`, which is emitted on every write and null when
+    /// there is nothing to say. The two tools differ on purpose: a write
+    /// always has a REQ-SEC-011 answer to give, and a wait does not.
+    pub warning: Option<String>,
     pub exit_code: Option<i32>,
     pub interaction_mode: Option<InteractionMode>,
     pub detection_tier: Option<DetectionTier>,
@@ -287,7 +310,18 @@ pub struct SendInput {
     /// would be a guess (§5.2).
     pub bytes_written: Option<u64>,
     /// `"session_awaiting_secret"` when the write went to an echo-off
-    /// session (REQ-SEC-011). The write still happened.
+    /// session (REQ-SEC-011) — the write still happened — or
+    /// `"pattern_did_not_match_but_session_is_at_prompt"` when a
+    /// `wait_for` ended unmatched against a session already at a measured
+    /// prompt.
+    ///
+    /// REQ-SEC-011 takes precedence when both could apply. They cannot
+    /// today, since an `AwaitingSecret` session is not `AtPrompt`; the
+    /// rule is written down against a future mode that breaks that.
+    ///
+    /// **Present on every write, null when there is nothing to say** —
+    /// the opposite of `WaitForPattern.warning`, which is omitted unless
+    /// it fires. `send_input` always has a REQ-SEC-011 answer to give.
     pub warning: Option<String>,
     pub timeout_ms: Option<u64>,
     pub exit_code: Option<i32>,

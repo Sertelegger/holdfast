@@ -114,6 +114,42 @@ fn safe_last_line(processor: &OutputProcessor, session: &Session, d: &Detection)
     redact_str(&processor.rules, visible)
 }
 
+/// `"pattern_did_not_match_but_session_is_at_prompt"` when a wait ended
+/// unmatched against a session detection already knew was at a prompt.
+///
+/// **"ended unmatched", not "expired": the predicate is `!matched &&
+/// at_prompt && measured` and reads no status.** `run_wait` can also
+/// return `SessionDied` with `matched: false`, and the two sets
+/// coincide today only because the detector reports `Exited` for such
+/// a session, which fails the `at_prompt` arm. That is a coincidence
+/// of the detector, not a check made here.
+///
+/// **The mistake this exists to catch is writing the shell's prompt as a
+/// regex.** An agent asked to wait for a command to finish reaches for
+/// `\$ $` or `> $`, which is a guess about somebody else's `$PS1` — and
+/// against a customised prompt (`❯`, a Starship segment line, a colour
+/// escape) it simply never matches. The call then reports `timeout` and
+/// `matched: false` beside `interaction_mode: AtPrompt` and
+/// `confidence: 1`, which is the truth and the false thing in one
+/// payload. Without this the agent has to notice that contradiction by
+/// eye; with it, the tool says so at the call that got it wrong.
+///
+/// **Read out of the payload rather than recomputed**, so the warning
+/// cannot disagree with the detection fields printed beside it.
+///
+/// Restricted to the tiers that *measured* the prompt. At `heuristic`,
+/// `AtPrompt` is itself a guess from quiescence, and warning that a guess
+/// contradicts a guess would be noise.
+pub fn unmatched_at_prompt(data: &Value) -> Option<&'static str> {
+    let matched = data.get("matched")?.as_bool()?;
+    let at_prompt = data.get("interaction_mode")?.as_str()? == "AtPrompt";
+    let measured = matches!(
+        data.get("detection_tier").and_then(Value::as_str),
+        Some("semantic" | "terminal_mode")
+    );
+    (!matched && at_prompt && measured).then_some("pattern_did_not_match_but_session_is_at_prompt")
+}
+
 /// Insert the session-state block into a tool's `data` object.
 ///
 /// The enums are siblings of `prompt`, not nested inside it: they describe

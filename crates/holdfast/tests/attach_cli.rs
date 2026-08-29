@@ -286,6 +286,16 @@ fn termios_of(fd: RawFd) -> libc::termios {
 /// Widened through `u64::from` rather than an `as` cast: `tcflag_t` is
 /// `u32` on Linux and `u64` on macOS, and `as` would be a no-op cast on
 /// one of them — which `-D warnings` rejects.
+///
+/// **The same trap closes on `from` from the other side, which is what
+/// the `allow` is for.** On macOS the widening reads `u64::from(u64)` and
+/// `useless_conversion` fires, so there is no spelling of this that is
+/// clean on both targets: whichever way it is written, one of the two
+/// lints objects on one of the two platforms. The `allow` is inert on
+/// Linux, where the conversion is real, and load-bearing on macOS, where
+/// it is not. Scoped to this function rather than the file so that it
+/// cannot quietly cover a genuinely useless conversion added later.
+#[allow(clippy::useless_conversion)]
 fn termios_fields(t: &libc::termios) -> (u64, u64, u64, u64, Vec<u8>) {
     (
         u64::from(t.c_iflag),
@@ -1552,6 +1562,93 @@ async fn watching_an_already_exited_session_ends_instead_of_hanging() {
         "the exit status was never reported:\n{}",
         String::from_utf8_lossy(&seen)
     );
+}
+
+/// The attach banner, which exists because its absence caused an incident.
+///
+/// `attach` printed nothing on a successful connect and replays no
+/// scrollback, so attaching to a session idling at a prompt rendered an
+/// empty pane. When the session is a shell wearing the operator's own
+/// prompt, that is indistinguishable from the attach having failed — and
+/// an operator who drew that conclusion attached a second time, at which
+/// point two clients reflowed each other into a resize loop that pegged
+/// two processes.
+///
+/// **The detach key is asserted, not just the session name.** `Ctrl-B`
+/// then `d` is not guessable, and somebody who cannot tell they are
+/// attached also cannot tell how to leave; a banner that named the
+/// session but not the way out would satisfy a weaker test and leave half
+/// the incident reachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attach_says_it_attached_and_how_to_leave() {
+    let d = TestDaemon::start("attachbanner").await;
+    // A **real** shell, not the mock: the ordering assertion below needs a
+    // child that answers the startup `SIGWINCH` by repainting, which is
+    // the thing the banner has to come after. A `MockPty` emits nothing,
+    // so the banner would arrive from the fallback timer and the ordering
+    // would be untested — which is how the first version of this test
+    // passed against a banner no human could see.
+    let s = d.real_session("bash", &["--norc", "--noprofile"]);
+
+    let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 80, 24);
+    let seen = term.wait_for(b"attached to", 15);
+    assert!(
+        contains(&seen, b"attached to"),
+        "attach never said it attached:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        contains(&seen, b"Ctrl-B d"),
+        "the banner must name the detach key:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    // The geometry `Term` gave it, so a banner that prints `0x0` — what
+    // `TIOCGWINSZ` answers on an unsized pty — fails rather than passing
+    // as "a size was printed".
+    assert!(
+        contains(&seen, b"80x24"),
+        "the banner should carry the real geometry:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    let pos = |needle: &[u8]| {
+        seen.windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap_or(usize::MAX)
+    };
+
+    // **Ordering, because presence alone shipped a banner nobody could
+    // see.** The startup `Resize` raises `SIGWINCH`, the child repaints,
+    // and a prompt repaint erases from above the cursor to the end of the
+    // screen — so a banner written first lands in the erased region:
+    // present in the byte stream, absent from the terminal.
+    //
+    // Anchored on the child's prompt rather than on "the first escape
+    // sequence", which was the first version of this assertion and was
+    // useless the moment the banner itself gained colour: its own SGR
+    // codes then satisfied "an escape came first".
+    assert!(
+        pos(b"$") < pos(b"\x1b7"),
+        "the banner must follow the child's own output, not precede it:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // Cursor save/restore around it. `attach` is a pass-through and the
+    // child tracks its own cursor, so a banner that does not put it back
+    // leaves the child's next write starting mid-line.
+    assert!(
+        contains(&seen, b"\x1b7") && contains(&seen, b"\x1b8"),
+        "the banner must save and restore the cursor:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        pos(b"\x1b7") < pos(b"attached to") && pos(b"attached to") < pos(b"\x1b8"),
+        "save must precede the text and restore must follow it:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    term.type_keys(b"\x02d");
+    assert_eq!(term.wait_exit(15), 0, "detach is an ordinary ending");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

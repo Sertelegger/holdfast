@@ -1,4 +1,4 @@
-# Holdfast weekly mutation sweep.
+# Holdfast monthly mutation sweep.
 # Plan: docs/superpowers/plans/2026-08-12-holdfast-ci-and-verification-harness.md Task 6.
 #
 # holdfast-core AND holdfast -- see the shard-calibration comment below for why
@@ -22,9 +22,41 @@ name: Mutants
 
 on:
   schedule:
-    # 11:41 UTC on Saturdays. UTC only; see nightly.yml for the note.
-    - cron: "41 11 * * 6"
+    # 11:41 UTC on the 1st of each month. UTC only; see nightly.yml
+    # for the note.
+    #
+    # **Monthly, not weekly, and the reason is the bill rather than the
+    # engineering.** At ~175 min a run this job cost 43% of the account's
+    # entire 2000 min/month free tier and exhausted it on the 25th, taking
+    # every other repository's CI down with it. Weekly was 4.33 runs =
+    # ~759 min/month; monthly is ~175.
+    #
+    # **Day-of-month, and NOT `1-7 * 6` for "first Saturday".** POSIX cron
+    # ORs a restricted day-of-month with a restricted day-of-week instead
+    # of ANDing them, and GitHub follows POSIX. `41 11 1-7 * 6` therefore
+    # fires on days 1-7 *and* on every Saturday — enumerated, 10 runs in
+    # 2026-09, 11 in 2026-10 — which is ~1800 min/month, a 2.4x INCREASE
+    # over the weekly schedule it was written to replace. It read as a
+    # saving and was a regression.
+    #
+    # A true first-Saturday needs day-of-month `*` and the day filter in
+    # the job, which pays a runner start every week to skip. The weekday
+    # was never load-bearing for a sweep nobody watches live, so this
+    # picks a fixed date instead and gets exactly one run.
+    #
+    # **What that costs in coverage, stated rather than glossed.** One
+    # shard of eight runs per invocation, so a full sweep went from 8
+    # weeks to 8 months. That is only acceptable because the value of a
+    # sweep is in *reading* the survivors, and an unread sweep is spend
+    # with no return. Before a milestone, dispatch the shards deliberately
+    # with the input below rather than waiting for the calendar.
+    - cron: "41 11 1 * *"
   workflow_dispatch:
+    inputs:
+      shard:
+        description: "Shard to sweep, 0-7. Empty rotates by month."
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -183,12 +215,42 @@ jobs:
       # do. Sharding keeps that property; `--in-diff` would have made the
       # job a slower duplicate of work already done.
       #
-      # The rotation is by ISO week so it needs no state. `--no-shuffle` and
+      # The rotation is by MONTH so it needs no state. `--no-shuffle` and
       # the pinned tool version keep shard membership stable between runs,
-      # so week N+8 re-runs the same ~224 mutants unless the code moved.
-      - run: |
-          shard=$(( $(date -u +%V) % 8 ))
-          echo "ISO week $(date -u +%V) -> shard ${shard}/8"
+      # so month N+8 re-runs the same ~224 mutants unless the code moved.
+      #
+      # **Months since epoch, and the naked month index it replaced was
+      # worse than the ISO week it replaced.** `date +%V % 8` under a
+      # first-Saturday cron picks shard 5 six times and shard 3 once over
+      # 24 months. But `(month - 1) % 8` is not a fix: a calendar month
+      # wraps at 12 against a modulus of 8, so driven once a month it
+      # NEVER completes a cycle — shards 0-3 land four times in 24 months
+      # and 4-7 twice, half the mutation surface swept once a year, and a
+      # September start covers four shards in eight months. `year * 12 +
+      # month` does not wrap, and is exactly uniform: every shard three
+      # times in 24 months, a full sweep every eight.
+      #
+      # An explicit `shard` input wins, so a milestone sweep can walk 0..7
+      # without waiting eight months for the calendar to do it.
+      # Through `env:` rather than `${{ }}` interpolation into the script
+      # body: an expression is pasted in before the shell sees the line, so
+      # a crafted input would be shell syntax rather than a value. Only a
+      # dispatcher with write access can set it, which lowers the severity
+      # and does not change the shape.
+      - env:
+          SHARD_INPUT: ${{ inputs.shard }}
+        run: |
+          shard="${SHARD_INPUT}"
+          case "${shard}" in
+            "" | [0-7]) ;;
+            *) echo "shard must be 0-7 or empty, got: ${shard}" >&2; exit 1 ;;
+          esac
+          if [ -z "${shard}" ]; then
+              shard=$(( ( $(date -u +%Y) * 12 + $(date -u +%-m) - 1 ) % 8 ))
+            echo "$(date -u +%Y-%m) -> shard ${shard}/8"
+          else
+            echo "dispatched shard ${shard}/8"
+          fi
           cargo mutants --package holdfast-core --package holdfast --no-shuffle \
             --jobs 2 --shard "${shard}/8" -- --locked
       # mutants.out/ is the only durable evidence this job produced anything.

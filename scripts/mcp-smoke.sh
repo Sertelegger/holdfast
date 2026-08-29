@@ -776,6 +776,55 @@ if [ -z "${HOLDFAST_RUNTIME_DIR:-}" ]; then
   exit 1
 fi
 
+# `stat` is two programs with one name: GNU spells the mode `-c '%a'`, BSD
+# (macOS, the *BSDs) spells it `-f '%Lp'`, and each rejects the other's
+# flag. Asked GNU-first so the CI platform takes the first branch.
+#
+# **The `2>/dev/null` this replaces is what made it worth a helper.** It
+# turned "this stat cannot answer" into the empty string, so the check
+# reported `expected: 600, got:` on macOS — which reads as a permissions
+# defect on a socket that was measured, by hand, to be 0600.
+file_mode() { # file_mode <path>
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+# `script(1)` is also two programs. GNU takes the command as one string
+# after `-c` with the typescript path last; BSD takes the path first and
+# the command as argv, and rejects `-efc` outright — which cost exit 127
+# and a row that read as an `attach` failure when `attach` was fine.
+# Probed rather than keyed to `uname`, so a GNU `script` installed on a
+# BSD is still driven correctly.
+#
+# **Both flavours return the child's own status**, which is the half of
+# the assertion below that would otherwise go degenerate off Linux. That
+# was measured on macOS 27 (`script -q /dev/null false` answers 1), not
+# assumed from the manual page.
+if script -qefc true /dev/null >/dev/null 2>&1; then
+  SCRIPT_FLAVOUR=gnu
+else
+  SCRIPT_FLAVOUR=bsd
+fi
+
+# `timeout(1)` is GNU coreutils and a stock macOS has neither it nor
+# `gtimeout`. `perl`'s `alarm` survives `exec`, so the cap costs no
+# wrapper process standing between this shell and the status it must
+# read — the same reason the `watch` check below backgrounds and waits
+# rather than reaching for `timeout --signal=INT`.
+pty_run() { # pty_run <timeout_secs> <command> [args...]
+  local secs=$1
+  shift
+  if [ "$SCRIPT_FLAVOUR" = gnu ]; then
+    set -- script -qefc "$*" /dev/null
+  else
+    set -- script -q /dev/null "$@"
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  else
+    perl -e 'my $s = shift; alarm $s; exec @ARGV or exit 127' "$secs" "$@"
+  fi
+}
+
 # **One check over both sockets, because either half alone is degenerate.**
 # `http.sock is not bound` is an absence, and an absence is satisfied by a
 # directory in which nothing ever happened -- against `/bin/true` it passed
@@ -789,7 +838,7 @@ check_eq "the daemon binds attach.sock and not http.sock (0.0.10)" \
   "$(test -S "$HOLDFAST_RUNTIME_DIR/attach.sock" && echo yes || echo no)/$(test -e "$HOLDFAST_RUNTIME_DIR/http.sock" && echo yes || echo no)" \
   "yes/no"
 check_eq "attach.sock is 0600" \
-  "$(stat -c '%a' "$HOLDFAST_RUNTIME_DIR/attach.sock" 2>/dev/null)" "600"
+  "$(file_mode "$HOLDFAST_RUNTIME_DIR/attach.sock")" "600"
 
 # A real session, created the only way this binary can create one, attached
 # by the real client and detached by the real key sequence. The session is
@@ -831,7 +880,7 @@ ATTACH_OUT="$(
     sleep 2
     printf '\002d'
     sleep 1
-  } | timeout 20 script -qefc "$BIN attach smokeattach" /dev/null 2>/dev/null
+  } | pty_run 20 "$BIN" attach smokeattach 2>/dev/null
 )"
 ATTACH_STATUS=$?
 # `case` and not `grep -q`: under `pipefail` a `grep -q` that matches early
@@ -911,8 +960,12 @@ SMOKE_SECRET='sm0kesecret'
 # and it is computed here independently of what the session computes.
 SMOKE_DIGEST="$(printf %s "$SMOKE_SECRET" | cksum | cut -d' ' -f1)"
 
-# The human. `script` gives `attach` the tty it needs for raw mode; the
-# keystrokes are written ahead of time, as everywhere else in this file.
+# The human. `pty_run` gives `attach` the tty it needs for raw mode and
+# caps it; the keystrokes are written ahead of time, as everywhere else in
+# this file. **Through the helper and not `timeout … script -qefc` direct**:
+# both of those are GNU-only spellings, and off Linux they exit 127 before
+# `attach` starts — which surfaces here as `secret_cancelled` and three
+# more red rows, describing a credential path that is in fact fine.
 #
 # The client only routes a line into `SecretInput` while an `AwaitingSecret`
 # is outstanding, and that happens either way round: if it is attached when
@@ -928,7 +981,7 @@ SECRET_ATTACH_LOG="$HOLDFAST_RUNTIME_DIR/secret-attach.out"
   sleep 3
   printf '\002d'
   sleep 1
-} | timeout 40 script -qefc "$BIN attach smokeattach" /dev/null >"$SECRET_ATTACH_LOG" 2>/dev/null &
+} | pty_run 40 "$BIN" attach smokeattach >"$SECRET_ATTACH_LOG" 2>/dev/null &
 SECRET_ATTACH_PID=$!
 sleep 1
 

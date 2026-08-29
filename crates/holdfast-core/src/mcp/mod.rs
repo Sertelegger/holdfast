@@ -38,9 +38,28 @@ use std::sync::Arc;
 pub const INSTRUCTIONS: &str = "Holdfast gives you PTY-backed shell sessions. start_session spawns a \
      shell or program; send_input types into it; read_output reads what \
      it printed using a cursor you carry between calls; \
-     wait_for_pattern blocks until a regex matches new output, which \
-     is how you wait for a command to finish or for a prompt to \
-     appear; interrupt sends Ctrl+C to the foreground process group, \
+     wait_for_pattern blocks until a regex matches new output, and \
+     **its pattern is optional**. Omit it to wait until the session \
+     stops executing. Read what that answers precisely: it is `is the \
+     session executing`, and it becomes `did the command finish` only \
+     when shell integration is live, because only then can the daemon \
+     count the command that started. Without it, a session that is merely \
+     quiet answers the same as one that is done. The response carries \
+     interaction_mode, detection_tier and prompt.reason so you can tell \
+     a measured prompt from a guessed one; for whether a command \
+     *succeeded*, read get_command_history's exit code. It returns as soon as the \
+     session is anything but Executing, so Fullscreen, AwaitingSecret \
+     and Exited come back at once rather than at the deadline -- read \
+     interaction_mode, because those three need different actions. \
+     Supply a pattern only for a PROGRAM's prompt -- `Password:`, \
+     `(gdb)`, `>>>` -- and NEVER for the shell's own: a shell-prompt \
+     regex is a guess about the operator's $PS1, and against a \
+     customised prompt it simply never matches, so the call reports a \
+     timeout for a command that finished long ago. To know whether a \
+     command succeeded, read get_command_history's exit code. A wait \
+     that ends unmatched against a session already back at a measured \
+     prompt says so, in warning; \
+     interrupt sends Ctrl+C to the foreground process group, \
      which stops the running command without killing the shell, and \
      terminate stops the session and its whole process group. \
      get_screen_state returns the rendered terminal grid rather than \
