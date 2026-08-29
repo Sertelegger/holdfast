@@ -10,7 +10,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Phase: Design complete, awaiting user review of spec → implementation planning.**
+**Phase: implementation, milestone 0.0.7 (secrets). `v0.0.6` is the newest tag; 0.0.7's work sits under `[Unreleased]` in the CHANGELOG.**
+
+**Read `CHANGELOG.md` and `ROADMAP.md`'s "Where it is now" for the current surface — not this file.** The scope list below is the v0.1.0 *plan*, and a plan is not a description of what exists. `scripts/mcp-smoke.sh` holds the authoritative tool list and asserts it exactly; when prose here and that assertion disagree, the assertion is right.
 
 The full design specification is at `docs/superpowers/specs/2026-05-01-holdfast-design.md`, with per-milestone implementation plans in `docs/superpowers/plans/`. Read the spec for any non-trivial work in this repo. The historical brainstorming notes are at `docs/brainstorming-progress.md` (kept as a record; superseded by the spec).
 
@@ -19,7 +21,7 @@ The full design specification is at `docs/superpowers/specs/2026-05-01-holdfast-
 ## Stack and Architecture (decided)
 
 - **Language:** Rust
-- **Architecture:** Single Cargo workspace with `holdfast-core` (library) + `holdfast` (single binary with subcommands: `mcp`, `daemon`, `attach`, `watch`, `list`, `logs`, `ui`, ...)
+- **Architecture:** Single Cargo workspace with `holdfast-core` (library) + `holdfast` (single binary). Subcommands **built today**: `mcp`, `daemon run|start|stop|status`, `list`, `logs` (`--tail`, `--raw`), `attach`, `watch`, `version`. Planned: `ui`, `confirm`.
 - **Transport:** Hybrid mode on Linux/macOS/WSL — stdio MCP shim + persistent Unix-socket daemon. Stdio-only mode on Windows native (sessions die with the shim).
 - **PTY:** `portable-pty` crate via a `PtyBackend` trait. v0.1.0 ships `InProcessPty`; `SubprocessPty` (process-isolated) is the priority post-v0.1.0 feature.
 - **MCP SDK:** `rmcp` (Rust)
@@ -27,7 +29,13 @@ The full design specification is at `docs/superpowers/specs/2026-05-01-holdfast-
 
 ## v0.1.0 Scope
 
-**13 MCP tools at v0.1.0 — 12 are implemented today; `precheck_command` is not yet.** (`tools.rs` has 12 `#[tool]` methods and `mcp-smoke.sh` asserts "exactly the twelve tools", so a count here that omits `get_screen_state` and `get_command_history` reads as a drift report against the code rather than a scope statement.) `precheck_command`, `get_screen_state`, `get_command_history`, `start_session` (with two-phase preflight), `send_input`, `request_secret_input`, `read_output`, `wait_for_pattern`, `resize`, `interrupt`, `terminate`, `list_sessions`, `status`. Tool annotations per MCP 2025-06-18 spec (`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`). Full hybrid mode on Linux/macOS/WSL, stdio-only on Windows. CLI subcommands: `holdfast attach`/`watch`/`list`/`logs` (with `--raw`)/`ui`/`confirm`. Web UI with `xterm.js` (Unix-socket-only daemon; TCP bridge via `holdfast ui` with bearer-token + Origin/Host validation). Gitleaks-derived secret redaction at every output boundary including audit logs. Argv-aware dangerous-command preflight with optional code-based `strict_confirmation` mode (agent gets token, only trusted UI sees the code). `request_secret_input` for out-of-band secret entry via attached clients (CLI attach `SecretInput` frame, web UI masked input). Process-group signal semantics (`setsid` Unix / job objects Windows). Multi-signal prompt detection with new combiner (`confidence = quiescent_score * pattern_score`). Bounded `read_output` responses (raw-byte budget; bulk output as MCP resources). Comprehensive testing across unit / integration / cross-platform CI / adversarial tiers.
+**Twelve tools exist today**, pinned exactly by `scripts/mcp-smoke.sh`:
+`start_session`, `send_input`, `request_secret_input`, `read_output`,
+`wait_for_pattern`, `get_command_history`, `get_screen_state`, `resize`,
+`interrupt`, `terminate`, `list_sessions`, `status`.
+
+Thirteen are scoped for v0.1.0: the twelve above plus `precheck_command`,
+which is not built, along with `start_session`'s two-phase preflight. Tool annotations per MCP 2025-06-18 spec (`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`). Full hybrid mode on Linux/macOS/WSL, stdio-only on Windows. CLI subcommands `holdfast ui` and `holdfast confirm` on top of those already built. Web UI with `xterm.js` (Unix-socket-only daemon; TCP bridge via `holdfast ui` with bearer-token + Origin/Host validation). Gitleaks-derived secret redaction at every output boundary including audit logs. Argv-aware dangerous-command preflight with optional code-based `strict_confirmation` mode (agent gets token, only trusted UI sees the code). `request_secret_input` for out-of-band secret entry via attached clients (CLI attach `SecretInput` frame, web UI masked input). Process-group signal semantics (`setsid` Unix / job objects Windows). Multi-signal prompt detection. **The combiner is `confidence = quiescent_score * max(pattern_score, cursor_score)`** (`detect/detector.rs`), not the two-term product this line claimed until the cursor sub-signal landed in 0.0.4. Bounded `read_output` responses (raw-byte budget; bulk output as MCP resources). Comprehensive testing across unit / integration / cross-platform CI / adversarial tiers.
 
 See spec §12.6 for the full ship-list and §14 for the post-v0.1.0 roadmap.
 
