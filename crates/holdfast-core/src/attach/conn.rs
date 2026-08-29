@@ -148,28 +148,41 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
     // what cannot work is two *keyboards* that are physically the same
     // keyboard, because the kernel hands each byte to exactly one reader
     // and the operator's `Ctrl-B d` is split between them.
-    if hs.mode == AttachMode::ReadWrite
-        && daemon
-            .attach_hub()
-            .writer_on_terminal(&session.id, hs.terminal.as_deref())
-    {
-        let _ = frame::write_frame(
-            &mut wr,
-            &ServerFrame::AttachReject {
-                reason: REJECT_TERMINAL_BUSY.to_string(),
-                // Begins with the token, like every other arm (§7.5), and
-                // then says what to do about it — an operator who is told
-                // only "busy" will try again and get the same answer.
-                message: format!(
-                    "{REJECT_TERMINAL_BUSY} — this terminal already has an interactive \
-                     client on that session; detach that one first, or attach from \
-                     another terminal."
-                ),
-            },
-        )
-        .await;
-        return;
-    }
+    //
+    // **A claim and not a question.** Asking "is it busy" here and
+    // registering a hundred lines later is a check-then-act across several
+    // `await` points, and every attach connection is its own task — two
+    // clients starting together both got "no" and both attached. The claim
+    // is test-and-set under one lock, and `_terminal_claim` must stay
+    // bound for the life of the connection: its `Drop` is the release, and
+    // dropping it here would give the terminal back while still holding it.
+    let _terminal_claim = match (hs.mode, hs.terminal.as_deref()) {
+        (AttachMode::ReadWrite, Some(terminal)) => {
+            match daemon.attach_hub().claim_terminal(&session.id, terminal) {
+                Some(claim) => Some(claim),
+                None => {
+                    let _ = frame::write_frame(
+                        &mut wr,
+                        &ServerFrame::AttachReject {
+                            reason: REJECT_TERMINAL_BUSY.to_string(),
+                            // Begins with the token, like every other arm
+                            // (§7.5), and then says what to do about it —
+                            // an operator told only "busy" will try again
+                            // and get the same answer.
+                            message: format!(
+                                "{REJECT_TERMINAL_BUSY} — this terminal already has an \
+                                 interactive client on that session; detach that one first, \
+                                 or attach from another terminal."
+                            ),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
 
     // **Subscribe before `Attached` is written.** §7.5: *"The frame is
     // sent before any `Output` frames"* — which is an ordering claim and

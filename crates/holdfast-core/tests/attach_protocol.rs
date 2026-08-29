@@ -4125,3 +4125,86 @@ async fn a_writer_may_join_a_terminal_that_only_has_an_observer() {
         .await
         .expect("an observer must not reserve the keyboard it never reads");
 }
+
+/// **Concurrent attaches from one terminal: exactly one wins.**
+///
+/// The predicate this replaced was a check-then-act — ask whether the
+/// terminal is busy, register a hundred lines and several `await` points
+/// later — and every attach connection is its own task, so two clients
+/// starting together both saw "not busy" and both attached. That is the
+/// state `terminal_busy` exists to prevent, reached through the check
+/// itself.
+///
+/// Deterministic in the fixed direction and only there: a test-and-set
+/// admits exactly one however the tasks interleave, while the predicate
+/// admits one *or more* depending on timing. A regression cannot make this
+/// row reliably green.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_one_of_several_simultaneous_writers_on_one_terminal_attaches() {
+    let d = TestDaemon::start("termrace").await;
+    let s = d.real_session();
+
+    // `tokio::join!` rather than threads, and it is the sharper tool: it
+    // interleaves the six futures at their `await` points, which is
+    // exactly where the old window was — the check completed, the task
+    // yielded writing `Attached`, and the next client checked before the
+    // first had registered.
+    let t = Some("rdev:0x7");
+    let (r1, r2, r3, r4, r5, r6) = tokio::join!(
+        attach_verdict(&d, &s.id, AttachMode::ReadWrite, t),
+        attach_verdict(&d, &s.id, AttachMode::ReadWrite, t),
+        attach_verdict(&d, &s.id, AttachMode::ReadWrite, t),
+        attach_verdict(&d, &s.id, AttachMode::ReadWrite, t),
+        attach_verdict(&d, &s.id, AttachMode::ReadWrite, t),
+        attach_verdict(&d, &s.id, AttachMode::ReadWrite, t),
+    );
+    let results = [r1, r2, r3, r4, r5, r6];
+
+    let won = results.iter().filter(|r| r.is_ok()).count();
+    let refused = results
+        .iter()
+        .filter(|r| matches!(r, Err((reason, _)) if reason == "terminal_busy"))
+        .count();
+    assert_eq!(won, 1, "{won} clients attached to one keyboard");
+    assert_eq!(refused, 5, "the losers must be told why");
+}
+
+/// **The claim is released when the holder goes**, including when it goes
+/// without saying anything.
+///
+/// This is the failure that would be worse than the bug: a leaked claim
+/// makes a terminal permanently unusable for a session, and no restart of
+/// the *client* clears it. The release is a `Drop` rather than a call at
+/// the end of the handshake precisely because there are early returns
+/// between claiming and registering; this row is what says the guard
+/// actually covers them.
+#[tokio::test]
+async fn a_terminal_is_free_again_once_its_writer_disconnects() {
+    let d = TestDaemon::start("termfree").await;
+    let s = d.real_session();
+
+    let first = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x9"))
+        .await
+        .expect("the first writer attaches");
+    attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x9"))
+        .await
+        .expect_err("held while the first is connected");
+
+    // Dropped without a `Detach` frame — the abrupt case, which is how a
+    // killed terminal ends and the one a tidy-up-on-detach release misses.
+    drop(first);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x9")).await {
+            Ok(_) => break,
+            Err((reason, _)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the terminal never came free: {reason}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}

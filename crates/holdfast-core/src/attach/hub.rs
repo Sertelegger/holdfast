@@ -15,7 +15,7 @@
 //! a given session, and — from 0.0.7 — where a session-scoped frame such
 //! as `AwaitingSecret` has to go.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -79,6 +79,23 @@ pub struct AttachConn {
     pub last_size: Mutex<Option<(u16, u16)>>,
 }
 
+/// A writer's hold on one terminal, released when this is dropped.
+///
+/// Held for the life of the connection by `attach::conn::run`. Dropping is
+/// the *only* release path on purpose: the connection has several early
+/// returns between claiming and registering, and a manual release would be
+/// a list to keep in step with them.
+pub struct TerminalClaim {
+    hub: Arc<AttachHub>,
+    key: (String, String),
+}
+
+impl Drop for TerminalClaim {
+    fn drop(&mut self) {
+        self.hub.terminals.lock().remove(&self.key);
+    }
+}
+
 /// Every live attach connection, grouped by the session it is attached
 /// to.
 #[derive(Default)]
@@ -109,6 +126,12 @@ pub struct AttachHub {
     /// expires — so one slot holding both would make the fall-through
     /// overwrite the thing it fell through from.
     approvals: crate::secret::BindingApprovals,
+    /// The `(session_id, terminal)` pairs a writer currently holds.
+    ///
+    /// A set rather than a count: the question is only ever *"is this
+    /// terminal taken on this session"*, and a count would have to be
+    /// decremented correctly on every path a guard now handles for free.
+    terminals: Mutex<HashSet<(String, String)>>,
     /// Monotonic, process-wide. **Never reused**, so an `unregister`
     /// arriving after the slot was refilled cannot remove somebody
     /// else's connection — the same reasoning that puts an `O_PATH` pin
@@ -127,23 +150,43 @@ impl AttachHub {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Is a **writer** already attached to `session_id` from `terminal`?
+    /// Claim `terminal` for a writer on `session_id`, or `None` if a
+    /// writer already holds it (GH #66).
     ///
-    /// The question `terminal_busy` answers (GH #66). Keyed on
-    /// [`AttachMode::ReadWrite`] and not on `role`, because what collides
-    /// is the keyboard: a `ReadOnly` client never calls `read()` on the
-    /// terminal, so any number of them can watch from wherever they like.
+    /// **Atomic, and that is the whole reason this is not a predicate.**
+    /// The obvious shape — ask whether the terminal is busy, then register
+    /// if it is not — is a check-then-act across the 100-odd lines and
+    /// several `await` points between the handshake and `register`, and
+    /// every attach connection is its own task. Two clients starting from
+    /// one terminal at once both saw "not busy" and both attached, which is
+    /// precisely the state the check exists to prevent. Test-and-set under
+    /// one lock has no such window.
     ///
-    /// `None` is never a match. A client with no terminal cannot be
-    /// sharing one, and two clients that both declined to say would
-    /// otherwise refuse each other for having nothing in common.
-    pub fn writer_on_terminal(&self, session_id: &str, terminal: Option<&str>) -> bool {
-        let Some(terminal) = terminal else {
-            return false;
-        };
-        self.clients_of(session_id)
-            .iter()
-            .any(|c| c.mode == AttachMode::ReadWrite && c.terminal.as_deref() == Some(terminal))
+    /// **Not folded into `clients`**, because the claim has to be taken
+    /// before the `AttachConn` exists: registering early to reserve a slot
+    /// would let another client's broadcast reach this connection's queue
+    /// ahead of its own `Attached`, and §7.5 makes `Attached` frame one.
+    ///
+    /// Callers claim only for [`AttachMode::ReadWrite`] and only when the
+    /// client declared a terminal — an observer never reads the keyboard,
+    /// and a client with no terminal cannot be sharing one, so two
+    /// `None`s are not a collision.
+    ///
+    /// The returned guard releases on drop, which is what makes the three
+    /// early returns between here and `register` safe to add to.
+    pub fn claim_terminal(
+        self: &Arc<Self>,
+        session_id: &str,
+        terminal: &str,
+    ) -> Option<TerminalClaim> {
+        let key = (session_id.to_string(), terminal.to_string());
+        if !self.terminals.lock().insert(key.clone()) {
+            return None;
+        }
+        Some(TerminalClaim {
+            hub: Arc::clone(self),
+            key,
+        })
     }
 
     /// The session geometry every attached writer can display: the
