@@ -384,6 +384,17 @@ impl StubDaemon {
     /// forward-compatibility rule against a client that was compiled
     /// before the frame existed. [`enc`] is the ordinary case.
     async fn start(tag: &str, replies: Vec<Vec<u8>>, hold: Duration) -> Self {
+        Self::start_paced(tag, replies, Duration::ZERO, hold).await
+    }
+
+    /// As [`Self::start`], with `gap` between consecutive replies.
+    ///
+    /// **Pacing is what makes a debounce testable.** Written back to back,
+    /// a burst is consumed without the client's runtime ever parking, so a
+    /// coalescing timer cannot fire mid-burst whether or not it is being
+    /// reset — a mutation deleting the reset entirely stayed green. At a
+    /// realistic drag rate the same mutation prints one notice per frame.
+    async fn start_paced(tag: &str, replies: Vec<Vec<u8>>, gap: Duration, hold: Duration) -> Self {
         let paths = RuntimePaths::with_dir(scratch_dir(tag));
         paths.ensure_dir().expect("ensure the runtime dir");
         let listener =
@@ -405,6 +416,9 @@ impl StubDaemon {
                 use tokio::io::AsyncWriteExt;
                 if stream.write_all(reply).await.is_err() || stream.flush().await.is_err() {
                     return;
+                }
+                if !gap.is_zero() {
+                    tokio::time::sleep(gap).await;
                 }
             }
             // Keep reading, so anything the client sends *after* the
@@ -1726,7 +1740,18 @@ async fn a_resize_flood_is_coalesced_into_one_notice_naming_the_final_size() {
         replies.push(enc(&ServerFrame::Resize { cols, rows }));
     }
 
-    let stub = StubDaemon::start("resizeflood", replies, Duration::from_secs(3)).await;
+    // ~50 Hz, the shape the report describes. Back-to-back frames made
+    // this row blind to whether the timer is reset at all: the client
+    // drained the burst without the runtime parking, so a one-shot timer
+    // armed once at start-up produced the same single notice. Paced, that
+    // mutation prints eight.
+    let stub = StubDaemon::start_paced(
+        "resizeflood",
+        replies,
+        Duration::from_millis(20),
+        Duration::from_secs(3),
+    )
+    .await;
     // A pty, not `run_plain`: `attach` refuses a pipe, and the diagnostics
     // under test are written to the terminal it insists on.
     let term = Term::spawn(stub.paths.dir(), &["attach", "sess_stub66"], 80, 24);
@@ -1750,6 +1775,128 @@ async fn a_resize_flood_is_coalesced_into_one_notice_naming_the_final_size() {
         notices[0].contains("104x55"),
         "the surviving notice must name where the drag landed, not where it \
          started — a stale geometry is worse than none:\n{}",
+        notices[0]
+    );
+}
+
+/// Run a real client under a pty against a recording stub, and return both
+/// the stub and the live `Term` — **the `Term` must stay alive in the
+/// caller**. A pty's device number is released when its master closes and
+/// the kernel hands the same number straight back out, so two terminals
+/// compared across a drop are not two terminals at all: the first version
+/// of this helper dropped each `Term` before returning and the two
+/// "different" ptys reported one identity.
+async fn client_on_a_pty(tag: &str) -> (StubDaemon, Term) {
+    let stub = StubDaemon::start(tag, Vec::new(), Duration::from_secs(3)).await;
+    let term = Term::spawn(stub.paths.dir(), &["attach", "sess_x"], 80, 24);
+    (stub, term)
+}
+
+fn recorded_terminal(stub: &StubDaemon) -> Option<String> {
+    match stub.frames().first() {
+        Some(ClientFrame::Attach { terminal, .. }) => terminal.clone(),
+        other => panic!("expected a recorded Attach, got {other:?}"),
+    }
+}
+
+/// **The field the whole guard rests on is actually produced** (review
+/// finding, GH #66).
+///
+/// Every daemon-side row builds `ClientFrame::Attach` by hand with a
+/// literal `Some("rdev:0x1")`, so none of them touches
+/// `terminal_identity()`. Two mutations of it shipped green across the
+/// entire suite: returning `None` unconditionally, which makes
+/// `terminal_busy` dead for every real user, and `st_rdev` -> `st_dev`,
+/// which is the worse direction — every pty shares one `st_dev`, so *every*
+/// second attach from *any* terminal would be refused.
+///
+/// The only assertion that mentioned the field pinned it to `None`, on a
+/// pipe, which is the one input for which the function returns nothing.
+///
+/// Two ptys held open **simultaneously**, because that is what separates
+/// the two mutations: `Some` alone kills the first, and *different* strings
+/// kill the second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_on_a_terminal_declares_it_and_two_terminals_differ() {
+    let (stub_a, term_a) = client_on_a_pty("termid1").await;
+    let (stub_b, term_b) = client_on_a_pty("termid2").await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while (stub_a.frames().is_empty() || stub_b.frames().is_empty())
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let a = recorded_terminal(&stub_a).expect("a client on a pty must declare its terminal");
+    let b = recorded_terminal(&stub_b).expect("a client on a pty must declare its terminal");
+    drop(term_a);
+    drop(term_b);
+
+    assert!(
+        a.starts_with("rdev:0x"),
+        "the daemon only compares it, but the shape is the documented one: {a}"
+    );
+    assert_ne!(
+        a, b,
+        "two ptys open at once reported the same identity — `st_dev` rather than \
+         `st_rdev` would do this, and it refuses every second attach anywhere"
+    );
+}
+
+/// **`watch` coalesces too, and nothing said so** (review finding).
+///
+/// A mutation reverting only the `watch` arm to a notice per frame —
+/// deleting half of the user-visible change — left all 25 rows green. The
+/// commit argues *harder* for this half than for `attach`: a watcher has no
+/// keyboard to escape a flood with, only `Ctrl+C`, which ends the view
+/// entirely. So the untested half was the one with the stronger case.
+///
+/// `run_plain` rather than a pty, because `watch` is the subcommand that
+/// deliberately works from a pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_flood_is_coalesced_for_watch_as_well() {
+    let mut replies = vec![enc(&ServerFrame::Attached {
+        session_id: "sess_w66".into(),
+        name: None,
+        cols: 80,
+        rows: 24,
+        state: "Running".into(),
+        exit_code: None,
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: 0,
+    })];
+    for (cols, rows) in [(107u16, 56u16), (115, 58), (113, 57), (119, 60), (104, 55)] {
+        replies.push(enc(&ServerFrame::Resize { cols, rows }));
+    }
+    let stub = StubDaemon::start_paced(
+        "watchflood",
+        replies,
+        Duration::from_millis(20),
+        Duration::from_millis(900),
+    )
+    .await;
+
+    let out = tokio::task::spawn_blocking({
+        let dir = stub.paths.dir().to_path_buf();
+        move || run_plain(&dir, &["watch", "sess_w66"])
+    })
+    .await
+    .expect("join");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+
+    let notices: Vec<&str> = err
+        .lines()
+        .filter(|l| l.contains("the session is now"))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "five Resize frames produced {} notices in watch; all stderr:\n{err}",
+        notices.len()
+    );
+    assert!(
+        notices[0].contains("104x55"),
+        "watch must name where the drag landed, not where it started: {}",
         notices[0]
     );
 }

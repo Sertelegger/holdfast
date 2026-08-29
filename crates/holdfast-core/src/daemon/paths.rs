@@ -348,7 +348,20 @@ impl RuntimePaths {
             return Ok(Self::with_dir(dir));
         }
 
-        let home = home.ok_or_else(|| {
+        // **An empty `$HOME` is treated as unset** (GH #72). `HOME=""`
+        // arrives here as `Some("")`, and `PathBuf::from("").join(".holdfast")`
+        // is the *relative* `.holdfast` — so every path this type hands out
+        // would resolve against whatever directory the process happened to
+        // start in, and the audit trail is the one that matters: a log
+        // written somewhere nobody will look is worse than no log, because
+        // it reads as evidence of absence.
+        //
+        // The rule already existed one module over, in `audit`'s own path
+        // helper, and did not exist here — which is exactly the hazard of a
+        // second spelling. The second spelling is gone and the guard moved
+        // to the one that remains, so every caller gets it rather than the
+        // one that happened to be written by someone who thought of it.
+        let home = home.filter(|h| !h.as_os_str().is_empty()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("neither {RUNTIME_DIR_ENV}, XDG_RUNTIME_DIR, nor HOME is set"),
@@ -516,6 +529,27 @@ impl RuntimePaths {
         // refusal below has to land before anything traverses a `logs/`
         // that may be somebody else's symlink.
         ensure_owner_only(&self.dir, Writable::Refuse)?;
+        // **The log directory's parent, when it is not `self.dir`** (GH
+        // #72). On the `~/.holdfast` fallback instance `log_dir` is inside
+        // `dir`, which the line above already checked. On the
+        // `XDG_RUNTIME_DIR` instance it is not: `dir` is
+        // `$XDG_RUNTIME_DIR/holdfast` while `log_dir` is
+        // `~/.holdfast/logs`, so `~/.holdfast` was only ever an
+        // intermediate component — created by the recursive builder,
+        // never `lstat`ed, and therefore **followed**. Measured: with
+        // `~/.holdfast` pointing elsewhere and `XDG_RUNTIME_DIR` set, the
+        // audit trail was written through the link, while the same link on
+        // the fallback path was refused. That asymmetry was the finding.
+        //
+        // `Tighten` rather than `Refuse`, matching `log_dir` itself: this
+        // is a directory the daemon is entitled to fix up, and refusing a
+        // merely group-readable `~/.holdfast` would break installs that
+        // predate the mode being enforced at all.
+        if let Some(parent) = self.log_dir.parent() {
+            if parent != self.dir {
+                ensure_owner_only(parent, Writable::Tighten)?;
+            }
+        }
         ensure_owner_only(&self.log_dir, Writable::Tighten)
     }
 
@@ -640,8 +674,31 @@ enum Writable {
 
 /// Create `dir` `0700` if it is absent, then bring an existing one to
 /// `0700` — or say why it cannot be.
+/// Create `dir` and any missing parents at [`DIR_MODE`], and do nothing
+/// else.
+///
+/// **Extracted so the creation mode is observable** (GH #72). Inside
+/// `ensure_owner_only` it is not: the tighten step immediately reflows the
+/// directory to `0700`, so changing this `mode` to `0o755` left the whole
+/// suite green while opening a real window during which the directory —
+/// and on the fallback instance the audit trail inside it — is
+/// world-readable. The end state was measured and the transient was not,
+/// which is the difference between a passing test and a covered one.
+/// `the_directory_is_created_owner_only_before_anything_tightens_it` calls
+/// this directly, where no tighten can hide the answer.
+///
+/// `DIR_MODE` is umask-proof by construction: `0700` has no group or other
+/// bits for a umask to clear, so the assertion holds under any of them.
+fn create_owner_only(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(dir)
+}
+
 fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     // `symlink_metadata`, not `exists()` and `metadata`: both of those
     // follow a link, and every decision below acts on what they report.
@@ -650,10 +707,7 @@ fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
     // reaches a *dangling* link, which `exists()` reports as absent —
     // the create below would then have followed it.
     if std::fs::symlink_metadata(dir).is_err() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(DIR_MODE)
-            .create(dir)?;
+        create_owner_only(dir)?;
     }
     let md = std::fs::symlink_metadata(dir)?;
     if md.file_type().is_symlink() {
@@ -1516,5 +1570,79 @@ mod tests {
         let err = RuntimePaths::resolve(None, None, None, true, false).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(err.to_string().contains(RUNTIME_DIR_ENV), "{err}");
+    }
+    /// **The mode a directory is born with, not the mode it ends up
+    /// wearing** (GH #72).
+    ///
+    /// `ensure_dir` tightens immediately after creating, so every existing
+    /// assertion measures the end state and a creation at `0o755` passed
+    /// all of them. The window is real: between `mkdir` and `chmod` the
+    /// directory is world-readable, and on the fallback instance the §9.4
+    /// audit trail lives inside it. This calls the creation directly,
+    /// where nothing can reflow the answer first.
+    #[test]
+    fn the_directory_is_created_owner_only_before_anything_tightens_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "holdfast-t-mkmode-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let nested = base.join("a").join("b");
+        create_owner_only(&nested).expect("create");
+        for d in [&nested, &base.join("a"), &base] {
+            let mode = std::fs::symlink_metadata(d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                DIR_MODE,
+                "{} was created {mode:o}, not {DIR_MODE:o} — every component, \
+                 because the recursive builder makes the intermediates too",
+                d.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **A symlinked `~/.holdfast` is refused on the XDG instance too**
+    /// (GH #72).
+    ///
+    /// It was refused on the fallback instance, where `~/.holdfast` *is*
+    /// `dir`, and followed on the XDG instance, where it is only an
+    /// intermediate component of `log_dir` and so was created by the
+    /// recursive builder without ever being `lstat`ed. Same planted link,
+    /// two answers, decided by an environment variable.
+    #[test]
+    fn a_symlinked_holdfast_home_is_refused_on_the_xdg_instance() {
+        // `/tmp` and a short suffix, not `temp_dir()`: on macOS that is a
+        // long `/var/folders/...` path and `check_socket_path_length` —
+        // which `ensure_dir` runs first — refused before this test's own
+        // condition was ever reached, so the row passed for the wrong
+        // reason until the assertion printed the message.
+        let base = std::path::PathBuf::from(format!(
+            "/tmp/hf-xl-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let home = base.join("home");
+        let xdg = base.join("xdg");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(".holdfast")).unwrap();
+
+        let paths = RuntimePaths::resolve(None, Some(xdg.clone()), Some(home.clone()), true, false)
+            .expect("resolve");
+        let err = paths
+            .ensure_dir()
+            .expect_err("a symlinked ~/.holdfast must be refused on this path too");
+        assert!(
+            err.to_string().contains("symlink"),
+            "the refusal must say what is wrong: {err}"
+        );
+        // And nothing was written through the link.
+        assert!(
+            !elsewhere.join("logs").exists(),
+            "the audit directory was created through the planted link"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

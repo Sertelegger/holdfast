@@ -47,7 +47,7 @@
 //!   malformed rule table *should* be a loud startup failure — means the
 //!   initialiser can never be run for the first time from inside the
 //!   hook.
-//! - [`emit`] writes with `writeln!` on a locked [`std::io::Stderr`] and
+//! - [`emit`] writes with a single `write_all` on a locked [`std::io::Stderr`] and
 //!   drops the error, rather than using `eprintln!`. `eprintln!`
 //!   `expect`s its write; on a full disk or a closed fd that is a panic,
 //!   and a panic from inside the hook aborts. A daemon that cannot write
@@ -393,6 +393,21 @@ mod tests {
     /// the test would then be asserting something untrue.
     const SHRED_PAD: &str = "----------------------------------------";
 
+    /// One line is intact when it is exactly one writer's record: the
+    /// prefix, that writer's pid, and a single `<pid>-END` terminating it.
+    ///
+    /// Two records merged by a torn write carry two `-END` markers, or end
+    /// on a pid that is not the one they began with.
+    fn line_is_one_whole_record(line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("holdfast shred-probe ") else {
+            return false;
+        };
+        let Some((pid, tail)) = rest.split_once(' ') else {
+            return false;
+        };
+        tail.matches("-END").count() == 1 && tail.ends_with(&format!("{pid}-END"))
+    }
+
     /// **Two processes, one pipe** — the shape from GH #66.
     ///
     /// The report's evidence was `holdholdfast attach: the session is now
@@ -461,24 +476,39 @@ mod tests {
         assert!(a.wait().unwrap().success(), "child a failed");
         assert!(b.wait().unwrap().success(), "child b failed");
 
+        // **The count is the assertion**, and the structural check is the
+        // diagnostic. A review found the previous ordering backwards: the
+        // `shredded` predicate was `starts_with(prefix) && ends_with(pad)`,
+        // which *every* concatenation of these payloads satisfies — a
+        // merged line still starts with the prefix and still ends in forty
+        // dashes — so under the pre-fix `writeln!` the panic always came
+        // from the count and never from the check the test was named for.
+        //
+        // Each line now brackets itself with its own writer's pid, so a
+        // merge is detectable in the line rather than only in the total:
+        // `12-END` never appears mid-line in an intact record.
         let lines: Vec<&str> = out.lines().filter(|l| l.contains("shred-probe")).collect();
-        let shredded: Vec<&&str> = lines
+        let malformed: Vec<&&str> = lines
             .iter()
-            .filter(|l| !(l.starts_with("holdfast shred-probe ") && l.ends_with(SHRED_PAD)))
+            .filter(|l| !line_is_one_whole_record(l))
             .collect();
-        assert!(
-            shredded.is_empty(),
-            "{} of {} lines were interleaved mid-line; first three: {:?}",
-            shredded.len(),
-            lines.len(),
-            &shredded[..shredded.len().min(3)]
-        );
-        // Guards the guard: if the children emitted nothing, every line
-        // above is vacuously intact and the assertion proves nothing.
         assert_eq!(
             lines.len(),
             SHRED_LINES * 2,
-            "expected both children's output"
+            "{} lines arrived, expected {}: a short count is interleaving, since \
+             every write that happened is a whole line or part of one. {} were also \
+             structurally malformed; first three: {:?}",
+            lines.len(),
+            SHRED_LINES * 2,
+            malformed.len(),
+            &malformed[..malformed.len().min(3)]
+        );
+        assert!(
+            malformed.is_empty(),
+            "{} of {} lines are not one writer's whole record; first three: {:?}",
+            malformed.len(),
+            lines.len(),
+            &malformed[..malformed.len().min(3)]
         );
     }
 
@@ -490,7 +520,13 @@ mod tests {
         }
         let pid = std::process::id();
         for i in 0..SHRED_LINES {
-            crate::diag!("holdfast shred-probe {pid} {i} {SHRED_PAD}");
+            // Brackets itself with its own pid: the line begins with the
+            // writer's id and ends with `<pid>-END`, so two records merged
+            // by a torn write carry two END markers or end on the wrong
+            // one. Kept well under `PIPE_BUF` (512 on macOS, 4096 on
+            // Linux) so a single `write` is atomic and the intact case
+            // cannot false-red.
+            crate::diag!("holdfast shred-probe {pid} {i} {SHRED_PAD} {pid}-END");
         }
     }
 }

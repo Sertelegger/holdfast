@@ -10,7 +10,6 @@ use crate::output::redact::redact_str;
 use crate::output::rules::RuleSet;
 use parking_lot::Mutex;
 use serde_json::{Map, Value};
-use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -407,36 +406,6 @@ impl AuditLog {
         self.redact_false_count.load(Ordering::Relaxed)
     }
 }
-
-/// `~/.holdfast/logs/audit.log` — the one path §9.4 names. There is no
-/// environment override: §10.1 reserves env vars for operational logging
-/// knobs, not configuration, and the config-file path arrives with the
-/// daemon in 0.0.5.
-///
-/// Returns `None` when `$HOME` is unset, in which case the caller runs
-/// with a disabled log rather than guessing a path.
-pub fn default_path() -> Option<PathBuf> {
-    audit_path_under_home(std::env::var_os("HOME"))
-}
-
-/// The pure half of `default_path`, so both of its arms are reachable
-/// from a test without mutating the process environment — which is racy
-/// under a parallel test runner and, from Rust 2024 on, unsafe.
-///
-/// An **empty** `$HOME` is treated as unset. `PathBuf::from("")` joins to
-/// a *relative* `.holdfast/logs/audit.log`, so the one thing worse than no
-/// audit trail — an audit trail written into whatever directory the
-/// daemon happened to start in, where nothing will look for it — is what
-/// the obvious spelling produces.
-fn audit_path_under_home(home: Option<OsString>) -> Option<PathBuf> {
-    home.filter(|h| !h.is_empty()).map(|h| {
-        PathBuf::from(h)
-            .join(".holdfast")
-            .join("logs")
-            .join("audit.log")
-    })
-}
-
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -846,35 +815,37 @@ mod tests {
         assert!(std::fs::read_to_string(&path).unwrap().contains("sess_b"));
     }
 
-    /// §9.4 names exactly one path, and both of `default_path`'s answers
-    /// matter: the components decide where the trail lands, and the
-    /// `None` decides that a caller with no `$HOME` runs with a disabled
-    /// log instead of guessing.
+    /// §9.4's path now has exactly one spelling, and this row is what
+    /// says so (GH #72).
+    ///
+    /// It used to assert `audit_path_under_home`, a second computation of
+    /// `$HOME/.holdfast/logs/audit.log` living here rather than in
+    /// `RuntimePaths`. Two spellings kept in step by matching string
+    /// literals in two files is how a daemon and a shim came to disagree
+    /// about where the audit trail was — read once as a missing trail and
+    /// filed as a security finding (GH #63) when the real log was
+    /// elsewhere with 19 entries in it.
+    ///
+    /// The empty-`$HOME` rule that lived only here moved with it: `HOME=""`
+    /// joins to a *relative* `.holdfast/logs/audit.log`, and an audit trail
+    /// written into the process's working directory is worse than none,
+    /// because it reads as evidence of absence.
     #[test]
-    fn the_default_path_is_the_one_9_4_names_and_is_absent_without_a_home() {
+    fn the_audit_path_has_one_spelling_and_no_home_yields_none() {
+        use crate::daemon::paths::RuntimePaths;
         assert_eq!(
-            audit_path_under_home(Some(OsString::from("/home/u"))),
-            Some(PathBuf::from("/home/u/.holdfast/logs/audit.log")),
+            RuntimePaths::resolve(None, None, Some("/home/u".into()), false, false)
+                .unwrap()
+                .audit_log(),
+            std::path::PathBuf::from("/home/u/.holdfast/logs/audit.log"),
         );
-        assert_eq!(audit_path_under_home(None), None, "no $HOME, no guess");
-        assert_eq!(
-            audit_path_under_home(Some(OsString::new())),
-            None,
-            "an empty $HOME would join to a *relative* path, which writes \
-             the audit trail into the daemon's working directory"
+        assert!(
+            RuntimePaths::resolve(None, None, None, false, false).is_err(),
+            "no $HOME, no guess"
         );
-        // …and the env-reading wrapper really is that function. Under
-        // `cargo test` $HOME is set, so this arm is the reachable one.
-        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-            assert_eq!(
-                default_path(),
-                Some(
-                    PathBuf::from(home)
-                        .join(".holdfast")
-                        .join("logs")
-                        .join("audit.log")
-                ),
-            );
-        }
+        assert!(
+            RuntimePaths::resolve(None, None, Some("".into()), false, false).is_err(),
+            "an empty $HOME must not become a relative path"
+        );
     }
 }

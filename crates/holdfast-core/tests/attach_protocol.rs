@@ -3806,8 +3806,8 @@ async fn the_sweep_tells_the_clients_still_on_a_dead_session_that_the_request_cl
         peer_uid: 0,
         tx,
         connected_at: Instant::now(),
-        terminal: None,
         last_size: parking_lot::Mutex::new(None),
+        last_told: parking_lot::Mutex::new(None),
     }));
 
     // **The control.** While the session is alive the sweep releases
@@ -4039,9 +4039,16 @@ async fn the_session_takes_the_smallest_attached_writers_geometry() {
         "the session must fit the smaller terminal"
     );
 
-    // **The ordering half.** `a` now asks for *more* than `b` can show. A
-    // last-writer-wins daemon grants it and leaves `b` rendering into
-    // columns it does not have; the minimum ignores it.
+    // **The ordering half, and the silence is the assertion.** `a` asks
+    // for *more* than `b` can show. A last-writer-wins daemon grants it
+    // and leaves `b` rendering into columns it does not have; the minimum
+    // ignores it — and nobody is told, because nobody's view changed.
+    //
+    // A review found this scenario set up here and then never read: the
+    // gate that suppresses a no-move broadcast was asserted nowhere, and
+    // under a minimum this is the *common* case, since every frame of a
+    // drag by the larger client changes nothing. A broadcast here is the
+    // flood this issue is about arriving by another route.
     send(
         &mut a,
         &ClientFrame::Resize {
@@ -4050,14 +4057,22 @@ async fn the_session_takes_the_smallest_attached_writers_geometry() {
         },
     )
     .await;
-    // `a` is told what it actually got rather than the 120 it asked for,
-    // and again that frame is the synchronisation point.
-    assert_eq!(next_resize(&mut a).await, (80, 24));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && s.size() != (80, 24) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(
         s.size(),
         (80, 24),
         "a larger client widened the session past the smaller one"
     );
+    for (name, c) in [("a", &mut a), ("b", &mut b)] {
+        match tokio::time::timeout(Duration::from_millis(400), recv(c)).await {
+            Err(_) => {}
+            Ok(ServerFrame::Output { .. }) => {}
+            Ok(other) => panic!("{name} was woken for a geometry that did not move: {other:?}"),
+        }
+    }
 }
 
 /// **A departing writer gives its columns back.** Without this the session
@@ -4104,15 +4119,21 @@ async fn a_departing_writer_relaxes_the_minimum() {
     assert_eq!(next_resize(&mut a).await, (120, 50));
 }
 
-/// **The other order, and it is the one a mutation found unguarded.**
+/// **The other order: an observer must not reserve a keyboard it never
+/// reads.**
 ///
-/// `an_observer_on_the_same_terminal_still_attaches` covers writer-then-
-/// observer, and it passes without the mode filter inside
-/// `writer_on_terminal` — the caller short-circuits on the *arriving*
-/// client's mode before the hub is ever asked. Only observer-then-writer
-/// reaches that filter, so only this row can hold it: a `holdfast watch`
-/// already running in the window must not lock the operator out of
-/// attaching there.
+/// A `holdfast watch` already running in a window must not lock the
+/// operator out of attaching there. The sibling row above covers
+/// writer-then-observer; this is observer-then-writer, and they fail for
+/// different reasons — the first because the arriving client's mode
+/// short-circuits before the hub is asked, this one because the *held*
+/// claim would have to exist for an observer, and observers never take one.
+///
+/// A review noted the earlier rationale here named `writer_on_terminal`, a
+/// predicate deleted when the check became a claim, and that no mutation
+/// killed this row alone. Kept anyway: it is the only row that states the
+/// direction an operator actually hits, and a row whose value is the
+/// scenario rather than the mutant is still worth its four lines.
 #[tokio::test]
 async fn a_writer_may_join_a_terminal_that_only_has_an_observer() {
     let d = TestDaemon::start("termobs2").await;
@@ -4207,4 +4228,40 @@ async fn a_terminal_is_free_again_once_its_writer_disconnects() {
             }
         }
     }
+}
+
+/// **One keyboard, two sessions — still refused** (review finding).
+///
+/// The claim was keyed `(session_id, terminal)`, and three independent
+/// reviews landed on the same hole: the failure it guards is that the
+/// kernel hands two readers of one terminal alternate bytes, and which
+/// session each client attached to has no bearing on that.
+/// `holdfast attach s1 & holdfast attach s2` in one window reproduced the
+/// original defect verbatim — worse than the same-session case, because
+/// whichever wins the detach restores cooked mode out from under the
+/// survivor. A mutation replacing the session component with a constant
+/// left all 72 rows green, so nothing held the dimension either way.
+#[tokio::test]
+async fn one_terminal_admits_one_writer_even_across_two_sessions() {
+    let d = TestDaemon::start("termxsess").await;
+    let s1 = d.real_session();
+    let s2 = d.real_session();
+
+    let _first = attach_verdict(&d, &s1.id, AttachMode::ReadWrite, Some("rdev:0x5"))
+        .await
+        .expect("the first writer attaches");
+    let (reason, message) = attach_verdict(&d, &s2.id, AttachMode::ReadWrite, Some("rdev:0x5"))
+        .await
+        .expect_err("one terminal cannot drive two sessions' keyboards");
+    assert_eq!(reason, "terminal_busy");
+    // The refusal names the session that holds it: "detach that one first"
+    // is unfollowable advice if the operator is looking at the wrong one.
+    assert!(
+        message.contains(&s1.id),
+        "the refusal must name the holder, since it is a different session: {message}"
+    );
+    // And a different terminal is still free to attach to either session.
+    let _other = attach_verdict(&d, &s2.id, AttachMode::ReadWrite, Some("rdev:0x6"))
+        .await
+        .expect("a different terminal is unaffected");
 }

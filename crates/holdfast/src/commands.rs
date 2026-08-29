@@ -1258,7 +1258,9 @@ pub async fn attach(session: &str) -> ExitCode {
     // tmux 3.6, pyte and GNU screen: DECSC stores raw coordinates and
     // `ESC[L` never touches them, so `ESC8` lands the cursor *on the bar*.
     // What steps it down onto the prompt is the `\n` that `diag::emit`
-    // appends with `writeln!`. That newline is therefore **load-bearing
+    // appends — since GH #66 by pushing `b'\n'` onto the buffer it writes
+    // in one `write_all`, where it used to be `writeln!`'s. The mechanism
+    // moved; the newline did not. That newline is therefore **load-bearing
     // layout**, not formatting, which is why it is named here and pinned
     // by `the_banner_lands_above_the_prompt_and_leaves_the_cursor_on_it`.
     // Switching the banner to a writer that does not append one puts the
@@ -1756,9 +1758,11 @@ mod tests {
     /// separates "the bytes were sent" from "the cursor is in the right
     /// place".
     ///
-    /// The trailing `\n` is fed deliberately: `diag::emit` writes with
-    /// `writeln!`, and that newline is what steps the cursor off the bar and
-    /// onto the prompt. See `attach_banner`.
+    /// The trailing `\n` is fed deliberately: `diag::emit` appends one —
+    /// `line.push(b'\n')` before a single `write_all`, since GH #66 — and
+    /// that newline is what steps the cursor off the bar and onto the
+    /// prompt. Deleting the push to "tidy" the emitter puts the cursor back
+    /// on the bar, which is why both ends are named. See `attach_banner`.
     #[test]
     fn the_banner_lands_above_the_prompt_and_leaves_the_cursor_on_it() {
         let mut p = vt100::Parser::new(24, 80, 0);

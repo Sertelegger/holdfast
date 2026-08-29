@@ -15,7 +15,7 @@
 //! a given session, and — from 0.0.7 — where a session-scoped frame such
 //! as `AwaitingSecret` has to go.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -62,13 +62,15 @@ pub struct AttachConn {
     /// blocks the reader task.
     pub tx: mpsc::Sender<ServerFrame>,
     pub connected_at: Instant,
-    /// This client's terminal device, as *it* reported it (GH #66).
+    /// The geometry this client was last *sent*, so it is not sent again.
     ///
-    /// Compared for equality and never parsed. `None` means "no terminal"
-    /// — a pipe, or a client older than the field — and **two `None`s are
-    /// not a match**, because "neither has a terminal" is not "both have
-    /// the same one".
-    pub terminal: Option<String>,
+    /// Initialised to the size carried by its own `Attached` frame, which
+    /// is a thing it has already been told. Without this the originator of
+    /// a resize received one identical correction per `SIGWINCH` of a drag
+    /// — the flood this issue is about, relocated from the terminal to the
+    /// wire, where a client already behind on its socket can be dropped as
+    /// a slow consumer by its own window drag.
+    pub last_told: Mutex<Option<(u16, u16)>>,
     /// The geometry this client last asked for, or `None` until it asks.
     ///
     /// The session's size is the **minimum** over the writers that have
@@ -87,12 +89,12 @@ pub struct AttachConn {
 /// a list to keep in step with them.
 pub struct TerminalClaim {
     hub: Arc<AttachHub>,
-    key: (String, String),
+    terminal: String,
 }
 
 impl Drop for TerminalClaim {
     fn drop(&mut self) {
-        self.hub.terminals.lock().remove(&self.key);
+        self.hub.terminals.lock().remove(&self.terminal);
     }
 }
 
@@ -131,7 +133,32 @@ pub struct AttachHub {
     /// A set rather than a count: the question is only ever *"is this
     /// terminal taken on this session"*, and a count would have to be
     /// decremented correctly on every path a guard now handles for free.
-    terminals: Mutex<HashSet<(String, String)>>,
+    /// Terminal device -> the session whose writer holds it.
+    ///
+    /// **Keyed on the terminal alone, not on `(session, terminal)`.** The
+    /// failure is that two processes `read()`ing one terminal device are
+    /// handed alternate bytes by the kernel; which session each is attached
+    /// to has no bearing on it. A `(session, terminal)` key let
+    /// `holdfast attach s1 & holdfast attach s2` in one window through —
+    /// two writers, one keyboard, the measured failure verbatim, and worse
+    /// than the same-session case because the first to exit restores cooked
+    /// mode out from under the survivor.
+    ///
+    /// The value is the session id so the refusal can name what holds it.
+    terminals: Mutex<HashMap<String, String>>,
+    /// Serialises "fold the writers' sizes, apply, read back".
+    ///
+    /// The fold itself is order-independent, which is the property that
+    /// makes a minimum converge — but the *sequence* was not: two tasks on
+    /// a multi-thread runtime could both fold, then apply in the other
+    /// order, leaving the session at a stale writer's geometry with no
+    /// further event to correct it. `writer_min_size` releases every lock
+    /// it takes before returning, so nothing it does can span the apply.
+    ///
+    /// Coarse on purpose. Resizes are human-paced, and one mutex is easier
+    /// to prove acyclic than a per-session map: the order is always this,
+    /// then `clients`, then `last_size`, and never the reverse.
+    resize_decisions: Mutex<()>,
     /// Monotonic, process-wide. **Never reused**, so an `unregister`
     /// arriving after the slot was refilled cannot remove somebody
     /// else's connection — the same reasoning that puts an `O_PATH` pin
@@ -150,8 +177,7 @@ impl AttachHub {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Claim `terminal` for a writer on `session_id`, or `None` if a
-    /// writer already holds it (GH #66).
+    /// Claim `terminal` for a writer, or `None` if one already holds it.
     ///
     /// **Atomic, and that is the whole reason this is not a predicate.**
     /// The obvious shape — ask whether the terminal is busy, then register
@@ -169,24 +195,35 @@ impl AttachHub {
     ///
     /// Callers claim only for [`AttachMode::ReadWrite`] and only when the
     /// client declared a terminal — an observer never reads the keyboard,
-    /// and a client with no terminal cannot be sharing one, so two
-    /// `None`s are not a collision.
+    /// and a client with no terminal cannot be sharing one.
     ///
-    /// The returned guard releases on drop, which is what makes the three
-    /// early returns between here and `register` safe to add to.
+    /// The returned guard releases on drop, and callers drop it as soon as
+    /// the attachment ends rather than when the task does: the writer task
+    /// can stay parked on a full socket long after the client stopped
+    /// being attached, and a claim held that long is a terminal nobody can
+    /// use and no advice can free.
     pub fn claim_terminal(
         self: &Arc<Self>,
-        session_id: &str,
         terminal: &str,
-    ) -> Option<TerminalClaim> {
-        let key = (session_id.to_string(), terminal.to_string());
-        if !self.terminals.lock().insert(key.clone()) {
-            return None;
+        session_id: &str,
+    ) -> Result<TerminalClaim, String> {
+        let mut held = self.terminals.lock();
+        if let Some(owner) = held.get(terminal) {
+            return Err(owner.clone());
         }
-        Some(TerminalClaim {
+        held.insert(terminal.to_string(), session_id.to_string());
+        drop(held);
+        Ok(TerminalClaim {
             hub: Arc::clone(self),
-            key,
+            terminal: terminal.to_string(),
         })
+    }
+
+    /// Run `f` with the resize sequence serialised. See
+    /// [`Self::resize_decisions`].
+    pub fn with_resize_decision<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self.resize_decisions.lock();
+        f()
     }
 
     /// The session geometry every attached writer can display: the

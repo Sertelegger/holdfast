@@ -1000,6 +1000,16 @@ mod tests {
                 ..
             }
         ));
+        // **And `terminal` too** (review finding): a 1.0 client sends no
+        // such key, and this is the only place the bytes of that frame are
+        // hand-built. `#[serde(default)]` turns out to be a no-op for an
+        // `Option` — serde already yields `None` for a missing one — so the
+        // attribute cannot be what carries this, and nothing asserted the
+        // behaviour it was credited with.
+        assert!(
+            matches!(f, ClientFrame::Attach { terminal: None, .. }),
+            "a 1.0 Attach must decode with no terminal, not fail"
+        );
     }
 
     #[test]
