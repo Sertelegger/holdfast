@@ -881,7 +881,43 @@ fn attach_handshake(
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_major: holdfast_core::protocol::PROTOCOL_MAJOR,
         protocol_minor: holdfast_core::protocol::PROTOCOL_MINOR,
+        terminal: terminal_identity(),
     }
+}
+
+/// Which terminal device this process's **keyboard** is, for `terminal_busy`
+/// (GH #66).
+///
+/// `st_rdev` of fd 0, hex, from a plain `fstat`. That is the identity of
+/// the *device*, so two processes sharing one terminal agree on it while
+/// two terminals never collide — which is precisely the distinction the
+/// daemon needs and the only one it makes, since it compares the string and
+/// never parses it.
+///
+/// **fd 0 and not fd 1**, because the contention this answers is over
+/// input: two clients reading one keyboard get alternate bytes from the
+/// kernel and split the operator's `Ctrl-B d` between them. A client whose
+/// output is redirected but whose stdin is still the terminal is exactly as
+/// affected, and keying on stdout would miss it.
+///
+/// `None` when stdin is not a terminal — a pipe cannot be contended for in
+/// this way, and `None` never matches `None` at the daemon.
+#[cfg(unix)]
+fn terminal_identity() -> Option<String> {
+    use std::os::unix::io::AsRawFd;
+    let stdin = std::io::stdin();
+    if !std::io::IsTerminal::is_terminal(&stdin) {
+        return None;
+    }
+    // SAFETY: `fstat` writes a `stat` and reads only the fd, which is
+    // borrowed for the call.
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(stdin.as_raw_fd(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let st = unsafe { st.assume_init() };
+    Some(format!("rdev:{:#x}", st.st_rdev))
 }
 
 /// What the handshake settled on, or why it did not.

@@ -3178,6 +3178,8 @@ mod tests {
             session_id: session_id.to_string(),
             mode: AttachMode::ReadWrite,
             role: AttachRole::Interactive,
+            terminal: None,
+            last_size: parking_lot::Mutex::new(None),
             client_kind: ClientKind::Cli,
             client_version: "test".to_string(),
             peer_pid: None,

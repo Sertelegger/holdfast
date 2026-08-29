@@ -62,6 +62,21 @@ pub struct AttachConn {
     /// blocks the reader task.
     pub tx: mpsc::Sender<ServerFrame>,
     pub connected_at: Instant,
+    /// This client's terminal device, as *it* reported it (GH #66).
+    ///
+    /// Compared for equality and never parsed. `None` means "no terminal"
+    /// — a pipe, or a client older than the field — and **two `None`s are
+    /// not a match**, because "neither has a terminal" is not "both have
+    /// the same one".
+    pub terminal: Option<String>,
+    /// The geometry this client last asked for, or `None` until it asks.
+    ///
+    /// The session's size is the **minimum** over the writers that have
+    /// reported one, so this is a per-client input to that fold rather
+    /// than a record of what the session ended up at. §7.5 is what
+    /// restricts the fold to writers: *"the canonical PTY size is set by
+    /// writers; observers don't influence it"*.
+    pub last_size: Mutex<Option<(u16, u16)>>,
 }
 
 /// Every live attach connection, grouped by the session it is attached
@@ -110,6 +125,48 @@ impl AttachHub {
     /// the id a connection carries is the one it was registered under.
     pub fn next_client_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Is a **writer** already attached to `session_id` from `terminal`?
+    ///
+    /// The question `terminal_busy` answers (GH #66). Keyed on
+    /// [`AttachMode::ReadWrite`] and not on `role`, because what collides
+    /// is the keyboard: a `ReadOnly` client never calls `read()` on the
+    /// terminal, so any number of them can watch from wherever they like.
+    ///
+    /// `None` is never a match. A client with no terminal cannot be
+    /// sharing one, and two clients that both declined to say would
+    /// otherwise refuse each other for having nothing in common.
+    pub fn writer_on_terminal(&self, session_id: &str, terminal: Option<&str>) -> bool {
+        let Some(terminal) = terminal else {
+            return false;
+        };
+        self.clients_of(session_id)
+            .iter()
+            .any(|c| c.mode == AttachMode::ReadWrite && c.terminal.as_deref() == Some(terminal))
+    }
+
+    /// The session geometry every attached writer can display: the
+    /// **minimum** of the sizes they have reported, or `None` if none has.
+    ///
+    /// §7.5 restricts the fold to writers — *"the canonical PTY size is
+    /// set by writers; observers don't influence it"* — and the minimum is
+    /// tmux's rule, for tmux's reason: a column the smallest terminal
+    /// cannot show is a column that is wrapped or lost for that client,
+    /// while a column a larger one leaves blank costs nothing.
+    ///
+    /// **This is what makes the size converge.** Last-writer-wins let two
+    /// clients dragging at once alternate between their own readings
+    /// forever, which is GH #66's unexplained "the sizes oscillate rather
+    /// than converging on a final geometry". A minimum has no such
+    /// ordering dependence: the same set of clients yields the same answer
+    /// whoever reported last.
+    pub fn writer_min_size(&self, session_id: &str) -> Option<(u16, u16)> {
+        self.clients_of(session_id)
+            .iter()
+            .filter(|c| c.mode == AttachMode::ReadWrite)
+            .filter_map(|c| *c.last_size.lock())
+            .reduce(|(ac, ar), (bc, br)| (ac.min(bc), ar.min(br)))
     }
 
     pub fn register(&self, conn: Arc<AttachConn>) {

@@ -221,6 +221,7 @@ fn attach_as_kind(
         client_version: "test".into(),
         protocol_major: PROTOCOL_MAJOR,
         protocol_minor: PROTOCOL_MINOR,
+        terminal: None,
     }
 }
 
@@ -1909,6 +1910,18 @@ async fn a_resize_from_one_client_is_broadcast_to_the_other() {
         "the other client was told the geometry that was asked for rather \
          than the one the terminal got"
     );
+    // **And so is the originator, because it did not get what it asked
+    // for** (GH #66). It used to be excluded unconditionally, on the
+    // stated ground that it already knows — which was true while the last
+    // writer won outright, and is false the moment the answer can be
+    // something else: a clamp here, and a smaller peer's terminal once the
+    // session takes the minimum. A client never told renders at a width
+    // the session does not have.
+    assert_eq!(
+        next_resize(&mut a).await,
+        (1000, 30),
+        "the client that asked for 5000 columns was never told it got 1000"
+    );
 
     send(
         &mut a,
@@ -1924,6 +1937,14 @@ async fn a_resize_from_one_client_is_broadcast_to_the_other() {
         "the other client was never told"
     );
 
+    // **The negative for the arm above, and it is load-bearing rather
+    // than incidental.** 100×30 is in range and no other writer has
+    // reported a size, so the session becomes exactly what `a` asked for
+    // and `a` must *not* be sent a correction. Nothing asserts that
+    // directly — `stream_until` below does it, by refusing any frame that
+    // is not `Output`. A regression that told the originator on every
+    // resize would arrive here as "expected Output, got Resize".
+    //
     // And the **child** sees it, which is the half a frame-only assertion
     // cannot reach: `stty size` reads the kernel's idea of the window,
     // not ours.
@@ -3033,6 +3054,7 @@ async fn the_audit_entry_names_the_client_kind_from_the_handshake() {
                 client_version: "test".into(),
                 protocol_major: PROTOCOL_MAJOR,
                 protocol_minor: PROTOCOL_MINOR,
+                terminal: None,
             },
         )
         .await;
@@ -3784,6 +3806,8 @@ async fn the_sweep_tells_the_clients_still_on_a_dead_session_that_the_request_cl
         peer_uid: 0,
         tx,
         connected_at: Instant::now(),
+        terminal: None,
+        last_size: parking_lot::Mutex::new(None),
     }));
 
     // **The control.** While the session is alive the sweep releases
@@ -3855,4 +3879,249 @@ async fn an_unknown_server_frame_is_skipped_and_the_stream_continues() {
         decode_server_frame(&[0xff, 0xff, 0xff]).is_err(),
         "corrupt bytes must not be mistaken for a future frame"
     );
+}
+
+// ------------------------------------ one keyboard, one writer (GH #66)
+
+/// The handshake with a declared terminal.
+fn attach_from_terminal(session: &str, mode: AttachMode, terminal: Option<&str>) -> ClientFrame {
+    ClientFrame::Attach {
+        session: session.to_string(),
+        mode,
+        role: AttachRole::Interactive,
+        client_kind: ClientKind::Cli,
+        client_version: "test".into(),
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
+        terminal: terminal.map(str::to_string),
+    }
+}
+
+/// Attach and return the first frame's verdict: `Ok` for `Attached`,
+/// `Err((reason, message))` for `AttachReject`.
+async fn attach_verdict(
+    d: &TestDaemon,
+    session: &str,
+    mode: AttachMode,
+    terminal: Option<&str>,
+) -> Result<UnixStream, (String, String)> {
+    let mut c = d.dial().await;
+    send(&mut c, &attach_from_terminal(session, mode, terminal)).await;
+    match recv(&mut c).await {
+        ServerFrame::Attached { .. } => Ok(c),
+        ServerFrame::AttachReject { reason, message } => Err((reason, message)),
+        other => panic!("expected Attached or AttachReject, got {other:?}"),
+    }
+}
+
+/// **Two writers on one terminal are refused** — the configuration in
+/// which detach silently stops working.
+///
+/// Measured before it was guarded: two `holdfast attach` processes sharing
+/// a pty, one `Ctrl-B d`, and one client exited 0 while the other survived.
+/// The kernel hands each byte of a terminal to exactly one reader, so the
+/// operator's detach sequence is split and the client that missed it stays
+/// alive believing nothing was asked of it.
+#[tokio::test]
+async fn a_second_writer_on_the_same_terminal_is_refused() {
+    let d = TestDaemon::start("termbusy").await;
+    let s = d.real_session();
+
+    let _first = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x1"))
+        .await
+        .expect("the first writer attaches");
+
+    let (reason, message) = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x1"))
+        .await
+        .expect_err("the second writer on that terminal must be refused");
+    assert_eq!(reason, "terminal_busy");
+    // §7.5's rule for every reject: the message begins with the bare
+    // token, so a client branches on the cause without matching prose.
+    assert!(
+        message.starts_with("terminal_busy"),
+        "the message must begin with the token: {message}"
+    );
+    // And it must say what to do — an operator told only "busy" retries
+    // and gets the same answer.
+    assert!(
+        message.contains("detach") && message.contains("another terminal"),
+        "the message names no way out: {message}"
+    );
+}
+
+/// **The negative that keeps multi-attach a feature.** Two terminals on one
+/// session is what §4.3 builds the hub for; only one *keyboard* is the
+/// problem, so a different terminal must still attach.
+#[tokio::test]
+async fn a_writer_on_a_different_terminal_still_attaches() {
+    let d = TestDaemon::start("termother").await;
+    let s = d.real_session();
+
+    let _a = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x1"))
+        .await
+        .expect("the first writer attaches");
+    let _b = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x2"))
+        .await
+        .expect("a writer from another terminal must still attach");
+}
+
+/// An observer never calls `read()` on the terminal, so it cannot take a
+/// keystroke from anybody — `holdfast watch` alongside `holdfast attach`
+/// in one window is a real thing to do.
+#[tokio::test]
+async fn an_observer_on_the_same_terminal_still_attaches() {
+    let d = TestDaemon::start("termobs").await;
+    let s = d.real_session();
+
+    let _a = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x1"))
+        .await
+        .expect("the writer attaches");
+    let _b = attach_verdict(&d, &s.id, AttachMode::ReadOnly, Some("rdev:0x1"))
+        .await
+        .expect("an observer shares a terminal without contending for it");
+}
+
+/// **Two `None`s are not a match.** A client on a pipe has no terminal to
+/// contend for, and a refusal keyed on "both said nothing" would break
+/// every piped client and every client older than the field.
+#[tokio::test]
+async fn clients_without_a_terminal_do_not_refuse_each_other() {
+    let d = TestDaemon::start("termnone").await;
+    let s = d.real_session();
+
+    let _a = attach_verdict(&d, &s.id, AttachMode::ReadWrite, None)
+        .await
+        .expect("the first attaches");
+    let _b = attach_verdict(&d, &s.id, AttachMode::ReadWrite, None)
+        .await
+        .expect("absent is not equal to absent");
+}
+
+/// **The session is sized to the smallest attached writer** — tmux's rule.
+///
+/// This is also what makes the geometry converge. Under last-writer-wins
+/// two clients dragging at once alternate between their own readings
+/// forever, which is GH #66's "the sizes oscillate rather than converging
+/// on a final geometry"; a minimum has no ordering dependence at all.
+#[tokio::test]
+async fn the_session_takes_the_smallest_attached_writers_geometry() {
+    let d = TestDaemon::start("sizemin").await;
+    let s = d.real_session();
+
+    let mut a = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x1"))
+        .await
+        .expect("a attaches");
+    let mut b = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x2"))
+        .await
+        .expect("b attaches");
+
+    send(
+        &mut a,
+        &ClientFrame::Resize {
+            cols: 100,
+            rows: 40,
+        },
+    )
+    .await;
+    assert_eq!(next_resize(&mut b).await, (100, 40));
+    assert_eq!(s.size(), (100, 40), "one writer is its own minimum");
+
+    send(&mut b, &ClientFrame::Resize { cols: 80, rows: 24 }).await;
+    // **Synchronise on the broadcast, not on a sleep.** `send` returns
+    // when the frame is on the socket, not when the daemon has acted on
+    // it, so reading `s.size()` here raced and read the old geometry. `a`
+    // is told because 80×24 is not the 100×40 it asked for, and that frame
+    // arriving *is* the daemon having applied it.
+    assert_eq!(next_resize(&mut a).await, (80, 24));
+    assert_eq!(
+        s.size(),
+        (80, 24),
+        "the session must fit the smaller terminal"
+    );
+
+    // **The ordering half.** `a` now asks for *more* than `b` can show. A
+    // last-writer-wins daemon grants it and leaves `b` rendering into
+    // columns it does not have; the minimum ignores it.
+    send(
+        &mut a,
+        &ClientFrame::Resize {
+            cols: 120,
+            rows: 50,
+        },
+    )
+    .await;
+    // `a` is told what it actually got rather than the 120 it asked for,
+    // and again that frame is the synchronisation point.
+    assert_eq!(next_resize(&mut a).await, (80, 24));
+    assert_eq!(
+        s.size(),
+        (80, 24),
+        "a larger client widened the session past the smaller one"
+    );
+}
+
+/// **A departing writer gives its columns back.** Without this the session
+/// stays clamped to a terminal that is no longer attached, and nothing
+/// short of a manual resize ever frees it.
+#[tokio::test]
+async fn a_departing_writer_relaxes_the_minimum() {
+    let d = TestDaemon::start("sizeleave").await;
+    let s = d.real_session();
+
+    let mut a = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x1"))
+        .await
+        .expect("a attaches");
+    let mut b = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x2"))
+        .await
+        .expect("b attaches");
+
+    send(
+        &mut a,
+        &ClientFrame::Resize {
+            cols: 120,
+            rows: 50,
+        },
+    )
+    .await;
+    let _ = next_resize(&mut b).await;
+    send(&mut b, &ClientFrame::Resize { cols: 80, rows: 24 }).await;
+    assert_eq!(next_resize(&mut a).await, (80, 24));
+    assert_eq!(s.size(), (80, 24));
+
+    drop(b);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while s.size() != (120, 50) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        s.size(),
+        (120, 50),
+        "the session stayed clamped to a terminal that had gone"
+    );
+    // The client that stayed is told, because from its point of view the
+    // geometry changed without it asking.
+    assert_eq!(next_resize(&mut a).await, (120, 50));
+}
+
+/// **The other order, and it is the one a mutation found unguarded.**
+///
+/// `an_observer_on_the_same_terminal_still_attaches` covers writer-then-
+/// observer, and it passes without the mode filter inside
+/// `writer_on_terminal` — the caller short-circuits on the *arriving*
+/// client's mode before the hub is ever asked. Only observer-then-writer
+/// reaches that filter, so only this row can hold it: a `holdfast watch`
+/// already running in the window must not lock the operator out of
+/// attaching there.
+#[tokio::test]
+async fn a_writer_may_join_a_terminal_that_only_has_an_observer() {
+    let d = TestDaemon::start("termobs2").await;
+    let s = d.real_session();
+
+    let _observer = attach_verdict(&d, &s.id, AttachMode::ReadOnly, Some("rdev:0x1"))
+        .await
+        .expect("the observer attaches");
+    let _writer = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0x1"))
+        .await
+        .expect("an observer must not reserve the keyboard it never reads");
 }

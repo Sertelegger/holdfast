@@ -300,6 +300,7 @@ mod tests {
                 client_version: "test".into(),
                 protocol_major: crate::protocol::handshake::PROTOCOL_MAJOR,
                 protocol_minor: crate::protocol::handshake::PROTOCOL_MINOR,
+                terminal: None,
             },
         )
         .await;
@@ -342,6 +343,7 @@ mod tests {
                 client_version: "test".into(),
                 protocol_major: crate::protocol::handshake::PROTOCOL_MAJOR,
                 protocol_minor: crate::protocol::handshake::PROTOCOL_MINOR,
+                terminal: None,
             },
         )
         .await

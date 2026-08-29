@@ -58,7 +58,7 @@ use tokio::sync::mpsc;
 use super::frames::{
     AttachMode, AttachRole, ClientDecode, ClientFrame, ClientFrameKind, ServerFrame, SignalName,
 };
-use super::handshake::{evaluate_attach, REJECT_SESSION_NOT_FOUND};
+use super::handshake::{evaluate_attach, REJECT_SESSION_NOT_FOUND, REJECT_TERMINAL_BUSY};
 use crate::daemon::server::Daemon;
 use crate::protocol::frame::{self, FrameError};
 use crate::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
@@ -74,6 +74,9 @@ struct Handshake {
     client_kind: ClientKind,
     client_version: String,
     protocol_major: u32,
+    /// The client's terminal, as it declared it (GH #66). `None` from a
+    /// pipe or from a client older than the field.
+    terminal: Option<String>,
 }
 
 /// Serve one accepted, uid-checked attach connection to completion.
@@ -133,6 +136,41 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
         }
     };
 
+    // **A second writer on a terminal that already has one is refused**
+    // (GH #66, `terminal_busy`). Checked here and not in
+    // `evaluate_attach`: it is the one refusal that depends on the other
+    // clients attached rather than on this connection's own version, and
+    // it is checked *after* the registry so a wrong session name is still
+    // reported as `session_not_found`.
+    //
+    // This is not multi-attach being restricted. Two terminals on one
+    // session is the feature §4.3 builds the hub for and it is untouched;
+    // what cannot work is two *keyboards* that are physically the same
+    // keyboard, because the kernel hands each byte to exactly one reader
+    // and the operator's `Ctrl-B d` is split between them.
+    if hs.mode == AttachMode::ReadWrite
+        && daemon
+            .attach_hub()
+            .writer_on_terminal(&session.id, hs.terminal.as_deref())
+    {
+        let _ = frame::write_frame(
+            &mut wr,
+            &ServerFrame::AttachReject {
+                reason: REJECT_TERMINAL_BUSY.to_string(),
+                // Begins with the token, like every other arm (§7.5), and
+                // then says what to do about it — an operator who is told
+                // only "busy" will try again and get the same answer.
+                message: format!(
+                    "{REJECT_TERMINAL_BUSY} — this terminal already has an interactive \
+                     client on that session; detach that one first, or attach from \
+                     another terminal."
+                ),
+            },
+        )
+        .await;
+        return;
+    }
+
     // **Subscribe before `Attached` is written.** §7.5: *"The frame is
     // sent before any `Output` frames"* — which is an ordering claim and
     // also a completeness one. Subscribing afterwards is a race that
@@ -176,6 +214,8 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
         peer_uid,
         tx: tx.clone(),
         connected_at: Instant::now(),
+        terminal: hs.terminal.clone(),
+        last_size: parking_lot::Mutex::new(None),
     });
 
     // Queued first, so the FIFO is what makes it frame one rather than a
@@ -303,6 +343,33 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
         .attach_hub()
         .unregister(&conn.session_id, conn.client_id);
 
+    // **A departing writer relaxes the minimum** (GH #66). The session is
+    // sized to the smallest attached writer, so the client that was
+    // holding it narrow leaving must give the columns back — otherwise a
+    // 200-column terminal stays clamped to the 80 of a peer that is no
+    // longer there, and nothing but a manual resize would ever free it.
+    //
+    // Ordered **after** `unregister` so this connection is already out of
+    // the fold; folding before would recompute the same minimum it is
+    // meant to lift. `writer_min_size` returning `None` means no writer is
+    // left with a size to honour, and the session simply keeps the
+    // geometry it has rather than being resized to a default nobody asked
+    // for.
+    if conn.mode == AttachMode::ReadWrite && conn.last_size.lock().is_some() {
+        if let Some((cols, rows)) = daemon.attach_hub().writer_min_size(&conn.session_id) {
+            if (cols, rows) != session.size() {
+                if let Err(e) = session.resize(cols, rows) {
+                    crate::diag!("holdfast daemon: resize after detach failed: {e}");
+                } else {
+                    let (cols, rows) = session.size();
+                    for other in daemon.attach_hub().clients_of(&conn.session_id) {
+                        let _ = other.tx.try_send(ServerFrame::Resize { cols, rows });
+                    }
+                }
+            }
+        }
+    }
+
     // **The one place `Detached` is emitted**, for all three of its wire
     // reasons. `client_detach` is deliberately absent — §7.5: *"The
     // client sent `Detach`; there is nobody left to tell."* Adding it
@@ -425,6 +492,7 @@ async fn read_handshake(
             client_version,
             protocol_major,
             protocol_minor: _,
+            terminal,
         }) => Some(Handshake {
             session,
             mode,
@@ -432,6 +500,7 @@ async fn read_handshake(
             client_kind,
             client_version,
             protocol_major,
+            terminal,
         }),
         // A well-formed frame of the wrong kind. §7.5:
         // *"pre-handshake violations close."*
@@ -547,8 +616,23 @@ async fn read_loop(
                     return;
                 }
             }
-            ClientDecode::Frame(ClientFrame::Resize { cols, rows }) => {
-                if let Err(e) = session.resize(cols, rows) {
+            ClientDecode::Frame(ClientFrame::Resize {
+                cols: asked_cols,
+                rows: asked_rows,
+            }) => {
+                // **What this client can display, not what the session
+                // becomes** (GH #66). Recorded first, then folded with
+                // every other writer's: the session gets the minimum, so
+                // no attached terminal is ever asked to show more columns
+                // than it has. tmux's rule, and for tmux's reason.
+                let before = session.size();
+                *conn.last_size.lock() = Some((asked_cols, asked_rows));
+                let (want_cols, want_rows) = daemon
+                    .attach_hub()
+                    .writer_min_size(&conn.session_id)
+                    .unwrap_or((asked_cols, asked_rows));
+
+                if let Err(e) = session.resize(want_cols, want_rows) {
                     crate::diag!("holdfast daemon: attach resize failed: {e}");
                     continue;
                 }
@@ -564,10 +648,31 @@ async fn read_loop(
                 // `Session::resize` clamps, and a client that asked for
                 // 5000 columns must not tell everybody else it succeeded.
                 let (cols, rows) = session.size();
+                let changed = (cols, rows) != before;
                 for other in daemon.attach_hub().clients_of(&conn.session_id) {
-                    // The originator is excluded: it already knows, and a
-                    // client that reflows on every `Resize` would loop.
-                    if other.client_id == conn.client_id {
+                    // **The originator is told only when the answer is not
+                    // what it asked for.** It used to be excluded outright,
+                    // on the grounds that it already knows — true under
+                    // last-writer-wins and false under a minimum, where a
+                    // client asking for 120 columns against a 80-column
+                    // peer gets 80 and would otherwise never learn it. The
+                    // loop the old comment guarded against is still guarded
+                    // against: this client is not sent its own echo, only a
+                    // correction, so a correction cannot provoke another.
+                    //
+                    // **Everyone else is told only when something moved.**
+                    // Under a minimum most resizes change nothing — a
+                    // client shrinking below the current floor, or growing
+                    // while a smaller peer holds it — and a broadcast per
+                    // frame would wake every attached client to tell it the
+                    // geometry it already has, which is the flood this
+                    // issue is about arriving by a second route.
+                    let tell = if other.client_id == conn.client_id {
+                        (cols, rows) != (asked_cols, asked_rows)
+                    } else {
+                        changed
+                    };
+                    if !tell {
                         continue;
                     }
                     // `try_send`, like the output path: a resize

@@ -929,6 +929,7 @@ async fn the_attach_handshake_carries_every_non_optional_field() {
             client_version,
             protocol_major,
             protocol_minor,
+            terminal,
         } => {
             assert_eq!(session, "sess_x");
             // REQ-SEC-008's first half, on the wire: `holdfast attach` is
@@ -944,6 +945,11 @@ async fn the_attach_handshake_carries_every_non_optional_field() {
             assert!(!client_version.is_empty());
             assert_eq!(*protocol_major, PROTOCOL_MAJOR);
             assert_eq!(*protocol_minor, PROTOCOL_MINOR);
+            // `run_plain` hands the client a pipe, and the field names a
+            // *terminal*. `None` is the right answer, and it is what stops
+            // two piped clients from refusing each other for having
+            // nothing in common (GH #66).
+            assert_eq!(*terminal, None);
         }
         other => panic!("the first frame must be Attach, got {other:?}"),
     }
@@ -986,6 +992,7 @@ async fn holdfast_version_prints_the_protocol_the_sockets_speak() {
             client_version: "test".into(),
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,
+            terminal: None,
         },
     )
     .await

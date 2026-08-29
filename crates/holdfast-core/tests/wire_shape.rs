@@ -170,6 +170,24 @@ const RECORDED_VERSIONS: &[(u32, u32)] = &[
     // the next hand should assume it already has. Two uses of an escape
     // hatch is where it starts looking like a procedure.
     (1, 0),
+    // 1.1 — `Attach` gains `terminal`, an optional client-declared string
+    // naming the terminal device a client's keyboard is (GH #66). It lets
+    // the daemon refuse a second *writer* on a terminal that already has
+    // one, which is the only configuration in which two clients silently
+    // split the operator's keystrokes between them.
+    //
+    // **Appended rather than folded into 1.0, and that is the point.** The
+    // 1.0 row's argument — nothing is externally distributed, so a new row
+    // would promise compatibility to nobody — is still true, and would
+    // have licensed a third rewrite. The row above says what is wrong with
+    // taking it: "two uses of an escape hatch is where it starts looking
+    // like a procedure", and a third use is no longer a hatch. This change
+    // is additive under the rule as written — a new *optional field*, not
+    // a new client frame — so the ordinary green path is available and
+    // there is nothing to argue. Taking the ordinary path when it exists
+    // is what keeps the extraordinary one credible for a change that has
+    // no alternative.
+    (1, 1),
 ];
 
 /// The placeholder every opaque string field carries in this file.
@@ -480,6 +498,9 @@ fn client_frames() -> Vec<ClientFrame> {
             client_version: STR.into(),
             protocol_major: 1,
             protocol_minor: 0,
+            // `Some`, because this list is documented as maximal and an
+            // `Option` sampled only as `None` never exercises its arm.
+            terminal: Some(STR.into()),
         },
         ClientFrame::Input { bytes: vec![0x1b] },
         ClientFrame::SecretInput {
