@@ -2907,11 +2907,99 @@ impl HoldfastServer {
         clamped: Option<u64>,
     ) -> (Status, serde_json::Map<String, serde_json::Value>) {
         let deadline = std::time::Instant::now() + timeout;
-        let mut reached = session.detection().interaction_mode != InteractionMode::Executing;
-        while !reached && std::time::Instant::now() < deadline {
+
+        // **The first sample used to be taken before any sleep, and that is
+        // the whole bug this loop is shaped around.** `send_input("make")`
+        // followed by `wait_for_pattern()` races the detector's transition
+        // into `Executing`: at the instant the wait arrives the shell may not
+        // have echoed the line yet, so the mode is still `AtPrompt` and a
+        // level-triggered read answers `reached: true`, `status: "ok"` —
+        // "the command finished" for a command that has not started.
+        // Measured at **1 in 20 on an idle box**, and reported at
+        // `detection_tier: "semantic"`, the tier an agent is told to trust.
+        // That is the failure this feature exists to retire, inverted: the
+        // old bug printed `timeout` beside a true `AtPrompt`, this one
+        // printed `ok` beside a false one.
+        //
+        // Two signals close it, and neither is sufficient alone.
+        //
+        // **The command counter**, when shell integration is live: a count
+        // above the baseline is positive proof that a command really started
+        // after this wait began, so returning at the next non-`Executing`
+        // sample needs no further evidence. It cannot carry the whole fix
+        // because a session with no OSC 133 never advances it, and because a
+        // command that finished *before* the call never will either.
+        //
+        // **A settle window** for everything else: `AtPrompt` has to hold
+        // for at least as long as the detector's own quiescence threshold
+        // before it is believed, because inside that window "at a prompt" and
+        // "has not started yet" are the same observation. The window is read
+        // from the session rather than hardcoded — an operator who raises
+        // `settle_threshold_ms` would otherwise silently reopen the race.
+        //
+        // **Residual, stated rather than hidden:** a session that is
+        // genuinely idle now pays the settle window before answering. That is
+        // the price of not lying, and it is bounded by the threshold. The
+        // deeper limitation stands and is documented on the tool: with no
+        // pattern this answers *is the session executing*, and only shell
+        // integration upgrades that to *did the command finish*.
+        // **`command_count()` counts commands *started*, not finished**, and
+        // reading it as a completion signal is a mistake this function made
+        // once already: `send_input("sleep 30")` emits OSC 133 `C`, the count
+        // advances, and a wait that treats that as "done" answers `ok` while
+        // the command runs — measured at 19 failures in 30 on an idle box,
+        // strictly worse than the race it was meant to close. The completion
+        // signal is `output_end_cursor`, set by the `D` marker, exactly as
+        // `CommandEntry::exit_code` documents.
+        let baseline = session.command_count();
+        let settle = Duration::from_millis(session.settle_threshold_ms());
+        let mut saw_executing = false;
+        let mut idle_since: Option<std::time::Instant> = None;
+        let reached = loop {
+            match session.detection().interaction_mode {
+                // Neither can be mistaken for "about to start the command
+                // you just sent", so both answer at once.
+                InteractionMode::Exited | InteractionMode::AwaitingSecret => break true,
+                // §5.2: a TUI never returns to `AtPrompt`, so this reports
+                // the mode promptly rather than running out the deadline.
+                InteractionMode::Fullscreen => break true,
+                InteractionMode::Executing => {
+                    saw_executing = true;
+                    idle_since = None;
+                }
+                InteractionMode::AtPrompt => {
+                    // Watched it run and watched it stop. Nothing ambiguous
+                    // is left, at any tier.
+                    if saw_executing {
+                        break true;
+                    }
+                    // Never saw it execute, so `AtPrompt` is either "finished
+                    // before the call" or "not started yet" — the same
+                    // observation. Shell integration settles it when present.
+                    match session.command_history(baseline, 1).first() {
+                        // Started since the baseline and its `D` closed it.
+                        Some(e) if e.output_end_cursor.is_some() => break true,
+                        // Started and still open: keep waiting, and do not let
+                        // the settle window expire underneath a running child.
+                        Some(_) => idle_since = None,
+                        // Nothing started. Believe the prompt only once it has
+                        // held for the detector's own quiescence window — read
+                        // from the session, because an operator who raises
+                        // `settle_threshold_ms` would otherwise reopen the race.
+                        None => {
+                            let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                            if since.elapsed() >= settle {
+                                break true;
+                            }
+                        }
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
             tokio::time::sleep(IDLE_WAIT_POLL).await;
-            reached = session.detection().interaction_mode != InteractionMode::Executing;
-        }
+        };
 
         let mut fields = serde_json::Map::new();
         fields.insert("reached".into(), json!(reached));
@@ -3208,7 +3296,9 @@ pub struct WaitForPatternArgs {
     pub session: String,
     /// Rust regex matched against the session's raw output bytes.
     ///
-    /// **Omit it to wait for the session to stop executing instead.** A
+    /// **Omit it to wait for the session to stop executing instead** —
+    /// which is not the same claim as "the command finished"; see
+    /// `run_wait_for_idle` for what each tier can actually establish. A
     /// shell-prompt regex is a guess about the operator's `$PS1` and
     /// silently never matches a customised one, so "wait until the
     /// command finishes" is answered from the detector rather than from

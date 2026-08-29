@@ -489,6 +489,8 @@ dependencies = [
  "rmcp",
  "serde_json",
  "tokio",
+ "unicode-width",
+ "vt100",
 ]
 
 [[package]]

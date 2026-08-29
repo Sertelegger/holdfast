@@ -40,10 +40,14 @@ pub const INSTRUCTIONS: &str = "Holdfast gives you PTY-backed shell sessions. st
      it printed using a cursor you carry between calls; \
      wait_for_pattern blocks until a regex matches new output, and \
      **its pattern is optional**. Omit it to wait until the session \
-     stops executing: that answers `has the command finished` from the \
-     detector instead of from text, and the response carries \
+     stops executing. Read what that answers precisely: it is `is the \
+     session executing`, and it becomes `did the command finish` only \
+     when shell integration is live, because only then can the daemon \
+     count the command that started. Without it, a session that is merely \
+     quiet answers the same as one that is done. The response carries \
      interaction_mode, detection_tier and prompt.reason so you can tell \
-     a measured prompt from a guessed one. It returns as soon as the \
+     a measured prompt from a guessed one; for whether a command \
+     *succeeded*, read get_command_history's exit code. It returns as soon as the \
      session is anything but Executing, so Fullscreen, AwaitingSecret \
      and Exited come back at once rather than at the deadline -- read \
      interaction_mode, because those three need different actions. \

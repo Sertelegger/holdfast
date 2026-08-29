@@ -148,6 +148,14 @@ impl PromptDetector {
 
     /// Whose OSC 133 markers this session is using (§18.2a, §8.5.1).
     /// `None` until the first marker arrives.
+    /// The quiescence window this detector needs before it will call a
+    /// session settled (§4.2). Read by `wait_for_pattern`'s pattern-less
+    /// form, which must not conclude "the command finished" inside the
+    /// window where the detector has not yet noticed it *started*.
+    pub fn settle_threshold_ms(&self) -> u64 {
+        self.config.settle_threshold_ms
+    }
+
     pub fn osc133_source(&self) -> Option<Osc133Source> {
         self.scanner.osc133_source()
     }

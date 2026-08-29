@@ -2455,6 +2455,93 @@ async fn a_pattern_less_wait_returns_at_once_from_awaiting_secret() {
     );
 }
 
+/// `Fullscreen` answers at once, and is pinned so it cannot start blocking.
+///
+/// **A mutation that made `Fullscreen` run out the deadline left the whole
+/// suite green.** A TUI never returns to `AtPrompt` (§5.2), so a wait that
+/// blocks on one blocks until the deadline every time — a correct answer
+/// turning into a hang, with nothing red to say so.
+#[tokio::test]
+async fn a_pattern_less_wait_returns_at_once_from_fullscreen() {
+    let server = HoldfastServer::new();
+    let (id, pty) = mock_session(&server, None);
+    // Alternate screen on: the deterministic Tier-2 route to `Fullscreen`.
+    pty.queue_output(b"\x1b[?1049h");
+    wait_for_mode(&server, &id, "Fullscreen").await;
+
+    let started = Instant::now();
+    let r = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: None,
+            timeout_secs: Some(30),
+            since_cursor: None,
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let elapsed = started.elapsed();
+    let payload = assert_matches_schema("wait_for_pattern", &r);
+    assert_eq!(payload["status"], "ok", "{payload}");
+    assert_eq!(payload["data"]["reached"], true, "{payload}");
+    assert_eq!(
+        payload["data"]["interaction_mode"], "Fullscreen",
+        "{payload}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "it blocked for {elapsed:?} against a 30s deadline; a TUI never \
+         returns to AtPrompt, so blocking here is a hang, not patience"
+    );
+}
+
+/// An exited session answers at once, for the same reason and with the
+/// same hole: a mutation that made `Exited` block left the suite green.
+#[tokio::test]
+async fn a_pattern_less_wait_returns_at_once_from_an_exited_session() {
+    let server = HoldfastServer::new();
+    let (id, pty) = mock_session(&server, None);
+    pty.exit(0);
+    wait_for_mode(&server, &id, "Exited").await;
+
+    let started = Instant::now();
+    let r = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: None,
+            timeout_secs: Some(30),
+            since_cursor: None,
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let elapsed = started.elapsed();
+    let payload = assert_matches_schema("wait_for_pattern", &r);
+    assert_eq!(payload["data"]["reached"], true, "{payload}");
+    assert_eq!(payload["data"]["interaction_mode"], "Exited", "{payload}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "it blocked for {elapsed:?} against a 30s deadline on a session \
+         whose child is gone; nothing can change that state back"
+    );
+}
+
+/// Poll until the session reports `mode`, or give up loudly.
+async fn wait_for_mode(server: &HoldfastServer, id: &str, mode: &str) {
+    for _ in 0..200 {
+        let r = server
+            .status(Parameters(StatusArgs { session: id.into() }))
+            .await
+            .expect("status");
+        let p = assert_matches_schema("status", &r);
+        if p["data"]["interaction_mode"] == mode {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("session never reached {mode}");
+}
+
 /// The timeout half: a session still running a command answers
 /// `reached: false`, and says what it is still doing.
 #[tokio::test]

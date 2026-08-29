@@ -1190,6 +1190,12 @@ impl Session {
         self.history.lock().is_active()
     }
 
+    /// This session's configured quiescence window (§4.2), forwarded from
+    /// the detector so a caller does not have to re-derive it from config.
+    pub fn settle_threshold_ms(&self) -> u64 {
+        self.detector.lock().settle_threshold_ms()
+    }
+
     /// Commands recorded so far, including ones evicted from the ring.
     pub fn command_count(&self) -> u64 {
         self.history.lock().total()

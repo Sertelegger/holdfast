@@ -43,6 +43,85 @@ pub const EXIT_USAGE: u8 = 64;
 /// the user's terminal in raw mode. Having caught them it reports what
 /// a shell would have reported had it not, so nothing downstream loses
 /// the distinction the catch was buying back.
+/// The attach notice, as the bytes `diag!` is handed.
+///
+/// **Split out of the attach loop so a test can render it.** The layout is
+/// cursor arithmetic — DECSC, `ESC[L`, DECRC and a trailing newline that
+/// belongs to `diag::emit` — and an assertion that the byte stream contains
+/// the bytes the code just wrote cannot see a cursor land on the wrong row.
+/// `the_banner_lands_above_the_prompt_and_leaves_the_cursor_on_it` drives
+/// this string through a real emulator instead.
+///
+/// `size` is `None` when `TIOCGWINSZ` failed or answered a zero dimension —
+/// a pty nobody sized reports `0x0`, and a bar claiming the session is `0x0`
+/// reads as a defect in the thing added to reassure the reader. Without a
+/// width there is nothing to pad to, so the notice is printed as a sentence.
+pub(crate) fn attach_banner(
+    session: &str,
+    size: Option<(u16, u16)>,
+    stderr_is_terminal: bool,
+) -> Option<String> {
+    // **The policy lives here, not at the call site.** A guard written as a
+    // bare `if` around the emit is a branch no test can reach without a
+    // process whose stderr is not a terminal; as a parameter it is one
+    // assertion. What stays outside is the capability query itself, which is
+    // a single std call with nothing to get wrong.
+    if !stderr_is_terminal {
+        return None;
+    }
+    let cols = match size {
+        Some((cols, rows)) if cols > 0 && rows > 0 => Some(cols as usize),
+        _ => None,
+    };
+    let geometry = match size {
+        Some((cols, rows)) if cols > 0 && rows > 0 => format!(" ({cols}x{rows})"),
+        _ => String::new(),
+    };
+    let text = format!(" holdfast: attached to {session}{geometry} — Ctrl-B d to detach ");
+    let body = match cols {
+        Some(cols) => fit_to_width(&text, cols),
+        None => text,
+    };
+    Some(format!(
+        "\x1b7\r\x1b[L\x1b[48;5;61m\x1b[38;5;231m{body}\x1b[0m\x1b8"
+    ))
+}
+
+/// Truncate or pad `s` so it occupies exactly `cols` display columns.
+///
+/// **Display columns, not `chars().count()`.** A session name is free-form
+/// agent input with no length or charset validation, so the bar can be handed
+/// text wider than the terminal — and a CJK name counts one `char` per two
+/// columns. Either way the bar wraps onto the next row, and the next row is
+/// the prompt `ESC[L` just made space for, so an over-wide bar destroys the
+/// thing this whole sequence exists to preserve. Measured at 41 ASCII chars
+/// and at 12 CJK chars on an 80-column terminal before this existed.
+fn fit_to_width(s: &str, cols: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if UnicodeWidthStr::width(s) <= cols {
+        let mut out = String::from(s);
+        for _ in UnicodeWidthStr::width(s)..cols {
+            out.push(' ');
+        }
+        return out;
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > cols {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    // A wide char that would not fit leaves a column short of the edge.
+    for _ in w..cols {
+        out.push(' ');
+    }
+    out
+}
+
 /// How long the attach banner waits for the child's repaint before
 /// printing anyway. Long enough for a shell to answer `SIGWINCH`, short
 /// enough that a silent session is not left wondering.
@@ -1119,12 +1198,23 @@ pub async fn attach(session: &str) -> ExitCode {
     // below it down; the bar is written into the gap, so it lands above
     // the prompt.
     //
-    // **`ESC8` alone puts the cursor back, with no compensating move.**
-    // The obvious reading is that the restore lands on the bar and needs
-    // a `ESC[B` after it, since the prompt moved down a row — measured,
-    // that overshoots by one and leaves the cursor a line below the
-    // prompt. The terminal adjusts the saved position when lines are
-    // inserted above it, so the restore already follows the prompt.
+    // **`ESC8` alone puts the cursor back, with no compensating move —
+    // and the trailing newline is what finishes the job.** The comment
+    // here used to say the terminal adjusts the saved position when lines
+    // are inserted above it. **That is false**, measured against vt100,
+    // tmux 3.6, pyte and GNU screen: DECSC stores raw coordinates and
+    // `ESC[L` never touches them, so `ESC8` lands the cursor *on the bar*.
+    // What steps it down onto the prompt is the `\n` that `diag::emit`
+    // appends with `writeln!`. That newline is therefore **load-bearing
+    // layout**, not formatting, which is why it is named here and pinned
+    // by `the_banner_lands_above_the_prompt_and_leaves_the_cursor_on_it`.
+    // Switching the banner to a writer that does not append one puts the
+    // cursor back on the bar, which is where the operator's next keystroke
+    // would go.
+    //
+    // This also explains the `ESC[B` that an earlier revision added and
+    // measured as overshooting: `ESC8` + `ESC[B` + the newline is two rows,
+    // not one. The conclusion was right and the model behind it was wrong.
     //
     // `attach` is a pass-through and the child tracks its own cursor, so
     // leaving it anywhere else starts the child's next write in the wrong
@@ -1139,25 +1229,16 @@ pub async fn attach(session: &str) -> ExitCode {
     //
     // Colour is SGR 256, background 61, padded to the terminal width so
     // it reads as a bar rather than a sentence.
-    let mut banner = Some(match crate::attach_tty::window_size(tty) {
-        // A zero dimension is dropped rather than printed. `TIOCGWINSZ`
-        // answers `0x0` on a pty nobody sized, and a bar claiming the
-        // session is `0x0` reads as a defect in the thing added to
-        // reassure the reader.
-        Ok((cols, rows)) if cols > 0 && rows > 0 => {
-            let text =
-                format!(" holdfast: attached to {session} ({cols}x{rows}) — Ctrl-B d to detach ");
-            let pad = (cols as usize).saturating_sub(text.chars().count());
-            format!(
-                "\x1b7\r\x1b[L\x1b[48;5;61m\x1b[38;5;231m{text}{:pad$}\x1b[0m\x1b8",
-                "",
-                pad = pad
-            )
-        }
-        _ => format!(
-            "\x1b7\r\x1b[L\x1b[48;5;61m\x1b[38;5;231m holdfast: attached to {session} — Ctrl-B d to detach \x1b[0m\x1b8"
-        ),
-    });
+    //
+    // **Only onto a terminal.** `holdfast attach 2>err.txt` otherwise
+    // writes DECSC, `ESC[L` and SGR into the file, and the reader of that
+    // file gets escape bytes rather than a notice. The bar is decoration
+    // on a human's screen; a redirected stderr has no screen to decorate.
+    let mut banner = attach_banner(
+        session,
+        crate::attach_tty::window_size(tty).ok(),
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+    );
     let banner_fallback = tokio::time::sleep(BANNER_AFTER_REPAINT);
     tokio::pin!(banner_fallback);
 
@@ -1563,6 +1644,126 @@ pub fn version() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use super::{attach_banner, fit_to_width};
+
+    /// Render the row the cursor ends on, for the assertions below.
+    fn row(p: &vt100::Parser, r: u16) -> String {
+        p.screen().contents_between(r, 0, r, p.screen().size().1)
+    }
+
+    /// The bar goes **above** the prompt and the cursor ends **on** the
+    /// prompt.
+    ///
+    /// **This is the test the feature shipped without, and its absence is
+    /// why four commits of cursor arithmetic could not fail.** The existing
+    /// integration assertion checks that the byte stream contains `ESC7` and
+    /// `ESC8`, which is the code emitting what the code emits: deleting
+    /// `ESC[L`, deleting the `\r`, or re-adding the `ESC[B` that an earlier
+    /// revision was written to remove all left it green. Rendering is what
+    /// separates "the bytes were sent" from "the cursor is in the right
+    /// place".
+    ///
+    /// The trailing `\n` is fed deliberately: `diag::emit` writes with
+    /// `writeln!`, and that newline is what steps the cursor off the bar and
+    /// onto the prompt. See `attach_banner`.
+    #[test]
+    fn the_banner_lands_above_the_prompt_and_leaves_the_cursor_on_it() {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"an earlier line\r\nPROMPT> ");
+        let (before_row, before_col) = p.screen().cursor_position();
+
+        p.process(
+            attach_banner("sess", Some((80, 24)), true)
+                .unwrap()
+                .as_bytes(),
+        );
+        p.process(b"\n");
+
+        let (after_row, after_col) = p.screen().cursor_position();
+        assert_eq!(
+            (after_row, after_col),
+            (before_row + 1, before_col),
+            "the cursor should follow the prompt down one row, not sit on the bar"
+        );
+        assert!(
+            row(&p, before_row).contains("attached to sess"),
+            "the bar should occupy the prompt's old row, got: {:?}",
+            row(&p, before_row)
+        );
+        assert!(
+            row(&p, after_row).contains("PROMPT>"),
+            "the prompt should survive, one row down; got: {:?}",
+            row(&p, after_row)
+        );
+    }
+
+    /// A stderr that is not a terminal gets no banner at all.
+    ///
+    /// `holdfast attach 2>err.txt` otherwise writes DECSC, `ESC[L` and SGR
+    /// into the file. Before this the repo contained no `is_terminal`,
+    /// `isatty` or `atty` call anywhere, so nothing distinguished a screen
+    /// from a pipe.
+    #[test]
+    fn a_redirected_stderr_gets_no_escape_sequences() {
+        assert_eq!(attach_banner("sess", Some((80, 24)), false), None);
+        assert_eq!(attach_banner("sess", None, false), None);
+        // And the terminal case still produces one, so the assertion above
+        // is not passing because the builder returns `None` for everything.
+        assert!(attach_banner("sess", Some((80, 24)), true).is_some());
+    }
+
+    /// A name wider than the terminal is truncated, not wrapped.
+    ///
+    /// An over-wide bar wraps onto the row `ESC[L` just made for the prompt
+    /// and overwrites it, so the notice destroys the thing it exists beside.
+    /// `name` is free-form agent input: `StartSessionArgs::name` has no
+    /// length or charset validation.
+    #[test]
+    fn an_over_wide_bar_cannot_reach_the_prompts_row() {
+        for name in ["x".repeat(200), "端末".repeat(60)] {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(b"an earlier line\r\nPROMPT> ");
+            let (before_row, _) = p.screen().cursor_position();
+
+            p.process(
+                attach_banner(&name, Some((80, 24)), true)
+                    .unwrap()
+                    .as_bytes(),
+            );
+            p.process(b"\n");
+
+            assert!(
+                row(&p, before_row + 1).contains("PROMPT>"),
+                "a {}-column name wrapped the bar onto the prompt: {:?}",
+                name.len(),
+                row(&p, before_row + 1)
+            );
+        }
+    }
+
+    /// `fit_to_width` measures columns, not `char`s.
+    ///
+    /// The distinction is the whole bug: `chars().count()` reports 2 for
+    /// `"端末"`, which occupies 4 columns.
+    #[test]
+    fn fit_to_width_counts_display_columns_not_chars() {
+        use unicode_width::UnicodeWidthStr;
+        assert_eq!(UnicodeWidthStr::width(fit_to_width("ab", 10).as_str()), 10);
+        assert_eq!(
+            UnicodeWidthStr::width(fit_to_width("端末", 10).as_str()),
+            10
+        );
+        // Truncation lands on a column budget, never mid-character.
+        assert_eq!(
+            UnicodeWidthStr::width(fit_to_width("端末端末", 5).as_str()),
+            5
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(fit_to_width(&"x".repeat(99), 7).as_str()),
+            7
+        );
+    }
+
     use super::*;
     use holdfast_core::protocol::frame;
     use holdfast_core::protocol::handshake::{self, HandshakeData};

@@ -37,7 +37,10 @@ pass count means nothing if the harness cannot fail:
 ./scripts/mcp-smoke.sh /usr/bin/true      # every check must FAIL
 ```
 
-Report as: one line per check with its number (`1279 passed / 0 failed / 2
-ignored`, `58 checks`), then the verdict. Quote what you measured, not what you
+Report as: one line per check with the numbers **that run emitted** — quote the
+`test result:` line and the smoke script's own `SMOKE OK (N checks)` rather than
+a count from this file. A literal here goes stale silently: `mcp-smoke.sh`
+records that its own "all 38 checks" drifted five times with nothing going red,
+which is why it now prints its total instead of asserting one. Then the verdict. Quote what you measured, not what you
 expected. If a check could not run, that is a third outcome and belongs in the
 report as itself — not as a pass and not as a failure.
