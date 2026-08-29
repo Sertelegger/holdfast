@@ -166,6 +166,21 @@ const RECORDED_VERSIONS: &[(u32, u32)] = &[
     //    append that would be honest about a history no external consumer
     //    has.
     //
+    // **Point 3 stopped being true at 1.1, and saying so here is the
+    // point of the file.** Nothing ships protocol 1.0: the only build that
+    // would have spoken the rewritten shape is 0.0.7, and 0.0.7 speaks
+    // 1.1. `v0.0.6` predates this file and spoke a 1.0 without 0.0.7's
+    // frames, so it is not the shape either. `1.0.golden` is therefore an
+    // orphaned record — superseded before first distribution, describing a
+    // shape no binary ever spoke, which is exactly the outcome point 2
+    // argued a `(1, 1)` row would cause.
+    //
+    // It is kept rather than deleted because the argument above is the
+    // history of how it got that way, and a record that quietly dropped
+    // its own wrong entry would be worse than one that carries it labelled.
+    // Found by review; the correction is prose, and it is here rather than
+    // only in a commit message for the same reason the rest of this is.
+    //
     // **This stops being available the moment a binary is published**, and
     // the next hand should assume it already has. Two uses of an escape
     // hatch is where it starts looking like a procedure.

@@ -225,9 +225,9 @@ mod tests {
     }
 
     #[test]
-    fn the_reject_tokens_are_the_four_18_4b_values_in_catalogue_order() {
-        // The four-arm guard, at the catalog level. §18.4b's set is
-        // closed; a fifth token added without a spec edit, or one of the
+    fn the_reject_tokens_are_the_18_4b_values_in_catalogue_order() {
+        // The catalogue guard, at the catalog level. §18.4b's set is
+        // closed; a sixth token added without a spec edit, or one of the
         // four deleted to "simplify" the match, fails here. Paired with
         // the two refusal tests above, which pin *which* two of the four
         // `evaluate_attach` can produce.
