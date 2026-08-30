@@ -1,9 +1,3 @@
----
-description: Adversarial pre-PR review — parallel reviewers on disjoint dimensions, in isolated worktrees
-argument-hint: "[base ref, default main]"
-allowed-tools: Bash(git:*), Bash(cargo:*), Bash(./scripts/:*), Bash(gh:*), Task
----
-
 Review the current branch against `$1` (default `main`) **before** it becomes a
 pull request. This is a gate, not a formality: the round that produced it found
 **twelve confirmed defects in three commits that had already passed the full

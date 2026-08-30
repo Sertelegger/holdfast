@@ -1,8 +1,3 @@
----
-description: Run the full local gate — fmt, clippy across targets, tests, smoke, workflows
-allowed-tools: Bash(cargo:*), Bash(./scripts/:*), Bash(actionlint:*), Bash(rustup:*)
----
-
 Run the checks that decide whether this tree is shippable, and report a single
 verdict with the numbers. Run them all even when one fails — a run that stops
 at the first red tells you one thing when it could have told you five.
