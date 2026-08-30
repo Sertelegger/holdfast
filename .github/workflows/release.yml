@@ -1,0 +1,98 @@
+# RELEASE-WORKFLOW: tag-triggered publishing
+#
+# Holdfast's release. **The changelog is the release and this file is the
+# messenger** — it publishes the section of CHANGELOG.md that bears the tag's
+# version and adds nothing of its own. Release prose is not in the repository,
+# is not reviewed with the code, and does not survive the repository being
+# recreated; a section under version control is all three.
+#
+# Constraints this file is held to (enforced by scripts/ci-hygiene.sh):
+#   * the `RELEASE-WORKFLOW:` marker above is **verified, not believed**: the
+#     `on:` block must name `tags:` and must name none of `branches:`,
+#     `pull_request`, `pull_request_target` or `schedule`. That is what makes
+#     the publishing capability safe to grant — nothing but somebody tagging
+#     a commit on purpose can start this.
+#   * no `continue-on-error`, no retry action — a release that half-happened
+#     and reported success is worse than one that failed
+#   * every `uses:` pinned to a 40-hex commit SHA
+#   * `persist-credentials: false`; the token this job needs is passed
+#     explicitly to the one step that needs it
+#   * `runs-on: ubuntu-24.04`, never ubuntu-latest
+#   * explicit timeout-minutes
+#
+# **`gh` rather than a release action**, deliberately: it is preinstalled on
+# the runner, so this adds no third-party dependency to pin, review and watch
+# for compromise on the one workflow that holds a write token.
+#
+# **No binary assets.** §12.3's binding event is *first external
+# distribution*, and several deliberate escapes — the wire-shape record's
+# in-place corrections most of all — are conditioned on it not having
+# happened. Attaching a binary here is that event, and it is not one to
+# trigger as a side effect of writing release notes. When it is time, it is a
+# decision, and it changes what the escapes above are allowed to do.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      # The whole grant, and only here: creating a release writes to the
+      # repository. `ci.yml` cannot ask for this — ci-hygiene refuses a write
+      # permission on any workflow without the verified marker.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # **Three things must agree before anything is published**: the tag, the
+      # workspace version, and a changelog section that exists. Any pair
+      # agreeing while the third does not is the failure this checks for — a
+      # tag pushed before the version bump, or a version bumped with no notes
+      # written, both of which are easy and both of which produce a release
+      # nobody can read.
+      - name: The tag, the crate version and the changelog must agree
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$version" != "$crate" ]; then
+            echo "tag $tag says $version; Cargo.toml says $crate" >&2
+            exit 1
+          fi
+          # The section for exactly this version, up to the next heading.
+          awk -v v="## [$version]" '
+            index($0, v) == 1 { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "CHANGELOG.md has no '## [$version]' section with content." >&2
+            echo "Cutting a release is: rename [Unreleased] to the version with" >&2
+            echo "its date, commit, then tag. The notes are the section." >&2
+            exit 1
+          fi
+          echo "notes: $(wc -l < release-notes.md) lines"
+
+      # `--verify-tag` so a release cannot be created for a tag that is not on
+      # the remote, and `--notes-file` so the body is the changelog verbatim
+      # rather than anything this file composed.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "holdfast ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md
