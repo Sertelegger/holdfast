@@ -45,6 +45,17 @@ self_test() {
   mkdir -p "$tmp/.github/workflows" "$tmp/scripts"
   printf '#!/bin/sh\nexit 0\n' > "$tmp/scripts/fixture-probe.sh"
   chmod +x "$tmp/scripts/fixture-probe.sh"
+  # **The fixture needs the files the *other* rules read**, or every
+  # `want_ok` fails on a rule it was not testing. That is not hypothetical:
+  # the tool-count rule was added after these fixtures were written, and
+  # from then on all three accepted cases failed on a missing
+  # `scripts/mcp-smoke.sh` — for months, unnoticed, because CI runs this
+  # script but never `--self-test`. A self-test that cannot pass is a guard
+  # nobody is guarding.
+  printf '%s\n' 'tools=["a","b","c","d","e","f","g","h","i","j","k","l"]' \
+    > "$tmp/scripts/mcp-smoke.sh"
+  chmod +x "$tmp/scripts/mcp-smoke.sh"
+  printf 'twelve MCP tools\n' > "$tmp/CLAUDE.md"
 
   fixture() { # fixture <the job's runner lines, indented>
     { cat <<'YAML'
@@ -96,6 +107,33 @@ YAML
     fi
   }
 
+  # A whole-file fixture, for rules about the `on:` block rather than a job.
+  whole() { printf '%s\n' "$1" > "$tmp/.github/workflows/fixture.yml"; }
+
+  want_file_ok() { # want_file_ok <label> <whole file>
+    whole "$2"
+    out="$(cd "$tmp" && "$me" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+      printf '  PASS  %s\n' "$1"
+    else
+      printf '  FAIL  %s — want exit 0, got %d\n' "$1" "$rc"
+      printf '%s\n' "$out" | sed 's/^/          /'
+      failures=$((failures + 1))
+    fi
+  }
+
+  want_file_denied() { # want_file_denied <label> <expected FORBIDDEN text> <whole file>
+    whole "$3"
+    out="$(cd "$tmp" && "$me" 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$2"; then
+      printf '  PASS  %s\n' "$1"
+    else
+      printf '  FAIL  %s — want %s; exit %d\n' "$1" "$2" "$rc"
+      printf '%s\n' "$out" | sed 's/^/          /'
+      failures=$((failures + 1))
+    fi
+  }
+
   echo "ci-hygiene self-test — the runner-image rule, both directions"
   echo
 
@@ -123,6 +161,76 @@ not reject 0.0.11's correct Windows job" \
   want_denied "runs-on: windows-latest is rejected (the case the rule named \
 but did not match)" \
               "    runs-on: windows-latest"
+
+  echo
+  echo "ci-hygiene self-test — the release gate, all three directions"
+  echo
+
+  # Publishing is allowed only where the trigger cannot fire by accident.
+  want_file_ok "a tag-triggered release workflow may use secrets and publish" \
+"# RELEASE-WORKFLOW: tag-triggered publishing
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: ./scripts/fixture-probe.sh
+      - run: gh release create \"\$TAG\" --notes-file NOTES.md
+        env:
+          GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}"
+
+  # The marker is checked, not believed. Without this the gate would be an
+  # opt-out anybody could write on any file.
+  want_file_denied "a release marker on a branch-triggered workflow is rejected" \
+    'the marker is checked, not believed' \
+"# RELEASE-WORKFLOW: tag-triggered publishing
+name: NotReallyRelease
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: ./scripts/fixture-probe.sh
+      - run: echo publish"
+
+  # And an ordinary workflow still cannot authenticate. This is the rule the
+  # widening must not have deleted.
+  want_file_denied "an unmarked workflow may not reference secrets" \
+    'FORBIDDEN: a secrets context reference' \
+"name: Fixture
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: ./scripts/fixture-probe.sh
+      - run: echo \${{ secrets.GITHUB_TOKEN }}"
   want_denied "runs-on: macos-latest is rejected" \
               "    runs-on: macos-latest"
   want_denied "an alias in a matrix os: list is rejected, where runs-on: \
@@ -228,17 +336,84 @@ deny() { # deny <extended-regex> <why>
   fi
 }
 
+# **Publishing is allowed, in exactly one shape.** The rule here used to be
+# "this pipeline authenticates to nothing", which forbade release automation
+# outright. That is more hygiene than the risk warrants: the danger is not
+# that a workflow *can* publish, it is that one publishes when nobody asked.
+# A trigger is what separates those, so the capability is gated on the
+# trigger rather than banned.
+#
+# A file may opt in with a `RELEASE-WORKFLOW:` marker, and the marker is
+# **verified rather than trusted** — same shape as the calibration exemption
+# above. `release_gate_ok` requires the `on:` block to name `tags:` and to
+# name none of `branches:`, `pull_request`, `pull_request_target` or
+# `schedule`. So a release workflow cannot fire from a branch push, a pull
+# request, or a timer; the only thing that starts it is somebody tagging a
+# commit on purpose. A marker on a file that does not meet that is a
+# failure, not a pass — otherwise the marker would be the whole security
+# model.
+release_ok=()
+for i in "${!files[@]}"; do
+  release_ok[$i]=0
+  # **Anchored to the start of a comment line**, and read from the
+  # unstripped file because a marker *is* a comment. Unanchored, this file's
+  # own header — which has to name the marker to document it — declared
+  # itself a release workflow, and `ci.yml` failed on the first run. Same
+  # class as the `-latest` rule's comment hazard, which is why that one is
+  # matched against the stripped copy; a marker cannot be.
+  grep -qE '^#[[:space:]]*RELEASE-WORKFLOW:' "${files[$i]}" || continue
+  # The `on:` block: from a line starting `on:` to the next top-level key.
+  on_block="$(awk '/^on:/{f=1;next} f&&/^[a-zA-Z_]+:/{exit} f{print}' "${stripped[$i]}")"
+  if printf '%s' "$on_block" | grep -qE '^[[:space:]]+tags:' \
+     && ! printf '%s' "$on_block" | grep -qE '^[[:space:]]+(branches|schedule):' \
+     && ! printf '%s' "$on_block" | grep -qE '^[[:space:]]*pull_request(_target)?:'; then
+    release_ok[$i]=1
+    printf 'note  %s is a release workflow: tag-triggered, publishing allowed\n' "${files[$i]}"
+  else
+    printf '  %s: RELEASE-WORKFLOW marker on a workflow that is not tag-only\n' "${files[$i]}"
+    printf '  FORBIDDEN: %s\n' 'a release marker whose `on:` block is not tags-only — the marker is checked, not believed'
+    fails=$((fails + 1))
+  fi
+done
+
+# `deny_unless_release` skips files that cleared the gate above; `deny`
+# still applies everywhere, including to release workflows.
+deny_unless_release() { # deny_unless_release <extended-regex> <why>
+  local re="$1" why="$2" out="" i m
+  for i in "${!files[@]}"; do
+    [ "${release_ok[$i]}" = "1" ] && continue
+    m="$(grep -nE -- "$re" "${stripped[$i]}" 2>/dev/null)" || true
+    if [ -n "$m" ]; then
+      out+="$(printf '%s\n' "$m" | sed "s|^|  ${files[$i]}:|")"$'\n'
+    fi
+  done
+  if [ -n "$out" ]; then
+    printf '%s' "$out"
+    printf '  FORBIDDEN: %s\n' "$why"
+    fails=$((fails + 1))
+  else
+    printf '  ok    absent outside a release workflow: %s\n' "$why"
+  fi
+}
+
+# Dangerous whatever the trigger. `continue-on-error` and retries hide the
+# races this suite exists to catch; `pull_request_target` runs untrusted code
+# with a writable token; `write-all` and `-latest` are unbounded grants.
 deny 'continue-on-error'                          'continue-on-error — a job that cannot fail; the Actions equivalent of retry:, and worse'
 deny 'uses:[^#]*(retry|wretry)'                   'a retry action — a retried PTY test hides the race it exists to catch'
-deny 'secrets\.'                                  'a secrets context reference — this pipeline authenticates to nothing'
-deny 'uses:[^#]*(action-gh-release|create-release|release-action|actions-gh-pages)' 'a release/publish action — release automation is milestone 0.0.12'
-deny 'cargo[[:space:]]+(publish|owner|login)'     'crates.io publishing'
-deny 'docker[[:space:]]+(push|login)'             'container registry push'
-deny '(^|[[:space:]])(gh|glab)[[:space:]]'        'a CLI that can publish or authenticate'
-deny 'git[[:space:]]+push'                        'writing to a remote'
 deny 'pull_request_target'                        'pull_request_target — runs untrusted code with a writable token'
-deny 'permissions:[[:space:]]*write-all'          'permissions: write-all'
-deny '(contents|packages|id-token|actions|deployments):[[:space:]]*write' 'a write permission'
+deny 'permissions:[[:space:]]*write-all'          'permissions: write-all — name the scopes you need'
+
+# Publishing capabilities: fine in a tag-triggered release workflow, never
+# anywhere else. A `contents: write` on the CI workflow is how a test job
+# grows the ability to move a tag; on the release workflow it is the point.
+deny_unless_release 'secrets\.'                                  'a secrets context reference'
+deny_unless_release 'uses:[^#]*(action-gh-release|create-release|release-action|actions-gh-pages)' 'a release/publish action'
+deny_unless_release 'cargo[[:space:]]+(publish|owner|login)'     'crates.io publishing'
+deny_unless_release 'docker[[:space:]]+(push|login)'             'container registry push'
+deny_unless_release '(^|[[:space:]])(gh|glab)[[:space:]]'        'a CLI that can publish or authenticate'
+deny_unless_release 'git[[:space:]]+push'                        'writing to a remote'
+deny_unless_release '(contents|packages|id-token|actions|deployments):[[:space:]]*write' 'a write permission'
 # Not anchored to `runs-on:`, deliberately: `runs-on: ${{ matrix.os }}` names
 # no image, and an anchored rule cannot see the alias in the `os:` list. These
 # three names are runner images and nothing else. Comments are blanked before
