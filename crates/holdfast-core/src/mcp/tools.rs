@@ -1029,17 +1029,70 @@ impl HoldfastServer {
                 "session has exited",
             ));
         }
+        // **The request is recorded, then folded with the attached
+        // writers** (GH #75). Before this the tool wrote straight through:
+        // any attached client's next `SIGWINCH` recomputed the minimum and
+        // silently overwrote it, and — new when the session started taking
+        // the smallest writer — an unrelated client *detaching* reverted it
+        // too. An agent that sized a session for a TUI had it reflowed by
+        // somebody leaving the room, with nothing on this surface to see.
+        //
+        // Recording it fixes the durable half: `desired_size` is the floor
+        // the session returns to when the last writer detaches, so the
+        // request outlives the clients rather than the other way round.
+        session.set_desired_size(args.cols, args.rows);
+        // `Some` unconditionally here: this call *is* the request, so the
+        // fold always has a desired size to work with.
+        let (want_cols, want_rows) = self
+            .attach_hub()
+            .effective_size(&session.id, Some((args.cols, args.rows)))
+            .unwrap_or((args.cols, args.rows));
+
         // A failing `ioctl` is Holdfast failing to do its job, not a session
         // outcome, so it takes the protocol channel (§5.1) — and it
         // matters that it does: the alternative is an `ok` reporting
         // dimensions the terminal never reached.
-        if let Err(e) = session.resize(args.cols, args.rows) {
+        if let Err(e) = session.resize(want_cols, want_rows) {
             return envelope::from_error(&e);
         }
         let (cols, rows) = session.size();
+        // Tell the attached clients, because this changed their view and
+        // none of them asked for it. The tool emitted no frame at all
+        // before, so a human's terminal learned about an agent's resize
+        // only by redrawing.
+        for c in self.attach_hub().clients_of(&session.id) {
+            {
+                let mut told = c.last_told.lock();
+                if *told == Some((cols, rows)) {
+                    continue;
+                }
+                *told = Some((cols, rows));
+            }
+            let _ =
+                c.tx.try_send(crate::attach::ServerFrame::Resize { cols, rows });
+        }
+
+        // **Reports what the terminal got, and says so when that is not
+        // what was asked.** Answering `ok` with the requested geometry while
+        // the session held another was the observability half of #75: the
+        // agent had no way to learn it had been narrowed.
+        let details = if (cols, rows) == (args.cols, args.rows) {
+            format!("resized to {cols}x{rows}")
+        } else {
+            format!(
+                "resized to {cols}x{rows}; {}x{} was requested but an attached client's \
+                 terminal is smaller, and the session returns to the requested size when \
+                 that client detaches",
+                args.cols, args.rows
+            )
+        };
         Ok(envelope::ok(
+            // **No `requested_*` fields.** `cols`/`rows` now report what the
+            // terminal actually has, which is the observability this needed;
+            // adding a second pair to a §23.3-gated surface for a nicety the
+            // details sentence already carries is not worth the key.
             json!({ "cols": cols, "rows": rows }),
-            format!("resized to {cols}x{rows}"),
+            details,
         ))
     }
 

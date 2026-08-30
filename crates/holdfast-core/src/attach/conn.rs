@@ -440,7 +440,13 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
     // move.
     if conn.mode == AttachMode::ReadWrite && conn.last_size.lock().is_some() {
         let achieved = daemon.attach_hub().with_resize_decision(|| {
-            let want = daemon.attach_hub().writer_min_size(&conn.session_id)?;
+            // **With no writers left this is the agent's desired size**, so
+            // the last human detaching returns the session to what a tool
+            // asked for rather than stranding it at a departed client's
+            // geometry — which nothing could observe or undo (GH #75).
+            let want = daemon
+                .attach_hub()
+                .effective_size(&conn.session_id, session.desired_size())?;
             if want == session.size() {
                 return None;
             }
@@ -752,7 +758,12 @@ async fn read_loop(
                 let outcome = daemon.attach_hub().with_resize_decision(|| {
                     *conn.last_size.lock() = claim;
                     let before = session.size();
-                    let want = daemon.attach_hub().writer_min_size(&conn.session_id);
+                    // Folded with what the *agent* asked for, so a client's
+                    // window narrows the session without erasing the size a
+                    // tool set (GH #75).
+                    let want = daemon
+                        .attach_hub()
+                        .effective_size(&conn.session_id, session.desired_size());
                     match want {
                         Some((c, r)) => match session.resize(c, r) {
                             Ok(()) => Some((before, session.size())),

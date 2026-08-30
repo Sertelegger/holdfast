@@ -4265,3 +4265,109 @@ async fn one_terminal_admits_one_writer_even_across_two_sessions() {
         .await
         .expect("a different terminal is unaffected");
 }
+
+/// **An agent's `resize` outlives the clients that narrow it** (GH #75).
+///
+/// The tool wrote straight through to the PTY, recorded nothing, and emitted
+/// no frame. So any attached client's next `SIGWINCH` silently overwrote it,
+/// and — new once the session began taking the smallest writer — an
+/// unrelated client *detaching* reverted it too. An agent that sized a
+/// session for a TUI had it reflowed by somebody leaving the room, with
+/// nothing on the MCP surface to observe it.
+///
+/// Three properties, and the third is the one that was impossible before:
+/// the request takes effect with nobody attached; an attached terminal that
+/// cannot display it narrows it *and the tool says so*; and when that client
+/// leaves, the session returns to what was asked for rather than stranding
+/// at the departed client's geometry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agents_resize_survives_a_client_attaching_and_detaching() {
+    use holdfast_core::mcp::tools::ResizeArgs;
+
+    let d = TestDaemon::start("resizetool").await;
+    let s = d.real_session();
+
+    let resize = |cols: u16, rows: u16| {
+        let server = &d.daemon.server;
+        let id = s.id.clone();
+        async move {
+            server
+                .resize(Parameters(ResizeArgs {
+                    session: id,
+                    cols,
+                    rows,
+                }))
+                .await
+                .expect("resize must not be a protocol error")
+        }
+    };
+
+    // 1. Nobody attached: the agent gets what it asked for.
+    let r = resize(200, 50).await;
+    let payload: serde_json::Value =
+        serde_json::from_str(&r.content[0].as_text().expect("text").text).expect("json");
+    assert_eq!(payload["data"]["cols"], 200, "{payload}");
+    assert_eq!(s.size(), (200, 50));
+
+    // 2. A narrower terminal attaches and reports itself. The session must
+    //    fit what the human can actually see.
+    let mut c = attach_verdict(&d, &s.id, AttachMode::ReadWrite, Some("rdev:0xf1"))
+        .await
+        .expect("attach");
+    send(&mut c, &ClientFrame::Resize { cols: 80, rows: 24 }).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while s.size() != (80, 24) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(s.size(), (80, 24), "the human's terminal must win");
+
+    // 3. The tool now reports what the terminal got, and names the reason.
+    //    Answering `ok` with the requested geometry while the session held
+    //    another was the observability half of this issue.
+    let r = resize(200, 50).await;
+    let payload: serde_json::Value =
+        serde_json::from_str(&r.content[0].as_text().expect("text").text).expect("json");
+    assert_eq!(payload["data"]["cols"], 80, "{payload}");
+    assert!(
+        payload["details"]
+            .as_str()
+            .expect("details")
+            .contains("attached client"),
+        "the agent must be told why it did not get 200 columns: {payload}"
+    );
+
+    // 3b. **The other direction, and it is what makes the fold a fold.**
+    //     Asking for *fewer* columns than the attached terminal has must
+    //     narrow the session: a human with 200 columns can display 60, so
+    //     there is no reason to refuse the agent. Without this step the
+    //     whole `min` could be replaced by "the writer wins" and every
+    //     assertion above still passes — the cases only diverge when the
+    //     agent's request is the smaller one.
+    let r = resize(60, 20).await;
+    let payload: serde_json::Value =
+        serde_json::from_str(&r.content[0].as_text().expect("text").text).expect("json");
+    assert_eq!(
+        payload["data"]["cols"], 60,
+        "an agent asking for fewer columns than the client has must get them: {payload}"
+    );
+    assert_eq!(
+        s.size(),
+        (60, 20),
+        "the smaller of the two, whichever it is"
+    );
+    // And back up, so step 4 is testing the detach rather than this.
+    let _ = resize(200, 50).await;
+
+    // 4. The client leaves, and the session returns to the agent's size.
+    drop(c);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while s.size() != (200, 50) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        s.size(),
+        (200, 50),
+        "the session stayed at the geometry of a client that had gone, and \
+         nothing on the MCP surface could have told the agent"
+    );
+}

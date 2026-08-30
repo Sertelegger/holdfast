@@ -128,12 +128,11 @@ pub struct AttachHub {
     /// expires — so one slot holding both would make the fall-through
     /// overwrite the thing it fell through from.
     approvals: crate::secret::BindingApprovals,
-    /// The `(session_id, terminal)` pairs a writer currently holds.
-    ///
-    /// A set rather than a count: the question is only ever *"is this
-    /// terminal taken on this session"*, and a count would have to be
-    /// decremented correctly on every path a guard now handles for free.
     /// Terminal device -> the session whose writer holds it.
+    ///
+    /// A map rather than a count: the question is only ever *"is this
+    /// terminal taken"*, and a count would have to be decremented correctly
+    /// on every path a guard now handles for free.
     ///
     /// **Keyed on the terminal alone, not on `(session, terminal)`.** The
     /// failure is that two processes `read()`ing one terminal device are
@@ -241,6 +240,36 @@ impl AttachHub {
     /// than converging on a final geometry". A minimum has no such
     /// ordering dependence: the same set of clients yields the same answer
     /// whoever reported last.
+    /// The geometry to put in force: what the agent asked for, narrowed by
+    /// what every attached writer can display (GH #75).
+    ///
+    /// **`desired` is the floor when nobody is attached**, which is the half
+    /// that was missing. The fold used to answer `None` with no writers and
+    /// the caller left the session alone — so a session an agent had sized
+    /// for a TUI stayed at the geometry of whichever human client had most
+    /// recently held it, forever, and the agent had no way to observe or
+    /// undo that. Now the last writer detaching returns the session to the
+    /// size it was asked for.
+    ///
+    /// A minimum in both directions on purpose: an attached human must not
+    /// be asked to render columns their terminal does not have, and an agent
+    /// asking for fewer than a human's terminal gets those fewer.
+    pub fn effective_size(
+        &self,
+        session_id: &str,
+        desired: Option<(u16, u16)>,
+    ) -> Option<(u16, u16)> {
+        match (self.writer_min_size(session_id), desired) {
+            (Some(w), Some(d)) => Some((w.0.min(d.0), w.1.min(d.1))),
+            (Some(w), None) => Some(w),
+            (None, Some(d)) => Some(d),
+            // Nobody is attached and nothing has been asked for: there is no
+            // geometry to put in force, and inventing one would resize a
+            // session to a default nobody chose.
+            (None, None) => None,
+        }
+    }
+
     pub fn writer_min_size(&self, session_id: &str) -> Option<(u16, u16)> {
         self.clients_of(session_id)
             .iter()
