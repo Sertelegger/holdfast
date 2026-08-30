@@ -176,12 +176,22 @@ fn bash_args() -> Vec<String> {
 }
 
 async fn start_bash(server: &HoldfastServer) -> (String, CallToolResult) {
+    start_bash_with(server, |_| {}).await
+}
+
+/// `start_bash`, with a chance to set one of `start_session`'s knobs.
+async fn start_bash_with(
+    server: &HoldfastServer,
+    tweak: impl FnOnce(&mut StartSessionArgs),
+) -> (String, CallToolResult) {
+    let mut args = StartSessionArgs {
+        command: Some("bash".into()),
+        args: bash_args(),
+        ..Default::default()
+    };
+    tweak(&mut args);
     let r = server
-        .start_session(Parameters(StartSessionArgs {
-            command: Some("bash".into()),
-            args: bash_args(),
-            ..Default::default()
-        }))
+        .start_session(Parameters(args))
         .await
         .expect("start_session must not be a protocol error");
     let id = body(&r)["data"]["session_id"]
@@ -2388,6 +2398,7 @@ async fn a_pattern_less_wait_resolves_when_the_command_finishes() {
         .await
         .expect("send_input");
 
+    let started = std::time::Instant::now();
     let r = server
         .wait_for_pattern(Parameters(WaitForPatternArgs {
             session: id.clone(),
@@ -2398,10 +2409,23 @@ async fn a_pattern_less_wait_resolves_when_the_command_finishes() {
         }))
         .await
         .expect("wait_for_pattern must not be a protocol error");
+    let elapsed = started.elapsed();
     let payload = assert_matches_schema("wait_for_pattern", &r);
     assert_eq!(payload["status"], "ok", "{payload}");
     assert_eq!(payload["data"]["reached"], true, "{payload}");
     assert_eq!(payload["data"]["interaction_mode"], "AtPrompt", "{payload}");
+    // **It has to have actually waited**, and until a review pointed it out
+    // this row measured nothing. Every other assertion here is satisfied by
+    // an implementation that returns before the command starts — which is
+    // precisely the race the settle window, `saw_executing` and the
+    // command-history probe exist to close, and which was measured at 19
+    // failures in 30 in one of the variants they replaced. Six mutations
+    // deleting that discipline outright left this row green.
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "returned in {elapsed:?} for a `sleep 1` — the wait resolved before \
+         the command finished: {payload}"
+    );
     // `matched` answers a question this call did not ask.
     assert!(
         payload["data"].get("matched").is_none(),
@@ -2410,7 +2434,42 @@ async fn a_pattern_less_wait_resolves_when_the_command_finishes() {
     // §8.3's rule: the caller must be able to tell a measured prompt from
     // a guessed one, so the tier travels with the verdict.
     assert_eq!(payload["data"]["detection_tier"], "semantic", "{payload}");
-    assert!(payload["data"]["prompt"]["reason"].is_string(), "{payload}");
+    // **The reason's content, not its type.** `is_string()` is true of
+    // `"MUTANT_NONSENSE_REASON"`, and a mutation writing exactly that
+    // survived. §8.3 names `prompt.reason` as one of the three fields an
+    // agent uses to tell a measured answer from a guessed one.
+    assert_eq!(
+        payload["data"]["prompt"]["reason"], "osc 133 prompt marker with no command started since",
+        "{payload}"
+    );
+    // **Exactly, not a subset.** A subset check passes against a response
+    // that grew `output_since_start`/`next_cursor` describing a scan that
+    // never ran — a mutation adding all four survived the whole suite.
+    let mut keys: Vec<&str> = payload["data"]
+        .as_object()
+        .expect("data is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "detection_tier",
+            "interaction_mode",
+            "prompt",
+            "reached",
+            "screen_tracking",
+            "title",
+        ],
+        "the pattern-less response key set drifted: {payload}"
+    );
+    // §5.1's human-readable half must not name a pattern the caller never
+    // supplied. It read "pattern matched" here.
+    assert_eq!(
+        payload["details"], "session is AtPrompt",
+        "details must describe the mode, not a pattern: {payload}"
+    );
 
     kill(&server, &id).await;
 }
@@ -2517,6 +2576,23 @@ async fn a_pattern_less_wait_returns_at_once_from_an_exited_session() {
         .expect("wait_for_pattern must not be a protocol error");
     let elapsed = started.elapsed();
     let payload = assert_matches_schema("wait_for_pattern", &r);
+    // **A death is not a success, and this row is where that is pinned.**
+    // Its two siblings both open with a `status` assertion and this one
+    // silently omitted it — the single line, present in three places and
+    // missing in the fourth, was the whole of the coverage. Without it the
+    // tool answered `ok` here while the *pattern* form answered
+    // `session_died` for the identical session state: one tool, two forms,
+    // disagreeing on the wire, and an agent needing a second `status` call
+    // to discover its shell was gone.
+    assert_eq!(payload["status"], "session_died", "{payload}");
+    // §18.1 puts this tool in the `session_died` row with `data.exit_code`
+    // set. It was declared in the schema, listed in no spec Returns block,
+    // and emitted by no path of this tool at all.
+    assert!(
+        payload["data"].get("exit_code").is_some(),
+        "session_died must carry the exit code, which is the only actionable \
+         datum on this answer: {payload}"
+    );
     assert_eq!(payload["data"]["reached"], true, "{payload}");
     assert_eq!(payload["data"]["interaction_mode"], "Exited", "{payload}");
     assert!(
@@ -3984,4 +4060,286 @@ fn every_tool_that_declares_prompt_declares_the_same_block() {
          walk is not walking: {found_in:?}",
         found_in.len()
     );
+}
+
+/// **An empty pattern is refused, not silently satisfied.**
+///
+/// `""` compiled to a regex matching at offset zero, so it returned
+/// `matched: true` with `match.text: ""` immediately — measured against a
+/// running `sleep 30`, and against an already-dead session where it also
+/// skipped the `session_died` the pattern path would have reported.
+///
+/// Absent and `null` are byte-identical and both mean the pattern-less
+/// wait, so `""` was the odd one out rather than a third of three, and
+/// making `pattern` optional is exactly what makes `""` a likely client
+/// encoding of "omit". Aliasing it to omitted would hide that bug in the
+/// caller; refusing names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_pattern_is_refused_rather_than_matching_everything() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for_at_prompt(&server, &id).await;
+
+    let err = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: Some(String::new()),
+            timeout_secs: Some(5),
+            since_cursor: None,
+            max_bytes: None,
+        }))
+        .await
+        .expect_err("an empty pattern must be a protocol error");
+    assert!(
+        err.message.contains("omit it entirely"),
+        "the refusal must say what to do instead: {}",
+        err.message
+    );
+
+    // The control: `null` is *not* an error, it is the pattern-less wait.
+    let r = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: None,
+            timeout_secs: Some(5),
+            since_cursor: None,
+            max_bytes: None,
+        }))
+        .await
+        .expect("an absent pattern is the idle wait, not an error");
+    let payload = assert_matches_schema("wait_for_pattern", &r);
+    assert_eq!(payload["status"], "ok", "{payload}");
+
+    kill(&server, &id).await;
+}
+
+/// **The caller's deadline bounds the settle window too.**
+///
+/// `settle_threshold_ms` is a per-session argument and a config key, and it
+/// gated the pattern-less wait's belief in an idle prompt without being
+/// bounded by the deadline. Measured at `settle_threshold_ms: 5000` with
+/// `timeout_secs: 1`: `reached: false` beside `interaction_mode: AtPrompt`
+/// at `semantic` tier and confidence 1.0 — the truth and the false thing in
+/// one payload, which is the exact failure this whole form exists to
+/// retire, reintroduced by a knob.
+///
+/// An operator who raises the threshold past their timeout must not turn
+/// short waits into guaranteed timeouts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_settle_threshold_does_not_make_a_short_wait_unsatisfiable() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash_with(&server, |a| {
+        a.settle_threshold_ms = Some(5_000);
+    })
+    .await;
+    wait_for_at_prompt(&server, &id).await;
+
+    let started = std::time::Instant::now();
+    let r = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: None,
+            timeout_secs: Some(2),
+            since_cursor: None,
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let elapsed = started.elapsed();
+    let payload = assert_matches_schema("wait_for_pattern", &r);
+    assert_eq!(
+        payload["status"], "ok",
+        "a settle threshold longer than the deadline made an idle session \
+         unreachable, in {elapsed:?}: {payload}"
+    );
+    assert_eq!(payload["data"]["reached"], true, "{payload}");
+    assert_eq!(payload["data"]["interaction_mode"], "AtPrompt", "{payload}");
+
+    kill(&server, &id).await;
+}
+
+/// **The wait begins before the command does, which is the race the
+/// `AtPrompt` discipline exists for.**
+///
+/// Its sibling `a_pattern_less_wait_resolves_when_the_command_finishes`
+/// cannot see this: by the time that row's wait starts, `send_input` has
+/// already driven the shell to `Executing`, so the `AtPrompt` arm is never
+/// reached while the answer is still ambiguous. A mutation breaking out of
+/// that arm unconditionally — verbatim pre-fix behaviour, measured at 19
+/// failures in 30 — passed it.
+///
+/// Here the wait is in flight *first* and the input arrives after, so the
+/// first thing it observes is an idle prompt with nothing started. Returning
+/// then would report "finished" for a command that has not begun, and the
+/// agent would read the previous command's exit code from
+/// `get_command_history`.
+///
+/// `settle_threshold_ms` is raised so the window cannot expire inside the
+/// gap before the input lands; the deadline is far longer, so the clamp
+/// added for the short-deadline case does not shorten it here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pattern_less_wait_started_at_an_idle_prompt_does_not_resolve_early() {
+    let server = std::sync::Arc::new(HoldfastServer::new());
+    let (id, _) = start_bash_with(&server, |a| {
+        a.settle_threshold_ms = Some(1_000);
+    })
+    .await;
+    wait_for_at_prompt(&server, &id).await;
+
+    // **A completed command before the wait starts**, so `baseline` is
+    // load-bearing. Without one the history is empty either way and reading
+    // it from offset zero instead of from the call's own baseline is an
+    // equivalent mutation — which is exactly what it looked like until this
+    // ran. With a warm-up present, a zero baseline finds *this* closed entry
+    // and reports the session finished before the real command starts.
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "echo warmup".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("warm-up send_input");
+    wait_for_at_prompt(&server, &id).await;
+
+    let waiter = {
+        let server = std::sync::Arc::clone(&server);
+        let id = id.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let r = server
+                .wait_for_pattern(Parameters(WaitForPatternArgs {
+                    session: id,
+                    pattern: None,
+                    timeout_secs: Some(30),
+                    since_cursor: None,
+                    max_bytes: None,
+                }))
+                .await
+                .expect("wait_for_pattern must not be a protocol error");
+            (started.elapsed(), r)
+        })
+    };
+
+    // Long enough that the wait is certainly polling an idle prompt, short
+    // enough that the settle window above cannot have expired.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "sleep 2".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("send_input");
+
+    let (elapsed, r) = waiter.await.expect("the waiter task");
+    let payload = assert_matches_schema("wait_for_pattern", &r);
+    assert_eq!(payload["status"], "ok", "{payload}");
+    assert!(
+        elapsed >= Duration::from_millis(2_000),
+        "the wait resolved in {elapsed:?}, before the `sleep 2` it was \
+         started ahead of could have finished: {payload}"
+    );
+
+    kill(&server, &id).await;
+}
+
+/// **The advertised contract for the pattern-less form, pinned by name.**
+///
+/// Deleting the sentence that tells a client the pattern may be omitted —
+/// the only wire-side documentation of the mode this milestone added — left
+/// the suite green, as did making `pattern` *required* again by dropping its
+/// `#[serde(default)]`, which would break every client that omits it.
+///
+/// `start_session` sets the precedent this follows: a constraint that lives
+/// in argument prose gets pinned by name, because prose is the only place a
+/// client can read it.
+#[test]
+fn the_pattern_argument_advertises_that_it_may_be_omitted() {
+    let tool = advertised("wait_for_pattern");
+    let schema = serde_json::to_value(&*tool.input_schema).expect("input schema");
+
+    // Required-ness is the wire fact: `["session"]`, not `["session","pattern"]`.
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("required is an array")
+        .iter()
+        .map(|v| v.as_str().expect("a string"))
+        .collect();
+    assert_eq!(
+        required,
+        vec!["session"],
+        "`pattern` became required again — every client that omits it now \
+         gets invalid_params: {schema}"
+    );
+
+    let desc = schema["properties"]["pattern"]["description"]
+        .as_str()
+        .expect("pattern has a description");
+    assert!(
+        desc.contains("Omit it"),
+        "the pattern-less form is documented nowhere a client can read it: {desc}"
+    );
+    // And the refusal a caller will actually hit, so the prose and the
+    // validation cannot drift apart.
+    assert!(
+        desc.contains("empty"),
+        "an empty pattern is refused by the code and unmentioned in the \
+         description a caller reads: {desc}"
+    );
+}
+
+/// **The idle path honours the deadline it was given, and says when it was
+/// rewritten.**
+///
+/// Two mutations survived here: dropping `clamped_timeout_secs` from this
+/// path entirely, and ignoring `timeout` in favour of a hardcoded ten
+/// seconds. The pattern path pins both; this one pinned neither, so
+/// `wait_for_pattern(pattern=None, timeout_secs=0)` could block for an hour
+/// with no field telling the agent its deadline had been rewritten — the
+/// exact information REQ-T-008 exists to surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pattern_less_wait_reports_its_clamp_and_honours_its_deadline() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for_at_prompt(&server, &id).await;
+
+    // `0` means "no caller deadline"; the daemon still caps it and must say so.
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "sleep 30".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("send_input");
+
+    let started = std::time::Instant::now();
+    let r = server
+        .wait_for_pattern(Parameters(WaitForPatternArgs {
+            session: id.clone(),
+            pattern: None,
+            timeout_secs: Some(1),
+            since_cursor: None,
+            max_bytes: None,
+        }))
+        .await
+        .expect("wait_for_pattern must not be a protocol error");
+    let elapsed = started.elapsed();
+    let payload = assert_matches_schema("wait_for_pattern", &r);
+    assert_eq!(payload["status"], "timeout", "{payload}");
+    assert_eq!(payload["data"]["reached"], false, "{payload}");
+    // The deadline it was given, not one of its own choosing.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "asked for 1s and took {elapsed:?} — the caller's deadline was ignored: {payload}"
+    );
+    // §5.1's text half must not name a pattern on this form either.
+    assert_eq!(
+        payload["details"], "session still executing after 1s",
+        "{payload}"
+    );
+
+    kill(&server, &id).await;
 }
