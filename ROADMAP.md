@@ -23,8 +23,10 @@ sessions outlive the MCP client rather than dying with it. Output is
 ANSI-stripped and **secret-redacted by default**, with `--raw` and
 `read_output(redact: false)` as audited opt-outs. Detection is real — sessions
 report `interaction_mode` with the `detection_tier` that produced it. Windows
-is not there yet, and neither is attach, the web UI, or the dangerous-command
-preflight. See the README for the accurate current surface and
+is not there yet, and neither is the web UI or the dangerous-command
+preflight. **`attach` shipped in 0.0.6** and this line said otherwise until
+0.0.7 — the README has opened with it as a shipped property the whole time,
+so the two files disagreed about the same feature. See the README for the accurate current surface and
 [SECURITY.md](./SECURITY.md) for what that means in practice.
 
 ## Output processing
@@ -94,7 +96,11 @@ rather than something the agent can arrange.
 `read_output` responses with bulk output delivered as MCP resources rather than
 inline, so a chatty build cannot consume the agent's context, and the tools that
 mean an agent no longer has to poll — `wait_for_pattern`, `interrupt`, `resize`.
-The backend already signals and resizes; neither is exposed as a tool.
+**All three shipped**, and `wait_for_pattern`'s `pattern` became optional in
+0.0.7 so the "has it finished?" question is answered from the detector rather
+than from a regex against the operator's `$PS1`. This paragraph described
+them as unexposed until then, which is the shape of staleness a roadmap
+collects: it is written forward and read as a status.
 
 ## Web UI
 
