@@ -18,7 +18,6 @@ been measured, and what would settle it.
 | [#39](https://github.com/Sertelegger/holdfast/issues/39) | `attaching_to_an_already_exited_session_ends_instead_of_hanging` (`crates/holdfast/tests/attach_cli.rs`) | A fixed `wait_exit(15)` outrun under load. |
 | [#42](https://github.com/Sertelegger/holdfast/issues/42) | `session::wait::tests::output_written_just_before_an_exit_still_matches` | Returns `SessionDied` where it expects `Matched`. **Possibly not a flake** — see below. |
 | [#52](https://github.com/Sertelegger/holdfast/issues/52) | `daemon::server::tests::a_connection_mid_handshake_holds_off_the_client_less_exit` | **2 failures in 54 whole-binary runs**, load-dependent; 0 in 800 runs filtered to `daemon::server` alone, so it needs the rest of the binary for contention. Asserts at `server.rs:3552`. **#52's second test is the row already tracked as #21 above** — the pair overlaps, so #52 contributes one new name, not two. |
-| [#60](https://github.com/Sertelegger/holdfast/issues/60) | `a_resource_read_and_a_read_output_return_the_same_bytes` (`crates/holdfast-core/tests/control_protocol.rs:1717`) | **Inverts this file's premise: it fails in isolation and passes under load.** Roughly 1 failure in 3 when run alone on macOS; 0 across the last two full `--workspace` runs. Whatever it needs is something the rest of the suite happens to provide, so the usual "run it alone to reproduce" instruction is backwards for this row. |
 
 ## Linux CI evidence, 2026-09-01
 
@@ -64,12 +63,14 @@ across two days:
 - **#39 does reproduce** — about one full run in three, 0/5 in isolation — and
   **it also fails at the pristine `v0.0.6` tag**, so it predates the 0.0.7 work
   entirely.
-- **`a_resource_read_and_a_read_output_return_the_same_bytes`** behaves the same
-  way on macOS. **Now filed as [#60](https://github.com/Sertelegger/holdfast/issues/60)**
-  and in the table above. Correcting an earlier report of mine that called it
-  clean: it fails about one run in three **in isolation**, which is the
-  opposite of every other row here, and passing full-suite runs are what made
-  it look fine.
+- **`a_resource_read_and_a_read_output_return_the_same_bytes`** behaved the
+  same way on macOS, was filed as
+  [#60](https://github.com/Sertelegger/holdfast/issues/60), and is **fixed and
+  closed at v0.0.7** — it was never a flake. The two paths differed by one
+  trailing `bash-5.2$ `: one buffer read twice with the prompt arriving in
+  between, because `read_until(…, "$")` matches the `$` inside the injected
+  shell-integration snippet rather than the shell's prompt. Kept here as the
+  reason a row can look load-dependent and be a race in its own setup.
 
 ## #42 deserves a different treatment from the rest
 
