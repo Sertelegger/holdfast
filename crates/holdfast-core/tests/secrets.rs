@@ -452,6 +452,7 @@ fn attach_frame(session: &str, mode: AttachMode) -> ClientFrame {
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_major: PROTOCOL_MAJOR,
         protocol_minor: PROTOCOL_MINOR,
+        terminal: None,
     }
 }
 

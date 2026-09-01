@@ -50,10 +50,20 @@ cargo fmt --version    >/dev/null 2>&1 && ok "rustfmt present" || bad "rustfmt m
 
 echo
 echo "--- shells and helpers the test suite spawns by name ---"
-# 8 of tests/detection.rs's 19 tests early-`return` when their program is
-# missing, and libtest reports that as `ok` with the explanation swallowed.
-# This list is what stops a slim image from certifying a suite that skipped
-# its most valuable half.
+# Host-dependent rows of tests/detection.rs early-`return` when their
+# program is missing, and libtest reports that as `ok` with the explanation
+# swallowed. This list is what stops a slim image from certifying a suite
+# that skipped its most valuable half.
+#
+# **No counts here, deliberately** (GH #74). This comment used to say "8 of
+# 19" while README.md said "Ten of 23" and the file held 23 — two restated
+# totals that disagreed with each other and with the tree, and nothing that
+# could go red. `scripts/ci-skip-census.sh` is what actually pins the set:
+# it asserts the exact rows that skipped, by name, and fails on a new one
+# *and* on an agreed one that stopped happening. A number here would be a
+# third copy of something already enforced somewhere else. Same reasoning
+# `mcp-smoke.sh` applies to its own check total, and for the same measured
+# reason — that one drifted five times with nothing going red.
 #   bash zsh dash sh -> OSC 133 marker streams and the T3 degradation rows (§8.5)
 #   dash + less      -> an_alt_screen_episode_leaves_a_dash_prompt_on_the_
 #                       heuristic_tier — the only PTY-level test of REQ-PD-011/015

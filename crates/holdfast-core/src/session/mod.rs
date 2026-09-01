@@ -216,6 +216,16 @@ pub struct Session {
     /// cheap read on the control path, and because the two are updated
     /// together under `resize` anyway.
     size: AtomicU32,
+    /// The geometry **asked for**, as distinct from the one in force.
+    ///
+    /// The agent's `resize` tool sets this; `size` is what the PTY actually
+    /// has, which is this folded with what every attached writer can
+    /// display (GH #75). They differ whenever a human's terminal is
+    /// narrower than the size an agent wanted for a TUI, and the difference
+    /// is the whole point: the human sees something legible, and when they
+    /// detach the session returns here rather than staying stuck at the
+    /// geometry of a client that has gone.
+    desired_size: AtomicU32,
     /// Spec §9.2 rule table, shared with the screen tracker so
     /// `set_screen_config` can rebuild it. Sourced from
     /// `output::rules::builtin_shared()` (0.0.3) — the process-wide table
@@ -678,6 +688,12 @@ impl Session {
             // Matches `ScreenConfig::default()` above, which matches
             // `PtySpawnConfig::new`. `set_screen_config` replaces both with
             // the geometry the child was actually spawned at.
+            // **Zero means "no agent has asked"**, and it must not be
+            // seeded from the start size: seeded, the session's opening
+            // 80x24 would cap every attached client, so a 200-column
+            // terminal would be clamped to 80 for no reason anybody chose.
+            // A desired size only participates once something asks for one.
+            desired_size: AtomicU32::new(0),
             size: AtomicU32::new(pack_size(
                 ScreenConfig::default().cols,
                 ScreenConfig::default().rows,
@@ -1728,6 +1744,27 @@ impl Session {
     /// the request.
     pub fn size(&self) -> (u16, u16) {
         unpack_size(self.size.load(Ordering::Relaxed))
+    }
+
+    /// The geometry an agent asked for, independent of what any attached
+    /// terminal can display, or `None` if none has (GH #75).
+    ///
+    /// `None` is not the same as "the size it started at": an unasked-for
+    /// geometry must not cap an attached client, or a session would clamp
+    /// every terminal to its opening 80x24.
+    pub fn desired_size(&self) -> Option<(u16, u16)> {
+        match self.desired_size.load(Ordering::Relaxed) {
+            0 => None,
+            packed => Some(unpack_size(packed)),
+        }
+    }
+
+    /// Record a new desired geometry. **Does not resize anything** — the
+    /// caller folds this with the attached writers and applies the result,
+    /// because only the attach hub knows who is looking.
+    pub fn set_desired_size(&self, cols: u16, rows: u16) {
+        self.desired_size
+            .store(pack_size(cols, rows), Ordering::Relaxed);
     }
 
     /// Resize the terminal (spec §5.2 `resize`, REQ-T-009): `SIGWINCH` to

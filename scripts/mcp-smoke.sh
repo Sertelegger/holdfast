@@ -424,12 +424,24 @@ jcheck() {
   jcheck_on "$1" "$OUT" "$2" "$3"
 }
 
-total=$((total + 1))
+# **A clean exit is a precondition, not a counted check.** Nothing about
+# "the process exited 0" distinguishes the real server from the `/bin/true`
+# the negative control runs, so counting it made that control's contract —
+# *every counted check must fail against a stub* — unsatisfiable wherever the
+# stub happens to exit 0. It did on Linux CI (57 of 58, this line the
+# survivor) and did not on macOS, where writing into an already-dead process
+# earns a signal and a non-zero status instead. A check whose outcome depends
+# on which platform reaped the corpse is not measuring Holdfast.
+#
+# A non-zero status still counts and still fails: that is a real defect, and
+# one that invalidates everything below it. A zero status is reported and
+# passes nothing, because it is what any process can do.
 if [ "$SERVER_STATUS" -ne 0 ]; then
+  total=$((total + 1))
   echo "  FAIL  server exited $SERVER_STATUS"
   fails=$((fails + 1))
 else
-  echo "  ok    server exited 0"
+  echo "  note  server exited 0 (a precondition, not counted -- see above)"
 fi
 
 # ---------------------------------------------------------- the handshake

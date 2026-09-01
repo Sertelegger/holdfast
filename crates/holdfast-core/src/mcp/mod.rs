@@ -545,7 +545,21 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let config = crate::config::load()?;
     // The audit path is resolved here rather than in `new()` so that only
     // the real server process ever writes to it.
-    let server = HoldfastServer::with_audit_path_and_config(crate::audit::default_path(), &config);
+    // **`RuntimePaths`, not a second spelling of the same path** (GH #72).
+    // `audit::default_path()` computed `$HOME/.holdfast/logs/audit.log`
+    // directly and therefore ignored `HOLDFAST_RUNTIME_DIR`, while §7.1
+    // says an explicit instance "takes everything with it, logs included".
+    // So an operator running a second instance got its audit trail written
+    // into the *default* instance's log — which is the mechanism behind the
+    // 0-byte `audit.log` that was once read as a missing audit trail and
+    // filed as a security finding (GH #63).
+    //
+    // Fails open exactly as before: no resolvable runtime directory means
+    // no audit path, which this transport already tolerates (see above).
+    let audit_path = crate::daemon::paths::RuntimePaths::discover()
+        .ok()
+        .map(|p| p.audit_log());
+    let server = HoldfastServer::with_audit_path_and_config(audit_path, &config);
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())

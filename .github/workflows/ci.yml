@@ -2,8 +2,13 @@
 # Plan: docs/superpowers/plans/2026-08-12-holdfast-ci-and-verification-harness.md
 #
 # Constraints this file is held to (enforced by scripts/ci-hygiene.sh):
-#   * no secrets, no publishing, no deploy — no release action, no
-#     `secrets.` reference, no cargo publish, no docker push, no git push
+#   * **publishing is gated on the trigger, not banned.** A workflow that
+#     opts in with a `RELEASE-WORKFLOW:` marker may use secrets, release
+#     actions, `gh`, `cargo publish` and `git push` — but only if its `on:`
+#     block names `tags:` and names none of `branches:`, `pull_request`,
+#     `pull_request_target` or `schedule`. The marker is verified, not
+#     believed. Everywhere else those capabilities stay forbidden, so *this*
+#     file cannot authenticate to anything no matter what it grows
 #   * no `continue-on-error` and no retry action anywhere — a retried PTY
 #     test hides the race it exists to catch, and this project has shipped
 #     two such races
@@ -103,6 +108,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # **The self-test first**, and it is not ceremony: this script's own
+      # fixtures silently stopped passing when a later rule was added, and
+      # nothing noticed because CI ran the script and never its self-test. A
+      # guard whose guard is unrun is a guard on trust.
+      - run: ./scripts/ci-hygiene.sh --self-test
       - run: ./scripts/ci-hygiene.sh
 
   fmt:

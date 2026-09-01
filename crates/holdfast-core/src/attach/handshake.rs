@@ -12,6 +12,12 @@
 //! asserted **unreachable** rather than exercised. Indexed at §25 — do
 //! not "simplify" this.
 //!
+//! **`terminal_busy` is not decided here** (GH #66). It is the one token
+//! in the catalogue that depends on the *other* clients already attached
+//! rather than on this connection's version, so it is `conn.rs`'s call and
+//! not `evaluate_attach`'s. Unlike `limit_reached` it is genuinely
+//! reachable in v0.1.0.
+//!
 //! **One version, not two.** These are `crate::protocol::handshake`'s
 //! constants, not a second pair. §7.5: "one daemon advertises one
 //! version on both sockets, which is the number `holdfast version` prints
@@ -27,9 +33,12 @@ use crate::protocol::handshake::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 ///
 /// **Declared in §18.4b's row order**, per §18's preamble (rev. 47) —
 /// `session_not_found`, `protocol_too_new`, `protocol_too_old`,
-/// `limit_reached`. That order is neither alphabetical nor grouped by
-/// cause, so it is only preserved by being asserted; a fifth token
-/// would **insert** at its catalogued position rather than append.
+/// `limit_reached`, `terminal_busy`. That order is neither alphabetical
+/// nor grouped by cause, so it is only preserved by being asserted.
+/// **`terminal_busy` is the fifth and it appends** — the note here used to
+/// warn that a fifth token would *insert* at its catalogued position, and
+/// that remains the rule; last is simply where §18.4b catalogues this one,
+/// because the row was written at the same time as the token.
 /// These are `const`s and not an enum, so the preamble's argument
 /// rather than its letter is what carries here — see the plan's
 /// *The §18 ordering rule, swept*, which is explicit that the sequence
@@ -41,6 +50,22 @@ pub const REJECT_PROTOCOL_TOO_OLD: &str = "protocol_too_old";
 /// never emits this. `no_attach_reject_is_limit_reached_in_v0_1_0`
 /// asserts that rather than leaving it ambiguous.
 pub const REJECT_LIMIT_REACHED: &str = "limit_reached";
+/// §18.4b's fifth row, catalogued last because it is the newest (GH #66).
+///
+/// **Refuses a second *writer* on a terminal that already has one**, and
+/// nothing else — two clients on two terminals is the multi-attach feature
+/// §4.3 builds the hub for, and an observer never contends for a keyboard.
+///
+/// The failure it prevents is not holdfast's to fix once it happens: two
+/// processes calling `read()` on one terminal device are handed alternate
+/// bytes by the kernel, so a `Ctrl-B d` is split between them and the
+/// client that missed it stays alive believing nothing happened. Measured
+/// exactly that way — one client exited 0, the other survived.
+///
+/// tmux never needs this because a foreground client owns the terminal and
+/// job control stops a backgrounded one with `SIGTTIN` the moment it reads.
+/// `holdfast attach` has no such protection and has to say so itself.
+pub const REJECT_TERMINAL_BUSY: &str = "terminal_busy";
 
 /// `None` when the client's major matches and the attach may proceed;
 /// otherwise the `(reason, message)` pair for an `AttachReject`.
@@ -200,9 +225,9 @@ mod tests {
     }
 
     #[test]
-    fn the_reject_tokens_are_the_four_18_4b_values_in_catalogue_order() {
-        // The four-arm guard, at the catalog level. §18.4b's set is
-        // closed; a fifth token added without a spec edit, or one of the
+    fn the_reject_tokens_are_the_18_4b_values_in_catalogue_order() {
+        // The catalogue guard, at the catalog level. §18.4b's set is
+        // closed; a sixth token added without a spec edit, or one of the
         // four deleted to "simplify" the match, fails here. Paired with
         // the two refusal tests above, which pin *which* two of the four
         // `evaluate_attach` can produce.
@@ -212,24 +237,26 @@ mod tests {
         // alphabetised list — which is a set comparison, and a set
         // comparison is green against every append. That is the exact
         // fault §18's preamble (rev. 47) names, and it applies here even
-        // though these are four `const`s rather than an enum: they have
+        // though these are five `const`s rather than an enum: they have
         // a declaration order, that order is published in the order the
         // arms are written, and §18.4b's row order is
         // session_not_found, protocol_too_new, protocol_too_old,
-        // limit_reached — which is neither alphabetical nor grouped by
-        // cause, so nothing but this assertion holds it.
+        // limit_reached, terminal_busy — which is neither alphabetical nor
+        // grouped by cause, so nothing but this assertion holds it.
         assert_eq!(
             [
                 REJECT_SESSION_NOT_FOUND,
                 REJECT_PROTOCOL_TOO_NEW,
                 REJECT_PROTOCOL_TOO_OLD,
                 REJECT_LIMIT_REACHED,
+                REJECT_TERMINAL_BUSY,
             ],
             [
                 "session_not_found",
                 "protocol_too_new",
                 "protocol_too_old",
                 "limit_reached",
+                "terminal_busy",
             ]
         );
         // The negative: `evaluate_attach` reaches exactly two of them,

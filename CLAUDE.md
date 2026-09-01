@@ -72,3 +72,16 @@ Rules:
 - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+
+## Development workflows
+
+`dev/workflows/` holds the procedures for working on this repository —
+[`verify.md`](dev/workflows/verify.md) for the full local gate and
+[`review.md`](dev/workflows/review.md) for the adversarial pre-PR review. Read
+and follow the relevant one rather than improvising an equivalent; both encode
+measurements and near-misses that are not obvious from the code.
+
+They are **not** slash commands, and that is deliberate: this repo doubles as
+its own plugin marketplace, so `.claude/commands/` is the product's command
+surface. `doctor` and `sessions` live there because they diagnose a running
+install; a gate that needs the source tree does not belong beside them.

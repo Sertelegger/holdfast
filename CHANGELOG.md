@@ -4,7 +4,78 @@ All notable changes to Holdfast are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Direction and
 upcoming work live in [ROADMAP.md](./ROADMAP.md).
 
+**This file is the release, and a GitHub Release is a pointer to it.** A
+release's notes are the section below bearing its version; the tag marks the
+commit. Nothing that matters about a release lives only in the GitHub object —
+release prose, unlike this file, is not in the repository, is not reviewed with
+the code, and does not survive the repository being recreated. Cutting a release
+is therefore: rename `[Unreleased]` to the version with its date, tag, and let
+the release body quote this section.
+
+For the same reason releases carry **no binary assets**. §12.3's binding event
+is first external distribution, and several deliberate escapes — the protocol
+shape record's in-place corrections most of all — are conditioned on it not
+having happened. A downloadable binary is that event, and it is not one to
+trigger as a side effect of writing release notes.
+
 ## [Unreleased]
+
+### Upgrading to 0.0.7 on macOS
+
+**Stop the daemon before upgrading.** 0.0.7 moves the macOS runtime directory
+from `~/Library/Application Support/holdfast` to `~/.holdfast`, so every
+platform without `XDG_RUNTIME_DIR` now uses one path. There is no migration and
+none is planned (GH #73).
+
+A 0.0.6 daemon left running is **invisible to 0.0.7**, which will start a second
+one at the new path. The old daemon keeps its live PTY sessions and
+`holdfast daemon stop` can no longer reach it, because the new binary computes a
+different socket path; recovery is `pkill holdfast`, which drops whatever those
+sessions were holding. No privilege boundary is crossed — the old socket stays
+`0600` inside a `0700` directory — it is an orphan, not a hole. The old
+directory can be deleted once nothing is running from it.
+
+**A terminal now hosts one interactive client per session.**
+`holdfast attach` declares which terminal device its keyboard is, and a second
+`ReadWrite` client on a terminal that already has one is refused with
+`terminal_busy` rather than admitted. Attaching from *another* terminal is
+unaffected — multi-client attach is a feature and is untouched — and
+`holdfast watch` never contends, in either order.
+
+The refusal exists because the alternative is silent: two processes reading one
+terminal are handed alternate bytes by the kernel, so an operator's `Ctrl-B d`
+is split between them and whichever misses it keeps running. Measured exactly
+that way, one client exiting 0 while the other survived. tmux never needs this
+guard because a foreground client owns the terminal and job control stops a
+backgrounded one with `SIGTTIN` the moment it reads; `holdfast attach` has no
+such protection and has to state the constraint itself.
+
+**The session is sized to the smallest attached writer**, not to whichever
+resized last (GH #66). Last-writer-wins does not converge: two clients dragging
+their windows at once alternate between their own readings for as long as either
+keeps moving, which was reported as a resize flood whose sizes oscillated
+rather than settling. A departing writer gives its columns back. This is a
+semantics change on a §23.3-gated surface and was taken through that gate
+deliberately.
+
+Alongside it, **a resize notice is coalesced rather than printed per frame** in
+both `attach` and `watch` — the notice now names where a drag landed, once —
+and a diagnostic is written in a single `write_all`, so two clients sharing a
+terminal can no longer shred each other's output mid-word.
+
+`PROTOCOL_MAJOR.PROTOCOL_MINOR` moves to **1.1**, with a new
+`tests/wire-shape/1.1.golden`. `Attach` gains an optional `terminal` and
+`AttachReject.reason` gains `terminal_busy`; both are additive, and the new
+token is unreachable for any peer that did not opt in by sending the field.
+
+**`wait_for_pattern`'s `pattern` is optional.** Omitted, the call waits until
+the session stops executing and answers `reached` instead of `matched` (GH #62).
+The regex form is for a *program's* prompt — `Password:`, `(gdb)`, `>>>` — and
+never for the shell's own, which is a guess about the operator's `$PS1` that no
+agent is in a position to make: against a customised prompt it simply never
+matches, and the call reports a timeout for a command that finished long ago. A
+wait that expires against a session already at a measured prompt now says so in
+`warning`.
 
 **The agent can ask for a credential it is never allowed to see.**
 `request_secret_input` blocks the calling tool while a human — or, where an
@@ -348,10 +419,11 @@ surfaces rather than redacted on them.
 
   This is mitigation and not a fix: it does nothing for
   `autofill_on_echo_off`, which is the unattended case, and it asks a person to
-  read a long line. It is additive on the attach protocol, and
-  `PROTOCOL_MAJOR.PROTOCOL_MINOR` stays at **1.0** — the shape recorded for a
-  protocol version nothing has yet been distributed speaking is corrected rather
-  than superseded. The argument is in `tests/wire_shape.rs`.
+  read a long line. It is additive on the attach protocol. **It was recorded by
+  correcting `1.0.golden` in place rather than by bumping the minor**, on the
+  argument that nothing had been distributed speaking 1.0; that argument, and
+  the fact that the protocol has since moved to 1.1 for an unrelated change, are
+  both in `tests/wire_shape.rs`.
 
 - **`require_confirm` now defaults to `true`.** It defaulted to `false`, which
   made silent resolution the shape an operator got by leaving a line out. A

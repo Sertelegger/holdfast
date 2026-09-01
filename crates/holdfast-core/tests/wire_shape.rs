@@ -166,10 +166,43 @@ const RECORDED_VERSIONS: &[(u32, u32)] = &[
     //    append that would be honest about a history no external consumer
     //    has.
     //
+    // **Point 3 stopped being true at 1.1, and saying so here is the
+    // point of the file.** Nothing ships protocol 1.0: the only build that
+    // would have spoken the rewritten shape is 0.0.7, and 0.0.7 speaks
+    // 1.1. `v0.0.6` predates this file and spoke a 1.0 without 0.0.7's
+    // frames, so it is not the shape either. `1.0.golden` is therefore an
+    // orphaned record — superseded before first distribution, describing a
+    // shape no binary ever spoke, which is exactly the outcome point 2
+    // argued a `(1, 1)` row would cause.
+    //
+    // It is kept rather than deleted because the argument above is the
+    // history of how it got that way, and a record that quietly dropped
+    // its own wrong entry would be worse than one that carries it labelled.
+    // Found by review; the correction is prose, and it is here rather than
+    // only in a commit message for the same reason the rest of this is.
+    //
     // **This stops being available the moment a binary is published**, and
     // the next hand should assume it already has. Two uses of an escape
     // hatch is where it starts looking like a procedure.
     (1, 0),
+    // 1.1 — `Attach` gains `terminal`, an optional client-declared string
+    // naming the terminal device a client's keyboard is (GH #66). It lets
+    // the daemon refuse a second *writer* on a terminal that already has
+    // one, which is the only configuration in which two clients silently
+    // split the operator's keystrokes between them.
+    //
+    // **Appended rather than folded into 1.0, and that is the point.** The
+    // 1.0 row's argument — nothing is externally distributed, so a new row
+    // would promise compatibility to nobody — is still true, and would
+    // have licensed a third rewrite. The row above says what is wrong with
+    // taking it: "two uses of an escape hatch is where it starts looking
+    // like a procedure", and a third use is no longer a hatch. This change
+    // is additive under the rule as written — a new *optional field*, not
+    // a new client frame — so the ordinary green path is available and
+    // there is nothing to argue. Taking the ordinary path when it exists
+    // is what keeps the extraordinary one credible for a change that has
+    // no alternative.
+    (1, 1),
 ];
 
 /// The placeholder every opaque string field carries in this file.
@@ -480,6 +513,9 @@ fn client_frames() -> Vec<ClientFrame> {
             client_version: STR.into(),
             protocol_major: 1,
             protocol_minor: 0,
+            // `Some`, because this list is documented as maximal and an
+            // `Option` sampled only as `None` never exercises its arm.
+            terminal: Some(STR.into()),
         },
         ClientFrame::Input { bytes: vec![0x1b] },
         ClientFrame::SecretInput {

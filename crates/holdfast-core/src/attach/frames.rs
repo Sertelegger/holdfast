@@ -120,6 +120,25 @@ pub enum ClientFrame {
         client_version: String,
         protocol_major: u32,
         protocol_minor: u32,
+        /// Which terminal device this client's keyboard is, when it has
+        /// one; `None` for a pipe or a client that predates the field
+        /// (GH #66). Additive and `#[serde(default)]`, exactly like
+        /// `role` above.
+        ///
+        /// **Declared, not kernel-supplied, and that is a real weakening**
+        /// — `AttachConn`'s `peer_pid`/`peer_uid` carry a note that they
+        /// are the only identity a client cannot choose, and this one it
+        /// can. It is accepted here because the check it feeds is a
+        /// usability guard and not a security boundary: `attach.sock` is
+        /// `0600` and uid-checked before a byte is parsed, so the only
+        /// person a lie can reach is the person telling it. Deriving it
+        /// server-side from `peer_pid` would need `/proc/<pid>/fd/0` on
+        /// Linux and `proc_pidfdinfo` on macOS — the exact `#[cfg]` split
+        /// that has already cost this project a deleted BSD arm.
+        ///
+        /// Opaque to the daemon, which only ever compares it for equality.
+        #[serde(default)]
+        terminal: Option<String>,
     },
     Input {
         #[serde(with = "serde_bytes")]
@@ -761,6 +780,7 @@ mod tests {
             client_version: "0.0.6".into(),
             protocol_major: 1,
             protocol_minor: 0,
+            terminal: Some("rdev:0x1000004".into()),
         })
         .unwrap();
         assert_eq!(
@@ -773,6 +793,7 @@ mod tests {
                 "protocol_minor",
                 "role",
                 "session",
+                "terminal",
                 "type",
             ]
         );
@@ -940,6 +961,7 @@ mod tests {
             client_version: "0.0.6".into(),
             protocol_major: 1,
             protocol_minor: 0,
+            terminal: None,
         })
         .unwrap();
         // §7.5 spells the modes in PascalCase and `role` in lower case,
@@ -978,6 +1000,16 @@ mod tests {
                 ..
             }
         ));
+        // **And `terminal` too** (review finding): a 1.0 client sends no
+        // such key, and this is the only place the bytes of that frame are
+        // hand-built. `#[serde(default)]` turns out to be a no-op for an
+        // `Option` — serde already yields `None` for a missing one — so the
+        // attribute cannot be what carries this, and nothing asserted the
+        // behaviour it was credited with.
+        assert!(
+            matches!(f, ClientFrame::Attach { terminal: None, .. }),
+            "a 1.0 Attach must decode with no terminal, not fail"
+        );
     }
 
     #[test]

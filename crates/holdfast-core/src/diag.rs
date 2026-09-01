@@ -47,7 +47,7 @@
 //!   malformed rule table *should* be a loud startup failure — means the
 //!   initialiser can never be run for the first time from inside the
 //!   hook.
-//! - [`emit`] writes with `writeln!` on a locked [`std::io::Stderr`] and
+//! - [`emit`] writes with a single `write_all` on a locked [`std::io::Stderr`] and
 //!   drops the error, rather than using `eprintln!`. `eprintln!`
 //!   `expect`s its write; on a full disk or a closed fd that is a panic,
 //!   and a panic from inside the hook aborts. A daemon that cannot write
@@ -93,12 +93,26 @@ pub(crate) fn render(message: &str) -> String {
 /// thing under test in more than one place here, and a capture that eats
 /// them makes those tests lie.
 pub fn emit(message: &str) {
-    let line = render(message);
+    // **One buffer, one `write_all`, and deliberately not `writeln!`** (GH
+    // #66). `writeln!` is `write_fmt`, which hands the formatter the line
+    // and the newline as separate pieces and therefore reaches the fd
+    // twice. The `StderrLock` orders those two writes against other
+    // *threads* and does nothing about other *processes*, so two `holdfast
+    // attach` clients sharing one terminal shredded each other mid-token:
+    // the report carries `holdholdfast attach: the session is now
+    // 116xholdfast attach: ...`, which is two interleaved writers and not
+    // one loop printing fast.
+    //
+    // A single `write` is not a portable atomicity guarantee on a tty — no
+    // such guarantee exists — but it is the difference between interleaving
+    // at line granularity and interleaving mid-word, and it costs nothing.
+    let mut line = render(message).into_bytes();
+    line.push(b'\n');
     let mut err = std::io::stderr().lock();
     // Deliberately dropped — see the module docs. This function is
     // reachable from inside the panic hook, where a panicking write
     // aborts the process.
-    let _ = writeln!(err, "{line}");
+    let _ = err.write_all(&line);
 }
 
 /// `eprintln!`, redacted. The only sanctioned diagnostic producer.
@@ -369,5 +383,150 @@ mod tests {
         install_panic_hook();
         crate::diag!("holdfast daemon: cannot read the config: token = {DIAG_SECRET}");
         panic!("the reaper died holding {PANIC_SECRET}");
+    }
+
+    const SHRED_ENV: &str = "HOLDFAST_TEST_DIAG_SHRED_CHILD";
+    const SHRED_LINES: usize = 400;
+    /// Padded so a line is substantial but stays far under `PIPE_BUF`
+    /// (4096, the size POSIX makes atomic). A line longer than that would
+    /// be split by the kernel no matter how many `write` calls it took, and
+    /// the test would then be asserting something untrue.
+    const SHRED_PAD: &str = "----------------------------------------";
+
+    /// One line is intact when it is exactly one writer's record: the
+    /// prefix, that writer's pid, and a single `<pid>-END` terminating it.
+    ///
+    /// Two records merged by a torn write carry two `-END` markers, or end
+    /// on a pid that is not the one they began with.
+    fn line_is_one_whole_record(line: &str) -> bool {
+        let Some(rest) = line.strip_prefix("holdfast shred-probe ") else {
+            return false;
+        };
+        let Some((pid, tail)) = rest.split_once(' ') else {
+            return false;
+        };
+        tail.matches("-END").count() == 1 && tail.ends_with(&format!("{pid}-END"))
+    }
+
+    /// **Two processes, one pipe** — the shape from GH #66.
+    ///
+    /// The report's evidence was `holdholdfast attach: the session is now
+    /// 116xholdfast attach: ...`: not one loop printing fast, but two
+    /// `holdfast attach` clients sharing a terminal and shredding each
+    /// other mid-token. `StderrLock` cannot help — it orders threads within
+    /// a process and knows nothing about a second process on the same fd.
+    ///
+    /// **A pipe is the medium on purpose.** POSIX makes a write of at most
+    /// `PIPE_BUF` atomic, so one `write` per line cannot interleave and two
+    /// can. A regular file would have made this pass either way, because
+    /// `O_APPEND` gives atomicity back in the kernel and would have hidden
+    /// the very defect being tested.
+    ///
+    /// What it would still pass against: an `emit` that builds the line
+    /// correctly and then writes it somewhere other than fd 2 — that is
+    /// what `nothing_reaches_daemon_log_unredacted_not_even_a_panic`
+    /// covers. It does **not** pass against a return to `writeln!`, which
+    /// hands the fd the line and the newline separately.
+    #[test]
+    #[cfg(unix)]
+    fn two_processes_emitting_at_once_never_shred_a_line() {
+        use std::io::Read;
+        use std::os::unix::io::FromRawFd;
+
+        if std::env::var_os(SHRED_ENV).is_some() {
+            return;
+        }
+
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let spawn = || {
+            // Each child needs its own descriptor for the same pipe;
+            // `Stdio::from_raw_fd` takes ownership and closes on drop, so
+            // handing the same number to both would close it twice.
+            let dup = unsafe { libc::dup(write_fd) };
+            assert!(dup >= 0, "dup() failed");
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("diag::tests::the_child_that_emits_many_lines")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(SHRED_ENV, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(unsafe { std::process::Stdio::from_raw_fd(dup) })
+                .spawn()
+                .unwrap()
+        };
+        let mut a = spawn();
+        let mut b = spawn();
+
+        // The parent's own write end must go before the read can ever see
+        // EOF, and it must go *after* both children have inherited theirs.
+        assert_eq!(unsafe { libc::close(write_fd) }, 0);
+
+        // Read to EOF rather than waiting first: the pipe holds 64K and two
+        // children emit more than that, so a parent that waited would
+        // deadlock against children blocked in `write`.
+        let mut out = String::new();
+        unsafe { std::fs::File::from_raw_fd(read_fd) }
+            .read_to_string(&mut out)
+            .unwrap();
+        assert!(a.wait().unwrap().success(), "child a failed");
+        assert!(b.wait().unwrap().success(), "child b failed");
+
+        // **The count is the assertion**, and the structural check is the
+        // diagnostic. A review found the previous ordering backwards: the
+        // `shredded` predicate was `starts_with(prefix) && ends_with(pad)`,
+        // which *every* concatenation of these payloads satisfies — a
+        // merged line still starts with the prefix and still ends in forty
+        // dashes — so under the pre-fix `writeln!` the panic always came
+        // from the count and never from the check the test was named for.
+        //
+        // Each line now brackets itself with its own writer's pid, so a
+        // merge is detectable in the line rather than only in the total:
+        // `12-END` never appears mid-line in an intact record.
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("shred-probe")).collect();
+        let malformed: Vec<&&str> = lines
+            .iter()
+            .filter(|l| !line_is_one_whole_record(l))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            SHRED_LINES * 2,
+            "{} lines arrived, expected {}: a short count is interleaving, since \
+             every write that happened is a whole line or part of one. {} were also \
+             structurally malformed; first three: {:?}",
+            lines.len(),
+            SHRED_LINES * 2,
+            malformed.len(),
+            &malformed[..malformed.len().min(3)]
+        );
+        assert!(
+            malformed.is_empty(),
+            "{} of {} lines are not one writer's whole record; first three: {:?}",
+            malformed.len(),
+            lines.len(),
+            &malformed[..malformed.len().min(3)]
+        );
+    }
+
+    /// The writer half of the test above; a no-op unless re-entered.
+    #[test]
+    fn the_child_that_emits_many_lines() {
+        if std::env::var_os(SHRED_ENV).is_none() {
+            return;
+        }
+        let pid = std::process::id();
+        for i in 0..SHRED_LINES {
+            // Brackets itself with its own pid: the line begins with the
+            // writer's id and ends with `<pid>-END`, so two records merged
+            // by a torn write carry two END markers or end on the wrong
+            // one. Kept well under `PIPE_BUF` (512 on macOS, 4096 on
+            // Linux) so a single `write` is atomic and the intact case
+            // cannot false-red.
+            crate::diag!("holdfast shred-probe {pid} {i} {SHRED_PAD} {pid}-END");
+        }
     }
 }

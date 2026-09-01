@@ -127,6 +127,23 @@ fn fit_to_width(s: &str, cols: usize) -> String {
 /// enough that a silent session is not left wondering.
 const BANNER_AFTER_REPAINT: Duration = Duration::from_millis(400);
 
+/// How long a `Resize` notice waits for the geometry to stop moving before
+/// it is printed (GH #66).
+///
+/// **Coalesced rather than rate-limited, and the difference matters.** A
+/// window drag delivers a `SIGWINCH` per frame, and each one reaches every
+/// *other* attached client as a `Resize`; the report caught a drag printing
+/// `107x56, 115x58, 104x55, …` — thirteen distinct widths — into a raw-mode
+/// terminal. A rate limit would have printed one of those intermediate
+/// sizes and then stopped, which is a number the session no longer has. A
+/// debounce prints the geometry the drag actually settled on, once.
+///
+/// Shorter than [`BANNER_AFTER_REPAINT`] because this one is answering a
+/// question the operator just asked with their mouse: at 150ms a release is
+/// reported before the hand leaves the trackpad, while a drag at any
+/// plausible frame rate keeps resetting it.
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
+
 pub const EXIT_SIGHUP: u8 = 128 + 1;
 pub const EXIT_SIGTERM: u8 = 128 + 15;
 
@@ -864,7 +881,43 @@ fn attach_handshake(
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_major: holdfast_core::protocol::PROTOCOL_MAJOR,
         protocol_minor: holdfast_core::protocol::PROTOCOL_MINOR,
+        terminal: terminal_identity(),
     }
+}
+
+/// Which terminal device this process's **keyboard** is, for `terminal_busy`
+/// (GH #66).
+///
+/// `st_rdev` of fd 0, hex, from a plain `fstat`. That is the identity of
+/// the *device*, so two processes sharing one terminal agree on it while
+/// two terminals never collide — which is precisely the distinction the
+/// daemon needs and the only one it makes, since it compares the string and
+/// never parses it.
+///
+/// **fd 0 and not fd 1**, because the contention this answers is over
+/// input: two clients reading one keyboard get alternate bytes from the
+/// kernel and split the operator's `Ctrl-B d` between them. A client whose
+/// output is redirected but whose stdin is still the terminal is exactly as
+/// affected, and keying on stdout would miss it.
+///
+/// `None` when stdin is not a terminal — a pipe cannot be contended for in
+/// this way, and `None` never matches `None` at the daemon.
+#[cfg(unix)]
+fn terminal_identity() -> Option<String> {
+    use std::os::unix::io::AsRawFd;
+    let stdin = std::io::stdin();
+    if !std::io::IsTerminal::is_terminal(&stdin) {
+        return None;
+    }
+    // SAFETY: `fstat` writes a `stat` and reads only the fd, which is
+    // borrowed for the call.
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(stdin.as_raw_fd(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let st = unsafe { st.assume_init() };
+    Some(format!("rdev:{:#x}", st.st_rdev))
 }
 
 /// What the handshake settled on, or why it did not.
@@ -1205,7 +1258,9 @@ pub async fn attach(session: &str) -> ExitCode {
     // tmux 3.6, pyte and GNU screen: DECSC stores raw coordinates and
     // `ESC[L` never touches them, so `ESC8` lands the cursor *on the bar*.
     // What steps it down onto the prompt is the `\n` that `diag::emit`
-    // appends with `writeln!`. That newline is therefore **load-bearing
+    // appends — since GH #66 by pushing `b'\n'` onto the buffer it writes
+    // in one `write_all`, where it used to be `writeln!`'s. The mechanism
+    // moved; the newline did not. That newline is therefore **load-bearing
     // layout**, not formatting, which is why it is named here and pinned
     // by `the_banner_lands_above_the_prompt_and_leaves_the_cursor_on_it`.
     // Switching the banner to a writer that does not append one puts the
@@ -1241,6 +1296,13 @@ pub async fn attach(session: &str) -> ExitCode {
     );
     let banner_fallback = tokio::time::sleep(BANNER_AFTER_REPAINT);
     tokio::pin!(banner_fallback);
+
+    // The geometry a `Resize` last reported, held until it stops moving —
+    // see `RESIZE_SETTLE`. The timer is armed only while this is `Some`, so
+    // an attach that never sees a resize never wakes for one.
+    let mut pending_resize: Option<(u16, u16)> = None;
+    let resize_settle = tokio::time::sleep(RESIZE_SETTLE);
+    tokio::pin!(resize_settle);
 
     let mut detach = crate::attach_tty::DetachKey::default();
     // `Some` while an `AwaitingSecret` is outstanding: the request id to
@@ -1332,9 +1394,16 @@ pub async fn attach(session: &str) -> ExitCode {
                     }
                     // Another client resized the session. This terminal
                     // cannot be resized from here, so the view is simply
-                    // reported rather than silently wrong.
+                    // reported rather than silently wrong — but **not on
+                    // this frame** (GH #66). Held until the geometry
+                    // settles, because a drag delivers one of these per
+                    // frame and printing each was a flood the operator had
+                    // to detach to escape.
                     ServerFrame::Resize { cols, rows } => {
-                        diag!("holdfast attach: the session is now {cols}x{rows}");
+                        pending_resize = Some((cols, rows));
+                        resize_settle
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RESIZE_SETTLE);
                     }
                     ServerFrame::ProtocolError { reason, frame_kind } => {
                         match frame_kind {
@@ -1462,6 +1531,15 @@ pub async fn attach(session: &str) -> ExitCode {
                     diag!("{b}");
                 }
             }
+            // The geometry stopped moving: report where it landed, once.
+            // Guarded on `is_some` so the timer is inert until a `Resize`
+            // arms it — an unguarded elapsed `Sleep` is permanently ready
+            // and would spin this loop.
+            _ = &mut resize_settle, if pending_resize.is_some() => {
+                if let Some((cols, rows)) = pending_resize.take() {
+                    diag!("holdfast attach: the session is now {cols}x{rows}");
+                }
+            }
             _ = winch.recv() => {
                 if let Ok((cols, rows)) = crate::attach_tty::window_size(tty) {
                     if frame::write_frame(&mut wr, &ClientFrame::Resize { cols, rows })
@@ -1525,6 +1603,14 @@ pub async fn watch(session: &str) -> ExitCode {
 
     let mut frames = spawn_frame_reader(rd);
 
+    // Same coalescing as `attach`, for the same reason (GH #66): a watcher
+    // receives a `Resize` per frame of somebody else's window drag, and it
+    // has no keyboard to escape the flood with — only `Ctrl+C`, which ends
+    // the session view entirely.
+    let mut pending_resize: Option<(u16, u16)> = None;
+    let resize_settle = tokio::time::sleep(RESIZE_SETTLE);
+    tokio::pin!(resize_settle);
+
     loop {
         tokio::select! {
             body = frames.recv() => {
@@ -1574,7 +1660,10 @@ pub async fn watch(session: &str) -> ExitCode {
                         );
                     }
                     ServerFrame::Resize { cols, rows } => {
-                        diag!("holdfast watch: the session is now {cols}x{rows}");
+                        pending_resize = Some((cols, rows));
+                        resize_settle
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RESIZE_SETTLE);
                     }
                     ServerFrame::ProtocolError { reason, frame_kind } => {
                         match frame_kind {
@@ -1586,6 +1675,12 @@ pub async fn watch(session: &str) -> ExitCode {
                     ServerFrame::Attached { .. } | ServerFrame::AttachReject { .. } => {
                         diag!("holdfast watch: a second handshake frame arrived; ignoring it");
                     }
+                }
+            }
+            // The geometry stopped moving: report where it landed, once.
+            _ = &mut resize_settle, if pending_resize.is_some() => {
+                if let Some((cols, rows)) = pending_resize.take() {
+                    diag!("holdfast watch: the session is now {cols}x{rows}");
                 }
             }
             r = tokio::signal::ctrl_c() => {
@@ -1663,9 +1758,11 @@ mod tests {
     /// separates "the bytes were sent" from "the cursor is in the right
     /// place".
     ///
-    /// The trailing `\n` is fed deliberately: `diag::emit` writes with
-    /// `writeln!`, and that newline is what steps the cursor off the bar and
-    /// onto the prompt. See `attach_banner`.
+    /// The trailing `\n` is fed deliberately: `diag::emit` appends one —
+    /// `line.push(b'\n')` before a single `write_all`, since GH #66 — and
+    /// that newline is what steps the cursor off the bar and onto the
+    /// prompt. Deleting the push to "tidy" the emitter puts the cursor back
+    /// on the bar, which is why both ends are named. See `attach_banner`.
     #[test]
     fn the_banner_lands_above_the_prompt_and_leaves_the_cursor_on_it() {
         let mut p = vt100::Parser::new(24, 80, 0);

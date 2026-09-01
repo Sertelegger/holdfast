@@ -9,8 +9,14 @@ ask — a doctor that treats without consent is how a diagnostic becomes an
 outage.
 
 Work out the instance first. The runtime directory is `$HOLDFAST_RUNTIME_DIR`
-when set, else `~/.holdfast`; config is `$XDG_CONFIG_HOME/holdfast/config.toml`,
-else `~/.config/holdfast/config.toml`. **`HOLDFAST_RUNTIME_DIR` deliberately
+when set, else `$XDG_RUNTIME_DIR/holdfast` on Linux when *that* is set, else
+`~/.holdfast`. **The middle arm is easy to drop and it matters**: a doctor run
+on a Linux box with `XDG_RUNTIME_DIR` set that checks `~/.holdfast` inspects a
+directory the daemon is not using and reports its absent sockets as findings.
+The logs are a separate answer — `~/.holdfast/logs` for the default instance
+whatever the runtime directory is, and inside the override when there is one,
+because §7.1 says an explicit instance takes everything with it. Config is
+`$XDG_CONFIG_HOME/holdfast/config.toml`, else `~/.config/holdfast/config.toml`. **`HOLDFAST_RUNTIME_DIR` deliberately
 does not move the config** (REQ-CFG-005 is instance selection, not a
 configuration knob), so a report that conflates them is wrong. Say which
 instance you are describing.

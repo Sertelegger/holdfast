@@ -1029,17 +1029,70 @@ impl HoldfastServer {
                 "session has exited",
             ));
         }
+        // **The request is recorded, then folded with the attached
+        // writers** (GH #75). Before this the tool wrote straight through:
+        // any attached client's next `SIGWINCH` recomputed the minimum and
+        // silently overwrote it, and — new when the session started taking
+        // the smallest writer — an unrelated client *detaching* reverted it
+        // too. An agent that sized a session for a TUI had it reflowed by
+        // somebody leaving the room, with nothing on this surface to see.
+        //
+        // Recording it fixes the durable half: `desired_size` is the floor
+        // the session returns to when the last writer detaches, so the
+        // request outlives the clients rather than the other way round.
+        session.set_desired_size(args.cols, args.rows);
+        // `Some` unconditionally here: this call *is* the request, so the
+        // fold always has a desired size to work with.
+        let (want_cols, want_rows) = self
+            .attach_hub()
+            .effective_size(&session.id, Some((args.cols, args.rows)))
+            .unwrap_or((args.cols, args.rows));
+
         // A failing `ioctl` is Holdfast failing to do its job, not a session
         // outcome, so it takes the protocol channel (§5.1) — and it
         // matters that it does: the alternative is an `ok` reporting
         // dimensions the terminal never reached.
-        if let Err(e) = session.resize(args.cols, args.rows) {
+        if let Err(e) = session.resize(want_cols, want_rows) {
             return envelope::from_error(&e);
         }
         let (cols, rows) = session.size();
+        // Tell the attached clients, because this changed their view and
+        // none of them asked for it. The tool emitted no frame at all
+        // before, so a human's terminal learned about an agent's resize
+        // only by redrawing.
+        for c in self.attach_hub().clients_of(&session.id) {
+            {
+                let mut told = c.last_told.lock();
+                if *told == Some((cols, rows)) {
+                    continue;
+                }
+                *told = Some((cols, rows));
+            }
+            let _ =
+                c.tx.try_send(crate::attach::ServerFrame::Resize { cols, rows });
+        }
+
+        // **Reports what the terminal got, and says so when that is not
+        // what was asked.** Answering `ok` with the requested geometry while
+        // the session held another was the observability half of #75: the
+        // agent had no way to learn it had been narrowed.
+        let details = if (cols, rows) == (args.cols, args.rows) {
+            format!("resized to {cols}x{rows}")
+        } else {
+            format!(
+                "resized to {cols}x{rows}; {}x{} was requested but an attached client's \
+                 terminal is smaller, and the session returns to the requested size when \
+                 that client detaches",
+                args.cols, args.rows
+            )
+        };
         Ok(envelope::ok(
+            // **No `requested_*` fields.** `cols`/`rows` now report what the
+            // terminal actually has, which is the observability this needed;
+            // adding a second pair to a §23.3-gated surface for a nicety the
+            // details sentence already carries is not worth the key.
             json!({ "cols": cols, "rows": rows }),
-            format!("resized to {cols}x{rows}"),
+            details,
         ))
     }
 
@@ -1110,7 +1163,26 @@ impl HoldfastServer {
     ) -> Result<CallToolResult, ErrorData> {
         // Argument validation before resolution, as everywhere (§5.1).
         // `None` is the pattern-less wait and is not an error.
+        // **An empty pattern is refused rather than aliased** (review
+        // finding). Absent and `null` are byte-identical and both mean the
+        // pattern-less wait; `""` compiled to a regex that matches at offset
+        // zero, so it returned `matched: true` with `match.text: ""` at once
+        // — measured against a running `sleep 30`, and against an already
+        // dead session, where it also skipped the `session_died` the pattern
+        // path would have reported.
+        //
+        // Making `pattern` optional is exactly what makes `""` a likely
+        // client encoding of "omit". Silently treating it as omitted would
+        // hide that bug in the caller; refusing it names it. Two spellings
+        // for one meaning, and an error for the third.
         let pattern = match args.pattern.as_deref() {
+            Some("") => {
+                return Err(ErrorData::invalid_params(
+                    "pattern must not be empty — omit it entirely to wait for the session \
+                     to stop executing",
+                    None,
+                ))
+            }
             Some(p) => Some(compile_pattern(p)?),
             None => None,
         };
@@ -1139,13 +1211,18 @@ impl HoldfastServer {
         };
         // `matched` for a pattern wait, `reached` for a pattern-less one:
         // the two answer different questions and are not spelled the same
-        // so that a caller cannot read one as the other.
+        // so that a caller cannot read one as the other. **The `details`
+        // sentence has to keep that distinction too** — it used to collapse
+        // both into one bool three lines below the comment asserting they
+        // must not be, and then said "pattern matched" on a call that
+        // supplied no pattern. `AwaitingSecret` was the worst case: the
+        // right reading is "stop, call `request_secret_input`", and what an
+        // agent was told is that its absent pattern had matched.
         let satisfied = fields
             .get("matched")
             .or_else(|| fields.get("reached"))
             .and_then(|m| m.as_bool())
             .unwrap_or(false);
-        let matched = satisfied;
         let mut data =
             detection::with_detection(serde_json::Value::Object(fields), &session, &self.processor);
         // After `with_detection`, not before: the warning is read out of
@@ -1153,15 +1230,21 @@ impl HoldfastServer {
         if let Some(w) = detection::unmatched_at_prompt(&data) {
             data["warning"] = json!(w);
         }
-        Ok(envelope::envelope(
-            status,
-            data,
-            if matched {
-                "pattern matched".to_string()
-            } else {
-                format!("pattern did not match within {}s", timeout.as_secs())
-            },
-        ))
+        let details = match (&pattern, satisfied) {
+            (Some(_), true) => "pattern matched".to_string(),
+            (Some(_), false) => format!("pattern did not match within {}s", timeout.as_secs()),
+            // Names the mode, because that is the whole answer this form
+            // gives and the caller is told to read it.
+            (None, true) => {
+                let mode = data
+                    .get("interaction_mode")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("not executing");
+                format!("session is {mode}")
+            }
+            (None, false) => format!("session still executing after {}s", timeout.as_secs()),
+        };
+        Ok(envelope::envelope(status, data, details))
     }
 
     /// Send keystrokes to a session's stdin.
@@ -2952,17 +3035,48 @@ impl HoldfastServer {
         // signal is `output_end_cursor`, set by the `D` marker, exactly as
         // `CommandEntry::exit_code` documents.
         let baseline = session.command_count();
-        let settle = Duration::from_millis(session.settle_threshold_ms());
+        // **Bounded by the caller's deadline as well as by the detector**
+        // (review finding). `settle_threshold_ms` is a per-session argument
+        // and a config key, so an operator who raised it past the timeout
+        // made short pattern-less waits *unsatisfiable*: measured with
+        // `settle_threshold_ms: 5000` and `timeout_secs: 1`, an idle bash
+        // returned `reached: false` beside `AtPrompt` at `semantic` tier and
+        // confidence 1.0 — the truth and the false thing in one payload,
+        // which is the exact failure this whole feature exists to retire.
+        //
+        // Clamping trades a little of the settle window's protection on very
+        // short deadlines for never being guaranteed to lie. The other two
+        // guards below — `saw_executing` and the command-history probe —
+        // are unaffected and cover the common case; this window is only the
+        // fallback for "no shell integration and never observed executing".
+        let settle = Duration::from_millis(session.settle_threshold_ms()).min(timeout);
         let mut saw_executing = false;
         let mut idle_since: Option<std::time::Instant> = None;
-        let reached = loop {
-            match session.detection().interaction_mode {
+        // The mode the wait stopped on, or `None` if the deadline won.
+        //
+        // **A mode and not a bool** (review finding). Folding `Exited`,
+        // `AwaitingSecret`, `Fullscreen` and `AtPrompt` into `true` is why a
+        // dead session answered `ok` / "pattern matched" with no
+        // `exit_code`, while the *pattern* path answered `session_died` for
+        // the identical state: one tool, two forms, disagreeing on the wire.
+        // The caller maps this to status, details and `exit_code`.
+        let stopped_on: Option<InteractionMode> = loop {
+            // **Liveness first, and read from the process rather than the
+            // detector.** The detector's cached mode can still say `AtPrompt`
+            // for a session that has already exited — observed once at
+            // `semantic` tier with confidence 1.0 — and the pattern path does
+            // not have that blind spot because it polls `is_alive` directly.
+            if !session.is_alive() {
+                break Some(InteractionMode::Exited);
+            }
+            let mode = session.detection().interaction_mode;
+            match mode {
                 // Neither can be mistaken for "about to start the command
                 // you just sent", so both answer at once.
-                InteractionMode::Exited | InteractionMode::AwaitingSecret => break true,
+                InteractionMode::Exited | InteractionMode::AwaitingSecret => break Some(mode),
                 // §5.2: a TUI never returns to `AtPrompt`, so this reports
                 // the mode promptly rather than running out the deadline.
-                InteractionMode::Fullscreen => break true,
+                InteractionMode::Fullscreen => break Some(mode),
                 InteractionMode::Executing => {
                     saw_executing = true;
                     idle_since = None;
@@ -2971,14 +3085,14 @@ impl HoldfastServer {
                     // Watched it run and watched it stop. Nothing ambiguous
                     // is left, at any tier.
                     if saw_executing {
-                        break true;
+                        break Some(mode);
                     }
                     // Never saw it execute, so `AtPrompt` is either "finished
                     // before the call" or "not started yet" — the same
                     // observation. Shell integration settles it when present.
                     match session.command_history(baseline, 1).first() {
                         // Started since the baseline and its `D` closed it.
-                        Some(e) if e.output_end_cursor.is_some() => break true,
+                        Some(e) if e.output_end_cursor.is_some() => break Some(mode),
                         // Started and still open: keep waiting, and do not let
                         // the settle window expire underneath a running child.
                         Some(_) => idle_since = None,
@@ -2989,24 +3103,36 @@ impl HoldfastServer {
                         None => {
                             let since = *idle_since.get_or_insert_with(std::time::Instant::now);
                             if since.elapsed() >= settle {
-                                break true;
+                                break Some(mode);
                             }
                         }
                     }
                 }
             }
             if std::time::Instant::now() >= deadline {
-                break false;
+                break None;
             }
             tokio::time::sleep(IDLE_WAIT_POLL).await;
         };
 
         let mut fields = serde_json::Map::new();
-        fields.insert("reached".into(), json!(reached));
+        fields.insert("reached".into(), json!(stopped_on.is_some()));
         if let Some(c) = clamped {
             fields.insert("clamped_timeout_secs".into(), json!(c));
         }
-        let status = if reached { Status::Ok } else { Status::Timeout };
+        // **`Exited` is a death, not a success.** §18.1 puts this tool in the
+        // `session_died` row with `data.exit_code` set, and the pattern path
+        // already answers that way; this one answered `ok` with no exit code,
+        // so an agent had to make a second `status` call to discover its
+        // shell was gone.
+        let status = match stopped_on {
+            Some(InteractionMode::Exited) => {
+                fields.insert("exit_code".into(), json!(session.exit_code()));
+                Status::SessionDied
+            }
+            Some(_) => Status::Ok,
+            None => Status::Timeout,
+        };
         (status, fields)
     }
 
@@ -3150,6 +3276,15 @@ impl HoldfastServer {
             (_, _, false) => Status::SessionDied,
             _ => Status::Timeout,
         };
+        // **`session_died` carries the exit code**, as §18.1's row for this
+        // tool requires and as `interrupt` and `send_input` already do. This
+        // path reported the status and omitted the datum, so the one answer
+        // where the exit code is the only actionable thing was the one
+        // answer without it — pre-existing, and the same gap the pattern-less
+        // path had for a different reason.
+        if status == Status::SessionDied {
+            fields.insert("exit_code".into(), json!(session.exit_code()));
+        }
         (status, fields)
     }
 }
@@ -3296,7 +3431,7 @@ pub struct WaitForPatternArgs {
     pub session: String,
     /// Rust regex matched against the session's raw output bytes.
     ///
-    /// **Omit it to wait for the session to stop executing instead** —
+    /// **Omit it to wait for the session to stop executing instead. An empty      string is rejected rather than treated as either, because it is a likely client      encoding of \"omit\" and it used to match at offset zero and complete instantly** —
     /// which is not the same claim as "the command finished"; see
     /// `run_wait_for_idle` for what each tier can actually establish. A
     /// shell-prompt regex is a guess about the operator's `$PS1` and

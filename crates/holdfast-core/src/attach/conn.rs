@@ -58,7 +58,7 @@ use tokio::sync::mpsc;
 use super::frames::{
     AttachMode, AttachRole, ClientDecode, ClientFrame, ClientFrameKind, ServerFrame, SignalName,
 };
-use super::handshake::{evaluate_attach, REJECT_SESSION_NOT_FOUND};
+use super::handshake::{evaluate_attach, REJECT_SESSION_NOT_FOUND, REJECT_TERMINAL_BUSY};
 use crate::daemon::server::Daemon;
 use crate::protocol::frame::{self, FrameError};
 use crate::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
@@ -74,6 +74,63 @@ struct Handshake {
     client_kind: ClientKind,
     client_version: String,
     protocol_major: u32,
+    /// The client's terminal, as it declared it (GH #66). `None` from a
+    /// pipe or from a client older than the field.
+    terminal: Option<String>,
+}
+
+/// Tell every client attached to `session_id` the geometry, skipping any
+/// that already knows it.
+///
+/// **One rule, replacing two** (GH #66 review). The originator used to be
+/// handled by "tell it when the answer is not what it asked" and everybody
+/// else by "tell them when the size changed". The first re-sent an
+/// identical frame on every `SIGWINCH` of a drag that changed nothing — a
+/// 120-column client against an 80-column peer got one per frame — which
+/// is the flood this issue is about, moved from the terminal to a bounded
+/// 64-frame queue where it can get its own sender dropped as a slow
+/// consumer.
+///
+/// Asking whether the client already knows subsumes both, and it is the
+/// question the two rules were separately approximating.
+fn broadcast_size(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+    size: (u16, u16),
+    origin: Option<(u64, (u16, u16))>,
+) {
+    for c in daemon.attach_hub().clients_of(session_id) {
+        {
+            let mut told = c.last_told.lock();
+            // **A client knows a geometry if it was told it, or if it
+            // asked for exactly it.** Both halves are load-bearing.
+            //
+            // Without the second, the originator of a resize that
+            // succeeded exactly as requested is sent its own request back,
+            // and `the_resizing_client_does_not_receive_its_own_resize_back`
+            // is red for the reason it names: a client that reflows on
+            // every `Resize` loops against itself.
+            //
+            // Without the first, a client is told the same thing over and
+            // over — which is what happens to a 120-column client dragging
+            // against an 80-column peer, one identical frame per
+            // `SIGWINCH`, into a bounded queue.
+            let asked_for_this =
+                matches!(origin, Some((id, asked)) if id == c.client_id && asked == size);
+            if *told == Some(size) || asked_for_this {
+                *told = Some(size);
+                continue;
+            }
+            *told = Some(size);
+        }
+        // `try_send`, like the output path: a resize notification is not
+        // worth blocking a read loop behind a client that stopped
+        // draining, and that client is on its way out anyway.
+        let _ = c.tx.try_send(ServerFrame::Resize {
+            cols: size.0,
+            rows: size.1,
+        });
+    }
 }
 
 /// Serve one accepted, uid-checked attach connection to completion.
@@ -133,6 +190,66 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
         }
     };
 
+    // **A second writer on a terminal that already has one is refused**
+    // (GH #66, `terminal_busy`). Checked here and not in
+    // `evaluate_attach`: it is the one refusal that depends on the other
+    // clients attached rather than on this connection's own version, and
+    // it is checked *after* the registry so a wrong session name is still
+    // reported as `session_not_found`.
+    //
+    // This is not multi-attach being restricted. Two terminals on one
+    // session is the feature §4.3 builds the hub for and it is untouched;
+    // what cannot work is two *keyboards* that are physically the same
+    // keyboard, because the kernel hands each byte to exactly one reader
+    // and the operator's `Ctrl-B d` is split between them.
+    //
+    // **A claim and not a question.** Asking "is it busy" here and
+    // registering a hundred lines later is a check-then-act across several
+    // `await` points, and every attach connection is its own task — two
+    // clients starting together both got "no" and both attached. The claim
+    // is test-and-set under one lock, and `_terminal_claim` must stay
+    // bound for the life of the connection: its `Drop` is the release, and
+    // dropping it here would give the terminal back while still holding it.
+    let mut terminal_claim = None;
+    if let (AttachMode::ReadWrite, Some(terminal)) = (hs.mode, hs.terminal.as_deref()) {
+        match daemon.attach_hub().claim_terminal(terminal, &session.id) {
+            Ok(claim) => terminal_claim = Some(claim),
+            Err(owner) => {
+                let same = owner == session.id;
+                let _ = frame::write_frame(
+                    &mut wr,
+                    &ServerFrame::AttachReject {
+                        reason: REJECT_TERMINAL_BUSY.to_string(),
+                        // Begins with the token, like every other arm
+                        // (§7.5), and then says what to do about it — an
+                        // operator told only "busy" will try again and get
+                        // the same answer. **Naming the other session
+                        // matters when it is a different one**: the advice
+                        // "detach that one first" is unfollowable if the
+                        // operator is looking at the wrong window.
+                        message: if same {
+                            format!(
+                                "{REJECT_TERMINAL_BUSY} — this terminal already has an \
+                                 interactive client on that session; detach that one first, \
+                                 or attach from another terminal."
+                            )
+                        } else {
+                            format!(
+                                "{REJECT_TERMINAL_BUSY} — this terminal already has an \
+                                 interactive client, attached to session {owner}; detach \
+                                 that one first, or attach from another terminal. Two \
+                                 clients on one keyboard are handed alternate keystrokes \
+                                 by the kernel, so neither reliably sees a detach."
+                            )
+                        },
+                    },
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
     // **Subscribe before `Attached` is written.** §7.5: *"The frame is
     // sent before any `Output` frames"* — which is an ordering claim and
     // also a completeness one. Subscribing afterwards is a race that
@@ -176,6 +293,11 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
         peer_uid,
         tx: tx.clone(),
         connected_at: Instant::now(),
+        last_size: parking_lot::Mutex::new(None),
+        // Seeded with what `Attached` is about to carry: a geometry this
+        // client has already been told, so the first correction it gets is
+        // a real change rather than an echo of its own handshake.
+        last_told: parking_lot::Mutex::new(Some(session.size())),
     });
 
     // Queued first, so the FIFO is what makes it frame one rather than a
@@ -303,6 +425,54 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
         .attach_hub()
         .unregister(&conn.session_id, conn.client_id);
 
+    // **A departing writer relaxes the minimum** (GH #66). The session is
+    // sized to the smallest attached writer, so the client that was
+    // holding it narrow leaving must give the columns back — otherwise a
+    // 200-column terminal stays clamped to the 80 of a peer that is no
+    // longer there, and nothing but a manual resize would ever free it.
+    //
+    // Ordered **after** `unregister` so this connection is already out of
+    // the fold, and under the same lock as the read-loop's sequence so the
+    // two cannot interleave into a stale apply. The comparison is
+    // clamped-against-clamped: `writer_min_size` now folds clamped values,
+    // so an out-of-range claim can no longer make this test permanently
+    // true and turn every detach into a broadcast of a size that did not
+    // move.
+    if conn.mode == AttachMode::ReadWrite && conn.last_size.lock().is_some() {
+        let achieved = daemon.attach_hub().with_resize_decision(|| {
+            // **With no writers left this is the agent's desired size**, so
+            // the last human detaching returns the session to what a tool
+            // asked for rather than stranding it at a departed client's
+            // geometry — which nothing could observe or undo (GH #75).
+            let want = daemon
+                .attach_hub()
+                .effective_size(&conn.session_id, session.desired_size())?;
+            if want == session.size() {
+                return None;
+            }
+            match session.resize(want.0, want.1) {
+                Ok(()) => Some(session.size()),
+                Err(e) => {
+                    crate::diag!("holdfast daemon: resize after detach failed: {e}");
+                    None
+                }
+            }
+        });
+        if let Some(achieved) = achieved {
+            // No originator: nobody asked for this, the constraint simply
+            // lifted, so every remaining client is learning it.
+            broadcast_size(&daemon, &conn.session_id, achieved, None);
+        }
+    }
+
+    // **The claim goes here, not when this task ends.** `run` continues
+    // past this point into `writer.await`, which parks for as long as the
+    // peer's socket stays full — on the `slow_consumer` ending it is
+    // already parked by definition. A claim held that long is a terminal
+    // no other client can use, whose refusal advises detaching a client
+    // the daemon has already detached.
+    drop(terminal_claim);
+
     // **The one place `Detached` is emitted**, for all three of its wire
     // reasons. `client_detach` is deliberately absent — §7.5: *"The
     // client sent `Detach`; there is nobody left to tell."* Adding it
@@ -425,6 +595,7 @@ async fn read_handshake(
             client_version,
             protocol_major,
             protocol_minor: _,
+            terminal,
         }) => Some(Handshake {
             session,
             mode,
@@ -432,6 +603,7 @@ async fn read_handshake(
             client_kind,
             client_version,
             protocol_major,
+            terminal,
         }),
         // A well-formed frame of the wrong kind. §7.5:
         // *"pre-handshake violations close."*
@@ -547,15 +719,73 @@ async fn read_loop(
                     return;
                 }
             }
-            ClientDecode::Frame(ClientFrame::Resize { cols, rows }) => {
-                if let Err(e) = session.resize(cols, rows) {
-                    crate::diag!("holdfast daemon: attach resize failed: {e}");
+            ClientDecode::Frame(ClientFrame::Resize {
+                cols: asked_cols,
+                rows: asked_rows,
+            }) => {
+                // **What this client can display, not what the session
+                // becomes** (GH #66). Recorded first, then folded with
+                // every other writer's: the session gets the minimum, so
+                // no attached terminal is ever asked to show more columns
+                // than it has. tmux's rule, and for tmux's reason.
+                // **Clamped on the way in, and a degenerate report is
+                // not a claim at all** (GH #66 review). `TIOCGWINSZ`
+                // answers `0` on a pty that was never sized — a harness,
+                // an emulator's startup transient, ssh before
+                // negotiation — and the client forwards it verbatim as its
+                // opening `Resize`. Stored raw, that `0` won every
+                // minimum, `Session::resize` clamped it to the 2x2 floor,
+                // and **no other writer could lift it**: under
+                // last-writer-wins the next frame from anyone repaired it,
+                // under a fold only that client can. Reproduced at 2x2
+                // with a 120x40 peer unable to move it.
+                //
+                // A client that cannot state a size is therefore recorded
+                // as having stated none, rather than as claiming the
+                // smallest one representable.
+                let claim = if asked_cols == 0 || asked_rows == 0 {
+                    None
+                } else {
+                    Some(crate::pty::clamp_geometry(asked_cols, asked_rows))
+                };
+
+                // **Fold, apply and read back under one lock.** The fold
+                // is order-independent; the sequence was not. Two writers
+                // on a multi-thread runtime could each fold and then apply
+                // in the opposite order, leaving the session at a departed
+                // or stale writer's geometry with no further event to
+                // correct it — the state this policy exists to prevent.
+                let outcome = daemon.attach_hub().with_resize_decision(|| {
+                    *conn.last_size.lock() = claim;
+                    let before = session.size();
+                    // Folded with what the *agent* asked for, so a client's
+                    // window narrows the session without erasing the size a
+                    // tool set (GH #75).
+                    let want = daemon
+                        .attach_hub()
+                        .effective_size(&conn.session_id, session.desired_size());
+                    match want {
+                        Some((c, r)) => match session.resize(c, r) {
+                            Ok(()) => Some((before, session.size())),
+                            Err(e) => {
+                                crate::diag!("holdfast daemon: attach resize failed: {e}");
+                                None
+                            }
+                        },
+                        // Nobody is claiming a size — this client withdrew
+                        // the only one. Leaving the geometry alone beats
+                        // resizing to a default nobody asked for.
+                        None => None,
+                    }
+                });
+                let Some((before, achieved)) = outcome else {
                     continue;
-                }
+                };
                 // §4.1: an attach `Resize` from a ReadWrite client is
                 // activity. The `resize` **tool** is not, which is why
                 // the stamp is here and not inside `Session::resize`.
                 session.note_activity();
+                let _ = before;
 
                 // §7.5: *"canonical PTY size, e.g. when another client
                 // resizes."* The size is re-read from the session rather
@@ -563,19 +793,26 @@ async fn read_loop(
                 // reflow to is the geometry the terminal actually got —
                 // `Session::resize` clamps, and a client that asked for
                 // 5000 columns must not tell everybody else it succeeded.
-                let (cols, rows) = session.size();
-                for other in daemon.attach_hub().clients_of(&conn.session_id) {
-                    // The originator is excluded: it already knows, and a
-                    // client that reflows on every `Resize` would loop.
-                    if other.client_id == conn.client_id {
-                        continue;
-                    }
-                    // `try_send`, like the output path: a resize
-                    // notification is not worth blocking this read loop
-                    // behind a client that stopped draining, and that
-                    // client is on its way out anyway.
-                    let _ = other.tx.try_send(ServerFrame::Resize { cols, rows });
-                }
+                //
+                // **Told-once, per client.** This replaces two separate
+                // rules — "others hear it if it changed" and "the
+                // originator hears it if it is not what it asked" — with
+                // the question both were approximating: does this client
+                // already know? The originator rule alone re-sent an
+                // identical correction on every frame of a drag that
+                // changed nothing, which is a flood on the wire rather
+                // than on the terminal, and enough of one to have a client
+                // dropped as a slow consumer by its own window drag.
+                broadcast_size(
+                    daemon,
+                    &conn.session_id,
+                    achieved,
+                    // **What it actually asked, not the clamped claim.**
+                    // A client that asked for 5000 columns and got 1000
+                    // does not know the answer, and passing the clamped
+                    // value here would say it does.
+                    Some((conn.client_id, (asked_cols, asked_rows))),
+                );
             }
             ClientDecode::Frame(ClientFrame::Signal { sig }) => {
                 // §4.4's per-value delivery, reached through

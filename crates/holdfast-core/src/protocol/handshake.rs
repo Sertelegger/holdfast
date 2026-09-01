@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 /// Bumped only for a breaking wire change (§23.3).
 pub const PROTOCOL_MAJOR: u32 = 1;
 /// Bumped for additive changes: new methods, new optional fields.
-pub const PROTOCOL_MINOR: u32 = 0;
+///
+/// 1.1 adds `Attach.terminal`, an optional field (GH #66).
+pub const PROTOCOL_MINOR: u32 = 1;
 
 /// How long either peer waits for the **first** frame of the handshake
 /// before giving up on the connection.

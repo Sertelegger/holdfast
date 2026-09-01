@@ -7,7 +7,7 @@ The **Human-Observable** in that name is a shipped property from 0.0.6:
 over — a live session from any terminal. The web UI is still to come; see
 [ROADMAP.md](./ROADMAP.md).
 
-> **Status: milestone 0.0.6 — early development.** Eleven tools, hybrid
+> **Status: milestone 0.0.7 — early development.** Twelve tools, hybrid
 > mode on Linux/macOS/WSL, Unix only. Sessions live in a background
 > daemon and survive the MCP client, so a Claude Code restart no longer
 > takes them with it. Output is ANSI-stripped and secret-redacted by
@@ -21,9 +21,14 @@ over — a live session from any terminal. The web UI is still to come; see
 - `read_output` — read what it printed, using a cursor you carry between
   calls; escape sequences stripped and secrets replaced with
   `[REDACTED:<kind>]` markers by default
-- `wait_for_pattern` — block until a regex matches new output, so an
-  agent can wait for a command to finish or a prompt to appear instead of
-  polling; `send_input(wait_for:)` does the same after a write
+- `wait_for_pattern` — block until the session stops executing, or until a
+  regex matches new output, instead of polling; `send_input(wait_for:)` does
+  the same after a write. **The pattern is optional, and for "has the command
+  finished?" you want it omitted**: a regex for the *shell's* prompt is a guess
+  about the operator's `$PS1`, and against a customised one it never matches, so
+  the call reports a timeout for a command that finished long ago. Supply a
+  pattern for a **program's** prompt — `Password:`, `(gdb)`, `>>>` — which is
+  text no detector knows about
 - `terminate` — stop it, killing the whole process group
 - `status` — what one session is doing right now
 - `list_sessions` — every session this server knows about, live or exited
@@ -49,10 +54,15 @@ over — a live session from any terminal. The web UI is still to come; see
   Detach with Ctrl+C.
 
 Multiple clients can attach at once: output goes to all of them, and input from
-any of them reaches the PTY. When a program asks for a password, every attached
+any of them reaches the PTY. **One terminal hosts one interactive client per
+session, though** — a second `holdfast attach` from a terminal that already has
+one is refused with `terminal_busy`, because two processes reading one keyboard
+are handed alternate keystrokes by the kernel and neither reliably sees a
+detach. Attach from another window instead. The session's size is the smallest
+attached writer's, so another client's window can narrow what a program sees. When a program asks for a password, every attached
 client is told and any of them can answer — without the value ever reaching the
 agent. `request_secret_input`, the tool an agent calls to *ask* for that
-password, arrives in 0.0.7.
+password, ships in 0.0.7 and is one of the twelve above.
 
 Sessions outlive the MCP client: `holdfast mcp` auto-spawns a daemon on
 first use and reconnects to it afterwards. `holdfast mcp --no-daemon` runs
@@ -162,7 +172,7 @@ request runs:
 | `fmt` | `cargo fmt --all --check` |
 | `clippy` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | `windows-cross` | The same clippy invocation against `x86_64-pc-windows-gnu`. A **cross-compilation check, not a test run** — it proves Holdfast still *compiles* for Windows; it is not evidence that it *works* there |
-| `probe` | `scripts/ci-probe.sh` — toolchain version, pseudoterminal allocation, and every shell and interpreter the suite spawns by name. Ten of `tests/detection.rs`'s 23 tests skip *and report as passing* when their program is absent, so this gate is part of what makes the test job's green mean something |
+| `probe` | `scripts/ci-probe.sh` — toolchain version, pseudoterminal allocation, and every shell and interpreter the suite spawns by name. Host-dependent rows of `tests/detection.rs` skip *and report as passing* when their program is absent, so this gate is part of what makes the test job's green mean something. The exact set is pinned by `scripts/ci-skip-census.sh` rather than counted here (GH #74) |
 | `test` | `scripts/ci-skip-census.sh --self-test` (the census's own gates, deleted one at a time against fixtures), then `cargo test --workspace --locked --no-fail-fast -- --test-threads=4 --show-output`, then `scripts/ci-skip-census.sh` over the captured log — which fails on any skipped row the pipeline has not agreed to, on any *assertion* gated off inside a row that ran without an agreed entry, **and on an agreed one of either kind that stopped happening** |
 | `package` | `cargo build --release --locked`, the MCP smoke script against the *release* binary, and a downloadable artifact + SHA-256. It `needs:` a green `test`, so the build that gets installed is the build that was tested |
 

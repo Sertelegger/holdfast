@@ -20,6 +20,40 @@ been measured, and what would settle it.
 | [#52](https://github.com/Sertelegger/holdfast/issues/52) | `daemon::server::tests::a_connection_mid_handshake_holds_off_the_client_less_exit` | **2 failures in 54 whole-binary runs**, load-dependent; 0 in 800 runs filtered to `daemon::server` alone, so it needs the rest of the binary for contention. Asserts at `server.rs:3552`. **#52's second test is the row already tracked as #21 above** — the pair overlaps, so #52 contributes one new name, not two. |
 | [#60](https://github.com/Sertelegger/holdfast/issues/60) | `a_resource_read_and_a_read_output_return_the_same_bytes` (`crates/holdfast-core/tests/control_protocol.rs:1717`) | **Inverts this file's premise: it fails in isolation and passes under load.** Roughly 1 failure in 3 when run alone on macOS; 0 across the last two full `--workspace` runs. Whatever it needs is something the rest of the suite happens to provide, so the usual "run it alone to reproduce" instruction is backwards for this row. |
 
+## Linux CI evidence, 2026-09-01
+
+The first runs after the Actions quota unblocked, and the first time anything
+had executed the 0.0.7 work on Linux. Two rows fail there **reproducibly**,
+not occasionally, and a `main` run under identical conditions was used as the
+control:
+
+| Row | main run 1 | main run 2 | branch run 1 | branch run 2 |
+|---|---|---|---|---|
+| [#39](https://github.com/Sertelegger/holdfast/issues/39) | fail | fail | fail | fail |
+| [#60](https://github.com/Sertelegger/holdfast/issues/60) | pass | fail | fail | fail |
+
+Both are therefore pre-existing rather than anything a branch introduced.
+
+**#60's title and this file were both wrong about it, and the fix is not a
+timing knob.** The assertion reads *"the two paths must be the same
+processor, not two implementations"*, and the two strings differ by exactly
+one trailing `bash-5.2$ `. It is not two implementations: it is one buffer
+read twice with output arriving in between. `read_until(&client, &id, "$")`
+matches the `$` inside the *injected shell-integration snippet* — `"${PS1-}"`
+contains one — so the test proceeds while the shell is still printing, and
+the prompt lands between the two reads. Fixed by waiting for the buffer to
+stop growing before comparing.
+
+**#39's recorded diagnosis is contradicted by the evidence.** This file said
+*"a fixed `wait_exit(15)` outrun under load"*. `wait_exit` **panics** on
+timeout; it does not return a code. The observed failure is
+`assert_eq!(term.wait_exit(15), 0)` with **left: 2**, and 2 is
+`EXIT_UNREACHABLE` — the client's code for *"the daemon closed the connection"*
+(no `Detached` frame before EOF), or a handshake that did not complete. So
+the row is not slow, it is ending the wrong way, and a longer deadline would
+not have helped. Still open, still pre-existing, and now with a diagnosis
+that points somewhere.
+
 ## Platform evidence
 
 Measured on macOS 27.0 / arm64 against `e1cb7cb`, roughly ten full-suite runs

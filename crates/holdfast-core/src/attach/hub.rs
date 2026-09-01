@@ -62,6 +62,40 @@ pub struct AttachConn {
     /// blocks the reader task.
     pub tx: mpsc::Sender<ServerFrame>,
     pub connected_at: Instant,
+    /// The geometry this client was last *sent*, so it is not sent again.
+    ///
+    /// Initialised to the size carried by its own `Attached` frame, which
+    /// is a thing it has already been told. Without this the originator of
+    /// a resize received one identical correction per `SIGWINCH` of a drag
+    /// — the flood this issue is about, relocated from the terminal to the
+    /// wire, where a client already behind on its socket can be dropped as
+    /// a slow consumer by its own window drag.
+    pub last_told: Mutex<Option<(u16, u16)>>,
+    /// The geometry this client last asked for, or `None` until it asks.
+    ///
+    /// The session's size is the **minimum** over the writers that have
+    /// reported one, so this is a per-client input to that fold rather
+    /// than a record of what the session ended up at. §7.5 is what
+    /// restricts the fold to writers: *"the canonical PTY size is set by
+    /// writers; observers don't influence it"*.
+    pub last_size: Mutex<Option<(u16, u16)>>,
+}
+
+/// A writer's hold on one terminal, released when this is dropped.
+///
+/// Held for the life of the connection by `attach::conn::run`. Dropping is
+/// the *only* release path on purpose: the connection has several early
+/// returns between claiming and registering, and a manual release would be
+/// a list to keep in step with them.
+pub struct TerminalClaim {
+    hub: Arc<AttachHub>,
+    terminal: String,
+}
+
+impl Drop for TerminalClaim {
+    fn drop(&mut self) {
+        self.hub.terminals.lock().remove(&self.terminal);
+    }
 }
 
 /// Every live attach connection, grouped by the session it is attached
@@ -94,6 +128,36 @@ pub struct AttachHub {
     /// expires — so one slot holding both would make the fall-through
     /// overwrite the thing it fell through from.
     approvals: crate::secret::BindingApprovals,
+    /// Terminal device -> the session whose writer holds it.
+    ///
+    /// A map rather than a count: the question is only ever *"is this
+    /// terminal taken"*, and a count would have to be decremented correctly
+    /// on every path a guard now handles for free.
+    ///
+    /// **Keyed on the terminal alone, not on `(session, terminal)`.** The
+    /// failure is that two processes `read()`ing one terminal device are
+    /// handed alternate bytes by the kernel; which session each is attached
+    /// to has no bearing on it. A `(session, terminal)` key let
+    /// `holdfast attach s1 & holdfast attach s2` in one window through —
+    /// two writers, one keyboard, the measured failure verbatim, and worse
+    /// than the same-session case because the first to exit restores cooked
+    /// mode out from under the survivor.
+    ///
+    /// The value is the session id so the refusal can name what holds it.
+    terminals: Mutex<HashMap<String, String>>,
+    /// Serialises "fold the writers' sizes, apply, read back".
+    ///
+    /// The fold itself is order-independent, which is the property that
+    /// makes a minimum converge — but the *sequence* was not: two tasks on
+    /// a multi-thread runtime could both fold, then apply in the other
+    /// order, leaving the session at a stale writer's geometry with no
+    /// further event to correct it. `writer_min_size` releases every lock
+    /// it takes before returning, so nothing it does can span the apply.
+    ///
+    /// Coarse on purpose. Resizes are human-paced, and one mutex is easier
+    /// to prove acyclic than a per-session map: the order is always this,
+    /// then `clients`, then `last_size`, and never the reverse.
+    resize_decisions: Mutex<()>,
     /// Monotonic, process-wide. **Never reused**, so an `unregister`
     /// arriving after the slot was refilled cannot remove somebody
     /// else's connection — the same reasoning that puts an `O_PATH` pin
@@ -110,6 +174,108 @@ impl AttachHub {
     /// the id a connection carries is the one it was registered under.
     pub fn next_client_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Claim `terminal` for a writer, or `None` if one already holds it.
+    ///
+    /// **Atomic, and that is the whole reason this is not a predicate.**
+    /// The obvious shape — ask whether the terminal is busy, then register
+    /// if it is not — is a check-then-act across the 100-odd lines and
+    /// several `await` points between the handshake and `register`, and
+    /// every attach connection is its own task. Two clients starting from
+    /// one terminal at once both saw "not busy" and both attached, which is
+    /// precisely the state the check exists to prevent. Test-and-set under
+    /// one lock has no such window.
+    ///
+    /// **Not folded into `clients`**, because the claim has to be taken
+    /// before the `AttachConn` exists: registering early to reserve a slot
+    /// would let another client's broadcast reach this connection's queue
+    /// ahead of its own `Attached`, and §7.5 makes `Attached` frame one.
+    ///
+    /// Callers claim only for [`AttachMode::ReadWrite`] and only when the
+    /// client declared a terminal — an observer never reads the keyboard,
+    /// and a client with no terminal cannot be sharing one.
+    ///
+    /// The returned guard releases on drop, and callers drop it as soon as
+    /// the attachment ends rather than when the task does: the writer task
+    /// can stay parked on a full socket long after the client stopped
+    /// being attached, and a claim held that long is a terminal nobody can
+    /// use and no advice can free.
+    pub fn claim_terminal(
+        self: &Arc<Self>,
+        terminal: &str,
+        session_id: &str,
+    ) -> Result<TerminalClaim, String> {
+        let mut held = self.terminals.lock();
+        if let Some(owner) = held.get(terminal) {
+            return Err(owner.clone());
+        }
+        held.insert(terminal.to_string(), session_id.to_string());
+        drop(held);
+        Ok(TerminalClaim {
+            hub: Arc::clone(self),
+            terminal: terminal.to_string(),
+        })
+    }
+
+    /// Run `f` with the resize sequence serialised. See
+    /// [`Self::resize_decisions`].
+    pub fn with_resize_decision<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _guard = self.resize_decisions.lock();
+        f()
+    }
+
+    /// The session geometry every attached writer can display: the
+    /// **minimum** of the sizes they have reported, or `None` if none has.
+    ///
+    /// §7.5 restricts the fold to writers — *"the canonical PTY size is
+    /// set by writers; observers don't influence it"* — and the minimum is
+    /// tmux's rule, for tmux's reason: a column the smallest terminal
+    /// cannot show is a column that is wrapped or lost for that client,
+    /// while a column a larger one leaves blank costs nothing.
+    ///
+    /// **This is what makes the size converge.** Last-writer-wins let two
+    /// clients dragging at once alternate between their own readings
+    /// forever, which is GH #66's unexplained "the sizes oscillate rather
+    /// than converging on a final geometry". A minimum has no such
+    /// ordering dependence: the same set of clients yields the same answer
+    /// whoever reported last.
+    /// The geometry to put in force: what the agent asked for, narrowed by
+    /// what every attached writer can display (GH #75).
+    ///
+    /// **`desired` is the floor when nobody is attached**, which is the half
+    /// that was missing. The fold used to answer `None` with no writers and
+    /// the caller left the session alone — so a session an agent had sized
+    /// for a TUI stayed at the geometry of whichever human client had most
+    /// recently held it, forever, and the agent had no way to observe or
+    /// undo that. Now the last writer detaching returns the session to the
+    /// size it was asked for.
+    ///
+    /// A minimum in both directions on purpose: an attached human must not
+    /// be asked to render columns their terminal does not have, and an agent
+    /// asking for fewer than a human's terminal gets those fewer.
+    pub fn effective_size(
+        &self,
+        session_id: &str,
+        desired: Option<(u16, u16)>,
+    ) -> Option<(u16, u16)> {
+        match (self.writer_min_size(session_id), desired) {
+            (Some(w), Some(d)) => Some((w.0.min(d.0), w.1.min(d.1))),
+            (Some(w), None) => Some(w),
+            (None, Some(d)) => Some(d),
+            // Nobody is attached and nothing has been asked for: there is no
+            // geometry to put in force, and inventing one would resize a
+            // session to a default nobody chose.
+            (None, None) => None,
+        }
+    }
+
+    pub fn writer_min_size(&self, session_id: &str) -> Option<(u16, u16)> {
+        self.clients_of(session_id)
+            .iter()
+            .filter(|c| c.mode == AttachMode::ReadWrite)
+            .filter_map(|c| *c.last_size.lock())
+            .reduce(|(ac, ar), (bc, br)| (ac.min(bc), ar.min(br)))
     }
 
     pub fn register(&self, conn: Arc<AttachConn>) {

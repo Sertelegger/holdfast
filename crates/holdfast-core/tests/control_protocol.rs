@@ -1720,6 +1720,36 @@ async fn a_resource_read_and_a_read_output_return_the_same_bytes() {
     let id = start_bash(&client, "same").await;
     read_until(&client, &id, "$").await;
 
+    // **Wait for the output to stop before comparing two reads of it.**
+    // `read_until("$")` matches the `$` inside the injected shell-integration
+    // snippet — `"${PS1-}"` contains one — not the shell's prompt, so it
+    // returns while bytes are still arriving. The two reads below then see
+    // different buffers, and CI reported them as "two implementations" when
+    // the whole difference was a trailing `bash-5.2$ ` that landed between
+    // them. Reproduced on Linux on both a branch run and a `main` run.
+    //
+    // Quiescence, not a sleep: two consecutive reads of the same length
+    // means nothing arrived in between, which is the actual precondition
+    // this comparison needs.
+    let mut stable = 0usize;
+    let mut last = usize::MAX;
+    for _ in 0..200 {
+        let params = method::to_cbor(&json!({ "session": id, "since_cursor": 0 })).unwrap();
+        let resp = client.call_raw("tool/read_output", params).await.unwrap();
+        let data: Value = method::from_cbor(&resp.data).unwrap();
+        let n = data["output"].as_str().unwrap().len();
+        if n == last {
+            stable += 1;
+            if stable >= 3 {
+                break;
+            }
+        } else {
+            stable = 0;
+            last = n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
     // Same cursor, same knobs, both paths. A second read implementation
     // that drifted from the processor shows up here and nowhere else.
     let params = method::to_cbor(&json!({

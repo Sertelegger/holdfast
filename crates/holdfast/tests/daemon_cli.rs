@@ -1356,7 +1356,15 @@ fn version_reports_the_protocol_version() {
     let env = TestEnv::new("version");
     let (code, out, _) = env.run(&["version"]);
     assert_eq!(code, 0);
-    assert!(out.contains("protocol 1.0"), "{out}");
+    // **A literal, deliberately.** Deriving this from `PROTOCOL_MINOR`
+    // would assert that the constant equals itself and go green through
+    // any bump, accidental or not; the number is a wire promise and a
+    // second pair of eyes on it is the whole value of the row. Moved 1.0
+    // → 1.1 for `Attach.terminal` (GH #66), alongside a new
+    // `1.1.golden` — the version and the recorded shape move together or
+    // the wire-shape guard fails, which is the pairing that makes this
+    // literal safe to update rather than a rubber stamp.
+    assert!(out.contains("protocol 1.1"), "{out}");
     assert!(out.contains(env!("CARGO_PKG_VERSION")), "{out}");
 }
 
