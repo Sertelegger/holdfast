@@ -20,6 +20,10 @@ trigger as a side effect of writing release notes.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.0.7] — 2026-09-01
+
 ### Upgrading to 0.0.7 on macOS
 
 **Stop the daemon before upgrading.** 0.0.7 moves the macOS runtime directory
@@ -907,4 +911,5 @@ Stated because they are easy to mistake for bugs:
   group plus the terminal's foreground group, so a background job in a third
   group can survive `terminate`.
 
-[Unreleased]: https://github.com/Sertelegger/holdfast/commits/main
+[Unreleased]: https://github.com/Sertelegger/holdfast/compare/v0.0.7...main
+[0.0.7]: https://github.com/Sertelegger/holdfast/releases/tag/v0.0.7
