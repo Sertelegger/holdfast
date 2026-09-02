@@ -153,6 +153,60 @@ impl SecretBytes {
         Self(out)
     }
 
+    /// Take a **just-decoded submission** into the zeroing type, with no
+    /// normalisation and no copy: the allocation handed in is the one
+    /// `Drop` zeroes.
+    ///
+    /// **Scope, stated precisely, because the first draft of this comment
+    /// claimed more than the code does.** This makes every exit *from the
+    /// `SecretInput` match arm* dispose of the submission by dropping it,
+    /// which is what GH #57 was filed about — the two refusals,
+    /// `too_large` and `unknown_request_id`, previously dropped a bare
+    /// `Vec<u8>`. The honest reading of that defect is not that two arms
+    /// forgot a call; it is that the value was a plain `Vec` for the
+    /// length of the arm, so each exit had to remember separately.
+    ///
+    /// **It does not make the whole attach path safe, and three claims to
+    /// the contrary were removed from here after review found them
+    /// false:**
+    ///
+    /// - The ReadOnly gate and the `BadFields`/`UnknownType`/`Malformed`
+    ///   paths sit *upstream* of this call and still drop the cleartext
+    ///   frame — and, on the ReadOnly path, the decoded `Vec` as well —
+    ///   without zeroing either, across a real `await`. GH #82.
+    /// - There was never a `select!` cancellation window between this
+    ///   call and the write. There is no suspension point between them,
+    ///   and a future can only be dropped at one.
+    /// - `len == capacity` does not hold above 4 KiB. `ciborium` fills a
+    ///   byte string in 4096-byte chunks and grows by doubling, so a
+    ///   submission over 4096 bytes has already been copied between
+    ///   freed, un-zeroed blocks before this is ever called — which is
+    ///   exactly the `too_large` case. GH #83.
+    ///
+    /// Deliberately **not** `normalise`: §5.2's normalisation belongs to
+    /// a value that is going to be written, and the cap is measured on
+    /// the bytes as received. See [`normalised`](Self::normalised).
+    pub(crate) fn received(raw: Vec<u8>) -> Self {
+        Self(raw)
+    }
+
+    /// §5.2's normalisation for a submission already owned by this type:
+    /// the accept path's half of [`received`](Self::received).
+    ///
+    /// The husk is zeroed by [`normalise_from`](Self::normalise_from)
+    /// before it drops, and the output is built at its final capacity so
+    /// it cannot grow into a second block later.
+    ///
+    /// **Not "one allocation at every point"** — an earlier draft said
+    /// that and it is not what the code does. `normalise_from` copies the
+    /// kept bytes into the output *before* zeroing the source, so for the
+    /// length of that copy both hold the plaintext. The property that
+    /// actually matters is weaker and sufficient: never two that a `Drop`
+    /// cannot reach. Both are owned by a `SecretBytes` here.
+    pub(crate) fn normalised(mut self, append_newline: bool) -> Self {
+        Self::normalise_from(&mut self.0, append_newline)
+    }
+
     /// The only reader: a **scoped** accessor. The bytes are borrowed for
     /// the duration of `f` and never escape the type, so the zeroing
     /// `Drop` still owns every copy.
@@ -497,6 +551,115 @@ mod tests {
         let sum: u32 = s.with_bytes(|b| b.iter().map(|c| *c as u32).sum());
         assert_eq!(sum, b"hunter2".iter().map(|c| *c as u32).sum::<u32>());
         assert!(!s.is_empty());
+    }
+
+    /// **GH #57: a refused submission is zeroed, and the refusal does not
+    /// have to remember.**
+    ///
+    /// The two `SecretInput` reject arms — `too_large` and
+    /// `unknown_request_id` — used to drop a bare `Vec<u8>`, whose `Drop`
+    /// does not zero. The fix is not a `zero_bytes` call in each arm; it
+    /// is that the decoded submission is a `SecretBytes` from the moment
+    /// it is decoded, so *dropping it* is the zeroing.
+    ///
+    /// **This is what makes the assertion falsifiable.** The witness only
+    /// ever records a `SecretBytes::drop`. If `received` is reverted to
+    /// handing back a plain `Vec`, no drop is recorded and the count
+    /// assertion fails; if the zeroing loop is deleted, a drop is
+    /// recorded holding `hunter2` and the content assertion fails. A test
+    /// that read the buffer back through a saved pointer could not
+    /// distinguish either case from allocator noise — see
+    /// [`drop_witness`].
+    #[test]
+    fn a_refused_submission_is_zeroed_by_being_dropped() {
+        drop_witness::reset();
+
+        // The shape the attach path hands in: a CBOR-decoded buffer with
+        // `len == capacity`.
+        let mut raw = Vec::with_capacity(7);
+        raw.extend_from_slice(b"hunter2");
+        let addr = raw.as_ptr();
+
+        let received = SecretBytes::received(raw);
+        assert_eq!(received.len(), 7);
+        assert_eq!(
+            received.with_bytes(|b| b.as_ptr()),
+            addr,
+            "`received` copied the plaintext into a second allocation; the copy it \
+             left behind is one no Drop can reach"
+        );
+        // This is the refusal: the arm simply lets the value go.
+        drop(received);
+
+        let seen = drop_witness::taken();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the refused submission was not disposed of by a zeroing Drop — a bare \
+             `Vec<u8>` leaves the credential in the heap (GH #57)"
+        );
+        assert_eq!(
+            seen[0],
+            vec![0u8; 7],
+            "the refused submission still held its plaintext at drop"
+        );
+    }
+
+    /// The accept path's half: `normalised` consumes the received value,
+    /// §5.2 still gives the same four answers it gave through
+    /// `normalise`, and exactly one husk drops, holding nothing.
+    ///
+    /// **Named for what it pins, after review found the previous name
+    /// ("leaves no second copy") describing a stronger test than this
+    /// is.** Measured, it survives a `received` that copies and a
+    /// `normalise_from` that stops zeroing its source — both genuine
+    /// second-copy leaks, both caught elsewhere
+    /// (`a_refused_submission_is_zeroed_by_being_dropped`'s pointer
+    /// assertion and `the_stripping_shapes_zero_their_source_too`
+    /// respectively). It also cannot tell *which* zeroing emptied the
+    /// husk, since `Drop` runs before the witness records, so a mutant
+    /// normalising from `self.0.clone()` survives — verified benign, both
+    /// copies are zeroed.
+    ///
+    /// What it does pin, and nothing else does: the §5.2 answers are
+    /// unchanged by the ownership move, and **exactly one** husk drops
+    /// holding a buffer the size of the input — which is what kills a
+    /// `mem::forget` or `mem::take` that would strand the husk unzeroed.
+    #[test]
+    fn the_accept_path_normalises_and_drops_one_empty_husk() {
+        for (raw, append, expect) in [
+            (&b"hunter2"[..], true, &b"hunter2\n"[..]),
+            (&b"hunter2\r\n"[..], true, &b"hunter2\n"[..]),
+            (&b"hunter2\n"[..], false, &b"hunter2"[..]),
+        ] {
+            drop_witness::reset();
+
+            let out = SecretBytes::received(raw.to_vec()).normalised(append);
+
+            // §5.2 is unchanged by the ownership move: same four cases,
+            // same answers as `normalise` gives.
+            assert_eq!(out.len(), expect.len(), "for {raw:?} append={append}");
+            out.with_bytes(|b| assert_eq!(b, expect, "for {raw:?} append={append}"));
+
+            // The husk dropped, and it dropped empty.
+            let seen = drop_witness::taken();
+            assert_eq!(
+                seen.len(),
+                1,
+                "for {raw:?}: expected exactly the husk's drop, saw {}",
+                seen.len()
+            );
+            assert!(
+                seen[0].iter().all(|c| *c == 0),
+                "for {raw:?}: the husk still held plaintext when it dropped: {:?}",
+                seen[0]
+            );
+            assert_eq!(
+                seen[0].len(),
+                raw.len(),
+                "for {raw:?}: the husk was not the buffer that was handed in"
+            );
+        }
     }
 
     #[test]

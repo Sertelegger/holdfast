@@ -627,3 +627,169 @@ fn the_providers_credential_buffers_are_sized_once_and_zeroed_on_the_timeout_pat
          {tcode:?}"
     );
 }
+
+/// **GH #57: the decoded `SecretInput` submission is owned by the zeroing
+/// type for the whole arm, not just on the path that writes it.**
+///
+/// The defect was two refusals — `too_large` and `unknown_request_id` —
+/// dropping a bare `Vec<u8>`, which does not zero. The fix moves the
+/// wrap to the decode, so the refusals are correct by construction and a
+/// `select!` cancellation between the decode and the write is too.
+///
+/// **Asserted against the source because the unit tests cannot reach this
+/// arm and the integration tests cannot see the difference.** From
+/// outside, a refusal that zeroes and a refusal that does not send byte
+/// for byte the same `ProtocolError` — measured; the whole attach suite
+/// stays green either way. And `attach::secret`'s `drop_witness`, which
+/// *can* see it, is `#[cfg(test)]` and therefore invisible from an
+/// integration target. What is checkable is the shape that makes the
+/// leak impossible: the binding is consumed into `SecretBytes` before the
+/// arm branches.
+#[test]
+fn the_secret_input_arm_owns_its_submission_as_a_secret() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let text = std::fs::read_to_string(src.join("attach/conn.rs")).expect("read attach/conn.rs");
+
+    let arm = text
+        .split_once("ClientFrame::SecretInput { request_id, bytes }) => {")
+        .expect("the SecretInput arm is gone or its binding was renamed")
+        .1;
+    let arm = arm
+        .split_once("\n            ClientDecode::")
+        .map_or(arm, |(b, _)| b);
+
+    // **Comments are not code, and the first draft of this guard did not
+    // know that.** The review that produced this version reintroduced GH
+    // #57 in full — bare `Vec<u8>`, both refusals leaking — and added one
+    // comment line naming `SecretBytes::received(bytes)`. Every suite went
+    // green. A scanner that reads prose passes against the tree its own
+    // explanation describes, which is the failure mode this file's other
+    // four guards already strip for.
+    let code: Vec<&str> = arm
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with("//"))
+        .collect();
+
+    // The stripper's own control, both directions — it must keep
+    // statements and drop prose, or everything below is satisfied by a
+    // filter that returned nothing.
+    assert!(
+        code.iter().any(|l| l.starts_with("match daemon")),
+        "the code-line filter dropped a statement, so nothing below is being checked"
+    );
+    assert!(
+        !code.iter().any(|l| l.starts_with("//")),
+        "the code-line filter kept comment lines, so the prose explaining the wrap \
+         counts as code"
+    );
+
+    // The wrap is a statement, and it precedes the branch — so every exit
+    // inherits it rather than each one having to remember.
+    let wrapped = code
+        .iter()
+        .position(|l| l.starts_with("let bytes = super::secret::SecretBytes::received(bytes);"))
+        .expect(
+            "the decoded submission is not taken into SecretBytes as a statement; each \
+             exit then has to remember to zero it, which is the shape GH #57 was filed \
+             against",
+        );
+    let branched = code
+        .iter()
+        .position(|l| l.starts_with("match daemon"))
+        .expect("the arm no longer branches");
+    assert!(
+        wrapped < branched,
+        "the submission is wrapped after the arm branches, so the branches taken \
+         before it still hold a bare Vec"
+    );
+
+    // **Every use of the binding, whitelisted.** The first draft blocked
+    // two spellings of a copy — `to_vec()` and `bytes.clone()` — and the
+    // review defeated both: `clone` cannot even compile (`SecretBytes` is
+    // not `Clone`, pinned by `secret_is_not_clone`), so that half was
+    // unreachable, and `with_bytes(|b| b.to_owned())` walked through the
+    // other half carrying a real un-zeroed copy of the credential. A
+    // blocklist of copy spellings is a list of the ones somebody thought
+    // of; `Vec::from(b)`, `b.into()` and `b.iter().copied().collect()` are
+    // the ones they did not.
+    //
+    // So this inverts it. Any *new* way of touching the binding fails
+    // until it is named here deliberately.
+    const ALLOWED: [&str; 4] = [
+        "let bytes = super::secret::SecretBytes::received(bytes);",
+        ".is_some_and(|cap| bytes.len() > cap as usize);",
+        "drop(bytes);",
+        "WriteRequest::secret(bytes.normalised(raised.append_newline));",
+    ];
+    // `bytes` as an *identifier*, not as a substring. A plain `contains`
+    // matches `zero_bytes`, `SecretBytes` and `bytes_written` — the last
+    // of which caught this guard out on its first run, which is the
+    // cheapest possible demonstration that the boundary check is load
+    // bearing rather than pedantry.
+    let touches_binding = |l: &str| {
+        let b = l.as_bytes();
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        l.match_indices("bytes").any(|(i, _)| {
+            let before = i == 0 || !ident(b[i - 1]);
+            let after = i + 5 >= b.len() || !ident(b[i + 5]);
+            before && after
+        })
+    };
+    for line in code.iter().filter(|l| touches_binding(l)) {
+        assert!(
+            ALLOWED.iter().any(|a| line.contains(a)),
+            "a use of the decoded submission that this guard has not seen before:\n  \
+             {line}\nIf it is legitimate, add it to ALLOWED and say why. If it copies \
+             the value out of the zeroing type — `to_owned`, `Vec::from`, `into`, \
+             `collect`, or a `with_bytes` whose result outlives the closure — the copy's \
+             Drop does not zero and it is GH #57 again."
+        );
+    }
+    // The whitelist is only a guard while it still matches something.
+    // **Five, not four**: `drop(bytes);` is two of them, one per refusal,
+    // and that is the count the fix is about. If a refusal stops
+    // disposing of the submission this drops to four and fails here even
+    // though every surviving line is still on the list.
+    assert_eq!(
+        code.iter().filter(|l| touches_binding(l)).count(),
+        5,
+        "the binding is used a different number of times than this guard enumerates; \
+         it is checking a shape the arm no longer has"
+    );
+    assert_eq!(
+        code.iter()
+            .filter(|l| l.starts_with("drop(bytes);"))
+            .count(),
+        2,
+        "a refusal path no longer disposes of the submission explicitly (GH #57)"
+    );
+
+    // **The superseded branch zeroes the frame body before it parks.**
+    // `the_secret_frame_body_is_zeroed_before_the_arm_can_be_cancelled`
+    // deliberately scopes itself to the submitting branch, on the grounds
+    // that the others do not hold a *taken request* across an await. True
+    // — but the property at issue is the cleartext *body*, and this
+    // branch does hold that across `tx.send(…).await`. Review moved the
+    // `zero_bytes` past that await and every suite stayed green, so this
+    // is the assertion that was missing.
+    let superseded = code
+        .iter()
+        .position(|l| l.starts_with("None => {"))
+        .expect("the SecretInput arm no longer has a superseded branch");
+    let tail = &code[superseded..];
+    let zeroed = tail
+        .iter()
+        .position(|l| l.contains("zero_bytes(&mut body)"))
+        .expect("the superseded branch no longer zeroes the cleartext frame body");
+    let first_await = tail
+        .iter()
+        .position(|l| l.contains(".await"))
+        .expect("the superseded branch has no await, so this guard is guarding nothing");
+    assert!(
+        zeroed < first_await,
+        "the superseded branch zeroes the frame body only after it has already parked \
+         on a send; a shutdown or a dead client socket at that suspension point drops \
+         the cleartext body as a plain Vec"
+    );
+}

@@ -20,7 +20,40 @@ trigger as a side effect of writing release notes.
 
 ## [Unreleased]
 
-Nothing yet.
+### Security
+
+- **A refused `SecretInput` submission is now zeroed.** The two reject paths —
+  `too_large` and `unknown_request_id` — dropped the decoded credential as a
+  plain `Vec<u8>`, whose `Drop` does not zero, leaving it in the heap until the
+  allocator reused the page (GH #57).
+
+  **This was not a disclosure.** Nothing read the value: it never reached the
+  agent, a log, another client, or the child. What it broke is §9.2's zeroing
+  discipline, which is the milestone's whole security model, and it broke it on
+  precisely the two arms where a hostile or malformed submission lands.
+
+  The fix is not a zeroing call added to each arm. The submission is taken into
+  `SecretBytes` at the point it is decoded, so *dropping it* is the zeroing and
+  every exit **from that arm** inherits it.
+
+  **Scoped deliberately, and narrower than this entry first claimed.** The
+  pre-merge review found three statements in the first draft that were not true,
+  and they are worth recording rather than quietly deleting:
+
+  - It said the fix also closed a `select!` cancellation window on the accept
+    path. There was never one — no suspension point sits between the decode and
+    the write, and a future can only be dropped at one.
+  - It said every exit inherits the zeroing. Every exit *from the arm* does. A
+    `SecretInput` refused by the ReadOnly gate, or decoded as `BadFields`, never
+    reaches the arm and still drops its cleartext frame un-zeroed across a real
+    `await` — a wider hole than the one this closes, now GH #82.
+  - The decoded buffer is not the single allocation `Drop` owns above 4 KiB.
+    `ciborium` fills a byte string in 4096-byte chunks and grows by doubling, so
+    an oversize submission has already been copied between freed, un-zeroed
+    blocks before anything owns it — GH #83, and it is the `too_large` case
+    specifically.
+
+  Also filed from the same review: GH #84, #85 and #86.
 
 ## [0.0.7] — 2026-09-01
 
