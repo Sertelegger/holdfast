@@ -110,6 +110,58 @@ YAML
   # A whole-file fixture, for rules about the `on:` block rather than a job.
   whole() { printf '%s\n' "$1" > "$tmp/.github/workflows/fixture.yml"; }
 
+  # The calibration cases need TWO files. A lone exempt workflow leaves
+  # `kept` empty and trips the "every workflow is calibration-exempt" guard,
+  # so the exempt fixture is paired with a clean one and the run asserts the
+  # exemption rather than that guard.
+  pair() { # pair <fixture.yml body>
+    printf '%s\n' "$1" > "$tmp/.github/workflows/fixture.yml"
+    cat > "$tmp/.github/workflows/second.yml" <<'CLEANYAML'
+name: Second
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: ./scripts/fixture-probe.sh
+CLEANYAML
+  }
+  unpair() { rm -f "$tmp/.github/workflows/second.yml"; }
+
+  want_pair_ok() { # want_pair_ok <label> <fixture.yml body>
+    pair "$2"
+    out="$(cd "$tmp" && "$me" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'is calibration-exempt until'; then
+      printf '  PASS  %s\n' "$1"
+    else
+      printf '  FAIL  %s — want exit 0 AND an exemption note; exit %d\n' "$1" "$rc"
+      printf '%s\n' "$out" | sed 's/^/          /'
+      failures=$((failures + 1))
+    fi
+    unpair
+  }
+
+  want_pair_denied() { # want_pair_denied <label> <expected text> <fixture.yml body>
+    pair "$3"
+    out="$(cd "$tmp" && "$me" 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$2"; then
+      printf '  PASS  %s\n' "$1"
+    else
+      printf '  FAIL  %s — want %s; exit %d\n' "$1" "$2" "$rc"
+      printf '%s\n' "$out" | sed 's/^/          /'
+      failures=$((failures + 1))
+    fi
+    unpair
+  }
+
   want_file_ok() { # want_file_ok <label> <whole file>
     whole "$2"
     out="$(cd "$tmp" && "$me" 2>&1)"; rc=$?
@@ -231,6 +283,79 @@ jobs:
           persist-credentials: false
       - run: ./scripts/fixture-probe.sh
       - run: echo \${{ secrets.GITHUB_TOKEN }}"
+  echo
+  echo "ci-hygiene self-test — the calibration exemption, all three directions"
+  echo
+
+  # THE MECHANISM STILL WORKS. Nothing in the tree claims this exemption any
+  # more, so without this case the whole dated-exemption path is dead code
+  # that no run exercises -- which is how it came to carry the anchoring bug
+  # the second case is about.
+  want_pair_ok "a marker that IS a whole comment line, dated ahead, grants the exemption" \
+"name: Fixture
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # CALIBRATION-EXEMPT-UNTIL: 2099-01-01
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: ./scripts/fixture-probe.sh"
+
+  # THE REGRESSION, and it is not hypothetical: the commit that retired the
+  # real exemption quoted the marker inside its own prose, the unanchored grep
+  # matched the quotation, and mutants.yml stayed exempt from every rule in
+  # this file with a re-added `continue-on-error` going undetected.
+  want_pair_denied "a marker merely QUOTED inside prose does not grant it" \
+    'FORBIDDEN: continue-on-error' \
+"name: Fixture
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # it used to carry a CALIBRATION-EXEMPT-UNTIL: 2099-01-01 marker
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: ./scripts/fixture-probe.sh"
+
+  # IT EXPIRES BY ITSELF. That is the entire argument for allowing a dated
+  # hole in a deny rule, and it is worth one fixture.
+  want_pair_denied "an EXPIRED marker stops granting it" \
+    'FORBIDDEN: continue-on-error' \
+"name: Fixture
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # CALIBRATION-EXEMPT-UNTIL: 2000-01-01
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: ./scripts/fixture-probe.sh"
+
   want_denied "runs-on: macos-latest is rejected" \
               "    runs-on: macos-latest"
   want_denied "an alias in a matrix os: list is rejected, where runs-on: \
@@ -274,10 +399,23 @@ fi
 # `continue-on-error`, which is otherwise banned. It expires by itself --
 # after the marker's date the file is checked like every other, so a
 # forgotten continue-on-error turns this job red without anyone remembering.
+#
+# **ANCHORED to the whole of a comment line, and this is the same fix the
+# RELEASE-WORKFLOW marker below already carries, for the same reason.** That
+# one's note reads: *"Unanchored, this file's own header -- which has to name
+# the marker to document it -- declared itself a release workflow."* The
+# calibration marker never got the treatment, and the hazard is not
+# hypothetical: the commit that RETIRED this exemption quoted the marker
+# inside its own explanatory comment, the unanchored grep matched the
+# quotation, and mutants.yml stayed exempt from every rule in this file with a
+# re-added `continue-on-error` going undetected. Measured by planting one.
+#
+# So the marker must BE the comment, not appear in one. `^[[:space:]]*#` and
+# not `^#`, because the real marker is indented inside a job block.
 today="$(date -u +%F)"
 kept=()
 for f in "${files[@]}"; do
-  until_date="$(grep -oE 'CALIBRATION-EXEMPT-UNTIL:[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}' "$f" 2>/dev/null \
+  until_date="$(grep -oE '^[[:space:]]*#[[:space:]]*CALIBRATION-EXEMPT-UNTIL:[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}' "$f" 2>/dev/null \
                 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)"
   if [ -n "$until_date" ] && [[ "$today" < "$until_date" ]]; then
     printf 'note  %s is calibration-exempt until %s\n' "$f" "$until_date"
