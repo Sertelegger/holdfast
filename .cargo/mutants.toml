@@ -1,4 +1,8 @@
-# cargo-mutants configuration for the weekly sweep.
+# cargo-mutants configuration for the monthly sweep.
+#
+# ("weekly" until 2026-09-03. The schedule became `cron: "41 11 1 * *"` when
+# the job was cut back; this header and two comments in `mutants.yml` kept the
+# old word.)
 # See docs/superpowers/plans/2026-08-12-holdfast-ci-and-verification-harness.md Task 6.
 #
 # THE PATH IS LOAD-BEARING. cargo-mutants reads `.cargo/mutants.toml`, not
@@ -28,6 +32,45 @@
 # double that IS being mutated; whether to exclude it is a calibration
 # decision for the survivor review, not a guess to make in advance.
 exclude_globs = ["crates/holdfast-core/tests/**"]
+
+# **cargo-mutants does not evaluate `#[cfg]`, and #19 made that expensive.**
+#
+# Measured at 27.1.0: it parses the source without resolving cfg, so a
+# `#[cfg(windows)]` function body is mutated and offered to a Linux sweep. The
+# build then succeeds *because the body is not compiled*, every test passes,
+# and the mutant is reported MISSED. It is not a test gap — no Linux test can
+# reach that code — but it is indistinguishable from one in the output.
+#
+# #19 gated the daemon subsystem off Windows and added ~15 such mutants across
+# `daemon/paths.rs`, `config.rs` and `crates/holdfast/src/commands.rs`. This
+# matters now rather than later because `mutants.yml` removed its
+# `continue-on-error` mask in the same change, so a MISSED mutant is a red job.
+#
+# **Only two of the fifteen can be excluded here without losing real
+# coverage**, and the reason is worth stating because it is what makes the rest
+# unfixable at this layer: `exclude_re` matches the mutant's description, which
+# names the function but says nothing about which cfg arm it came from. The
+# dual-arm functions -- `open_log_append`, `create_owner_only`, `mcp_hybrid`,
+# `daemon_run`, `daemon_start`, `daemon_stop`, `daemon_status`, `list`, `logs`,
+# `untrusted_reason` -- each have a Unix arm that IS reachable and IS worth
+# mutating, and a name-keyed exclusion would drop both arms. Trading live Unix
+# coverage for a quieter Linux sweep is the wrong way round.
+#
+# So these two, which exist only under `#[cfg(windows)]` and have no Unix
+# counterpart to protect:
+exclude_re = [
+    # `daemon/paths.rs` -- warns once that a Windows directory's inherited ACL
+    # cannot be tightened. No Unix analogue; the Unix path refuses instead.
+    "warn_inherited_acl_once",
+    # `crates/holdfast/src/commands.rs` -- the single refusal message shared by
+    # the seven daemon-backed subcommands on Windows native.
+    "unsupported",
+]
+
+# The residual is tracked rather than hidden: see the note on `mutants.yml`'s
+# `continue-on-error` removal. The first sweep after #19 is expected to report
+# cfg-gated survivors, and triaging them is a survivor-review decision, not a
+# thing to pre-empt with a guess here.
 
 # The suite spawns real shells and has deliberate multi-second waits, so a
 # mutant that hangs must be bounded generously rather than tightly. These

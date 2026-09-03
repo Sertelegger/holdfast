@@ -25,11 +25,29 @@ on:
     # 11:41 UTC on the 1st of each month. UTC only; see nightly.yml
     # for the note.
     #
-    # **Monthly, not weekly, and the reason is the bill rather than the
-    # engineering.** At ~175 min a run this job cost 43% of the account's
-    # entire 2000 min/month free tier and exhausted it on the 25th, taking
-    # every other repository's CI down with it. Weekly was 4.33 runs =
-    # ~759 min/month; monthly is ~175.
+    # **Monthly, not weekly. The reason WAS the bill, and the bill is gone —
+    # so the cadence is now a choice rather than a constraint.**
+    #
+    # What was measured, while this repository was private: at ~175 min a run,
+    # weekly was 4.33 runs = ~759 min/month against an account-wide 2000
+    # min/month free tier, i.e. **38%** of it. (This read 43%, which was
+    # arithmetic rather than measurement: 4.33 x 175 / 2000 = 0.379.) It
+    # exhausted the tier on the 25th and took every other repository's CI down
+    # with it. Monthly is ~175 min.
+    #
+    # **That constraint no longer binds.** The repository went public on
+    # 2026-09-02, and Actions minutes on standard runners are free for public
+    # repositories — they do not draw on the tier at all. The change that fixed
+    # #19 says so in `ci.yml`, where it is the reason the `paths-ignore` filter
+    # was deleted.
+    #
+    # Monthly is kept anyway, and the reason is now the engineering rather than
+    # the money: at 350 minutes of wall clock this is the longest job in the
+    # repository, nothing downstream waits on it, and nobody reads it live.
+    # Weekly would buy four samples a month of a signal that is not read within
+    # the month. **If that judgement is revisited, revisit it on its merits —
+    # the budget argument is no longer available to either side.**
+    # `nightly.yml` carries the same correction for the same reason.
     #
     # **Day-of-month, and NOT `1-7 * 6` for "first Saturday".** POSIX cron
     # ORs a restricted day-of-month with a restricted day-of-week instead
@@ -83,15 +101,31 @@ jobs:
     # marker, which `ci-hygiene.sh` honours with a strict `<` — so the last
     # exempt day was 2026-09-08 and the ban would have started firing on the
     # 9th, turning `hygiene` red on every push and pull request. It is removed
-    # here rather than on the deadline, because `hygiene` is about to become a
-    # required status check and a dated fuse under a required check is a dated
-    # merge freeze.
+    # here rather than on the deadline, because a dated fuse is a dated
+    # surprise and there is no reason to spend the last week of one.
+    #
+    # (This said it was removed early because *"`hygiene` is about to become a
+    # required status check"*. That was not true and is not scheduled: the
+    # repository has no branch protection and no rulesets — `branches/main/
+    # protection` answers 404 and `rulesets` is `[]` — so nothing in this
+    # pipeline gates a merge today. The removal stands on its own merits; it
+    # did not need the borrowed urgency.)
     #
     # The consequence is deliberate and is the point of the exemption expiring:
     # a sweep that finds a surviving mutant is now a RED job rather than a
     # green one with the finding buried in an artifact. That is the correct
     # signal — a survivor is a test that cannot fail, which is this project's
     # defining defect class.
+    #
+    # **Expect the first post-#19 sweep to be red, and read it before believing
+    # it.** cargo-mutants does not evaluate `#[cfg]`: it offers a Linux sweep
+    # the `#[cfg(windows)]` bodies #19 added, the build succeeds because they
+    # are not compiled, every test passes, and they are reported MISSED. That
+    # is not a test gap — no Linux test can reach that code — but it is
+    # indistinguishable from one in the output. `.cargo/mutants.toml` excludes
+    # the two such functions that have no Unix arm to protect and explains why
+    # the other ten cannot be excluded without discarding live Unix coverage.
+    # A survivor named in that list is a cfg artifact; anything else is real.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -127,8 +161,10 @@ jobs:
       # halves: the real config is where the tool looks, and no inert decoy
       # has reappeared at the root for someone to edit in good faith.
       - run: test -f .cargo/mutants.toml && test ! -e mutants.toml
-      # ONE SHARD PER WEEK, rotating; the whole (now two-package) scope
-      # every eight weeks.
+      # ONE SHARD PER RUN, rotating by month; the whole (now two-package)
+      # scope every eight months. ("per week ... every eight weeks" until
+      # 2026-09-03 — the cadence comment above already stated the eight-month
+      # consequence, so this line contradicted it.)
       #
       # RE-CALIBRATED 2026-08-18 (0.0.5 milestone review, finding I-18).
       # Two things were wrong with the previous calibration, not one:
@@ -268,15 +304,23 @@ jobs:
       # runs this step and still uploads it. A completed-clean run and a
       # timed-out one both produce an artifact this check accepts; do not
       # read "an artifact exists" as "a verdict exists."
-      # What DOES distinguish them, and is not masked by continue-on-error
-      # (which only ever turns a FAILURE conclusion into a reported
-      # success, never a CANCELLED one): the run's own conclusion --
+      # What DOES distinguish them is the run's own conclusion --
       #   gh run list --workflow mutants.yml --json conclusion --limit 5
-      # reads "success" for a clean sweep or a still-masked survivor-found
-      # sweep (indistinguishable from each other until 2026-09-09, by
-      # design -- see the continue-on-error comment above), and reads
-      # "cancelled" for a timeout with no verdict. That is the check;
-      # artifact presence alone is not.
+      # -- which now reads "success" only for a clean sweep, "failure" for a
+      # survivor-found one, and "cancelled" for a timeout with no verdict.
+      # That is the check; artifact presence alone is not.
+      #
+      # **This paragraph said the opposite until 2026-09-03**, and it is
+      # corrected rather than deleted because the wrong version is the more
+      # instructive one. It read: "reads 'success' for a clean sweep or a
+      # still-masked survivor-found sweep (indistinguishable from each other
+      # until 2026-09-09, by design -- see the continue-on-error comment
+      # above)" -- and it pointed at a comment the same change had already
+      # deleted. The mask went with the change that fixed #19, so a
+      # survivor-found sweep has reported "failure" ever since. The documented
+      # procedure for reading the one job nobody watches live was telling the
+      # reader to expect a success that cannot happen, which is the same
+      # mistake as reading "an artifact exists" for "a verdict exists".
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

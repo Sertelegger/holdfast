@@ -15,12 +15,13 @@
 #   * every `uses:` pinned to a 40-hex commit SHA, version in the comment
 #   * `persist-credentials: false` on every checkout — the default is true
 #     and writes a pushable token into .git/config
-#   * `runs-on: ubuntu-24.04`, never ubuntu-latest
+#   * a PINNED runner image, never a `-latest` alias. `ubuntu-24.04`
+#     everywhere except `windows-native`, which is `windows-2022`
 #   * explicit timeout-minutes on every job — the default is 360
 #   * every job body is a command a developer can run locally
 #
 # Pinned inputs:
-#   runner image    ubuntu-24.04
+#   runner images   ubuntu-24.04, and windows-2022 for `windows-native`
 #   rust toolchain  channel "1.97" — from rust-toolchain.toml, the ONLY pin.
 #                   Do not add RUSTUP_TOOLCHAIN and do not add a toolchain
 #                   action; either creates a second pin that can drift.
@@ -45,7 +46,10 @@ on:
   # answers 403, upgrade to GitHub Pro or make this repository public — so
   # there are no required checks to strand. Re-check this the day the
   # repository goes public or gains protection."* The repository went public
-  # on 2026-09-01. This is that re-check, and the filter loses.
+  # on **2026-09-02** — the repo object's own `created_at`, which IS the
+  # going-public event because the repository was deleted and recreated that
+  # day; the `v0.0.7` tag dated 2026-09-01 predates the object holding it.
+  # This is that re-check, and the filter loses.
   #
   # **Deleted rather than reworked into job-level `if:` conditions**, which
   # would keep the saving and still post a check run for every job. That form
@@ -75,10 +79,12 @@ env:
   # Incremental artifacts are useless across jobs and bloat the cache.
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
-  # Pinned rather than tracking nproc. The standard runner is 2 vCPU while
-  # this repo is private and 4 vCPU after it goes public; a fixed value
-  # means that flip does not silently change the timing profile the suite
-  # was calibrated under. See plan Task 4 Step 1.
+  # Pinned rather than tracking nproc. The standard runner was 2 vCPU while
+  # this repository was private and is 4 vCPU now that it is public
+  # (2026-09-02); a fixed value is why that flip did not silently change the
+  # timing profile the suite was calibrated under. See plan Task 4 Step 1.
+  # The calibration still describes a 2-vCPU box, deliberately — re-taking it
+  # on 4 is a measurement, not an edit.
   TEST_THREADS: "4"
 
 jobs:
@@ -168,8 +174,16 @@ jobs:
     # Windows.** Until it existed, the entire Windows position rested on a
     # cross-compile: `windows-cross` proves the crate type-checks for
     # `x86_64-pc-windows-gnu` and nothing more, and the `#[cfg(windows)]` arms
-    # added in #19 — six CLI refusals, the inherited-ACL warning, the config
-    # trust arm — were verified by the compiler and by no test anywhere.
+    # added in #19 were verified by the compiler and by no test anywhere.
+    #
+    # **What those arms are, counted rather than estimated.** Eight CLI arms:
+    # seven refusals (`daemon run`, `daemon start`, `daemon status`, `list`,
+    # `logs`, `attach`, `watch`) and `daemon stop`, which is NOT a refusal —
+    # §3.2 makes it idempotent, so it prints "no daemon running" and exits 0.
+    # Plus the inherited-ACL warning and the config trust arm. (This comment
+    # said "six CLI refusals" through three revisions; five went through the
+    # shared helper, `attach`/`watch` had hand-rolled copies, and `daemon stop`
+    # was miscounted as a refusal after the commit that stopped it being one.)
     #
     # `windows-2022` and not `windows-latest`: `ci-hygiene.sh` rejects the
     # alias, and its self-test carries a case asserting a pinned `windows-2022`
@@ -180,9 +194,15 @@ jobs:
     # and what a release binary would be. `windows-cross` checks the other ABI;
     # neither subsumes the other.
     #
-    # **WHY THIS IS NOT `cargo test --workspace`.** Four ungated integration
-    # targets — `detection`, `integration`, `screen`, `schema` — spawn `bash`,
-    # `sh`, `zsh` or `dash` by name (26, 33, 8 and 13 references respectively).
+    # **WHY THIS IS NOT `cargo test --workspace`.** Six of `holdfast-core`'s
+    # integration targets are ungated; four of them — `detection`,
+    # `integration`, `screen`, `schema` — spawn a shell by NAME, 26/33/8/13
+    # references respectively (`bash`, `zsh`, `dash`, `fish`, and one `sh` in
+    # `schema`). **`fish` is in those totals and was missing from this list**,
+    # which is why re-deriving them without it gives 21/33/5/11 and looks like
+    # a drift. The other two ungated targets, `source_guards` and
+    # `stress_write_path`, spawn nothing and are not part of this argument —
+    # `source_guards` is why the step below can run at all.
     # They compile on Windows and would fail at run time for want of a shell,
     # which says nothing about Holdfast. Making them pass needs either a
     # Windows shell fixture or per-row gating, and that is 0.0.11's work, not a
@@ -239,28 +259,82 @@ jobs:
       - name: Source guards and the cross-platform lib rows, which must have run
         shell: bash
         run: |
-          set -o pipefail
+          # **`-e` stated rather than inherited.** GitHub runs `shell: bash` as
+          # `bash --noprofile --norc -eo pipefail {0}`, which this file already
+          # relies on twice (see the `test` job's tee note). Relying on it is
+          # correct and was correct here — but the step BELOW deliberately sets
+          # `+e`, because its cases exit 64 on purpose, so one job now holds two
+          # steps that need opposite error modes. Naming both locally is what
+          # stops the next reader porting the wrong one across.
+          #
+          # Measured with a stub `cargo` that prints `test result: FAILED` and
+          # exits 101: without `-e` this step exits 0 on a red suite, and the
+          # three guards below do not catch it, because the row floor reads the
+          # LAST `test result:` line and a `source_guards` failure has no floor.
+          set -eo pipefail
           cargo test -p holdfast-core --locked --test source_guards -- --test-threads=4 2>&1 | tee win-test.log
           # **A filter, and a narrow one, for a reason the comment above
           # rejects a filter for.** Skipping the 55 shell-spawning rows would
           # need a per-module `--skip` list that drops passing tests with
-          # them. NAMING the two modules that exist to be cross-platform is
-          # the opposite move: `home_dir`'s `USERPROFILE` split and
+          # them. NAMING the modules that exist to be cross-platform is the
+          # opposite move.
+          #
+          # **Three modules, not two, and the earlier claim was too strong.**
+          # It read that `home_dir`'s `USERPROFILE` split and
           # `open_log_append`'s create-parent / append-not-truncate contract
-          # are the only lib code in this file whose Windows arm differs from
-          # its Unix one, and both were unexecutable by any job before this.
+          # "are the only lib code in this file whose Windows arm differs from
+          # its Unix one" — `create_owner_only` and `ensure_owner_only`'s
+          # `#[cfg(windows)]` block are two more in the same file, and
+          # `config::untrusted_reason` is a third outside it. `config::tests`
+          # is added here because it was executed by NOTHING: the review
+          # measured it passing on Windows, so the whole Windows trust arm was
+          # compiler-verified only, for the cost of one filter.
           #
           # The pre-PR review measured four mutations of those Windows arms
           # surviving every gate, the sharpest being `.append(true)` ->
           # `.truncate(true)`, which zeroes the §9.4 audit trail on every
           # start. Re-measured after these rows landed: that mutation now
           # fails HERE and passes on Linux, which is the correct split.
-          cargo test -p holdfast-core --locked --lib -- --test-threads=4 \
-            daemon::paths::home_tests:: daemon::paths::log_append_tests:: 2>&1 | tee -a win-test.log
+          # **One invocation per module, each with its own floor.** A single
+          # combined run hides which filter stopped matching: the total still
+          # looks plausible, and the `0 passed` guard only fires if ALL of them
+          # stop matching at once. Per-module, a renamed module is named.
+          #
+          # Floors are measured, dated, and deliberately below the true count
+          # rather than equal to it — an equality here is a line every added
+          # test row breaks, which is how `mcp-smoke.sh`'s own total drifted
+          # five times with nothing going red. Measured on this commit,
+          # 2026-09-03: home_tests 7, log_append_tests 2, config::tests 50 on
+          # Unix and 49 on Windows (one row is `#[cfg(unix)]`). Neither
+          # `paths.rs` test module has a platform gate, so those two counts are
+          # the same on both platforms.
+          lib_module() {
+            local filter="$1" floor="$2" before after got
+            before=$(grep -cE '^test result:' win-test.log || true)
+            cargo test -p holdfast-core --locked --lib -- --test-threads=4 "$filter" 2>&1 | tee -a win-test.log
+            after=$(grep -cE '^test result:' win-test.log)
+            if [ "$after" -ne $((before + 1)) ]; then
+              echo "FAIL  $filter produced no 'test result:' line — the target never started" >&2
+              exit 1
+            fi
+            got=$(grep -E '^test result:' win-test.log | tail -1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')
+            if [ "${got:-0}" -lt "$floor" ]; then
+              echo "FAIL  $filter matched ${got:-0} rows, want >= $floor" >&2
+              echo "      a renamed module reports 0; a half-matched one reports fewer" >&2
+              exit 1
+            fi
+            echo "ok    $filter -> ${got} rows (floor $floor)"
+          }
+          lib_module daemon::paths::home_tests:: 6
+          lib_module daemon::paths::log_append_tests:: 2
+          lib_module config::tests:: 45
+
+          # Every invocation in this step, including source_guards above, must
+          # have reported a verdict and none may have run nothing.
           results=$(grep -cE '^test result:' win-test.log)
-          if [ "$results" -lt 2 ]; then
-            echo "expected a 'test result:' line per invocation, got $results —" >&2
-            echo "a target never started and this step proved nothing." >&2
+          if [ "$results" -ne 4 ]; then
+            echo "expected 4 'test result:' lines (source_guards + 3 lib modules), got $results" >&2
+            grep -nE '^test result:' win-test.log >&2
             exit 1
           fi
           if grep -qE '^test result: ok\. 0 passed' win-test.log; then
@@ -268,26 +342,27 @@ jobs:
             grep -nE '^test result:' win-test.log >&2
             exit 1
           fi
-          # A floor on the FILTERED run only, where the count is small,
-          # deliberate and known: 3 home rows + 2 log-append rows. A filter
-          # that stopped matching would otherwise report `0 passed` — caught
-          # above — but one that matched only half would not.
-          filtered=$(grep -E '^test result:' win-test.log | tail -1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')
-          if [ "${filtered:-0}" -lt 5 ]; then
-            echo "the cross-platform lib filter matched ${filtered:-0} rows, want >= 5" >&2
-            echo "(3 in home_tests, 2 in log_append_tests) — did a module get renamed?" >&2
-            exit 1
-          fi
           grep -E '^test result:' win-test.log
       # **The step this whole job exists for: the `#[cfg(windows)]` arms #19
-      # added, executed on Windows.** Before this, every one of them — six CLI
-      # refusals, the inherited-ACL warning, the config trust arm — was
-      # verified by the compiler and by nothing else. A refusal that compiles
-      # and then exits 0, or exits 64 with an empty message, is exactly the
-      # defect a cross-compile cannot see.
+      # added, executed on Windows.** A refusal that compiles and then exits 0,
+      # or exits 64 with an empty message, is exactly the defect a
+      # cross-compile cannot see.
+      #
+      # **What this step closes, stated as coverage rather than intent.** It
+      # ran the seven CLI refusals and `daemon stop`. It does NOT assert the
+      # inherited-ACL warning — that is *reached* by `log_append_tests` on
+      # Windows but nothing pins its content or that it goes to stderr — and
+      # the config trust arm is covered by the `config::tests::` filter added
+      # above, not here. An earlier version of this comment listed all three as
+      # what the step ends; it ended one of them.
+      #
+      # Still verified by the compiler alone: `create_owner_only` and
+      # `ensure_owner_only`'s Windows blocks, whose only production callers sit
+      # inside `#[cfg(unix)] daemon::{spawn,server}` and are therefore
+      # unreachable in a Windows build at all.
       #
       # `version` first as the control: it shares the binary and the argument
-      # parser with the six below, so if it fails they prove nothing about
+      # parser with the arms below, so if it fails they prove nothing about
       # the arms and everything about the build.
       #
       # Both halves are asserted per subcommand — the exit code AND the
@@ -338,6 +413,19 @@ jobs:
           run_case daemon status
           run_case list
           run_case logs some-session
+          # **`attach` and `watch` were the two arms this job was written to
+          # cover and did not.** Both are `#[cfg(windows)]` refusals with the
+          # same contract, and both carried hand-rolled copies of the message
+          # rather than going through the shared helper — so rewording either
+          # left all nine jobs green. They now share the one helper, and these
+          # two lines are what keeps that true.
+          #
+          # **The session argument is required.** A bare `attach` is a usage
+          # error, which `main.rs` answers with the banner — also exit 64, but
+          # WITHOUT the refusal text, so the exit-code half would pass and the
+          # message half would fail on a false alarm.
+          run_case attach some-session
+          run_case watch some-session
 
           # **`daemon stop` is deliberately NOT in that loop.** §3.2 makes it
           # idempotent — stopping a daemon that is not running prints "no
@@ -363,7 +451,72 @@ jobs:
             echo "$fails Windows arm(s) did not behave as #19 claims" >&2
             exit 1
           fi
-          echo "five refusal arms exit 64 and name the reason; daemon stop exits 0"
+          echo "seven refusal arms exit 64 and name the reason; daemon stop exits 0"
+
+      # **The subcommand that WORKS on Windows, actually serving.** Everything
+      # above proves the refusals refuse. Nothing proved the one thing Windows
+      # can do still does it — the review replaced `mcp_hybrid`'s
+      # `serve_in_process().await` with `ExitCode::FAILURE`, so `holdfast mcp`
+      # warned and then served nothing, and the mutation survived all nine
+      # jobs. If this arm breaks, Windows has no product and every other check
+      # here stays green.
+      #
+      # It also covers `home_dir()` on the platform that needs it. `HOME` is
+      # unset, so resolution must fall through to `%USERPROFILE%` — the split
+      # `c14ba36` added and the one the unit tests reach only by re-exec.
+      # Asserting the §9.4 audit trail lands under the directory we handed it
+      # is what makes that end-to-end rather than a unit claim.
+      - name: mcp --no-daemon serves, and writes the audit trail it promises
+        shell: bash
+        run: |
+          set -eo pipefail
+          BIN=target/debug/holdfast.exe
+          test -x "$BIN" || { echo "no binary at $BIN" >&2; exit 1; }
+          scratch="$(mktemp -d)"
+
+          # One `initialize`, the same request `scripts/mcp-smoke.sh` opens
+          # with. stdin closes after it, which is a clean shutdown for a stdio
+          # server rather than an error.
+          req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'
+          rc=0
+          out="$(printf '%s\n' "$req" | env -u HOME USERPROFILE="$scratch" "$BIN" mcp --no-daemon 2>mcp-stderr.log)" || rc=$?
+
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL  mcp --no-daemon exited $rc" >&2
+            sed -n '1,40p' mcp-stderr.log >&2
+            exit 1
+          fi
+          # A served response, not just a clean exit: `ExitCode::FAILURE` in
+          # place of the serve call would exit non-zero, but a stub that
+          # returned SUCCESS without serving would print nothing.
+          if ! printf '%s' "$out" | grep -q '"jsonrpc"'; then
+            echo "FAIL  mcp --no-daemon produced no JSON-RPC response — it did not serve" >&2
+            echo "      stdout: $out" >&2
+            sed -n '1,40p' mcp-stderr.log >&2
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q '"result"'; then
+            echo "FAIL  initialize did not answer with a result" >&2
+            echo "      stdout: $out" >&2
+            exit 1
+          fi
+          echo "ok    mcp --no-daemon answered initialize"
+
+          # The trail, found rather than assumed: `RuntimePaths` puts it at
+          # `<home>/.holdfast/logs/audit.log`, and searching for it by name
+          # keeps this step honest if that layout is ever revised.
+          log="$(find "$scratch" -name audit.log -type f 2>/dev/null | head -1)"
+          if [ -z "$log" ]; then
+            echo "FAIL  no audit.log anywhere under the USERPROFILE we passed" >&2
+            echo "      %USERPROFILE% resolution did not reach the fallback (GH #19, c14ba36)" >&2
+            find "$scratch" >&2 || true
+            exit 1
+          fi
+          if [ ! -s "$log" ]; then
+            echo "FAIL  $log exists but is empty — the trail is a file, not a record" >&2
+            exit 1
+          fi
+          echo "ok    audit trail at ${log#"$scratch"/} ($(wc -c <"$log" | tr -d ' ') bytes)"
 
   # --- the capability gate -------------------------------------------------
 
@@ -540,10 +693,14 @@ jobs:
       # agreed one that stopped happening — and, since it grew a second
       # marker, on any ASSERTION gated off inside a row that ran without an
       # agreed entry, and on an agreed entry whose assertion turns out to
-      # have run. The one entry today is §11.4's control-path p99, which
-      # this 2-core runner cannot make a statement about; it goes red here
-      # the day the runner is big enough, which is the only notice anyone
-      # will get.
+      # have run. The one entry today is §11.4's control-path p99, which the
+      # hosted runner cannot make a statement about; it goes red here the day
+      # the runner is big enough, which is the only notice anyone will get.
+      #
+      # (This said "this 2-core runner". The runner became 4-core when the
+      # repository went public on 2026-09-02, and the entry did NOT go red —
+      # correctly, because `ci-skip-census.sh` gates on `min_cores=8` and 4 is
+      # still under it. The sentence named the wrong number as the trigger.)
       - run: ./scripts/ci-skip-census.sh test-output.log
 
   # --- the one row the fish-less suite cannot measure ----------------------

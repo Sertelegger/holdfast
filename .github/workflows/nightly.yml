@@ -34,13 +34,29 @@ on:
     # does nothing until it is merged there.
     #
     # **Weekly, not nightly, and the name now overstates the cadence on
-    # purpose.** The tier keeps its name because REQ-TST-004's tier-4
-    # content still belongs here; what changed is the bill. At ~14 min a
-    # run, daily was ~426 min/month against an account-wide 2000 min free
-    # tier that this repository exhausted on the 25th. The new cost is
-    # below, with the iteration count that drives it — deliberately NOT
-    # quoted twice, because the first draft of this file gave one schedule
-    # two different costs eighteen lines apart.
+    # purpose.** The tier keeps its name because REQ-TST-004's tier-4 content
+    # still belongs here; what changed was the bill. At ~14 min a run, daily
+    # was ~426 min/month against an account-wide 2000 min free tier that this
+    # repository exhausted on the 25th. The new cost is below, with the
+    # iteration count that drives it — deliberately NOT quoted twice, because
+    # the first draft of this file gave one schedule two different costs
+    # eighteen lines apart.
+    #
+    # **The bill no longer exists, and this cadence has not been re-argued
+    # since.** The repository went public on 2026-09-02; Actions minutes on
+    # standard runners are free for public repositories and do not draw on that
+    # tier at all. The change that fixed #19 states this in `ci.yml`, as the
+    # reason its `paths-ignore` filter was deleted — so the same change that
+    # removed one budget-motivated saving left this one and `mutants.yml`'s
+    # standing on a constraint it had just declared void.
+    #
+    # Left weekly rather than restored to nightly, because the reduction below
+    # is described as "taken knowingly" and reversing it deserves the same
+    # deliberateness as taking it — not a silent flip inside a Windows CI fix.
+    # **But the argument for it is now the engineering, not the money, and the
+    # engineering has not been made.** Whoever next touches the flake budget:
+    # ~433 samples/month at weekly@100 versus ~608 at daily@20 is the trade,
+    # and it is now free to reverse.
     #
     # **The trade-off is real and is not a drift argument, and it is paid
     # rather than accepted.** Most of what a scheduled job re-runs on an
