@@ -152,10 +152,157 @@ jobs:
       # tests/integration.rs; those are fixed, and the narrower form must
       # not be restored without re-measuring.
       #
-      # This proves Holdfast still COMPILES for Windows. It is not evidence
-      # that it WORKS on Windows — that needs a Windows runner, which is
-      # milestone 0.0.11.
+      # This proves Holdfast still COMPILES for Windows, against the GNU ABI,
+      # on a cheap Linux runner in about two minutes. It is not evidence that
+      # it WORKS there — `windows-native` below is. Both are kept: this one
+      # fails fast and catches a `#[cfg]` split on every PR, and the shipped
+      # target is MSVC, which this does not check.
       - run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+
+  # --- the Windows runner --------------------------------------------------
+
+  windows-native:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    # **The first job in this repository that executes Holdfast's own code on
+    # Windows.** Until it existed, the entire Windows position rested on a
+    # cross-compile: `windows-cross` proves the crate type-checks for
+    # `x86_64-pc-windows-gnu` and nothing more, and the `#[cfg(windows)]` arms
+    # added in #19 — six CLI refusals, the inherited-ACL warning, the config
+    # trust arm — were verified by the compiler and by no test anywhere.
+    #
+    # `windows-2022` and not `windows-latest`: `ci-hygiene.sh` rejects the
+    # alias, and its self-test carries a case asserting a pinned `windows-2022`
+    # is accepted, written for exactly this job.
+    #
+    # **MSVC, not GNU.** The host toolchain here is
+    # `x86_64-pc-windows-msvc`, which is what a Windows user actually installs
+    # and what a release binary would be. `windows-cross` checks the other ABI;
+    # neither subsumes the other.
+    #
+    # **WHY THIS IS NOT `cargo test --workspace`.** Four ungated integration
+    # targets — `detection`, `integration`, `screen`, `schema` — spawn `bash`,
+    # `sh`, `zsh` or `dash` by name (26, 33, 8 and 13 references respectively).
+    # They compile on Windows and would fail at run time for want of a shell,
+    # which says nothing about Holdfast. Making them pass needs either a
+    # Windows shell fixture or per-row gating, and that is 0.0.11's work, not a
+    # thing to fake here. What runs below is the surface that is genuinely
+    # platform-independent; it grows as 0.0.11 lands.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-native
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Native MSVC, all targets. This is the strictly stronger half of
+      # `windows-cross` and the reason that job's comment no longer claims to
+      # be the only Windows signal.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # **`--lib` is deliberately NOT run here, and the exclusion is measured
+      # rather than assumed.** Run natively on Windows 2026-09-02, against
+      # this commit, `cargo test -p holdfast-core --lib` gives:
+      #
+      #     721 passed; 55 failed
+      #       secret::binding::tests    45
+      #       secret::provider::tests    5
+      #       mcp::tools::tests          5
+      #
+      # All 55 fail identically — `CreateProcessW "sh -c …" failed: The system
+      # cannot find the file specified (os error 2)` — from fixtures that
+      # spawn a real shell. Nothing else in the unit suite fails: the pty,
+      # session, detect and diag tests all pass on Windows, which a reading of
+      # the source would not have predicted and did not.
+      #
+      # So the prize for gating those three modules' shell fixtures is 721
+      # real unit tests running on Windows, and it is worth taking — in
+      # 0.0.11, where the Windows fixtures live. It is not taken here because
+      # this job's job is to stop #19's arms being untested, and a `--skip`
+      # list to dodge the 55 would either be per-test and enormous, or
+      # per-module and silently drop the many passing tests in
+      # `mcp::tools::tests` along with its five.
+      #
+      # `source_guards` is the one integration target that reads source files
+      # and spawns nothing, so it runs, and the `test result:` assertion is
+      # its anti-vacuity guard: a filter matching nothing reports `0 passed`
+      # and exits 0, which is a green tick over no executed code.
+      #
+      # No floor on the count. It moves whenever anything is added, and a
+      # literal here is a number nobody re-derives — the failure
+      # `mcp-smoke.sh` records drifting five times with nothing going red.
+      #
+      # `shell: bash` throughout: the parsing is bash and the default shell on
+      # a Windows runner is PowerShell. Git Bash ships on the image.
+      - name: Source guards, which must actually have run
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p holdfast-core --locked --test source_guards -- --test-threads=4 2>&1 | tee win-test.log
+          if ! grep -qE '^test result:' win-test.log; then
+            echo "no 'test result:' line — the target never started, and this" >&2
+            echo "step proved nothing." >&2
+            exit 1
+          fi
+          if grep -qE '^test result: ok\. 0 passed' win-test.log; then
+            echo "the target reported 0 passed — it ran no code:" >&2
+            grep -nE '^test result:' win-test.log >&2
+            exit 1
+          fi
+          grep -E '^test result:' win-test.log
+      # **The step this whole job exists for: the `#[cfg(windows)]` arms #19
+      # added, executed on Windows.** Before this, every one of them — six CLI
+      # refusals, the inherited-ACL warning, the config trust arm — was
+      # verified by the compiler and by nothing else. A refusal that compiles
+      # and then exits 0, or exits 64 with an empty message, is exactly the
+      # defect a cross-compile cannot see.
+      #
+      # `version` first as the control: it shares the binary and the argument
+      # parser with the six below, so if it fails they prove nothing about
+      # the arms and everything about the build.
+      #
+      # Both halves are asserted per subcommand — the exit code AND the
+      # reason. §18.8 gives 64 to "you asked for something this build does not
+      # have"; a bare 64 with no explanation sends an operator hunting.
+      - name: The Windows refusal arms, exercised rather than compiled
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo build --locked -p holdfast
+          BIN=target/debug/holdfast.exe
+          test -x "$BIN" || { echo "no binary at $BIN after cargo build" >&2; exit 1; }
+
+          "$BIN" version || { echo "control failed: 'holdfast version' is broken on Windows" >&2; exit 1; }
+
+          fails=0
+          run_case() {
+            out="$("$BIN" "$@" 2>&1)"; rc=$?
+            if [ "$rc" -ne 64 ]; then
+              echo "FAIL  holdfast $* exited $rc, want 64 (EXIT_USAGE)" >&2
+              echo "      output: $out" >&2
+              fails=$((fails + 1))
+            elif ! printf '%s' "$out" | grep -q 'not supported on Windows native'; then
+              echo "FAIL  holdfast $* exited 64 but did not say why" >&2
+              echo "      output: $out" >&2
+              fails=$((fails + 1))
+            else
+              echo "ok    holdfast $* -> 64, refused by name"
+            fi
+          }
+          run_case daemon run
+          run_case daemon start
+          run_case daemon stop
+          run_case daemon status
+          run_case list
+          run_case logs some-session
+
+          if [ "$fails" -ne 0 ]; then
+            echo "$fails Windows refusal arm(s) did not behave as #19 claims" >&2
+            exit 1
+          fi
+          echo "all six refusal arms exit 64 and name the reason"
 
   # --- the capability gate -------------------------------------------------
 
