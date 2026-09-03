@@ -296,6 +296,21 @@ jobs:
       - name: The Windows refusal arms, exercised rather than compiled
         shell: bash
         run: |
+          # **`set +e` first, and it is load bearing.** GitHub runs
+          # `shell: bash` as `bash --noprofile --norc -eo pipefail {0}`, so
+          # errexit is already ON before this script's first line, and
+          # `set -uo pipefail` does not clear it — only `set +e` does.
+          #
+          # Every case below deliberately runs a command that exits 64, and
+          # `run_case`'s `out="$(…)"` is an assignment whose status is the
+          # substitution's. Under errexit that ends the shell on the first
+          # case, before `rc` is ever read: measured, the step died 0.15s
+          # after the `version` control printed, with not one `ok` or `FAIL`
+          # line emitted, and reported exit 64 — the exact code it exists to
+          # assert on, which is why it read as a product bug rather than a
+          # harness one. The `version` line above survived only because a
+          # `||` suppresses errexit for its left side.
+          set +e
           set -uo pipefail
           cargo build --locked -p holdfast
           BIN=target/debug/holdfast.exe
