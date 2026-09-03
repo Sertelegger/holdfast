@@ -142,10 +142,14 @@ fn redacted(message: &str) -> String {
 ///
 /// `None` when neither variable is set, which is the same as "no file":
 /// a process with no home is not a misconfigured one.
+/// `HOME` is read through `daemon::paths::home_dir`, which falls back to
+/// `USERPROFILE` on Windows — the same one answer `RuntimePaths` uses, so a
+/// Windows install cannot end up reading its config from one home and
+/// writing its logs under another.
 pub fn config_path() -> Option<PathBuf> {
     config_path_from(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        crate::daemon::paths::home_dir(),
     )
 }
 

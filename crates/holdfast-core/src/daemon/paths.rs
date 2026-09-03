@@ -367,6 +367,108 @@ impl Drop for ForcedUmask {
     }
 }
 
+/// The user's home directory, as **this platform** names it.
+///
+/// **`USERPROFILE` on Windows, and without it the whole Windows build is
+/// pathless.** `HOME` is a POSIX convention and a native Windows process
+/// does not have it — measured: `cmd /c "echo %HOME%"` echoes the literal
+/// `%HOME%`, while `%USERPROFILE%` is `C:\Users\<name>`. Every path this
+/// module hands out is derived from this one answer, so with `HOME` unset
+/// `RuntimePaths::discover()` returns `NotFound`, `serve_stdio` swallows it
+/// with `.ok()`, and `holdfast mcp` runs with **no §9.4 audit trail at all**
+/// — silently, because a missing trail looks exactly like a quiet one.
+///
+/// It is also what makes #19's "warn rather than refuse" posture reachable.
+/// Both callers of `warn_inherited_acl_once` sit downstream of path
+/// resolution, so before this the warning could not fire on the platform it
+/// exists to describe. Measured on a native `holdfast.exe mcp --no-daemon`:
+/// no warning, no trail.
+///
+/// `HOME` is still preferred where it is set, so a Windows user who exports
+/// it — MSYS2 and Git Bash both do — keeps the instance they already had
+/// rather than silently acquiring a second one under `%USERPROFILE%`.
+///
+/// The empty-string rule (GH #72) is deliberately NOT applied here: it lives
+/// in `resolve`, which is the one place every caller passes through, and a
+/// second copy is the hazard that rule's own comment is about.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// [`home_dir`] over what the environment said, split out for the same reason
+/// [`RuntimePaths::resolve`] and [`crate::config::config_path_from`] are:
+/// the env is process-global and this test binary is threaded, so a test that
+/// set `HOME` would be setting it for every other test at the same time.
+fn home_from(
+    home: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(home) = home {
+        return Some(PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    if let Some(profile) = user_profile {
+        return Some(PathBuf::from(profile));
+    }
+    #[cfg(not(windows))]
+    let _ = user_profile;
+    None
+}
+
+/// **Its own module, and NOT `#[cfg(all(test, unix))]` like the big one at the
+/// bottom of this file.** The whole point of [`home_from`] is what it does on
+/// a target that is not Unix, so gating its tests the way the mode-bit tests
+/// are gated would leave the Windows arm asserted by nothing — which is the
+/// exact shape #19 was fixing. These need no mode bits, no umask and no
+/// filesystem, so nothing stops them running everywhere.
+#[cfg(test)]
+mod home_tests {
+    use super::home_from;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn os(s: &str) -> Option<OsString> {
+        Some(OsString::from(s))
+    }
+
+    #[test]
+    fn home_wins_wherever_it_is_set() {
+        // The claim that a Windows user who exports `HOME` — MSYS2 and Git
+        // Bash both do — keeps the instance they already had instead of
+        // silently acquiring a second one under `%USERPROFILE%`.
+        assert_eq!(
+            home_from(os("/home/ada"), os(r"C:\Users\ada")),
+            Some(PathBuf::from("/home/ada"))
+        );
+    }
+
+    #[test]
+    fn user_profile_is_the_windows_fallback_and_is_ignored_everywhere_else() {
+        // **The separating negative, and it is the whole test.** Asserting
+        // only that this returns `Some` on Windows would pass against a
+        // fallback wired up on every platform, which would change where a
+        // Unix box with no `HOME` puts its audit trail. The answer has to
+        // DIFFER by platform, so the expectation is written from `cfg!`.
+        let got = home_from(None, os(r"C:\Users\ada"));
+        if cfg!(windows) {
+            assert_eq!(got, Some(PathBuf::from(r"C:\Users\ada")));
+        } else {
+            assert_eq!(
+                got, None,
+                "USERPROFILE is a Windows convention and must not move a Unix instance"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_set_is_none_on_every_platform() {
+        // `resolve` turns this into the `NotFound` that names all three
+        // variables; the empty-string rule (GH #72) lives there too, and
+        // deliberately not here — one spelling, one place.
+        assert_eq!(home_from(None, None), None);
+    }
+}
+
 /// `sockaddr_un.sun_path` is 108 bytes on Linux and 104 on macOS, minus
 /// the NUL. Binding a longer path fails with a confusing `EINVAL`, so we
 /// check up front and say what is actually wrong (§7.1).
@@ -480,7 +582,7 @@ impl RuntimePaths {
         Self::resolve(
             std::env::var_os(RUNTIME_DIR_ENV).map(PathBuf::from),
             std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
-            std::env::var_os("HOME").map(PathBuf::from),
+            home_dir(),
             cfg!(target_os = "linux"),
             cfg!(target_os = "macos"),
         )
