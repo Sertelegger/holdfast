@@ -415,6 +415,75 @@ fn home_from(
     None
 }
 
+/// **`open_log_append`'s cross-platform half, and the reason this module is
+/// not `#[cfg(all(test, unix))]` either.**
+///
+/// The pre-PR review measured four mutations of this file's `#[cfg(windows)]`
+/// bodies and all four SURVIVED both CI gates — `windows-cross` is
+/// `cargo clippy`, which type-checks and never links, and no job ran a test
+/// on that target. The sharpest of the four turned the Windows arm's
+/// `.append(true)` into `.write(true).truncate(true)`, which zeroes the §9.4
+/// audit trail on every process start and on every post-rotation reopen, and
+/// nothing anywhere went red.
+///
+/// Two of that function's three obligations do not depend on mode bits at
+/// all — it must CREATE the parent directory, and it must APPEND rather than
+/// truncate — so they are asserted here, on every target, against whichever
+/// arm this build compiled. Only the mode application stays untestable off
+/// Unix. That is the review's own suggested shape: assert the shared contract
+/// once cross-platform and leave just the `#[cfg]`-dependent part behind.
+#[cfg(test)]
+mod log_append_tests {
+    use super::open_log_append;
+    use std::io::Write;
+
+    /// A scratch path under the system temp dir, so this runs identically on
+    /// both platforms — `/tmp` is not a Windows path and `sun_path`'s length
+    /// limit, which forces `/tmp` elsewhere in this file, is irrelevant here
+    /// because nothing binds a socket.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        std::env::temp_dir().join(format!("holdfast-log-{tag}-{}", &unique[..8]))
+    }
+
+    #[test]
+    fn it_creates_the_parent_directory_it_was_given() {
+        let dir = scratch("mkparent");
+        let path = dir.join("nested").join("audit.log");
+        assert!(!path.exists(), "fixture must start absent");
+
+        let file = open_log_append(&path).expect("open_log_append creates its parent");
+        drop(file);
+
+        assert!(path.is_file(), "the log itself was not created at {path:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn it_appends_and_does_not_truncate_what_is_already_there() {
+        // **The mutation this exists for.** `.write(true).truncate(true)`
+        // passes every other assertion in this file and silently empties the
+        // audit trail; only reading back across two opens can see it.
+        let dir = scratch("append");
+        let path = dir.join("audit.log");
+
+        let mut first = open_log_append(&path).expect("first open");
+        first.write_all(b"line one\n").expect("first write");
+        drop(first);
+
+        let mut second = open_log_append(&path).expect("second open");
+        second.write_all(b"line two\n").expect("second write");
+        drop(second);
+
+        let got = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            got, "line one\nline two\n",
+            "the reopen truncated the trail instead of appending to it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// **Its own module, and NOT `#[cfg(all(test, unix))]` like the big one at the
 /// bottom of this file.** The whole point of [`home_from`] is what it does on
 /// a target that is not Unix, so gating its tests the way the mode-bit tests
@@ -872,12 +941,22 @@ fn create_owner_only(dir: &Path) -> io::Result<()> {
 }
 
 fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
-    // **The symlink refusal below is cross-platform and stays that way.**
-    // It is the half of this function that does not depend on mode bits:
-    // `symlink_metadata` does not follow a link on either platform, and a
-    // planted `logs -> /elsewhere` redirects the §9.4 audit trail just as
-    // effectively on Windows. Only the mode inspection and the tighten are
-    // Unix-gated, at the bottom.
+    // **The symlink refusal below is cross-platform in this function, and
+    // that is NOT the same as being in force on Windows.** It is the half
+    // that does not depend on mode bits: `symlink_metadata` follows no link
+    // on either platform, and a planted `logs -> /elsewhere` redirects the
+    // §9.4 trail just as effectively there. Only the mode inspection and the
+    // tighten are Unix-gated, at the bottom.
+    //
+    // But every production caller of this function is inside `daemon::spawn`
+    // or `daemon::server`, both `#[cfg(unix)]`, so on a Windows build nothing
+    // reaches it: `open_log_append`'s Windows arm creates the parent with a
+    // bare `DirBuilder` and a junction at `~/.holdfast/logs` goes unchecked.
+    // The Unix `open_log_append` has the same gap, so this is pre-existing in
+    // kind rather than introduced here — but the honest claim is "kept
+    // compiling", not "kept in force". Closing it means routing
+    // `open_log_append` through this function on both platforms, which is a
+    // change to the Unix path and does not belong in a Windows fix.
     // `symlink_metadata`, not `exists()` and `metadata`: both of those
     // follow a link, and every decision below acts on what they report.
     // A planted `logs -> /elsewhere` would be chmodded at its *target*
@@ -966,7 +1045,8 @@ fn log_dir_or_err(log_dir: PathBuf, home: &io::Result<PathBuf>) -> io::Result<Pa
 // a handful that pass for want of anything to check, which reads as coverage
 // and is not. `RuntimePaths`'s pure path arithmetic is worth testing on
 // Windows and is not tested here today; splitting it out is a follow-up, not
-// something to fake with a `#[cfg]` (#19).
+// something to fake with a `#[cfg]`. Tracked in this branch's PR rather
+// than in #19, which the branch closes.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

@@ -236,19 +236,46 @@ jobs:
       #
       # `shell: bash` throughout: the parsing is bash and the default shell on
       # a Windows runner is PowerShell. Git Bash ships on the image.
-      - name: Source guards, which must actually have run
+      - name: Source guards and the cross-platform lib rows, which must have run
         shell: bash
         run: |
           set -o pipefail
           cargo test -p holdfast-core --locked --test source_guards -- --test-threads=4 2>&1 | tee win-test.log
-          if ! grep -qE '^test result:' win-test.log; then
-            echo "no 'test result:' line — the target never started, and this" >&2
-            echo "step proved nothing." >&2
+          # **A filter, and a narrow one, for a reason the comment above
+          # rejects a filter for.** Skipping the 55 shell-spawning rows would
+          # need a per-module `--skip` list that drops passing tests with
+          # them. NAMING the two modules that exist to be cross-platform is
+          # the opposite move: `home_dir`'s `USERPROFILE` split and
+          # `open_log_append`'s create-parent / append-not-truncate contract
+          # are the only lib code in this file whose Windows arm differs from
+          # its Unix one, and both were unexecutable by any job before this.
+          #
+          # The pre-PR review measured four mutations of those Windows arms
+          # surviving every gate, the sharpest being `.append(true)` ->
+          # `.truncate(true)`, which zeroes the §9.4 audit trail on every
+          # start. Re-measured after these rows landed: that mutation now
+          # fails HERE and passes on Linux, which is the correct split.
+          cargo test -p holdfast-core --locked --lib -- --test-threads=4 \
+            daemon::paths::home_tests:: daemon::paths::log_append_tests:: 2>&1 | tee -a win-test.log
+          results=$(grep -cE '^test result:' win-test.log)
+          if [ "$results" -lt 2 ]; then
+            echo "expected a 'test result:' line per invocation, got $results —" >&2
+            echo "a target never started and this step proved nothing." >&2
             exit 1
           fi
           if grep -qE '^test result: ok\. 0 passed' win-test.log; then
-            echo "the target reported 0 passed — it ran no code:" >&2
+            echo "an invocation reported 0 passed — it ran no code:" >&2
             grep -nE '^test result:' win-test.log >&2
+            exit 1
+          fi
+          # A floor on the FILTERED run only, where the count is small,
+          # deliberate and known: 3 home rows + 2 log-append rows. A filter
+          # that stopped matching would otherwise report `0 passed` — caught
+          # above — but one that matched only half would not.
+          filtered=$(grep -E '^test result:' win-test.log | tail -1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')
+          if [ "${filtered:-0}" -lt 5 ]; then
+            echo "the cross-platform lib filter matched ${filtered:-0} rows, want >= 5" >&2
+            echo "(3 in home_tests, 2 in log_append_tests) — did a module get renamed?" >&2
             exit 1
           fi
           grep -E '^test result:' win-test.log

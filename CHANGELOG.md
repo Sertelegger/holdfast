@@ -83,6 +83,10 @@ trigger as a side effect of writing release notes.
   from this release. `daemon::paths`, `protocol::{frame, handshake, method}`
   and everything else stay cross-platform: the wire shape is a claim about the
   protocol, not about Unix.
+- **This is not a removal, and calling it one would overstate it.** Nothing
+  changes on Unix. On Windows `holdfast-core` did not compile at all before
+  this release — 32 errors — so there was no cross-compiling build for a
+  consumer to lose; that target goes from having no API to having this one.
 
 [#19]: https://github.com/Sertelegger/holdfast/issues/19
 
