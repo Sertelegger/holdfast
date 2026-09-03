@@ -138,9 +138,21 @@ is missing, which is why this is a design question rather than a detection one.
 
 **Native Windows support.** ConPTY, job objects in place of process groups (the
 signal semantics are genuinely different, not a port of `killpg`), and
-stdio-only mode where the hybrid daemon does not apply. The tree is already kept
-compiling and clippy-clean for `x86_64-pc-windows-gnu` so this does not start
-from a red build.
+stdio-only mode where the hybrid daemon does not apply.
+
+**This does start from a red build, and the sentence here used to say
+otherwise.** `windows-cross` — the `x86_64-pc-windows-gnu` clippy job — has
+been red on `main` since before 0.0.6, with 0 passes in the last 20 runs
+([#19](https://github.com/Sertelegger/holdfast/issues/19)). The claim that the
+tree is "kept compiling and clippy-clean" for that target was false for two
+milestones, and it was the sentence a contributor would have read before
+starting. The 31 lib errors are all in the daemon subsystem —
+`daemon/{spawn,server,paths,peer,attach_server}.rs`, `protocol/client.rs`,
+`config.rs`'s mode-bit checks, and one unconditional reference to the already
+`cfg(unix)`-gated `attach::conn` — which is the subsystem this milestone says
+does not exist on Windows anyway. Getting that green is compile-gating rather
+than porting, needs no Windows machine, and is scheduled ahead of the rest as
+0.0.10a.
 
 ## Distribution
 

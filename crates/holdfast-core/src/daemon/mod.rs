@@ -14,11 +14,26 @@
 // constructor *this* module calls, so its line went into `daemon.log`
 // unredacted while the denial sat one directory away (re-review I-2).
 
+// **`paths` is NOT gated, and the asymmetry is the whole shape of this
+// module on Windows (#19).** The other four are the daemon proper — Unix
+// sockets, `flock`, `setsid`, `SO_PEERCRED` — and have no meaning without
+// one. `paths` holds `RuntimePaths`, which answers "where does this
+// instance keep its logs", and `audit`, `diag`, `config` and `mcp` all
+// read it on every transport including stdio-only. Gating it would take
+// the audit trail and the diagnostic log off Windows to make a
+// cross-compile check go green, which is a green gate that checks
+// nothing — strictly worse than the red one it replaced. Its own
+// mode-bit internals carry the `#[cfg(unix)]`, not the module.
+#[cfg(unix)]
 pub mod attach_server;
 pub mod paths;
+#[cfg(unix)]
 pub mod peer;
+#[cfg(unix)]
 pub mod server;
+#[cfg(unix)]
 pub mod spawn;
 
 pub use paths::RuntimePaths;
+#[cfg(unix)]
 pub use server::{Daemon, DaemonStatus, StopOutcome, StopParams};

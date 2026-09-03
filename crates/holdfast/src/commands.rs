@@ -1,7 +1,15 @@
 //! Subcommand bodies. Parsing and printing live here; every piece of
 //! state comes from `holdfast-core` (spec §3.5).
 
+// `RuntimePaths` is gated here and NOT in `holdfast-core`, and the split is
+// deliberate. The type stays cross-platform there because `audit`, `diag`,
+// `config` and `mcp` all resolve log paths through it on every transport.
+// This crate is the CLI, and every one of its remaining users — `daemon_*`,
+// `list`, `logs`, `attach`, `watch` — is Unix-only, so on Windows the import
+// itself is what goes unused.
+#[cfg(unix)]
 use holdfast_core::daemon::paths::RuntimePaths;
+#[cfg(unix)]
 use holdfast_core::daemon::{server, spawn};
 // The `diag!` macro, not the module — every diagnostic below goes to
 // stderr, and on `holdfast daemon run` stderr is `daemon.log`, which §9.2
@@ -9,17 +17,28 @@ use holdfast_core::daemon::{server, spawn};
 // that is the subcommands' actual answer, and `holdfast logs --raw` is
 // specified to be unredacted.
 use holdfast_core::diag;
+#[cfg(unix)]
 use holdfast_core::mcp::shim::ShimServer;
+#[cfg(unix)]
 use holdfast_core::protocol::client::{ClientError, ControlClient};
+#[cfg(unix)]
 use holdfast_core::protocol::handshake::ClientKind;
+#[cfg(unix)]
 use holdfast_core::protocol::method;
+#[cfg(unix)]
 use holdfast_core::protocol::CborValue;
+#[cfg(unix)]
 use rmcp::ServiceExt;
+#[cfg(unix)]
 use serde_json::{json, Value};
+#[cfg(unix)]
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::path::Path;
 use std::process::ExitCode;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
 /// §18.8 shim exit codes, in §18.8's row order — `0`, `1`, `2`, `64`.
@@ -56,6 +75,7 @@ pub const EXIT_USAGE: u8 = 64;
 /// a pty nobody sized reports `0x0`, and a bar claiming the session is `0x0`
 /// reads as a defect in the thing added to reassure the reader. Without a
 /// width there is nothing to pad to, so the notice is printed as a sentence.
+#[cfg(unix)]
 pub(crate) fn attach_banner(
     session: &str,
     size: Option<(u16, u16)>,
@@ -96,6 +116,7 @@ pub(crate) fn attach_banner(
 /// the prompt `ESC[L` just made space for, so an over-wide bar destroys the
 /// thing this whole sequence exists to preserve. Measured at 41 ASCII chars
 /// and at 12 CJK chars on an 80-column terminal before this existed.
+#[cfg(unix)]
 fn fit_to_width(s: &str, cols: usize) -> String {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     if UnicodeWidthStr::width(s) <= cols {
@@ -125,6 +146,7 @@ fn fit_to_width(s: &str, cols: usize) -> String {
 /// How long the attach banner waits for the child's repaint before
 /// printing anyway. Long enough for a shell to answer `SIGWINCH`, short
 /// enough that a silent session is not left wondering.
+#[cfg(unix)]
 const BANNER_AFTER_REPAINT: Duration = Duration::from_millis(400);
 
 /// How long a `Resize` notice waits for the geometry to stop moving before
@@ -142,19 +164,25 @@ const BANNER_AFTER_REPAINT: Duration = Duration::from_millis(400);
 /// question the operator just asked with their mouse: at 150ms a release is
 /// reported before the hand leaves the trackpad, while a drag at any
 /// plausible frame rate keeps resetting it.
+#[cfg(unix)]
 const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 
+#[cfg(unix)]
 pub const EXIT_SIGHUP: u8 = 128 + 1;
+#[cfg(unix)]
 pub const EXIT_SIGTERM: u8 = 128 + 15;
 
+#[cfg(unix)]
 fn paths() -> anyhow::Result<RuntimePaths> {
     Ok(RuntimePaths::discover()?)
 }
 
+#[cfg(unix)]
 fn empty() -> CborValue {
     CborValue::Map(Vec::new())
 }
 
+#[cfg(unix)]
 async fn connect(kind: ClientKind) -> Result<ControlClient, ClientError> {
     let paths = RuntimePaths::discover().map_err(|source| ClientError::Connect {
         path: "runtime directory".into(),
@@ -163,21 +191,59 @@ async fn connect(kind: ClientKind) -> Result<ControlClient, ClientError> {
     ControlClient::connect(&paths.control_sock(), kind).await
 }
 
+/// The in-process half, which is `--no-daemon` on Unix and the *only*
+/// transport on Windows (§3.3, §3.6). Extracted so both callers below run
+/// exactly the same code rather than two copies that can drift.
+async fn serve_in_process() -> ExitCode {
+    match holdfast_core::mcp::serve_stdio().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            diag!("holdfast mcp: {e}");
+            ExitCode::from(no_daemon_exit_code(&e))
+        }
+    }
+}
+
 /// `holdfast mcp [--no-daemon]`
 pub async fn mcp(no_daemon: bool) -> ExitCode {
-    // Windows has no daemon at all (§3.3, §3.6); that arm lands in
-    // 0.0.11. On Unix, `--no-daemon` is the documented escape hatch and
-    // the shape the Windows build will reuse.
+    // On Unix, `--no-daemon` is the documented escape hatch and the shape
+    // the Windows build reuses.
     if no_daemon {
-        return match holdfast_core::mcp::serve_stdio().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                diag!("holdfast mcp: {e}");
-                ExitCode::from(no_daemon_exit_code(&e))
-            }
-        };
+        return serve_in_process().await;
     }
 
+    mcp_hybrid().await
+}
+
+/// **Windows serves stdio rather than refusing, and says so once.**
+///
+/// §3.3/§3.6 make stdio the only transport there, so the useful answer to a
+/// bare `holdfast mcp` is the in-process server — refusing would leave the
+/// platform with no working MCP command at all. What it must not do is let
+/// the operator believe they got hybrid mode: the difference is visible only
+/// when the client exits and takes every session with it, which is exactly
+/// the surprise §3.3 documents.
+///
+/// A paired function rather than a `#[cfg]` block inside [`mcp`], matching
+/// `attach`/`watch` above. The block form needs an explicit `return` to
+/// type-check once the Unix arm is compiled out, and clippy then reads that
+/// `return` as needless on Windows and only on Windows — a lint fighting a
+/// `#[cfg]`, which is a `#[allow]` waiting to happen.
+#[cfg(windows)]
+async fn mcp_hybrid() -> ExitCode {
+    diag!(
+        "holdfast mcp: hybrid mode is not available on Windows native \
+         (§3.3, §3.6) — there is no daemon, so this is serving stdio \
+         in-process. Sessions end when this process does. Use WSL for a \
+         daemon that outlives the client."
+    );
+    serve_in_process().await
+}
+
+/// The hybrid path: auto-spawn a daemon (§7.3) and serve `ShimServer` over
+/// stdio against it.
+#[cfg(unix)]
+async fn mcp_hybrid() -> ExitCode {
     let paths = match paths() {
         Ok(p) => p,
         Err(e) => {
@@ -244,6 +310,7 @@ fn no_daemon_exit_code(e: &anyhow::Error) -> u8 {
 
 /// `holdfast daemon run` — foreground, for systemd/launchd and for the
 /// process `daemon start` detaches.
+#[cfg(unix)]
 pub async fn daemon_run() -> ExitCode {
     let paths = match paths() {
         Ok(p) => p,
@@ -262,6 +329,7 @@ pub async fn daemon_run() -> ExitCode {
 }
 
 /// `holdfast daemon start` — fork-and-detach, idempotent (§3.2).
+#[cfg(unix)]
 pub fn daemon_start() -> ExitCode {
     let paths = match paths() {
         Ok(p) => p,
@@ -307,6 +375,7 @@ pub fn daemon_start() -> ExitCode {
 /// `holdfast logs` may legitimately take a while), so an unbounded call
 /// here would park `--force` in exactly the situation it is meant to
 /// resolve. That is what `TestEnv::drop` was paying `CLI_TIMEOUT` for.
+#[cfg(unix)]
 const FORCE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long `holdfast daemon stop` **without** `--force` waits for the
@@ -336,10 +405,12 @@ const FORCE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// that follows the grace. The daemon's grace is the floor and this must
 /// stay strictly above it — see
 /// `the_graceful_bound_leaves_room_for_the_daemons_own_grace`.
+#[cfg(unix)]
 const STOP_RPC_TIMEOUT: Duration = Duration::from_secs(server::DEFAULT_STOP_GRACE_SECS as u64 + 5);
 
 /// What the `daemon/stop` RPC did, kept separate from what `--force`
 /// then does about it.
+#[cfg(unix)]
 enum StopRpc {
     Stopped(server::StopOutcome),
     /// Nothing was listening on the control socket.
@@ -349,6 +420,7 @@ enum StopRpc {
     Failed(String),
 }
 
+#[cfg(unix)]
 async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
     // No discoverable runtime directory means no socket to call on and
     // no `holdfast.pid` to read, which is the same outcome as nothing
@@ -384,6 +456,7 @@ async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
 /// accept loop will not hear — so `--force` follows it with a signal to
 /// the daemon process itself, whether the RPC answered, failed, or never
 /// came back.
+#[cfg(unix)]
 pub async fn daemon_stop(force: bool) -> ExitCode {
     let deadline = if force {
         FORCE_RPC_TIMEOUT
@@ -405,6 +478,7 @@ pub async fn daemon_stop(force: bool) -> ExitCode {
 /// and waiting a real [`STOP_RPC_TIMEOUT`]. `u8` rather than `ExitCode`
 /// because `ExitCode` cannot be compared, so a test could only assert on
 /// its `Debug` formatting.
+#[cfg(unix)]
 async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeout: Duration) -> u8 {
     // **Both paths are bounded now.** `--force`'s bound was already here
     // because a daemon that accepts and never replies is the state
@@ -505,6 +579,7 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
 }
 
 /// The result of §3.2's `--force` escalation.
+#[cfg(unix)]
 enum Escalation {
     /// SIGKILL was delivered to a pid confirmed to be this instance's
     /// daemon.
@@ -524,6 +599,7 @@ enum Escalation {
 /// of each PTY closing as the daemon dies, which hangs up the terminal.
 /// The deliberate teardown is the RPC's, and only a daemon that can
 /// answer performs it — which is the trade `--force` makes.
+#[cfg(unix)]
 fn escalate_to_sigkill(paths: &RuntimePaths) -> Escalation {
     let Some(pid) = server::read_pid_file(paths) else {
         return Escalation::Nothing;
@@ -597,6 +673,7 @@ fn escalate_to_sigkill(paths: &RuntimePaths) -> Escalation {
 /// but has not yet exited reads as unconfirmed. That is the tail of a
 /// *successful* cooperative shutdown, so the escalation it declines is
 /// one that was not needed.
+#[cfg(unix)]
 fn confirm_daemon_pid(paths: &RuntimePaths, pid: u32) -> Result<(), String> {
     if !Path::new("/proc/self/cmdline").exists() {
         return Err("no /proc on this platform, so the pid cannot be tied to a daemon".into());
@@ -617,6 +694,7 @@ fn confirm_daemon_pid(paths: &RuntimePaths, pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn proc_argv(pid: u32) -> Result<Vec<String>, String> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline"))
         .map_err(|e| format!("cannot read /proc/{pid}/cmdline: {e}"))?;
@@ -633,6 +711,7 @@ fn proc_argv(pid: u32) -> Result<Vec<String>, String> {
 /// it; `/proc/<pid>/fd` maps a process to the inodes it holds. Neither
 /// alone names both ends, and the intersection is what ties a process to
 /// a path.
+#[cfg(unix)]
 fn holds_socket_bound_at(pid: u32, sock: &Path) -> Result<bool, String> {
     let table = std::fs::read_to_string("/proc/net/unix")
         .map_err(|e| format!("cannot read /proc/net/unix: {e}"))?;
@@ -679,6 +758,7 @@ fn holds_socket_bound_at(pid: u32, sock: &Path) -> Result<bool, String> {
 /// unescaped, so a runtime directory below a home directory with a space
 /// in it would otherwise be compared against its own first word and
 /// never match.
+#[cfg(unix)]
 fn unix_socket_row(line: &str) -> Option<(&str, &str)> {
     let mut rest = line.trim_start();
     let mut inode = "";
@@ -694,6 +774,7 @@ fn unix_socket_row(line: &str) -> Option<(&str, &str)> {
 }
 
 /// `holdfast daemon status [--json]`
+#[cfg(unix)]
 pub async fn daemon_status(as_json: bool) -> ExitCode {
     let client = match connect(ClientKind::Cli).await {
         Ok(c) => c,
@@ -737,6 +818,7 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
 }
 
 /// `holdfast list [--json]`
+#[cfg(unix)]
 pub async fn list(as_json: bool) -> ExitCode {
     let client = match connect(ClientKind::Cli).await {
         Ok(c) => c,
@@ -797,6 +879,7 @@ pub async fn list(as_json: bool) -> ExitCode {
 }
 
 /// `holdfast logs <session> [--tail N] [--raw]`
+#[cfg(unix)]
 pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCode {
     let client = match connect(ClientKind::Cli).await {
         Ok(c) => c,
@@ -1725,6 +1808,71 @@ pub async fn attach(_session: &str) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
+// **The six `#[cfg(windows)]` arms below exist for `main.rs`'s benefit, and
+// they are refusals rather than ports.** Every one of these subcommands is a
+// client of, or is, the daemon — and §3.3/§3.6 give Windows native no daemon
+// at all. `main.rs` dispatches them unconditionally, so a `#[cfg(unix)]`-only
+// function with no counterpart is a hard error under `windows-cross` rather
+// than a warning; that is the same reason `attach` and `watch` above have had
+// arms since 0.0.6.
+//
+// `EXIT_USAGE` (64) and not `EXIT_UNREACHABLE` (2), matching `attach` and
+// `watch`: 2 means "there should be a daemon and I could not reach it", which
+// would send a Windows operator hunting for a process that is not supposed to
+// exist. 64 is "you asked for something this build does not have".
+
+/// §3.6: there is no daemon to run on Windows native.
+#[cfg(windows)]
+pub async fn daemon_run() -> ExitCode {
+    unsupported("daemon run")
+}
+
+/// §3.6: there is no daemon to start on Windows native.
+#[cfg(windows)]
+pub fn daemon_start() -> ExitCode {
+    unsupported("daemon start")
+}
+
+/// §3.6: there is no daemon to stop on Windows native.
+#[cfg(windows)]
+pub async fn daemon_stop(_force: bool) -> ExitCode {
+    unsupported("daemon stop")
+}
+
+/// §3.6: there is no daemon to report on Windows native.
+#[cfg(windows)]
+pub async fn daemon_status(_as_json: bool) -> ExitCode {
+    unsupported("daemon status")
+}
+
+/// §3.6: `list` reads the daemon's registry over the control socket, and
+/// there is neither on Windows native. Sessions there live and die inside
+/// the `holdfast mcp` process, so the MCP `list_sessions` tool is the
+/// answer and this subcommand has nothing to enumerate.
+#[cfg(windows)]
+pub async fn list(_as_json: bool) -> ExitCode {
+    unsupported("list")
+}
+
+/// §3.6: `logs` reads a session's ring buffer out of the daemon, same as
+/// `list`. The `read_output` tool is the in-process equivalent.
+#[cfg(windows)]
+pub async fn logs(_session: &str, _tail_lines: Option<usize>, _raw: bool) -> ExitCode {
+    unsupported("logs")
+}
+
+/// The one refusal message, so six subcommands cannot drift into six
+/// wordings of the same fact.
+#[cfg(windows)]
+fn unsupported(what: &str) -> ExitCode {
+    diag!(
+        "holdfast {what} is not supported on Windows native (§3.6): there is \
+         no daemon. Sessions live inside `holdfast mcp` and end with it. Use \
+         WSL for a daemon that outlives the client."
+    );
+    ExitCode::from(EXIT_USAGE)
+}
+
 /// `holdfast version`
 pub fn version() -> ExitCode {
     println!(
@@ -1737,7 +1885,10 @@ pub fn version() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[cfg(test)]
+// Unix-only for the same reason the subcommands above are: these rows drive
+// `daemon_stop_within` against a wedged daemon on a real Unix socket, and
+// exercise the attach banner. Neither exists on a target with no daemon.
+#[cfg(all(test, unix))]
 mod tests {
     use super::{attach_banner, fit_to_width};
 

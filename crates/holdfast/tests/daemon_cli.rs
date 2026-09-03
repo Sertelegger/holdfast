@@ -21,6 +21,12 @@
 //! So a wait that expires **panics**. It is never absorbed into an
 //! `Ok(_) | Err(_)` that would let a timeout count as a pass.
 
+// Unix-only, like `attach_cli.rs` above it. Everything below drives a real
+// daemon over a Unix socket, and §3.3/§3.6 give Windows native neither —
+// `holdfast-core`'s `daemon` module is `#[cfg(unix)]` from #19 on, so these
+// targets have nothing to link against there rather than nothing to say.
+#![cfg(unix)]
+
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};

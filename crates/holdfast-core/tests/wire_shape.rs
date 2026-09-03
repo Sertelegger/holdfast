@@ -102,6 +102,21 @@
 //! client at runtime by `tools/list` and owned by `tests/schema.rs`; they
 //! are forwarded through this wire rather than defined by it.
 
+// **Unix-only, and this one is a wart rather than a clean line (#19).**
+//
+// The wire shape is cross-platform by design — `protocol::{frame, handshake,
+// method}` stay on every target precisely because the golden record is a
+// claim about the protocol, not about Unix. But three of the response types
+// it pins — `DaemonStatus`, `StopOutcome`, `StopParams` — live inside
+// `daemon::server`, which is Unix-only, so the record cannot be checked on a
+// target that has no daemon module to import them from.
+//
+// The fix is to move those three out of `daemon::server` into `protocol`,
+// where the rest of the wire types already are. That is a public-API move
+// and does not belong in a change whose job is to make `windows-cross` go
+// green, so it is recorded here and left.
+#![cfg(unix)]
+
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::path::PathBuf;

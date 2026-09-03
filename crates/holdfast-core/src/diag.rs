@@ -398,6 +398,11 @@ mod tests {
     ///
     /// Two records merged by a torn write carry two `-END` markers, or end
     /// on a pid that is not the one they began with.
+    /// Gated to match its only caller, `two_processes_emitting_at_once_
+    /// never_shred_a_line`, which has been `#[cfg(unix)]` since it was
+    /// written — it forks. The helper was not, so it read as dead code the
+    /// moment anything compiled this module for another target (#19).
+    #[cfg(unix)]
     fn line_is_one_whole_record(line: &str) -> bool {
         let Some(rest) = line.strip_prefix("holdfast shred-probe ") else {
             return false;

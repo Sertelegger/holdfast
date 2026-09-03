@@ -737,6 +737,7 @@ mod tests {
         assert_eq!(entries[1]["pid"], 2);
     }
 
+    #[cfg(unix)]
     /// **The audit trail is owner-only, on the transport nobody tested.**
     ///
     /// `serve_stdio` opens this log through `to_path` with no

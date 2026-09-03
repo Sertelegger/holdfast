@@ -17,6 +17,12 @@
 //!   one socket. Every close assertion here is therefore followed by a
 //!   fresh, well-formed attach that must still succeed.
 
+// Unix-only, like `attach_cli.rs` above it. Everything below drives a real
+// daemon over a Unix socket, and §3.3/§3.6 give Windows native neither —
+// `holdfast-core`'s `daemon` module is `#[cfg(unix)]` from #19 on, so these
+// targets have nothing to link against there rather than nothing to say.
+#![cfg(unix)]
+
 use holdfast_core::attach::frames::{decode_server_frame, ClientFrame, ServerFrame};
 use holdfast_core::attach::hub::{AttachConn, ATTACH_QUEUE_FRAMES};
 use holdfast_core::attach::{

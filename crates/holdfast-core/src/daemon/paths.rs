@@ -254,6 +254,7 @@ pub const LOG_MODE: u32 = 0o600;
 /// path that runs before every assertion is exactly how
 /// `ensure_dir_creates_the_tree_mode_0700` came to be unable to observe
 /// its own `DirBuilder::mode` — see the note on that test.
+#[cfg(unix)]
 pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
@@ -274,6 +275,66 @@ pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+/// The same file, created without a mode, because Windows has none to set.
+///
+/// **This warns and proceeds; it does not refuse, and it does not pretend.**
+/// The refusing version was considered and is wrong: a file created here
+/// inherits the DACL of its parent, and the parent is inside the user's own
+/// profile, so the inherited ACL grants the owning user, `SYSTEM` and
+/// `Administrators` — not "everyone". That is a genuinely different posture
+/// from a `0644` on Unix, and refusing to write an audit log over it would
+/// trade a real capability for a risk that is largely already handled by the
+/// platform.
+///
+/// What is *not* handled, and is what the warning is for: Holdfast asserts
+/// nothing here. On Unix `LOG_MODE` is enforced and `ensure_owner_only`
+/// re-checks it; here the ACL is whatever was inherited, which a machine
+/// policy, a redirected profile, or a runtime directory relocated onto a
+/// shared volume by `HOLDFAST_RUNTIME_DIR` can all widen without Holdfast
+/// noticing. An explicit DACL is 0.0.11's, and the 0.0.11 plan records a
+/// decision (D9) for the recording file's `0600` and **none** for this path.
+#[cfg(windows)]
+pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
+    warn_inherited_acl_once();
+
+    if let Some(parent) = path.parent() {
+        std::fs::DirBuilder::new().recursive(true).create(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Say once per process that the mode bits this module is named for are not
+/// being applied.
+///
+/// **Once, and on stderr.** Once because this is a property of the platform
+/// rather than of the file, and one line per log write would be noise an
+/// operator learns to scroll past. On stderr via `diag::emit` because on
+/// Windows the only transport is stdio-only MCP (§3.3) and **stdout is the
+/// JSON-RPC wire** — a warning written there is a protocol violation, not a
+/// diagnostic.
+/// `pub(crate)` so `config::untrusted_reason` raises the same one. Two
+/// warnings about one platform fact is two chances to ignore it.
+#[cfg(windows)]
+pub(crate) fn warn_inherited_acl_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::diag::emit(
+            "no supported permission model on this platform: Holdfast's runtime \
+             directory, logs and config.toml are used with the ACL they inherit \
+             from their parent. The 0700/0600 modes it enforces on Unix are not \
+             applied, and the config trust check (owner and mode) does not run — \
+             config.toml is read whoever owns it. Inside a normal user profile \
+             the inherited ACL is owner + SYSTEM + Administrators, which is \
+             usually what you want; on a redirected profile, a shared volume, or \
+             a HOLDFAST_RUNTIME_DIR or XDG_CONFIG_HOME pointed somewhere else, it \
+             may not be. Set the ACL yourself if that matters.",
+        );
+    });
+}
+
 /// Forces the process umask for the lifetime of the guard.
 ///
 /// A mode test without this measures the developer's shell rather than
@@ -287,10 +348,10 @@ pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
 /// is deliberately the loosest value anything here asserts against:
 /// `022` can clear no bit of `0600` or `0700`, so a concurrent test
 /// creating a file with an explicit mode is unaffected either way.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct ForcedUmask(libc::mode_t);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl ForcedUmask {
     pub(crate) fn loose() -> Self {
         // SAFETY: `umask` cannot fail; it returns the previous mask.
@@ -298,7 +359,7 @@ impl ForcedUmask {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for ForcedUmask {
     fn drop(&mut self) {
         // SAFETY: as above, restoring what we replaced.
@@ -689,6 +750,7 @@ enum Writable {
 ///
 /// `DIR_MODE` is umask-proof by construction: `0700` has no group or other
 /// bits for a umask to clear, so the assertion holds under any of them.
+#[cfg(unix)]
 fn create_owner_only(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
@@ -697,9 +759,23 @@ fn create_owner_only(dir: &Path) -> io::Result<()> {
         .create(dir)
 }
 
-fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+/// The Windows arm: created with the inherited ACL, and named the same on
+/// purpose so every caller reads identically. It is **not** owner-only by
+/// construction here — see `open_log_append`'s Windows arm for why that is
+/// warned about rather than refused.
+#[cfg(windows)]
+fn create_owner_only(dir: &Path) -> io::Result<()> {
+    warn_inherited_acl_once();
+    std::fs::DirBuilder::new().recursive(true).create(dir)
+}
 
+fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
+    // **The symlink refusal below is cross-platform and stays that way.**
+    // It is the half of this function that does not depend on mode bits:
+    // `symlink_metadata` does not follow a link on either platform, and a
+    // planted `logs -> /elsewhere` redirects the §9.4 audit trail just as
+    // effectively on Windows. Only the mode inspection and the tighten are
+    // Unix-gated, at the bottom.
     // `symlink_metadata`, not `exists()` and `metadata`: both of those
     // follow a link, and every decision below acts on what they report.
     // A planted `logs -> /elsewhere` would be chmodded at its *target*
@@ -730,31 +806,44 @@ fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
     // link swapped in after this check is not caught. Closing that needs
     // `openat(O_DIRECTORY|O_NOFOLLOW)` plus `fchmod`, which is worth
     // doing and is not this change.
-    let mode = md.permissions().mode() & 0o777;
-    if writable == Writable::Refuse && mode & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{d} is mode {mode:o}: group/world-writable, so another local user may \
-                 already have planted entries inside it. Refusing rather than tightening \
-                 — a chmod does not undo what is already there. Check what is inside it, \
-                 then `chmod 700 {d}`; or set {RUNTIME_DIR_ENV} to run this instance from \
-                 a directory somewhere else.",
-                d = dir.display()
-            ),
-        ));
+    #[cfg(windows)]
+    {
+        // No mode to inspect and none to tighten to, so both decisions
+        // below are unreachable here. `writable` is consumed so `-D
+        // warnings` does not flag it, and the fact that its refusal has no
+        // analogue on this platform is exactly what the warning says.
+        let _ = writable;
+        warn_inherited_acl_once();
     }
-    if mode != DIR_MODE {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DIR_MODE))?;
-        let after = std::fs::metadata(dir)?.permissions().mode() & 0o777;
-        if after != DIR_MODE {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = md.permissions().mode() & 0o777;
+        if writable == Writable::Refuse && mode & 0o022 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "{} is mode {after:o}, and could not be tightened to {DIR_MODE:o}",
-                    dir.display()
+                    "{d} is mode {mode:o}: group/world-writable, so another local user may \
+                     already have planted entries inside it. Refusing rather than tightening \
+                     — a chmod does not undo what is already there. Check what is inside it, \
+                     then `chmod 700 {d}`; or set {RUNTIME_DIR_ENV} to run this instance from \
+                     a directory somewhere else.",
+                    d = dir.display()
                 ),
             ));
+        }
+        if mode != DIR_MODE {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DIR_MODE))?;
+            let after = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+            if after != DIR_MODE {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} is mode {after:o}, and could not be tightened to {DIR_MODE:o}",
+                        dir.display()
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -769,7 +858,14 @@ fn log_dir_or_err(log_dir: PathBuf, home: &io::Result<PathBuf>) -> io::Result<Pa
     }
 }
 
-#[cfg(test)]
+// **The whole module, not the failing rows.** Every test here asserts a mode
+// bit — `DirBuilder::mode`, `Permissions::from_mode`, the umask forced below
+// — because that is what this module does. Gating them row by row would leave
+// a handful that pass for want of anything to check, which reads as coverage
+// and is not. `RuntimePaths`'s pure path arithmetic is worth testing on
+// Windows and is not tested here today; splitting it out is a follow-up, not
+// something to fake with a `#[cfg]` (#19).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

@@ -78,17 +78,20 @@ jobs:
     # the platform rather than by its own timeout, with a less legible
     # message. Ten minutes of headroom makes the timeout ours.
     timeout-minutes: 350
-    # CALIBRATION ONLY -- REMOVE THIS KEY OR DELETE THE FILE BY 2026-09-09.
+    # **The calibration exemption is spent.** This job carried
+    # `continue-on-error: true` under a `CALIBRATION-EXEMPT-UNTIL: 2026-09-09`
+    # marker, which `ci-hygiene.sh` honours with a strict `<` — so the last
+    # exempt day was 2026-09-08 and the ban would have started firing on the
+    # 9th, turning `hygiene` red on every push and pull request. It is removed
+    # here rather than on the deadline, because `hygiene` is about to become a
+    # required status check and a dated fuse under a required check is a dated
+    # merge freeze.
     #
-    # ci-hygiene.sh bans continue-on-error everywhere, and this is the one
-    # exemption. It is narrow and SELF-EXPIRING rather than a hole in the
-    # rule: hygiene skips this file only while the dated marker below is in
-    # the future. After 2026-09-09 the file is checked like every other, so
-    # a forgotten continue-on-error turns the hygiene job red without
-    # anyone having to remember. "Leave it as-is" is not on the list.
-    #
-    # CALIBRATION-EXEMPT-UNTIL: 2026-09-09
-    continue-on-error: true
+    # The consequence is deliberate and is the point of the exemption expiring:
+    # a sweep that finds a surviving mutant is now a RED job rather than a
+    # green one with the finding buried in an artifact. That is the correct
+    # signal — a survivor is a test that cannot fail, which is this project's
+    # defining defect class.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
