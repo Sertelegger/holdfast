@@ -26,6 +26,21 @@ use holdfast_core::diag;
 use std::process::ExitCode;
 use std::time::Duration;
 
+/// **What the usage banner has to say on a platform that refuses most of
+/// it.** Eight of the ten subcommands above are daemon-backed and every
+/// Windows build answers them with a refusal (§3.6), which the operator
+/// currently discovers one subcommand at a time. Empty on Unix, so the
+/// banner there is unchanged byte for byte.
+#[cfg(windows)]
+const PLATFORM_NOTE: &str = "\
+\nON WINDOWS NATIVE only `mcp` and `version` do anything: there is no daemon
+(§3.6), so `daemon *`, `list`, `logs`, `attach` and `watch` refuse. Sessions
+live inside `holdfast mcp` and end with it. Use WSL for a daemon that
+outlives the client.\n";
+
+#[cfg(not(windows))]
+const PLATFORM_NOTE: &str = "";
+
 const USAGE: &str = "\
 HOLDFAST — Human-Observable Long-lived Daemon For Agent Shell Terminals
 
@@ -74,7 +89,7 @@ FILES:
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 fn usage_error(msg: &str) -> ExitCode {
-    diag!("holdfast: {msg}\n\n{USAGE}");
+    diag!("holdfast: {msg}\n\n{USAGE}{PLATFORM_NOTE}");
     ExitCode::from(commands::EXIT_USAGE)
 }
 
@@ -145,7 +160,7 @@ async fn run() -> ExitCode {
         Some("version") => commands::version(),
         Some(other) => usage_error(&format!("unknown subcommand `{other}`")),
         None => {
-            diag!("{USAGE}");
+            diag!("{USAGE}{PLATFORM_NOTE}");
             ExitCode::from(commands::EXIT_USAGE)
         }
     }
