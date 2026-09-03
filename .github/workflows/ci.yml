@@ -293,16 +293,35 @@ jobs:
           }
           run_case daemon run
           run_case daemon start
-          run_case daemon stop
           run_case daemon status
           run_case list
           run_case logs some-session
 
+          # **`daemon stop` is deliberately NOT in that loop.** §3.2 makes it
+          # idempotent — stopping a daemon that is not running prints "no
+          # daemon running" and exits 0, pinned on Unix by
+          # `stopping_a_daemon_that_is_not_running_succeeds`. On Windows there
+          # is never a daemon, so that is the only case and the answer is the
+          # same. Asserting 64 here would pin the contradiction rather than
+          # catch it.
+          out="$("$BIN" daemon stop 2>&1)"; rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL  holdfast daemon stop exited $rc, want 0 (§3.2 idempotent)" >&2
+            echo "      output: $out" >&2
+            fails=$((fails + 1))
+          elif ! printf '%s' "$out" | grep -q 'no daemon running'; then
+            echo "FAIL  holdfast daemon stop exited 0 without the §3.2 message" >&2
+            echo "      output: $out" >&2
+            fails=$((fails + 1))
+          else
+            echo "ok    holdfast daemon stop -> 0, idempotent as §3.2 requires"
+          fi
+
           if [ "$fails" -ne 0 ]; then
-            echo "$fails Windows refusal arm(s) did not behave as #19 claims" >&2
+            echo "$fails Windows arm(s) did not behave as #19 claims" >&2
             exit 1
           fi
-          echo "all six refusal arms exit 64 and name the reason"
+          echo "five refusal arms exit 64 and name the reason; daemon stop exits 0"
 
   # --- the capability gate -------------------------------------------------
 

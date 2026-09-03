@@ -171,29 +171,40 @@ request runs:
 | `hygiene` | `scripts/ci-hygiene.sh` — asserts the workflows have not grown a publish step, a `continue-on-error`, a retry action, a `secrets.` reference, an unpinned action, a missing job timeout, or a checkout that leaves a pushable credential behind |
 | `fmt` | `cargo fmt --all --check` |
 | `clippy` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
-| `windows-cross` | The same clippy invocation against `x86_64-pc-windows-gnu`. A **cross-compilation check, not a test run** — it proves Holdfast still *compiles* for Windows; it is not evidence that it *works* there |
+| `windows-cross` | The same clippy invocation against `x86_64-pc-windows-gnu`, on a Linux runner. A **cross-compilation check, not a test run** — it proves Holdfast still *compiles* for Windows, against the GNU ABI, in about two minutes. It was red on `main` from before 0.0.6 until #19 |
+| `windows-native` | `windows-2022`. Native **MSVC** clippy over `--all-targets` (the ABI a Windows user actually installs, which `windows-cross` does not check), `tests/source_guards.rs`, and the six `#[cfg(windows)]` CLI arms executed: `daemon run\|start\|status`, `list` and `logs` must exit 64 and name the reason, `daemon stop` must exit 0 (§3.2 is idempotent). `--lib` is not run: 55 of its tests spawn a real shell — measured 721 passed / 55 failed natively — and gating those is 0.0.11's |
 | `probe` | `scripts/ci-probe.sh` — toolchain version, pseudoterminal allocation, and every shell and interpreter the suite spawns by name. Host-dependent rows of `tests/detection.rs` skip *and report as passing* when their program is absent, so this gate is part of what makes the test job's green mean something. The exact set is pinned by `scripts/ci-skip-census.sh` rather than counted here (GH #74) |
 | `test` | `scripts/ci-skip-census.sh --self-test` (the census's own gates, deleted one at a time against fixtures), then `cargo test --workspace --locked --no-fail-fast -- --test-threads=4 --show-output`, then `scripts/ci-skip-census.sh` over the captured log — which fails on any skipped row the pipeline has not agreed to, on any *assertion* gated off inside a row that ran without an agreed entry, **and on an agreed one of either kind that stopped happening** |
 | `package` | `cargo build --release --locked`, the MCP smoke script against the *release* binary, and a downloadable artifact + SHA-256. It `needs:` a green `test`, so the build that gets installed is the build that was tested |
 
-Scheduled: a nightly flake hunt (the suite 20× at 4× oversubscribed
-parallelism) and a weekly `cargo mutants` sweep.
+Scheduled: a **weekly** flake hunt (Sundays — the suite 100× at 4×
+oversubscribed parallelism) and a **monthly** `cargo mutants` sweep (the 1st).
+Both were cut back from nightly/weekly when the account's Actions quota ran
+out mid-month; `nightly.yml` keeps its name because REQ-TST-004's tier-4 work
+belongs there, not because it runs nightly.
 
-**No job here is blocking, and that is a platform limit rather than a
-choice.** Required status checks are configured only through branch
-protection rules or rulesets, and both are gated to public repositories on
-GitHub Free — so on a *private* repository under that plan no check can be
-made required at all. **This pipeline observes; it does not gate.** A red job
-does not stop a merge; someone has to look. That changes when the repository
-goes public, and no check should be made required before it has been
-observed red.
+**No job here is blocking yet, and that is now a choice rather than a
+platform limit.** Required status checks need branch protection or a ruleset,
+and both are gated to public repositories on GitHub Free — which this
+repository has been since 2026-09-01. So they are available; none is
+configured. **This pipeline still observes rather than gates**: a red job does
+not stop a merge, and someone has to look.
+
+Turning them on has one prerequisite and one rule. The prerequisite was
+`paths-ignore`: a workflow filtered out at the `on:` level posts no check at
+all, so any required check would have left every docs-only PR pending
+forever. That filter is gone. The rule is the CI plan's — **do not require a
+check until it has been observed red** — which is why `windows-cross` could
+not have been required before #19 and `windows-native` should not be until it
+has failed once.
 
 **Read the job, not the run.** `gh run list` reports the *run* conclusion, and
 a job carrying `continue-on-error` records `failure` while its run records
-`success`. That is measured here rather than hypothetical: the weekly
-mutation sweep carries a dated calibration exemption (`continue-on-error:
-true`, self-expiring 2026-09-09) and has already shown a **green** tick in
-`gh run list` for a sweep that tested zero mutants. Until that key is gone:
+`success`. That was measured here rather than hypothetical: the mutation
+sweep carried a dated calibration exemption and showed a **green** tick for a
+sweep that tested zero mutants. **That key is now gone** — a surviving mutant
+fails the job — so this is the general technique rather than a live
+workaround, and it still matters for reading any run whose jobs disagree:
 
 ```bash
 gh api repos/Sertelegger/holdfast/actions/runs/<id>/jobs \
@@ -214,8 +225,8 @@ case as unknown rather than exempt:
 
 ```bash
 gh workflow list                                # both scheduled workflows must read `active`
-gh run list --workflow nightly.yml --limit 5    # newest run younger than a day?
-gh run list --workflow mutants.yml --limit 5    # younger than a week?
+gh run list --workflow nightly.yml --limit 5    # newest run younger than a week?
+gh run list --workflow mutants.yml --limit 5    # younger than a month?
 gh workflow enable nightly.yml
 ```
 

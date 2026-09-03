@@ -20,7 +20,71 @@ trigger as a side effect of writing release notes.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **The Windows build compiles again ([#19]).** `windows-cross` — the
+  `x86_64-pc-windows-gnu` clippy job — had been red on `main` since before
+  0.0.6, with 0 passes in its last 20 runs, while `ROADMAP.md` said the tree
+  was "kept compiling and clippy-clean" for that target. The 31 errors were all
+  in the daemon subsystem, which §3.3/§3.6 already say does not exist on
+  Windows, so the fix is compile-gating rather than porting.
+- **`holdfast mcp` on Windows writes its audit trail again.** Runtime and
+  config discovery read `HOME` and the `XDG_*` variables only, and a native
+  Windows process has neither. `RuntimePaths::discover()` therefore failed,
+  `serve_stdio` swallowed the error, and the §9.4 trail was silently absent.
+  `USERPROFILE` is now the Windows fallback; `HOME` still wins where it is set,
+  so an MSYS2 or Git Bash user keeps the instance they already had.
+
+### Changed
+
+- **On Windows native, `daemon run|start|status`, `list` and `logs` now refuse
+  with exit 64** and a message naming §3.6, joining `attach` and `watch` which
+  already did. `daemon stop` exits **0** with "no daemon running", because §3.2
+  makes it idempotent and on this platform that is the only case. `holdfast
+  mcp` does not refuse: stdio-only is the Windows transport, so it serves
+  in-process and says once that hybrid mode is unavailable and sessions end
+  with the process.
+- **Holdfast now warns rather than refuses about Windows file permissions.**
+  There are no mode bits to apply, so the runtime directory, logs and
+  `config.toml` are used with the ACL they inherit — owner, `SYSTEM` and
+  `Administrators` inside a normal user profile. One stderr warning per process
+  says so, and says that the config trust check (owner and mode) does not run.
+  An ACL-shaped answer is still owed.
+- **CI no longer skips itself on documentation-only changes.** `paths-ignore`
+  is removed from both of `ci.yml`'s triggers: a workflow filtered out at the
+  `on:` level posts no check run at all, so any *required* status check on it
+  would leave every docs-only pull request pending forever. Standard runners
+  are free on public repositories, so the filter bought nothing.
+- **A surviving mutant now fails the mutation sweep.** Its dated
+  `continue-on-error` calibration exemption is retired.
+
+### Added
+
+- **A `windows-2022` CI job.** Native MSVC clippy over `--all-targets`,
+  `tests/source_guards.rs`, and the `#[cfg(windows)]` CLI arms *executed* — the
+  first job in this repository that runs Holdfast's own code on Windows.
+  `--lib` is not run yet: 55 of its tests spawn a real shell (measured natively
+  at 721 passed / 55 failed, in three modules), and gating those is 0.0.11's.
+
+### Security
+
+- `ci-hygiene.sh`'s dated calibration exemption was granted to any workflow
+  merely *mentioning* the marker, because the grep was unanchored — so a file
+  that documented the marker in a comment silently exempted itself from every
+  rule in that script, including the bans on `continue-on-error`, unpinned
+  actions and `secrets.` references. The marker must now BE a comment line
+  rather than appear in one, matching the anchoring `RELEASE-WORKFLOW` already
+  carried, and the mechanism has self-test coverage in all three directions.
+
+### For library consumers
+
+- `daemon::{server, spawn, peer, attach_server}`, `protocol::client` (and its
+  `ClientError` / `ControlClient` re-exports) and `mcp::shim` are `#[cfg(unix)]`
+  from this release. `daemon::paths`, `protocol::{frame, handshake, method}`
+  and everything else stay cross-platform: the wire shape is a claim about the
+  protocol, not about Unix.
+
+[#19]: https://github.com/Sertelegger/holdfast/issues/19
 
 ## [0.0.7] — 2026-09-01
 

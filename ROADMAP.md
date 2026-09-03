@@ -140,19 +140,36 @@ is missing, which is why this is a design question rather than a detection one.
 signal semantics are genuinely different, not a port of `killpg`), and
 stdio-only mode where the hybrid daemon does not apply.
 
-**This does start from a red build, and the sentence here used to say
-otherwise.** `windows-cross` — the `x86_64-pc-windows-gnu` clippy job — has
-been red on `main` since before 0.0.6, with 0 passes in the last 20 runs
-([#19](https://github.com/Sertelegger/holdfast/issues/19)). The claim that the
-tree is "kept compiling and clippy-clean" for that target was false for two
-milestones, and it was the sentence a contributor would have read before
-starting. The 31 lib errors are all in the daemon subsystem —
-`daemon/{spawn,server,paths,peer,attach_server}.rs`, `protocol/client.rs`,
-`config.rs`'s mode-bit checks, and one unconditional reference to the already
-`cfg(unix)`-gated `attach::conn` — which is the subsystem this milestone says
-does not exist on Windows anyway. Getting that green is compile-gating rather
-than porting, needs no Windows machine, and is scheduled ahead of the rest as
-0.0.10a.
+**It no longer starts from a red build, and this paragraph has been wrong in
+both directions.** `windows-cross` — the `x86_64-pc-windows-gnu` clippy job —
+was red on `main` from before 0.0.6 with 0 passes in its last 20 runs, while
+this file claimed the tree was "kept compiling and clippy-clean" for that
+target. [#19](https://github.com/Sertelegger/holdfast/issues/19) fixed it: the
+31 errors were all in the daemon subsystem, which is the subsystem this
+milestone already says does not exist on Windows, so compile-gating it behind
+`#[cfg(unix)]` was the whole of the work. The tree now cross-compiles
+clippy-clean, a `windows-2022` job runs native MSVC clippy and executes the
+CLI's Windows arms, and `holdfast mcp` serves stdio in-process there with an
+audit trail.
+
+**What is actually left**, then, is the part that needs a Windows machine and
+a port rather than a `#[cfg]`:
+
+- **ConPTY** in place of `/dev/ptmx`, behind the existing `PtyBackend` trait.
+- **Job objects** in place of process groups — `killpg`, `setsid` and
+  `tcgetpgrp` have no port, only replacements with different semantics.
+- **Console modes** (`GetConsoleMode`) in place of the termios `ECHO`/`ICANON`
+  rung that §8.3's Tier 2 detection reads, without which `AwaitingSecret` is
+  unreachable there.
+- **An ACL-shaped trust check.** Windows has no mode bits, so §9.4's `0700`
+  runtime directory and `0600` logs are currently the ACL they inherit and
+  Holdfast says so in a warning rather than enforcing anything. `config.rs`
+  asks for "an ACL-shaped answer, not a `#[cfg]` that returns trusted"; that
+  debt is still owed.
+- **The unit suite on Windows.** 55 of `holdfast-core`'s lib tests spawn a
+  real shell (measured natively: 721 passed, 55 failed, in three modules), so
+  the Windows job runs the source guards and the CLI arms rather than `--lib`.
+  Gating those fixtures buys 721 tests on the platform.
 
 ## Distribution
 

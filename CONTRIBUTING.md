@@ -59,11 +59,12 @@ cargo build --workspace && ./scripts/mcp-smoke.sh
 ```
 
 CI runs all four on every push and pull request (see
-[README.md](./README.md#continuous-integration)), but **it cannot block a
-merge**: required status checks need branch protection or a ruleset, and both
-are gated to public repositories on GitHub Free. Until this repository goes
-public, running these locally is still the actual gate and a red job is
-something a human has to notice.
+[README.md](./README.md#continuous-integration)), but **no check is required
+yet**, so a red job does not block a merge and someone has to notice. That is
+now a choice rather than a limit — required status checks need branch
+protection or a ruleset, both of which are available on a public repository
+under GitHub Free, and this one has been public since 2026-09-01. Until a
+check is actually marked required, running these locally is still the gate.
 
 `cargo test --workspace` was 890 tests at the `v0.0.5` tag: 669 unit (666 in
 `holdfast-core`'s lib, 3 in `holdfast`'s bin), 23 in `tests/detection.rs`, 71 in

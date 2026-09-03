@@ -326,13 +326,19 @@ fn untrusted_reason(meta: &std::fs::Metadata) -> Option<String> {
 ///   `0775` `~/.holdfast/logs` and had to take back. World-writable has no
 ///   such benign origin — it wants `umask 000` or a deliberate `chmod` —
 ///   and it means any local user can rewrite the file.
-// **Unused on Windows, and kept compiled and tested there anyway.** Only the
-// Unix `untrusted_reason` calls it — the Windows arm has no uid or mode to
-// pass — so `dead_code` fires on that target alone. It stays because it is a
-// pure function of four scalars whose tests *are* the specification of the
-// trust rule: `#[cfg(unix)]`-ing it would take the rule's definition off
-// Windows, not just its application, and 0.0.11's ACL answer has to be
+// **Unused on Windows, and kept COMPILED there anyway — not tested there.**
+// Only the Unix `untrusted_reason` calls it (the Windows arm has no uid or
+// mode to pass), so `dead_code` fires on that target alone. It stays because
+// it is a pure function of four scalars whose tests *are* the specification
+// of the trust rule: `#[cfg(unix)]`-ing it would take the rule's definition
+// off Windows, not just its application, and 0.0.11's ACL answer has to be
 // written against that definition.
+//
+// An earlier revision of this comment said "compiled and tested there", which
+// was false and is the kind of false this project cares about: its tests live
+// in a `#[cfg(test)]` module that the `windows-native` job does not run —
+// that job runs `source_guards` and the CLI arms, not `--lib`. On Windows
+// this function is type-checked and nothing more.
 #[cfg_attr(windows, allow(dead_code))]
 fn trust_verdict(is_file: bool, uid: u32, mode: u32, euid: u32) -> Option<String> {
     if !is_file {

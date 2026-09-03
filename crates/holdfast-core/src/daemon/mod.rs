@@ -18,12 +18,19 @@
 // module on Windows (#19).** The other four are the daemon proper — Unix
 // sockets, `flock`, `setsid`, `SO_PEERCRED` — and have no meaning without
 // one. `paths` holds `RuntimePaths`, which answers "where does this
-// instance keep its logs", and `audit`, `diag`, `config` and `mcp` all
-// read it on every transport including stdio-only. Gating it would take
-// the audit trail and the diagnostic log off Windows to make a
-// cross-compile check go green, which is a green gate that checks
-// nothing — strictly worse than the red one it replaced. Its own
-// mode-bit internals carry the `#[cfg(unix)]`, not the module.
+// instance keep its logs". TWO modules import it outside their own tests,
+// and they are the ones that matter: `audit` takes `open_log_append` for
+// the §9.4 trail, and `mcp::serve_stdio` calls `RuntimePaths::discover()`
+// on EVERY transport, stdio-only included. Gating the module would take
+// the audit trail off Windows to make a cross-compile check go green,
+// which is a green gate that checks nothing, strictly worse than the red
+// one it replaced. Its own mode-bit internals carry the `#[cfg(unix)]`,
+// not the module.
+//
+// (An earlier revision listed four consumers. `diag` uses it only in its
+// tests, and `config`'s dependency is the Windows warning helper added in
+// this same change — citing either would be citing this commit back at
+// itself as evidence for itself.)
 #[cfg(unix)]
 pub mod attach_server;
 pub mod paths;

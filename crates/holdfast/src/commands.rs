@@ -1833,10 +1833,30 @@ pub fn daemon_start() -> ExitCode {
     unsupported("daemon start")
 }
 
-/// §3.6: there is no daemon to stop on Windows native.
+/// **`stop` is the one that succeeds, and it is not an inconsistency.**
+///
+/// §3.2 makes `daemon stop` idempotent: stopping a daemon that is not running
+/// prints "no daemon running" and exits 0, pinned on Unix by
+/// `stopping_a_daemon_that_is_not_running_succeeds`. On Windows native there
+/// is never a daemon, so that is not an edge case here — it is the only case,
+/// and the truthful answer to "stop the daemon" is that there is none and
+/// nothing needs doing. Returning `EXIT_USAGE` would make this the single
+/// subcommand whose Windows behaviour contradicts its own documented
+/// contract, and would break a caller that reasonably treats `daemon stop` as
+/// safe to run unconditionally in a teardown script.
+///
+/// The platform note still goes to stderr, so an operator who expected a
+/// daemon learns there is none; the answer on stdout is the same sentence
+/// Unix prints, because it is equally true.
 #[cfg(windows)]
 pub async fn daemon_stop(_force: bool) -> ExitCode {
-    unsupported("daemon stop")
+    diag!(
+        "holdfast daemon stop: there is no daemon on Windows native (§3.6). \
+         Sessions live inside `holdfast mcp` and end with it. Use WSL for a \
+         daemon that outlives the client."
+    );
+    println!("no daemon running");
+    ExitCode::SUCCESS
 }
 
 /// §3.6: there is no daemon to report on Windows native.

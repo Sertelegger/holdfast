@@ -32,7 +32,7 @@
 //!   ill-typed value must come back `bad_params`, where a renamed field
 //!   is an unknown key and is dropped in silence.
 
-// Unix-only, like `attach_cli.rs` above it. Everything below drives a real
+// Unix-only, like `crates/holdfast/tests/attach_cli.rs`. Everything below drives a real
 // daemon over a Unix socket, and §3.3/§3.6 give Windows native neither —
 // `holdfast-core`'s `daemon` module is `#[cfg(unix)]` from #19 on, so these
 // targets have nothing to link against there rather than nothing to say.
