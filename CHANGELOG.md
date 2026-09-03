@@ -63,13 +63,26 @@ trigger as a side effect of writing release notes.
 
 ### Changed
 
-- **On Windows native, `daemon run|start|status`, `list` and `logs` now refuse
-  with exit 64** and a message naming §3.6, joining `attach` and `watch` which
-  already did. `daemon stop` exits **0** with "no daemon running", because §3.2
-  makes it idempotent and on this platform that is the only case. `holdfast
-  mcp` does not refuse: stdio-only is the Windows transport, so it serves
-  in-process and says once that hybrid mode is unavailable and sessions end
-  with the process.
+- **On Windows native, seven subcommands now refuse with exit 64** and a
+  message naming §3.6: `daemon run`, `daemon start`, `daemon status`, `list`,
+  `logs`, `attach` and `watch`. All seven share one message, emitted from a
+  single line — `attach` and `watch` previously carried hand-rolled copies, so
+  rewording either changed a user-visible string with nothing to catch it.
+  `list` and `logs` additionally name the MCP tool that *does* answer them here
+  (`list_sessions`, `read_output`) rather than sending everyone to WSL; that
+  knowledge was in the source and stopped there.
+
+  `daemon stop` exits **0** with "no daemon running", because §3.2 makes it
+  idempotent and on this platform that is the only case — a teardown script may
+  run it unconditionally. `daemon status --json` still prints a JSON object
+  (`{"running": false, "supported": false, "reason": …}`) before exiting 64:
+  `--json` is a promise to a program, and empty stdout gave a caller no way to
+  tell "no daemon here, ever" from "the command is broken". `running: false` is
+  the same key the Unix down-path emits, so a consumer needs no Windows arm.
+
+  `holdfast mcp` does not refuse: stdio-only is the Windows transport, so it
+  serves in-process and says once that hybrid mode is unavailable and sessions
+  end with the process.
 - **Holdfast now warns rather than refuses about Windows file permissions.**
   There are no mode bits to apply, so the runtime directory, logs and
   `config.toml` are used with the ACL they inherit — owner, `SYSTEM` and
