@@ -505,6 +505,27 @@ jobs:
           # The trail, found rather than assumed: `RuntimePaths` puts it at
           # `<home>/.holdfast/logs/audit.log`, and searching for it by name
           # keeps this step honest if that layout is ever revised.
+          #
+          # **Existence is the assertion. Emptiness is NOT a failure, and this
+          # project has already paid once for thinking otherwise.** A bare
+          # `initialize` has nothing to audit: `serve_stdio` resolves the path
+          # and opens the log, and entries arrive when something auditable
+          # happens. `mcp/mod.rs` records the precedent directly — a 0-byte
+          # `audit.log` "was once read as a missing audit trail and filed as a
+          # security finding (GH #63)". Asserting non-empty here would
+          # re-litigate that, and the first run of this step did exactly that
+          # before this comment existed.
+          #
+          # What the file's PRESENCE proves is the part that was untested: that
+          # `home_dir()` fell through to `%USERPROFILE%` with `HOME` unset, and
+          # that `open_log_append` created the parent directories under the
+          # path we handed it. If resolution had gone anywhere else — the real
+          # profile, a temp dir, or nowhere — nothing would appear under
+          # `$scratch` and this fails.
+          #
+          # Proving a WRITE needs an auditable action, and the actions that
+          # audit need a PTY, which is unported on Windows until 0.0.11. That
+          # is the residual, stated rather than papered over.
           log="$(find "$scratch" -name audit.log -type f 2>/dev/null | head -1)"
           if [ -z "$log" ]; then
             echo "FAIL  no audit.log anywhere under the USERPROFILE we passed" >&2
@@ -512,11 +533,7 @@ jobs:
             find "$scratch" >&2 || true
             exit 1
           fi
-          if [ ! -s "$log" ]; then
-            echo "FAIL  $log exists but is empty — the trail is a file, not a record" >&2
-            exit 1
-          fi
-          echo "ok    audit trail at ${log#"$scratch"/} ($(wc -c <"$log" | tr -d ' ') bytes)"
+          echo "ok    audit trail opened at ${log#"$scratch"/} ($(wc -c <"$log" | tr -d ' ') bytes; 0 is correct for a bare initialize)"
 
   # --- the capability gate -------------------------------------------------
 
