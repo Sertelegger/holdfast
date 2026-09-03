@@ -43,9 +43,12 @@ claude mcp add --scope user holdfast -- "$(pwd)/target/debug/holdfast" mcp
 **hybrid mode**: it auto-spawns a background `holdfast daemon` that owns the
 sessions, so they outlive the MCP client that started them. `holdfast daemon
 run|start|stop [--force]|status [--json]`, `holdfast list [--json]`, `holdfast logs
-<session> [--tail N] [--raw]`, and `holdfast version` are all live subcommands.
-`holdfast attach`, `watch`, `ui`, `confirm`, and the dangerous-command preflight
-are later milestones — see [ROADMAP.md](./ROADMAP.md).
+<session> [--tail N] [--raw]`, `holdfast attach <session>`, `holdfast watch
+<session>`, and `holdfast version` are all live subcommands: **`attach` and
+`watch` shipped in 0.0.6**, which this paragraph listed as later milestones
+until it was checked against the CHANGELOG. `holdfast ui`, `holdfast confirm`
+and the dangerous-command preflight still are — see
+[ROADMAP.md](./ROADMAP.md).
 
 ## The checks
 
@@ -63,7 +66,10 @@ CI runs all four on every push and pull request (see
 yet**, so a red job does not block a merge and someone has to notice. That is
 now a choice rather than a limit — required status checks need branch
 protection or a ruleset, both of which are available on a public repository
-under GitHub Free, and this one has been public since 2026-09-01. Until a
+under GitHub Free, and this one has been public since **2026-09-02** — the
+repository object's own `created_at`, since going public was done by deleting
+and recreating the repository. This read 2026-09-01, which is the `v0.0.7`
+tag's date and therefore predates the object that holds the tag. Until a
 check is actually marked required, running these locally is still the gate.
 
 `cargo test --workspace` was 890 tests at the `v0.0.5` tag: 669 unit (666 in
@@ -107,8 +113,18 @@ this file's testing section generalises.
 
 Clippy is also expected to be clean cross-compiled to Windows
 (`cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings`)
-if you touch anything platform-gated. Windows is not supported at runtime, but
-the tree is kept compiling for it.
+if you touch anything platform-gated — and CI now checks the **other** ABI
+natively as well, on a `windows-2022` runner, so an arm that cross-compiles
+clean for the GNU target can still fail the MSVC job.
+
+"Windows is not supported at runtime", which this paragraph said, is no longer
+the right shape. `holdfast mcp` serves MCP over stdio in-process there and
+writes its audit trail, `version` works, and the daemon-backed subcommands
+refuse by name because §3.6 gives that platform no daemon rather than because
+nothing works. What is genuinely unsupported is anything needing a shell or a
+PTY, which is why the Windows job runs the source guards, the `#[cfg(windows)]`
+CLI arms and a *filtered* `--lib` rather than the suite. The README's
+platform-support table is the current account of what is verified there.
 
 ## Testing standards
 

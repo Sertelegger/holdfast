@@ -25,9 +25,27 @@ trigger as a side effect of writing release notes.
 - **The Windows build compiles again ([#19]).** `windows-cross` — the
   `x86_64-pc-windows-gnu` clippy job — had been red on `main` since before
   0.0.6, with 0 passes in its last 20 runs, while `ROADMAP.md` said the tree
-  was "kept compiling and clippy-clean" for that target. The 31 errors were all
-  in the daemon subsystem, which §3.3/§3.6 already say does not exist on
-  Windows, so the fix is compile-gating rather than porting.
+  was "kept compiling and clippy-clean" for that target. **27 of the 31
+  errors were in the daemon subsystem** — `daemon/spawn.rs` 10,
+  `daemon/server.rs` 7, `daemon/peer.rs` 5, `daemon/paths.rs` 3,
+  `daemon/attach_server.rs` 2 — which §3.3/§3.6 already say does not exist on
+  Windows. **The other four are not**: `config.rs` reaches for `std::os::unix`
+  twice and for `libc::O_NONBLOCK` once, in the mode-bit trust check, and
+  `protocol/client.rs` imports `tokio::net::UnixStream`. They are the same
+  `#[cfg]` class, so the fix is still compile-gating rather than porting — but
+  this entry claimed the 31 were *all* in the daemon subsystem, and that
+  universal is precisely what licenses the conclusion, so it is recorded as
+  the overstatement it was rather than quietly narrowed. The attribution was
+  re-measured at `origin/main` on 2026-09-03: `cargo clippy --lib -p
+  holdfast-core --target x86_64-pc-windows-gnu --message-format json` emits 31
+  `"level":"error"` messages, counted by the file of each one's primary span.
+  The "0 passes in its last 20 runs" figure is **not** re-checkable here: it
+  was read off the *previous* repository object's Actions history, and going
+  public by recreation did not carry that history over — `gh run list` in this
+  repository begins on 2026-09-02 and reports 12 runs in total as of
+  2026-09-03, none of them on `main`. The figure stays on the record as what
+  was measured; the JSON error counts above are the part a reader can
+  reproduce.
 - **`holdfast mcp` on Windows writes its audit trail again.** Runtime and
   config discovery read `HOME` and the `XDG_*` variables only, and a native
   Windows process has neither. `RuntimePaths::discover()` therefore failed,
@@ -61,10 +79,14 @@ trigger as a side effect of writing release notes.
 ### Added
 
 - **A `windows-2022` CI job.** Native MSVC clippy over `--all-targets`,
-  `tests/source_guards.rs`, and the `#[cfg(windows)]` CLI arms *executed* — the
-  first job in this repository that runs Holdfast's own code on Windows.
-  `--lib` is not run yet: 55 of its tests spawn a real shell (measured natively
-  at 721 passed / 55 failed, in three modules), and gating those is 0.0.11's.
+  `tests/source_guards.rs`, the `#[cfg(windows)]` CLI arms *executed*, and a
+  **filtered `--lib`** naming the modules whose Windows arm differs from its
+  Unix one — the first job in this repository that runs Holdfast's own code on
+  Windows. That filter is not a convenience: it is the only gate anywhere that
+  kills the `.append(true)` → `.truncate(true)` mutation, which would zero the
+  §9.4 audit trail on every start. The **full** `--lib` is still not run: 55
+  of its tests spawn a real shell (measured natively at 721 passed / 55
+  failed, in three modules), and gating those is 0.0.11's.
 
 ### Security
 
@@ -85,8 +107,13 @@ trigger as a side effect of writing release notes.
   protocol, not about Unix.
 - **This is not a removal, and calling it one would overstate it.** Nothing
   changes on Unix. On Windows `holdfast-core` did not compile at all before
-  this release — 32 errors — so there was no cross-compiling build for a
-  consumer to lose; that target goes from having no API to having this one.
+  this release — 31 errors, the same 31 the [#19] entry above attributes — so
+  there was no cross-compiling build for a consumer to lose; that target goes
+  from having no API to having this one. **This line read 32**, disagreeing
+  with that entry sixty lines up about a single measurement:
+  `2>&1 | grep -cE '^error'` counts cargo's own trailing summary line —
+  "could not compile ... due to 31 previous errors" — as a 32nd error. Count
+  the JSON messages, or read the number the summary line itself gives.
 
 [#19]: https://github.com/Sertelegger/holdfast/issues/19
 
@@ -960,7 +987,13 @@ Stated because they are easy to mistake for bugs:
   or type into a session the agent is driving.
 - **Unix only.** The tree is kept compiling and clippy-clean for
   `x86_64-pc-windows-gnu`, but signalling returns an error there and there is no
-  process-group handling.
+  process-group handling. *(Corrected by GH #19, and left standing rather than
+  edited: `windows-cross` was red on `main` from before 0.0.6, so "kept
+  compiling and clippy-clean" had stopped being true by then and cannot now be
+  dated further back — this repository's Actions history starts at its
+  recreation on 2026-09-02. The wrong claim is the point: it was asserted here,
+  in `ROADMAP.md` and in `CONTRIBUTING.md` for two milestones while a job that
+  would have caught it was red and unread.)*
 - **Eleven tools.** No `precheck_command`, `request_secret_input`, `send_file`,
   `fetch_file` or `wait_for_any` yet.
 - **`get_command_history`'s `command` field is best-effort**, reconstructed from

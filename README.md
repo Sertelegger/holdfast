@@ -7,14 +7,16 @@ The **Human-Observable** in that name is a shipped property from 0.0.6:
 over — a live session from any terminal. The web UI is still to come; see
 [ROADMAP.md](./ROADMAP.md).
 
-> **Status: milestone 0.0.7 — early development.** Twelve tools, hybrid
-> mode on Linux/macOS/WSL, Unix only. Sessions live in a background
+> **Status: `v0.0.7` is the newest tag — early development.** Twelve
+> tools, hybrid mode on Linux/macOS/WSL. Sessions live in a background
 > daemon and survive the MCP client, so a Claude Code restart no longer
-> takes them with it. Output is ANSI-stripped and secret-redacted by
+> takes them with it. On Windows there is no daemon: `holdfast mcp`
+> serves stdio in-process and sessions end with it — see the
+> platform-support table below for what is verified there. Output is ANSI-stripped and secret-redacted by
 > default. Not yet suitable for real use; see [ROADMAP.md](./ROADMAP.md)
 > for what is and is not there.
 
-## What works today (0.0.6)
+## What works today (`v0.0.7`)
 
 - `start_session` — spawn a shell or program on a real PTY
 - `send_input` — type into it
@@ -172,22 +174,34 @@ request runs:
 | `fmt` | `cargo fmt --all --check` |
 | `clippy` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | `windows-cross` | The same clippy invocation against `x86_64-pc-windows-gnu`, on a Linux runner. A **cross-compilation check, not a test run** — it proves Holdfast still *compiles* for Windows, against the GNU ABI, in about two minutes. It was red on `main` from before 0.0.6 until #19 |
-| `windows-native` | `windows-2022`. Native **MSVC** clippy over `--all-targets` (the ABI a Windows user actually installs, which `windows-cross` does not check), `tests/source_guards.rs`, and the six `#[cfg(windows)]` CLI arms executed: `daemon run\|start\|status`, `list` and `logs` must exit 64 and name the reason, `daemon stop` must exit 0 (§3.2 is idempotent). `--lib` is not run: 55 of its tests spawn a real shell — measured 721 passed / 55 failed natively — and gating those is 0.0.11's |
+| `windows-native` | `windows-2022`. Native **MSVC** clippy over `--all-targets` (the ABI a Windows user actually installs, which `windows-cross` does not check), `tests/source_guards.rs`, a **filtered `--lib`**, and the `#[cfg(windows)]` CLI arms executed: the daemon-backed subcommands must exit 64 and name the reason, `daemon stop` must exit 0 (§3.2 is idempotent). The `--lib` filter names only the modules whose Windows arm differs from its Unix one, and it is load-bearing: it is the only gate anywhere that kills the `.append(true)` → `.truncate(true)` mutation, which would zero the §9.4 audit trail on every start. This row said "`--lib` is not run" — read that as the **full** `--lib`, which is not: 55 of its tests spawn a real shell — measured 721 passed / 55 failed natively — and gating those is 0.0.11's |
 | `probe` | `scripts/ci-probe.sh` — toolchain version, pseudoterminal allocation, and every shell and interpreter the suite spawns by name. Host-dependent rows of `tests/detection.rs` skip *and report as passing* when their program is absent, so this gate is part of what makes the test job's green mean something. The exact set is pinned by `scripts/ci-skip-census.sh` rather than counted here (GH #74) |
 | `test` | `scripts/ci-skip-census.sh --self-test` (the census's own gates, deleted one at a time against fixtures), then `cargo test --workspace --locked --no-fail-fast -- --test-threads=4 --show-output`, then `scripts/ci-skip-census.sh` over the captured log — which fails on any skipped row the pipeline has not agreed to, on any *assertion* gated off inside a row that ran without an agreed entry, **and on an agreed one of either kind that stopped happening** |
+| `fish-req-ts-008` | `ubuntu-24.04` with fish 4.x from `ppa:fish-shell/release-4`, running REQ-TS-008's three-arm row and nothing else — the measurement §4.5.1's decision to write unsolicited bytes into a child's stdin rests on, which had executed nowhere in this pipeline until 0.0.4. It gets its own job because installing fish in `test` takes `tests/detection.rs`'s fish row red for a defect that is not the pipeline's; the `detection` binary is never invoked here, so that row's agreed skip is untouched. Not gated on `probe` — fish is deliberately not among the shells the probe asserts |
 | `package` | `cargo build --release --locked`, the MCP smoke script against the *release* binary, and a downloadable artifact + SHA-256. It `needs:` a green `test`, so the build that gets installed is the build that was tested |
 
 Scheduled: a **weekly** flake hunt (Sundays — the suite 100× at 4×
 oversubscribed parallelism) and a **monthly** `cargo mutants` sweep (the 1st).
-Both were cut back from nightly/weekly when the account's Actions quota ran
-out mid-month; `nightly.yml` keeps its name because REQ-TST-004's tier-4 work
+Both were cut back from nightly/weekly while this repository was private, when
+the account's 2000-minute Actions free tier ran out mid-month — **and that is
+no longer the reason.** Standard runners on a public repository do not draw on
+the free tier at all, which is the same fact that made `paths-ignore` pointless
+to keep. The reduced cadence stays as a deliberate choice resting on runtime
+rather than billing: `nightly.yml`'s own measurement puts the 100-iteration
+hunt at ~54 min against its `timeout-minutes: 180`, where the cadence it
+replaced reached the cap, and the sample count given up is recorded there as a
+knowing trade. `nightly.yml` keeps its name because REQ-TST-004's tier-4 work
 belongs there, not because it runs nightly.
 
 **No job here is blocking yet, and that is now a choice rather than a
 platform limit.** Required status checks need branch protection or a ruleset,
 and both are gated to public repositories on GitHub Free — which this
-repository has been since 2026-09-01. So they are available; none is
-configured. **This pipeline still observes rather than gates**: a red job does
+repository has been since **2026-09-02**. So they are available; none is
+configured. (That date read 2026-09-01, which is the `v0.0.7` tag's date and
+not this repository's: going public was done by deleting and recreating the
+repository, so the object's own `created_at` — `2026-09-02T07:06:34Z`, matching
+its `PublicEvent`, and *after* the tag it now holds — is the event.
+`gh api repos/Sertelegger/holdfast --jq .created_at` is the check.) **This pipeline still observes rather than gates**: a red job does
 not stop a merge, and someone has to look.
 
 Turning them on has one prerequisite and one rule. The prerequisite was
@@ -256,7 +270,7 @@ its `--test-threads=192` banner suggests.
 | Platform | Verified by |
 |---|---|
 | Linux x86_64 | **CI** — the full suite on every push and pull request |
-| Windows x86_64 | **Cross-compilation check only** — `cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu`. Nothing executes. There is no Windows runner and no Windows test job, so runtime behaviour on Windows is unverified. Milestone 0.0.11 |
+| Windows x86_64 | **CI on two jobs, one of them a real runner** — this row read "Nothing executes. There is no Windows runner and no Windows test job" while the CI table above it listed `windows-native` on `windows-2022`, so the same file contradicted itself. `windows-cross` cross-compiles for the GNU ABI on Linux; `windows-native` runs natively: MSVC clippy over `--all-targets`, `tests/source_guards.rs`, a filtered `--lib` over the modules whose Windows arm differs from its Unix one, and the `#[cfg(windows)]` CLI arms *executed* — exit-64 refusals with their reasons for the daemon-backed subcommands, and `daemon stop`'s idempotent 0. What Windows does at run time: `holdfast mcp` serves MCP over stdio in-process and writes the §9.4 audit trail (there is no daemon, so sessions end with the process), and `version` works. What is **still** unverified there is everything that needs a shell or a PTY — the 55 shell-spawning lib tests and the four shell-spawning integration targets do not run on Windows, so session behaviour on the platform rests on no test. Milestone 0.0.11 |
 | macOS (x86_64 / aarch64) | **Owner-run local execution.** GitHub offers macOS runners; not using one is a deliberate decision rather than a constraint. The suite is run on the owner's machine before a release — a documented verification route, not an absent one |
 | WSL | Covered indirectly via Linux. GitHub-hosted runners offer no WSL image, so a dedicated runner is post-v0.1.0 |
 

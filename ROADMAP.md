@@ -17,14 +17,27 @@ still ahead.
 
 ## Where it is now
 
-Twelve MCP tools, Unix only, in **hybrid mode**: a background `holdfast daemon`
+Twelve MCP tools in **hybrid mode on Unix**: a background `holdfast daemon`
 owns the sessions and a `holdfast mcp` shim proxies to it over a Unix socket, so
 sessions outlive the MCP client rather than dying with it. Output is
 ANSI-stripped and **secret-redacted by default**, with `--raw` and
 `read_output(redact: false)` as audited opt-outs. Detection is real — sessions
-report `interaction_mode` with the `detection_tier` that produced it. Windows
-is not there yet, and neither is the web UI or the dangerous-command
-preflight. **`attach` shipped in 0.0.6** and this line said otherwise until
+report `interaction_mode` with the `detection_tier` that produced it. Neither
+the web UI nor the dangerous-command preflight exists on any platform yet.
+
+**On Windows the MCP server now starts, and that is close to the whole of it.**
+This paragraph read "Unix only" while the Windows section below said `holdfast
+mcp` serves stdio in-process there with an audit trail, so the file
+contradicted itself about one platform. What is true as of the #19 work:
+`holdfast mcp` serves MCP over stdio in-process and writes the §9.4 audit
+trail, and `version` works. There is no daemon, so sessions end with the
+process and the daemon-backed subcommands refuse by name rather than
+half-working — `daemon stop` excepted, which exits 0 because §3.2 makes it
+idempotent and on this platform that is its only case. The PTY layer itself is
+still unported (ConPTY, below), so "the server serves" is a smaller claim than
+"the tools work", and the Windows section is where the difference is listed.
+
+**`attach` shipped in 0.0.6** and this line said otherwise until
 0.0.7 — the README has opened with it as a shipped property the whole time,
 so the two files disagreed about the same feature. See the README for the accurate current surface and
 [SECURITY.md](./SECURITY.md) for what that means in practice.
@@ -144,10 +157,19 @@ stdio-only mode where the hybrid daemon does not apply.
 both directions.** `windows-cross` — the `x86_64-pc-windows-gnu` clippy job —
 was red on `main` from before 0.0.6 with 0 passes in its last 20 runs, while
 this file claimed the tree was "kept compiling and clippy-clean" for that
-target. [#19](https://github.com/Sertelegger/holdfast/issues/19) fixed it: the
-31 errors were all in the daemon subsystem, which is the subsystem this
-milestone already says does not exist on Windows, so compile-gating it behind
-`#[cfg(unix)]` was the whole of the work. The tree now cross-compiles
+target. [#19](https://github.com/Sertelegger/holdfast/issues/19) fixed it, and
+this paragraph then overstated *how* by one word: **27 of the 31 errors were
+in the daemon subsystem** — the subsystem this milestone already says does not
+exist on Windows — and the remaining **four were not**, three in `config.rs`
+(`std::os::unix` twice, `libc::O_NONBLOCK` once, all in the mode-bit trust
+check) and one in `protocol/client.rs` (`tokio::net::UnixStream`). The
+correction does not change the conclusion, because all four are the same
+`#[cfg]` class, and `#[cfg(unix)]` was still the whole of the work — but "all
+in one subsystem" is the sentence that licensed compile-gating over porting,
+so the universal is left on the record rather than silently narrowed. Counts
+re-measured at `origin/main` on 2026-09-03 from `cargo clippy --lib -p
+holdfast-core --target x86_64-pc-windows-gnu --message-format json`, attributed
+by each error's primary span. The tree now cross-compiles
 clippy-clean, a `windows-2022` job runs native MSVC clippy and executes the
 CLI's Windows arms, and `holdfast mcp` serves stdio in-process there with an
 audit trail.
@@ -168,8 +190,10 @@ a port rather than a `#[cfg]`:
   debt is still owed.
 - **The unit suite on Windows.** 55 of `holdfast-core`'s lib tests spawn a
   real shell (measured natively: 721 passed, 55 failed, in three modules), so
-  the Windows job runs the source guards and the CLI arms rather than `--lib`.
-  Gating those fixtures buys 721 tests on the platform.
+  the Windows job runs the source guards, the CLI arms, and a **filtered**
+  `--lib` naming only the modules whose Windows arm differs from its Unix one
+  — not the full `--lib`. Gating those shell fixtures buys the other 721 tests
+  on the platform.
 
 ## Distribution
 
