@@ -50,8 +50,16 @@ trigger as a side effect of writing release notes.
   config discovery read `HOME` and the `XDG_*` variables only, and a native
   Windows process has neither. `RuntimePaths::discover()` therefore failed,
   `serve_stdio` swallowed the error, and the §9.4 trail was silently absent.
-  `USERPROFILE` is now the Windows fallback; `HOME` still wins where it is set,
-  so an MSYS2 or Git Bash user keeps the instance they already had.
+  `USERPROFILE` is now the Windows fallback; `HOME` still wins where it is set
+  **to a non-empty value**, so an MSYS2 or Git Bash user keeps the instance
+  they already had. That qualifier is the fix and not a pedantry: `HOME=""`
+  counted as an answer, so `%USERPROFILE%` never got its turn, `resolve`
+  refused the empty path, `serve_stdio` swallowed the error with `.ok()`, and
+  `holdfast mcp` ran with no §9.4 audit trail on a machine that had a
+  perfectly good home — the exact state the fallback exists to prevent,
+  reached through the fallback. `config.toml` was ignored on the same machine
+  for the same reason. An empty variable is now one that did not answer, at
+  the point where the source is chosen rather than downstream of it.
 
 ### Changed
 
