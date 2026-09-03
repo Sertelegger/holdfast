@@ -1784,13 +1784,13 @@ pub async fn watch(session: &str) -> ExitCode {
 
 /// §3.6 marks `holdfast watch` `✗` on Windows native **permanently**,
 /// for the same reason as `holdfast attach`.
+///
+/// [`Remedy::Wsl`] and not an MCP tool, even though `get_screen_state`
+/// renders a session: `watch` is a surface for a *human* at a terminal,
+/// and a tool call an agent makes is not a substitute for one.
 #[cfg(windows)]
 pub async fn watch(_session: &str) -> ExitCode {
-    diag!(
-        "holdfast watch is not supported on Windows native (§3.6): there is \
-         no daemon to attach to. Use WSL."
-    );
-    ExitCode::from(EXIT_USAGE)
+    unsupported("watch", Remedy::Wsl)
 }
 
 /// §3.6 marks `holdfast attach` `✗` on Windows native **permanently** —
@@ -1799,22 +1799,30 @@ pub async fn watch(_session: &str) -> ExitCode {
 /// The arm exists so `main.rs`'s unconditional match compiles on that
 /// target: a `#[cfg(unix)]`-only function referenced by an unconditional
 /// caller is a hard error under `windows-cross`, not a warning.
+///
+/// **It routes through [`unsupported`] rather than writing its own
+/// sentence, and that is the point of the helper.** This arm and `watch`'s
+/// each carried a hand-rolled copy of the refusal literal, while the CI job
+/// that greps for that literal exercised only the helper's callers — so
+/// rewording either copy left every job in the workflow green. There is now
+/// exactly one place in this crate that prints the sentence.
 #[cfg(windows)]
 pub async fn attach(_session: &str) -> ExitCode {
-    diag!(
-        "holdfast attach is not supported on Windows native (§3.6): there is \
-         no daemon to attach to. Use WSL."
-    );
-    ExitCode::from(EXIT_USAGE)
+    unsupported("attach", Remedy::Wsl)
 }
 
 // **The six `#[cfg(windows)]` arms below exist for `main.rs`'s benefit, and
-// they are refusals rather than ports.** Every one of these subcommands is a
-// client of, or is, the daemon — and §3.3/§3.6 give Windows native no daemon
-// at all. `main.rs` dispatches them unconditionally, so a `#[cfg(unix)]`-only
-// function with no counterpart is a hard error under `windows-cross` rather
-// than a warning; that is the same reason `attach` and `watch` above have had
-// arms since 0.0.6.
+// five of them are refusals rather than ports.** Every one of these
+// subcommands is a client of, or is, the daemon — and §3.3/§3.6 give Windows
+// native no daemon at all. `main.rs` dispatches them unconditionally, so a
+// `#[cfg(unix)]`-only function with no counterpart is a hard error under
+// `windows-cross` rather than a warning; that is the same reason `attach` and
+// `watch` above have had arms since 0.0.6, and they now share this section's
+// [`unsupported`] helper.
+//
+// **The sixth is `daemon stop`, which answers and exits 0** — see its own
+// note below. Counting it among the refusals is the mistake `PLATFORM_NOTE`
+// made, and it is the one an operator writing a teardown script pays for.
 //
 // `EXIT_USAGE` (64) and not `EXIT_UNREACHABLE` (2), matching `attach` and
 // `watch`: 2 means "there should be a daemon and I could not reach it", which
@@ -1824,13 +1832,13 @@ pub async fn attach(_session: &str) -> ExitCode {
 /// §3.6: there is no daemon to run on Windows native.
 #[cfg(windows)]
 pub async fn daemon_run() -> ExitCode {
-    unsupported("daemon run")
+    unsupported("daemon run", Remedy::Wsl)
 }
 
 /// §3.6: there is no daemon to start on Windows native.
 #[cfg(windows)]
 pub fn daemon_start() -> ExitCode {
-    unsupported("daemon start")
+    unsupported("daemon start", Remedy::Wsl)
 }
 
 /// **`stop` is the one that succeeds, and it is not an inconsistency.**
@@ -1860,9 +1868,47 @@ pub async fn daemon_stop(_force: bool) -> ExitCode {
 }
 
 /// §3.6: there is no daemon to report on Windows native.
+///
+/// **`--json` still prints a JSON object, and the refusal still goes to
+/// stderr with exit [`EXIT_USAGE`].** The reasoning, since the alternative
+/// (refuse and say `--json` is dead here) was the other honest option:
+///
+/// `--json` is a promise about *stdout*, made to a program. On Unix the
+/// daemon-down path answers `{"running": false}` and exits 2; before this,
+/// Windows answered with empty stdout, so the one caller that exists —
+/// `.claude/commands/holdfast/doctor.md`, which runs `holdfast daemon status
+/// --json` as its first step and has no Windows arm — got nothing to parse
+/// and no way to tell "no daemon here, ever" from "the command is broken".
+/// A flag whose contract holds on one platform and evaporates on another is
+/// worse than one that never existed, because the caller has no reason to
+/// check. Emitting the object costs nothing: it is the same shape Unix
+/// emits when it is down, plus two fields that say the state is permanent.
+///
+/// The exit code stays 64 and does **not** become Unix's 2. 2 means "there
+/// should be a daemon and I could not reach it", which would send a Windows
+/// operator hunting for a process that is not supposed to exist — the whole
+/// reason these arms chose 64 — and it must not fork on the presence of
+/// `--json` either. So a `--json` caller reads the object; anyone reading
+/// the code reads 64 and the sentence on stderr.
 #[cfg(windows)]
-pub async fn daemon_status(_as_json: bool) -> ExitCode {
-    unsupported("daemon status")
+pub async fn daemon_status(as_json: bool) -> ExitCode {
+    if as_json {
+        // `running: false` is exactly what the Unix down-path prints, so a
+        // consumer that only knows that key needs no Windows arm.
+        // `supported` and `reason` are additive, and are what distinguish a
+        // daemon that is down from a platform that has none: only the first
+        // is worth retrying or starting.
+        println!(
+            "{}",
+            serde_json::json!({
+                "running": false,
+                "supported": false,
+                "reason": "no daemon on Windows native (§3.6); sessions live \
+                           inside `holdfast mcp` and end with it",
+            })
+        );
+    }
+    unsupported("daemon status", Remedy::Wsl)
 }
 
 /// §3.6: `list` reads the daemon's registry over the control socket, and
@@ -1871,25 +1917,79 @@ pub async fn daemon_status(_as_json: bool) -> ExitCode {
 /// answer and this subcommand has nothing to enumerate.
 #[cfg(windows)]
 pub async fn list(_as_json: bool) -> ExitCode {
-    unsupported("list")
+    unsupported("list", Remedy::McpTool("list_sessions"))
 }
 
 /// §3.6: `logs` reads a session's ring buffer out of the daemon, same as
 /// `list`. The `read_output` tool is the in-process equivalent.
 #[cfg(windows)]
 pub async fn logs(_session: &str, _tail_lines: Option<usize>, _raw: bool) -> ExitCode {
-    unsupported("logs")
+    unsupported("logs", Remedy::McpTool("read_output"))
 }
 
-/// The one refusal message, so six subcommands cannot drift into six
-/// wordings of the same fact.
+/// Where the operator is sent instead, which is **not** the same answer
+/// for all seven callers.
+///
+/// The remedy was a per-command fact recorded only in the doc comments
+/// above — `list`'s said "the MCP `list_sessions` tool is the answer",
+/// `logs`'s said "`read_output` is the in-process equivalent" — while the
+/// message every caller actually printed sent all of them to WSL. So an
+/// operator was told to install a second operating system to enumerate
+/// sessions the `holdfast mcp` in front of them could already list. This
+/// enum is that knowledge moved from the comment into the argument.
 #[cfg(windows)]
-fn unsupported(what: &str) -> ExitCode {
-    diag!(
-        "holdfast {what} is not supported on Windows native (§3.6): there is \
-         no daemon. Sessions live inside `holdfast mcp` and end with it. Use \
-         WSL for a daemon that outlives the client."
-    );
+enum Remedy {
+    /// The subcommand *is* the daemon, or drives one: `daemon run|start|
+    /// status`, and the two human terminal surfaces. Nothing in this
+    /// process can stand in for it, so the answer is a platform that has
+    /// a daemon.
+    Wsl,
+    /// A `holdfast mcp` running here already answers the question, through
+    /// the named MCP tool. True for `list` and `logs` specifically because
+    /// the Unix bodies above are thin wrappers over `tool/list_sessions`
+    /// and `tool/read_output` — the same calls, with a human on the end —
+    /// and on this platform the sessions live inside the MCP process
+    /// itself.
+    McpTool(&'static str),
+}
+
+/// The one refusal message. **Seven** subcommands reach it — `daemon run`,
+/// `daemon start`, `daemon status`, `list`, `logs`, `attach` and `watch` —
+/// so it is what keeps them from drifting into seven wordings of the same
+/// fact.
+///
+/// It said "six" through the commit that dropped `daemon stop` from the
+/// callers, and separately `attach` and `watch` kept hand-rolled copies of
+/// the sentence instead of calling this, which is how the count came to be
+/// wrong in both directions at once. Both are fixed. The seven are named
+/// above rather than left to a count, so a caller added or removed brings
+/// a list to update with it.
+///
+/// **No other line in this crate emits the `Windows native` refusal
+/// substring** — the arms above print it only by coming here. The
+/// `windows-2022` CI job greps stderr for exactly that substring on every
+/// one of the seven, so rewording it here turns seven cases red together,
+/// which is the intent; rewording a *copy* turned none of them red, which
+/// is what the copies cost.
+///
+/// stderr, via `diag!`, and never stdout: on this platform stdout is the
+/// MCP JSON-RPC transport for `holdfast mcp` and the answer channel for
+/// everything else.
+#[cfg(windows)]
+fn unsupported(what: &str, remedy: Remedy) -> ExitCode {
+    // The tail is built separately rather than as a second `diag!` arm, so
+    // the shared half above stays a single literal.
+    let tail = match remedy {
+        Remedy::Wsl => "there is no daemon. Sessions live inside `holdfast mcp` and end \
+                        with it. Use WSL for a daemon that outlives the client."
+            .to_string(),
+        Remedy::McpTool(tool) => format!(
+            "there is no daemon to ask. Sessions live inside `holdfast mcp` and end \
+             with it, so the `{tool}` MCP tool is what answers this here — WSL is \
+             only needed for a daemon that outlives the client."
+        ),
+    };
+    diag!("holdfast {what} is not supported on Windows native (§3.6): {tail}");
     ExitCode::from(EXIT_USAGE)
 }
 

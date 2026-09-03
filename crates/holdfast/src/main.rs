@@ -27,16 +27,33 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 /// **What the usage banner has to say on a platform that refuses most of
-/// it.** Eight of the ten subcommands above are daemon-backed and every
-/// Windows build answers them with a refusal (§3.6), which the operator
-/// currently discovers one subcommand at a time. Empty on Unix, so the
-/// banner there is unchanged byte for byte.
+/// it.** Eight of the ten subcommands above are daemon-backed, and seven
+/// of those eight answer every Windows build with a refusal (§3.6) — which
+/// the operator otherwise discovers one subcommand at a time.
+///
+/// **The eighth is `daemon stop`, and the note has to say so rather than
+/// round it off to `daemon *`.** It prints "no daemon running" and exits
+/// 0, because §3.2 makes it idempotent and on this platform that is the
+/// only case; the whole point is that a teardown script may run it
+/// unconditionally. A banner that lumps it in with the refusals tells
+/// that script's author the opposite of what the binary does, which is
+/// the one reader this paragraph exists for. So: seven refuse, three
+/// answer (`mcp`, `version`, `daemon stop`).
+///
+/// Empty on Unix, so the banner there is unchanged byte for byte.
 #[cfg(windows)]
 const PLATFORM_NOTE: &str = "\
-\nON WINDOWS NATIVE only `mcp` and `version` do anything: there is no daemon
-(§3.6), so `daemon *`, `list`, `logs`, `attach` and `watch` refuse. Sessions
-live inside `holdfast mcp` and end with it. Use WSL for a daemon that
-outlives the client.\n";
+\nON WINDOWS NATIVE there is no daemon (§3.6), so seven of the ten
+subcommands above refuse with exit 64 and change nothing: `daemon run`,
+`daemon start`, `daemon status`, `list`, `logs`, `attach` and `watch`.
+Three answer: `mcp` serves stdio in-process, so sessions live inside that
+process and end with it; `version` prints; and `daemon stop` prints `no
+daemon running` and exits 0, because §3.2 makes it idempotent and here that
+is the only case — a teardown script may run it unconditionally.
+What `list` and `logs` would have told you, a running `holdfast mcp` can:
+the `list_sessions` and `read_output` tools. `daemon status --json` still
+prints a JSON object saying there is no daemon, rather than nothing at
+all. Use WSL for a daemon that outlives its client.\n";
 
 #[cfg(not(windows))]
 const PLATFORM_NOTE: &str = "";
