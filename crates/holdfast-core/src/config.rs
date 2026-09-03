@@ -146,6 +146,17 @@ fn redacted(message: &str) -> String {
 /// `USERPROFILE` on Windows — the same one answer `RuntimePaths` uses, so a
 /// Windows install cannot end up reading its config from one home and
 /// writing its logs under another.
+///
+/// **That shared answer is also where the empty-`HOME` case is decided, and it
+/// was decided wrongly until the PR 87 review.** `home_dir` took an
+/// exported-but-empty `HOME` as an answer, so `%USERPROFILE%` was never
+/// consulted and this function returned `None` on a Windows box that had a
+/// perfectly good home — the config file silently ignored, on the same machine
+/// and for the same reason its audit trail was. The rule now lives in
+/// `home_dir` too; see the note there for why `resolve`'s copy of it could not
+/// stand in. The empty check below stays, because it answers a different
+/// question — "the home we were handed is unusable as a base", which is still
+/// reachable on a platform with no fallback to fall through to.
 pub fn config_path() -> Option<PathBuf> {
     config_path_from(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
@@ -2839,6 +2850,18 @@ reference = \"db/prod\"
             Some(PathBuf::from("/h/.config/holdfast/config.toml")),
         );
         assert_eq!(config_path_from(None, None), None);
+        // And an empty `HOME` is not an empty base either, which nothing
+        // asserted until the PR 87 review — `PathBuf::from("").join(".config")`
+        // is the *relative* `.config`, so the config file would be read from
+        // whatever directory the process happened to start in. `None` is the
+        // honest answer: a process with no home is not a misconfigured one.
+        //
+        // Whether an empty `HOME` gets this far is `daemon::paths::home_dir`'s
+        // decision, not this one — on Windows it now falls through to
+        // `%USERPROFILE%` and never reaches here. This guard is the platform
+        // where there is nothing to fall through to.
+        assert_eq!(config_path_from(None, Some("".into())), None);
+        assert_eq!(config_path_from(Some("".into()), Some("".into())), None);
     }
 
     #[test]

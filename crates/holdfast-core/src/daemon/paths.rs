@@ -388,9 +388,28 @@ impl Drop for ForcedUmask {
 /// it — MSYS2 and Git Bash both do — keeps the instance they already had
 /// rather than silently acquiring a second one under `%USERPROFILE%`.
 ///
-/// The empty-string rule (GH #72) is deliberately NOT applied here: it lives
-/// in `resolve`, which is the one place every caller passes through, and a
-/// second copy is the hazard that rule's own comment is about.
+/// **The empty-string rule (GH #72) is applied here too, and the comment that
+/// said it was not is kept because being wrong about it was the interesting
+/// part.** It read: the rule "is deliberately NOT applied here: it lives in
+/// `resolve`, which is the one place every caller passes through, and a second
+/// copy is the hazard that rule's own comment is about." Every clause of that
+/// is true and they do not compose. `resolve`'s rule means **error**, not
+/// "fall through to the next source", and by the time `resolve` runs this
+/// function has already *chosen* which variable answered — so on Windows an
+/// exported-but-empty `HOME` returned `Some("")`, `%USERPROFILE%` was never
+/// consulted, `resolve` rejected the empty string, `serve_stdio` swallowed the
+/// `NotFound` with `.ok()`, and `holdfast mcp` ran with no §9.4 trail at all.
+/// That is the exact state the `USERPROFILE` fallback exists to prevent,
+/// reached through the fallback. `config::config_path_from` carries its own
+/// copy of the rule and so returned `None` independently, which ignored
+/// `config.toml` on the same machine for the same reason.
+///
+/// Two spellings of one rule is still the hazard #72 named; the answer is that
+/// this one is a *precedence* rule ("an empty variable did not answer") and
+/// `resolve`'s is a *refusal* ("nothing answered"), and the refusal cannot
+/// stand in for the precedence. Unix behaviour is unchanged: `HOME=""` already
+/// meant "no home" there, because there was never a second source to fall
+/// through to.
 pub(crate) fn home_dir() -> Option<PathBuf> {
     home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
 }
@@ -403,16 +422,53 @@ fn home_from(
     home: Option<std::ffi::OsString>,
     user_profile: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    if let Some(home) = home {
+    // An empty variable is one that did not answer, so the next source gets
+    // its turn — see the note on `home_dir` for what taking `Some("")` here
+    // cost. `resolve`'s empty-string refusal is downstream of this choice and
+    // cannot make it.
+    if let Some(home) = home.filter(|h| !h.is_empty()) {
         return Some(PathBuf::from(home));
     }
     #[cfg(windows)]
-    if let Some(profile) = user_profile {
+    if let Some(profile) = user_profile.filter(|p| !p.is_empty()) {
         return Some(PathBuf::from(profile));
     }
     #[cfg(not(windows))]
     let _ = user_profile;
     None
+}
+
+/// What [`RuntimePaths::resolve`] says when it has no directory to use.
+///
+/// **It names the variables this build actually consults, and it used to name
+/// a fixed three.** The old text was `neither HOLDFAST_RUNTIME_DIR,
+/// XDG_RUNTIME_DIR, nor HOME is set`, and on Windows every part of that was
+/// unhelpful: `discover` passes `is_linux = false`, so `XDG_RUNTIME_DIR` is
+/// never read; `HOME` is a POSIX convention a native process does not have
+/// (measured — `cmd /c "echo %HOME%"` echoes the literal `%HOME%`); and
+/// `USERPROFILE`, the one variable that would resolve it, went unmentioned.
+/// An error that tells an operator to set two variables the code will not read
+/// while withholding the one it will is worse than a terse one, because it
+/// sends them somewhere the fix cannot be.
+///
+/// `is_linux` is the parameter `resolve` decides the XDG branch with rather
+/// than `cfg!(target_os = "linux")`, so the message cannot drift from the
+/// branch it describes. The home half is a `cfg!` because that is what
+/// [`home_from`] compiles the `USERPROFILE` arm under.
+fn not_found_message(is_linux: bool) -> String {
+    let mut names = vec![RUNTIME_DIR_ENV];
+    if is_linux {
+        names.push("XDG_RUNTIME_DIR");
+    }
+    names.push("HOME");
+    if cfg!(windows) {
+        names.push("USERPROFILE");
+    }
+    format!(
+        "none of {} is set, so there is no directory to hold this instance's \
+         sockets and logs. Set {RUNTIME_DIR_ENV} to place it explicitly.",
+        names.join(", ")
+    )
 }
 
 /// **`open_log_append`'s cross-platform half, and the reason this module is
@@ -490,6 +546,12 @@ mod log_append_tests {
 /// are gated would leave the Windows arm asserted by nothing — which is the
 /// exact shape #19 was fixing. These need no mode bits, no umask and no
 /// filesystem, so nothing stops them running everywhere.
+///
+/// It also holds the two rows that are about the same variable set but not
+/// about `home_from`: [`home_dir`], the wrapper that decides which variable
+/// goes in which argument, and the `NotFound` message `resolve` prints when
+/// none of them answered. Both have to be asserted per-platform, which is what
+/// this module is for.
 #[cfg(test)]
 mod home_tests {
     use super::home_from;
@@ -531,10 +593,238 @@ mod home_tests {
 
     #[test]
     fn neither_set_is_none_on_every_platform() {
-        // `resolve` turns this into the `NotFound` that names all three
-        // variables; the empty-string rule (GH #72) lives there too, and
-        // deliberately not here — one spelling, one place.
+        // `resolve` turns this into a `NotFound` that names the variables
+        // *this platform* consults — not the fixed three it used to name,
+        // which on Windows was two the code never reads and omitted the one
+        // it does. `the_not_found_error_names_the_variables_this_platform_consults`
+        // pins that; the empty-string rule lives in both places, for the two
+        // different jobs the note on `home_dir` sets out.
         assert_eq!(home_from(None, None), None);
+    }
+
+    #[test]
+    fn an_empty_home_does_not_answer_and_user_profile_still_gets_its_turn() {
+        // **The composition failure, and it is a product bug rather than a
+        // tidiness one.** `HOME=""` was taken as an answer, so on Windows
+        // `%USERPROFILE%` was never consulted, `resolve` refused the empty
+        // string, and `serve_stdio`'s `.ok()` turned that into `holdfast mcp`
+        // running with no §9.4 audit trail — silently, which is the state the
+        // `USERPROFILE` fallback exists to prevent.
+        //
+        // Asserted from `cfg!` like the row above, for the same reason: the
+        // answer must DIFFER by platform, or a fallback wired up everywhere
+        // would move a Unix instance's audit trail.
+        let got = home_from(os(""), os(r"C:\Users\ada"));
+        if cfg!(windows) {
+            assert_eq!(
+                got,
+                Some(PathBuf::from(r"C:\Users\ada")),
+                "an exported-but-empty HOME must not shadow %USERPROFILE%"
+            );
+        } else {
+            assert_eq!(
+                got, None,
+                "USERPROFILE is a Windows convention and must not move a Unix instance"
+            );
+        }
+
+        // Unix is unaffected in *behaviour* — `HOME=""` already meant "no
+        // home" there, because there was no second source to fall through to
+        // — but it is covered, because that is what makes the row above a
+        // statement about precedence rather than about Windows.
+        assert_eq!(home_from(os(""), None), None);
+        assert_eq!(
+            home_from(os(""), os("")),
+            None,
+            "two empty variables are two non-answers, on every platform"
+        );
+    }
+
+    #[test]
+    fn the_not_found_error_names_the_variables_this_platform_consults() {
+        use super::{RuntimePaths, RUNTIME_DIR_ENV};
+
+        // Cross-platform, and in this module rather than beside the other
+        // `resolve` tests, because the claim is about *which home variable*
+        // the platform reads — the same claim the rest of this module is
+        // about. `resolve` with no home is pure path arithmetic: no
+        // filesystem, no mode bits, nothing to gate on Unix.
+        for is_linux in [true, false] {
+            let msg = RuntimePaths::resolve(None, None, None, is_linux, false)
+                .expect_err("no override and no home is not resolvable")
+                .to_string();
+            assert!(
+                msg.contains(RUNTIME_DIR_ENV),
+                "the error must name the escape hatch: {msg}"
+            );
+            assert!(msg.contains("HOME"), "{msg}");
+            // The two that are decided rather than always-on. `XDG_RUNTIME_DIR`
+            // is only read on the branch `is_linux` selects, and naming it off
+            // that branch sends a Windows or macOS operator to a variable
+            // `resolve` will not look at.
+            assert_eq!(
+                msg.contains("XDG_RUNTIME_DIR"),
+                is_linux,
+                "XDG_RUNTIME_DIR is named exactly when it is consulted (is_linux={is_linux}): {msg}"
+            );
+            // And the one whose absence was the finding: on Windows
+            // `%USERPROFILE%` is the variable that fixes this error, and the
+            // message did not mention it.
+            assert_eq!(
+                msg.contains("USERPROFILE"),
+                cfg!(windows),
+                "USERPROFILE is the Windows fix for this error and a Unix red herring: {msg}"
+            );
+        }
+    }
+
+    /// Set on the child in
+    /// `home_dir_reads_home_first_and_user_profile_only_as_a_fallback`.
+    const CHILD_ENV: &str = "HOLDFAST_TEST_HOME_DIR_CHILD";
+    /// The answer the parent expects out of it; empty means `None`.
+    const WANT_ENV: &str = "HOLDFAST_TEST_HOME_DIR_WANT";
+    /// Where the child records that it ran, so the parent can tell "the
+    /// assertion held" from "`--exact` matched nothing" — which libtest
+    /// reports as a *successful* run of zero tests, and which would otherwise
+    /// read as a pass.
+    ///
+    /// A file rather than a line on stdout, and not by preference: this crate
+    /// denies `clippy::print_stdout` at the root and `tests/source_guards.rs`
+    /// scans for both the macro and an `#[allow]` beside one, because under
+    /// `holdfast mcp` stdout is the JSON-RPC wire. A test module is still this
+    /// crate's source. It is also the sturdier signal — it does not depend on
+    /// `--nocapture`, and it cannot be confused with libtest's own report.
+    const REPORT_ENV: &str = "HOLDFAST_TEST_HOME_DIR_REPORT";
+    const CHILD_RAN: &str = "holdfast-home-dir-child-ran";
+    const CHILD_TEST: &str =
+        "daemon::paths::home_tests::the_child_that_reports_home_dir_under_a_given_environment";
+
+    /// **`home_dir` itself, which every row above leaves uncovered.** They
+    /// all call `home_from` with literals; the wrapper that decides *which
+    /// variable goes in which argument* was asserted by nothing. Measured
+    /// before this existed: swapping its two arguments survived the whole
+    /// core lib suite, the `daemon_cli` suite and clippy `-D warnings`, while
+    /// breaking the product on every platform — a Unix box with only `HOME`
+    /// set then finds no runtime directory at all.
+    ///
+    /// **A subprocess rather than `set_var`.** The environment is
+    /// process-global and libtest runs tests in threads, so setting `HOME`
+    /// here would set it for every other test at the same time — the hazard
+    /// `resolve`, `home_from` and `config_path_from` were all split out to
+    /// avoid. Reading the *ambient* environment instead would work on this
+    /// machine and go vacuous wherever `HOME` and `USERPROFILE` happen to
+    /// agree or both be absent, which is a test that reports coverage it does
+    /// not have. A child gets an environment we choose outright, and it is the
+    /// pattern `diag`'s `nothing_reaches_daemon_log_unredacted_not_even_a_panic`
+    /// already uses here.
+    #[test]
+    fn home_dir_reads_home_first_and_user_profile_only_as_a_fallback() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // We *are* the child, re-entered under a different test name.
+            return;
+        }
+
+        // `(HOME, USERPROFILE)`, as the child's real environment will have
+        // them; `None` removes the variable, `Some("")` exports it empty.
+        let cases: [(Option<&str>, Option<&str>); 4] = [
+            // Both set: the row that kills an argument swap on every
+            // platform, because the two answers differ.
+            (Some("/home/ada"), Some(r"C:\Users\ada")),
+            (None, Some(r"C:\Users\ada")),
+            // The Finding-1 shape, end to end through the real environment.
+            (Some(""), Some(r"C:\Users\ada")),
+            (None, None),
+        ];
+
+        for (home, user_profile) in cases {
+            let want = match (
+                home.filter(|h| !h.is_empty()),
+                user_profile.filter(|p| !p.is_empty()),
+            ) {
+                (Some(h), _) => Some(h),
+                (None, Some(p)) if cfg!(windows) => Some(p),
+                _ => None,
+            };
+
+            let report = std::env::temp_dir().join(format!(
+                "holdfast-t-homedir-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            ));
+            struct Scoped(PathBuf);
+            impl Drop for Scoped {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+            }
+            let _scoped = Scoped(report.clone());
+
+            let mut cmd = std::process::Command::new(
+                std::env::current_exe().expect("this test binary's own path"),
+            );
+            cmd.arg(CHILD_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .env(REPORT_ENV, &report)
+                .env(WANT_ENV, want.unwrap_or_default());
+            // Note for a Windows reader: `CreateProcess` treats an empty
+            // value as a deletion, so the `Some("")` row degenerates to the
+            // removed one there. Both expect the same answer, so it is weaker
+            // on Windows rather than wrong.
+            if let Some(h) = home {
+                cmd.env("HOME", h);
+            } else {
+                cmd.env_remove("HOME");
+            }
+            if let Some(p) = user_profile {
+                cmd.env("USERPROFILE", p);
+            } else {
+                cmd.env_remove("USERPROFILE");
+            }
+
+            let out = cmd.output().expect("re-exec this test binary");
+            let reported = std::fs::read_to_string(&report).unwrap_or_default();
+            let ctx = format!(
+                "HOME={home:?} USERPROFILE={user_profile:?}, expected {want:?}\
+                 \n--- child report ---\n{reported}\n--- child stdout ---\n{}\
+                 \n--- child stderr ---\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                reported.contains(CHILD_RAN),
+                "the child never ran, so this row asserted nothing: `--exact \
+                 {CHILD_TEST}` matched no test, which libtest reports as a green \
+                 run of zero tests. Did the child get renamed? {ctx}"
+            );
+            assert!(out.status.success(), "child exited {}: {ctx}", out.status);
+        }
+    }
+
+    /// The other half of the test above; a no-op unless re-entered as a
+    /// child, so the ordinary suite runs it and it costs nothing.
+    #[test]
+    fn the_child_that_reports_home_dir_under_a_given_environment() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+        let want = std::env::var(WANT_ENV).unwrap_or_default();
+        let want = (!want.is_empty()).then(|| PathBuf::from(want));
+        let got = super::home_dir();
+        // Written before the assertion, so the parent sees it whether the row
+        // held or not — its absence must mean "did not run", never "failed".
+        if let Some(report) = std::env::var_os(REPORT_ENV) {
+            std::fs::write(report, format!("{CHILD_RAN} got={got:?} want={want:?}"))
+                .expect("record that this child ran");
+        }
+        assert_eq!(
+            got,
+            want,
+            "HOME={:?} USERPROFILE={:?}",
+            std::env::var_os("HOME"),
+            std::env::var_os("USERPROFILE")
+        );
     }
 }
 
@@ -593,12 +883,9 @@ impl RuntimePaths {
         // second spelling. The second spelling is gone and the guard moved
         // to the one that remains, so every caller gets it rather than the
         // one that happened to be written by someone who thought of it.
-        let home = home.filter(|h| !h.as_os_str().is_empty()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("neither {RUNTIME_DIR_ENV}, XDG_RUNTIME_DIR, nor HOME is set"),
-            )
-        });
+        let home = home
+            .filter(|h| !h.as_os_str().is_empty())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, not_found_message(is_linux)));
 
         // §19.1: the daemon log lives in `~/.holdfast/logs` whenever the
         // instance is the default one, whatever the runtime directory is.
