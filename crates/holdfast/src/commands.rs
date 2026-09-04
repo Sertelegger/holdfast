@@ -1289,13 +1289,34 @@ pub async fn attach(session: &str) -> ExitCode {
 
     // One at startup, so the session reflows to *this* terminal
     // immediately rather than at the first time the user drags a window.
+    //
+    // **Best effort, and returning `EXIT_UNREACHABLE` from a failure here
+    // was GH #39.** This is the only frame the client sends that the user
+    // did not ask for, and it goes out before a single frame past
+    // `Attached` has been read — so a failure is `EPIPE` from a daemon
+    // that closed *after* answering, which is not the same fact as a
+    // daemon that cannot be reached.
+    //
+    // Attaching to an already-exited session is exactly that shape.
+    // `forward_output` short-circuits on `!session.is_alive()`, so §7.5's
+    // entire ending — `SessionExited` then `Detached { reason:
+    // "session_exit" }` — is written and the socket closed while this
+    // client is still installing two signal handlers, taking raw mode,
+    // spawning two readers and registering `SIGWINCH`. The daemon is
+    // entitled to win that race, and on a fast enough machine it wins it
+    // every time. Returning from here then threw away a complete and
+    // correct ending already sitting in this process's own receive
+    // buffer, and did it **silently** — exit 2, an empty terminal, and no
+    // diagnostic naming what went wrong.
+    //
+    // So the write is allowed to fail and the **reader** names the
+    // ending: the loop below returns `SUCCESS` on `Detached` and
+    // diagnoses a bare EOF as an unreachable daemon. That still covers a
+    // daemon that is genuinely gone — a write half broken by a dead peer
+    // is a read half that EOFs at once — so this cannot wait on a peer
+    // that will never answer.
     if let Ok((cols, rows)) = crate::attach_tty::window_size(tty) {
-        if frame::write_frame(&mut wr, &ClientFrame::Resize { cols, rows })
-            .await
-            .is_err()
-        {
-            return ExitCode::from(EXIT_UNREACHABLE);
-        }
+        let _ = frame::write_frame(&mut wr, &ClientFrame::Resize { cols, rows }).await;
     }
 
     // **Say that the attach worked, but not yet.** Nothing else here

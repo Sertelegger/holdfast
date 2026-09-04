@@ -15,7 +15,6 @@ been measured, and what would settle it.
 |---|---|---|
 | [#10](https://github.com/Sertelegger/holdfast/issues/10) | `send_input_wait_for_returns_the_identical_shape` (`crates/holdfast-core/tests/integration.rs`) | `matched differs between wait_for_pattern and send_input(wait_for=)`. Its file-mate `send_input_reaches_the_shell` fails the same way, so the issue title under-describes it by one row. |
 | [#21](https://github.com/Sertelegger/holdfast/issues/21) | `the_exit_cleanup_leaves_a_successor…socket_and_pid_file_alone` | `AddrInUse` in `bind_control`. Under `--workspace` another target's daemon binds the control socket in the same instant; in isolation there is no competitor. |
-| [#39](https://github.com/Sertelegger/holdfast/issues/39) | `attaching_to_an_already_exited_session_ends_instead_of_hanging` (`crates/holdfast/tests/attach_cli.rs`) | A fixed `wait_exit(15)` outrun under load. |
 | [#42](https://github.com/Sertelegger/holdfast/issues/42) | `session::wait::tests::output_written_just_before_an_exit_still_matches` | Returns `SessionDied` where it expects `Matched`. **Possibly not a flake** — see below. |
 | [#52](https://github.com/Sertelegger/holdfast/issues/52) | `daemon::server::tests::a_connection_mid_handshake_holds_off_the_client_less_exit` | **2 failures in 54 whole-binary runs**, load-dependent; 0 in 800 runs filtered to `daemon::server` alone, so it needs the rest of the binary for contention. Asserts at `server.rs:3552`. **#52's second test is the row already tracked as #21 above** — the pair overlaps, so #52 contributes one new name, not two. |
 
@@ -43,15 +42,45 @@ contains one — so the test proceeds while the shell is still printing, and
 the prompt lands between the two reads. Fixed by waiting for the buffer to
 stop growing before comparing.
 
-**#39's recorded diagnosis is contradicted by the evidence.** This file said
-*"a fixed `wait_exit(15)` outrun under load"*. `wait_exit` **panics** on
-timeout; it does not return a code. The observed failure is
-`assert_eq!(term.wait_exit(15), 0)` with **left: 2**, and 2 is
-`EXIT_UNREACHABLE` — the client's code for *"the daemon closed the connection"*
-(no `Detached` frame before EOF), or a handshake that did not complete. So
-the row is not slow, it is ending the wrong way, and a longer deadline would
-not have helped. Still open, still pre-existing, and now with a diagnosis
-that points somewhere.
+**#39 is fixed, and it was never a timing row.** This file first said *"a
+fixed `wait_exit(15)` outrun under load"*, which the evidence contradicted:
+`wait_exit` **panics** on timeout and does not return a code, while the
+observed failure was `assert_eq!(term.wait_exit(15), 0)` with **left: 2**.
+That narrowed it to `EXIT_UNREACHABLE` and, from there, to a product bug
+rather than a test one.
+
+**Root cause.** `holdfast attach` sends one unsolicited startup `Resize` so
+the session reflows to the new terminal. Against an already-exited session
+the daemon has nothing to wait for — `forward_output` short-circuits on
+`!session.is_alive()` — so it writes §7.5's whole ending (`Attached`,
+`SessionExited`, `Detached { reason: "session_exit" }`) and closes while the
+client is still installing signal handlers, taking raw mode and spawning its
+readers. The `Resize` then hit `EPIPE`, and the client returned
+`EXIT_UNREACHABLE` **from a failed write**, discarding a complete and correct
+ending already sitting unread in its own receive buffer — silently, with no
+diagnostic, which is why the failing terminal was blank.
+
+**The same bug made the unreachable-daemon diagnostic unreachable.** Because
+the startup write returned before the frame loop ever ran, `"holdfast attach:
+the daemon closed the connection"` could not be printed in the one case it
+was written for: a genuinely dead daemon also exited 2 onto an empty screen.
+
+**Fixed** by making that write best effort and letting the reader name the
+ending — `Detached` is a clean exit 0, a bare EOF is a diagnosed exit 2.
+Pinned by two rows in `attach_cli.rs` that drive a stub which closes the
+instant it answers, so the race is removed rather than raced:
+`a_daemon_that_closes_the_instant_it_answers_still_delivers_its_ending` and
+its separating negative
+`a_daemon_that_closes_without_detaching_is_still_an_unreachable_daemon`.
+Both are red without the fix.
+
+**Why it read as a flake for so long.** Whether the client's write beats the
+daemon's close is decided by machine speed, and the split is near-total in
+both directions: 20 failures in 20 isolated runs on one checkout, 0 in 20 on
+another of the same tree, and 0 in 5 whole-target runs where 26 neighbouring
+tests loaded the machine enough for the client to win. A `git bisect` over
+that signal named a commit touching only `.github/workflows/ci.yml`, which is
+the tell that the bisect was measuring scheduling noise and not a change.
 
 ## Platform evidence
 
@@ -60,9 +89,10 @@ across two days:
 
 - **#10 and #21 did not reproduce at all.** Evidence for Linux scheduling rather
   than logic.
-- **#39 does reproduce** — about one full run in three, 0/5 in isolation — and
-  **it also fails at the pristine `v0.0.6` tag**, so it predates the 0.0.7 work
-  entirely.
+- **#39 did reproduce** — about one full run in three, 0/5 in isolation — and
+  **it also failed at the pristine `v0.0.6` tag**, so it predated the 0.0.7
+  work entirely, as the root cause above confirms: the startup `Resize` and
+  its `EXIT_UNREACHABLE` are both older than either milestone. Now fixed.
 - **`a_resource_read_and_a_read_output_return_the_same_bytes`** behaved the
   same way on macOS, was filed as
   [#60](https://github.com/Sertelegger/holdfast/issues/60), and is **fixed and

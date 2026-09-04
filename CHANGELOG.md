@@ -61,6 +61,43 @@ trigger as a side effect of writing release notes.
   for the same reason. An empty variable is now one that did not answer, at
   the point where the source is chosen rather than downstream of it.
 
+- **`holdfast attach` no longer discards an ending it has already been sent
+  ([#39]).** Attaching to a session that had already exited could end in exit
+  2 — `EXIT_UNREACHABLE` — onto a blank terminal, with nothing printed to say
+  why. The client sends one unsolicited startup `Resize` so the session
+  reflows to the new terminal; against a dead session the daemon has nothing
+  to wait for, so it writes §7.5's whole ending (`Attached`, `SessionExited`,
+  `Detached { reason: "session_exit" }`) and closes the socket while the
+  client is still installing signal handlers, taking raw mode and spawning its
+  readers. The `Resize` then hit `EPIPE` and the client returned
+  `EXIT_UNREACHABLE` **from a failed write**, throwing away a complete and
+  correct ending that was already sitting unread in its own receive buffer. A
+  peer that closed *after* answering is not a peer that cannot be reached.
+  That write is now best effort and the **reader** names the ending, which is
+  the only side that can tell the two apart: `Detached` is a clean exit 0, and
+  an EOF without one is still exit 2 — now with the diagnostic it always
+  should have had.
+
+- **The unreachable-daemon diagnostic was itself unreachable ([#39]).** Same
+  cause, found by the separating negative rather than by the report: because
+  the startup write returned before the frame loop ever ran, `"holdfast
+  attach: the daemon closed the connection"` could not be printed in the one
+  case it exists for. A genuinely dead daemon also exited 2 onto an empty
+  screen, so the two endings were indistinguishable to an operator — and the
+  message that would have distinguished them was dead code.
+
+- **#39 was tracked as an intermittent and was not one.** It is pinned now by
+  two rows that drive a stub daemon which closes the instant it answers, so
+  the race is removed from the reproduction instead of being raced: whether
+  the client's write beats the daemon's close is decided by machine speed, and
+  the split was near-total in both directions — 20 failures in 20 isolated
+  runs on one checkout, 0 in 20 on another of the same tree, and 0 in 5
+  whole-target runs where 26 neighbouring tests loaded the machine enough for
+  the client to win. A `git bisect` over that signal named a commit touching
+  only `.github/workflows/ci.yml`, which is the tell that it was measuring
+  scheduling noise rather than a change. `KNOWN-INTERMITTENTS.md` carries the
+  full record, including the two earlier diagnoses that were wrong.
+
 ### Changed
 
 - **On Windows native, seven subcommands now refuse with exit 64** and a
@@ -137,6 +174,7 @@ trigger as a side effect of writing release notes.
   the JSON messages, or read the number the summary line itself gives.
 
 [#19]: https://github.com/Sertelegger/holdfast/issues/19
+[#39]: https://github.com/Sertelegger/holdfast/issues/39
 
 ## [0.0.7] — 2026-09-01
 
