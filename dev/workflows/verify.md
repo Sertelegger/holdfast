@@ -11,6 +11,30 @@ at the first red tells you one thing when it could have told you five.
 5. `actionlint .github/workflows/*.yml`
 6. `./scripts/mcp-smoke.sh` — the only check that drives the real JSON-RPC wire
 
+**Step 5 needs two tools, and it was listed here for months with neither
+installed** — a step nobody could run, which is worth exactly as much as no
+step. Neither is packaged in this repo; both are single static binaries from
+their own releases:
+
+```
+gh release download "v$VER" --repo rhysd/actionlint \
+  -p "actionlint_${VER}_linux_amd64.tar.gz" -p "actionlint_${VER}_checksums.txt"
+gh release download v0.11.0 --repo koalaman/shellcheck \
+  -p 'shellcheck-v0.11.0.linux.x86_64.tar.xz'
+```
+
+actionlint publishes a `checksums.txt` — verify against it. **shellcheck
+publishes none**, so there is nothing to verify against and the most that can
+be done is to record what was fetched: the 0.11.0 linux x86_64 tarball used
+here was `8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198`.
+
+**shellcheck is not optional, and this is the trap.** actionlint shells out to
+it to lint the shell inside every `run:` block, and when it is missing it
+**skips that silently and still exits 0** — so the check most likely to catch
+a real defect in this repo's workflows is the one that quietly does not run.
+`ci.yml` is mostly `run:` blocks. Confirm `shellcheck --version` answers
+before believing a green from step 5.
+
 **Then the part CI structurally cannot do.** Every workflow runs
 `ubuntu-24.04`, so a break confined to another platform reaches `main`
 unnoticed. Add, for each of `x86_64-unknown-linux-gnu`,

@@ -6,6 +6,12 @@ pub mod envelope;
 pub mod passthrough;
 pub mod resources;
 pub mod schema;
+// Hybrid mode is a `ControlClient` over a Unix socket talking to a daemon,
+// and Windows has neither (§3.3: stdio-only, sessions die with the shim).
+// `HoldfastServer` — the in-process half `--no-daemon` and Windows both
+// serve — is in this module and stays on every target, which is what keeps
+// this gate a statement about the *transport* rather than about the tools.
+#[cfg(unix)]
 pub mod shim;
 pub mod tools;
 

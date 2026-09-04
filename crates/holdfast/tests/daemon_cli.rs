@@ -21,6 +21,24 @@
 //! So a wait that expires **panics**. It is never absorbed into an
 //! `Ok(_) | Err(_)` that would let a timeout count as a pass.
 
+// Unix-only, like `attach_cli.rs` above it. Everything below drives a real
+// daemon over a Unix socket, and §3.3/§3.6 give Windows native neither —
+// `holdfast-core`'s `daemon::{attach_server, peer, server, spawn}` are
+// `#[cfg(unix)]` from #19 on, so these targets have nothing to link
+// against there rather than nothing to say.
+//
+// **Named per module, and NOT as `daemon`, which is what this comment
+// said until PR #87's review.** `daemon::paths` is deliberately ungated —
+// the argument is in `src/daemon/mod.rs`, which calls that asymmetry the
+// whole shape of the module on Windows — so "the `daemon` module is
+// `#[cfg(unix)]`" is false, and false in the direction that makes a real
+// gate look vacuous: `ci.yml`'s `windows-native` job runs a filtered
+// `--lib` over `daemon::paths::{home_tests, log_append_tests}` and
+// asserts a floor on how many rows ran, which is only reachable because
+// `paths` compiles on Windows. `tests/wire_shape.rs` had the form right,
+// naming `daemon::server` rather than its parent.
+#![cfg(unix)]
+
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};

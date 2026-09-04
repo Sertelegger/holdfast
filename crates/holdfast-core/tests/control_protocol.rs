@@ -32,6 +32,24 @@
 //!   ill-typed value must come back `bad_params`, where a renamed field
 //!   is an unknown key and is dropped in silence.
 
+// Unix-only, like `crates/holdfast/tests/attach_cli.rs`. Everything below drives a real
+// daemon over a Unix socket, and §3.3/§3.6 give Windows native neither —
+// `holdfast-core`'s `daemon::{attach_server, peer, server, spawn}` are
+// `#[cfg(unix)]` from #19 on, so these targets have nothing to link
+// against there rather than nothing to say.
+//
+// **Named per module, and NOT as `daemon`, which is what this comment
+// said until PR #87's review.** `daemon::paths` is deliberately ungated —
+// the argument is in `src/daemon/mod.rs`, which calls that asymmetry the
+// whole shape of the module on Windows — so "the `daemon` module is
+// `#[cfg(unix)]`" is false, and false in the direction that makes a real
+// gate look vacuous: `ci.yml`'s `windows-native` job runs a filtered
+// `--lib` over `daemon::paths::{home_tests, log_append_tests}` and
+// asserts a floor on how many rows ran, which is only reachable because
+// `paths` compiles on Windows. `tests/wire_shape.rs` had the form right,
+// naming `daemon::server` rather than its parent.
+#![cfg(unix)]
+
 use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::server::{self, Daemon, DaemonStatus, StopOutcome, StopParams};
 use holdfast_core::protocol::client::{ClientError, ControlClient};

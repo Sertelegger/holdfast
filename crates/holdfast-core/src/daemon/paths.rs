@@ -254,6 +254,7 @@ pub const LOG_MODE: u32 = 0o600;
 /// path that runs before every assertion is exactly how
 /// `ensure_dir_creates_the_tree_mode_0700` came to be unable to observe
 /// its own `DirBuilder::mode` — see the note on that test.
+#[cfg(unix)]
 pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
@@ -274,6 +275,66 @@ pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+/// The same file, created without a mode, because Windows has none to set.
+///
+/// **This warns and proceeds; it does not refuse, and it does not pretend.**
+/// The refusing version was considered and is wrong: a file created here
+/// inherits the DACL of its parent, and the parent is inside the user's own
+/// profile, so the inherited ACL grants the owning user, `SYSTEM` and
+/// `Administrators` — not "everyone". That is a genuinely different posture
+/// from a `0644` on Unix, and refusing to write an audit log over it would
+/// trade a real capability for a risk that is largely already handled by the
+/// platform.
+///
+/// What is *not* handled, and is what the warning is for: Holdfast asserts
+/// nothing here. On Unix `LOG_MODE` is enforced and `ensure_owner_only`
+/// re-checks it; here the ACL is whatever was inherited, which a machine
+/// policy, a redirected profile, or a runtime directory relocated onto a
+/// shared volume by `HOLDFAST_RUNTIME_DIR` can all widen without Holdfast
+/// noticing. An explicit DACL is 0.0.11's, and the 0.0.11 plan records a
+/// decision (D9) for the recording file's `0600` and **none** for this path.
+#[cfg(windows)]
+pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
+    warn_inherited_acl_once();
+
+    if let Some(parent) = path.parent() {
+        std::fs::DirBuilder::new().recursive(true).create(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Say once per process that the mode bits this module is named for are not
+/// being applied.
+///
+/// **Once, and on stderr.** Once because this is a property of the platform
+/// rather than of the file, and one line per log write would be noise an
+/// operator learns to scroll past. On stderr via `diag::emit` because on
+/// Windows the only transport is stdio-only MCP (§3.3) and **stdout is the
+/// JSON-RPC wire** — a warning written there is a protocol violation, not a
+/// diagnostic.
+/// `pub(crate)` so `config::untrusted_reason` raises the same one. Two
+/// warnings about one platform fact is two chances to ignore it.
+#[cfg(windows)]
+pub(crate) fn warn_inherited_acl_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::diag::emit(
+            "no supported permission model on this platform: Holdfast's runtime \
+             directory, logs and config.toml are used with the ACL they inherit \
+             from their parent. The 0700/0600 modes it enforces on Unix are not \
+             applied, and the config trust check (owner and mode) does not run — \
+             config.toml is read whoever owns it. Inside a normal user profile \
+             the inherited ACL is owner + SYSTEM + Administrators, which is \
+             usually what you want; on a redirected profile, a shared volume, or \
+             a HOLDFAST_RUNTIME_DIR or XDG_CONFIG_HOME pointed somewhere else, it \
+             may not be. Set the ACL yourself if that matters.",
+        );
+    });
+}
+
 /// Forces the process umask for the lifetime of the guard.
 ///
 /// A mode test without this measures the developer's shell rather than
@@ -287,10 +348,10 @@ pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
 /// is deliberately the loosest value anything here asserts against:
 /// `022` can clear no bit of `0600` or `0700`, so a concurrent test
 /// creating a file with an explicit mode is unaffected either way.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct ForcedUmask(libc::mode_t);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl ForcedUmask {
     pub(crate) fn loose() -> Self {
         // SAFETY: `umask` cannot fail; it returns the previous mask.
@@ -298,11 +359,472 @@ impl ForcedUmask {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for ForcedUmask {
     fn drop(&mut self) {
         // SAFETY: as above, restoring what we replaced.
         unsafe { libc::umask(self.0) };
+    }
+}
+
+/// The user's home directory, as **this platform** names it.
+///
+/// **`USERPROFILE` on Windows, and without it the whole Windows build is
+/// pathless.** `HOME` is a POSIX convention and a native Windows process
+/// does not have it — measured: `cmd /c "echo %HOME%"` echoes the literal
+/// `%HOME%`, while `%USERPROFILE%` is `C:\Users\<name>`. Every path this
+/// module hands out is derived from this one answer, so with `HOME` unset
+/// `RuntimePaths::discover()` returns `NotFound`, `serve_stdio` swallows it
+/// with `.ok()`, and `holdfast mcp` runs with **no §9.4 audit trail at all**
+/// — silently, because a missing trail looks exactly like a quiet one.
+///
+/// It is also what makes #19's "warn rather than refuse" posture reachable.
+/// Both callers of `warn_inherited_acl_once` sit downstream of path
+/// resolution, so before this the warning could not fire on the platform it
+/// exists to describe. Measured on a native `holdfast.exe mcp --no-daemon`:
+/// no warning, no trail.
+///
+/// `HOME` is still preferred where it is set, so a Windows user who exports
+/// it — MSYS2 and Git Bash both do — keeps the instance they already had
+/// rather than silently acquiring a second one under `%USERPROFILE%`.
+///
+/// **The empty-string rule (GH #72) is applied here too, and the comment that
+/// said it was not is kept because being wrong about it was the interesting
+/// part.** It read: the rule "is deliberately NOT applied here: it lives in
+/// `resolve`, which is the one place every caller passes through, and a second
+/// copy is the hazard that rule's own comment is about." Every clause of that
+/// is true and they do not compose. `resolve`'s rule means **error**, not
+/// "fall through to the next source", and by the time `resolve` runs this
+/// function has already *chosen* which variable answered — so on Windows an
+/// exported-but-empty `HOME` returned `Some("")`, `%USERPROFILE%` was never
+/// consulted, `resolve` rejected the empty string, `serve_stdio` swallowed the
+/// `NotFound` with `.ok()`, and `holdfast mcp` ran with no §9.4 trail at all.
+/// That is the exact state the `USERPROFILE` fallback exists to prevent,
+/// reached through the fallback. `config::config_path_from` carries its own
+/// copy of the rule and so returned `None` independently, which ignored
+/// `config.toml` on the same machine for the same reason.
+///
+/// Two spellings of one rule is still the hazard #72 named; the answer is that
+/// this one is a *precedence* rule ("an empty variable did not answer") and
+/// `resolve`'s is a *refusal* ("nothing answered"), and the refusal cannot
+/// stand in for the precedence. Unix behaviour is unchanged: `HOME=""` already
+/// meant "no home" there, because there was never a second source to fall
+/// through to.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// [`home_dir`] over what the environment said, split out for the same reason
+/// [`RuntimePaths::resolve`] and [`crate::config::config_path_from`] are:
+/// the env is process-global and this test binary is threaded, so a test that
+/// set `HOME` would be setting it for every other test at the same time.
+fn home_from(
+    home: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    // An empty variable is one that did not answer, so the next source gets
+    // its turn — see the note on `home_dir` for what taking `Some("")` here
+    // cost. `resolve`'s empty-string refusal is downstream of this choice and
+    // cannot make it.
+    if let Some(home) = home.filter(|h| !h.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    if let Some(profile) = user_profile.filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(profile));
+    }
+    #[cfg(not(windows))]
+    let _ = user_profile;
+    None
+}
+
+/// What [`RuntimePaths::resolve`] says when it has no directory to use.
+///
+/// **It names the variables this build actually consults, and it used to name
+/// a fixed three.** The old text was `neither HOLDFAST_RUNTIME_DIR,
+/// XDG_RUNTIME_DIR, nor HOME is set`, and on Windows every part of that was
+/// unhelpful: `discover` passes `is_linux = false`, so `XDG_RUNTIME_DIR` is
+/// never read; `HOME` is a POSIX convention a native process does not have
+/// (measured — `cmd /c "echo %HOME%"` echoes the literal `%HOME%`); and
+/// `USERPROFILE`, the one variable that would resolve it, went unmentioned.
+/// An error that tells an operator to set two variables the code will not read
+/// while withholding the one it will is worse than a terse one, because it
+/// sends them somewhere the fix cannot be.
+///
+/// `is_linux` is the parameter `resolve` decides the XDG branch with rather
+/// than `cfg!(target_os = "linux")`, so the message cannot drift from the
+/// branch it describes. The home half is a `cfg!` because that is what
+/// [`home_from`] compiles the `USERPROFILE` arm under.
+fn not_found_message(is_linux: bool) -> String {
+    let mut names = vec![RUNTIME_DIR_ENV];
+    if is_linux {
+        names.push("XDG_RUNTIME_DIR");
+    }
+    names.push("HOME");
+    if cfg!(windows) {
+        names.push("USERPROFILE");
+    }
+    format!(
+        "none of {} is set, so there is no directory to hold this instance's \
+         sockets and logs. Set {RUNTIME_DIR_ENV} to place it explicitly.",
+        names.join(", ")
+    )
+}
+
+/// **`open_log_append`'s cross-platform half, and the reason this module is
+/// not `#[cfg(all(test, unix))]` either.**
+///
+/// The pre-PR review measured four mutations of this file's `#[cfg(windows)]`
+/// bodies and all four SURVIVED both CI gates — `windows-cross` is
+/// `cargo clippy`, which type-checks and never links, and no job ran a test
+/// on that target. The sharpest of the four turned the Windows arm's
+/// `.append(true)` into `.write(true).truncate(true)`, which zeroes the §9.4
+/// audit trail on every process start and on every post-rotation reopen, and
+/// nothing anywhere went red.
+///
+/// Two of that function's three obligations do not depend on mode bits at
+/// all — it must CREATE the parent directory, and it must APPEND rather than
+/// truncate — so they are asserted here, on every target, against whichever
+/// arm this build compiled. Only the mode application stays untestable off
+/// Unix. That is the review's own suggested shape: assert the shared contract
+/// once cross-platform and leave just the `#[cfg]`-dependent part behind.
+#[cfg(test)]
+mod log_append_tests {
+    use super::open_log_append;
+    use std::io::Write;
+
+    /// A scratch path under the system temp dir, so this runs identically on
+    /// both platforms — `/tmp` is not a Windows path and `sun_path`'s length
+    /// limit, which forces `/tmp` elsewhere in this file, is irrelevant here
+    /// because nothing binds a socket.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        std::env::temp_dir().join(format!("holdfast-log-{tag}-{}", &unique[..8]))
+    }
+
+    #[test]
+    fn it_creates_the_parent_directory_it_was_given() {
+        let dir = scratch("mkparent");
+        let path = dir.join("nested").join("audit.log");
+        assert!(!path.exists(), "fixture must start absent");
+
+        let file = open_log_append(&path).expect("open_log_append creates its parent");
+        drop(file);
+
+        assert!(path.is_file(), "the log itself was not created at {path:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn it_appends_and_does_not_truncate_what_is_already_there() {
+        // **The mutation this exists for.** `.write(true).truncate(true)`
+        // passes every other assertion in this file and silently empties the
+        // audit trail; only reading back across two opens can see it.
+        let dir = scratch("append");
+        let path = dir.join("audit.log");
+
+        let mut first = open_log_append(&path).expect("first open");
+        first.write_all(b"line one\n").expect("first write");
+        drop(first);
+
+        let mut second = open_log_append(&path).expect("second open");
+        second.write_all(b"line two\n").expect("second write");
+        drop(second);
+
+        let got = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            got, "line one\nline two\n",
+            "the reopen truncated the trail instead of appending to it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// **Its own module, and NOT `#[cfg(all(test, unix))]` like the big one at the
+/// bottom of this file.** The whole point of [`home_from`] is what it does on
+/// a target that is not Unix, so gating its tests the way the mode-bit tests
+/// are gated would leave the Windows arm asserted by nothing — which is the
+/// exact shape #19 was fixing. These need no mode bits, no umask and no
+/// filesystem, so nothing stops them running everywhere.
+///
+/// It also holds the two rows that are about the same variable set but not
+/// about `home_from`: [`home_dir`], the wrapper that decides which variable
+/// goes in which argument, and the `NotFound` message `resolve` prints when
+/// none of them answered. Both have to be asserted per-platform, which is what
+/// this module is for.
+#[cfg(test)]
+mod home_tests {
+    use super::home_from;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn os(s: &str) -> Option<OsString> {
+        Some(OsString::from(s))
+    }
+
+    #[test]
+    fn home_wins_wherever_it_is_set() {
+        // The claim that a Windows user who exports `HOME` — MSYS2 and Git
+        // Bash both do — keeps the instance they already had instead of
+        // silently acquiring a second one under `%USERPROFILE%`.
+        assert_eq!(
+            home_from(os("/home/ada"), os(r"C:\Users\ada")),
+            Some(PathBuf::from("/home/ada"))
+        );
+    }
+
+    #[test]
+    fn user_profile_is_the_windows_fallback_and_is_ignored_everywhere_else() {
+        // **The separating negative, and it is the whole test.** Asserting
+        // only that this returns `Some` on Windows would pass against a
+        // fallback wired up on every platform, which would change where a
+        // Unix box with no `HOME` puts its audit trail. The answer has to
+        // DIFFER by platform, so the expectation is written from `cfg!`.
+        let got = home_from(None, os(r"C:\Users\ada"));
+        if cfg!(windows) {
+            assert_eq!(got, Some(PathBuf::from(r"C:\Users\ada")));
+        } else {
+            assert_eq!(
+                got, None,
+                "USERPROFILE is a Windows convention and must not move a Unix instance"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_set_is_none_on_every_platform() {
+        // `resolve` turns this into a `NotFound` that names the variables
+        // *this platform* consults — not the fixed three it used to name,
+        // which on Windows was two the code never reads and omitted the one
+        // it does. `the_not_found_error_names_the_variables_this_platform_consults`
+        // pins that; the empty-string rule lives in both places, for the two
+        // different jobs the note on `home_dir` sets out.
+        assert_eq!(home_from(None, None), None);
+    }
+
+    #[test]
+    fn an_empty_home_does_not_answer_and_user_profile_still_gets_its_turn() {
+        // **The composition failure, and it is a product bug rather than a
+        // tidiness one.** `HOME=""` was taken as an answer, so on Windows
+        // `%USERPROFILE%` was never consulted, `resolve` refused the empty
+        // string, and `serve_stdio`'s `.ok()` turned that into `holdfast mcp`
+        // running with no §9.4 audit trail — silently, which is the state the
+        // `USERPROFILE` fallback exists to prevent.
+        //
+        // Asserted from `cfg!` like the row above, for the same reason: the
+        // answer must DIFFER by platform, or a fallback wired up everywhere
+        // would move a Unix instance's audit trail.
+        let got = home_from(os(""), os(r"C:\Users\ada"));
+        if cfg!(windows) {
+            assert_eq!(
+                got,
+                Some(PathBuf::from(r"C:\Users\ada")),
+                "an exported-but-empty HOME must not shadow %USERPROFILE%"
+            );
+        } else {
+            assert_eq!(
+                got, None,
+                "USERPROFILE is a Windows convention and must not move a Unix instance"
+            );
+        }
+
+        // Unix is unaffected in *behaviour* — `HOME=""` already meant "no
+        // home" there, because there was no second source to fall through to
+        // — but it is covered, because that is what makes the row above a
+        // statement about precedence rather than about Windows.
+        assert_eq!(home_from(os(""), None), None);
+        assert_eq!(
+            home_from(os(""), os("")),
+            None,
+            "two empty variables are two non-answers, on every platform"
+        );
+    }
+
+    #[test]
+    fn the_not_found_error_names_the_variables_this_platform_consults() {
+        use super::{RuntimePaths, RUNTIME_DIR_ENV};
+
+        // Cross-platform, and in this module rather than beside the other
+        // `resolve` tests, because the claim is about *which home variable*
+        // the platform reads — the same claim the rest of this module is
+        // about. `resolve` with no home is pure path arithmetic: no
+        // filesystem, no mode bits, nothing to gate on Unix.
+        for is_linux in [true, false] {
+            let msg = RuntimePaths::resolve(None, None, None, is_linux, false)
+                .expect_err("no override and no home is not resolvable")
+                .to_string();
+            assert!(
+                msg.contains(RUNTIME_DIR_ENV),
+                "the error must name the escape hatch: {msg}"
+            );
+            assert!(msg.contains("HOME"), "{msg}");
+            // The two that are decided rather than always-on. `XDG_RUNTIME_DIR`
+            // is only read on the branch `is_linux` selects, and naming it off
+            // that branch sends a Windows or macOS operator to a variable
+            // `resolve` will not look at.
+            assert_eq!(
+                msg.contains("XDG_RUNTIME_DIR"),
+                is_linux,
+                "XDG_RUNTIME_DIR is named exactly when it is consulted (is_linux={is_linux}): {msg}"
+            );
+            // And the one whose absence was the finding: on Windows
+            // `%USERPROFILE%` is the variable that fixes this error, and the
+            // message did not mention it.
+            assert_eq!(
+                msg.contains("USERPROFILE"),
+                cfg!(windows),
+                "USERPROFILE is the Windows fix for this error and a Unix red herring: {msg}"
+            );
+        }
+    }
+
+    /// Set on the child in
+    /// `home_dir_reads_home_first_and_user_profile_only_as_a_fallback`.
+    const CHILD_ENV: &str = "HOLDFAST_TEST_HOME_DIR_CHILD";
+    /// The answer the parent expects out of it; empty means `None`.
+    const WANT_ENV: &str = "HOLDFAST_TEST_HOME_DIR_WANT";
+    /// Where the child records that it ran, so the parent can tell "the
+    /// assertion held" from "`--exact` matched nothing" — which libtest
+    /// reports as a *successful* run of zero tests, and which would otherwise
+    /// read as a pass.
+    ///
+    /// A file rather than a line on stdout, and not by preference: this crate
+    /// denies `clippy::print_stdout` at the root and `tests/source_guards.rs`
+    /// scans for both the macro and an `#[allow]` beside one, because under
+    /// `holdfast mcp` stdout is the JSON-RPC wire. A test module is still this
+    /// crate's source. It is also the sturdier signal — it does not depend on
+    /// `--nocapture`, and it cannot be confused with libtest's own report.
+    const REPORT_ENV: &str = "HOLDFAST_TEST_HOME_DIR_REPORT";
+    const CHILD_RAN: &str = "holdfast-home-dir-child-ran";
+    const CHILD_TEST: &str =
+        "daemon::paths::home_tests::the_child_that_reports_home_dir_under_a_given_environment";
+
+    /// **`home_dir` itself, which every row above leaves uncovered.** They
+    /// all call `home_from` with literals; the wrapper that decides *which
+    /// variable goes in which argument* was asserted by nothing. Measured
+    /// before this existed: swapping its two arguments survived the whole
+    /// core lib suite, the `daemon_cli` suite and clippy `-D warnings`, while
+    /// breaking the product on every platform — a Unix box with only `HOME`
+    /// set then finds no runtime directory at all.
+    ///
+    /// **A subprocess rather than `set_var`.** The environment is
+    /// process-global and libtest runs tests in threads, so setting `HOME`
+    /// here would set it for every other test at the same time — the hazard
+    /// `resolve`, `home_from` and `config_path_from` were all split out to
+    /// avoid. Reading the *ambient* environment instead would work on this
+    /// machine and go vacuous wherever `HOME` and `USERPROFILE` happen to
+    /// agree or both be absent, which is a test that reports coverage it does
+    /// not have. A child gets an environment we choose outright, and it is the
+    /// pattern `diag`'s `nothing_reaches_daemon_log_unredacted_not_even_a_panic`
+    /// already uses here.
+    #[test]
+    fn home_dir_reads_home_first_and_user_profile_only_as_a_fallback() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // We *are* the child, re-entered under a different test name.
+            return;
+        }
+
+        // `(HOME, USERPROFILE)`, as the child's real environment will have
+        // them; `None` removes the variable, `Some("")` exports it empty.
+        let cases: [(Option<&str>, Option<&str>); 4] = [
+            // Both set: the row that kills an argument swap on every
+            // platform, because the two answers differ.
+            (Some("/home/ada"), Some(r"C:\Users\ada")),
+            (None, Some(r"C:\Users\ada")),
+            // The Finding-1 shape, end to end through the real environment.
+            (Some(""), Some(r"C:\Users\ada")),
+            (None, None),
+        ];
+
+        for (home, user_profile) in cases {
+            let want = match (
+                home.filter(|h| !h.is_empty()),
+                user_profile.filter(|p| !p.is_empty()),
+            ) {
+                (Some(h), _) => Some(h),
+                (None, Some(p)) if cfg!(windows) => Some(p),
+                _ => None,
+            };
+
+            let report = std::env::temp_dir().join(format!(
+                "holdfast-t-homedir-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            ));
+            struct Scoped(PathBuf);
+            impl Drop for Scoped {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+            }
+            let _scoped = Scoped(report.clone());
+
+            let mut cmd = std::process::Command::new(
+                std::env::current_exe().expect("this test binary's own path"),
+            );
+            cmd.arg(CHILD_TEST)
+                .arg("--exact")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .env(REPORT_ENV, &report)
+                .env(WANT_ENV, want.unwrap_or_default());
+            // Note for a Windows reader: `CreateProcess` treats an empty
+            // value as a deletion, so the `Some("")` row degenerates to the
+            // removed one there. Both expect the same answer, so it is weaker
+            // on Windows rather than wrong.
+            if let Some(h) = home {
+                cmd.env("HOME", h);
+            } else {
+                cmd.env_remove("HOME");
+            }
+            if let Some(p) = user_profile {
+                cmd.env("USERPROFILE", p);
+            } else {
+                cmd.env_remove("USERPROFILE");
+            }
+
+            let out = cmd.output().expect("re-exec this test binary");
+            let reported = std::fs::read_to_string(&report).unwrap_or_default();
+            let ctx = format!(
+                "HOME={home:?} USERPROFILE={user_profile:?}, expected {want:?}\
+                 \n--- child report ---\n{reported}\n--- child stdout ---\n{}\
+                 \n--- child stderr ---\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                reported.contains(CHILD_RAN),
+                "the child never ran, so this row asserted nothing: `--exact \
+                 {CHILD_TEST}` matched no test, which libtest reports as a green \
+                 run of zero tests. Did the child get renamed? {ctx}"
+            );
+            assert!(out.status.success(), "child exited {}: {ctx}", out.status);
+        }
+    }
+
+    /// The other half of the test above; a no-op unless re-entered as a
+    /// child, so the ordinary suite runs it and it costs nothing.
+    #[test]
+    fn the_child_that_reports_home_dir_under_a_given_environment() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+        let want = std::env::var(WANT_ENV).unwrap_or_default();
+        let want = (!want.is_empty()).then(|| PathBuf::from(want));
+        let got = super::home_dir();
+        // Written before the assertion, so the parent sees it whether the row
+        // held or not — its absence must mean "did not run", never "failed".
+        if let Some(report) = std::env::var_os(REPORT_ENV) {
+            std::fs::write(report, format!("{CHILD_RAN} got={got:?} want={want:?}"))
+                .expect("record that this child ran");
+        }
+        assert_eq!(
+            got,
+            want,
+            "HOME={:?} USERPROFILE={:?}",
+            std::env::var_os("HOME"),
+            std::env::var_os("USERPROFILE")
+        );
     }
 }
 
@@ -361,12 +883,9 @@ impl RuntimePaths {
         // second spelling. The second spelling is gone and the guard moved
         // to the one that remains, so every caller gets it rather than the
         // one that happened to be written by someone who thought of it.
-        let home = home.filter(|h| !h.as_os_str().is_empty()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("neither {RUNTIME_DIR_ENV}, XDG_RUNTIME_DIR, nor HOME is set"),
-            )
-        });
+        let home = home
+            .filter(|h| !h.as_os_str().is_empty())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, not_found_message(is_linux)));
 
         // §19.1: the daemon log lives in `~/.holdfast/logs` whenever the
         // instance is the default one, whatever the runtime directory is.
@@ -419,7 +938,7 @@ impl RuntimePaths {
         Self::resolve(
             std::env::var_os(RUNTIME_DIR_ENV).map(PathBuf::from),
             std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
-            std::env::var_os("HOME").map(PathBuf::from),
+            home_dir(),
             cfg!(target_os = "linux"),
             cfg!(target_os = "macos"),
         )
@@ -689,6 +1208,7 @@ enum Writable {
 ///
 /// `DIR_MODE` is umask-proof by construction: `0700` has no group or other
 /// bits for a umask to clear, so the assertion holds under any of them.
+#[cfg(unix)]
 fn create_owner_only(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
@@ -697,9 +1217,33 @@ fn create_owner_only(dir: &Path) -> io::Result<()> {
         .create(dir)
 }
 
-fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+/// The Windows arm: created with the inherited ACL, and named the same on
+/// purpose so every caller reads identically. It is **not** owner-only by
+/// construction here — see `open_log_append`'s Windows arm for why that is
+/// warned about rather than refused.
+#[cfg(windows)]
+fn create_owner_only(dir: &Path) -> io::Result<()> {
+    warn_inherited_acl_once();
+    std::fs::DirBuilder::new().recursive(true).create(dir)
+}
 
+fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
+    // **The symlink refusal below is cross-platform in this function, and
+    // that is NOT the same as being in force on Windows.** It is the half
+    // that does not depend on mode bits: `symlink_metadata` follows no link
+    // on either platform, and a planted `logs -> /elsewhere` redirects the
+    // §9.4 trail just as effectively there. Only the mode inspection and the
+    // tighten are Unix-gated, at the bottom.
+    //
+    // But every production caller of this function is inside `daemon::spawn`
+    // or `daemon::server`, both `#[cfg(unix)]`, so on a Windows build nothing
+    // reaches it: `open_log_append`'s Windows arm creates the parent with a
+    // bare `DirBuilder` and a junction at `~/.holdfast/logs` goes unchecked.
+    // The Unix `open_log_append` has the same gap, so this is pre-existing in
+    // kind rather than introduced here — but the honest claim is "kept
+    // compiling", not "kept in force". Closing it means routing
+    // `open_log_append` through this function on both platforms, which is a
+    // change to the Unix path and does not belong in a Windows fix.
     // `symlink_metadata`, not `exists()` and `metadata`: both of those
     // follow a link, and every decision below acts on what they report.
     // A planted `logs -> /elsewhere` would be chmodded at its *target*
@@ -730,31 +1274,44 @@ fn ensure_owner_only(dir: &Path, writable: Writable) -> io::Result<()> {
     // link swapped in after this check is not caught. Closing that needs
     // `openat(O_DIRECTORY|O_NOFOLLOW)` plus `fchmod`, which is worth
     // doing and is not this change.
-    let mode = md.permissions().mode() & 0o777;
-    if writable == Writable::Refuse && mode & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{d} is mode {mode:o}: group/world-writable, so another local user may \
-                 already have planted entries inside it. Refusing rather than tightening \
-                 — a chmod does not undo what is already there. Check what is inside it, \
-                 then `chmod 700 {d}`; or set {RUNTIME_DIR_ENV} to run this instance from \
-                 a directory somewhere else.",
-                d = dir.display()
-            ),
-        ));
+    #[cfg(windows)]
+    {
+        // No mode to inspect and none to tighten to, so both decisions
+        // below are unreachable here. `writable` is consumed so `-D
+        // warnings` does not flag it, and the fact that its refusal has no
+        // analogue on this platform is exactly what the warning says.
+        let _ = writable;
+        warn_inherited_acl_once();
     }
-    if mode != DIR_MODE {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DIR_MODE))?;
-        let after = std::fs::metadata(dir)?.permissions().mode() & 0o777;
-        if after != DIR_MODE {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = md.permissions().mode() & 0o777;
+        if writable == Writable::Refuse && mode & 0o022 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "{} is mode {after:o}, and could not be tightened to {DIR_MODE:o}",
-                    dir.display()
+                    "{d} is mode {mode:o}: group/world-writable, so another local user may \
+                     already have planted entries inside it. Refusing rather than tightening \
+                     — a chmod does not undo what is already there. Check what is inside it, \
+                     then `chmod 700 {d}`; or set {RUNTIME_DIR_ENV} to run this instance from \
+                     a directory somewhere else.",
+                    d = dir.display()
                 ),
             ));
+        }
+        if mode != DIR_MODE {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DIR_MODE))?;
+            let after = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+            if after != DIR_MODE {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} is mode {after:o}, and could not be tightened to {DIR_MODE:o}",
+                        dir.display()
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -769,7 +1326,16 @@ fn log_dir_or_err(log_dir: PathBuf, home: &io::Result<PathBuf>) -> io::Result<Pa
     }
 }
 
-#[cfg(test)]
+// **The whole module, not the failing rows.** Every test here asserts a mode
+// bit — `DirBuilder::mode`, `Permissions::from_mode`, the umask forced below
+// — because that is what this module does. Gating them row by row would leave
+// a handful that pass for want of anything to check, which reads as coverage
+// and is not. `RuntimePaths`'s pure path arithmetic is worth testing on
+// Windows and is not tested here today; splitting it out is a follow-up, not
+// something to fake with a `#[cfg]`. Tracked in
+// [#90](https://github.com/Sertelegger/holdfast/issues/90) rather than in
+// #19, which the branch closes.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
