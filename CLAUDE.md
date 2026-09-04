@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**HOLDFAST** (Human-Observable Long-lived Daemon For Agent Shell Terminals) — An MCP server that gives AI agents a persistent, PTY-backed shell environment. "Human-Observable" is the design intent; the attach/watch/UI surfaces that would make it true are 0.0.6 and later. Solves the problem that Claude Code's Bash tool runs non-interactive, isolated processes with no PTY, no stdin, and no session persistence.
+**HOLDFAST** (Human-Observable Long-lived Daemon For Agent Shell Terminals) — An MCP server that gives AI agents a persistent, PTY-backed shell environment. "Human-Observable" is partly shipped: `attach` and `watch` landed in 0.0.6, and the web UI is still ahead. Solves the problem that Claude Code's Bash tool runs non-interactive, isolated processes with no PTY, no stdin, and no session persistence.
 
 **Framing:** Holdfast gives the agent a persistent shell environment, the way tmux gives a developer one.
 
 ## Project Status
 
-**Phase: implementation, milestone 0.0.7 (secrets). `v0.0.6` is the newest tag; 0.0.7's work sits under `[Unreleased]` in the CHANGELOG.**
+**Phase: implementation. `v0.0.7` (secrets) is the newest tag and is released — `CHANGELOG.md` carries it as `## [0.0.7] — 2026-09-01`, and the workspace version is `0.0.7`. Work since sits under `[Unreleased]`: the GH #19 Windows-compile fix and the `windows-2022` CI job. This line read "milestone 0.0.7 (secrets). `v0.0.6` is the newest tag; 0.0.7's work sits under `[Unreleased]`" after 0.0.7 shipped — a status block goes stale by default, so check `git tag --list` against the CHANGELOG's own version headings rather than trusting it.**
 
 **Read `CHANGELOG.md` and `ROADMAP.md`'s "Where it is now" for the current surface — not this file.** The scope list below is the v0.1.0 *plan*, and a plan is not a description of what exists. `scripts/mcp-smoke.sh` holds the authoritative tool list and asserts it exactly; when prose here and that assertion disagree, the assertion is right.
 

@@ -27,6 +27,15 @@ pub struct Capabilities {
     pub out_of_band_secret_input: bool,
 }
 
+// **Hand-written on purpose, and clippy is right only on one target.**
+// `cfg!(unix)` folds to `false` on Windows, which is `bool::default()`, so
+// `derivable_impls` fires there and nowhere else — the lint is reading a
+// coincidence of this build rather than the shape of the type. Deriving
+// would also make the answer depend on each field's `Default` instead of on
+// the platform, so the next capability added would come out `false` on Unix
+// too, silently. The `allow` is scoped to this impl rather than the module
+// so it cannot cover a genuinely derivable one added later.
+#[allow(clippy::derivable_impls)]
 impl Default for Capabilities {
     fn default() -> Self {
         Self {

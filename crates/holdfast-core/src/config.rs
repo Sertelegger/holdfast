@@ -142,10 +142,25 @@ fn redacted(message: &str) -> String {
 ///
 /// `None` when neither variable is set, which is the same as "no file":
 /// a process with no home is not a misconfigured one.
+/// `HOME` is read through `daemon::paths::home_dir`, which falls back to
+/// `USERPROFILE` on Windows — the same one answer `RuntimePaths` uses, so a
+/// Windows install cannot end up reading its config from one home and
+/// writing its logs under another.
+///
+/// **That shared answer is also where the empty-`HOME` case is decided, and it
+/// was decided wrongly until the PR 87 review.** `home_dir` took an
+/// exported-but-empty `HOME` as an answer, so `%USERPROFILE%` was never
+/// consulted and this function returned `None` on a Windows box that had a
+/// perfectly good home — the config file silently ignored, on the same machine
+/// and for the same reason its audit trail was. The rule now lives in
+/// `home_dir` too; see the note there for why `resolve`'s copy of it could not
+/// stand in. The empty check below stays, because it answers a different
+/// question — "the home we were handed is unusable as a base", which is still
+/// reachable on a platform with no fallback to fall through to.
 pub fn config_path() -> Option<PathBuf> {
     config_path_from(
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        crate::daemon::paths::home_dir(),
     )
 }
 
@@ -193,13 +208,24 @@ pub fn load() -> Result<Config, ConfigError> {
 /// set.
 pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
 
-    let mut file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
+    // **The flag is Unix-only because the hazard is.** `O_NONBLOCK` is here
+    // to stop a config path aimed at a fifo hanging startup in the kernel
+    // before `trust_verdict` gets a turn. Windows has no fifo reachable
+    // this way — a named pipe lives under `\\.\pipe\` and is not something
+    // `OpenOptions::open` on a `config.toml` path resolves to — so there is
+    // no equivalent open to defuse, and `FILE_FLAG_OVERLAPPED` (which is
+    // what `custom_flags` would take there) is a different thing entirely
+    // and would be wrong to set.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+
+    let mut file = match opts.open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(source) => return Err(io_error(path, source)),
@@ -225,10 +251,11 @@ fn io_error(path: &Path, source: std::io::Error) -> ConfigError {
 /// verdict itself can be tested against ownerships an unprivileged test
 /// process cannot create.
 ///
-/// Unix-only, as this crate already is (`daemon::paths` and
-/// `daemon::peer` both reach for `std::os::unix` unconditionally). A
-/// Windows port owes this function an ACL-shaped answer, not a `#[cfg]`
-/// that returns "trusted".
+/// A Windows port owes this function an ACL-shaped answer, not a `#[cfg]`
+/// that returns "trusted". That debt is **still owed** — see the Windows
+/// arm below, which returns "trusted" and says so out loud rather than
+/// silently, which is the most this milestone can honestly do.
+#[cfg(unix)]
 fn untrusted_reason(meta: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     trust_verdict(
@@ -237,6 +264,31 @@ fn untrusted_reason(meta: &std::fs::Metadata) -> Option<String> {
         meta.mode() & 0o777,
         crate::daemon::peer::current_uid(),
     )
+}
+
+/// **The `#[cfg]` the doc above warns against, made non-silent.**
+///
+/// There is no honest Windows answer here yet: `trust_verdict` asks "is
+/// this file owned by me, and is it not group- or world-writable", and both
+/// halves are mode-and-uid questions with no `std` equivalent — the real
+/// answer needs `GetSecurityInfo` and a walk of the DACL against the
+/// process token's SID, which is 0.0.11's and is not something to improvise
+/// inside a `#[cfg]`.
+///
+/// So this returns `None`, meaning trusted, and raises the one-shot warning
+/// that says the check did not run. Refusing instead was considered and
+/// rejected: it would make `config.toml` unreadable on Windows, which turns
+/// an unenforced check into an unusable product. The file still has to be
+/// a regular file — that half *is* answerable — so a directory or a device
+/// is still refused here, and only the ownership and permission clauses go
+/// unchecked.
+#[cfg(windows)]
+fn untrusted_reason(meta: &std::fs::Metadata) -> Option<String> {
+    crate::daemon::paths::warn_inherited_acl_once();
+    if !meta.is_file() {
+        return Some("not a regular file".to_string());
+    }
+    None
 }
 
 /// Whether this process will read `config.toml`, given what `fstat` says
@@ -285,6 +337,20 @@ fn untrusted_reason(meta: &std::fs::Metadata) -> Option<String> {
 ///   `0775` `~/.holdfast/logs` and had to take back. World-writable has no
 ///   such benign origin — it wants `umask 000` or a deliberate `chmod` —
 ///   and it means any local user can rewrite the file.
+// **Unused on Windows, and kept COMPILED there anyway — not tested there.**
+// Only the Unix `untrusted_reason` calls it (the Windows arm has no uid or
+// mode to pass), so `dead_code` fires on that target alone. It stays because
+// it is a pure function of four scalars whose tests *are* the specification
+// of the trust rule: `#[cfg(unix)]`-ing it would take the rule's definition
+// off Windows, not just its application, and 0.0.11's ACL answer has to be
+// written against that definition.
+//
+// An earlier revision of this comment said "compiled and tested there", which
+// was false and is the kind of false this project cares about: its tests live
+// in a `#[cfg(test)]` module that the `windows-native` job does not run —
+// that job runs `source_guards` and the CLI arms, not `--lib`. On Windows
+// this function is type-checked and nothing more.
+#[cfg_attr(windows, allow(dead_code))]
 fn trust_verdict(is_file: bool, uid: u32, mode: u32, euid: u32) -> Option<String> {
     if !is_file {
         return Some(
@@ -2784,6 +2850,18 @@ reference = \"db/prod\"
             Some(PathBuf::from("/h/.config/holdfast/config.toml")),
         );
         assert_eq!(config_path_from(None, None), None);
+        // And an empty `HOME` is not an empty base either, which nothing
+        // asserted until the PR 87 review — `PathBuf::from("").join(".config")`
+        // is the *relative* `.config`, so the config file would be read from
+        // whatever directory the process happened to start in. `None` is the
+        // honest answer: a process with no home is not a misconfigured one.
+        //
+        // Whether an empty `HOME` gets this far is `daemon::paths::home_dir`'s
+        // decision, not this one — on Windows it now falls through to
+        // `%USERPROFILE%` and never reaches here. This guard is the platform
+        // where there is nothing to fall through to.
+        assert_eq!(config_path_from(None, Some("".into())), None);
+        assert_eq!(config_path_from(Some("".into()), Some("".into())), None);
     }
 
     #[test]
@@ -2884,6 +2962,7 @@ reference = \"db/prod\"
 
     // ------------------------------------ the file itself as a trust boundary
 
+    #[cfg(unix)]
     /// The half of the check that a stock install has to survive, paired
     /// with the half that has to fire. Without the pairing, a `load_from`
     /// that refused *every* file passes the refusal row perfectly.
@@ -2931,6 +3010,7 @@ reference = \"db/prod\"
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_config_path_that_resolves_to_a_device_is_refused_and_one_that_resolves_to_a_file_is_not() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2960,6 +3040,7 @@ reference = \"db/prod\"
         assert_eq!(cfg.limits.max_concurrent_sessions, 5);
     }
 
+    #[cfg(unix)]
     /// The fifo, which the regular-file question alone does not reach.
     ///
     /// Bounded, and here the **timeout is the evidence** rather than a

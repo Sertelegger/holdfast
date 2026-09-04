@@ -106,6 +106,24 @@
 //! | §11.4 Web secret endpoint `request_id` binding (`409 conflict`) | **0.0.10** — `SecretSlots::matches_outstanding` is exported for it to call; the HTTP rendering is not written |
 //! | §11.3 Windows `not_supported_on_platform` on a **Windows runner** | **0.0.11** — [`an_unsupported_platform_returns_before_allocating_anything`] asserts the same code path on Unix through a forced capability, which is the Unix half and not the runner assertion |
 
+// Unix-only, like `crates/holdfast/tests/attach_cli.rs`. Everything below drives a real
+// daemon over a Unix socket, and §3.3/§3.6 give Windows native neither —
+// `holdfast-core`'s `daemon::{attach_server, peer, server, spawn}` are
+// `#[cfg(unix)]` from #19 on, so these targets have nothing to link
+// against there rather than nothing to say.
+//
+// **Named per module, and NOT as `daemon`, which is what this comment
+// said until PR #87's review.** `daemon::paths` is deliberately ungated —
+// the argument is in `src/daemon/mod.rs`, which calls that asymmetry the
+// whole shape of the module on Windows — so "the `daemon` module is
+// `#[cfg(unix)]`" is false, and false in the direction that makes a real
+// gate look vacuous: `ci.yml`'s `windows-native` job runs a filtered
+// `--lib` over `daemon::paths::{home_tests, log_append_tests}` and
+// asserts a floor on how many rows ran, which is only reachable because
+// `paths` compiles on Windows. `tests/wire_shape.rs` had the form right,
+// naming `daemon::server` rather than its parent.
+#![cfg(unix)]
+
 use holdfast_core::attach::frames::{
     decode_server_frame, ApprovalDecision, ClientFrame, ServerFrame,
 };

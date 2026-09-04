@@ -17,12 +17,16 @@
 #      rather than Holdfast. Measured on the 2-vCPU runner: the sampling loop
 #      gets 13 turns in three seconds instead of ~590, `percentile(0.99)`
 #      of thirteen samples IS the maximum, and one 500.89 ms scheduling
-#      stall failed a 500 ms budget. GitHub's standard hosted runners are
-#      2-core on a private repository — which this one is — so on this
-#      pipeline that assertion has NEVER run and will not until the runner
-#      grows. The row still runs, still guards its other two assertions,
-#      and still reports `ok`; the census counted zero skips, truthfully
-#      and uselessly, because it had no vocabulary for this.
+#      stall failed a 500 ms budget. That measurement was taken while this
+#      repository was private, on the 2-core standard runner private repos
+#      get; **it went public on 2026-09-02**, which raises the standard
+#      runner to 4 cores and changes NOTHING here, because the gate demands
+#      8. So the numbers a fresh CI log reports are a 4-core box's, and on
+#      this pipeline that assertion has still NEVER run and will not until
+#      the runner grows past the gate. The row still runs, still guards its
+#      other two assertions, and still reports `ok`; the census counted zero
+#      skips, truthfully and uselessly, because it had no vocabulary for
+#      this.
 #
 # THE TWO MARKERS, and why they are deliberately different strings:
 #
@@ -70,9 +74,11 @@
 #     below.
 #
 # STRICTNESS, and why exactly one of the six rules has any. The p99
-# exemption is a claim about a SMALL HOST. On the 2-core runner it is true
-# and the marker appears; on a 48-core workstation the assertion runs and
-# the marker correctly does not, and failing there would paint every
+# exemption is a claim about a SMALL HOST. On a hosted runner — 2 cores
+# while this repository was private, 4 since it went public, both under the
+# gate — it is true and the marker appears; on a 48-core workstation the
+# assertion runs and the marker correctly does not, and failing there
+# would paint every
 # developer's local run red for behaving BETTER than CI — which is how a
 # script gets `|| true`-d. So the stale half of the gated census fails
 # where the exemption is claimed, and prints a NOTE elsewhere:
@@ -203,11 +209,13 @@ EXPECTED=(
 #   run passing vacuously) are unconditional and still guard on every host,
 #   so this entry exempts one assertion and not the row.
 #   RETIRED BY: a runner with >= 8 cores. GitHub's standard hosted runners
-#   are 2-core while this repository is private and 4-core once it is
-#   public, so going public does NOT retire it; a larger runner label, a
-#   self-hosted runner, or a lowered `P99_MIN_CORES` does. Any of those
-#   makes the marker stop appearing in CI, which fails the stale half
-#   below — delete this entry then, and the gate in
+#   are 2-core on a private repository and 4-core on a public one; this
+#   repository WENT PUBLIC on 2026-09-02, and that did not retire the entry
+#   — 4 is still under the 8 this gate demands, which is why `min_cores`
+#   stays where it is. A larger runner label, a self-hosted runner, or a
+#   lowered `P99_MIN_CORES` retires it. Any of those makes the marker stop
+#   appearing in CI, which fails the stale half below — delete this entry
+#   then, and the gate in
 #   crates/holdfast-core/tests/stress_write_path.rs with it.
 GATED_EXPECTED=(
   "stress_write_path::control_path_p99|tier_b_stays_off_and_the_control_path_stays_responsive_under_load|8"
@@ -589,7 +597,12 @@ self_test() {
   # are anchored against: `test result:` at column 0, the `---- NAME stdout
   # ----` banner `--show-output` prints for a PASSING test, and both
   # notices inside it. The `not-asserted: ` line below is the one a real
-  # 2-core run of this suite emits, copied verbatim.
+  # 2-core run of this suite emitted, copied verbatim — and it is left at
+  # `cores=2` rather than refreshed to the 4 a public repo's runner now
+  # reports, because a verbatim log is the point and every rule here treats
+  # the two identically: `gated-threshold` reads only `min_cores`, and
+  # `gated-incoherent` asks whether `cores < min_cores`, which 2 and 4 both
+  # are.
   #
   # ROW NAMES ARE THE REAL ONES, and that is not cosmetic. Until 2026-08-19
   # this fixture used an invented `a_fish_prompt_is_marked` and carried

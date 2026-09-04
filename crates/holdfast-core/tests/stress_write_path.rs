@@ -34,14 +34,15 @@ const P99_BUDGET: Duration = Duration::from_millis(500);
 /// machine that can carry the scenario §11.4 describes.
 ///
 /// **Measured, which is why the number is 8 and not a guess.** On
-/// `ubuntu-24.04` at 2 vCPU (the runner's size while this repo is private;
-/// 4 after it goes public), a hundred reader threads saturate both cores:
-/// the sampling loop gets **13** turns in three seconds instead of ~590,
-/// `percentile(0.99)` of thirteen samples *is* the maximum, and one
-/// 500.89 ms scheduling stall failed a 500 ms budget. That number
-/// describes the runner. The same code on 48 cores answers p50 = 3.9 us,
-/// p99 = 731 us, max = 1.09 ms — 684x inside the budget — which is what
-/// §4.2a predicts for Tier-A-only scanning and what this assertion is for.
+/// `ubuntu-24.04` at 2 vCPU — the runner this repo got while it was
+/// private; it went public on 2026-09-02 and now gets four — a hundred
+/// reader threads saturate both cores: the sampling loop gets **13** turns
+/// in three seconds instead of ~590, `percentile(0.99)` of thirteen
+/// samples *is* the maximum, and one 500.89 ms scheduling stall failed a
+/// 500 ms budget. That number describes the runner. The same code on 48
+/// cores answers p50 = 3.9 us, p99 = 731 us, max = 1.09 ms — 684x inside
+/// the budget — which is what §4.2a predicts for Tier-A-only scanning and
+/// what this assertion is for.
 ///
 /// Eight is comfortably above both runner sizes and at or below every
 /// development machine and self-hosted runner, so the assertion still runs

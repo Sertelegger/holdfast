@@ -1696,6 +1696,109 @@ async fn attaching_to_an_already_exited_session_ends_instead_of_hanging() {
     );
 }
 
+/// **A daemon is allowed to close the moment it has answered** (GH #39).
+///
+/// The intermittent above, made deterministic. Attaching to an
+/// already-exited session, the daemon writes §7.5's whole ending —
+/// `Attached { state: "Exited" }`, `SessionExited`, `Detached { reason:
+/// "session_exit" }` — and closes, because `forward_output` short-circuits
+/// on `!session.is_alive()` and has nothing to wait for. The client is
+/// meanwhile still installing two signal handlers, taking raw mode,
+/// spawning two readers and registering `SIGWINCH`, and only then sends
+/// its unsolicited startup `Resize`. Whether that write beats the close is
+/// a coin flip decided by machine speed: the live-daemon test above lost
+/// it 20 times out of 20 on one developer's machine and won it 20 out of
+/// 20 on another checkout of the same tree, which is exactly why #39 read
+/// as a flake and was misfiled as a timeout.
+///
+/// **`hold: ZERO` is what removes the coin flip.** The stub drops the
+/// socket as soon as the last reply is flushed, so the startup `Resize`
+/// always gets `EPIPE` and this row always exercises the losing side.
+/// Before the fix it failed with exit 2 and a blank terminal — the client
+/// returned `EXIT_UNREACHABLE` from a failed *write* while a complete and
+/// correct ending sat unread in its own receive buffer, and printed
+/// nothing on the way out.
+///
+/// Paired with the row below, which is the same close **without** the
+/// `Detached`: that one must still be exit 2, or this fix would have
+/// bought a clean ending by calling every broken connection clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_that_closes_the_instant_it_answers_still_delivers_its_ending() {
+    let replies = vec![
+        enc(&ServerFrame::Attached {
+            session_id: "sess_stub39a".into(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            state: "Exited".into(),
+            exit_code: Some(5),
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: 0,
+        }),
+        enc(&ServerFrame::SessionExited { code: 5 }),
+        enc(&ServerFrame::Detached {
+            reason: "session_exit".into(),
+        }),
+    ];
+    let stub = StubDaemon::start("closefast", replies, Duration::ZERO).await;
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_stub39a"], 80, 24);
+    assert_eq!(
+        term.wait_exit(15),
+        0,
+        "a daemon that delivered `Detached` before closing ended this \
+         attachment cleanly, however early it closed"
+    );
+    let seen = term.snapshot();
+    assert!(
+        contains(&seen, b"the session exited (5)"),
+        "the ending was already in the client's receive buffer and was \
+         never read:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+/// **The separating negative: a close with no `Detached` is still
+/// unreachable** (GH #39).
+///
+/// Identical to the row above but for the one frame that matters, so the
+/// difference in outcome is attributable to that frame and to nothing
+/// else — same stub, same `hold: ZERO`, same `EPIPE` on the same startup
+/// `Resize`. §7.5 guarantees a `Detached` before a clean close, so its
+/// absence is the daemon dying rather than finishing, and it has to stay
+/// `EXIT_UNREACHABLE`.
+///
+/// **And it has to say so.** The bug this pairs with was not only the
+/// wrong exit code, it was a silent one; the diagnostic is asserted here
+/// because exit 2 with an empty terminal is what made #39 take a
+/// bisect to misdiagnose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_that_closes_without_detaching_is_still_an_unreachable_daemon() {
+    let replies = vec![enc(&ServerFrame::Attached {
+        session_id: "sess_stub39b".into(),
+        name: None,
+        cols: 80,
+        rows: 24,
+        state: "Running".into(),
+        exit_code: None,
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: 0,
+    })];
+    let stub = StubDaemon::start("closerude", replies, Duration::ZERO).await;
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_stub39b"], 80, 24);
+    assert_eq!(
+        term.wait_exit(15),
+        2,
+        "a daemon that closed without `Detached` is gone, not finished"
+    );
+    let seen = term.snapshot();
+    assert!(
+        contains(&seen, b"the daemon closed the connection"),
+        "an unreachable daemon must name itself; exit 2 onto a blank \
+         terminal is the shape of GH #39:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
 /// **A resize drag prints one line, not one per frame** (GH #66).
 ///
 /// The report caught `holdfast attach` printing `107x56, 115x58, 104x55, …`

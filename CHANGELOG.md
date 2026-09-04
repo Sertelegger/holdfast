@@ -20,6 +20,132 @@ trigger as a side effect of writing release notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Windows build compiles again ([#19]).** `windows-cross` — the
+  `x86_64-pc-windows-gnu` clippy job — had been red on `main` since before
+  0.0.6, with 0 passes in its last 20 runs, while `ROADMAP.md` said the tree
+  was "kept compiling and clippy-clean" for that target. **27 of the 31
+  errors were in the daemon subsystem** — `daemon/spawn.rs` 10,
+  `daemon/server.rs` 7, `daemon/peer.rs` 5, `daemon/paths.rs` 3,
+  `daemon/attach_server.rs` 2 — which §3.3/§3.6 already say does not exist on
+  Windows. **The other four are not**: `config.rs` reaches for `std::os::unix`
+  twice and for `libc::O_NONBLOCK` once, in the mode-bit trust check, and
+  `protocol/client.rs` imports `tokio::net::UnixStream`. They are the same
+  `#[cfg]` class, so the fix is still compile-gating rather than porting — but
+  this entry claimed the 31 were *all* in the daemon subsystem, and that
+  universal is precisely what licenses the conclusion, so it is recorded as
+  the overstatement it was rather than quietly narrowed. The attribution was
+  re-measured at `origin/main` on 2026-09-03: `cargo clippy --lib -p
+  holdfast-core --target x86_64-pc-windows-gnu --message-format json` emits 31
+  `"level":"error"` messages, counted by the file of each one's primary span.
+  The "0 passes in its last 20 runs" figure is **not** re-checkable here: it
+  was read off the *previous* repository object's Actions history, and going
+  public by recreation did not carry that history over — `gh run list` in this
+  repository begins on 2026-09-02 and reports 12 runs in total as of
+  2026-09-03, none of them on `main`. The figure stays on the record as what
+  was measured; the JSON error counts above are the part a reader can
+  reproduce.
+- **`holdfast mcp` on Windows writes its audit trail again.** Runtime and
+  config discovery read `HOME` and the `XDG_*` variables only, and a native
+  Windows process has neither. `RuntimePaths::discover()` therefore failed,
+  `serve_stdio` swallowed the error, and the §9.4 trail was silently absent.
+  `USERPROFILE` is now the Windows fallback; `HOME` still wins where it is set
+  **to a non-empty value**, so an MSYS2 or Git Bash user keeps the instance
+  they already had. That qualifier is the fix and not a pedantry: `HOME=""`
+  counted as an answer, so `%USERPROFILE%` never got its turn, `resolve`
+  refused the empty path, `serve_stdio` swallowed the error with `.ok()`, and
+  `holdfast mcp` ran with no §9.4 audit trail on a machine that had a
+  perfectly good home — the exact state the fallback exists to prevent,
+  reached through the fallback. `config.toml` was ignored on the same machine
+  for the same reason. An empty variable is now one that did not answer, at
+  the point where the source is chosen rather than downstream of it.
+
+- **`holdfast attach` no longer discards an ending it has already been sent
+  ([#39]).** Attaching to a session that had already exited could end in exit
+  2 — `EXIT_UNREACHABLE` — onto a blank terminal, with nothing printed to say
+  why. The client sends one unsolicited startup `Resize` so the session
+  reflows to the new terminal; against a dead session the daemon has nothing
+  to wait for, so it writes §7.5's whole ending (`Attached`, `SessionExited`,
+  `Detached { reason: "session_exit" }`) and closes the socket while the
+  client is still installing signal handlers, taking raw mode and spawning its
+  readers. The `Resize` then hit `EPIPE` and the client returned
+  `EXIT_UNREACHABLE` **from a failed write**, throwing away a complete and
+  correct ending that was already sitting unread in its own receive buffer. A
+  peer that closed *after* answering is not a peer that cannot be reached.
+  That write is now best effort and the **reader** names the ending, which is
+  the only side that can tell the two apart: `Detached` is a clean exit 0, and
+  an EOF without one is still exit 2 — now with the diagnostic it always
+  should have had.
+
+- **The unreachable-daemon diagnostic was itself unreachable ([#39]).** Same
+  cause, found by the separating negative rather than by the report: because
+  the startup write returned before the frame loop ever ran, `"holdfast
+  attach: the daemon closed the connection"` could not be printed in the one
+  case it exists for. A genuinely dead daemon also exited 2 onto an empty
+  screen, so the two endings were indistinguishable to an operator — and the
+  message that would have distinguished them was dead code.
+
+- **#39 was tracked as an intermittent and was not one.** It is pinned now by
+  two rows that drive a stub daemon which closes the instant it answers, so
+  the race is removed from the reproduction instead of being raced: whether
+  the client's write beats the daemon's close is decided by machine speed, and
+  the split was near-total in both directions — 20 failures in 20 isolated
+  runs on one checkout, 0 in 20 on another of the same tree, and 0 in 5
+  whole-target runs where 26 neighbouring tests loaded the machine enough for
+  the client to win. A `git bisect` over that signal named a commit touching
+  only `.github/workflows/ci.yml`, which is the tell that it was measuring
+  scheduling noise rather than a change. `KNOWN-INTERMITTENTS.md` carries the
+  full record, including the two earlier diagnoses that were wrong.
+
+### Changed
+
+- **On Windows native, seven subcommands now refuse with exit 64** and a
+  message naming §3.6: `daemon run`, `daemon start`, `daemon status`, `list`,
+  `logs`, `attach` and `watch`. All seven share one message, emitted from a
+  single line — `attach` and `watch` previously carried hand-rolled copies, so
+  rewording either changed a user-visible string with nothing to catch it.
+  `list` and `logs` additionally name the MCP tool that *does* answer them here
+  (`list_sessions`, `read_output`) rather than sending everyone to WSL; that
+  knowledge was in the source and stopped there.
+
+  `daemon stop` exits **0** with "no daemon running", because §3.2 makes it
+  idempotent and on this platform that is the only case — a teardown script may
+  run it unconditionally. `daemon status --json` still prints a JSON object
+  (`{"running": false, "supported": false, "reason": …}`) before exiting 64:
+  `--json` is a promise to a program, and empty stdout gave a caller no way to
+  tell "no daemon here, ever" from "the command is broken". `running: false` is
+  the same key the Unix down-path emits, so a consumer needs no Windows arm.
+
+  `holdfast mcp` does not refuse: stdio-only is the Windows transport, so it
+  serves in-process and says once that hybrid mode is unavailable and sessions
+  end with the process.
+- **Holdfast now warns rather than refuses about Windows file permissions.**
+  There are no mode bits to apply, so the runtime directory, logs and
+  `config.toml` are used with the ACL they inherit — owner, `SYSTEM` and
+  `Administrators` inside a normal user profile. One stderr warning per process
+  says so, and says that the config trust check (owner and mode) does not run.
+  An ACL-shaped answer is still owed.
+- **CI no longer skips itself on documentation-only changes.** `paths-ignore`
+  is removed from both of `ci.yml`'s triggers: a workflow filtered out at the
+  `on:` level posts no check run at all, so any *required* status check on it
+  would leave every docs-only pull request pending forever. Standard runners
+  are free on public repositories, so the filter bought nothing.
+- **A surviving mutant now fails the mutation sweep.** Its dated
+  `continue-on-error` calibration exemption is retired.
+
+### Added
+
+- **A `windows-2022` CI job.** Native MSVC clippy over `--all-targets`,
+  `tests/source_guards.rs`, the `#[cfg(windows)]` CLI arms *executed*, and a
+  **filtered `--lib`** naming the modules whose Windows arm differs from its
+  Unix one — the first job in this repository that runs Holdfast's own code on
+  Windows. That filter is not a convenience: it is the only gate anywhere that
+  kills the `.append(true)` → `.truncate(true)` mutation, which would zero the
+  §9.4 audit trail on every start. The **full** `--lib` is still not run: 55
+  of its tests spawn a real shell (measured natively at 721 passed / 55
+  failed, in three modules), and gating those is 0.0.11's.
+
 ### Security
 
 - **A refused `SecretInput` submission is now zeroed.** The two reject paths —
@@ -54,6 +180,34 @@ trigger as a side effect of writing release notes.
     specifically.
 
   Also filed from the same review: GH #84, #85 and #86.
+
+- `ci-hygiene.sh`'s dated calibration exemption was granted to any workflow
+  merely *mentioning* the marker, because the grep was unanchored — so a file
+  that documented the marker in a comment silently exempted itself from every
+  rule in that script, including the bans on `continue-on-error`, unpinned
+  actions and `secrets.` references. The marker must now BE a comment line
+  rather than appear in one, matching the anchoring `RELEASE-WORKFLOW` already
+  carried, and the mechanism has self-test coverage in all three directions.
+
+### For library consumers
+
+- `daemon::{server, spawn, peer, attach_server}`, `protocol::client` (and its
+  `ClientError` / `ControlClient` re-exports) and `mcp::shim` are `#[cfg(unix)]`
+  from this release. `daemon::paths`, `protocol::{frame, handshake, method}`
+  and everything else stay cross-platform: the wire shape is a claim about the
+  protocol, not about Unix.
+- **This is not a removal, and calling it one would overstate it.** Nothing
+  changes on Unix. On Windows `holdfast-core` did not compile at all before
+  this release — 31 errors, the same 31 the [#19] entry above attributes — so
+  there was no cross-compiling build for a consumer to lose; that target goes
+  from having no API to having this one. **This line read 32**, disagreeing
+  with that entry sixty lines up about a single measurement:
+  `2>&1 | grep -cE '^error'` counts cargo's own trailing summary line —
+  "could not compile ... due to 31 previous errors" — as a 32nd error. Count
+  the JSON messages, or read the number the summary line itself gives.
+
+[#19]: https://github.com/Sertelegger/holdfast/issues/19
+[#39]: https://github.com/Sertelegger/holdfast/issues/39
 
 ## [0.0.7] — 2026-09-01
 
@@ -925,7 +1079,13 @@ Stated because they are easy to mistake for bugs:
   or type into a session the agent is driving.
 - **Unix only.** The tree is kept compiling and clippy-clean for
   `x86_64-pc-windows-gnu`, but signalling returns an error there and there is no
-  process-group handling.
+  process-group handling. *(Corrected by GH #19, and left standing rather than
+  edited: `windows-cross` was red on `main` from before 0.0.6, so "kept
+  compiling and clippy-clean" had stopped being true by then and cannot now be
+  dated further back — this repository's Actions history starts at its
+  recreation on 2026-09-02. The wrong claim is the point: it was asserted here,
+  in `ROADMAP.md` and in `CONTRIBUTING.md` for two milestones while a job that
+  would have caught it was red and unread.)*
 - **Eleven tools.** No `precheck_command`, `request_secret_input`, `send_file`,
   `fetch_file` or `wait_for_any` yet.
 - **`get_command_history`'s `command` field is best-effort**, reconstructed from
