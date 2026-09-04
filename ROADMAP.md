@@ -193,7 +193,8 @@ a port rather than a `#[cfg]`:
   the Windows job runs the source guards, the CLI arms, and a **filtered**
   `--lib` naming only the modules whose Windows arm differs from its Unix one
   — not the full `--lib`. Gating those shell fixtures buys the other 721 tests
-  on the platform.
+  on the platform —
+  [#91](https://github.com/Sertelegger/holdfast/issues/91).
 
 ## Distribution
 

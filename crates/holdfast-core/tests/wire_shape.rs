@@ -114,8 +114,9 @@
 // The fix is to move those three out of `daemon::server` into `protocol`,
 // where the rest of the wire types already are. That is a public-API move
 // and does not belong in a change whose job is to make `windows-cross` go
-// green, so it is recorded here and left. Tracked in this branch's PR
-// rather than in #19, which this branch closes.
+// green, so it is recorded here and left. Tracked in
+// [#89](https://github.com/Sertelegger/holdfast/issues/89) rather than in
+// #19, which this branch closes.
 #![cfg(unix)]
 
 use std::collections::BTreeSet;

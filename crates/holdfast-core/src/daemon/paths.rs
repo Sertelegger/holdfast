@@ -1332,8 +1332,9 @@ fn log_dir_or_err(log_dir: PathBuf, home: &io::Result<PathBuf>) -> io::Result<Pa
 // a handful that pass for want of anything to check, which reads as coverage
 // and is not. `RuntimePaths`'s pure path arithmetic is worth testing on
 // Windows and is not tested here today; splitting it out is a follow-up, not
-// something to fake with a `#[cfg]`. Tracked in this branch's PR rather
-// than in #19, which the branch closes.
+// something to fake with a `#[cfg]`. Tracked in
+// [#90](https://github.com/Sertelegger/holdfast/issues/90) rather than in
+// #19, which the branch closes.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
