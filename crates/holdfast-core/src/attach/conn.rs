@@ -849,6 +849,29 @@ async fn read_loop(
                 }
             }
             ClientDecode::Frame(ClientFrame::SecretInput { request_id, bytes }) => {
+                // **Into the zeroing type before anything else looks at
+                // it, including the cap check.** `received` does not copy
+                // or normalise; it takes the decoded allocation, so every
+                // exit *from this arm* zeroes the plaintext by dropping
+                // it — the two refusals below and the accept path.
+                //
+                // GH #57 filed the refusals as forgetting to zero. They
+                // did, but the reason they could is that this was a bare
+                // `Vec<u8>` with three exits and a discipline; it is now
+                // one value with one `Drop`.
+                //
+                // **This arm is not the whole story, and review found the
+                // first version of this comment claiming it was.** A
+                // `SecretInput` that never reaches here — refused by the
+                // ReadOnly gate above, or decoded as `BadFields` — still
+                // drops its cleartext frame un-zeroed, across an `await`.
+                // That is GH #82, and it is a wider hole than the one
+                // this line closes. There is also no cancellation window
+                // between here and the write: no suspension point sits
+                // between them, so there is nothing for a `select!` to
+                // cancel.
+                let bytes = super::secret::SecretBytes::received(bytes);
+
                 // **The cap is measured here, on the received bytes and
                 // before anything is copied.** Normalisation strips a
                 // trailing newline and may append one, so a check made
@@ -873,10 +896,15 @@ async fn read_loop(
                     .close_secret(&conn.session_id, Some(&request_id))
                 {
                     // Over the waiting call's `max_secret_bytes`. Nothing
-                    // is written, no `SecretBytes` is built, and the
-                    // request closes: the child is still blocked, and the
-                    // agent is told which of the four reasons it was.
+                    // is written, nothing is normalised, and the request
+                    // closes: the child is still blocked, and the agent is
+                    // told which of the four reasons it was.
+                    //
+                    // **`drop` is the zeroing**, and it is explicit rather
+                    // than left to the end of the arm so the plaintext is
+                    // gone before `settle` runs rather than after.
                     Some(raised) if over_cap => {
+                        drop(bytes);
                         super::secret::zero_bytes(&mut body);
                         SecretAnswer::new(daemon, session, raised).settle(
                             crate::secret::Resolution::Cancelled(
@@ -892,9 +920,8 @@ async fn read_loop(
                         // defaults to `true` — an echo-off prompt is
                         // waiting for a line — and is the waiting call's
                         // own argument when there is one.
-                        let (write, ack) = WriteRequest::secret(
-                            super::secret::SecretBytes::normalise(bytes, raised.append_newline),
-                        );
+                        let (write, ack) =
+                            WriteRequest::secret(bytes.normalised(raised.append_newline));
                         // The frame body still holds the value in
                         // cleartext and is about to be reused for the
                         // next frame; `SecretBytes` owns only the decoded
@@ -973,7 +1000,16 @@ async fn read_loop(
                     // written. A client whose request was superseded
                     // between the prompt and the keystrokes must not have
                     // its password typed into whatever came next.
+                    //
+                    // **`drop` before the `await`.** The send below is a
+                    // suspension point, and a submission that was
+                    // superseded is exactly the one most likely to be
+                    // sitting here when the connection goes away. `Drop`
+                    // would zero it on cancellation regardless; doing it
+                    // here means it is gone before the wait rather than
+                    // during it.
                     None => {
+                        drop(bytes);
                         super::secret::zero_bytes(&mut body);
                         if tx
                             .send(protocol_error(
