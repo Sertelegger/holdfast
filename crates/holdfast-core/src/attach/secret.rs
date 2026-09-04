@@ -186,6 +186,26 @@ impl SecretBytes {
     /// Deliberately **not** `normalise`: §5.2's normalisation belongs to
     /// a value that is going to be written, and the cap is measured on
     /// the bytes as received. See [`normalised`](Self::normalised).
+    ///
+    /// **Not dead off Unix — early.** The only non-test caller is
+    /// `attach::conn`, which is `#[cfg(unix)]` because there is no daemon
+    /// on Windows (§3.3, §3.6), so on that target this has no caller and
+    /// `-D warnings` makes `dead_code` a build error.
+    ///
+    /// **`#[cfg(unix)]` is the wrong repair, and `attach/mod.rs` says so
+    /// in advance**: `secret` is one of the modules deliberately left
+    /// ungated, because `SecretBytes` names no platform type and 0.0.10's
+    /// web UI submits a masked value through the same frame. Gating this
+    /// to Unix would contradict that note and have to be reversed one
+    /// milestone later — and it would take the type's Windows
+    /// type-checking off `windows-cross` in the meantime, which is the
+    /// coverage that gating buys nothing and costs something.
+    ///
+    /// So the allowance is scoped to the platform that lacks the caller,
+    /// and **it goes away when the web UI lands** — at which point this
+    /// has a second, cross-platform caller and the attribute stops
+    /// compiling clean under `unused_attributes`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn received(raw: Vec<u8>) -> Self {
         Self(raw)
     }
@@ -203,6 +223,13 @@ impl SecretBytes {
     /// length of that copy both hold the plaintext. The property that
     /// actually matters is weaker and sufficient: never two that a `Drop`
     /// cannot reach. Both are owned by a `SecretBytes` here.
+    ///
+    /// Off-Unix allowance for the same reason as
+    /// [`received`](Self::received), which carries the full rationale:
+    /// the only non-test caller is the `#[cfg(unix)]` `attach::conn`, and
+    /// gating the method itself would contradict `attach/mod.rs`'s
+    /// deliberate decision to leave this module ungated for 0.0.10.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn normalised(mut self, append_newline: bool) -> Self {
         Self::normalise_from(&mut self.0, append_newline)
     }
