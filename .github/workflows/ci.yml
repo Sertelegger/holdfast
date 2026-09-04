@@ -31,6 +31,7 @@
 #   actions/upload-artifact     v7.0.1  043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
 #   actions/setup-python        v7.0.0  5fda3b95a4ea91299a34e894583c3862153e4b97
 #   python                      3.13    (minor series; see the probe job)
+#   actionlint                  1.7.12  (verified against its checksums.txt)
 
 name: CI
 
@@ -89,7 +90,8 @@ env:
 
 jobs:
   # --- checks that need no capability gate ---------------------------------
-  # hygiene/fmt/clippy/windows-cross deliberately do NOT `needs: probe`.
+  # hygiene/actionlint/fmt/clippy/windows-cross deliberately do NOT
+  # `needs: probe`.
   # None of them spawns a shell or allocates a pty, so the probe's
   # assertions are irrelevant to them, and gating them would add minutes to
   # the feedback a developer actually reads first. Only `test` is gated,
@@ -108,6 +110,41 @@ jobs:
       # guard whose guard is unrun is a guard on trust.
       - run: ./scripts/ci-hygiene.sh --self-test
       - run: ./scripts/ci-hygiene.sh
+
+  # `dev/workflows/verify.md` has listed `actionlint` under *"CI's own gate,
+  # which must pass"* since the file was written, and CI did not run it —
+  # so the sentence was false, and the tool was not installed on the machine
+  # of anyone who tried to follow it either. A named step nobody executes is
+  # worth what no step is worth.
+  actionlint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # **Asserted, not assumed.** actionlint shells out to shellcheck to
+      # lint the shell inside every `run:` block, and when it is missing it
+      # skips that silently and still exits 0 — so the check most likely to
+      # find a real defect in this file is the one that would quietly not
+      # run. `ubuntu-24.04` ships shellcheck; this step is what makes that a
+      # thing CI has verified rather than a thing the image notes promise.
+      - name: shellcheck must exist, or actionlint's best check is a no-op
+        run: shellcheck --version
+      - name: Install actionlint, verified against its published checksums
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          set -euo pipefail
+          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          curl -fsSLO "${base}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "${base}/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          grep " actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz$" \
+            "actionlint_${ACTIONLINT_VERSION}_checksums.txt" | sha256sum -c -
+          tar xzf "actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" actionlint
+      # The glob is the same one `verify.md` step 5 names, so a developer
+      # running that file locally runs this job.
+      - run: ./actionlint .github/workflows/*.yml
 
   fmt:
     runs-on: ubuntu-24.04
