@@ -69,3 +69,22 @@
 //! rows that owe them and the task they are owed by.
 
 pub mod frames;
+
+/// The per-session listener (§4.1, §7.1, REQ-SPTY-004).
+///
+/// **`#[cfg(unix)]` on the module, and `frames` deliberately without
+/// one.** `daemon::server` became `#[cfg(unix)]` in the GH #19 Windows
+/// work, so [`socket`]'s three borrowed symbols — `bind_socket_within`,
+/// `SocketIdentity`, `OwnedSocket` — exist only there. Gating this
+/// declaration is what keeps the `windows-cross` and `windows-native`
+/// checks green without gating the frame catalogue beside it, which is a
+/// serde definition with no platform in it and no reason to leave a
+/// Windows build.
+///
+/// This is a compile-time consequence of where the machinery lives
+/// today, **not** a decision that the worker link is Unix-only forever.
+/// Windows 10+ supports `AF_UNIX`; 0.0.11 is the milestone that decides
+/// whether the answer is to ungate `daemon::server` or to write a second
+/// binder, and it should decide rather than inherit.
+#[cfg(unix)]
+pub mod socket;

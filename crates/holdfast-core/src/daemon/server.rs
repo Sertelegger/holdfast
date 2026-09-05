@@ -925,7 +925,7 @@ impl OwnedSocket {
     /// `ctime` is what carries it. Both arms fail closed: an error
     /// anywhere reads as "not ours", which skips the unlink and leaves a
     /// stale socket for the next binder to clear under this same lock.
-    fn still_at(&self, path: &std::path::Path) -> bool {
+    pub(crate) fn still_at(&self, path: &std::path::Path) -> bool {
         let Ok(now) = SocketIdentity::of(path) else {
             return false;
         };
@@ -1041,7 +1041,15 @@ pub fn bind_socket(paths: &RuntimePaths, path: PathBuf) -> io::Result<(UnixListe
     bind_socket_within(paths, path, super::spawn::LOCK_TIMEOUT)
 }
 
-fn bind_socket_within(
+/// **Widened from module-private to `pub(crate)` for 0.0.10a**, which is
+/// the whole of this function's involvement in that milestone.
+/// `pty::worker::socket` binds the per-session worker socket and needs
+/// every step above; a second copy of them is how one socket ends up
+/// `0600` and another `0755`, and re-deriving the four-field identity or
+/// the `O_PATH` pin would be re-deriving the two things measured at
+/// 500/500 on ext4. It is `pub(crate)` and not `pub` because the caller
+/// is one module in this crate, not the API.
+pub(crate) fn bind_socket_within(
     paths: &RuntimePaths,
     path: PathBuf,
     lock_timeout: Duration,
