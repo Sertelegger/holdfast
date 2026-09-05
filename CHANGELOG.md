@@ -133,6 +133,56 @@ trigger as a side effect of writing release notes.
   are free on public repositories, so the filter bought nothing.
 - **A surviving mutant now fails the mutation sweep.** Its dated
   `continue-on-error` calibration exemption is retired.
+- **A hung test is now killed and named.** The `test` job runs the suite under
+  `cargo nextest` (0.9.143, pinned by the digest of the tarball fetched)
+  instead of `cargo test`, at a per-test budget of a `SLOW` warning at 60s and
+  a kill at 300s — `.config/nextest.toml`, which applies to a developer's local
+  run identically.
+
+  **What was missing was attribution, not redness.** Every job in `ci.yml` has
+  carried an explicit `timeout-minutes` since the file was written, so a wedged
+  test already turned the build red; `test` sits at 40 minutes. What that could
+  never do was say *which* test. `cargo test` has no per-test timeout, so the
+  kill arrives from outside the process, cargo has printed nothing about the
+  row still in flight, and the log ends mid-suite naming nobody — a red build
+  and a blind one. nextest prints `SLOW`, then `TERMINATING`, then `TIMEOUT`,
+  names the test in each, preserves what that test printed before it hung,
+  escalates SIGTERM to SIGKILL after a grace period, and exits 100.
+
+  **300s is bounded on both sides by measurements rather than by taste.** Above
+  it: the slowest single test this suite has been observed to take is
+  **127.70s** on the hosted runner —
+  `tier_b_stays_off_and_the_control_path_stays_responsive_under_load`, the
+  figure `scripts/ci-skip-census.sh`'s own fixture records verbatim — against
+  ~26s for the slowest locally on 4 cores. Below it: the per-test kill has to
+  land well inside the job's own 40 minutes, or the outer timeout takes the
+  process group and the log with it and nothing has been gained.
+
+  **Two flags are load-bearing and neither looks it.** `--success-output
+  immediate` replaces `--show-output`; without it a *passing* test's
+  `skipping: …` notice is shown to nobody and the skip census reads a log that
+  cannot contain what it looks for. `--no-output-indent` keeps captured output
+  at column 0 — nextest's default indents it four spaces, which silently
+  defeats every `^`-anchored grep in that census and would have reported a
+  clean sweep on a run that skipped two rows. The census's vacuity gate also
+  learned nextest's name for the detection binary, `holdfast-core::detection`,
+  where cargo printed `Running tests/detection.rs` **on stderr**. The `2>&1`
+  in that pipeline was already load-bearing for exactly that one line; it is
+  now load-bearing for all of it, because nextest writes its *entire* stream
+  to stderr — status lines, captured output, summary — and leaves stdout
+  empty, so dropping it would `tee` a zero-byte log. The census's self-test
+  grew a second, nextest-shaped fixture family rather than trusting the new
+  branch: 32 checks to 40.
+
+  **Doctests get their own `cargo test --doc` step, because nextest does not
+  run them at all.** Both of this workspace's doctests are `ignored`, so the
+  step measures nothing today; it is there so that the capability cannot
+  disappear without a diff. The census step is now `if: always()`, since an
+  exit 100 would otherwise skip the census on exactly the run this change was
+  made to diagnose. `TEST_THREADS` survives, mapped to nextest's `-j`: its
+  default is one process per core, which is the nproc-tracking that pin exists
+  to refuse, and `scripts/ci-flake-hunt.sh` reads the value to assert it is
+  oversubscribed relative to CI.
 
 ### Added
 

@@ -1,0 +1,39 @@
+# cargo-nextest's workspace profile. Read automatically by every
+# `cargo nextest run` in this tree, CI and local alike, so a hang gets the
+# same treatment on a developer's box as on the runner.
+#
+# THE POINT OF THIS FILE IS ONE LINE: `terminate-after`. `cargo test` has no
+# per-test timeout at all — a test that never returns holds the whole suite
+# until the JOB's `timeout-minutes` fires, and a job killed from outside
+# names nothing. The build was already red; what was missing was WHICH test.
+# nextest prints `SLOW`, then `TERMINATING`, then `TIMEOUT`, names the test
+# in each, keeps whatever that test printed before it wedged, and exits 100.
+#
+# THE TWO NUMBERS, so the choice is auditable rather than arbitrary:
+#
+#   period = "60s"        the first SLOW warning. A test that is merely slow
+#                         is not killed by this; it is only reported, once
+#                         per period, and that report is the early notice
+#                         that something is drifting toward the kill.
+#   terminate-after = 5   kill at 5 * 60s = 300s.
+#
+#   * 300s is comfortably ABOVE the worst this suite has been observed to
+#     take: 127.70s, for
+#     `tier_b_stays_off_and_the_control_path_stays_responsive_under_load`
+#     on the hosted runner — the figure is recorded verbatim in
+#     `scripts/ci-skip-census.sh`'s own fixture, so it moves when the
+#     measurement does. On a 24-core workstation at `-j 24` the same row
+#     takes 5.33s and the slowest row in the whole 1331 is 20.11s
+#     (`secret::binding::tests::the_approval_command_line_is_rendered_…`),
+#     which is the point: the budget has to clear the SMALL box, not the
+#     one it was written on. 300s is 2.3x the runner's worst.
+#   * 300s is comfortably BELOW `timeout-minutes: 40` on ci.yml's `test`
+#     job. That ordering is the whole design: the per-test kill must fire
+#     first, or the job-level timeout takes the process group and the log
+#     with it and we are back to an unattributed hang.
+#
+# Raise `terminate-after` only against a MEASUREMENT — a test that legitimately
+# needs longer — not to quiet a red build. A hang that gets its budget raised
+# until it fits is a hang that ships.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }

@@ -7,9 +7,11 @@
 #      crates/holdfast-core/tests/detection.rs, and REQ-TS-008's row in
 #      crates/holdfast-core/tests/screen.rs, early-`return` when their host
 #      requirement is unmet. libtest reports every one of them as `ok` and
-#      swallows the explanation unless `--show-output` is passed, so a
-#      suite that measured half of what its name promises still prints a
-#      green pass count. That is the defect this file exists to end.
+#      swallows the explanation unless the runner is asked to show a
+#      PASSING test's output (`--show-output` under cargo test,
+#      `--success-output immediate` under nextest), so a suite that
+#      measured half of what its name promises still prints a green pass
+#      count. That is the defect this file exists to end.
 #
 #   2. AN ASSERTION THAT DID NOT RUN, INSIDE A ROW THAT DID. Spec §11.4's
 #      control-path p99 is asserted only where `available_parallelism()`
@@ -110,13 +112,38 @@
 #
 # Run it locally exactly as CI does:
 #
-#   cargo test --workspace --locked --no-fail-fast -- \
-#     --test-threads=4 --show-output 2>&1 | tee test-output.log
+#   cargo nextest run --workspace --locked --no-fail-fast -j 4 \
+#     --success-output immediate --no-output-indent 2>&1 | tee test-output.log
 #   ./scripts/ci-skip-census.sh test-output.log
 #
-# `--show-output` is not optional: without it libtest captures the
-# `skipping: …` and `not-asserted: …` notices and this script reads a log
-# that cannot contain what it is looking for.
+# THREE PARTS OF THAT LINE ARE LOAD-BEARING, and none of them looks it:
+#
+#   `--success-output immediate`  without it nextest, like libtest, shows a
+#       PASSING test's output to nobody, and this script reads a log that
+#       cannot contain what it is looking for. Under `cargo test` the
+#       equivalent was `--show-output`, and a log made that way is still
+#       censusable — see the vacuity-detection gate.
+#   `--no-output-indent`  without it nextest indents every captured line by
+#       four spaces, and EVERY anchored grep here (`^skipping: `,
+#       `^not-asserted: `, `^test result:`, `^test <row> \.\.\.`) silently
+#       stops matching. The census then reports zero skips and zero
+#       non-assertions on a log that is full of both — the exact vacuous
+#       pass this file exists to make impossible.
+#   `2>&1`  under `cargo test` this mattered for one line: the
+#       `Running tests/detection.rs …` banner, which cargo prints on STDERR
+#       and which the vacuity gate below reads. **Under nextest it is the
+#       whole log.** Measured: nextest writes its ENTIRE stream to stderr —
+#       the `PASS`/`SLOW`/`TIMEOUT` lines, the captured test output, the
+#       summary — and leaves stdout completely empty, so without `2>&1` the
+#       `tee` writes a zero-byte file and this script is reading nothing at
+#       all. It fails loudly on that (an empty log is not a pass), which is
+#       the only reason the mistake would be survivable.
+#
+# Both fixture families are in the self-test: `ci.log` is cargo-shaped and
+# `nextest.log` is nextest-shaped, the latter transcribed from a real run.
+# The nextest family covers every grep whose anchoring the format change
+# could have broken, plus the branch of the vacuity gate that only a
+# nextest log can reach.
 #
 # And prove it can still fail, which is why every rule above sits inside a
 # named `# --- gate: … ---` block that the self-test deletes one at a time:
@@ -273,15 +300,38 @@ census() {
   # --- anti-vacuity: a log that never ran the rows cannot certify them ---
   #
   # Without these, an empty file, a log from a build failure, or a log
-  # whose `--show-output` was dropped all produce zero observed skips and
-  # zero observed non-assertions — and every "unexpected" rule below would
-  # pass on each of them. The expected-skip check catches most of that by
-  # itself, but only while EXPECTED is non-empty, and this file's whole
+  # whose passing-test output was dropped all produce zero observed skips
+  # and zero observed non-assertions — and every "unexpected" rule below
+  # would pass on each of them. The expected-skip check catches most of that
+  # by itself, but only while EXPECTED is non-empty, and this file's whole
   # purpose is to shrink EXPECTED to nothing.
+  #
+  # TWO TOKENS, because the suite has two runners and they name the same
+  # binary differently:
+  #
+  #   `tests/detection.rs`        cargo's own `Running tests/detection.rs
+  #                               (target/debug/deps/detection-…)` banner.
+  #   `holdfast-core::detection ` nextest's name for that binary, printed on
+  #                               EVERY result line from it.
+  #
+  # **The cargo token only ever appeared on cargo's STDERR**, never on
+  # stdout, which is why the pipeline that produces the log this reads is
+  # `… 2>&1 | tee test-output.log` and why that `2>&1` is load-bearing
+  # rather than tidiness. nextest prints its result lines on stdout and
+  # names the binary on each of them, so the widened token is an equally
+  # strong anti-vacuity signal — arguably stronger, since it is one token
+  # per ROW rather than one per binary. The trailing space is deliberate:
+  # it stops a hypothetical `holdfast-core::detection_something` binary from
+  # answering for this one.
+  #
+  # An alternation rather than a swap, because BOTH runners are supported:
+  # `dev/workflows/verify.md` and CI run nextest, and a `cargo test` log
+  # from someone bisecting an old commit must still be censusable.
   # --- gate: vacuity-detection ---
-  if ! grep -qE 'tests/detection\.rs' "$log"; then
-    echo "SKIP CENSUS FAILED: $log never mentions tests/detection.rs, so it is not" >&2
-    echo "a log of a run that could have skipped anything. Did the build fail?" >&2
+  if ! grep -qE 'tests/detection\.rs|holdfast-core::detection ' "$log"; then
+    echo "SKIP CENSUS FAILED: $log never mentions tests/detection.rs (cargo) or" >&2
+    echo "holdfast-core::detection (nextest), so it is not a log of a run that" >&2
+    echo "could have skipped anything. Did the build fail?" >&2
     return 1
   fi
   # --- /gate: vacuity-detection ---
@@ -709,17 +759,145 @@ FIXTURE
   grep -v '^test result:' "$td/ci.log" > "$td/nosummary.log"
   : > "$td/empty.log"
 
+  # ---- the nextest family ----------------------------------------------
+  #
+  # THE SHAPE CI ACTUALLY PRODUCES SINCE THE `test` JOB MOVED TO NEXTEST,
+  # transcribed from a real `cargo nextest run --workspace --locked
+  # --no-fail-fast --success-output immediate --no-output-indent` of this
+  # workspace and trimmed to the three rows this file has entries for. The
+  # timings and the `not-asserted: ` line are the hosted runner's; the
+  # counters are the excerpt's own, so the fixture is self-consistent.
+  #
+  # It exists because the cargo family CANNOT reach half of the
+  # vacuity-detection gate. `tests/detection.rs` appears nowhere in a
+  # nextest log — nextest names that binary `holdfast-core::detection` —
+  # so with only `ci.log` here the new alternation branch would ship
+  # unexercised, which is the precise class of unproven guard this whole
+  # file exists to prevent.
+  #
+  # Nextest runs each test as its OWN libtest process, and what
+  # `--success-output immediate` prints is that process's whole captured
+  # output: the `running 1 test` banner, the `test <row> ... ok` line and
+  # the `test result:` summary, once per row rather than once per binary.
+  # That is why every anchored grep in this file survives the runner
+  # change unaltered — and why `--no-output-indent` is not cosmetic, which
+  # `nx-indented.log` below is the demonstration of.
+  cat > "$td/nextest.log" <<'FIXTURE'
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.02s
+────────────
+ Nextest run ID 00000000-0000-0000-0000-000000000000 with nextest profile: default
+    Starting 5 tests across 3 binaries
+        PASS [   0.019s] (   1/5) holdfast-core::detection the_pty_matrix_runs_every_host_dependent_row_but_the_two_it_names
+── stdout ──
+
+running 1 test
+test the_pty_matrix_runs_every_host_dependent_row_but_the_two_it_names ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.01s
+
+
+        PASS [   0.091s] (   2/5) holdfast-core::detection fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes
+── stdout ──
+
+running 1 test
+test fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.08s
+
+── stderr ──
+skipping: fish not installed — the fish snippet remains UNVERIFIED by this suite (fish version: none)
+
+        PASS [   0.009s] (   3/5) holdfast-core::screen the_all_but_da1_fixture_answers_every_probe_except_primary_da
+── stdout ──
+
+running 1 test
+test the_all_but_da1_fixture_answers_every_probe_except_primary_da ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.00s
+
+
+        PASS [   0.068s] (   4/5) holdfast-core::screen only_answering_da1_takes_fish_to_its_first_prompt
+── stdout ──
+
+running 1 test
+test only_answering_da1_takes_fish_to_its_first_prompt ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.06s
+
+── stderr ──
+skipping: fish not installed — REQ-TS-008's three arms need fish >= 4.0 (REQ-TST-007)
+
+        PASS [ 127.700s] (   5/5) holdfast-core::stress_write_path tier_b_stays_off_and_the_control_path_stays_responsive_under_load
+── stdout ──
+
+running 1 test
+test tier_b_stays_off_and_the_control_path_stays_responsive_under_load ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 127.70s
+
+── stderr ──
+not-asserted: stress_write_path::control_path_p99 cores=2 min_cores=8 — §11.4's p99 needs >= 8 cores to be a statement about Holdfast rather than about the scheduler; this box has 2. Measured anyway: p99 1.109297052s, max 1.109297052s, 17 samples, 2343186436 bytes streamed.
+
+────────────
+     Summary [ 128.104s] 5 tests run: 5 passed, 0 skipped
+FIXTURE
+
+  # A nextest log that cannot be about detection.rs at all: the binary's
+  # name struck from every result line, the rows otherwise untouched — the
+  # nextest counterpart of `nodetect.log`, and the ONLY fixture here that
+  # reaches the `holdfast-core::detection ` branch of the vacuity gate.
+  sed 's/holdfast-core::detection //' "$td/nextest.log" > "$td/nx-nodetect.log"
+  # The row renamed out from under its exemption, in nextest's shape. This
+  # is what asserts that `^test <row> \.\.\.` still anchors after the
+  # runner change: the row name reaches the log only through the libtest
+  # block nextest captures, at column 0 only because of --no-output-indent.
+  sed 's/only_answering_da1_takes_fish_to_its_first_prompt/only_answering_da1_takes_fish_to_a_prompt/' \
+    "$td/nextest.log" > "$td/nx-renamedrow.log"
+  # THE FLAG THAT LOOKS COSMETIC. Nextest's default indents captured output
+  # by four spaces and spells the banners `  stdout ───`; every `^`-anchored
+  # grep in this file then matches nothing, on a log that is full of what
+  # they are looking for. Reproduced verbatim from a run without
+  # --no-output-indent, and the assertion below is that this is REFUSED
+  # rather than censused as a clean run with nothing skipped.
+  sed -E -e 's/^── (stdout|stderr) ──$/  \1 ───/' \
+         -e 's/^(running |test |skipping: |not-asserted: )/    \1/' \
+    "$td/nextest.log" > "$td/nx-indented.log"
+
   echo "Self-test 1 — fixtures with known answers"
   echo
 
   # THE GREEN CASE, and it has to be green under CI's own strictness or the
-  # entry could never be carried at all.
-  expect "the log CI produces today is CLEAN under CI's strictness" \
+  # entry could never be carried at all. Asserted for BOTH runners: nextest
+  # is what the `test` job runs, and a `cargo test` log — from a bisect, or
+  # from a box with no nextest on it — must stay censusable.
+  expect "a cargo-shaped log is CLEAN under CI's strictness" \
     ci.log 1 0 "SKIP CENSUS OK"
   expect "...and it says what did NOT run, rather than reading as full coverage" \
     ci.log 1 0 "2 tolerated skip(s), 1 tolerated non-assertion(s)"
   expect "...and it names the gated assertion in the listing" \
     ci.log 1 0 "not-asserted: stress_write_path::control_path_p99 cores=2 min_cores=8"
+
+  # THE NEXTEST FAMILY. The log CI produces today, and the three greps the
+  # runner change could have broken silently: the vacuity token (which is a
+  # DIFFERENT string under nextest), the `^skipping: ` anchor, and the
+  # `^not-asserted: ` line's `awk '{print $2}'` id and `cores=`/`min_cores=`
+  # fields.
+  expect "the nextest log CI produces today is CLEAN under CI's strictness" \
+    nextest.log 1 0 "SKIP CENSUS OK"
+  expect "...and it too says what did NOT run" \
+    nextest.log 1 0 "2 tolerated skip(s), 1 tolerated non-assertion(s)"
+  expect "...and its gated assertion parses, id and both core counts" \
+    nextest.log 1 0 "not-asserted: stress_write_path::control_path_p99 cores=2 min_cores=8"
+  expect "a nextest log that never names the detection binary certifies nothing" \
+    nx-nodetect.log 0 1 "never mentions tests/detection.rs"
+  expect "RENAMING the row still FAILS when the row name comes via nextest" \
+    nx-renamedrow.log 0 1 "CANNOT CERTIFY"
+  # Dropping --no-output-indent must be REFUSED, not censused clean. Every
+  # anchored grep here stops matching against nextest's four-space indent,
+  # so without this the census would report "nothing skipped, nothing gated
+  # off" on a run that skipped two rows and gated an assertion off.
+  expect "a nextest log made WITHOUT --no-output-indent is refused, not silently vacuous" \
+    nx-indented.log 0 1 "certifies nothing"
 
   # THE TWO DEMONSTRATIONS THE BRIEF ASKS FOR.
   expect "a gated assertion nobody agreed to FAILS" \
@@ -777,8 +955,15 @@ FIXTURE
   echo
 
   # <gate name>|<fixture the gate is the only thing catching>|<strictness>
+  # Two entries name `vacuity-detection`, once per runner: the gate is an
+  # ALTERNATION now, and a mutation that only ever deletes it in front of a
+  # cargo log proves nothing about the branch a nextest log takes. The
+  # coverage check below `sort -u`s this column, so the pair costs nothing
+  # there.
   local mutations=(
     "vacuity-detection|nodetect.log|0"
+    "vacuity-detection|nx-nodetect.log|0"
+    "skip-absent-row|nx-renamedrow.log|0"
     "vacuity-result|nosummary.log|0"
     "skip-unexpected|unexpected.log|0"
     "skip-stale|stalefish.log|0"

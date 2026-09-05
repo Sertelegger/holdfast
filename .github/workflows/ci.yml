@@ -32,6 +32,9 @@
 #   actions/setup-python        v7.0.0  5fda3b95a4ea91299a34e894583c3862153e4b97
 #   python                      3.13    (minor series; see the probe job)
 #   actionlint                  1.7.12  (verified against its checksums.txt)
+#   cargo-nextest               0.9.143 (no published checksums file; pinned
+#                                       by the sha256 of the tarball that was
+#                                       fetched, recorded in the `test` job)
 
 name: CI
 
@@ -86,6 +89,20 @@ env:
   # timing profile the suite was calibrated under. See plan Task 4 Step 1.
   # The calibration still describes a 2-vCPU box, deliberately — re-taking it
   # on 4 is a measurement, not an edit.
+  #
+  # KEPT, and mapped to nextest's `-j`, rather than dropped when the `test`
+  # job stopped using `cargo test`. Two reasons, both of which would have
+  # been lost by deleting it:
+  #   * nextest's DEFAULT is one test process per core. That is exactly the
+  #     nproc-tracking this pin exists to refuse — it would hand the runner's
+  #     core count back the power to change the suite's timing profile with
+  #     no diff anywhere.
+  #   * `scripts/ci-flake-hunt.sh` refuses to run at or below "the CI test
+  #     job's parallelism", reading this variable's value to decide. A test
+  #     job with no stated parallelism makes that assertion meaningless.
+  # The unit changed and the ceiling did not: libtest's `--test-threads` was
+  # threads inside one binary at a time, nextest's `-j` is concurrent test
+  # PROCESSES across the whole workspace. Four either way.
   TEST_THREADS: "4"
 
 jobs:
@@ -724,24 +741,89 @@ jobs:
       # is supposed to be guarding.
       - name: Prove the skip census can still fail
         run: ./scripts/ci-skip-census.sh --self-test
+      # WHY NEXTEST RUNS THE SUITE AND `cargo test` NO LONGER DOES.
+      #
+      # `cargo test` has no per-test timeout. A test that wedges — a pty
+      # read that never returns, a wait_for_pattern on a prompt that never
+      # comes — holds the whole run until this job's `timeout-minutes: 40`
+      # fires. That was already a RED build; `timeout-minutes` has been on
+      # every job here from the start. What it was not was an ATTRIBUTED
+      # one: the runner kills the process group from outside, cargo has
+      # printed nothing about the test still in flight, and the log ends
+      # mid-suite naming nobody. nextest gives that failure a name — SLOW,
+      # then TERMINATING, then TIMEOUT, each naming the test, with whatever
+      # the test printed before it hung preserved, escalating SIGTERM to
+      # SIGKILL after a grace period and exiting 100.
+      #
+      # The kill threshold lives in `.config/nextest.toml`, not here, so a
+      # developer's local run behaves the same way. See that file for why
+      # 60s/300s and not some other pair.
+      #
+      # Installed as its own static binary rather than `cargo install`
+      # (minutes of compile on every run) and deliberately NOT added to
+      # Cargo.toml: it is a tool this pipeline runs, not something the crate
+      # depends on. Same treatment as actionlint above, with one difference
+      # that is stated rather than papered over — actionlint publishes a
+      # `checksums.txt` and nextest publishes none, so there is nothing to
+      # verify AGAINST and the most that can be done is to record what was
+      # fetched. The digest below is the 0.9.143 linux tarball, taken twice
+      # from two fetches; GitHub release assets are immutable, so a mismatch
+      # here means the artefact changed underneath the version and the job
+      # should stop rather than run it.
+      - name: Install cargo-nextest, at the digest recorded for the pinned version
+        env:
+          NEXTEST_VERSION: 0.9.143
+          NEXTEST_SHA256: 66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 "https://get.nexte.st/${NEXTEST_VERSION}/linux" \
+            -o cargo-nextest.tar.gz
+          echo "${NEXTEST_SHA256}  cargo-nextest.tar.gz" | sha256sum -c -
+          mkdir -p "${HOME}/.cargo/bin"
+          tar xzf cargo-nextest.tar.gz -C "${HOME}/.cargo/bin" cargo-nextest
+          cargo nextest --version
       # --no-fail-fast is not optional. Measured on this project: without it
       # a lib-test failure hides whether the integration suite catches the
       # same defect, which is the only way to tell a narrow defect from a
       # broad one.
       #
-      # --show-output prints the captured stdout/stderr of *passing* tests,
-      # so a `skipping: …` notice — and a `not-asserted: …` one, from an
-      # assertion gated off inside a row that RAN — is visible in the log
-      # instead of swallowed by libtest. It is also what the census step
-      # below reads, which is why the log is teed rather than only printed.
+      # --success-output immediate prints the captured stdout/stderr of
+      # *passing* tests, so a `skipping: …` notice — and a `not-asserted: …`
+      # one, from an assertion gated off inside a row that RAN — is visible
+      # in the log instead of swallowed. It replaces `cargo test`'s
+      # `--show-output`, which nextest does not have. It is also what the
+      # census step below reads, which is why the log is teed rather than
+      # only printed.
+      #
+      # --no-output-indent IS MANDATORY and does not look it. Nextest's
+      # default indents captured output by four spaces; every `^`-anchored
+      # grep in ci-skip-census.sh then matches nothing, and the census
+      # reports a clean "nothing skipped" on a run that skipped two rows.
+      # The script's self-test carries a fixture for exactly that.
+      #
+      # `2>&1` used to matter for one line — cargo's `Running
+      # tests/detection.rs …` banner, printed on STDERR, which the census's
+      # vacuity gate reads. Under nextest it is the WHOLE log: measured,
+      # nextest writes its entire stream to stderr (status lines, captured
+      # test output, summary) and leaves stdout empty, so without it the
+      # `tee` produces a zero-byte file.
       #
       # `set -o pipefail` is not decoration: the default shell for `run:`
-      # is `bash -e {0}` WITHOUT pipefail, so a failing `cargo test` piped
+      # is `bash -e {0}` WITHOUT pipefail, so a failing test run piped
       # into `tee` would exit 0 and this job would go green on a red suite.
+      # It is what makes nextest's exit 100 on a TIMEOUT reach this job.
       - name: Run the suite, keeping the log for the skip census
         run: |
           set -o pipefail
-          cargo test --workspace --locked --no-fail-fast -- --test-threads=${{ env.TEST_THREADS }} --show-output 2>&1 | tee test-output.log
+          cargo nextest run --workspace --locked --no-fail-fast -j "${{ env.TEST_THREADS }}" --success-output immediate --no-output-indent 2>&1 | tee test-output.log
+      # NEXTEST DOES NOT RUN DOCTESTS AT ALL — a documented, deliberate gap
+      # in it, not a flag anyone can pass. Both doctests in this workspace
+      # are `ignored` today, so this step measures nothing and costs
+      # seconds; it is here so that the CAPABILITY does not vanish silently.
+      # Without it, the first non-ignored doctest anyone writes would be
+      # collected by rustdoc, reported by nobody, and asserted by nothing.
+      - name: Doctests, which nextest does not run
+        run: cargo test --workspace --locked --doc
       # The census the variable would have enforced from inside the suite.
       # It fails on any skip this pipeline has not agreed to, and on an
       # agreed one that stopped happening — and, since it grew a second
@@ -755,7 +837,16 @@ jobs:
       # repository went public on 2026-09-02, and the entry did NOT go red —
       # correctly, because `ci-skip-census.sh` gates on `min_cores=8` and 4 is
       # still under it. The sentence named the wrong number as the trigger.)
-      - run: ./scripts/ci-skip-census.sh test-output.log
+      #
+      # `if: always()` is the whole reason nextest was adopted paying off.
+      # A TIMEOUT exits 100, the step above goes red, and the default
+      # `if: success()` would SKIP the census on precisely the run someone
+      # needs to read — the hang. The log is teed before the pipeline's exit
+      # status is known, so it exists and is worth censusing either way; and
+      # a census finding cannot mask a suite failure, because a failed step
+      # earlier in the job already decides the job.
+      - if: always()
+        run: ./scripts/ci-skip-census.sh test-output.log
 
   # --- the one row the fish-less suite cannot measure ----------------------
 
