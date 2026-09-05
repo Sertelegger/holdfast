@@ -253,7 +253,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
 ./scripts/ci-skip-census.sh --self-test
-cargo test --workspace --locked --no-fail-fast -- --test-threads=4 --show-output 2>&1 | tee test-output.log
+cargo nextest run --workspace --locked --no-fail-fast -j 4 --success-output immediate --no-output-indent 2>&1 | tee test-output.log
+cargo test --workspace --locked --doc   # nextest does not run doctests
 ./scripts/ci-skip-census.sh test-output.log
 taskset -c 0,1 env TEST_THREADS=4 ./scripts/ci-flake-hunt.sh 20
 ```
