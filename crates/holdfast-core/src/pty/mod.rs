@@ -4,14 +4,26 @@
 
 pub mod in_process;
 pub mod mock;
+pub mod worker;
 
 pub use in_process::InProcessPty;
 pub use mock::MockPty;
 
+use serde::{Deserialize, Serialize};
+
 use crate::Result;
 
 /// Signals Holdfast delivers to a session's process group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` because 0.0.10a's worker link carries this
+/// enum **itself** across the daemon ↔ worker socket (`pty::worker`).
+/// The alternative is a mirror type in `worker::frames` — a
+/// `#[serde(remote)]` shadow or a parallel enum — and the plan for that
+/// milestone rules it out by name: a second declaration of a closed set
+/// is a second place for the set to change. The derive is additive, it
+/// is invisible above the `PtyBackend` trait, and it leaves exactly one
+/// definition of what a Holdfast signal is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Signal {
     Interrupt,
     Terminate,
@@ -19,7 +31,15 @@ pub enum Signal {
 }
 
 /// How to spawn a session's child process.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` for the same reason [`Signal`] carries
+/// them: the worker link sends this struct verbatim rather than a
+/// mirror of it, so `DaemonFrame::Spawn` and `InProcessPty::spawn`
+/// cannot come to disagree about what a spawn request is. `PartialEq`
+/// so that round-trip is testable — comparing field by field in the
+/// test would pass a struct that had silently gained a field the wire
+/// drops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PtySpawnConfig {
     pub command: String,
     pub args: Vec<String>,
@@ -137,7 +157,11 @@ pub fn clamp_geometry(cols: u16, rows: u16) -> (u16, u16) {
 /// No platform in this tree produces `echo: Some(_), canonical: None`.
 /// It is representable anyway because REQ-PD-021's degradation rule is
 /// only falsifiable if it is, and `MockPty` is what produces it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `Serialize`/`Deserialize` because `QueryResult::Discipline` carries
+/// it across the worker link; see [`Signal`] for why the derive lives
+/// on the type rather than on a mirror of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LineDiscipline {
     /// `c_lflag & ECHO`. Off at every readline prompt — §8.7 finding 1 —
     /// so it means nothing alone and everything in combination.
