@@ -1005,6 +1005,66 @@ impl RuntimePaths {
         self.dir.join("bind.lock")
     }
 
+    /// `<runtime>/workers/` — one directory holding every per-session
+    /// daemon ↔ `holdfast pty-worker` socket (§4.1, REQ-SPTY-004).
+    ///
+    /// A subdirectory rather than the runtime root, because the count is
+    /// unbounded: one file per live session, named by a server-generated
+    /// id. `list`, `doctor` and every future reader of the runtime
+    /// directory can then keep treating its top level as a fixed,
+    /// enumerable set — `control.sock`, `attach.sock`, `http.sock`,
+    /// `holdfast.pid`, the two locks, `logs/` — instead of having to
+    /// know which of the names they find are sessions.
+    pub fn worker_dir(&self) -> PathBuf {
+        self.dir.join("workers")
+    }
+
+    /// `<runtime>/workers/<session_id>.sock`.
+    ///
+    /// **Not covered by [`check_socket_path_length`], and the arithmetic
+    /// is why that is a documented gap rather than an oversight.** That
+    /// check measures `control.sock`, which is the *shortest* socket path
+    /// an instance produces; this one is longer by `workers/` plus a
+    /// `sess_` + 12 hex-digit id and `.sock`, less `control.sock` — 14
+    /// bytes, fixed, because [`crate::session::new_session_id`] emits a
+    /// constant-width id. So a runtime directory in the top 14 bytes of
+    /// the 100-byte budget passes `ensure_dir` and then fails here with
+    /// the bare `EINVAL` that `MAX_SOCKET_PATH` exists to translate.
+    /// Widening the check to the longest path an instance can produce
+    /// would move the refusal onto every caller of `ensure_dir`, which
+    /// is a change to when the daemon refuses to start and does not
+    /// belong in the commit that adds the directory.
+    ///
+    /// [`check_socket_path_length`]: RuntimePaths::check_socket_path_length
+    pub fn worker_sock(&self, session_id: &str) -> PathBuf {
+        self.worker_dir().join(format!("{session_id}.sock"))
+    }
+
+    /// Create `workers/` `0700` and *verify* the mode, exactly as
+    /// [`ensure_dir`](Self::ensure_dir) does for the runtime and log
+    /// directories, and for exactly the same reason: `create_dir_all`
+    /// succeeds on a directory that already exists whatever its
+    /// permissions, so an inherited `0755` would otherwise sail through
+    /// and leave every session's socket reachable by any local user who
+    /// can traverse the parent (§7.1).
+    ///
+    /// [`ensure_dir`](Self::ensure_dir) first, because `workers/` is
+    /// inside `self.dir` and the symlink refusal there has to land
+    /// before anything traverses a runtime directory that may be
+    /// somebody else's link.
+    ///
+    /// [`Writable::Refuse`] rather than `Tighten`, matching `self.dir`
+    /// and not `log_dir`: a group-writable directory of live session
+    /// sockets is one another local user may already have planted a
+    /// socket in, and a `chmod` does not undo what is already there.
+    /// There are no installs predating this directory, so the
+    /// compatibility argument that earns `log_dir` its `Tighten` has no
+    /// analogue here.
+    pub fn ensure_worker_dir(&self) -> io::Result<()> {
+        self.ensure_dir()?;
+        ensure_owner_only(&self.worker_dir(), Writable::Refuse)
+    }
+
     /// §19.1's log directory — `~/.holdfast/logs` by default, relocated
     /// under the runtime directory only for an explicit instance (§7.1).
     pub fn log_dir(&self) -> PathBuf {
