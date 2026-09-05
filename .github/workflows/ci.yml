@@ -808,6 +808,20 @@ jobs:
       # test output, summary) and leaves stdout empty, so without it the
       # `tee` produces a zero-byte file.
       #
+      # `CARGO_TERM_COLOR: always`, from the workflow env above, REACHES THIS
+      # LOG and is deliberately left alone. nextest obeys it, so the file the
+      # census reads has SGR escapes wrapped around every field of every
+      # result line — `ESC[35;1mholdfast-core::detectionESC[0m` and so on.
+      # That is the right trade: the Actions UI renders it, and the captured
+      # libtest block stays plain anyway because those processes are on a
+      # pipe. But it means the census's patterns must not assume the byte
+      # after a field is a space. One of them did, and it went red HERE and
+      # nowhere else — every local fixture and every developer's piped run
+      # is uncoloured, so the pattern was green everywhere it was tried.
+      # `ci-skip-census.sh` now carries a colourised fixture, so the next
+      # pattern to make that assumption fails in the self-test instead of in
+      # this job.
+      #
       # `set -o pipefail` is not decoration: the default shell for `run:`
       # is `bash -e {0}` WITHOUT pipefail, so a failing test run piped
       # into `tee` would exit 0 and this job would go green on a red suite.

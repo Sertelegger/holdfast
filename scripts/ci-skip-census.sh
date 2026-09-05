@@ -309,26 +309,49 @@ census() {
   # TWO TOKENS, because the suite has two runners and they name the same
   # binary differently:
   #
-  #   `tests/detection.rs`        cargo's own `Running tests/detection.rs
-  #                               (target/debug/deps/detection-…)` banner.
-  #   `holdfast-core::detection ` nextest's name for that binary, printed on
-  #                               EVERY result line from it.
+  #   `tests/detection.rs`       cargo's own `Running tests/detection.rs
+  #                              (target/debug/deps/detection-…)` banner.
+  #   `holdfast-core::detection` nextest's name for that binary, printed on
+  #                              EVERY result line from it.
   #
-  # **The cargo token only ever appeared on cargo's STDERR**, never on
-  # stdout, which is why the pipeline that produces the log this reads is
-  # `… 2>&1 | tee test-output.log` and why that `2>&1` is load-bearing
-  # rather than tidiness. nextest prints its result lines on stdout and
-  # names the binary on each of them, so the widened token is an equally
-  # strong anti-vacuity signal — arguably stronger, since it is one token
-  # per ROW rather than one per binary. The trailing space is deliberate:
-  # it stops a hypothetical `holdfast-core::detection_something` binary from
-  # answering for this one.
+  # **Neither token reaches stdout.** cargo prints its `Running …` banner on
+  # STDERR, and nextest writes its ENTIRE stream there — which is why the
+  # pipeline producing the log this reads is `… 2>&1 | tee test-output.log`
+  # and why that `2>&1` is load-bearing rather than tidiness. The nextest
+  # token is an equally strong anti-vacuity signal, arguably stronger: it is
+  # one token per ROW rather than one per binary.
+  #
+  # THE NEXTEST TOKEN IS NOT FOLLOWED BY A SPACE, AND THE FIRST DRAFT OF
+  # THIS GATE REQUIRED ONE. `ci.yml` sets `CARGO_TERM_COLOR: always` at the
+  # workflow level, so nextest colours its own result lines and what a CI
+  # log actually holds is
+  #
+  #   ESC[32;1m        PASSESC[0m [ 0.09s] (…) ESC[35;1mholdfast-core::detectionESC[0m ESC[34;1m<row>ESC[0m
+  #
+  # — the name is wrapped in its own SGR pair, so the byte after `detection`
+  # is ESC, not a space. A trailing space would have matched on every
+  # developer's uncoloured local run and matched NOTHING in CI: green here,
+  # red there, for a reason nobody would look for in a grep. Measured on a
+  # probe crate rather than reasoned about. The boundary is therefore spelt
+  # as "not an identifier character", which holds with or without colour and
+  # still stops a hypothetical `holdfast-core::detection_something` binary
+  # from answering for this one. `nx-color.log` in the self-test exists
+  # solely to keep that true.
+  #
+  # Nothing else here is at risk from that setting, and it was checked
+  # rather than assumed: nextest colours only its OWN lines, while the
+  # captured libtest block it re-emits — the source of `^test result:`,
+  # `^test <row> \.\.\.`, `^skipping: ` and `^not-asserted: ` alike — is
+  # written by a process whose stdout is a pipe, so libtest emits no SGR of
+  # its own. A colour reset landing at the END of a captured line is
+  # harmless: every rule below matches a PREFIX or reads whitespace-separated
+  # tokens.
   #
   # An alternation rather than a swap, because BOTH runners are supported:
   # `dev/workflows/verify.md` and CI run nextest, and a `cargo test` log
   # from someone bisecting an old commit must still be censusable.
   # --- gate: vacuity-detection ---
-  if ! grep -qE 'tests/detection\.rs|holdfast-core::detection ' "$log"; then
+  if ! grep -qE 'tests/detection\.rs|holdfast-core::detection($|[^A-Za-z0-9_])' "$log"; then
     echo "SKIP CENSUS FAILED: $log never mentions tests/detection.rs (cargo) or" >&2
     echo "holdfast-core::detection (nextest), so it is not a log of a run that" >&2
     echo "could have skipped anything. Did the build fail?" >&2
@@ -845,7 +868,7 @@ FIXTURE
   # A nextest log that cannot be about detection.rs at all: the binary's
   # name struck from every result line, the rows otherwise untouched — the
   # nextest counterpart of `nodetect.log`, and the ONLY fixture here that
-  # reaches the `holdfast-core::detection ` branch of the vacuity gate.
+  # reaches the `holdfast-core::detection` branch of the vacuity gate.
   sed 's/holdfast-core::detection //' "$td/nextest.log" > "$td/nx-nodetect.log"
   # The row renamed out from under its exemption, in nextest's shape. This
   # is what asserts that `^test <row> \.\.\.` still anchors after the
@@ -862,6 +885,22 @@ FIXTURE
   sed -E -e 's/^── (stdout|stderr) ──$/  \1 ───/' \
          -e 's/^(running |test |skipping: |not-asserted: )/    \1/' \
     "$td/nextest.log" > "$td/nx-indented.log"
+  # THE LOG CI ACTUALLY WRITES, because `ci.yml` sets `CARGO_TERM_COLOR:
+  # always` workflow-wide and nextest obeys it. The SGR pairs below are the
+  # ones a colour-forced run emits, transcribed from one: the binary name
+  # gets its own `35;1`…`0m` wrapper, which is why the vacuity token above
+  # cannot require a trailing space. Only nextest's OWN lines are coloured —
+  # the captured libtest block is written by a process on a pipe — and the
+  # single trailing reset on a captured line is what a real run puts there.
+  #
+  # This fixture is the one that would have caught the defect: the earlier
+  # pattern passed every uncoloured fixture here and would have failed in CI
+  # alone.
+  local esc=$'\033'
+  sed -E -e "s/^( +)PASS (\[[^]]*\]) (\([^)]*\)) ([^ ]+) (.*)$/${esc}[32;1m\1PASS${esc}[0m \2 \3 ${esc}[35;1m\4${esc}[0m ${esc}[34;1m\5${esc}[0m/" \
+         -e "s/^── (stdout|stderr) ──$/${esc}[32;1m──${esc}[0m ${esc}[32;1m\1${esc}[0m ${esc}[32;1m──${esc}[0m/" \
+         -e "s/^(skipping: |not-asserted: )(.*)$/\1\2${esc}[0m/" \
+    "$td/nextest.log" > "$td/nx-color.log"
 
   echo "Self-test 1 — fixtures with known answers"
   echo
@@ -898,6 +937,16 @@ FIXTURE
   # off" on a run that skipped two rows and gated an assertion off.
   expect "a nextest log made WITHOUT --no-output-indent is refused, not silently vacuous" \
     nx-indented.log 0 1 "certifies nothing"
+  # THE ONE THAT NEARLY SHIPPED RED. `CARGO_TERM_COLOR: always` is set
+  # workflow-wide, so this — not `nextest.log` — is the byte sequence CI
+  # feeds the census. The first version of the vacuity token required a
+  # space after the binary name, which colour replaces with an SGR reset:
+  # green on every fixture here and on every developer's machine, red in CI
+  # only.
+  expect "the COLOURISED log CI actually writes is CLEAN too" \
+    nx-color.log 1 0 "SKIP CENSUS OK"
+  expect "...and its rows, skips and gated assertion all still parse under SGR" \
+    nx-color.log 1 0 "2 tolerated skip(s), 1 tolerated non-assertion(s)"
 
   # THE TWO DEMONSTRATIONS THE BRIEF ASKS FOR.
   expect "a gated assertion nobody agreed to FAILS" \

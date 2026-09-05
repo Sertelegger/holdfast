@@ -172,7 +172,20 @@ trigger as a side effect of writing release notes.
   to stderr — status lines, captured output, summary — and leaves stdout
   empty, so dropping it would `tee` a zero-byte log. The census's self-test
   grew a second, nextest-shaped fixture family rather than trusting the new
-  branch: 32 checks to 40.
+  branch: 32 checks to 42.
+
+  **One of those fixtures is colourised, and that is the one that earned its
+  place.** `CARGO_TERM_COLOR: always` is set workflow-wide, nextest obeys it,
+  and the binary name therefore arrives wrapped in its own SGR pair — the byte
+  after `holdfast-core::detection` is `ESC`, not the space the first version of
+  the vacuity token required. That pattern was green on every fixture here, on
+  every local run and on every uncoloured pipe, and red **in CI alone**; it was
+  found by watching it fail there. The boundary is now spelt as "not an
+  identifier character", which holds with or without colour, and `nx-color.log`
+  is what stops the next such assumption getting past the self-test. The colour
+  setting itself is left alone: the Actions UI renders it, and the captured
+  libtest block — where every other anchored grep reads from — stays plain
+  regardless, because those processes are on a pipe.
 
   **Doctests get their own `cargo test --doc` step, because nextest does not
   run them at all.** Both of this workspace's doctests are `ignored`, so the
@@ -183,6 +196,12 @@ trigger as a side effect of writing release notes.
   default is one process per core, which is the nproc-tracking that pin exists
   to refuse, and `scripts/ci-flake-hunt.sh` reads the value to assert it is
   oversubscribed relative to CI.
+
+  Measured on the runner under this change: `1331 tests run: 1331 passed
+  (1 slow), 0 skipped` in 193.35s, with one `SLOW [> 60.000s]` naming
+  `tier_b_stays_off_and_the_control_path_stays_responsive_under_load` — the
+  row the 127.70s figure belongs to. Both thresholds behaved as chosen: 60s
+  named the one row worth watching, 300s killed nothing that was working.
 
 ### Added
 
