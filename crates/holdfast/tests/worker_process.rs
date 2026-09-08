@@ -50,15 +50,23 @@
 //! an awaited call — it accepts a timeout as a pass — and every worker is
 //! killed on the way out by `WorkerProcess`'s `Drop`, pass or fail.
 //!
-//! # `/proc` is Linux-only and this repository now has a macOS job
+//! # `/proc` is Linux-only, and **there is still no macOS job**
 //!
-//! Three rows read `/proc`. Each `/proc` assertion is
+//! Checked rather than assumed, because this task was dispatched on the
+//! belief that one had landed: every `runs-on:` in `.github/workflows/`
+//! is `ubuntu-24.04` except a single `windows-2022`. So the split below
+//! is written for the developer machine and for whenever 0.0.11 or later
+//! adds the job — not for a job that exists today.
+//!
+//! Two rows read `/proc`. Each `/proc` assertion is
 //! `#[cfg(target_os = "linux")]` and each is **paired with a portable
-//! `ps` assertion that runs everywhere**, so the row still asserts
-//! something on macOS rather than silently becoming a no-op. Writing a
-//! macOS `sysctl`/`KERN_PROCARGS2` path instead would be code no job in
-//! this repository exercises, which `CLAUDE.md`'s macOS section explains
-//! is worse than an honest gap.
+//! `ps` assertion**, so on a non-Linux Unix the row still asserts
+//! something rather than silently becoming a no-op — which is the
+//! failure mode `CLAUDE.md`'s macOS section is about, and it costs a
+//! wrong diagnosis whether or not CI is watching. Writing a macOS
+//! `sysctl`/`KERN_PROCARGS2` path instead would be code **no job in this
+//! repository exercises**, which the same section explains is worse than
+//! an honest gap.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
