@@ -273,6 +273,62 @@ async fn wait_for_at_prompt(server: &HoldfastServer, session: &str) {
     }
 }
 
+/// Wait until `want` commands have been **recorded and closed**, read from
+/// the history rather than inferred from the mode.
+///
+/// **`wait_for_at_prompt` cannot do this job, and using it for it is a
+/// race.** That helper is level-triggered on `interaction_mode`, so it
+/// cannot tell *"the command I just sent has finished"* from *"the command
+/// I just sent has not started yet"*: immediately after `send_input`, a
+/// shell that has not echoed the line yet is still `AtPrompt` at
+/// `semantic` tier from the **previous** prompt, and the helper returns at
+/// once with the command still in flight.
+///
+/// That is the very race `run_wait_for_idle`'s
+/// `baseline`/`saw_executing`/settle-window machinery exists to close,
+/// reappearing in a test helper that had no equivalent guard. Measured
+/// against `a_pattern_less_wait_started_at_an_idle_prompt_does_not_resolve_early`
+/// at **4 failures in 12** contended runs of this binary
+/// (`taskset -c 0,1`, `--test-threads=16`); 25/25 green for the same row
+/// in isolation, which is why it read as load-dependent rather than as a
+/// missing synchronisation.
+///
+/// The positive signal is a history entry carrying `output_end_cursor` —
+/// the same *"started and its `D` closed it"* fact the product reads, so
+/// this helper and `run_wait_for_idle` cannot disagree about whether a
+/// command is done.
+async fn wait_for_closed_commands(server: &HoldfastServer, session: &str, want: usize) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let r = server
+            .get_command_history(Parameters(GetCommandHistoryArgs {
+                session: session.into(),
+                limit: None,
+                since_index: None,
+            }))
+            .await
+            .expect("get_command_history must not be a protocol error");
+        let data = body(&r)["data"].clone();
+        let closed = data["entries"]
+            .as_array()
+            .map(|es| {
+                es.iter()
+                    .filter(|e| !e["output_end_cursor"].is_null())
+                    .count()
+            })
+            .unwrap_or(0);
+        if closed >= want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {closed} of {want} command(s) closed within the deadline; \
+             history: {data}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn kill(server: &HoldfastServer, session: &str) {
     let _ = server
         .terminate(Parameters(TerminateArgs {
@@ -4200,7 +4256,14 @@ async fn a_pattern_less_wait_started_at_an_idle_prompt_does_not_resolve_early() 
         }))
         .await
         .expect("warm-up send_input");
-    wait_for_at_prompt(&server, &id).await;
+    // **Positive synchronisation, not a mode reading.** `wait_for_at_prompt`
+    // here returned on the *previous* prompt whenever the shell had not yet
+    // echoed `echo warmup`, so the waiter below started with the warm-up
+    // still in flight — and then correctly reported the session finished,
+    // because a command really had started since its baseline and closed.
+    // The product was right and this line was wrong; see
+    // `wait_for_closed_commands`.
+    wait_for_closed_commands(&server, &id, 1).await;
 
     let waiter = {
         let server = std::sync::Arc::clone(&server);
