@@ -656,10 +656,19 @@ jobs:
       # reason that has nothing to do with the code under test. A developer's
       # Mac usually has a modern bash first on `PATH` from Homebrew, which is
       # precisely why this did not reproduce locally.
+      #
+      # **`fish` is deliberately NOT installed, matching the `test` job.** It
+      # was, briefly, and the result is the reason it is not: `fish` is absent
+      # from both runners by default, so `detection`'s fish rows are no-ops
+      # everywhere -- installing it on macOS alone turned this job into a
+      # comparison of a different surface, and one of those newly-live rows
+      # failed against fish 4.8.1. That is a real finding and it is filed, but
+      # it is not a macOS finding, and discovering it here would make every
+      # future macOS red ambiguous. Fish coverage has its own job.
       - name: The shells the suite spawns by name, including a bash that can do OSC 133
         run: |
           set -euo pipefail
-          brew install --quiet bash dash fish
+          brew install --quiet bash dash
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       # **Asserted, because the alternative is nine confusing failures.** A
       # missing shell should be one loud line naming the missing shell, not a
@@ -668,7 +677,7 @@ jobs:
       - name: Assert the environment before blaming the code
         run: |
           set -euo pipefail
-          for sh in bash zsh dash fish; do
+          for sh in bash zsh dash; do
             command -v "$sh" || { echo "$sh is not on PATH" >&2; exit 1; }
           done
           bash --version | head -1
@@ -678,7 +687,7 @@ jobs:
             echo "and every semantic-tier detection row will fall back to heuristic." >&2
             exit 1
           fi
-          echo "ok    bash ${major}.x, and all four shells resolve"
+          echo "ok    bash ${major}.x, and the three shells this job needs resolve"
       # Same version and the same digest discipline as the `test` job, with the
       # `mac` tarball's own SHA-256 — computed from the published artifact and
       # verified by running it (`cargo-nextest 0.9.143 (60fa45f63 2026-08-04)`).
