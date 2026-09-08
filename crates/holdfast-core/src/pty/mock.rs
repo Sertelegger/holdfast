@@ -5,6 +5,7 @@ use super::{LineDiscipline, PtyBackend, Signal};
 use crate::Result;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::time::Duration;
 
 #[derive(Debug, Default)]
 struct MockState {
@@ -23,6 +24,9 @@ struct MockState {
     /// unobservable — a child that dies on the first signal proves
     /// nothing about the second.
     traps_terminate: bool,
+    /// How long `read` stalls before draining, modelling a reader that
+    /// the scheduler has not run yet. See [`MockPty::set_read_delay`].
+    read_delay: Duration,
 }
 
 /// Something to run when `line_discipline` is sampled — see
@@ -85,6 +89,20 @@ impl MockPty {
     /// Queue bytes that subsequent `read` calls will return.
     pub fn queue_output(&self, bytes: &[u8]) {
         self.state.lock().to_read.extend(bytes.iter().copied());
+    }
+
+    /// Stall every subsequent `read` by `d` before it drains.
+    ///
+    /// **This models scheduling, not a slow device**, and it exists to
+    /// make GH #42 deterministic. That defect is a race between a child's
+    /// death and the reader thread's next `read`: the window is normally
+    /// microseconds, so the row that covers it was green in 60 isolated
+    /// and 8 whole-lib contended runs on a 2-core box while failing on a
+    /// slower CI host. Widening the window turns "fails when the machine
+    /// is unlucky" into "fails whenever the bug is present", which is the
+    /// difference between a test and a coin.
+    pub fn set_read_delay(&self, d: Duration) {
+        self.state.lock().read_delay = d;
     }
 
     /// Everything written to the child so far.
@@ -183,6 +201,14 @@ impl PtyBackend for MockPty {
     }
 
     fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        // **Slept before the lock, never under it.** Holding `state`
+        // across a sleep would block `queue_output` and `exit` too, which
+        // would serialise the very interleaving this delay exists to
+        // expose.
+        let delay = self.state.lock().read_delay;
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         let mut s = self.state.lock();
         let n = s.to_read.len().min(buf.len());
         for (i, b) in s.to_read.drain(..n).enumerate() {

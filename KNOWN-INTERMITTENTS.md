@@ -15,7 +15,6 @@ been measured, and what would settle it.
 |---|---|---|
 | [#10](https://github.com/Sertelegger/holdfast/issues/10) | `send_input_wait_for_returns_the_identical_shape` (`crates/holdfast-core/tests/integration.rs`) | `matched differs between wait_for_pattern and send_input(wait_for=)`. Its file-mate `send_input_reaches_the_shell` fails the same way, so the issue title under-describes it by one row. |
 | [#21](https://github.com/Sertelegger/holdfast/issues/21) | `the_exit_cleanup_leaves_a_successor…socket_and_pid_file_alone` | `AddrInUse` in `bind_control`. Under `--workspace` another target's daemon binds the control socket in the same instant; in isolation there is no competitor. |
-| [#42](https://github.com/Sertelegger/holdfast/issues/42) | `session::wait::tests::output_written_just_before_an_exit_still_matches` | Returns `SessionDied` where it expects `Matched`. **Possibly not a flake** — see below. |
 | [#52](https://github.com/Sertelegger/holdfast/issues/52) | `daemon::server::tests::a_connection_mid_handshake_holds_off_the_client_less_exit` | **2 failures in 54 whole-binary runs**, load-dependent; 0 in 800 runs filtered to `daemon::server` alone, so it needs the rest of the binary for contention. Asserts at `server.rs:3552`. **#52's second test is the row already tracked as #21 above** — the pair overlaps, so #52 contributes one new name, not two. |
 
 ## Linux CI evidence, 2026-09-01
@@ -102,18 +101,42 @@ across two days:
   shell-integration snippet rather than the shell's prompt. Kept here as the
   reason a row can look load-dependent and be a race in its own setup.
 
-## #42 deserves a different treatment from the rest
+## #42 was a product bug, exactly as this section suspected
 
-The final rescan **reads the session buffer rather than confirming the reader
-has caught up**. If that is right, the failure is not the test being impatient —
-it is `wait_for_pattern` answering `SessionDied` over output a real child
-genuinely produced, which is a user-visible correctness bug on a shipped tool.
+**Fixed 2026-09-08.** This section read: *"The final rescan reads the session
+buffer rather than confirming the reader has caught up. If that is right, the
+failure is not the test being impatient — it is `wait_for_pattern` answering
+`SessionDied` over output a real child genuinely produced, which is a
+user-visible correctness bug on a shipped tool."* The hypothesis was correct in
+every part, including the warning not to close it by raising a timeout.
 
-Measured: **17 failures in 500 runs under 96-way CPU saturation, 0 in 141 idle.**
+**The mechanism.** `for_pattern`'s final rescan fired on `!session.is_alive()`,
+which flips the instant the child exits. The reader thread breaks only once
+`read` returns 0 **and** the backend is dead, so it always drains the child's
+last bytes — but a waiter polling liveness can look in the window between those
+two events and search a buffer that does not yet hold them. It then answered
+`SessionDied` for output that `read_output` would return a moment later.
 
-**Do not close it by raising a timeout** until that question is settled. A raised
-deadline would hide the defect if the hypothesis holds, and the issue title would
-then be actively misleading.
+**Proved causally, because sampling could not reach it here.** The row was green
+in **60 isolated and 8 whole-lib contended runs** on a 2-core box — consistent
+with the 0-in-141-idle already recorded above, and a reminder that this row
+needs saturation rather than merely load. Inserting a 150 ms delay ahead of the
+reader's `buffer.push` turned it into **10 failures in 10**, with exactly the
+observed signature (`left: SessionDied, right: Matched`). One delayed component,
+one predicted failure.
+
+**The obvious fix does not work, and that is worth recording.** Treating
+`RecvError::Closed` as "the reader is done" fails because `Session` holds
+`output_tx` itself, so the sender outlives the reader thread and that arm is
+unreachable while the caller holds an `Arc<Session>` — which it always does.
+The fix is a positive signal: `Session::reader_finished()`, stored `Release` by
+the reader as it leaves its loop and read `Acquire` by the rescan, so every
+`buffer.push` before it is visible to the search.
+
+Pinned by `session::wait::tests::a_slow_reader_does_not_turn_a_match_into_a_death`,
+which uses `MockPty::set_read_delay` to make the window deterministic rather
+than lucky. The original row is kept beside it: it is the same claim without the
+widened window, and it is the one that reproduced on a slow host.
 
 ## #56 is not the common cause this file said it was
 

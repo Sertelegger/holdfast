@@ -281,6 +281,16 @@ pub struct Session {
     /// `PromptDetector` is a pure classifier with no previous mode and an
     /// edge is not computable from its state.
     awaiting_secret: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once the reader thread has left its loop, which is the only
+    /// moment at which "no further output will ever arrive" becomes true.
+    ///
+    /// **Not the same fact as `is_alive()`, and conflating them was GH
+    /// #42.** The child's death and the reader's completion are separated
+    /// by however long the scheduler takes to run one more `read` — the
+    /// reader breaks only once `read` returns 0 *and* the backend is dead,
+    /// so it always drains first, but a caller polling `is_alive()` can
+    /// look in between and see a buffer missing the child's last line.
+    reader_finished: Arc<std::sync::atomic::AtomicBool>,
     /// How many writes this session's PTY has actually **taken**, bumped
     /// in [`Session::write_input_acked`] after the backend accepted them.
     ///
@@ -664,6 +674,7 @@ impl Session {
         let (events_tx, _) = broadcast::channel(SESSION_EVENT_FRAMES);
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_FRAMES);
         let awaiting_secret = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writes_performed = Arc::new(AtomicU64::new(0));
 
         // Geometry and mode are applied by `set_screen_config` right
@@ -708,6 +719,7 @@ impl Session {
             output_tx: output_tx.clone(),
             events_tx: events_tx.clone(),
             awaiting_secret: Arc::clone(&awaiting_secret),
+            reader_finished: Arc::clone(&reader_finished),
             writes_performed: Arc::clone(&writes_performed),
             write_tx,
             last_activity_ms: Arc::clone(&last_activity_ms),
@@ -733,6 +745,7 @@ impl Session {
         let deadline = Arc::clone(&idle_deadline_ms);
         let reader_clock = clock.clone();
         let reader_backend = Arc::clone(&backend);
+        let reader_finished_flag = Arc::clone(&reader_finished);
         let reader_rules = Arc::clone(&session.rules);
         // §4.5.1's responder is used from the reader thread alone, so it
         // needs no `Mutex` and no `Weak` — it is moved into the closure
@@ -979,6 +992,19 @@ impl Session {
                 // reaper's sweep must not have to hold anything.
                 deadline.store(deadline_from(at, idle_timeout_ms), Ordering::Relaxed);
             }
+
+            // **Raised here, before the reap grace below, because the two
+            // answer different questions.** This flag means *the PTY is
+            // drained and nothing further will be published*; the block
+            // below waits for a wait-status so the exit **code** is right.
+            // A waiter that needs the final bytes must not be held for
+            // `EXIT_REAP_GRACE` to learn a number it never asked for.
+            //
+            // `Release`, paired with the `Acquire` in
+            // [`Session::reader_finished`]: every `buffer.push` above must
+            // be visible to a thread that observes this flag, which is the
+            // entire guarantee `wait::for_pattern`'s final rescan rests on.
+            reader_finished_flag.store(true, Ordering::Release);
 
             // **§7.5's `SessionExited { code }`, at the one place a
             // session's end is observed rather than asked about.**
@@ -1246,6 +1272,18 @@ impl Session {
 
     pub fn exit_code(&self) -> Option<i32> {
         self.backend.exit_code()
+    }
+
+    /// Whether the reader has left its loop, and with it whether the
+    /// output buffer is final.
+    ///
+    /// **`is_alive() == false` does not imply this**, which is GH #42:
+    /// the child's death is observable one scheduler slice before the
+    /// reader has run the `read` that moves the child's last bytes into
+    /// the buffer. A consumer that needs *all* of a dead session's output
+    /// must wait for this, not for the child.
+    pub fn reader_finished(&self) -> bool {
+        self.reader_finished.load(Ordering::Acquire)
     }
 
     pub fn pid(&self) -> Option<u32> {
