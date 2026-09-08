@@ -16,12 +16,14 @@
 #   * `persist-credentials: false` on every checkout — the default is true
 #     and writes a pushable token into .git/config
 #   * a PINNED runner image, never a `-latest` alias. `ubuntu-24.04`
-#     everywhere except `windows-native`, which is `windows-2022`
+#     everywhere except `windows-native` (`windows-2022`) and `macos-native`
+#     (`macos-14`)
 #   * explicit timeout-minutes on every job — the default is 360
 #   * every job body is a command a developer can run locally
 #
 # Pinned inputs:
-#   runner images   ubuntu-24.04, and windows-2022 for `windows-native`
+#   runner images   ubuntu-24.04; windows-2022 for `windows-native`;
+#                   macos-14 for `macos-native`
 #   rust toolchain  channel "1.97" — from rust-toolchain.toml, the ONLY pin.
 #                   Do not add RUSTUP_TOOLCHAIN and do not add a toolchain
 #                   action; either creates a second pin that can drift.
@@ -34,7 +36,9 @@
 #   actionlint                  1.7.12  (verified against its checksums.txt)
 #   cargo-nextest               0.9.143 (no published checksums file; pinned
 #                                       by the sha256 of the tarball that was
-#                                       fetched, recorded in the `test` job)
+#                                       fetched. TWO digests, one per platform:
+#                                       the `linux` tarball in `test`, the `mac`
+#                                       one in `macos-native`)
 
 name: CI
 
@@ -588,6 +592,134 @@ jobs:
             exit 1
           fi
           echo "ok    audit trail opened at ${log#"$scratch"/} ($(wc -c <"$log" | tr -d ' ') bytes; 0 is correct for a bare initialize)"
+
+  macos-native:
+    runs-on: macos-14
+    # Generous because a 3-vCPU macOS runner is several times slower than the
+    # box these numbers were taken on, and because a hung pty test here would
+    # otherwise sit until GitHub's own six-hour cap. `.config/nextest.toml`
+    # kills an individual test after 5x60s, so this bounds the job, not a row.
+    timeout-minutes: 45
+    # **The third platform, and the one this project develops on.**
+    #
+    # `CLAUDE.md` opens its macOS section with "Every CI job is `ubuntu-24.04`,
+    # so nothing here is caught by CI and all of it has already cost someone a
+    # wrong diagnosis." That was true until this job. Two defects have now been
+    # found by hand on macOS that the pipeline was structurally unable to see:
+    #
+    #   * a `#[cfg]` split that deleted the arm for every BSD but compiled
+    #     cleanly on the two platforms anyone tested, and
+    #   * GH #96, where `worker_protocol`'s peer-pairing row fails 5/5 in
+    #     isolation on macOS while every Linux job stays green.
+    #
+    # Both are runtime, kernel-shaped behaviour — pty buffering, accept
+    # ordering, line discipline. A cross-compile cannot see any of it.
+    #
+    # **On the bill, because it is the reason this job did not exist sooner.**
+    # GitHub's docs say "GitHub Actions usage is free for standard
+    # GitHub-hosted runners in public repositories", and that sentence carries
+    # no macOS carve-out; `macos-14` is a standard runner. The $0.062/min in
+    # the pricing table is *billable* usage — private repositories, or larger
+    # runners, which "are always charged for, even when used by public
+    # repositories". So this is expected to be free while the repository is
+    # public, and to become the most expensive minute in the pipeline the day
+    # it is not. **If this repository ever goes private again, revisit this
+    # job first** — moving it to `nightly.yml` is a one-line change and the
+    # obvious lever.
+    #
+    # Measured on `aarch64-apple-darwin` (many-core, so treat as a lower bound
+    # for a 3-vCPU runner): cold build of the full test surface 21s, full suite
+    # 96s. A curated "platform-sensitive subset" was considered and rejected —
+    # it saves about a minute, and it is a hand-maintained list of targets that
+    # drifts. This file already records what that costs: `mcp-smoke.sh`'s own
+    # check count drifted five times with nothing going red. The whole
+    # workspace needs no list.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain && rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: macos-native
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Same version and the same digest discipline as the `test` job, with the
+      # `mac` tarball's own SHA-256 — computed from the published artifact and
+      # verified by running it (`cargo-nextest 0.9.143 (60fa45f63 2026-08-04)`).
+      # A second platform must not become a second, unpinned supply chain.
+      - name: Install cargo-nextest, at the digest recorded for the pinned version
+        env:
+          NEXTEST_VERSION: 0.9.143
+          NEXTEST_SHA256: 4830d430411148d17602a75cc880bfb4dc8dac153dea59a48a2ef4cc93577f07
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 "https://get.nexte.st/${NEXTEST_VERSION}/mac" \
+            -o cargo-nextest.tar.gz
+          echo "${NEXTEST_SHA256}  cargo-nextest.tar.gz" | shasum -a 256 -c -
+          mkdir -p "${HOME}/.cargo/bin"
+          tar xzf cargo-nextest.tar.gz -C "${HOME}/.cargo/bin" cargo-nextest
+          cargo nextest --version
+      # **GH #96 is excluded by name, and the next step makes the exclusion
+      # expire loudly.** Adding this job with a known-red row would have
+      # produced a job everyone learns to ignore, which is worse than no job.
+      # Excluding it silently would be worse still.
+      - name: The suite, on a BSD kernel
+        shell: bash
+        run: |
+          set -eo pipefail
+          cargo nextest run --workspace --locked --no-fail-fast \
+            -j "${{ env.TEST_THREADS }}" --no-output-indent \
+            -E 'not test(=per_session_socket::a_second_process_cannot_take_the_workers_slot)' \
+            2>&1 | tee macos-test.log
+          # Anti-vacuity: a filter expression that stopped matching, or a
+          # binary that ran nothing, both exit 0 with no rows. Measured 1336
+          # passed on macOS at the commit that added this job; the floor is
+          # below that on purpose, because an equality is a line every added
+          # test breaks.
+          line="$(grep -E 'tests run:' macos-test.log | tail -1)"
+          if [ -z "$line" ]; then
+            echo "no nextest summary line — the run produced no verdict" >&2
+            exit 1
+          fi
+          passed="$(printf '%s' "$line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')"
+          if [ "${passed:-0}" -lt 1250 ]; then
+            echo "only ${passed:-0} rows passed on macOS, want >= 1250 — did a filter stop matching?" >&2
+            echo "$line" >&2
+            exit 1
+          fi
+          echo "ok    macOS ran ${passed} rows"
+      # **The allowance above expires by failing.** If GH #96 starts passing,
+      # this step goes red and says to delete the exclusion — so the filter
+      # cannot quietly outlive the bug it was written for.
+      #
+      # `set +e` is deliberate and is not decoration: GitHub runs `shell: bash`
+      # as `bash --noprofile --norc -eo pipefail {0}`, so a command that exits
+      # non-zero ends the script before its status can be read. This step's
+      # whole purpose is to read a non-zero status.
+      - name: GH #96 still fails, so the exclusion above is still earning it
+        shell: bash
+        run: |
+          set +e
+          cargo nextest run -p holdfast-core --locked \
+            -j "${{ env.TEST_THREADS }}" --no-output-indent \
+            -E 'test(=per_session_socket::a_second_process_cannot_take_the_workers_slot)' \
+            >gh96.log 2>&1
+          rc=$?
+          set -eo pipefail
+          tail -5 gh96.log
+          if [ "$rc" -eq 0 ]; then
+            echo "" >&2
+            echo "GH #96 now PASSES on macOS." >&2
+            echo "Delete the -E exclusion in the step above and delete this step." >&2
+            echo "A standing allowance that is no longer needed is how a suite" >&2
+            echo "quietly stops testing something." >&2
+            exit 1
+          fi
+          echo "ok    GH #96 still fails on macOS; the exclusion is still needed"
+      # Doctests are not run here. They are platform-independent prose checks
+      # and the `test` job already runs them; repeating them buys nothing a
+      # BSD kernel can tell you.
 
   # --- the capability gate -------------------------------------------------
 
