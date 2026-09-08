@@ -88,3 +88,20 @@ pub mod frames;
 /// binder, and it should decide rather than inherit.
 #[cfg(unix)]
 pub mod socket;
+
+/// The worker-side loop — the body of `holdfast pty-worker`.
+///
+/// `#[cfg(unix)]` for the same reason [`socket`] is: it reads that
+/// module's accept deadline so the two sides of the link share one
+/// number, and 0.0.10a ships no Windows worker (REQ-CFG-007 defaults
+/// Windows to `in_process` until 0.0.11).
+#[cfg(unix)]
+pub mod child;
+
+/// The daemon-side half of bringing a worker up: the argv, the three
+/// standard streams, the stderr drain, and the handshake.
+///
+/// Paired with [`socket`] — that module binds and accepts, this one
+/// spawns and greets — and `#[cfg(unix)]` for the same reason.
+#[cfg(unix)]
+pub mod spawn;

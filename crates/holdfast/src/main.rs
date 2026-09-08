@@ -40,6 +40,13 @@ use std::time::Duration;
 /// the one reader this paragraph exists for. So: seven refuse, three
 /// answer (`mcp`, `version`, `daemon stop`).
 ///
+/// **"Ten" counts `USAGE`, not `run`'s match arms**, and since 0.0.10a
+/// the two differ: `pty-worker` is dispatched and is deliberately not in
+/// the banner (see its arm in [`run`]). The count above is about what an
+/// operator is offered, so it is still ten — recorded here because a
+/// reader who counts arms instead would otherwise read a stale number and
+/// "fix" it.
+///
 /// Empty on Unix, so the banner there is unchanged byte for byte.
 #[cfg(windows)]
 const PLATFORM_NOTE: &str = "\
@@ -174,6 +181,14 @@ async fn run() -> ExitCode {
             };
             commands::watch(session).await
         }
+        // **Dispatched, and deliberately absent from `USAGE` above.**
+        // This workspace has no clap, so the plan's `hide = true` is this:
+        // the arm exists, the banner does not mention it, and
+        // `holdfast pty-worker --help` still answers. It is spawned by the
+        // daemon once per session (milestone 0.0.10a) and is not a command
+        // to run by hand; advertising it in the banner would make an
+        // internal protocol endpoint look like a user surface.
+        Some("pty-worker") => commands::pty_worker(&args[1..]).await,
         Some("version") => commands::version(),
         Some(other) => usage_error(&format!("unknown subcommand `{other}`")),
         None => {
