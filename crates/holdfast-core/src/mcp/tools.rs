@@ -3102,7 +3102,38 @@ impl HoldfastServer {
                         // `settle_threshold_ms` would otherwise reopen the race.
                         None => {
                             let since = *idle_since.get_or_insert_with(std::time::Instant::now);
-                            if since.elapsed() >= settle {
+                            // **Clamped against what is left from *here*, not
+                            // against the whole timeout — and the difference is
+                            // a race the outer clamp could not win.**
+                            //
+                            // `settle` above is `min(threshold, timeout)`,
+                            // measured from the *call*. This window is measured
+                            // from the first idle sample, which is strictly
+                            // later. So whenever an operator sets
+                            // `settle_threshold_ms >= timeout` the two become
+                            // equal, and the settle break needs `t0 + timeout`
+                            // while the deadline fires at `start + timeout` —
+                            // the deadline wins by exactly `t0 - start`, and the
+                            // clamp bought nothing it was added for. With a
+                            // 50 ms poll the row failed roughly
+                            // `(t0 - start) / 50 ms` of the time, which is rare
+                            // on an idle box and common on a loaded one.
+                            //
+                            // Measured: delaying the first sample by 300 ms
+                            // makes `a_long_settle_threshold_does_not_make_a_
+                            // short_wait_unsatisfiable` fail 6 times in 6.
+                            //
+                            // Leaving one poll of headroom is what makes the
+                            // clamp's promise — *"never guaranteed to lie"* —
+                            // true rather than lucky. On a long deadline `room`
+                            // exceeds `settle` and nothing changes; only a
+                            // deadline this window could not have fitted inside
+                            // shortens it, which is precisely the trade §4.5
+                            // already chose.
+                            let room = deadline
+                                .saturating_duration_since(since)
+                                .saturating_sub(IDLE_WAIT_POLL);
+                            if since.elapsed() >= settle.min(room) {
                                 break Some(mode);
                             }
                         }
