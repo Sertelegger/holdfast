@@ -644,6 +644,41 @@ jobs:
         with:
           key: macos-native
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # **The shells the suite spawns BY NAME, which macOS does not ship.**
+      # The `test` job's equivalent installs `zsh dash less python3`; this one
+      # was written without it and the first run showed exactly what that
+      # costs: nine `detection` rows failed with `"last_line":"bash-3.2$ "` and
+      # `"detection_tier":"heuristic"`.
+      #
+      # Apple still ships **bash 3.2**, the last GPLv2 release, as `/bin/bash`.
+      # OSC 133 shell integration cannot work on it, so every row that expects
+      # a `semantic` tier gets the heuristic fallback instead and fails for a
+      # reason that has nothing to do with the code under test. A developer's
+      # Mac usually has a modern bash first on `PATH` from Homebrew, which is
+      # precisely why this did not reproduce locally.
+      - name: The shells the suite spawns by name, including a bash that can do OSC 133
+        run: |
+          set -euo pipefail
+          brew install --quiet bash dash fish
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+      # **Asserted, because the alternative is nine confusing failures.** A
+      # missing shell should be one loud line naming the missing shell, not a
+      # detection matrix that looks like a product regression. This is the same
+      # argument `ci-probe.sh` makes for the Linux job.
+      - name: Assert the environment before blaming the code
+        run: |
+          set -euo pipefail
+          for sh in bash zsh dash fish; do
+            command -v "$sh" || { echo "$sh is not on PATH" >&2; exit 1; }
+          done
+          bash --version | head -1
+          major="$(bash -c 'echo ${BASH_VERSINFO[0]}')"
+          if [ "${major}" -lt 4 ]; then
+            echo "bash on PATH is ${major}.x; OSC 133 shell integration needs >= 4," >&2
+            echo "and every semantic-tier detection row will fall back to heuristic." >&2
+            exit 1
+          fi
+          echo "ok    bash ${major}.x, and all four shells resolve"
       # Same version and the same digest discipline as the `test` job, with the
       # `mac` tarball's own SHA-256 — computed from the published artifact and
       # verified by running it (`cargo-nextest 0.9.143 (60fa45f63 2026-08-04)`).
