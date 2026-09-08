@@ -22,6 +22,34 @@ trigger as a side effect of writing release notes.
 
 ### Fixed
 
+- **`wait_for_pattern` no longer reports a death over output the child
+  really produced ([#42]).** The pattern path's final rescan fired on
+  `!session.is_alive()`, which flips the instant the child exits — but the
+  reader thread breaks only once `read` returns 0 **and** the backend is
+  dead, so it drains the child's last bytes strictly afterwards. A waiter
+  that looked in the window between those two events searched a buffer that
+  did not yet hold them, and answered `session_died` for a pattern that had
+  in fact matched. `read_output` would return those same bytes a moment
+  later, so the tool contradicted the session it was reporting on.
+
+  **Tracked as an intermittent for weeks, and it was never one.**
+  `KNOWN-INTERMITTENTS.md` recorded the right hypothesis — *"the final
+  rescan reads the session buffer rather than confirming the reader has
+  caught up"* — and warned against closing it by raising a timeout, which
+  would have hidden it. Confirmed causally rather than by sampling: the row
+  is green in 60 isolated and 8 whole-lib contended runs on a 2-core box,
+  and inserting a 150 ms delay ahead of the reader's `buffer.push` makes it
+  fail 10 times out of 10 with the observed signature.
+
+  The obvious repair does not work and is recorded so it is not retried:
+  `RecvError::Closed` cannot mean "the reader is done", because `Session`
+  holds `output_tx` itself and the sender outlives the reader thread. The
+  fix is `Session::reader_finished()` — stored `Release` as the reader
+  leaves its loop, read `Acquire` by the rescan, so every `buffer.push`
+  before it is visible. A session that dies with a reader that never
+  finishes still answers `session_died` at the caller's deadline rather
+  than inventing a timeout.
+
 - **The Windows build compiles again ([#19]).** `windows-cross` — the
   `x86_64-pc-windows-gnu` clippy job — had been red on `main` since before
   0.0.6, with 0 passes in its last 20 runs, while `ROADMAP.md` said the tree
@@ -277,6 +305,7 @@ trigger as a side effect of writing release notes.
 
 [#19]: https://github.com/Sertelegger/holdfast/issues/19
 [#39]: https://github.com/Sertelegger/holdfast/issues/39
+[#42]: https://github.com/Sertelegger/holdfast/issues/42
 
 ## [0.0.7] — 2026-09-01
 
