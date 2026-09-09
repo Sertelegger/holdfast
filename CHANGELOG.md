@@ -22,6 +22,27 @@ trigger as a side effect of writing release notes.
 
 ### Fixed
 
+- **A settle threshold at or above the deadline no longer makes a
+  pattern-less wait time out beside a true `AtPrompt`.** The clamp that
+  exists to stop a long `settle_threshold_ms` making short waits
+  unsatisfiable was measured from the wrong origin: `min(threshold,
+  timeout)` is relative to the *call*, while the settle window runs from
+  the first idle sample, which is strictly later. So whenever
+  `threshold >= timeout` the two were equal and the deadline won by
+  exactly that difference — the clamp bought nothing it was added for,
+  and the row failed roughly `(first sample - call) / 50 ms` of the time:
+  rare on an idle box, common on a loaded one, which is how it read as a
+  flake.
+
+  The window is now clamped against the time left from the sample itself,
+  with one poll of headroom. On a long deadline nothing changes; only a
+  deadline the window could not have fitted inside shortens it, which is
+  the trade the clamp already chose.
+
+  **Measured causally rather than by sampling**: delaying the first idle
+  sample by 300 ms makes the row fail 6 times in 6 before the change and
+  0 in 6 after it, same probe both sides.
+
 - **`wait_for_pattern` no longer reports a death over output the child
   really produced ([#42]).** The pattern path's final rescan fired on
   `!session.is_alive()`, which flips the instant the child exits — but the
