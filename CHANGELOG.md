@@ -22,6 +22,62 @@ trigger as a side effect of writing release notes.
 
 ### Fixed
 
+- **`every_emitted_unix_field_is_a_number` no longer waits on the output
+  bytes for a fact only the command history carries.** The row walks every
+  payload asserting each `*_unix_*` field is a number, and refuses to pass
+  when `started_at_unix_ms` never appeared — a deliberate anti-vacuity
+  guard, since an empty walk proves nothing. `started_at_unix_ms` lives on a
+  `get_command_history` entry and nowhere else on the surface, and the row
+  reached that entry by sending `echo` and polling `read_output` for its
+  output. That is the same publication skew as
+  `no_output_is_classified_between_the_echo_sample_and_the_answer` below,
+  one publication earlier: the reader pushes a chunk into the ring buffer and
+  only *then*, outside the buffer lock per §4.3, applies that chunk's OSC 133
+  events to the history. `echo`'s `C` marker and its output bytes arrive in
+  one chunk, so a poll on the buffer returns inside a gap holding the
+  subscriber fan-out, a full `screen.feed` VT100 parse, the §4.5.1 query
+  responder, the detector lock with its `feed`/`line_discipline`/`snapshot`,
+  an `AtomicBool` swap and a `now_ms()` — and `get_command_history` then
+  answered with an empty ring. The row now waits on a closed history entry
+  (`wait_for_closed_commands`) and enters at an OSC 133 prompt rather than at
+  the first `$` in the buffer, which bash prints before the §8.5 snippet has
+  run. **2 failures in 200 whole-binary runs before, 0 in 400 after**, same
+  box and same load (`taskset -c 0,1 … --test-threads=16`, eight lanes on
+  distinct core pairs), every pre-fix failure carrying the identical `seen:`
+  list.
+
+  **No product change.** The reader's ordering is the documented one and the
+  emitted values were never wrong; the row was reading across a gap the
+  product states it leaves.
+
+  **Proved causally rather than by sampling**: a 150 ms delay between the
+  reader's `buffer.push` and its `history.lock()` fails the old form 10 times
+  in 10 with the observed message and passes the new form 10 times in 10,
+  same probe both sides. The vacuity guard is untouched and still fires —
+  renaming the emitted key to `started_at_ms` fails the repaired row 3 times
+  in 3 on that guard, and emitting the value as a string fails it 2 times in
+  2 on the number assertion.
+
+  **That probe is a deterministic amplifier for the whole defect class, so
+  `schema.rs` was swept with it and two more rows were red.**
+  `every_nested_object_a_tool_returns_has_its_key_set_pinned` carried the
+  identical arrangement — poll the buffer for `NESTED_OK`, then require
+  `get_command_history` to have an entry to enumerate — and failed 6 times
+  in 6 with `unavailable` / "this shell has emitted no OSC 133 markers";
+  it now waits the same way. `exited_session`, the fixture behind
+  `get_screen_state_on_a_dead_session_matches_its_schema` and two
+  neighbours, waited for `is_alive()` to go false and then read the grid,
+  which is precisely the mistake `Session::reader_finished`'s own
+  documentation names as GH #42: the child's death is observable one
+  scheduler slice before the reader has moved its last bytes into the
+  buffer. It failed 2 times in 2 under the probe with "the final screen is
+  empty, so `session_died carries data` is untested here" — the row's own
+  anti-vacuity guard doing its job — and now waits on the drain flag, which
+  is `Release`/`Acquire` against every `buffer.push` for exactly this.
+  With all three repaired the binary is green 63/63 under the probe, where
+  before it was 3 red.
+
+||||||| 574f9f8
 - **`interrupt`'s row no longer gates on a mode the shell raises before it
   has handed over the terminal.** `interrupt` signals
   `tcgetpgrp(master)`, and a shell raises `Executing` — `PS0`'s OSC 133
