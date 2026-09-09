@@ -3204,6 +3204,51 @@ mod tests {
         let (a_listener, a_socket) = bind_control(&paths).expect("A binds its control socket");
         drop(a_listener);
 
+        // **Wait for A to stop answering rather than assuming `drop` did
+        // it — GH #21.** The comment above says "A's listener drops, so
+        // `socket_is_live` goes false". That is true of *this* process
+        // immediately and of the machine only once every child that
+        // inherited the descriptor has reached `exec`.
+        //
+        // **The cause is a `fork`, not a slow kernel or a loaded box**,
+        // and `remove_runtime_files_we_own` below already says so for its
+        // own unlink: every `fork` in this tree briefly hands a child a
+        // copy of ours, and `SOCK_CLOEXEC` closes it at `exec`. Under a
+        // parallel suite the forks are the sibling rows' PTY spawns.
+        // Measured: 16.4% (492/3000) with eight threads spawning
+        // `/bin/true` and **no** CPU pinning, against **0 in 30,000**
+        // under `taskset -c 0,1` at 16 threads with no forks — starvation
+        // alone never produces it.
+        //
+        // The failing call is B's `bind_control`, and the `AddrInUse`
+        // comes from `bind_socket_within`'s **own** inline `connect`, not
+        // from `socket_is_live` — so the row fails in its *setup*, never
+        // in the assertion it exists to make.
+        //
+        // **Polling here rather than changing either probe.** A probe
+        // that retried until it saw a failure would still be guessing:
+        // the only thing that distinguishes "a daemon is serving" from "a
+        // dead daemon's descriptor is held by somebody's fork child" is
+        // process ownership, and the answer this tree already has for that
+        // — `holds_socket_bound_at`, intersecting `/proc/net/unix` with
+        // `/proc/<pid>/fd` — is Linux-only and far too much machinery for
+        // a test's setup.
+        //
+        // Bounded so a descriptor that is never released fails loudly
+        // instead of hanging. The spin is short when it happens at all:
+        // 2.35 ms was the longest observed, against a 5 s deadline.
+        let settled_by = std::time::Instant::now() + Duration::from_secs(5);
+        while super::super::spawn::socket_is_live(&paths) {
+            assert!(
+                std::time::Instant::now() < settled_by,
+                "A's listener was dropped but `connect(2)` still succeeds 5s \
+                 later. Expect a process holding an inherited copy of the \
+                 descriptor — a sibling row's child stalled between `fork` \
+                 and `exec` — not a daemon that refuses to die"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
         // Daemon B, through the real binder: lock, probe, unlink, bind,
         // chmod. Then its pid file, naming a process that is not us.
         let (b_listener, b_socket) =

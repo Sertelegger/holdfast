@@ -122,6 +122,27 @@ impl Drop for DaemonLock {
 /// the real client, and conflating the two would make a
 /// version-mismatched daemon look absent and get a second one spawned
 /// on top of it.
+///
+/// **A success can outlive the listener, and the reason is a `fork`, not a
+/// slow kernel.** The drop is synchronous; what survives it is another
+/// process's *inherited copy* of the descriptor, live from `fork` until
+/// `exec`. `remove_runtime_files_we_own` in `daemon::server` already
+/// explains this window in full — read it there rather than trusting a
+/// second account here, because two accounts drift.
+///
+/// Measured, so nobody sizes a remedy against the wrong variable: with
+/// eight threads `fork`+`exec`ing `/bin/true` and **no** CPU pinning,
+/// a `connect(2)` after the drop succeeds **16.4% of the time**
+/// (492/3000). Under CPU starvation with no forks — `taskset -c 0,1`,
+/// 16 threads — it succeeds **0 times in 30,000**, the same as idle. The
+/// width is the *child's* `fork`→`exec` latency, not a constant: p50
+/// 75 µs, max 3.1 ms with `/bin/true`, and 300 ms on demand from a child
+/// that sleeps before `exec`. A caller that needs "the predecessor has
+/// stopped" must poll this to `false` against its own deadline.
+///
+/// **This is not the only such probe.** `bind_socket_within` runs its own
+/// inline `connect` and is what actually returns `AddrInUse`; a change
+/// here would not affect it.
 pub fn socket_is_live(paths: &RuntimePaths) -> bool {
     std::os::unix::net::UnixStream::connect(paths.control_sock()).is_ok()
 }
