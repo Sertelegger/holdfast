@@ -1105,6 +1105,14 @@ impl HoldfastServer {
     /// session-state block beside it is what tells you whether it landed:
     /// a session that was `Executing` and is now `AtPrompt` is an
     /// interrupt that worked.
+    ///
+    /// `Executing` does **not** mean the command owns the terminal yet. A
+    /// shell raises it before it forks the command and hands the terminal
+    /// to it, so an interrupt issued in that gap goes to the shell's own
+    /// group and reaches nothing — measured here 9 times in 1360 trials
+    /// under load. A real terminal loses a Ctrl+C in the same gap, and
+    /// the remedy is the same: the session still reads `Executing`, so
+    /// call again.
     #[tool(
         annotations(
             title = "Send Ctrl+C to a session's process group",

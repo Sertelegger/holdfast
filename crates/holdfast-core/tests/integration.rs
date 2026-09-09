@@ -240,11 +240,34 @@ fn interrupt_reaches_the_foreground_job_not_the_shell() {
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
     pty.write(b"echo READY''_ONE\n").unwrap();
     read_until(&pty, "READY_ONE", Duration::from_secs(5));
+    let at_prompt = poll_foreground(&pty, |g| g.is_some(), Duration::from_secs(5));
+    assert!(at_prompt.is_some(), "the shell never took the terminal");
 
     // Foreground sleep: job control gives it its own process group, which
     // becomes the terminal's foreground group.
     pty.write(b"sleep 300\n").unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    // **Waited for, not slept through.** This was a flat 500 ms, and the
+    // thing it was guessing at is the subject of the test: `signal`
+    // targets `tcgetpgrp(master)`, and the shell owns that until it has
+    // forked the job and handed the terminal over. Its server-level twin
+    // guessed with `interaction_mode`, which the shell raises *before*
+    // the handover, and failed 1 whole-binary run in 30 under
+    // `taskset -c 0,1 --test-threads=16` for exactly that reason. Here
+    // the precondition is readable, so it is read rather than waited out.
+    //
+    // Drained across the poll, and the echo drained before it: on macOS a
+    // pty nobody reads from fills, and the shell then blocks part way
+    // through echoing the line — before the fork — so the group this is
+    // waiting on never changes. Inert on Linux.
+    read_until(&pty, "sleep 300", Duration::from_secs(5));
+    let running = draining(&pty, || {
+        poll_foreground(&pty, |g| g != at_prompt, Duration::from_secs(10))
+    });
+    assert_ne!(
+        running, at_prompt,
+        "the shell never handed the terminal to the job, so there is \
+         nothing here to tell a foreground-group signal from a session one"
+    );
 
     pty.signal(Signal::Interrupt).unwrap();
 
@@ -3965,6 +3988,124 @@ async fn interrupt(server: &HoldfastServer, id: &str) -> Value {
     body(&r)
 }
 
+/// The process group that owns a session's terminal — `tcgetpgrp(2)` of
+/// the shell's controlling terminal, which is the exact value `interrupt`
+/// signals (`InProcessPty::foreground_pgid`).
+///
+/// Read out of `/proc/<pid>/stat` field 8 (`tpgid`) rather than off the
+/// backend, because `PtyBackend::foreground_group` is not reachable
+/// through a `Session` and this is the only place a test wants it. That
+/// makes it Linux-only, and its one caller gates to Linux for that
+/// reason and no other.
+#[cfg(target_os = "linux")]
+fn terminal_owner(session: &holdfast_core::session::Session) -> i32 {
+    let pid = session.pid().expect("a live session has a pid");
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read the shell's stat");
+    // `comm` is parenthesised and may itself contain spaces and ')', so
+    // the fields after it start past the LAST ')' — the same parse as
+    // `InProcessPty::session_pgids`, for the same reason.
+    let rest = stat.rsplit_once(')').expect("stat carries a comm field").1;
+    // rest: [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr [5]=tpgid
+    rest.split_whitespace()
+        .nth(5)
+        .and_then(|f| f.parse().ok())
+        .expect("stat carries a tpgid field")
+}
+
+/// **Why the row below gates on the job's own output and never on
+/// `interaction_mode`.**
+///
+/// `interrupt` signals `tcgetpgrp(master)`. The shell raises `Executing`
+/// by writing `PS0`'s OSC 133 `C` marker, and it writes that *before* it
+/// expands the command's words, forks, and hands the terminal to the
+/// child's group — so `Executing` is reachable while the terminal is
+/// still the shell's own, and an `interrupt` there is delivered to a
+/// group the command has not joined. That was one flake, at 1 failure in
+/// 30 whole-binary runs under `taskset -c 0,1 --test-threads=16`: across
+/// 1360 contended trials the command survived the interrupt in exactly
+/// the 9 where this value was the shell's own group, and in none of the
+/// other 1351.
+///
+/// **The window is made deterministic rather than waited for.**
+/// `${var//x/y}` is shell-side work with no fork in it, so it sits
+/// between the marker and the fork and holds the terminal open against
+/// the 1 ms poll below. bash's substitution is quadratic — 7.7 s at
+/// 200 KB on the machine this was sized on — so the operand's length is
+/// the dial, and 40 KB is ~0.3 s of it. Without the pad the window is
+/// microseconds wide and both halves of this test would be measuring
+/// luck. If a future bash closes it, the first assertion fails saying so
+/// rather than going quietly green.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_job_owns_the_terminal_by_its_first_output_and_not_by_its_executing_mode() {
+    let server = HoldfastServer::new();
+    let id = start_bash(&server).await;
+    let session = server.registry.get(&id).unwrap();
+    read_until_contains(&server, &id, "$", 50).await;
+    // `setsid()` in the child makes PGID == SID == PID, so the shell's
+    // own process group is its pid.
+    let shell = session.pid().unwrap() as i32;
+
+    session
+        .write_input(b"printf -v HFPAD '%0*d' 40000 0; echo PAD''_BUILT\n")
+        .unwrap();
+    let out = read_until_contains(&server, &id, "PAD_BUILT", 100).await;
+    assert!(
+        out.contains("PAD_BUILT"),
+        "the pad was never built: {out:?}"
+    );
+
+    // The shape the flake had: a command line whose foreground job *will*
+    // be a group of its own, sampled the way a caller samples it — read
+    // the mode, then signal.
+    session.write_input(b"x=${HFPAD//0/1}; sleep 30\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut owner_when_executing = None;
+    while Instant::now() < deadline {
+        if session.detection().interaction_mode == holdfast_core::detect::InteractionMode::Executing
+        {
+            owner_when_executing = Some(terminal_owner(&session));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        owner_when_executing,
+        Some(shell),
+        "`Executing` was not reachable before the handover: the window \
+         this row pins has closed, and the row below can go back to \
+         gating on the mode"
+    );
+    let _ = session.signal(holdfast_core::pty::Signal::Interrupt);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session.detection().interaction_mode != holdfast_core::detect::InteractionMode::AtPrompt
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // And the gate that holds: `( … )` is one job, so bash hands it the
+    // terminal *before* running its body, and the marker cannot reach
+    // this buffer until the handover is done. The identical pad is in
+    // front of it, so the two halves differ in nothing but the gate.
+    session
+        .write_input(b"x=${HFPAD//0/1}; ( echo RUN''NING; sleep 30 )\n")
+        .unwrap();
+    let out = read_until_contains(&server, &id, "RUNNING", 200).await;
+    assert!(
+        out.contains("RUNNING"),
+        "the foreground job never started: {out:?}"
+    );
+    assert_ne!(
+        terminal_owner(&session),
+        shell,
+        "a job that has printed must already hold the terminal, or the \
+         row below is gating on nothing"
+    );
+
+    kill_all(&server).await;
+}
+
 /// **Unix-only, and the reason is the assertion rather than the API**: the
 /// discriminating half probes a *descendant* pid with `kill(pid, 0)`.
 /// Windows job objects are 0.0.11's and get their own test.
@@ -4005,23 +4146,49 @@ async fn interrupt_stops_a_running_command_and_leaves_the_shell_alive() {
         .unwrap_or_else(|| panic!("no background pid in: {out:?}"));
     assert!(pid_alive(bg_pid), "the background job never started");
 
-    // Foreground, so job control gives `sleep` its own process group —
+    // Foreground, so job control gives the job its own process group —
     // which is what makes this a test of the *foreground* targeting rather
     // than of signalling in general.
-    session.write_input(b"sleep 30\n").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while session.detection().interaction_mode != holdfast_core::detect::InteractionMode::Executing
-        && Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    // Asserted rather than merely waited for: if the `sleep` never
-    // started, the marker below comes back because there was nothing to
-    // interrupt, and this test proves nothing at all.
+    //
+    // **The gate is output from the job, and `interaction_mode` cannot
+    // be.** This waited for `Executing` until it was measured failing 1 in
+    // 30 whole-binary runs under `taskset -c 0,1 --test-threads=16`, and
+    // the mode is not the property this needs. `interrupt` signals
+    // `tcgetpgrp(master)`; the shell raises `Executing` by printing
+    // `PS0`'s OSC 133 `C` marker, and it prints that *before* it expands
+    // the command's words, forks, and hands the terminal to the child's
+    // group. So there is a window in which every signal Holdfast offers
+    // reads `Executing` while the terminal still belongs to the shell's
+    // own group, and an `interrupt` there is delivered to a group the
+    // command is not in yet. Measured over 1360 contended trials: the
+    // foreground group was the shell's own in 9, the command survived the
+    // interrupt in exactly those 9, and in the other 1351 it never
+    // survived once. Injecting a delay between the marker and the fork —
+    // a `${var//x/y}`, which is shell-side work with no fork in it —
+    // opens the window in all 30 trials it was tried in with no
+    // contention at all (20 at 32 KB, 10 at 200 KB), and leaves it shut
+    // in 10 of 10 against the gate below.
+    //
+    // A subshell is what closes it: `( … )` is one job, so bash gives it
+    // the terminal *before* running its body, and `RUNNING` can therefore
+    // not reach this buffer until the handover is complete. `sleep 30`
+    // then runs inside that same group, so the interrupt still has to
+    // find a group the shell does not belong to.
+    session
+        .write_input(b"( echo RUN''NING; sleep 30 )\n")
+        .unwrap();
+    let out = read_until_contains(&server, &id, "RUNNING", 60).await;
+    // Asserted rather than merely waited for: if the job never started,
+    // the marker below comes back because there was nothing to interrupt,
+    // and this test proves nothing at all.
+    assert!(
+        out.contains("RUNNING"),
+        "the shell never started the foreground job: {out:?}"
+    );
     assert_eq!(
         session.detection().interaction_mode,
         holdfast_core::detect::InteractionMode::Executing,
-        "the shell never started the `sleep`"
+        "a job that has printed is not reported as executing"
     );
 
     let r = interrupt(&server, &id).await;
