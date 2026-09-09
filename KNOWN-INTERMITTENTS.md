@@ -187,18 +187,27 @@ not yet exist, a ring buffer that remembers the previous round's prompt, a
 file that exists before it has contents. Each is closed causally, by
 delaying one component and predicting the failure, rather than by sampling.
 
+**The fourth is a live flake and stays open**, and the first revision of
+this section closed it wrongly on an argument its own text named the
+falsification test for. It reproduces, the assertion it fails is correct,
+and what it is catching is a **product** defect — see its paragraph at the
+end.
+
 | Row (`secret::binding::tests::`) | Before | After |
 |---|---|---|
 | `a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act` | **8 failures in 25**, and **10 in 10** with the window widened | 0 in 25 |
 | `max_uses_is_per_session_and_bounded` | **10 in 10** with the window widened | 10 in 10 green |
 | `an_absolute_program_does_not_save_a_profile_from_an_agents_env` | **6 in 6** with the window widened | 6 in 6 green |
-| `the_listener_and_a_connections_raise_ride_the_same_edge` | 2 recorded hits | **not found — still open** |
+| `the_listener_and_a_connections_raise_ride_the_same_edge` | 2 recorded, **1 in 50** reproduced, **6 in 6** with a 20 ms delay injected | **open — the defect behind it is in the product** |
 
 The contended figures are the `holdfast-core` lib binary filtered to
 `secret::binding`, `--test-threads=16` under `taskset -c 0,1` on a 24-core
-box; the widened ones are that row alone, in isolation, with one delay
-injected. The whole-lib rate for the first row was 1 in 8 at the same
-settings.
+box; the whole-lib rate for the first row was 1 in 8 at the same settings.
+**Every widened figure is now a committed property of its row rather than a
+one-off experiment**: each of the three closed rows carries the delay that
+produced it, so reverting the fix is a red rather than a rate. That was not
+true of the third row in the first revision of this section — see its
+paragraph.
 
 **The first row armed a consumer on an edge and then hoped.** §8.3's echo
 drop is published on a `tokio::sync::broadcast`, which keeps nothing for a
@@ -226,38 +235,92 @@ the line discipline as well as for the bytes.
 **The third row waited on a file's existence and then read its contents.**
 `printf '%s' "$x" > '<sink>'` creates the file and fills it in two steps
 with a deschedulable gap between them, so the poll could return on an empty
-file and the `assert_eq!` compare `""`. It now polls the value. Both GH #55
-probes carried the same loop and both are fixed.
+file and the `assert_eq!` compare `""`. It now polls the value
+(`await_capture`). Both GH #55 probes carried the same loop and both are
+fixed.
 
-**The fourth row did not reproduce and is not explained.** 0 failures in 8
-whole-lib runs, 0 in 25 contended module runs, and 0 in **48 runs under
-eight concurrent copies of the binary** at `--test-threads=4`, all eight
-pinned to the same two cores — which is the "several concurrent lib
-binaries" arrangement the section below records as never having been run,
-and it is the highest-contention configuration reached here. That is a
-denominator, not a diagnosis: the row simply never failed. What was ruled
-out, so the next attempt does not re-tread it:
+**Its two `6 in 6`s are two different measurements of two different
+causes, and the first revision of this section credited one number to
+both.** They are separated here because a number that names the wrong
+cause is worse than no number:
 
-- **Not the first row's cause.** Both consumers — `watch_for_autofill` and
-  `spawn_forwarder` — subscribe before the child gate is opened, in both
-  halves, so the edge cannot precede either subscription.
-- **Not the second row's.** Every pass builds a fresh session, so there is
-  no earlier round for the ring buffer to remember.
-- **Not the third row's.** The row captures nothing to a file.
-- **Probably not its own `fulfilled == PASSES`.** The obvious suspect is the
-  raced half's claim that the two orderings converge: if the autofill's
-  `take_if_unadopted_matching` ran before the forwarder's `raise_secret`,
-  the slot would answer `Vacant`, the value would be written with no raise
-  to close, and the forwarder's `AwaitingSecretLeft` arm would close a late
-  raise `cancelled` instead. But `#[tokio::test]` is a **current-thread**
-  runtime, and `autofill_from_binding` awaits `spawn_blocking` — a yield —
-  before it can reach the take, so the forwarder is polled in between. That
-  interleaving needs the blocking join to complete without yielding, which
-  needs a `fork`/`exec` and a read to finish inside one poll. **This is an
-  argument, not a measurement**, and it is the first thing to attack with an
-  injected delay ahead of the forwarder's raise: if that turns the row red
-  with *"the two orderings did not converge on `fulfilled`"*, the argument
-  is wrong and the row's doc needs re-deriving with it.
+- **Remove `await_capture`** and the row fails 6 in 6 at the capture
+  comparison with `left: ""`. That figure was originally taken with a
+  one-off injected delay and stated as though it were a property of the
+  tree; without one, reverting `await_capture` alone reproduces at about
+  **1 in 8** — an intermittent, not a red. The two-step write is now
+  spelled out in the fixture itself, so the 6 in 6 is the committed
+  behaviour.
+- **Remove `await_prompt`'s liveness arm** and the *same row* fails 6 in 6
+  somewhere else entirely — at `await_prompt`, on `ECHO is None`. That is
+  not the capture race at all: an `autofill_on_echo_off` row resolves and
+  injects with no tool call, so prompt, credential, `got=` and exit can all
+  be over before the first poll runs, and `line_discipline` answers
+  `UNKNOWN` for a dead child.
+
+**The arm is an opt-out, not a completion.** For any row whose child can
+finish early the new echo guarantee is silently off and `await_prompt`
+degrades to the containment wait it was before. That is the right answer
+where the exchange it guards has already happened, but it is not the same
+promise, and a row that needs the stronger one has to keep its child alive
+to get it.
+
+**And the second row's loop carried the same stale-ring defect one line
+below the one that was fixed**, which the fix for it did not reach.
+`buffer_until(&a, b"got=HUNTER2", …)` is containment over a cumulative
+ring, so at iteration 2 it is answered by round one's copy and the row
+never observes that the *second* credential reached the child.
+Instrumented: one copy is already in the ring before that wait runs.
+Measured by mutation rather than argued — a `write_secret_if_unread` that
+answers `Written` while writing nothing for every write after a session's
+first **passed all 54 rows in this module**, which would ship a
+`request_secret_input` that answers `secret_provided`, audits
+`binding_resolved` and spends a `max_uses` claim while the child's prompt
+sits unanswered. `buffer_until_count` closes it: the same mutation is now
+caught 3 in 3 with *"reached the buffer 1 time(s), wanted 2"*. The
+counting idiom was already in this file —
+`the_listener_and_a_connections_raise_ride_the_same_edge` counts `got=`
+rather than testing for it.
+
+**The fourth row is a live flake, and the first revision of this section
+was wrong to close it.** That revision recorded 0 failures in 8 whole-lib
+runs, 0 in 25 contended module runs and 0 in 48 runs under eight concurrent
+binaries on two cores, and then argued the row's `fulfilled == PASSES`
+claim was safe because `#[tokio::test]` is current-thread and
+`autofill_from_binding` awaits `spawn_blocking` before it can reach
+`take_if_unadopted_matching`. It also named the test that would falsify
+that argument. **The test was run and the argument lost.**
+
+- **Injected**: a 20 ms sleep in `spawn_forwarder` ahead of
+  `hub.raise_secret` gives **6 failures in 6**, verbatim *"the two
+  orderings did not converge on `fulfilled`"*, `left: 0, right: 6`.
+- **Natural**: **1 failure in 50** contended runs (`taskset -c 0,1`,
+  `--test-threads=16`), `left: 5, right: 6`.
+
+**Where the argument went wrong** is worth keeping, because it is an easy
+one to make again: yielding at `spawn_blocking(...).await` hands control to
+the *runtime*, not to the forwarder. It only lets the forwarder raise first
+if the forwarder is runnable at that moment, and it need not be —
+`broadcast::send` wakes its receivers one at a time, so the reader thread
+can be preempted between waking the autofill listener and waking the
+forwarder, and the listener then runs its whole provider and takes a slot
+the forwarder has not been woken to fill.
+
+**The defect the row is catching is in the product, not in the row.**
+Instrumentation of a losing pass shows all six requests closing with
+`outcome: "cancelled"` while the credential *was* written to the child: the
+autofill's `take_if_unadopted_matching` answered `Vacant`, so it wrote with
+no raise to close, and the forwarder's late raise was then closed by the
+`AwaitingSecretLeft` arm. An attached client is told
+`SecretRequestClosed { outcome: "cancelled" }` for a request that was
+fulfilled, having first been shown an `AwaitingSecret` prompt for a read
+that was already answered — *"the affordance appearing and vanishing for no
+reason a human can see"*, which `mcp::tools` names as the thing to avoid.
+It is the exact mirror of the case `inject_resolved` already guards:
+*"a write the writer declines would otherwise have told every attached
+client `fulfilled` for a value the child never received"*. To be filed
+against §7.5; the row's assertion is correct and stays as it is until the
+product is.
 
 ## What was not run
 

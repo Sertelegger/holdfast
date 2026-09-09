@@ -979,6 +979,19 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// How many times `needle` appears — the question [`contains`] cannot
+    /// answer for a buffer that remembers every earlier round.
+    ///
+    /// Kept separate rather than folded into [`contains`] because the two
+    /// are different questions and `contains` short-circuits: it runs on
+    /// every 20 ms poll of a ring that may hold 256 KiB.
+    fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    }
+
     /// A scratch directory that removes itself **on unwind as well as on
     /// success**. Task 9 measured the alternative: with the removal
     /// written as a statement at the end of a row, every injected mutation
@@ -1243,16 +1256,49 @@ mod tests {
     }
 
     /// Poll the ring buffer until `needle` shows up, or fail.
+    ///
+    /// **Containment, and the ring is cumulative** — so this answers *"has
+    /// this ever appeared"*, not *"has it appeared again"*. A row driving
+    /// the same fixture twice on one session wants
+    /// [`buffer_until_count`]; see its doc for the mutation that proves
+    /// the difference is not academic.
     async fn buffer_until(s: &Session, needle: &[u8], secs: u64) -> Vec<u8> {
+        buffer_until_count(s, needle, 1, secs).await
+    }
+
+    /// Poll the ring buffer until `needle` has appeared `count` times, or
+    /// fail.
+    ///
+    /// **This is [`buffer_until`] without the assumption that the row runs
+    /// once.** The ring is cumulative, so a second round's
+    /// `buffer_until(b"got=…")` is answered by the *first* round's copy
+    /// and never observes the second at all — the same defect
+    /// [`await_prompt`] grew a second half for, one line further down the
+    /// same loop in `max_uses_is_per_session_and_bounded`. Instrumented
+    /// there: at iteration 2 the ring already held one copy before the
+    /// wait ran.
+    ///
+    /// **Load-bearing, by mutation.** A `write_secret_if_unread` that
+    /// answers `Written` while writing nothing for every write after a
+    /// session's first is a plausible wrong implementation — it makes
+    /// `request_secret_input` answer `secret_provided`, audits
+    /// `binding_resolved` and spends a `max_uses` claim while the child's
+    /// prompt sits unanswered — and it passed **all 54 rows in this
+    /// module** before this function existed. Counting is the idiom the
+    /// file already uses where it matters:
+    /// `the_listener_and_a_connections_raise_ride_the_same_edge` counts
+    /// `got=` rather than testing for it.
+    async fn buffer_until_count(s: &Session, needle: &[u8], count: usize, secs: u64) -> Vec<u8> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
         loop {
             let buf = buffered(s);
-            if contains(&buf, needle) {
+            let seen = occurrences(&buf, needle);
+            if seen >= count {
                 return buf;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "{:?} never reached the buffer:\n{}",
+                "{:?} reached the buffer {seen} time(s), wanted {count}:\n{}",
                 String::from_utf8_lossy(needle),
                 String::from_utf8_lossy(&buf)
             );
@@ -1285,6 +1331,15 @@ mod tests {
     /// is the round this caller is about to write into. A positive wait
     /// rather than a sleep, so a child that never drops echo fails
     /// naming what it did instead.
+    ///
+    /// **The liveness arm below is an opt-out, not a completion**, and a
+    /// caller should know which of the two it got. For any row whose child
+    /// can finish before this first polls — every `autofill_on_echo_off`
+    /// row — the echo guarantee is silently off and this degrades to the
+    /// containment wait it was before. That is the right answer there,
+    /// because the exchange it was guarding has already happened, but it
+    /// is not the same promise, and a row that needs the stronger one must
+    /// keep its child alive to get it.
     async fn await_prompt(s: &Session, prompt: &[u8]) {
         buffer_until(s, prompt, 20).await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -2328,7 +2383,15 @@ mod tests {
                 payload["status"], "secret_provided",
                 "resolution {n} of 2 was refused: {payload}"
             );
-            buffer_until(&a, b"got=HUNTER2", 20).await;
+            // **`count`, not containment.** The ring remembers round
+            // one, so `buffer_until` here is answered by round one's copy
+            // and this row never observes that the *second* credential
+            // reached the child — which is the same stale-ring defect the
+            // line above it was fixed for, and the hole a
+            // `write_secret_if_unread` that stopped writing after the
+            // first write in a session walked through with all 54 rows
+            // green.
+            buffer_until_count(&a, b"got=HUNTER2", n as usize, 20).await;
         }
         assert_eq!(a.binding_uses().get(&sc.name("prod-ssh")), Some(&2));
 
@@ -6604,11 +6667,26 @@ mod tests {
         let sink = sc.path("stolen");
         // The agent's redirection: sourced by `bash` *before* the
         // operator's script, and it replaces `stty`/`read` with its own.
+        //
+        // **The two-step write is spelled out, and that is the window
+        // held open on purpose** — the `MockPty::set_read_delay` idiom,
+        // as in the two rows above. `> '<sink>'` creates the file and the
+        // builtin fills it; those are two steps in any spelling, and
+        // writing them apart is a *more* faithful model of the
+        // redirection than collapsing them. It is what makes
+        // `await_capture` provably load-bearing: with the wait written as
+        // `while !sink.exists()` this row fails **6 in 6** on `left: ""`.
+        // Without the gap, reverting `await_capture` reproduces at
+        // roughly **1 in 8** — an intermittent rather than a red, which
+        // is the state this whole section exists to get out of, and the
+        // reason the gap is committed rather than injected for one
+        // measurement and dropped.
         let preload = sc.path("preload.sh");
         std::fs::write(
             &preload,
             format!(
-                "read() {{ builtin read \"$@\"; printf '%s' \"${{!1}}\" > '{}'; }}\n",
+                "read() {{ builtin read \"$@\"; : > '{0}'; sleep 1; \
+                 printf '%s' \"${{!1}}\" > '{0}'; }}\n",
                 sink.display()
             ),
         )
