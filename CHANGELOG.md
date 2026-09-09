@@ -77,6 +77,56 @@ trigger as a side effect of writing release notes.
   With all three repaired the binary is green 63/63 under the probe, where
   before it was 3 red.
 
+||||||| 574f9f8
+- **`interrupt`'s row no longer gates on a mode the shell raises before it
+  has handed over the terminal.** `interrupt` signals
+  `tcgetpgrp(master)`, and a shell raises `Executing` — `PS0`'s OSC 133
+  `C` marker, or bracketed paste going off — *before* it expands the
+  command's words, forks, and gives the child's group the terminal. So
+  there is a gap in which every signal Holdfast offers reads `Executing`
+  while the terminal is still the shell's own, and an interrupt issued
+  there is delivered to a group the command has not joined: the command
+  runs on, `delivered: true` notwithstanding, and the shell never comes
+  back to a prompt.
+  `interrupt_stops_a_running_command_and_leaves_the_shell_alive` gated on
+  that mode, and failed 1 whole-binary run in 30 under `taskset -c 0,1
+  --test-threads=16`.
+
+  **The gap belongs to the product, not to the test, and it is the gap a
+  real terminal has**: a Ctrl+C typed in it lands on the shell too, and
+  is lost the same way. Nothing here can close it — at the instant of the
+  call the shell really is the foreground group, and a builtin that never
+  hands over is indistinguishable from a command that has not handed over
+  yet. `interrupt`'s description now says so and says the remedy, which
+  is the one a human uses: the session still reads `Executing`, so call
+  again. The row gates on output from the job instead, which a subshell
+  cannot emit until bash has handed it the terminal.
+
+  **Measured causally rather than by sampling, and it had to be.** Over
+  1360 contended trials the command survived the interrupt in exactly the
+  9 where `tcgetpgrp` was the shell's own group, and in none of the other
+  1351 — but the natural window then stopped appearing on that box, 0 in
+  a further 4700 trials including a replay of the byte-identical binary
+  that had produced the 9. So there is no matched "after" arm here and
+  none is claimed; the causal experiment is the evidence. Injecting
+  shell-side work between the marker and the fork — a `${var//x/y}`,
+  which forks nothing — opens the window in all 30 trials it was tried in
+  with no contention at all (20 at 32 KB, 10 at 200 KB), and leaves it
+  shut in 10 of 10 against the new gate.
+  `a_job_owns_the_terminal_by_its_first_output_and_not_by_its_executing_mode`
+  pins both halves with that delay in place, so neither is measuring
+  luck.
+
+  **The 0.0.1 backend row had the same hole, behind a
+  `sleep(500ms)`.** `interrupt_reaches_the_foreground_job_not_the_shell`
+  signalled 500 ms after writing `sleep 300` and asserted the job died —
+  a flat wait standing in for the handover, which is the one precondition
+  the row exists to depend on. At that layer the precondition is
+  readable, so it now polls `foreground_group()` until it leaves the
+  shell's own group and asserts that it did. The row is 0.01 s instead of
+  0.5 s as a side effect.
+
+||||||| d73d86c
 - **`no_output_is_classified_between_the_echo_sample_and_the_answer` no
   longer reads the session between the reader's two publications.** The row
   polled `Session::detection()` until the mode reached `Executing` and
