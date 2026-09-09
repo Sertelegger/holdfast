@@ -13,7 +13,6 @@ been measured, and what would settle it.
 
 | Issue | Test | Symptom |
 |---|---|---|
-| [#10](https://github.com/Sertelegger/holdfast/issues/10) | `send_input_wait_for_returns_the_identical_shape` (`crates/holdfast-core/tests/integration.rs`) | `matched differs between wait_for_pattern and send_input(wait_for=)`. Its file-mate `send_input_reaches_the_shell` fails the same way, so the issue title under-describes it by one row. |
 | [#21](https://github.com/Sertelegger/holdfast/issues/21) | `the_exit_cleanup_leaves_a_successor…socket_and_pid_file_alone` | `AddrInUse` in `bind_control`. Under `--workspace` another target's daemon binds the control socket in the same instant; in isolation there is no competitor. |
 
 ## Linux CI evidence, 2026-09-01
@@ -85,8 +84,12 @@ the tell that the bisect was measuring scheduling noise and not a change.
 Measured on macOS 27.0 / arm64 against `e1cb7cb`, roughly ten full-suite runs
 across two days:
 
-- **#10 and #21 did not reproduce at all.** Evidence for Linux scheduling rather
-  than logic.
+- **#10 and #21 did not reproduce at all.** This was read as *"evidence for
+  Linux scheduling rather than logic"*, and for #10 that reading has now been
+  measured and is **half right in a way that mattered**: it really was
+  scheduling, and it was also a defect — in the test's arrangement, not the
+  product. See #10's section below; the margin macOS never lost is a wall
+  clock the arrangement had no business trusting on either platform.
 - **#39 did reproduce** — about one full run in three, 0/5 in isolation — and
   **it also failed at the pristine `v0.0.6` tag**, so it predated the 0.0.7
   work entirely, as the root cause above confirms: the startup `Resize` and
@@ -99,6 +102,62 @@ across two days:
   between, because `read_until(…, "$")` matches the `$` inside the injected
   shell-integration snippet rather than the shell's prompt. Kept here as the
   reason a row can look load-dependent and be a race in its own setup.
+
+## #10 was two different test defects, and the product is not one of them
+
+**Fixed 2026-09-08.** The row this file tracked asserts that
+`send_input(wait_for=)` and `wait_for_pattern` return the identical envelope,
+so the first question is *which path is wrong when they disagree*. The answer
+is **neither**, and the assertion is worth keeping: the two really are one
+`run_wait`, and every field they emit comes from it. What disagreed was not
+the shape but the **bytes each arm was asked about**.
+
+**The two scan starts are sampled in different places, and both are correct.**
+`wait_for_pattern` with `since_cursor: null` starts at the head
+`wait::for_pattern` snapshots one statement after it subscribes;
+`send_input(wait_for=)` starts at the `pre_write_head` the *writer* thread
+samples one statement before the write (§5.2, and the reason for that is
+pinned by `send_input_wait_for_sees_the_echo_of_its_own_write`). They are two
+different instants by design — "from now" and "from my write" — so an
+arrangement that wants both arms to see the same bytes has to place the output
+after **both** samples. The old one placed it 100 ms after the *test* started,
+from two `std::thread::sleep`s, and hoped.
+
+That hope is scheduling-bound and unbounded above. `send_input` reaches its
+sample through `spawn_blocking`, whose dispatch was measured here at **2.4 ms**
+idle and **5–12 ms** with the binary pinned to two cores at
+`--test-threads=16`. Nothing caps it; the 100 ms was the whole margin.
+
+**Proved causally, because sampling could not reach it on this box.** The row
+was green in **30 whole-binary runs at `--test-threads=16` on two pinned cores
+of a 24-core host** — the shape that reproduces several of the others here.
+A 150 ms delay inserted in front of that one sample turned it into **10
+failures in 10**, every one of them `matched differs between wait_for_pattern
+and send_input(wait_for=)`, `left: true, right: false` — the issue's own
+signature, including which arm loses.
+
+**Fixed by removing the clock**, not by widening it: the chunk is now queued
+from the send session's `MockPty::on_write` hook, which runs on the writer
+thread immediately after `pre_write_head` is sampled, and the wait arm is
+polled exactly once first — `Pending` being the positive fact that it has
+subscribed and snapshotted. The row also now lags its `send_input` by 300 ms
+on purpose. That delay is inert against the new arrangement (0 failures in 10,
+and 0 in 5 at delays of 500 ms and 1000 ms injected at the sample itself) and
+makes the arrangement it replaced **10 failures in 10** with no product patch
+at all, so a regression to a timer is red rather than lucky.
+
+**Its file-mate is a separate defect and does not fail the same way** — this
+file's claim that it did was wrong, and so is the issue comment it came from.
+`send_input_reaches_the_shell` carries no cross-path assertion; it cannot emit
+that message. It ran `echo SEND''_MARKER; echo $((6*7))`, polled
+`read_until_contains` for **`SEND_MARKER`**, and then asserted on **`42`** —
+an assertion about output nothing had waited for. Each `echo` is its own
+`write(2)`, so a reader that wakes between them publishes the first line
+alone. Pulling the two writes 300 ms apart made it **10 failures in 10**,
+every one `shell did not evaluate:` with the capture ending exactly at
+`SEND_MARKER`. Fixed by polling for the *last* thing the command prints, and
+the 300 ms gap is kept, so the row now proves the poll waits for the whole
+command.
 
 ## #42 was a product bug, exactly as this section suspected
 
