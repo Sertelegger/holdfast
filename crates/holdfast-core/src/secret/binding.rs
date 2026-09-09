@@ -1265,8 +1265,57 @@ mod tests {
     /// would have the line discipline echo the value straight back into
     /// the ring buffer, failing the leak assertions for a reason that has
     /// nothing to do with a binding.
+    ///
+    /// **The prompt on its own does not say that, and the ring buffer is
+    /// why.** It is cumulative, so a row whose child runs the fixture
+    /// twice finds the *first* round's `Password: ` still in it and
+    /// returns with the child between reads — `stty echo` has run,
+    /// `stty -echo` has not. What follows then resolves a credential and
+    /// hands it to `write_secret_if_unread`, which reads the tty rather
+    /// than a cache of it, declines `NotEchoOff`, and drops the value;
+    /// step 1 falls through and the row waits out the human-prompt
+    /// deadline for a `secret_cancelled` it did not ask for — while the
+    /// `max_uses` claim and the `binding_resolved` line stand, because
+    /// §9.6 counts resolutions from the store and not writes to a PTY.
+    /// That is `max_uses_is_per_session_and_bounded`, and its doc carries
+    /// the measurement.
+    ///
+    /// So **both**, and the echo test is the load-bearing half: the
+    /// prompt says the child has drawn one, the line discipline says it
+    /// is the round this caller is about to write into. A positive wait
+    /// rather than a sleep, so a child that never drops echo fails
+    /// naming what it did instead.
     async fn await_prompt(s: &Session, prompt: &[u8]) {
         buffer_until(s, prompt, 20).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let echo = s.line_discipline().echo;
+            if echo == Some(false) {
+                return;
+            }
+            // **A child that has finished is not a child to wait on**, and
+            // this arm is not defensive: an `autofill_on_echo_off` row
+            // resolves and injects with no tool call, so prompt,
+            // credential, `got=` and exit can all be over before the first
+            // poll here runs. `line_discipline` answers `UNKNOWN` for a
+            // dead child (`in_process.rs`: *"a dead child's line
+            // discipline says nothing"*), so waiting for `Some(false)`
+            // from one is waiting for the deadline and nothing else.
+            // Measured: without this arm
+            // `an_absolute_program_does_not_save_a_profile_from_an_agents_env`
+            // fails 6 in 6 on `ECHO is None`.
+            if !s.is_alive() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{:?} is in the ring buffer, the child is alive, and its `ECHO` is \
+                 {echo:?} — so a secret written now would be declined `NotEchoOff` \
+                 and dropped",
+                String::from_utf8_lossy(prompt)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Wait until the **detector** has the prompt line, not merely the
@@ -2070,6 +2119,22 @@ mod tests {
     /// the one that does not depend on that: this field is documented as
     /// one line of plain text a human reads to make a decision, and a
     /// control character in it is outside what that promises.
+    ///
+    /// **This row was the noisiest in the suite, and it was arranged
+    /// wrong rather than timing-sensitive.** It armed `spawn_forwarder`
+    /// on §8.3's echo-drop **edge** and then hoped the child had not
+    /// reached it yet — the exact defect [`gated_echo_off`]'s own doc
+    /// warns about one section down, for the listener. `session_running`
+    /// returns with the child already executing, and
+    /// `tokio::sync::broadcast` keeps nothing for a receiver that does
+    /// not yet exist, so a child that printed first left the row waiting
+    /// out `wait_for` on a frame that had already been sent to nobody:
+    /// *"no AwaitingSecret reached the client; it saw []"*. Measured at
+    /// **8 failures in 25** runs of this module at `--test-threads=16` on
+    /// two cores, and proved causally rather than by sampling — a 500 ms
+    /// delay in front of the subscription turned it into **10 failures in
+    /// 10** in isolation, with the identical message. The gate below is
+    /// the fix; the delay stays, so the gate cannot be removed quietly.
     #[tokio::test]
     async fn a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act() {
         // 8-bit CSI as the child's own bytes — `\xc2\x9b` on the wire —
@@ -2083,15 +2148,37 @@ mod tests {
 
         let sc = Scratch::new("childpromptstrip");
         let server = server_with(keychain_mode(vec![]), &sc.audit_log());
+        // **Gated, because §8.3's echo drop is an edge and this row has a
+        // consumer of it** — see [`gated`] and [`gated_echo_off`], whose
+        // doc describes this exact defect for the *listener*.
+        // `spawn_forwarder` subscribes to the same broadcast, and
+        // `session_running` returns with the child already executing: an
+        // unheld child can print its echo-off prompt before that
+        // subscription exists, and `tokio::sync::broadcast` keeps nothing
+        // for receivers that do not yet exist. The frame then never
+        // arrives and the row fails on `wait_for` with `it saw []`.
+        let child_gate = sc.path("child.gate");
         let s = session_running(
             Some(PROD_PROFILE),
             "ssh",
             &["prod-01"],
-            &echo_off_prompting(prompt),
+            &gated(&child_gate, &echo_off_prompting(prompt)),
         );
         server.registry.insert(Arc::clone(&s)).expect("register");
         let mut client = attach_fake(&server, &s.id);
+        // **This is not a wait. It is the window, held open on purpose**,
+        // and it is what makes the gate above provably load-bearing
+        // rather than merely present — the `MockPty::set_read_delay`
+        // idiom, in the one shape available here. Delete the gate and the
+        // child spends this delay printing its prompt to nobody:
+        // **10 failures in 10** isolated runs at this exact duration,
+        // with the identical message, against 8 in 25 contended runs
+        // without it. Nothing happens during it while the gate stands, so
+        // it costs the suite half a second once and buys a deterministic
+        // red.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let forwarder = spawn_forwarder(&server, &s, None);
+        std::fs::write(&child_gate, b"go").expect("release the child");
 
         // Anti-vacuity first, and it waits for the **whole** prompt, so
         // the three assertions below cannot be satisfied by a prefix.
@@ -2194,6 +2281,19 @@ mod tests {
     /// per-session budget from a global counter — a global one starves
     /// every other session on the box — and the first is what separates it
     /// from no counter at all, which passes any single-session test.
+    ///
+    /// **Its recorded flake was the ring buffer, not the budget.** The
+    /// row failed as *"resolution 2 of 2 was refused"* with a
+    /// `secret_cancelled` and a ten-second wait, and the counter was
+    /// never involved: [`buffer_until`] searches the **whole** ring, so
+    /// round two's `await_prompt` matched round *one's* `Password: ` and
+    /// returned while the child was between reads with `stty echo` on.
+    /// The credential then resolved — spending a use and writing the
+    /// audit line — and was declined `NotEchoOff` at the writer and
+    /// dropped, leaving step 1 to fall through to a human who was not
+    /// there. `await_prompt` now waits for the line discipline as well as
+    /// for the bytes; see its doc, and the `sleep` below, which is what
+    /// makes that half provably load-bearing.
     #[tokio::test]
     async fn max_uses_is_per_session_and_bounded() {
         let mut sc = Scratch::new("maxuses");
@@ -2203,7 +2303,21 @@ mod tests {
 
         // A child that answers three echo-off reads in a row, so the row
         // does not need three sessions to make three requests.
-        let three = format!("{ECHO_OFF_FIXTURE}; {ECHO_OFF_FIXTURE}; {ECHO_OFF_FIXTURE}");
+        //
+        // **The `sleep` is not a wait, it is the window held open** — the
+        // `MockPty::set_read_delay` idiom, in the shape available here.
+        // The ring buffer is cumulative, so round two's `await_prompt`
+        // finds round *one's* `Password: ` still in it and returns
+        // whatever the child happens to be doing; in the gap between the
+        // rounds that is `stty echo`, and a credential written there is
+        // declined `NotEchoOff` by the writer and dropped — step 1 falls
+        // through and this row waits out its own ten-second deadline for
+        // a `secret_cancelled` it did not ask for, with the `max_uses`
+        // claim spent and the `binding_resolved` line written. That is
+        // the recorded flake, and the second half of `await_prompt` is
+        // what closes it. Delete that half and this line turns the row
+        // from 1 failure in a campaign into 10 in 10.
+        let three = format!("{ECHO_OFF_FIXTURE}; sleep 1; {ECHO_OFF_FIXTURE}; {ECHO_OFF_FIXTURE}");
         let a = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], &three);
         server.registry.insert(Arc::clone(&a)).expect("register");
 
@@ -4828,8 +4942,21 @@ mod tests {
     /// and appears verbatim, in the same way the two-read rows above
     /// concatenate it.
     fn gated_echo_off(gate: &Path) -> String {
+        gated(gate, ECHO_OFF_FIXTURE)
+    }
+
+    /// [`gated_echo_off`]'s prefix, over an arbitrary child script.
+    ///
+    /// Split out because the listener is not the only consumer of §8.3's
+    /// edge that a row can arm too late: `spawn_forwarder` subscribes to
+    /// the same broadcast, and
+    /// [`a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act`]
+    /// needs [`echo_off_prompting`]'s prompt rather than
+    /// [`ECHO_OFF_FIXTURE`]'s. One spelling of the gate, whatever it
+    /// holds back.
+    fn gated(gate: &Path, script: &str) -> String {
         format!(
-            "until [ -f '{}' ]; do sleep 1; done; {ECHO_OFF_FIXTURE}",
+            "until [ -f '{}' ]; do sleep 1; done; {script}",
             gate.display()
         )
     }
@@ -6231,6 +6358,34 @@ mod tests {
         )
     }
 
+    /// Poll until a capturing fixture has actually written its capture,
+    /// and hand back what it wrote.
+    ///
+    /// **The content, not the existence, and the difference is a race.**
+    /// `printf '%s' "$x" > '<sink>'` is two steps — the redirection
+    /// creates the file, the builtin fills it — with a gap the kernel may
+    /// deschedule the child in. A poll on `Path::exists` can return while
+    /// the file is still empty, and the `assert_eq!` that follows then
+    /// compares `""` against the value and reports a broken fixture for
+    /// what is a wait that stopped early. Same class as the stale ring
+    /// buffer in [`await_prompt`]: a wait on a proxy for the thing the
+    /// next line needs.
+    ///
+    /// `empty_means` is the anti-vacuity message the old existence loop
+    /// carried, and it still means the same thing — nothing was captured
+    /// — because a fixture that ran wrote a non-empty value.
+    async fn await_capture(sink: &Path, empty_means: &str) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let seen = std::fs::read_to_string(sink).unwrap_or_default();
+            if !seen.is_empty() {
+                return seen;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{empty_means}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Start one session through the **real** tool and hand back its id,
     /// or the argument error the call was refused with.
     async fn start_via_tool(
@@ -6312,17 +6467,13 @@ mod tests {
         await_prompt(&planted, b"Password: ").await;
         write_as_a_human(&planted, b"probe-value\n").await;
         // The agent's program ran and captured what was typed at it.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while !sink.exists() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the planted `sh` never captured anything, so every absence below is \
-                 a claim about a fixture that does not work"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
         assert_eq!(
-            std::fs::read_to_string(&sink).unwrap_or_default(),
+            await_capture(
+                &sink,
+                "the planted `sh` never captured anything, so every absence below is \
+                 a claim about a fixture that does not work",
+            )
+            .await,
             "probe-value",
             "the planted program captured something other than the value typed at it"
         );
@@ -6508,17 +6659,13 @@ mod tests {
         std::fs::write(&gate, b"go").expect("open the gate");
         await_prompt(&planted, b"Password: ").await;
         write_as_a_human(&planted, b"probe-value\n").await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while !sink.exists() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "`BASH_ENV` captured nothing, so every absence below is a claim about a \
-                 fixture that does not work — the operator's binary ran unmodified"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
         assert_eq!(
-            std::fs::read_to_string(&sink).unwrap_or_default(),
+            await_capture(
+                &sink,
+                "`BASH_ENV` captured nothing, so every absence below is a claim about a \
+                 fixture that does not work — the operator's binary ran unmodified",
+            )
+            .await,
             "probe-value",
             "the redirection captured something other than the value typed at it"
         );

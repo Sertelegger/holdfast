@@ -173,18 +173,91 @@ used. `/run/user/1000/holdfast/{bind.lock,holdfast.lock}` and
 18:40–18:44 UTC against an empty `daemon.log`. That is consistent with a
 hand-run `holdfast mcp` or `daemon start`, not with `cargo test`.
 
-## Unfiled — `secret::binding` is now the noisiest module in the suite
+## `secret::binding` — triaged; three of the four rows are closed
 
-Caught in passing during the #52 hunt and **not yet filed as issues**. At 9
-failures to `daemon::server`'s 2, this module deserves its own triage before
-anything in the table above.
+**2026-09-08.** This section was a table of counts headed *"`secret::binding`
+is now the noisiest module in the suite"*, and it was right that the module
+deserved triage before anything above it. The counts were the least
+interesting thing about it. **None of the three rows now closed was
+load-dependent in the sense that phrase carries, and none was a product
+defect.** They are one mistake in three spellings: *the row synchronises
+with a real `sh` child through a signal that does not mean what its next
+line needs* — a broadcast edge that keeps nothing for a receiver that does
+not yet exist, a ring buffer that remembers the previous round's prompt, a
+file that exists before it has contents. Each is closed causally, by
+delaying one component and predicting the failure, rather than by sampling.
 
-| Test (`secret::binding::tests::`) | count | note |
+| Row (`secret::binding::tests::`) | Before | After |
 |---|---|---|
-| `a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act` | 5 | "no AwaitingSecret reached the client; it saw []" |
-| `the_listener_and_a_connections_raise_ride_the_same_edge` | 2 | |
-| `max_uses_is_per_session_and_bounded` | 1 | got `secret_cancelled`/timeout, wanted `secret_provided` |
-| `an_absolute_program_does_not_save_a_profile_from_an_agents_env` | 1 | **failed on an idle lane** |
+| `a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act` | **8 failures in 25**, and **10 in 10** with the window widened | 0 in 25 |
+| `max_uses_is_per_session_and_bounded` | **10 in 10** with the window widened | 10 in 10 green |
+| `an_absolute_program_does_not_save_a_profile_from_an_agents_env` | **6 in 6** with the window widened | 6 in 6 green |
+| `the_listener_and_a_connections_raise_ride_the_same_edge` | 2 recorded hits | **not found — still open** |
+
+The contended figures are the `holdfast-core` lib binary filtered to
+`secret::binding`, `--test-threads=16` under `taskset -c 0,1` on a 24-core
+box; the widened ones are that row alone, in isolation, with one delay
+injected. The whole-lib rate for the first row was 1 in 8 at the same
+settings.
+
+**The first row armed a consumer on an edge and then hoped.** §8.3's echo
+drop is published on a `tokio::sync::broadcast`, which keeps nothing for a
+receiver that does not yet exist, and `session_running` returns with the
+child already executing. `spawn_forwarder` subscribed after that, so a child
+that printed its echo-off prompt first left the row waiting out `wait_for`
+on a frame that had been sent to nobody — *"no AwaitingSecret reached the
+client; it saw []"*, exactly as recorded. `gated_echo_off`'s own doc, one
+section down in the same file, describes this defect for the *listener* and
+gates every autofill row against it; this row is the one that did not. A
+500 ms delay in front of the subscription made it **10 failures in 10** in
+isolation. Fixed by gating the child, and the delay stays so the gate cannot
+be removed quietly.
+
+**The second row's `await_prompt` was satisfied by the wrong round.** The
+ring buffer is cumulative and the row runs the fixture three times on one
+session, so round two matched round *one's* `Password: ` and returned with
+the child between reads — `stty echo` on. The credential then resolved,
+spending a `max_uses` claim and writing the `binding_resolved` line, and was
+declined `NotEchoOff` by the writer and dropped; step 1 fell through to a
+human who was not attached, and the row waited out its ten-second deadline
+for the recorded `secret_cancelled`/timeout. `await_prompt` now waits for
+the line discipline as well as for the bytes.
+
+**The third row waited on a file's existence and then read its contents.**
+`printf '%s' "$x" > '<sink>'` creates the file and fills it in two steps
+with a deschedulable gap between them, so the poll could return on an empty
+file and the `assert_eq!` compare `""`. It now polls the value. Both GH #55
+probes carried the same loop and both are fixed.
+
+**The fourth row did not reproduce and is not explained.** 0 failures in 8
+whole-lib runs, 0 in 25 contended module runs, and 0 in **48 runs under
+eight concurrent copies of the binary** at `--test-threads=4`, all eight
+pinned to the same two cores — which is the "several concurrent lib
+binaries" arrangement the section below records as never having been run,
+and it is the highest-contention configuration reached here. That is a
+denominator, not a diagnosis: the row simply never failed. What was ruled
+out, so the next attempt does not re-tread it:
+
+- **Not the first row's cause.** Both consumers — `watch_for_autofill` and
+  `spawn_forwarder` — subscribe before the child gate is opened, in both
+  halves, so the edge cannot precede either subscription.
+- **Not the second row's.** Every pass builds a fresh session, so there is
+  no earlier round for the ring buffer to remember.
+- **Not the third row's.** The row captures nothing to a file.
+- **Probably not its own `fulfilled == PASSES`.** The obvious suspect is the
+  raced half's claim that the two orderings converge: if the autofill's
+  `take_if_unadopted_matching` ran before the forwarder's `raise_secret`,
+  the slot would answer `Vacant`, the value would be written with no raise
+  to close, and the forwarder's `AwaitingSecretLeft` arm would close a late
+  raise `cancelled` instead. But `#[tokio::test]` is a **current-thread**
+  runtime, and `autofill_from_binding` awaits `spawn_blocking` — a yield —
+  before it can reach the take, so the forwarder is polled in between. That
+  interleaving needs the blocking join to complete without yielding, which
+  needs a `fork`/`exec` and a read to finish inside one poll. **This is an
+  argument, not a measurement**, and it is the first thing to attack with an
+  injected delay ahead of the forwarder's raise: if that turns the row red
+  with *"the two orderings did not converge on `fulfilled`"*, the argument
+  is wrong and the row's doc needs re-deriving with it.
 
 ## What was not run
 
