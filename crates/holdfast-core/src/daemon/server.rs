@@ -3206,33 +3206,45 @@ mod tests {
 
         // **Wait for A to stop answering rather than assuming `drop` did
         // it — GH #21.** The comment above says "A's listener drops, so
-        // `socket_is_live` goes false", and that is true eventually and
-        // not instantly: measured, a `connect(2)` to a closed listener
-        // still succeeds about **1 time in 300** under CPU starvation
-        // (`taskset -c 0,1`, 16 threads) and **0 in 300** idle. When it
-        // does, B's `bind_control` probe sees a live peer and returns
-        // `AddrInUse`, and the row fails in its *setup* — never in the
-        // assertion it exists to make.
+        // `socket_is_live` goes false". That is true of *this* process
+        // immediately and of the machine only once every child that
+        // inherited the descriptor has reached `exec`.
         //
-        // **The probe is deliberately not the thing being changed.**
-        // `socket_is_live` prefers "live" on a single successful
-        // `connect`, and that bias is correct: the two errors are not the
-        // same size. Believing a dead daemon live refuses a start, which
-        // is recoverable and loud. Believing a live daemon dead unlinks
-        // its socket and leaves it serving PTY sessions on an inode
-        // nothing can reach — the exact catastrophe the assertion below
-        // pins. Making the probe retry until it sees a failure would buy
-        // this row at the price of that one.
+        // **The cause is a `fork`, not a slow kernel or a loaded box**,
+        // and `remove_runtime_files_we_own` below already says so for its
+        // own unlink: every `fork` in this tree briefly hands a child a
+        // copy of ours, and `SOCK_CLOEXEC` closes it at `exec`. Under a
+        // parallel suite the forks are the sibling rows' PTY spawns.
+        // Measured: 16.4% (492/3000) with eight threads spawning
+        // `/bin/true` and **no** CPU pinning, against **0 in 30,000**
+        // under `taskset -c 0,1` at 16 threads with no forks — starvation
+        // alone never produces it.
         //
-        // Bounded so a drop that never settles fails loudly instead of
-        // hanging; on a healthy run this returns on the first check.
+        // The failing call is B's `bind_control`, and the `AddrInUse`
+        // comes from `bind_socket_within`'s **own** inline `connect`, not
+        // from `socket_is_live` — so the row fails in its *setup*, never
+        // in the assertion it exists to make.
+        //
+        // **Polling here rather than changing either probe.** A probe
+        // that retried until it saw a failure would still be guessing:
+        // the only thing that distinguishes "a daemon is serving" from "a
+        // dead daemon's descriptor is held by somebody's fork child" is
+        // process ownership, and the answer this tree already has for that
+        // — `holds_socket_bound_at`, intersecting `/proc/net/unix` with
+        // `/proc/<pid>/fd` — is Linux-only and far too much machinery for
+        // a test's setup.
+        //
+        // Bounded so a descriptor that is never released fails loudly
+        // instead of hanging. The spin is short when it happens at all:
+        // 2.35 ms was the longest observed, against a 5 s deadline.
         let settled_by = std::time::Instant::now() + Duration::from_secs(5);
         while super::super::spawn::socket_is_live(&paths) {
             assert!(
                 std::time::Instant::now() < settled_by,
                 "A's listener was dropped but `connect(2)` still succeeds 5s \
-                 later: the predecessor never stopped answering, which is a \
-                 different defect from the one this row covers"
+                 later. Expect a process holding an inherited copy of the \
+                 descriptor — a sibling row's child stalled between `fork` \
+                 and `exec` — not a daemon that refuses to die"
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
