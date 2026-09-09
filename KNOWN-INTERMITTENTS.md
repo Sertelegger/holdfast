@@ -459,14 +459,51 @@ client `fulfilled` for a value the child never received"*. To be filed
 against §7.5; the row's assertion is correct and stays as it is until the
 product is.
 
-## Caught in passing on the #52 lanes, not filed
+## The row caught in passing on the #52 lanes was reading the session too early
 
-`session::tests::no_output_is_classified_between_the_echo_sample_and_the_answer`
+**Diagnosed and fixed 2026-09-09**, never filed as an issue. This section read:
+*"`session::tests::no_output_is_classified_between_the_echo_sample_and_the_answer`
 (`session/mod.rs:2932`) failed **once in the same 100 whole-binary runs**, with
-`left: 0, right: 1` — its own message says 0 means *"the deferred chunk never
-reached the history"*. Recorded here because an unfiled failure that nobody
-wrote down is how this file came to exist; it was not investigated, and no
-claim is made about whether it is a test or a product defect.
+`left: 0, right: 1` … it was not investigated, and no claim is made about
+whether it is a test or a product defect."* It is a test defect, and — the
+question that made it worth doing ahead of its rate — **the property in the
+row's name is not violated.**
+
+**Reproduced before anything was changed**: **4 failures in 200 whole-binary
+runs** of the `holdfast-core` lib binary under `taskset -c 0,1 …
+--test-threads=16` on a 2-core pin, every one of them at `mod.rs:2932` with
+`left: 0, right: 1`.
+
+**The mechanism.** The row's epilogue polled `Session::detection()` until the
+mode reached `Executing` and asserted `command_count() == 1` in the next
+statement. The reader thread publishes those two at different instants and in
+that order: it drops `detector_guard` — which is what makes `Executing`
+visible to a poll — and only *then* takes `history.lock()` to apply the events
+the same `feed` returned. The gap is deliberate, because §4.3 forbids holding
+two of a session's locks at once; what is in it is an `AtomicBool` swap, a
+conditional `events_tx.send` and a `now_ms()`, so it is a scheduler slice wide
+rather than an instruction wide. The poll returned inside it.
+
+**Why it is not the misclassification the row is named for.** `Executing` is
+reachable only through rungs that require `!modes.bracketed_paste`, and in this
+row nothing clears bracketed paste except the injected `\x1b[?2004l` — so the
+mode the poll saw was always the *right* answer, arriving ahead of its own
+bookkeeping. Nothing was classified in the window §8.3 cares about. The row
+still catches the thing it exists for: sampling `line_discipline` outside the
+detector lock in `Session::detection` gives **0 passes in 10** against the
+repaired row, failing on the `assert_ne!` with `AwaitingSecret` at 0.95 —
+the same measurement the row's own comment records for the pre-repair form.
+
+**Proved causally rather than by sampling.** A 150 ms `sleep` inserted between
+the reader's `drop(detector_guard)` and its `history.lock()` fails the old form
+**10 times in 10** with exactly the observed signature, and passes the repaired
+form **10 times in 10**. Same probe both sides.
+
+**The fix is one wait moved onto the later publication**: wait for
+`command_count() > 0`, then assert the mode. That direction of the implication
+is the one that holds — the history is applied strictly after `feed` returns,
+so a session whose history holds the command has certainly classified the
+chunk — which is why the mode is now a hard assertion instead of a poll.
 
 ## What was not run
 

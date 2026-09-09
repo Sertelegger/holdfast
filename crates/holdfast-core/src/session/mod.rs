@@ -2918,23 +2918,60 @@ mod tests {
         // requires. Without this half the test would also pass against a
         // backend that dropped the bytes on the floor.
         pty.set_echo(Some(true));
-        wait_until("the submitted command to be classified", || {
-            s.detection().interaction_mode == InteractionMode::Executing
+        // **Waited on the history and not on the mode, because the two
+        // are published at different instants and the history is the
+        // later one.** The reader drops `detector_guard` and only *then*
+        // takes `history.lock()` to apply the events that same `feed`
+        // returned — deliberately, since §4.3 forbids holding two of a
+        // session's locks at once. Between those two statements the
+        // session answers `Executing` with an empty history, and a poll
+        // on the mode returns inside exactly that gap; the gap holds an
+        // `AtomicBool` swap, a conditional `events_tx.send` and a
+        // `now_ms()`, so it is a scheduler slice wide rather than an
+        // instruction wide.
+        //
+        // That is the whole of this row's unfiled intermittent, measured:
+        // **4 failures in 200 whole-binary runs at `--test-threads=16` on
+        // 2 cores**, every one of them `left: 0, right: 1` on the count
+        // below. Causally: a 150 ms `sleep` inserted between those two
+        // reader statements fails the pre-`wait_until` form 10 times in
+        // 10 with that exact signature, and passes this form 10 times in
+        // 10. It was never the property in this row's name — `Executing`
+        // requires `!bracketed_paste`, which requires the injected chunk
+        // to have been fed, so the mode the old poll saw was always the
+        // right answer arriving before its bookkeeping.
+        //
+        // The direction that does hold is the one the header comment
+        // states: the history is applied strictly *after* `feed` returns,
+        // so a session whose history holds the command has certainly
+        // classified the chunk. Waiting on the history and then asserting
+        // the mode uses the implication in the direction that is true,
+        // which is why the mode below is a hard assertion and no longer a
+        // poll.
+        wait_until("the deferred chunk to reach the history", || {
+            s.command_count() > 0
         });
+        assert_eq!(
+            s.detection().interaction_mode,
+            InteractionMode::Executing,
+            "the deferred chunk reached the history, so the detector had \
+             already consumed it — with `ECHO` back on it is a submitted \
+             command and not a secret prompt"
+        );
         // **Both directions, because the message used to name only one
-        // of them and it was the one that never happened.** This row's
-        // every observed failure was `left: 2, right: 1` — a duplicate
-        // injected by the hook, not a chunk lost by the reader — while
-        // the message said "the chunk never reached the history". A
-        // failure message that describes the opposite of the failure
-        // sends the next reader to look at the reader thread, which is
-        // exactly where the time went.
+        // of them and it was the one that never happened.** Before the
+        // one-shot latch above, this row's every observed failure was
+        // `left: 2, right: 1` — a duplicate injected by the hook, not a
+        // chunk lost by the reader — while the message said "the chunk
+        // never reached the history". A failure message that describes
+        // the opposite of the failure sends the next reader to look at
+        // the reader thread, which is exactly where the time went. The
+        // `0` case now fails in the `wait_until` above, which says so.
         assert_eq!(
             s.command_count(),
             1,
             "the hook queues one `\\x1b]133;C` and the history must hold \
-             exactly one command for it: 0 means the deferred chunk never \
-             reached the history, and more than 1 means this test's own \
+             exactly one command for it: more than 1 means this test's own \
              hook fired twice — a defect in the hook, not in the reader"
         );
     }
