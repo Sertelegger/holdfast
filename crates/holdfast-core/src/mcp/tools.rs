@@ -2606,6 +2606,31 @@ impl HoldfastServer {
     /// `fulfilled`, which is the `SecretRequestClosed { outcome:
     /// "fulfilled" }` §7.5 promises; with nobody attached there is no raise
     /// to close and no client to tell.
+    ///
+    /// **The subscription has a window ahead of it, and it is the one
+    /// `attach::conn` already closed for its own copy.** `start_session`
+    /// spawns the child, `Session::new` starts the reader, and this call
+    /// happens three statements later; a `tokio::sync::broadcast` keeps
+    /// nothing for a receiver that does not yet exist, so a child that
+    /// drops `ECHO` and prints inside that window loses its autofill
+    /// silently and for good — there is no replay here, only the
+    /// `Lagged` arm below, which is about a different thing. The window
+    /// is a handful of lock-guarded statements wide today and no test has
+    /// lost it. It is recorded because the identical one in
+    /// `attach::conn::forward_events` was also a few instructions wide
+    /// until §9.4's `attach_connect` write landed in the middle of it and
+    /// made it ~1.5 ms, at which point a row failed 3/3 — so the cost of
+    /// widening it is one unrelated statement inserted above.
+    ///
+    /// It is **not** closed here, and that is a decision rather than an
+    /// oversight: `attach::conn` de-duplicates its replay against the
+    /// request id it replayed, and this path has no id to compare. A
+    /// replay that fired alongside a delivered edge would run the
+    /// provider twice, spend two `max_uses` claims and write two
+    /// `binding_resolved` lines for one prompt — the second write is
+    /// refused by `SecretIfUnread`'s `expect_writes`, but the claims and
+    /// the trail are not. Closing it wants its own design and its own
+    /// rows.
     pub(crate) fn watch_for_autofill(&self, session: &Arc<Session>) {
         if !self.config.security.autofill_on_echo_off
             || !crate::secret::binding::keychain_step_runs(&self.config.security.secret_provider)
