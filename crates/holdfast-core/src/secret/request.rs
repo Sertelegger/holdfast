@@ -145,6 +145,64 @@ pub enum Resolution {
     },
 }
 
+/// A credential that actually reached the child, and the echo-off
+/// episode it answered (GH #105).
+///
+/// **Recorded by whoever wrote the value, read by whoever closes the
+/// request.** They are not the same task and cannot be ordered against
+/// each other — the autofill's `take_if_unadopted_matching` and a
+/// connection's `AwaitingSecretLeft` are independent receivers on one
+/// broadcast, and `broadcast::send` wakes them one at a time. So the
+/// resolution is *recorded* where both can see it rather than inferred
+/// from whichever edge happened to arrive second, which is the inference
+/// that told an attached human `cancelled` for a prompt the daemon had
+/// just answered.
+///
+/// **Private to this module, unlike its neighbours**, on the same reasoning
+/// [`SlotSnapshot`] carries: nothing outside constructs one or reads a
+/// field of one. [`SecretSlots::record_episode_answered`] takes the two
+/// numbers and [`SecretSlots::take_on_echo_return`] hands back the answer,
+/// so there is no external caller and no reason to publish a shape whose
+/// invariants live in [`slots::Slots::record_answered`]. Widening it later
+/// is additive; narrowing it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EpisodeAnswer {
+    /// [`crate::session::Session::secret_episode`] as it stood when the
+    /// writer was handed the value.
+    episode: u64,
+    bytes_written: u64,
+}
+
+/// §5.2's [`Resolution`] for the waiting call and §7.5's
+/// `SecretRequestClosed.outcome` for every attached client, given what
+/// was recorded for the echo-off read that just ended (GH #105).
+///
+/// **A function rather than two `match`es, because the echo return has
+/// two closers and they must not be able to disagree.**
+/// `attach::conn::forward_events` owns it for an attached client;
+/// `mcp::tools`' `await_secret` owns it for a call waiting with nobody
+/// attached, which is the second observer §5.2's supersede grew this
+/// milestone. Both used to answer `Cancelled(UserCancelled)`
+/// unconditionally, and a repair that reached only one of them would
+/// make the answer depend on which observer won the close — the same
+/// *"decided by whether a human happened to be watching"* defect that
+/// second observer exists to fix.
+pub fn echo_return_resolution(answered: Option<u64>) -> (Resolution, &'static str) {
+    // `answered` comes from [`SecretSlots::claim_echo_return_answer`] —
+    // a claim the request being closed was entitled to make, and not a
+    // lookup keyed by the read that just ended: an episode is one
+    // *contiguous run of echo-off*, and `sudo` asking twice puts two
+    // child reads inside one. See [`RaisedRequest::claim_episode`].
+
+    match answered {
+        Some(bytes_written) => (Resolution::Provided { bytes_written }, "fulfilled"),
+        None => (
+            Resolution::Cancelled(CancelReason::UserCancelled),
+            "cancelled",
+        ),
+    }
+}
+
 /// The answer to a call that arrived at a slot with somebody already
 /// waiting on it.
 ///
@@ -190,6 +248,69 @@ pub struct RaisedRequest {
     /// The waiting call's `append_newline`. `true` with no waiter,
     /// because an echo-off prompt is waiting for a line.
     pub append_newline: bool,
+    /// `Some(episode)` when this raise is a reaction to §8.3's echo-drop
+    /// edge, and therefore **entitled to claim a credential §9.6's
+    /// autofill wrote for that same read** (GH #105). `None` for every
+    /// other raise.
+    ///
+    /// **An entitlement carried by the request, redeemed at the close**,
+    /// and every word of that is load-bearing.
+    ///
+    /// *Carried by the request*, because the closer has nothing else to
+    /// decide `fulfilled` from: `AwaitingSecretLeft` means the echo-off
+    /// condition cleared, which is equally true of a human aborting, a
+    /// child abandoning its read, and a credential the daemon wrote — the
+    /// last being the case where echo came back *because* the request was
+    /// answered.
+    ///
+    /// *Only for the edge reaction*, because the obvious alternative —
+    /// the closer looking the answer up by the episode that just ended —
+    /// is **wrong, and measured wrong**. An episode is one contiguous run
+    /// of reader-observed echo-off, not one child read: `stty -echo;
+    /// read x; read y; stty echo` is a single episode with two reads, and
+    /// it is the ordinary `sudo`-asks-twice shape. A lookup lets the
+    /// *second* read's raise — genuinely unanswered — claim the first
+    /// read's credential and report `fulfilled`, with the first value's
+    /// byte count, to a caller that supplied nothing. That is the defect
+    /// GH #105 exists to remove, inverted. So the entitlement belongs to
+    /// [`SecretSlots::raise_on_echo_drop_edge`] —
+    /// `attach::conn::forward_events`' only raise, once per edge — and to
+    /// nothing else. A tool call's raise, §7.5's replay for a client
+    /// attaching mid-episode and a caller-timeout re-raise all name no
+    /// particular read.
+    ///
+    /// *Read at the close and not consumed*: several connections can raise
+    /// for one edge — §7.5's raise is per connection — and telling the
+    /// first `fulfilled` and the rest `cancelled` reports one prompt two
+    /// ways depending on which client a human happens to be on. See
+    /// [`slots::Slots::answer_for`].
+    ///
+    /// *Redeemed at the close*, and **not at the raise**, because the
+    /// record is written by `inject_resolved` after the writer's ack and
+    /// nothing orders those two against each other. A draft that claimed
+    /// at the raise left the fix depending on the record winning that
+    /// footrace against a raise woken by the *same* broadcast send: driven
+    /// by a review lane with 200 ms inserted ahead of the record, both
+    /// positive rows went red with the pre-fix message.
+    ///
+    /// **The close is a wider margin, not a happens-before, and this
+    /// comment says so because the first draft of it claimed otherwise.**
+    /// Between the record and a close there is a whole child round trip —
+    /// the value consumed, echo restored, a chunk read, the detector run
+    /// and the edge broadcast — against one task wake for the record. It
+    /// is the same margin GH #105 had before any of this, and the same 200
+    /// ms probe still reddens `a_late_raise_for_a_prompt_the_autofill_answered_closes_fulfilled`,
+    /// which is exactly how wide it is. What is not in question is the
+    /// **direction**: a close that beats the record claims nothing and
+    /// reports `cancelled`, which is the behaviour before this fix rather
+    /// than a new lie.
+    ///
+    /// Closing it properly means recording on the **writer thread**, one
+    /// statement after `write_input` returns, where the bytes cannot have
+    /// been consumed yet. That needs a way for `WriteRequest::SecretIfUnread`
+    /// to reach `SecretSlots`, which is a layering change and not this
+    /// fix's; recorded here rather than left to be rediscovered.
+    claim_episode: Option<u64>,
     waiter: Option<oneshot::Sender<Resolution>>,
 }
 
@@ -200,6 +321,12 @@ impl RaisedRequest {
 
     pub fn has_waiter(&self) -> bool {
         self.waiter.is_some()
+    }
+
+    /// See the field: `Some(episode)` when this raise reacted to §8.3's
+    /// echo-drop edge and may claim a credential written for that read.
+    pub fn claim_episode(&self) -> Option<u64> {
+        self.claim_episode
     }
 
     /// Answer the waiting call, if there is one.
@@ -274,7 +401,7 @@ pub(crate) struct SlotSnapshot {
 mod slots {
     use std::collections::HashMap;
 
-    use super::RaisedRequest;
+    use super::{EpisodeAnswer, RaisedRequest};
 
     #[derive(Default, Debug)]
     pub(super) struct Slots {
@@ -282,6 +409,17 @@ mod slots {
         /// Per session, monotonic, and **never removed** — see
         /// [`super::SecretSlots::snapshot`].
         closed: HashMap<String, u64>,
+        /// Per session, a credential written into a child that had **no
+        /// raise to close** — waiting to be claimed by the raise that
+        /// announces the same read (GH #105).
+        ///
+        /// **At most one entry per session and it is removed when
+        /// claimed.** Both halves matter: a record that survived its claim
+        /// would be claimed again by the next read's raise inside the same
+        /// echo-off run, which is the inversion
+        /// [`super::RaisedRequest::answered`] describes. Bounded by a
+        /// subset of the sessions `closed` already keys.
+        answered: HashMap<String, EpisodeAnswer>,
     }
 
     impl Slots {
@@ -330,6 +468,51 @@ mod slots {
         pub(super) fn closed(&self, session_id: &str) -> u64 {
             self.closed.get(session_id).copied().unwrap_or(0)
         }
+
+        /// Record a credential that reached the child.
+        ///
+        /// **`>=` and not a bare overwrite**, so a late writer cannot
+        /// move the record backwards onto an episode that is already
+        /// over. The counter it carries is monotonic and every writer
+        /// reads it before the value leaves, so a record arriving with a
+        /// *lower* episode than the one already here describes an older
+        /// read — and answering an older read says nothing about this
+        /// one.
+        pub(super) fn record_answered(&mut self, session_id: &str, answer: EpisodeAnswer) {
+            let entry = self
+                .answered
+                .entry(session_id.to_string())
+                .or_insert(answer);
+            if answer.episode >= entry.episode {
+                *entry = answer;
+            }
+        }
+
+        /// The recorded answer, if it is for `episode`.
+        ///
+        /// **A read and not a take, and a draft got that backwards.**
+        /// "One credential answers one prompt" sounds like a reason to
+        /// remove it, but the thing several raises share here is one
+        /// *edge*, not one prompt: §7.5's raise is per connection, and
+        /// with three clients attached the autofill can close the first
+        /// connection's request and the second and third then raise
+        /// requests of their own for the same edge. Removing on the first
+        /// claim told the second client the truth and the third
+        /// `cancelled` — the same prompt reported two ways depending on
+        /// which client you happened to be on, which is the shape of the
+        /// defect this whole change exists to remove. Measured by a review
+        /// lane with a third connection: `outcome_c=cancelled`.
+        ///
+        /// What stops the *next read* of one echo-off run from taking it
+        /// is not this: it is that the next read's raise is a tool call or
+        /// a replay, and neither is entitled to claim at all. See
+        /// [`super::RaisedRequest::claim_episode`], and
+        /// `only_the_edge_raise_claims_a_recorded_answer`, which is the row
+        /// that actually holds the line.
+        pub(super) fn answer_for(&self, session_id: &str, episode: u64) -> Option<u64> {
+            let a = self.answered.get(session_id)?;
+            (a.episode == episode).then_some(a.bytes_written)
+        }
     }
 }
 
@@ -363,6 +546,42 @@ impl SecretSlots {
         prompt_text: &str,
         raised_by: RaisedBy,
     ) -> (SecretRequest, bool) {
+        self.raise_inner(session_id, prompt_text, raised_by, None)
+    }
+
+    /// [`raise`](Self::raise) for the **one raise that is a reaction to
+    /// §8.3's echo-drop edge**, which is the only one entitled to claim an
+    /// answer §9.6's autofill left behind (GH #105).
+    ///
+    /// `attach::conn::forward_events` calls this and nothing else does.
+    /// It runs once per edge per connection and `raise_on_echo_drop_edge`
+    /// is idempotent, so the *first* connection to see the edge allocates
+    /// and claims and the rest get the same request back — one claim, one
+    /// request, however many clients are attached.
+    ///
+    /// **The three raises that deliberately do not claim** are §7.5's
+    /// replay for a client attaching mid-episode, a tool call's
+    /// [`raise_or_adopt`](Self::raise_or_adopt), and `await_secret`'s
+    /// caller-timeout re-raise. None of them is tied to a read: each can
+    /// be made at any moment inside an echo-off run, including after the
+    /// child has consumed the credential and moved to its next read. See
+    /// [`RaisedRequest::answered`] for the measurement.
+    pub fn raise_on_echo_drop_edge(
+        &self,
+        session_id: &str,
+        prompt_text: &str,
+        episode: u64,
+    ) -> (SecretRequest, bool) {
+        self.raise_inner(session_id, prompt_text, RaisedBy::EchoDrop, Some(episode))
+    }
+
+    fn raise_inner(
+        &self,
+        session_id: &str,
+        prompt_text: &str,
+        raised_by: RaisedBy,
+        claim_episode: Option<u64>,
+    ) -> (SecretRequest, bool) {
         let mut slots = self.inner.lock();
         match slots.get(session_id) {
             Some(existing) => (existing.request.clone(), false),
@@ -376,6 +595,7 @@ impl SecretSlots {
                         notice_written: false,
                         max_secret_bytes: None,
                         append_newline: true,
+                        claim_episode,
                         waiter: None,
                     },
                 );
@@ -438,6 +658,10 @@ impl SecretSlots {
                         notice_written: false,
                         max_secret_bytes,
                         append_newline,
+                        // **Never entitled.** A tool call arrives at a
+                        // moment of the agent's choosing and names no
+                        // read — see [`RaisedRequest::claim_episode`].
+                        claim_episode: None,
                         waiter: Some(tx),
                     },
                 );
@@ -532,6 +756,32 @@ impl SecretSlots {
             .lock()
             .get(session_id)
             .is_some_and(|r| r.has_waiter())
+    }
+
+    /// What §9.6's autofill wrote for the edge `raised` announces, if
+    /// anything (GH #105).
+    ///
+    /// Called by the two closers of §5.2's echo return and by nothing
+    /// else. `None` comes back for every request that is not the edge
+    /// reaction (see [`RaisedRequest::claim_episode`]) and for an episode
+    /// nothing was recorded against. **Every** edge raise for one episode
+    /// gets the same answer, which is the point: they are several
+    /// connections announcing one read, and telling them different things
+    /// is the defect.
+    ///
+    /// **At the close rather than at the raise**, because the record is
+    /// written after the writer's ack and nothing orders it against a
+    /// raise, which is woken by the same broadcast send. The close is
+    /// separated from the record by a whole child round trip instead — a
+    /// wider margin, not a happens-before. See the field for the
+    /// measurement and for what closing it properly would take.
+    pub fn claim_echo_return_answer(
+        &self,
+        session_id: &str,
+        raised: &RaisedRequest,
+    ) -> Option<u64> {
+        let episode = raised.claim_episode()?;
+        self.inner.lock().answer_for(session_id, episode)
     }
 
     pub fn matches_outstanding(&self, session_id: &str, request_id: &str) -> bool {
@@ -748,6 +998,50 @@ impl SecretSlots {
         }
     }
 
+    /// Record that a credential reached the child during `episode`
+    /// (GH #105).
+    ///
+    /// **Called only once the writer has said `Written`**, never before.
+    /// `inject_resolved`'s own note is the reason: a write the writer
+    /// declines *"would otherwise have told every attached client
+    /// `fulfilled` for a value the child never received"*, and a record
+    /// written on intent rather than on outcome is that same lie moved
+    /// one function further out.
+    ///
+    /// **And only when the write found no raise to close.** A write that
+    /// took a raise reports `fulfilled` on that raise itself, so there is
+    /// nothing left for a later raise to learn; recording anyway hands
+    /// the next read's raise a credential that was already accounted for.
+    ///
+    /// Claimed by [`raise_on_echo_drop_edge`](Self::raise_on_echo_drop_edge)
+    /// and removed when claimed — one credential answers one prompt.
+    ///
+    /// **`episode` is read before the value is queued, not after the
+    /// ack**, so it can only name the read the writer was aimed at or an
+    /// earlier one — never a later one. That direction is deliberate: an
+    /// episode recorded too *late* would label the next prompt as
+    /// answered, which is the failure this record exists to prevent,
+    /// pointed at a different read.
+    ///
+    /// ## What it still cannot see
+    ///
+    /// A value that reaches the child by a route with no writer of its
+    /// own — an MCP `send_input` (REQ-SEC-011), or a human typing
+    /// ordinary input at an attached terminal. Those satisfy the child's
+    /// read and record nothing, so the closer still reports
+    /// `user_cancelled`. That is the behaviour this fix leaves as it
+    /// found it: neither route is a *secret* submission, and inferring
+    /// one from a byte count is the guessing this record replaces.
+    pub fn record_episode_answered(&self, session_id: &str, episode: u64, bytes_written: u64) {
+        self.inner.lock().record_answered(
+            session_id,
+            EpisodeAnswer {
+                episode,
+                bytes_written,
+            },
+        );
+    }
+
     /// Mark §9.5's buffer notice written, returning `true` for the caller
     /// that flipped it (Task 7). At most one notice per request.
     pub fn claim_notice(&self, session_id: &str, request_id: &str) -> bool {
@@ -870,6 +1164,196 @@ mod tests {
         // which is what proves the wrong one was refused rather than the
         // slot being empty all along.
         assert!(slots.take(S, Some(&a.request_id)).is_some());
+    }
+
+    /// **The two things echo coming back can mean, isolated from every
+    /// child, every PTY and every task** (GH #105).
+    ///
+    /// `attach::conn`'s arm used to answer `Cancelled(UserCancelled)`
+    /// whatever had happened, on the premise that a request cannot end
+    /// without a value while somebody is waiting. §9.6's autofill is the
+    /// counter-example: it writes the credential — which is *why* echo
+    /// comes back — and when its snapshot predates a connection's raise it
+    /// finds the slot `Vacant` and closes nothing, so the raise the arm
+    /// then takes is a request the writer never saw.
+    ///
+    /// Both directions in one row, because the second is what stops the
+    /// repair inverting: an implementation that reported `fulfilled`
+    /// whenever it found a raise satisfies the first half exactly.
+    #[test]
+    fn echo_returning_is_a_cancellation_only_when_nothing_answered_that_raise() {
+        // Answered: the value reached the child during episode 4, and the
+        // raise that announces episode 4 may claim it at its close.
+        let slots = SecretSlots::new();
+        slots.record_episode_answered(S, 4, 8);
+        let (raised, first) = slots.raise_on_echo_drop_edge(S, "Password: ", 4);
+        assert!(first);
+        let closed = slots.take(S, None).expect("the raise is still outstanding");
+        assert_eq!(closed.request_id(), raised.request_id);
+        assert_eq!(
+            echo_return_resolution(slots.claim_echo_return_answer(S, &closed)),
+            (Resolution::Provided { bytes_written: 8 }, "fulfilled"),
+            "an attached human was told nobody answered a prompt that was answered"
+        );
+
+        // Abandoned: same shape, nothing recorded for the read that ended.
+        let slots = SecretSlots::new();
+        slots.raise_on_echo_drop_edge(S, "Password: ", 4);
+        let closed = slots.take(S, None).expect("the raise is still outstanding");
+        assert_eq!(
+            echo_return_resolution(slots.claim_echo_return_answer(S, &closed)),
+            (
+                Resolution::Cancelled(CancelReason::UserCancelled),
+                "cancelled"
+            ),
+            "a prompt nobody answered was reported fulfilled"
+        );
+    }
+
+    /// **One credential answers one prompt** (GH #105), and this row is
+    /// the reason the answer is claimed rather than looked up.
+    ///
+    /// An episode is one contiguous run of echo-off, **not one child
+    /// read**: `stty -echo; read x; read y; stty echo` is a single episode
+    /// with two reads, which is `sudo` asking twice. A closer that
+    /// resolved the word by asking *"was this episode answered?"* hands
+    /// the second read's raise — genuinely unanswered — the first read's
+    /// credential, and reports `fulfilled` with the first value's byte
+    /// count to a caller that supplied nothing. Measured end to end before
+    /// this shape existed; that is the defect GH #105 exists to remove,
+    /// inverted.
+    ///
+    /// So what stops read two is **who raised it**, not how many times
+    /// the record has been read: read one's raise reacts to the edge and
+    /// read two's is a tool call, which is never entitled.
+    ///
+    /// **A draft of this row spelled read two as a second
+    /// `raise_on_echo_drop_edge` for the same episode, and that is the
+    /// wrong shape.** Only `forward_events` makes that call and it makes
+    /// it once per edge per connection, so a second one is not a second
+    /// read — it is a *second connection* announcing the same read, and it
+    /// must be told the same thing the first was
+    /// (`a_second_connections_raise_on_one_edge_is_answered_too`). Spelled
+    /// that way, the row asserted `None` for exactly the call the
+    /// three-client case needs to answer `Some`, and it was the reason a
+    /// draft removed the record on first claim.
+    #[test]
+    fn a_recorded_answer_does_not_reach_the_next_read_of_one_echo_off_run() {
+        let slots = SecretSlots::new();
+        slots.record_episode_answered(S, 1, 8);
+
+        // Read one: the raise announcing episode 1's edge.
+        let (_, first) = slots.raise_on_echo_drop_edge(S, "A: ", 1);
+        assert!(first);
+        let closed = slots.take(S, None).expect("outstanding");
+        assert_eq!(slots.claim_echo_return_answer(S, &closed), Some(8));
+
+        // Read two, **same episode** — echo never came back in between, so
+        // no new edge fires and the only thing that can raise is a tool
+        // call. Nothing answered it, and it must not inherit read one's
+        // credential.
+        slots
+            .raise_or_adopt(S, "B: ", None, true)
+            .expect("a vacant slot raises");
+        let closed = slots.take(S, None).expect("outstanding");
+        assert_eq!(
+            slots.claim_echo_return_answer(S, &closed),
+            None,
+            "the second read of one `stty -echo` region inherited the first read's \
+             credential — `sudo` asking twice reports `fulfilled` for a prompt \
+             nobody answered"
+        );
+    }
+
+    /// **Only the raise that reacts to the edge is entitled to claim**
+    /// (GH #105).
+    ///
+    /// The other three raises in this file are not tied to a read and must
+    /// not take an answer: §7.5's replay for a client attaching part way
+    /// through an echo-off run, a tool call's `raise_or_adopt`, and
+    /// `await_secret`'s caller-timeout re-raise. Each can be made after the
+    /// child has consumed the credential and moved on to its next read, at
+    /// which point claiming would report `fulfilled` for a prompt the
+    /// credential could not have answered.
+    ///
+    /// The pairing is the edge raise on the *same* record immediately
+    /// afterwards, which is what proves the record was there to be taken
+    /// and that the refusals above are refusals rather than an empty map.
+    #[test]
+    fn only_the_edge_raise_claims_a_recorded_answer() {
+        for label in ["the replay", "a tool call"] {
+            let slots = SecretSlots::new();
+            slots.record_episode_answered(S, 1, 8);
+            match label {
+                "the replay" => {
+                    slots.raise(S, "p", RaisedBy::EchoDrop);
+                }
+                _ => {
+                    slots
+                        .raise_or_adopt(S, "p", None, true)
+                        .expect("a vacant slot raises");
+                }
+            }
+            let closed = slots.take(S, None).expect("outstanding");
+            assert_eq!(
+                slots.claim_echo_return_answer(S, &closed),
+                None,
+                "{label} claimed a credential written for a read it does not name"
+            );
+
+            // The pairing: the record really was there.
+            slots.raise_on_echo_drop_edge(S, "p", 1);
+            let closed = slots.take(S, None).expect("outstanding");
+            assert_eq!(
+                slots.claim_echo_return_answer(S, &closed),
+                Some(8),
+                "{label}: the edge raise found no record, so the refusal above is \
+                 vacuous"
+            );
+        }
+    }
+
+    /// **The record is keyed by the read's episode, and cannot move
+    /// backwards** (GH #105).
+    ///
+    /// A credential written for one echo-off run says nothing about the
+    /// next one; without the episode in the key this is a per-session *"a
+    /// secret was written once"*, which the next run's raise would claim.
+    /// The backwards half is the same claim from the other side: a record
+    /// arriving late with an older episode must not displace a newer one,
+    /// and a second record for the *same* episode is the later truth.
+    #[test]
+    fn an_answer_belongs_to_one_episode_and_cannot_move_backwards() {
+        let claim = |slots: &SecretSlots, episode: u64| {
+            slots.raise_on_echo_drop_edge(S, "p", episode);
+            let closed = slots.take(S, None).expect("outstanding");
+            slots.claim_echo_return_answer(S, &closed)
+        };
+
+        let slots = SecretSlots::new();
+        slots.record_episode_answered(S, 7, 8);
+        slots.record_episode_answered(S, 3, 99);
+        assert_eq!(
+            claim(&slots, 3),
+            None,
+            "an older read's answer displaced a newer one"
+        );
+        assert_eq!(
+            claim(&slots, 8),
+            None,
+            "the next run of echo-off inherited the previous one's answer"
+        );
+        assert_eq!(
+            claim(&slots, 7),
+            Some(8),
+            "the read that was actually answered lost its answer"
+        );
+
+        // Same episode recorded twice: the later write is the later truth.
+        let slots = SecretSlots::new();
+        slots.record_episode_answered(S, 5, 8);
+        slots.record_episode_answered(S, 5, 9);
+        assert_eq!(claim(&slots, 5), Some(9));
     }
 
     #[test]
@@ -1066,7 +1550,8 @@ mod tests {
     /// compile, and inside it there is exactly one — in `Slots::close`.
     /// That is a compile-time property no runtime row can see, so this row
     /// states the runtime half: the four public routes out of a slot all
-    /// reach it.
+    /// reach it. GH #105 added no fifth — its echo-return closer goes
+    /// through `take(session, None)`, which is the first of them.
     ///
     /// **The negatives are the half that makes it a rule rather than a
     /// tally.** A count that also moved on a raise, on an adoption, or on

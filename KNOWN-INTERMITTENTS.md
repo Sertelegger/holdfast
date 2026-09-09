@@ -324,18 +324,18 @@ not yet exist, a ring buffer that remembers the previous round's prompt, a
 file that exists before it has contents. Each is closed causally, by
 delaying one component and predicting the failure, rather than by sampling.
 
-**The fourth is a live flake and stays open**, and the first revision of
-this section closed it wrongly on an argument its own text named the
-falsification test for. It reproduces, the assertion it fails is correct,
-and what it is catching is a **product** defect — see its paragraph at the
-end.
+**The fourth was a live flake and is now closed by a product change**, and
+the first revision of this section closed it wrongly on an argument its own
+text named the falsification test for. It reproduced, the assertion it
+failed was correct, and what it was catching was a **product** defect —
+GH #105, fixed 2026-09-09. See its paragraph at the end.
 
 | Row (`secret::binding::tests::`) | Before | After |
 |---|---|---|
 | `a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act` | **8 failures in 25**, and **10 in 10** with the window widened | 0 in 25 |
 | `max_uses_is_per_session_and_bounded` | **10 in 10** with the window widened | 10 in 10 green |
 | `an_absolute_program_does_not_save_a_profile_from_an_agents_env` | **6 in 6** with the window widened | 6 in 6 green |
-| `the_listener_and_a_connections_raise_ride_the_same_edge` | 2 recorded, **1 in 50** reproduced, **6 in 6** with a 20 ms delay injected | **open — the defect behind it is in the product** |
+| `the_listener_and_a_connections_raise_ride_the_same_edge` | 2 recorded, **1 in 50** reproduced, **6 in 6** with a 20 ms delay injected | **closed** — [#105](https://github.com/Sertelegger/holdfast/issues/105), a product defect; 3 in 3 green with the same delay injected |
 
 The contended figures are the `holdfast-core` lib binary filtered to
 `secret::binding`, `--test-threads=16` under `taskset -c 0,1` on a 24-core
@@ -455,9 +455,68 @@ that was already answered — *"the affordance appearing and vanishing for no
 reason a human can see"*, which `mcp::tools` names as the thing to avoid.
 It is the exact mirror of the case `inject_resolved` already guards:
 *"a write the writer declines would otherwise have told every attached
-client `fulfilled` for a value the child never received"*. To be filed
-against §7.5; the row's assertion is correct and stays as it is until the
-product is.
+client `fulfilled` for a value the child never received"*. Filed against
+§7.5 as GH #105; the row's assertion is correct and stays as it is.
+
+**Fixed 2026-09-09, and the row is now closed.** `AwaitingSecretLeft` was
+inferring `user_cancelled` from a condition that is equally true of an
+answered prompt: an autofill that already wrote the credential is *why*
+echo came back. It now reads the resolution instead. `Session` bumps a
+monotonic `secret_episode` inside the same `swap` that latches
+`is_awaiting_secret` — the only writer of that flag in the tree, so the
+counter names exactly one echo-off read — both edges carry it, and a write
+the writer reports as `Written` records `{episode, bytes_written}` in
+`SecretSlots` for the other closer to read. The two closers do not share a
+request id (the writer may have found the slot vacant), so they join on the
+child's read instead.
+
+Neither subscriber was ordered against the other, deliberately: that is the
+assumption that produced the withdrawn argument above. With the same 20 ms
+delay injected the row is **3 green in 3** where it was **3 red in 3**
+immediately before, `left: 0, right: 6` each time, raw lib binary under
+`taskset -c 0,1 --test-threads=16`. Six new rows in `secret::binding` drive
+the orderings with a **gate rather than a delay** —
+`a_late_raise_for_a_prompt_the_autofill_answered_closes_fulfilled` holds the
+forwarder's raise until the child has printed the digest of the value it
+received — and `a_late_raise_for_a_prompt_nothing_answered_still_closes_cancelled`
+keeps the repair from inverting: an arm answering `cancelled`
+unconditionally reddens the first and not the second, one answering
+`fulfilled` unconditionally reddens the second and not the first.
+
+**The first revision of this fix was wrong in the direction it was written
+to prevent, and an adversarial review lane measured it.** It keyed the
+answer by episode and looked it up at the close. An episode is one
+contiguous run of echo-off, **not one child read** — `stty -echo; read x;
+read y; stty echo` is one episode with two reads, which is `sudo` asking
+twice — so the second read's raise, genuinely unanswered, claimed the first
+read's credential and was reported `fulfilled` with the first value's byte
+count. The answer is now claimed — taken — at the close, by the one raise that
+reacted to the edge and by nothing else;
+`the_second_read_of_one_echo_off_run_is_not_answered_by_the_firsts_credential`
+is that shape driven end to end. A first repair claimed at the *raise*
+instead, and the same lane measured that this made the fix depend on the
+record winning a footrace against a raise woken by the same broadcast
+send — 200 ms ahead of the record turned both positive rows red. At the
+close the margin is a whole child round trip.
+
+**A second lane found that none of the rows reached the production arm at
+all.** `spawn_forwarder` is a hand copy of `attach::conn::forward_events`'
+two secret arms, and reverting the *production* arm to its pre-fix form left
+every new row and all 120 `secret::` rows green. The closing arm is now one
+call on `AttachHub` that both the daemon and the test forwarder make, so
+the copy has nothing left to drift from.
+
+**And the sweeps that qualified this fix caught two of its own rows.**
+`an_unattended_call_…`'s first draft did not gate its child, so
+`watch_for_autofill` could subscribe after the echo-off edge had already
+fired: **1 failure in 20** contended runs, *"no `binding_resolved` line was
+ever written"*, which is GH #106 and not that row's subject. Its second
+draft then waited on that same `binding_resolved` line as a proxy for the
+*write* — but §9.6 audits a resolution from the store, before
+`inject_resolved` has touched the slot, so the listener could take the
+row's own hand-raise: **2 failures in 25**, two different `secreq_` ids. It
+gates the child and waits on `Session::writes_performed` now, and both
+measurements are recorded in the row so neither reads as a tidy-up.
 
 ## The row caught in passing on the #52 lanes was reading the session too early
 

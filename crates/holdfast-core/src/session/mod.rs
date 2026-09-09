@@ -281,6 +281,9 @@ pub struct Session {
     /// `PromptDetector` is a pure classifier with no previous mode and an
     /// edge is not computable from its state.
     awaiting_secret: Arc<std::sync::atomic::AtomicBool>,
+    /// Which echo-off read this session is on — see
+    /// [`Session::secret_episode`].
+    secret_episode: Arc<AtomicU64>,
     /// Set once the reader thread has left its loop, which is the only
     /// moment at which "no further output will ever arrive" becomes true.
     ///
@@ -576,8 +579,19 @@ pub enum SessionEvent {
     /// classified the session as `AwaitingSecret` (REQ-SEC-010). Carries
     /// the redacted prompt line the child had just drawn, which may
     /// legitimately be empty (REQ-O-013).
-    AwaitingSecretEntered { prompt_text: String },
-    /// Echo came back without a submission — §5.2's supersede case.
+    ///
+    /// `episode` names this echo-off read — see
+    /// [`Session::secret_episode`].
+    AwaitingSecretEntered { episode: u64, prompt_text: String },
+    /// Echo came back — §5.2's supersede case, *if* nothing answered.
+    ///
+    /// **Whether anything answered is not knowable from this edge**, and
+    /// reading it as "the human cancelled" is GH #105: an autofill that
+    /// wrote the credential is precisely *why* echo came back. The closer
+    /// reads [`crate::secret::RaisedRequest::answered`] off the request it
+    /// closes instead — **not** an episode carried here, because an
+    /// episode is one contiguous run of echo-off and `sudo` asking twice
+    /// puts two child reads inside one.
     AwaitingSecretLeft,
     /// The child ended. **The only place in the tree where a session's
     /// exit is an *event* rather than a poll.**
@@ -674,6 +688,7 @@ impl Session {
         let (events_tx, _) = broadcast::channel(SESSION_EVENT_FRAMES);
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_FRAMES);
         let awaiting_secret = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let secret_episode = Arc::new(AtomicU64::new(0));
         let reader_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writes_performed = Arc::new(AtomicU64::new(0));
 
@@ -719,6 +734,7 @@ impl Session {
             output_tx: output_tx.clone(),
             events_tx: events_tx.clone(),
             awaiting_secret: Arc::clone(&awaiting_secret),
+            secret_episode: Arc::clone(&secret_episode),
             reader_finished: Arc::clone(&reader_finished),
             writes_performed: Arc::clone(&writes_performed),
             write_tx,
@@ -913,6 +929,25 @@ impl Session {
                 drop(detector_guard);
 
                 if awaiting_secret.swap(now_awaiting, Ordering::Relaxed) != now_awaiting {
+                    // **The episode id, allocated in the same transition
+                    // that latches the flag** (GH #105). This `swap` is
+                    // the only writer of `awaiting_secret` in the tree, so
+                    // a counter bumped here names exactly one *run* of
+                    // echo-off — which is not the same thing as one child
+                    // read, and [`Session::secret_episode`] says so.
+                    //
+                    // **The property anything depends on is that every
+                    // `AwaitingSecretEntered` carries a number no other
+                    // one has**, not the economy of bumping on one edge.
+                    // Bumping on both would satisfy it too and is
+                    // deliberately not treated as a regression: measured,
+                    // no row can tell the two apart, because nothing reads
+                    // this on the way *out* — `AwaitingSecretLeft` carries
+                    // no episode, and the closer reads the answer off the
+                    // request it closes.
+                    if now_awaiting {
+                        secret_episode.fetch_add(1, Ordering::Relaxed);
+                    }
                     // Fired **after** the guard is released: a subscriber
                     // that reacted by calling back into the session would
                     // otherwise re-enter the detector lock from inside it.
@@ -922,6 +957,7 @@ impl Session {
                         // is the child's own bytes and a password prompt
                         // is not the only thing that turns echo off.
                         SessionEvent::AwaitingSecretEntered {
+                            episode: secret_episode.load(Ordering::Relaxed),
                             // `redact_for_display` and not `redact_str`:
                             // this line becomes `AwaitingSecret.prompt_text`
                             // on every attached client, and `holdfast
@@ -1344,6 +1380,44 @@ impl Session {
     /// to be told anyway.
     pub fn is_awaiting_secret(&self) -> bool {
         self.awaiting_secret.load(Ordering::Relaxed)
+    }
+
+    /// Which echo-off read this session is on — `0` before the first.
+    ///
+    /// **An identity for one `AwaitingSecret` episode**, bumped inside
+    /// the same `swap` that latches
+    /// [`is_awaiting_secret`](Self::is_awaiting_secret) and carried on
+    /// both edges that bracket it. It exists because a *state* cannot
+    /// answer "is this the read I was told about?", and two of this
+    /// milestone's defects are that question asked with the wrong tool:
+    ///
+    /// * GH #105 — a credential §9.6's autofill wrote with no raise to
+    ///   close has to be matched to the raise that announces *the same
+    ///   edge*, and to nothing else. This number is that match.
+    /// * GH #106 — `watch_for_autofill` cannot replay a missed edge
+    ///   because a bare `if is_awaiting_secret()` double-fires across an
+    ///   Entered/Left/Entered sequence. A remembered episode is the key
+    ///   that de-duplicates it. **Not built here**; the primitive is.
+    ///
+    /// **One episode is not one child read, and reading it that way is a
+    /// measured defect.** The counter moves on the *transition*, and the
+    /// transition is computed per output chunk from the tty's `ECHO` bit,
+    /// so `stty -echo; read x; read y; stty echo` — `sudo` asking twice,
+    /// a username-then-password prompt — is **one** episode with two
+    /// reads. Anything that treats this number as naming a read will
+    /// attribute the first read's answer to the second. See
+    /// [`crate::secret::RaisedRequest::answered`], which is where that
+    /// went wrong and how it is closed.
+    ///
+    /// **A cache in the same sense the flag is**, and for the same
+    /// reason: its only writer is the reader thread, which runs when a
+    /// chunk arrives. A child that drops `ECHO` and prints nothing has
+    /// not started an episode as far as this counter is concerned. So a
+    /// caller reading it to *label* something can be one episode behind
+    /// — never ahead, because it is monotonic — which is the direction
+    /// that under-reports rather than the one that invents.
+    pub fn secret_episode(&self) -> u64 {
+        self.secret_episode.load(Ordering::Relaxed)
     }
 
     /// The child's line discipline, sampled **now** — one `tcgetattr`.
