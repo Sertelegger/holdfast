@@ -3204,6 +3204,39 @@ mod tests {
         let (a_listener, a_socket) = bind_control(&paths).expect("A binds its control socket");
         drop(a_listener);
 
+        // **Wait for A to stop answering rather than assuming `drop` did
+        // it — GH #21.** The comment above says "A's listener drops, so
+        // `socket_is_live` goes false", and that is true eventually and
+        // not instantly: measured, a `connect(2)` to a closed listener
+        // still succeeds about **1 time in 300** under CPU starvation
+        // (`taskset -c 0,1`, 16 threads) and **0 in 300** idle. When it
+        // does, B's `bind_control` probe sees a live peer and returns
+        // `AddrInUse`, and the row fails in its *setup* — never in the
+        // assertion it exists to make.
+        //
+        // **The probe is deliberately not the thing being changed.**
+        // `socket_is_live` prefers "live" on a single successful
+        // `connect`, and that bias is correct: the two errors are not the
+        // same size. Believing a dead daemon live refuses a start, which
+        // is recoverable and loud. Believing a live daemon dead unlinks
+        // its socket and leaves it serving PTY sessions on an inode
+        // nothing can reach — the exact catastrophe the assertion below
+        // pins. Making the probe retry until it sees a failure would buy
+        // this row at the price of that one.
+        //
+        // Bounded so a drop that never settles fails loudly instead of
+        // hanging; on a healthy run this returns on the first check.
+        let settled_by = std::time::Instant::now() + Duration::from_secs(5);
+        while super::super::spawn::socket_is_live(&paths) {
+            assert!(
+                std::time::Instant::now() < settled_by,
+                "A's listener was dropped but `connect(2)` still succeeds 5s \
+                 later: the predecessor never stopped answering, which is a \
+                 different defect from the one this row covers"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
         // Daemon B, through the real binder: lock, probe, unlink, bind,
         // chmod. Then its pid file, naming a process that is not us.
         let (b_listener, b_socket) =

@@ -122,6 +122,20 @@ impl Drop for DaemonLock {
 /// the real client, and conflating the two would make a
 /// version-mismatched daemon look absent and get a second one spawned
 /// on top of it.
+/// **A success can outlive the listener, and callers must not read this
+/// as "the predecessor has not finished dying".** Measured on Linux: after
+/// a `tokio::net::UnixListener` is dropped, a `connect(2)` to its path
+/// still succeeds roughly **1 time in 300** under CPU starvation
+/// (`taskset -c 0,1`, 16 threads), and **0 in 300** on an idle box. The
+/// window is microseconds wide and it is what GH #21 was.
+///
+/// **The bias towards "live" is deliberate and is not a defect.** The two
+/// errors are not the same size: believing a dead daemon live refuses a
+/// start, which is recoverable and says so; believing a live daemon dead
+/// unlinks its socket and leaves it serving sessions on an inode no
+/// `connect(2)` can reach, which it never learns about. A caller that
+/// needs "the predecessor has stopped" must poll this to *false* with its
+/// own deadline — never ask this function to retry until it agrees.
 pub fn socket_is_live(paths: &RuntimePaths) -> bool {
     std::os::unix::net::UnixStream::connect(paths.control_sock()).is_ok()
 }
