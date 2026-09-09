@@ -15,7 +15,6 @@ been measured, and what would settle it.
 |---|---|---|
 | [#10](https://github.com/Sertelegger/holdfast/issues/10) | `send_input_wait_for_returns_the_identical_shape` (`crates/holdfast-core/tests/integration.rs`) | `matched differs between wait_for_pattern and send_input(wait_for=)`. Its file-mate `send_input_reaches_the_shell` fails the same way, so the issue title under-describes it by one row. |
 | [#21](https://github.com/Sertelegger/holdfast/issues/21) | `the_exit_cleanup_leaves_a_successor…socket_and_pid_file_alone` | `AddrInUse` in `bind_control`. Under `--workspace` another target's daemon binds the control socket in the same instant; in isolation there is no competitor. |
-| [#52](https://github.com/Sertelegger/holdfast/issues/52) | `daemon::server::tests::a_connection_mid_handshake_holds_off_the_client_less_exit` | **2 failures in 54 whole-binary runs**, load-dependent; 0 in 800 runs filtered to `daemon::server` alone, so it needs the rest of the binary for contention. Asserts at `server.rs:3552`. **#52's second test is the row already tracked as #21 above** — the pair overlaps, so #52 contributes one new name, not two. |
 
 ## Linux CI evidence, 2026-09-01
 
@@ -137,6 +136,85 @@ Pinned by `session::wait::tests::a_slow_reader_does_not_turn_a_match_into_a_deat
 which uses `MockPty::set_read_delay` to make the window deterministic rather
 than lucky. The original row is kept beside it: it is the same claim without the
 widened window, and it is the one that reproduced on a slow host.
+
+## #52 was #21's `fork` window, on a connected socket
+
+**Fixed 2026-09-08, and its row is gone from the table above.**
+[#52](https://github.com/Sertelegger/holdfast/issues/52) was
+`daemon::server::tests::a_connection_mid_handshake_holds_off_the_client_less_exit`
+— **2 failures in 54 whole-binary runs** and **0 in 800** filtered to
+`daemon::server` alone, which the row read as needing the rest of the binary for
+contention. It did, and not for the reason "contention" suggests. (#52's second
+test was the row tracked as #21, so the pair overlapped and #52 contributed one
+name, not two.)
+
+Not a new mechanism: the same descriptor window the
+`remove_runtime_files_we_own` note has documented all along, one layer over.
+
+**Which assertion.** This row's `server.rs:3552` was recorded against the tree
+at `38c7bf2`, where that line is not the mid-handshake claim the test is named
+for but the **pairing** at the bottom — `drop(peer)` and then
+*"the count was never given back, so the exit is now disabled for good"*. Every
+reproduction, natural and forced, lands there. The row's own name points at the
+wrong half of it, which is worth knowing before reading the test.
+
+**The mechanism.** Every `fork` in this binary — `start_detached`, every PTY
+spawn — hands its child a copy of *every* descriptor the process holds, and
+`SOCK_CLOEXEC` closes it at the `exec` and not before. While a copy survives,
+`drop(peer)` closes one descriptor and releases no socket: the daemon's
+`read_frame` sees no EOF, `handle_connection` stays parked until
+`HANDSHAKE_TIMEOUT` (5 s), and `in_flight` does not come back. The waiter was
+`yield_until`, which is 500 yields and no wall clock — a few hundred
+microseconds — so the row lost.
+
+That is exactly the property the row recorded without recognising it: "needs the
+rest of the binary for contention" is fork density, and the 0 in 800 filtered
+runs are a module that barely forks.
+
+**Measured.** On a 24-core box, `--test-threads=32`, four concurrent whole-binary
+lanes: **1 failure in 100 runs before, 0 in 100 after**, same machine, same load,
+same afternoon — consistent with the historical 2 in 54. Forced, it is not
+probabilistic at all, and the forcing measures the row's tolerance directly: a
+real `fork` whose child holds the inherited descriptor for **200 ms fails it 10
+in 10**, for **1 ms, 20 in 20**, and for **100 µs, 1 in 20** — so the row's whole
+budget is a few hundred microseconds, against a `fork`→`exec` latency this tree
+has already measured at p50 75 µs with a 3.1 ms tail
+(`spawn::socket_is_live`). An in-process `dup` — the same open file
+description, which is what actually holds the socket — is **10 in 10**.
+
+**Fixed by asking for the ending instead of inferring it.** `shutdown(2)` acts
+on the socket, so every descriptor onto it sees the half-close and the daemon
+reads EOF on its next poll; `close(2)` acts on a descriptor and sends nothing
+while another copy survives. The row now half-closes and then drops.
+
+**Pinned deterministically rather than by luck.** The test holds a `dup` of the
+client descriptor across the drop — the inherited copy, made permanent — so the
+hostile arrangement is always present. Without the half-close it is red 20 in
+20; with it, green 20 in 20.
+
+**No product defect.** The daemon is right to keep counting a connection whose
+socket has not been released, and its one unbounded read is already covered by
+`HANDSHAKE_TIMEOUT`. The defect is a test that inferred "the client is gone"
+from `close`.
+
+**And the runner matters, which is worth saying plainly rather than letting the
+next person discover it.** The mechanism needs a sibling `fork` *in this
+process*. Under libtest — `cargo test`, the raw binary with `--test-threads=N`,
+which is what every measurement above used and what `scripts/ci-flake-hunt.sh`
+still runs — every row is a thread in one process and a sibling's PTY spawn
+duplicates this row's descriptors. Under `cargo nextest`, adopted in `f209c97`
+and what CI's `test` job runs, each row is **its own process**: measured here,
+9 concurrent processes at `-j 8`. A sibling's `fork` cannot reach this row's
+descriptor table there, so the natural failure is unreachable under the gate as
+it stands today. That is not the row being fixed — it is the row being hidden by
+a change made for another reason, which is exactly the state in which a
+fragility survives. The `dup` makes it runner-independent.
+
+**And a sweep, because this is now twice.** `drop(…)` followed by a pure-yield
+wait occurred exactly once in the tree, and it was this row. The comparable
+waits in `attach_protocol.rs` spend a 5 s wall-clock deadline, which is orders
+of magnitude past any `fork`→`exec` this binary produces. `yield_until`'s doc
+comment now says what its budget is for.
 
 ## #56 is not the common cause this file said it was
 
@@ -321,6 +399,15 @@ It is the exact mirror of the case `inject_resolved` already guards:
 client `fulfilled` for a value the child never received"*. To be filed
 against §7.5; the row's assertion is correct and stays as it is until the
 product is.
+
+## Caught in passing on the #52 lanes, not filed
+
+`session::tests::no_output_is_classified_between_the_echo_sample_and_the_answer`
+(`session/mod.rs:2932`) failed **once in the same 100 whole-binary runs**, with
+`left: 0, right: 1` — its own message says 0 means *"the deferred chunk never
+reached the history"*. Recorded here because an unfiled failure that nobody
+wrote down is how this file came to exist; it was not investigated, and no
+claim is made about whether it is a test or a product defect.
 
 ## What was not run
 

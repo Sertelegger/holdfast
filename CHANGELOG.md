@@ -129,6 +129,43 @@ trigger as a side effect of writing release notes.
   and stays; `KNOWN-INTERMITTENTS.md` carries the measurements and the
   mistake in the reasoning that first closed it.
 
+- **`a_connection_mid_handshake_holds_off_the_client_less_exit` no longer
+  depends on what the rest of the binary is forking ([#52]).** The row's
+  recorded line, `server.rs:3552` at `38c7bf2`, is not the mid-handshake
+  claim it is named for: it is the **pairing** at the bottom — `drop(peer)`,
+  then *"the count was never given back"*. And the cause is not new. Every
+  `fork` in this binary hands its child a copy of every descriptor the
+  process holds, released at the `exec` and not before, which is the window
+  `remove_runtime_files_we_own` has documented all along for the *listening*
+  socket and GH #21 turned out to be. On a **connected** socket it means
+  `drop` closes one descriptor and releases nothing: the daemon reads no
+  EOF, `handle_connection` stays parked until `HANDSHAKE_TIMEOUT`, and
+  `in_flight` does not come back inside `yield_until`'s 500 yields — a few
+  hundred microseconds against a `fork`→`exec` latency whose tail is
+  milliseconds.
+
+  Fixed by asking for the ending rather than inferring it: `shutdown(2)`
+  acts on the socket, so every copy of the descriptor sees the half-close,
+  where `close(2)` acts on a descriptor and sends nothing while another
+  survives. **1 failure in 100 whole-binary runs before, 0 in 100 after**,
+  same box and same load — and the row now carries a `dup` of the client
+  descriptor across the drop, so the inherited copy is always present
+  instead of arriving by luck: **red 20 in 20** without the half-close,
+  green 20 in 20 with it.
+
+  No product change. The daemon is right to keep counting a connection
+  whose socket has not been released, and its one unbounded read is already
+  bounded by the handshake deadline; what was wrong was a test inferring
+  "the client is gone" from `close`.
+
+  **The runner had already hidden it**, which is not the same as fixing it.
+  The mechanism needs a sibling `fork` in the *same process*, so it is
+  reachable under libtest — `cargo test`, and `scripts/ci-flake-hunt.sh`,
+  which still runs it — and not under `cargo nextest`, which gives every
+  row its own process and has been CI's runner since `f209c97`. A
+  fragility that survives because the harness changed for another reason
+  is exactly the one nobody finds again.
+
 - **The Windows build compiles again ([#19]).** `windows-cross` — the
   `x86_64-pc-windows-gnu` clippy job — had been red on `main` since before
   0.0.6, with 0 passes in its last 20 runs, while `ROADMAP.md` said the tree
@@ -385,6 +422,7 @@ trigger as a side effect of writing release notes.
 [#19]: https://github.com/Sertelegger/holdfast/issues/19
 [#39]: https://github.com/Sertelegger/holdfast/issues/39
 [#42]: https://github.com/Sertelegger/holdfast/issues/42
+[#52]: https://github.com/Sertelegger/holdfast/issues/52
 
 ## [0.0.7] — 2026-09-01
 
