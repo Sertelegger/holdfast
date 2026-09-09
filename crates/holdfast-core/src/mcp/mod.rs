@@ -201,6 +201,30 @@ pub struct HoldfastServer {
     /// raise fans out to nobody and the waiting call runs out its
     /// deadline, which is the correct answer rather than a special case.
     pub attach_hub: Arc<crate::attach::hub::AttachHub>,
+    /// **`#[cfg(test)]` — the width of GH #106's window, on purpose.**
+    ///
+    /// `start_session` spawns the child and then arms §9.6's listener a
+    /// few statements later, so a child that drops `ECHO` and prints in
+    /// between loses its `AwaitingSecretEntered` to a `broadcast` with no
+    /// receiver. The window is real and its width is the child's
+    /// `fork`/`exec` cost — which is a property of the machine, not of
+    /// anything the daemon controls, so a row that merely raced it would
+    /// be green on a slow box for the wrong reason. Every existing
+    /// autofill row instead *gates* its child until after `start_session`
+    /// returns, which is why the suite was structurally blind to this.
+    ///
+    /// This is the width made an argument. Two sleeps read it —
+    /// `start_session`'s, immediately above the arming, and the listener
+    /// task's, between its `subscribe_events` and its replay check — so
+    /// one knob arranges both halves: an edge that is *lost* before the
+    /// subscription, and an edge that is *delivered* into it and must not
+    /// then be autofilled twice.
+    ///
+    /// `#[cfg(test)]` and not a config knob: it exists to make a defect
+    /// reproducible, and a shipped binary that can be asked to widen a
+    /// credential window is a worse thing than the defect.
+    #[cfg(test)]
+    pub(crate) autofill_arm_delay: std::time::Duration,
 }
 
 impl HoldfastServer {
@@ -342,7 +366,19 @@ impl HoldfastServer {
             audit_open_error,
             capabilities,
             attach_hub: Arc::new(crate::attach::hub::AttachHub::new()),
+            // Zero, so every row that does not ask for the window pays
+            // nothing and takes no scheduler yield: both sleep sites are
+            // behind an `is_zero()` guard.
+            #[cfg(test)]
+            autofill_arm_delay: std::time::Duration::ZERO,
         }
+    }
+
+    /// See [`autofill_arm_delay`](HoldfastServer::autofill_arm_delay).
+    #[cfg(test)]
+    pub(crate) fn with_autofill_arm_delay(mut self, delay: std::time::Duration) -> Self {
+        self.autofill_arm_delay = delay;
+        self
     }
 
     /// Every live attach connection, and the per-session secret slot.

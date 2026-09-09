@@ -928,9 +928,31 @@ impl Session {
                 let prompt_line = snap.last_line.clone();
                 drop(detector_guard);
 
-                if awaiting_secret.swap(now_awaiting, Ordering::Relaxed) != now_awaiting {
+                // **A load and a store rather than a `swap`, and that is
+                // load-bearing** (GH #106). This loop is the only writer
+                // of `awaiting_secret` in the tree — `Session` holds a
+                // read-only handle and every other reference is a `load`
+                // — so the read-modify-write buys nothing that a plain
+                // pair does not, and splitting it is what lets the
+                // episode be **published before the flag it names**.
+                //
+                // A `swap` cannot: the transition is only known once the
+                // flag has already been latched, so the `fetch_add` is
+                // necessarily behind it and a thread that observes
+                // `is_awaiting_secret() == true` may still read the
+                // *previous* episode. See
+                // [`Session::awaiting_secret_episode`], which is the
+                // reader that cannot tolerate that — it would de-duplicate
+                // a replay against a number one episode short and fire
+                // twice for one prompt, which is the direction that costs
+                // a provider run and a `max_uses` claim.
+                //
+                // **A second writer of this flag breaks the transition
+                // test**, which the `swap` made atomic and this does not.
+                // There is none, and there must not be one.
+                if awaiting_secret.load(Ordering::Relaxed) != now_awaiting {
                     // **The episode id, allocated in the same transition
-                    // that latches the flag** (GH #105). This `swap` is
+                    // that latches the flag** (GH #105). This block is
                     // the only writer of `awaiting_secret` in the tree, so
                     // a counter bumped here names exactly one *run* of
                     // echo-off — which is not the same thing as one child
@@ -948,6 +970,13 @@ impl Session {
                     if now_awaiting {
                         secret_episode.fetch_add(1, Ordering::Relaxed);
                     }
+                    // **`Release`, and the `fetch_add` above is what it
+                    // publishes** (GH #106). Paired with the `Acquire` in
+                    // [`Session::is_awaiting_secret`], it is what makes
+                    // *"the flag is set"* imply *"and the episode that
+                    // names it is visible"* on a machine whose store
+                    // order is not x86's.
+                    awaiting_secret.store(now_awaiting, Ordering::Release);
                     // Fired **after** the guard is released: a subscriber
                     // that reacted by calling back into the session would
                     // otherwise re-enter the detector lock from inside it.
@@ -1378,26 +1407,63 @@ impl Session {
     /// case the edge cannot serve: a client that attaches while a secret
     /// prompt is already up missed the transition, and §7.5 requires it
     /// to be told anyway.
+    ///
+    /// **`Acquire`, and it is not decoration** — see
+    /// [`awaiting_secret_episode`](Self::awaiting_secret_episode) for the
+    /// caller that needs the episode this flag belongs to and not the one
+    /// before it.
     pub fn is_awaiting_secret(&self) -> bool {
-        self.awaiting_secret.load(Ordering::Relaxed)
+        self.awaiting_secret.load(Ordering::Acquire)
+    }
+
+    /// The episode this session is **currently** inside, or `None` if
+    /// echo is not off — [`is_awaiting_secret`](Self::is_awaiting_secret)
+    /// and [`secret_episode`](Self::secret_episode) read as one fact.
+    ///
+    /// **Two loads that could be written at any call site, published as
+    /// one because the order and the ordering both matter** (GH #106).
+    ///
+    /// * The flag is read **first**. A caller that reads the episode
+    ///   first can have the reader thread start a *new* episode between
+    ///   the two loads, and it would then label the prompt it is looking
+    ///   at with the number of the one before — off by one, in the
+    ///   direction that makes a de-duplication key match nothing.
+    /// * The flag is read with `Acquire` against the reader's `Release`
+    ///   store, so the `fetch_add` sequenced before that store is visible
+    ///   here. Both are `Relaxed` on x86 anyway; neither is on aarch64,
+    ///   and no CI job runs on one.
+    ///
+    /// **Still a cache, exactly as the flag is.** Its writer is the
+    /// reader thread, which runs only when a chunk arrives, so `Some` for
+    /// a child that has since restored echo in silence is expected — the
+    /// live question is [`line_discipline`](Self::line_discipline), and
+    /// the write itself is gated on it by
+    /// [`crate::pty::WriteRequest::SecretIfUnread`]. What this answers is
+    /// *"which prompt am I looking at"*, which is a question about
+    /// identity and not about liveness.
+    pub fn awaiting_secret_episode(&self) -> Option<u64> {
+        self.is_awaiting_secret().then(|| self.secret_episode())
     }
 
     /// Which echo-off read this session is on — `0` before the first.
     ///
     /// **An identity for one `AwaitingSecret` episode**, bumped inside
-    /// the same `swap` that latches
-    /// [`is_awaiting_secret`](Self::is_awaiting_secret) and carried on
-    /// both edges that bracket it. It exists because a *state* cannot
+    /// the same transition that latches
+    /// [`is_awaiting_secret`](Self::is_awaiting_secret) — and published
+    /// just *before* it, so the two can be read as one fact — and carried
+    /// on both edges that bracket it. It exists because a *state* cannot
     /// answer "is this the read I was told about?", and two of this
     /// milestone's defects are that question asked with the wrong tool:
     ///
     /// * GH #105 — a credential §9.6's autofill wrote with no raise to
     ///   close has to be matched to the raise that announces *the same
     ///   edge*, and to nothing else. This number is that match.
-    /// * GH #106 — `watch_for_autofill` cannot replay a missed edge
+    /// * GH #106 — `watch_for_autofill` could not replay a missed edge
     ///   because a bare `if is_awaiting_secret()` double-fires across an
     ///   Entered/Left/Entered sequence. A remembered episode is the key
-    ///   that de-duplicates it. **Not built here**; the primitive is.
+    ///   that de-duplicates it, and
+    ///   [`awaiting_secret_episode`](Self::awaiting_secret_episode) is how
+    ///   that replay reads it.
     ///
     /// **One episode is not one child read, and reading it that way is a
     /// measured defect.** The counter moves on the *transition*, and the
@@ -3000,7 +3066,7 @@ mod tests {
         // session's locks at once. Between those two statements the
         // session answers `Executing` with an empty history, and a poll
         // on the mode returns inside exactly that gap; the gap holds an
-        // `AtomicBool` swap, a conditional `events_tx.send` and a
+        // `AtomicBool` store, a conditional `events_tx.send` and a
         // `now_ms()`, so it is a scheduler slice wide rather than an
         // instruction wide.
         //
