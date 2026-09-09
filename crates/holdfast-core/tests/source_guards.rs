@@ -187,6 +187,100 @@ fn the_write_channel_carries_the_secret_as_itself() {
     );
 }
 
+/// **The two secret arms of `attach::conn::forward_events` are the two
+/// calls `secret::binding`'s `spawn_forwarder` makes** (GH #105).
+///
+/// **Here because a runtime test in this workspace cannot reach
+/// `forward_events` at all**, and a review lane measured what that costs.
+/// It takes an `Arc<Daemon>`, so the unit target substitutes
+/// `spawn_forwarder` — the same two hub calls in the same two arms on the
+/// same broadcast — and the integration target cannot drive the *other*
+/// half of the pair, because every `SecretBinding` it can build resolves
+/// nothing (`the_arbitrary_program_seam_is_still_out_of_the_published_api`
+/// is why: no provider a test can install is in the published API).
+///
+/// So the production arms are covered by nothing, and reverting either of
+/// them to its pre-GH #105 form left **all 125 `secret::` rows and all 45
+/// `attach::` rows green** — twice, once for each arm:
+///
+/// * the closing arm reverted to `close_secret(&id, None)` with an
+///   unconditional `Cancelled(UserCancelled)`, which is GH #105 verbatim;
+/// * the raising arm reverted to `raise_secret(..)`, after which no
+///   request is ever entitled to claim and **every** echo return closes
+///   `cancelled` — the same defect, reached by taking the entitlement
+///   away rather than by ignoring it.
+///
+/// A scanner is a blunt instrument and this one is deliberately narrow:
+/// it asserts the *names* the two functions call, which is exactly the
+/// thing the two mutations changed. It cannot see a wrong argument, and
+/// it is not trying to.
+#[test]
+fn the_daemons_secret_arms_are_the_ones_the_unit_target_substitutes_for() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let conn = std::fs::read_to_string(src.join("attach/conn.rs")).expect("read attach/conn.rs");
+    let binding =
+        std::fs::read_to_string(src.join("secret/binding.rs")).expect("read secret/binding.rs");
+
+    // Code lines only — both files discuss these names in prose, and a
+    // scanner that read comments would pass on a tree that is wrong. Same
+    // lesson as `calls_a_print_macro`.
+    let calls = |text: &str, from: &str| -> Vec<String> {
+        let (_, body) = text.split_once(from).unwrap_or_else(|| {
+            panic!("`{from}` is gone; this guard is now about a function that does not exist")
+        });
+        let mut out = Vec::new();
+        for line in body.lines().take_while(|l| !l.starts_with("}")) {
+            let code = line.trim_start();
+            if code.starts_with("//") || code.starts_with("///") {
+                continue;
+            }
+            for name in [
+                "raise_secret_on_edge",
+                "raise_secret",
+                "close_secret_on_echo_return",
+                "close_secret",
+            ] {
+                if code.contains(&format!("{name}(")) && !out.iter().any(|n| n == name) {
+                    out.push(name.to_string());
+                    break;
+                }
+            }
+        }
+        out.sort();
+        out
+    };
+
+    let daemon = calls(&conn, "async fn forward_events(");
+    let double = calls(&binding, "    ) -> tokio::task::JoinHandle<()> {");
+
+    assert_eq!(
+        daemon,
+        vec![
+            "close_secret".to_string(),
+            "close_secret_on_echo_return".to_string(),
+            "raise_secret_on_edge".to_string(),
+        ],
+        "`forward_events` no longer makes the calls GH #105 put there. \
+         `close_secret` is the `Exited` arm's §5.1 close and stays; the other \
+         two are the echo-drop pair."
+    );
+    assert_eq!(
+        double,
+        vec![
+            "close_secret_on_echo_return".to_string(),
+            "raise_secret_on_edge".to_string(),
+        ],
+        "`spawn_forwarder` no longer makes the same two calls as the daemon, so \
+         every row that drives it is measuring something the daemon does not do"
+    );
+    for name in ["raise_secret_on_edge", "close_secret_on_echo_return"] {
+        assert!(
+            daemon.contains(&name.to_string()) && double.contains(&name.to_string()),
+            "`{name}` is in one of the two and not the other"
+        );
+    }
+}
+
 /// REQ-SEC-012's structural half, pinned as a fact about the tree.
 ///
 /// **Here because the guarantee is a *visibility*, and no runtime test

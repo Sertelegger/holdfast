@@ -2245,6 +2245,14 @@ impl HoldfastServer {
             }
         };
 
+        // **The episode this value is aimed at, read before it is
+        // queued** (GH #105). It is the key the closer of a *late* raise
+        // joins the answer against, and reading it here rather than after
+        // the ack is what makes it safe: `secret_episode` is monotonic,
+        // so a value taken now can only name this read or an earlier one,
+        // never the next prompt. See `SecretSlots::record_episode_answered`.
+        let episode = session.secret_episode();
+
         // The same write path a client's `SecretInput` takes, plus the two
         // conditions §9.6's autofill needs and a human's keystroke does
         // not: the value moves into the queue as a `SecretBytes` and is
@@ -2277,6 +2285,30 @@ impl HoldfastServer {
                 return Some(self.session_died_under_autofill(session));
             }
         };
+        // **Recorded once the writer has said `Written`, and whether or
+        // not there was a raise to close** (GH #105).
+        //
+        // `Vacant` is the case the record exists for: the credential
+        // reached the child and no raise existed to say so, so the raise
+        // that announces this same edge claims it and reports the truth.
+        //
+        // **A `request_id.is_none()` guard was written here and removed,
+        // because it is wrong in the two-client shape.** §7.5's raise is
+        // per connection: A's `forward_events` raises `R1`, this call
+        // takes it and closes it `fulfilled` below, and B's — reacting to
+        // the *same* edge, a moment later — finds the slot vacant again
+        // and raises `R2`. With the guard, B's client is told `cancelled`
+        // for a prompt that was answered, which is GH #105 with two
+        // connections instead of one. Without it, `R2` claims the record
+        // and B is told the same thing A was.
+        //
+        // Recording unconditionally is safe because **the claim is not a
+        // lookup**: only `raise_on_echo_drop_edge` takes the record, and
+        // it takes it, so at most one raise per write can be marked. A
+        // second read inside the same echo-off run is raised by a tool
+        // call or by §7.5's replay, neither of which may claim.
+        hub.secrets()
+            .record_episode_answered(&session.id, episode, bytes_written);
         close("fulfilled");
         // §4.1 counts a write as activity, or a session idle-reaps while
         // its own credential is being filled in.
@@ -2906,7 +2938,6 @@ impl HoldfastServer {
             // own the close. We *are* the waiter, so there is nobody to
             // answer — the value is returned below.
             Some(raised) => {
-                drop(raised);
                 match woke {
                     // §5.1: the code, not `timeout` a window later. **No
                     // re-raise**: a child that has exited is not sitting
@@ -2919,14 +2950,27 @@ impl HoldfastServer {
                         }
                     }
                     // §5.2's supersede, reached without an attached
-                    // client: the echo-off condition cleared and nothing
-                    // was written. **No re-raise** — the child is not at
-                    // a prompt any more, and an affordance pointing at
-                    // one that has gone is the same defect the exit arm
+                    // client — **if** the echo-off condition cleared and
+                    // nothing was written. Echo also comes back because
+                    // §9.6's autofill answered the read, and this arm
+                    // used to call that a cancellation too (GH #105), so
+                    // it asks the record rather than inferring from the
+                    // edge. `echo_return_resolution` and not a `match`
+                    // here: `attach::conn` closes the same edge for an
+                    // attached client, and an answer that differed by
+                    // which observer won the close is the *"decided by
+                    // whether a human happened to be watching"* defect
+                    // this second observer exists to fix.
+                    //
+                    // **No re-raise** either way — the child is not at a
+                    // prompt any more, and an affordance pointing at one
+                    // that has gone is the same defect the exit arm
                     // refuses above.
                     Woke::EchoReturned => {
-                        hub.broadcast_secret_closed(&session.id, request_id, "cancelled");
-                        Resolution::Cancelled(CancelReason::UserCancelled)
+                        let answered = hub.secrets().claim_echo_return_answer(&session.id, &raised);
+                        let (resolution, outcome) = crate::secret::echo_return_resolution(answered);
+                        hub.broadcast_secret_closed(&session.id, request_id, outcome);
+                        resolution
                     }
                     Woke::Deadline => {
                         hub.broadcast_secret_closed(&session.id, request_id, "timeout");
@@ -3661,7 +3705,8 @@ enum Woke {
     Deadline,
     /// §5.1: the child ended while the call was waiting.
     Exited(Option<i32>),
-    /// §5.2's supersede: echo came back with no value written.
+    /// Echo came back. **Not on its own a supersede** — see
+    /// [`SecretEnded::EchoReturned`].
     EchoReturned,
 }
 
@@ -3809,7 +3854,10 @@ enum StepOne {
 enum SecretEnded {
     /// §5.1: the child ended.
     Exited(Option<i32>),
-    /// §5.2's supersede: echo came back with no submission.
+    /// Echo came back — §5.2's supersede **only if nothing answered the
+    /// read this call's request announces**, which the request itself
+    /// carries (`RaisedRequest::answered`) and this edge cannot know
+    /// (GH #105).
     EchoReturned,
 }
 
@@ -3817,10 +3865,12 @@ enum SecretEnded {
 /// echo comes back with nothing written.
 ///
 /// **The second half is I-1, and it is the same defect `session_exit`
-/// exists for, one event over.** `request.rs` states the property
-/// outright — *"`user_cancelled` has exactly one producer and it is this
-/// line"* — and that line lives in `attach::conn::forward_events`, which
-/// is **one task per attach connection** and is `abort()`ed with it. So
+/// exists for, one event over.** `attach::conn::forward_events` used to
+/// state the property outright — *"`user_cancelled` has exactly one
+/// producer and it is this line"* — and that line is **one task per
+/// attach connection**, `abort()`ed with it. (The quoted claim was also
+/// wrong on its own terms; GH #105 is the third producer it did not
+/// count, and the comment there now says so.) So
 /// with nobody attached (which is exactly the deployment §9.5's rung-3
 /// buffer notice exists for) a child that abandons its own echo-off read
 /// produced no observer at all: the event went onto the session broadcast

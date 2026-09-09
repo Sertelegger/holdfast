@@ -22,6 +22,92 @@ trigger as a side effect of writing release notes.
 
 ### Fixed
 
+- **A fulfilled secret request is no longer reported as `cancelled`**
+  (GH #105). Two producers can close a secret request and they race:
+  §9.6's autofill through `take_if_unadopted_matching`, and a connection's
+  `hub.raise_secret` followed by its `AwaitingSecretLeft` arm. When the
+  autofill won, the slot answered `Vacant`, the credential was written to
+  the child **successfully**, and the connection then raised *late* — after
+  which the echo return closed that raise as `cancelled`. §7.5's `outcome`
+  said nobody answered a prompt the daemon had just answered, and the human
+  had first been shown an `AwaitingSecret` affordance for a read that was
+  already satisfied. It is the exact mirror of the case `inject_resolved`
+  already guards, where a declined write would have claimed `fulfilled` for
+  a value the child never received.
+
+  **`AwaitingSecretLeft` was inferring a fact it does not carry.** Echo
+  coming back is equally true of a human aborting, a child abandoning its
+  read, and a credential the daemon wrote — the last being the case where
+  echo came back *because* the request was answered. So the answer is now
+  carried by the request: a write that finds no raise to close records
+  `{episode, bytes_written}` on the session's slot, and the **one raise
+  that reacts to §8.3's echo-drop edge** claims it. The closer then reports
+  what the request holds rather than inferring from the edge.
+
+  **The claim is a take made by that raise at its close, and not a lookup
+  keyed by the edge** — because an episode is one contiguous run of
+  echo-off and **not one child read**. `stty -echo; read x; read y; stty echo` is a single
+  episode with two reads, which is `sudo` asking twice. A closer that asked
+  *"was this episode answered?"* handed the second read's raise the first
+  read's credential and reported `fulfilled`, with the first value's byte
+  count, to a caller that supplied nothing — the same lie pointed the other
+  way. Found by an adversarial review lane and driven by
+  `the_second_read_of_one_echo_off_run_is_not_answered_by_the_firsts_credential`.
+  For the same reason §7.5's replay, a tool call's raise and
+  `await_secret`'s re-raise may not claim: none of them names a read.
+
+  **The claim is redeemed at the close and not at the raise**, because the
+  record is written after the writer's ack and nothing orders it against a
+  raise woken by the same broadcast send — a draft that claimed at the
+  raise was red in both positive rows with 200 ms inserted ahead of the
+  record. The close is behind a whole child round trip instead, which is a
+  wider margin rather than a happens-before; the residual fails to
+  `cancelled`, which is the behaviour before this fix rather than a new
+  lie, and `RaisedRequest::claim_episode` records what closing it properly
+  would take.
+
+  **The echo return has two closers and both carried the premise.** With a
+  client attached it is `attach::conn::forward_events`; with **nobody**
+  attached — the deployment §9.5's buffer notice exists for — it is
+  `await_secret`'s own `secret_condition_ended`, the second observer added
+  so the same child did not answer `user_cancelled` attached and `timeout`
+  unattended. Both now derive the word from one function
+  (`secret::echo_return_resolution`), and the closing arm itself is one
+  call on `AttachHub`, so a test-module copy of it cannot stay green while
+  the original is reverted — measured: it did, for every row in the first
+  revision of this fix.
+
+  **No new `outcome` value.** §7.5's set is a gated surface the web UI
+  mirrors, and from the caller's side the prompt *was* answered, so the
+  existing `fulfilled` wording is the truthful one. Nor is either
+  subscriber ordered against the other: they are independent receivers on
+  one broadcast and `broadcast::send` wakes them one at a time, which is
+  what made this reachable in the first place.
+
+  Measured, raw lib binary under `taskset -c 0,1 --test-threads=16`:
+  `the_listener_and_a_connections_raise_ride_the_same_edge` fails **1 run
+  in 50** contended, is **3 red in 3** with the issue's 20 ms delay ahead
+  of the raise, and **3 green in 3** with that same delay after the fix.
+  **Neither production arm was reachable from any test**, which two
+  reverts proved: the closing arm restored to its pre-fix form, and the
+  raising arm switched back to the unentitled `raise_secret`, each left all
+  125 `secret::` and all 45 `attach::` rows green. `forward_events` needs
+  an `Arc<Daemon>` the unit target cannot build, and the integration target
+  can install no provider that resolves. Both arms are one hub call now,
+  and `source_guards.rs` asserts they are the two calls the unit target's
+  stand-in makes — the file's idiom for a guarantee invisible from inside
+  the program.
+
+  Seven new rows drive the orderings with gates rather than sleeps.
+  Fourteen injected mutations were run against them and thirteen are
+  caught, each by the rows that should catch it and by no others — including both
+  directions of the defect, the pre-fix arm restored in the production
+  code, a record written on a declined write, a claim that reads instead of
+  taking, and a claim that ignores the episode. The fourteenth is bumping the
+  episode counter on both edges, which no row can see and which the code
+  now states as a non-property rather than a guarantee.
+
+||||||| 5824dfa
 - **`every_emitted_unix_field_is_a_number` no longer waits on the output
   bytes for a fact only the command history carries.** The row walks every
   payload asserting each `*_unix_*` field is a number, and refuses to pass
@@ -126,7 +212,6 @@ trigger as a side effect of writing release notes.
   shell's own group and asserts that it did. The row is 0.01 s instead of
   0.5 s as a side effect.
 
-||||||| d73d86c
 - **`no_output_is_classified_between_the_echo_sample_and_the_answer` no
   longer reads the session between the reader's two publications.** The row
   polled `Session::detection()` until the mode reached `Executing` and
