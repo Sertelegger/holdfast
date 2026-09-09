@@ -22,6 +22,37 @@ trigger as a side effect of writing release notes.
 
 ### Fixed
 
+- **`no_output_is_classified_between_the_echo_sample_and_the_answer` no
+  longer reads the session between the reader's two publications.** The row
+  polled `Session::detection()` until the mode reached `Executing` and
+  asserted `command_count() == 1` in the next statement — but the reader
+  thread publishes those two at different instants and in that order. It
+  drops `detector_guard`, which is what makes `Executing` visible, and only
+  then takes `history.lock()` to apply the events the same `feed` returned;
+  §4.3 forbids holding two of a session's locks at once, so the gap is
+  deliberate, and an `AtomicBool` swap, a conditional `events_tx.send` and a
+  `now_ms()` sit inside it. The poll returned there. **4 failures in 200
+  whole-binary runs before, 0 in 200 after**, same box and same load
+  (`taskset -c 0,1 … --test-threads=16`), every pre-fix failure carrying the
+  same `left: 0, right: 1`.
+
+  **No product change, and the property the row is named for was never
+  violated.** `Executing` is reachable only through rungs requiring
+  `!modes.bracketed_paste`, which in this row only the injected
+  `\x1b[?2004l` clears — so the mode the poll saw was always the right
+  answer, arriving ahead of its own bookkeeping, and nothing was classified
+  in §8.3's window. The row still kills the defect it exists for: sampling
+  `line_discipline` outside the detector lock in `Session::detection` gives
+  **0 passes in 10** against the repaired row, on the `AwaitingSecret`
+  assertion.
+
+  **Proved causally rather than by sampling**: a 150 ms delay between the
+  reader's `drop(detector_guard)` and its `history.lock()` fails the old
+  form 10 times in 10 with the observed signature and passes the new form 10
+  times in 10, same probe both sides. `KNOWN-INTERMITTENTS.md` carried this
+  as an unfiled, uninvestigated failure "caught in passing on the #52
+  lanes"; that section now records the diagnosis.
+
 - **A settle threshold at or above the deadline no longer makes a
   pattern-less wait time out beside a true `AtPrompt`.** The clamp that
   exists to stop a long `settle_threshold_ms` making short waits
