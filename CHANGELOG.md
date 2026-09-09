@@ -71,6 +71,64 @@ trigger as a side effect of writing release notes.
   finishes still answers `session_died` at the caller's deadline rather
   than inventing a timeout.
 
+- **Three `secret::binding` rows were flaky arrangements, not flaky
+  timing.** `KNOWN-INTERMITTENTS.md` recorded the module as the noisiest in
+  the suite at 9 failures to `daemon::server`'s 2. Triage found one mistake
+  in three spellings, all in the tests and none in the product: **a row
+  synchronising with a real `sh` child through a signal that does not mean
+  what its next line needs.**
+
+  `a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act`
+  armed `spawn_forwarder` on §8.3's echo-drop **edge** after
+  `session_running` had already released the child; `tokio::sync::broadcast`
+  keeps nothing for a receiver that does not yet exist, so a child that
+  printed first left the row waiting on a frame sent to nobody. That is the
+  defect `gated_echo_off`'s own doc warns about for the *listener*, in the
+  one autofill-adjacent row that was not gated.
+  `max_uses_is_per_session_and_bounded` matched the *previous* round's
+  `Password: ` in a cumulative ring buffer and resolved a credential while
+  the child had `stty echo` on — spending a `max_uses` claim, writing the
+  `binding_resolved` line, and having the value declined `NotEchoOff` at the
+  writer and dropped.
+  `an_absolute_program_does_not_save_a_profile_from_an_agents_env` waited on
+  a capture file's *existence* and then read its *contents*, which the
+  child writes in a separate step. (That row fails 6 in 6 two different
+  ways, for two different reasons — the capture wait, and `await_prompt`'s
+  liveness arm, which is an opt-out rather than a completion and turns the
+  new echo guarantee off for any row whose child can finish early. The two
+  numbers are kept apart in `KNOWN-INTERMITTENTS.md`; an earlier draft
+  credited both to one cause.)
+
+  Closed causally rather than by sampling, on the pattern [#42] set, and
+  each row now **carries** the delay that produced its figure, so reverting
+  a fix is a red rather than a rate: 8 failures in 25 contended runs becomes
+  **10 in 10** with a 500 ms delay ahead of the subscription; one hit in a
+  campaign becomes **10 in 10** with a `sleep` between the fixture's rounds;
+  and one becomes **6 in 6** with the capture's two steps written apart.
+  All three are green at those same windows now, and the module is 0 in 25
+  where it was 8.
+
+  **A second stale-ring defect sat one line below the first**, in the same
+  loop, and only a mutation found it: `buffer_until` is containment over a
+  cumulative buffer, so `max_uses_is_per_session_and_bounded` was answered
+  at iteration 2 by round *one's* `got=` and never observed that the second
+  credential reached the child. A `write_secret_if_unread` that answers
+  `Written` while writing nothing for every write after a session's first
+  **passed all 54 rows in this module** — shipping a `request_secret_input`
+  that answers `secret_provided`, audits `binding_resolved` and spends a
+  `max_uses` claim while the child's prompt sits unanswered.
+  `buffer_until_count` catches it 3 in 3.
+
+  **The fourth row is not fixed and is not a flake in the tests.**
+  `the_listener_and_a_connections_raise_ride_the_same_edge` reproduces at 1
+  in 50 contended and 6 in 6 with a 20 ms delay ahead of the forwarder's
+  raise, and what it is catching is a §7.5 defect in the product: when the
+  autofill's slot take beats a connection's raise, the credential is written
+  and the attached client is told `SecretRequestClosed { outcome:
+  "cancelled" }` for a request that was fulfilled. The assertion is right
+  and stays; `KNOWN-INTERMITTENTS.md` carries the measurements and the
+  mistake in the reasoning that first closed it.
+
 - **The Windows build compiles again ([#19]).** `windows-cross` — the
   `x86_64-pc-windows-gnu` clippy job — had been red on `main` since before
   0.0.6, with 0 passes in its last 20 runs, while `ROADMAP.md` said the tree
