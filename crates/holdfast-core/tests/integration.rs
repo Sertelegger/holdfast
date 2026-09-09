@@ -890,10 +890,21 @@ async fn send_input_reaches_the_shell() {
 
     // Same `''` construction as the read_output test, for the same
     // reason: a literal marker would match the terminal's echo.
+    //
+    // **The `sleep` between the two `echo`s is the arrangement, not
+    // padding — GH #10.** Each `echo` is its own `write(2)`, so a reader
+    // that wakes between them publishes `SEND_MARKER` with `42` still
+    // unwritten. The poll below used to stop on `SEND_MARKER` and the
+    // assertion after it then spoke about `42`, which is an assertion
+    // about output nothing had waited for: pulling the two writes 300 ms
+    // apart made that **10 failures in 10**, every one of them `shell did
+    // not evaluate` with the capture ending exactly at `SEND_MARKER`.
+    // Keeping the gap keeps the row honest — it now proves the poll waits
+    // for the whole command rather than for its first line.
     let r = server
         .send_input(Parameters(SendInputArgs {
             session: id.clone(),
-            data: "echo SEND''_MARKER; echo $((6*7))".into(),
+            data: "echo SEND''_MARKER; sleep 0.3; echo $((6*7))".into(),
             append_newline: None,
             ..Default::default()
         }))
@@ -901,7 +912,10 @@ async fn send_input_reaches_the_shell() {
         .unwrap();
     assert_eq!(body(&r)["status"], "ok");
 
-    let out = read_until_contains(&server, &id, "SEND_MARKER", 30).await;
+    // Polled for on the *last* thing the command prints, so both
+    // assertions below are about output this call waited for. The budget
+    // carries the 0.3 s the arrangement spends on purpose.
+    let out = read_until_contains(&server, &id, "42", 40).await;
     assert!(out.contains("SEND_MARKER"), "got: {out:?}");
     // `42` appears nowhere in the bytes we wrote, so only a shell that
     // evaluated the expression can have produced it.
@@ -3763,37 +3777,102 @@ async fn send_input_wait_for_returns_the_identical_shape() {
     let (wid, wpty) = mock_session_in(&server, "shape-wait");
     let (sid, spty) = mock_session_in(&server, "shape-send");
 
-    for pty in [Arc::clone(&wpty), Arc::clone(&spty)] {
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            pty.queue_output(b"line one\nghp_abcdef");
-        });
-    }
+    // **The bytes are queued by the write, not by a clock — GH #10.**
+    //
+    // Each arm scans from the head it sampled when it began, and the two
+    // samples are taken in different places: `wait_for_pattern` takes its
+    // own inside `wait::for_pattern`, one statement after the subscribe;
+    // `send_input` takes its `pre_write_head` on the *writer* thread, one
+    // statement before the write (§5.2). Both are right, and neither is
+    // the other's, so the arrangement has to put the output after **both**
+    // of them or the two responses are about different bytes and disagree
+    // on `matched`.
+    //
+    // This used to be a `thread::sleep(100ms)` per session, which is a
+    // guess about how long the second sample takes. It is not a constant:
+    // `send_input` reaches its through `spawn_blocking`, whose dispatch is
+    // scheduling-bound — measured here at 2.4 ms idle, 12 ms with the
+    // binary pinned to two cores at `--test-threads=16`, and unbounded
+    // above that. Inserting a 150 ms delay in front of that one sample
+    // turned this row from green in 30 contended whole-binary runs into
+    // **10 failures in 10**, always `matched` `true` vs `false` — the
+    // signature the issue records.
+    //
+    // `on_write` runs on the send session's writer thread immediately
+    // after `pre_write_head` is sampled, so queueing from inside it is
+    // the ordering the sleep was hoping for, as a fact. **Both** sessions
+    // are fed from here, so the two arms still see byte-identical
+    // buffers.
+    let wait_side = Arc::clone(&wpty);
+    let send_side = Arc::downgrade(&spty);
+    spty.on_write(move || {
+        wait_side.queue_output(b"line one\nghp_abcdef");
+        if let Some(send_side) = send_side.upgrade() {
+            send_side.queue_output(b"line one\nghp_abcdef");
+        }
+    });
 
     let mut args = wait_args(&wid, r"ghp_\w+");
     args.since_cursor = None; // live-only, like send_input's
     args.timeout_secs = Some(2);
 
-    // Concurrently, because both waits must be *running* when the bytes
-    // land: each one's scan starts at the head it saw when it began, and
-    // running them in sequence leaves the second starting after its
-    // session's output had already arrived.
-    let (waited, sent) = tokio::join!(async { wait_data(&server, args).await }, async {
-        body(
-            &server
-                .send_input(Parameters(SendInputArgs {
-                    session: sid.clone(),
-                    // Empty and no newline: nothing is typed, so the
-                    // two sessions see the same bytes.
-                    data: String::new(),
-                    append_newline: Some(false),
-                    wait_for: Some(r"ghp_\w+".into()),
-                    timeout_secs: Some(2),
-                }))
-                .await
-                .expect("send_input must not be a protocol error"),
-        )
-    });
+    // The other half of the ordering, and the reason this arm no longer
+    // has to be *raced* into position. One poll runs `wait_for_pattern`
+    // through `for_pattern`'s subscribe-then-snapshot — its scan start,
+    // and both sit before its first await — so `Pending` here is the
+    // positive fact that this arm is live with its start sampled. A
+    // `Ready` would mean output had already arrived, which is exactly the
+    // state the old arrangement raced and could not detect.
+    let mut wait_fut = std::pin::pin!(server.wait_for_pattern(Parameters(args)));
+    let first = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(wait_fut.as_mut(), cx))
+    })
+    .await;
+    assert!(
+        first.is_pending(),
+        "wait_for_pattern answered before anything had been queued"
+    );
+
+    let (waited, sent) = tokio::join!(
+        async {
+            body(
+                &wait_fut
+                    .await
+                    .expect("wait_for_pattern must not be a protocol error"),
+            )
+        },
+        async {
+            // **A delay that must not matter, and the guard on this
+            // fix.** Nothing here is on a timer any more, so pushing the
+            // write far past any clock the test could have used is free —
+            // and an arrangement that went back to queueing output on one
+            // would be red rather than lucky. 10/10 red against the
+            // arrangement this replaced.
+            //
+            // **The residual, stated rather than hidden:** the wait arm
+            // must still be inside its own 2 s deadline when the write
+            // lands, so this is not unbounded — it is 300 ms of a 2 s
+            // budget, against the ~100 ms budget the sleeps had, and the
+            // 1.7 s left is what `spawn_blocking`'s dispatch would have
+            // to burn. 0 failures in 5 with that dispatch delayed 1000 ms
+            // on purpose.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            body(
+                &server
+                    .send_input(Parameters(SendInputArgs {
+                        session: sid.clone(),
+                        // Empty and no newline: nothing is typed, so the
+                        // two sessions see the same bytes.
+                        data: String::new(),
+                        append_newline: Some(false),
+                        wait_for: Some(r"ghp_\w+".into()),
+                        timeout_secs: Some(2),
+                    }))
+                    .await
+                    .expect("send_input must not be a protocol error"),
+            )
+        }
+    );
 
     assert_eq!(waited["status"], sent["status"], "{waited} vs {sent}");
     for key in [
