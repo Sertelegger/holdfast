@@ -92,7 +92,32 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # **The name is derived, not composed here.** `CONTRIBUTING.md`
+          # settles it as `holdfast X.Y.Z (Codename)`: no `v`, and the
+          # codename is the only thing after the number. The tag keeps its
+          # `v`; the release name does not. Three releases shipped before
+          # this was written and carried three different conventions,
+          # because this line was the only thing naming them and it just
+          # echoed the ref.
+          #
+          # `version` is recomputed here rather than carried: each `run:`
+          # block is its own shell, and the extractor step's copy is out of
+          # scope by the time this runs.
+          version="${GITHUB_REF_NAME#v}"
+          # The codename comes off the changelog heading, which is the one
+          # place it is already recorded beside its version — so there is
+          # no second file to update and no way for the two to disagree.
+          # Absent (a version cut before the register existed), the name is
+          # just `holdfast X.Y.Z`, which is still the convention minus an
+          # optional part rather than a different one.
+          codename="$(sed -n "s/^## \[$version\][^(]*(\([^)]*\)).*/\1/p" CHANGELOG.md | head -1)"
+          if [ -n "$codename" ]; then
+            title="holdfast $version ($codename)"
+          else
+            title="holdfast $version"
+          fi
+          echo "release title: $title"
           gh release create "${GITHUB_REF_NAME}" \
             --verify-tag \
-            --title "holdfast ${GITHUB_REF_NAME}" \
+            --title "$title" \
             --notes-file release-notes.md

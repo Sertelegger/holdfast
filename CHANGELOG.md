@@ -111,7 +111,7 @@ is cut, named and published is in
   line — so a file can no longer exempt itself from the bans on
   `continue-on-error`, unpinned actions and `secrets.` references.
 
-## [0.0.7] — 2026-09-01
+## [0.0.7] — 2026-09-01 (Carabiner)
 
 ### Added
 
@@ -235,7 +235,7 @@ is cut, named and published is in
   and `not_supported_on_platform` after `spawn_failed`, inserted at their
   catalogue positions because that array's order is a wire fact.
 
-## [0.0.6] — 2026-08-19
+## [0.0.6] — 2026-08-19 (Bolt)
 
 ### Added
 
@@ -296,7 +296,7 @@ is cut, named and published is in
   script's header and `CONTRIBUTING.md` both still said 38. The invariant no
   longer carries a number (`F == N`), and CI runs the negative control.
 
-## [0.0.5] — 2026-08-19
+## [0.0.5] — 2026-08-19 (Anchor)
 
 **The first tagged release.** Milestones 0.0.1 through 0.0.5 are all in it;
 there was no earlier tag, nothing on crates.io and no distributed binary. The

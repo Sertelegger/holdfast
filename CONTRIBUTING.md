@@ -120,8 +120,8 @@ clean for the GNU target can still fail the MSVC job.
 "Windows is not supported at runtime", which this paragraph said, is no longer
 the right shape. `holdfast mcp` serves MCP over stdio in-process there and
 writes its audit trail, `version` works, and the daemon-backed subcommands
-refuse by name because §3.6 gives that platform no daemon rather than because
-nothing works. What is genuinely unsupported is anything needing a shell or a
+refuse by name because the design gives that platform no daemon rather than
+because nothing works. What is genuinely unsupported is anything needing a shell or a
 PTY, which is why the Windows job runs the source guards, the `#[cfg(windows)]`
 CLI arms and a *filtered* `--lib` rather than the suite. The README's
 platform-support table is the current account of what is verified there.
@@ -263,7 +263,9 @@ Cutting one is therefore:
 5. Tag `vX.Y.Z` and push the tag. That triggers
    `.github/workflows/release.yml`, which checks that the tag, the crate
    version and a non-empty changelog section all agree, then publishes the
-   release with that section as the body.
+   release with that section as the body and the name derived from its
+   heading. **The codename must be on the heading before the tag is
+   pushed**, or the release ships without it.
 
 ### Naming
 
@@ -276,10 +278,12 @@ Three releases shipped before this was settled and still read
 `holdfast v0.0.7` — three conventions in three releases. Renaming them is
 outstanding.
 
-**The workflow does not yet apply this convention.** `release.yml` titles the
-release `holdfast $GITHUB_REF_NAME`, which is the `holdfast vX.Y.Z` form. Until
-that line is changed, the title has to be corrected by hand after the workflow
-publishes.
+**Nothing types this by hand.** `release.yml` reads the version off the tag
+and the codename off that version's `CHANGELOG.md` heading — the one place it
+is already recorded beside its version, so there is no second file to update
+and no way for the two to disagree. A version whose heading carries no
+codename is named `holdfast X.Y.Z`: the convention minus an optional part,
+rather than a different convention.
 
 ### Codenames
 
