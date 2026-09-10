@@ -9,6 +9,40 @@
 # closed in a4dc498 among them -- are exactly the shape that a single green
 # run misses and twenty contended runs catch.
 #
+# WHY THIS RUNS `cargo test` AND NOT `cargo nextest run`.
+#
+# CI switched to nextest, which gives every test its own process. That is
+# good for isolation and it is exactly what makes one whole class of race
+# UNREACHABLE here: a defect that needs a sibling `fork` in the SAME
+# process cannot occur when no two tests share one. GH #52 was that class,
+# and under nextest its natural failure could not happen at all -- the row
+# was hidden by a harness change rather than fixed by it. libtest shares a
+# process, so this hunt can still see them. Do not "modernise" this line.
+#
+# TWO MEASUREMENTS WORTH NOT RE-DERIVING.
+#
+# 1. Contention that matters is fork density, not CPU starvation. A
+#    descriptor inherited across `fork` and closed at `exec` leaves a
+#    window in which a `connect(2)` still succeeds on a listener that was
+#    already dropped. Measured: 0 in 30,000 under `taskset -c 0,1` at 16
+#    threads with no forks, and 0 in 30,000 idle -- against 492 in 3,000
+#    (16.4%) with eight threads spawning `/bin/true` and no pinning at
+#    all. GH #21 and GH #52 were both this. `remove_runtime_files_we_own`
+#    in `daemon/server.rs` documents the window itself.
+#
+# 2. The session reader publishes to the buffer FIRST, then -- outside the
+#    buffer lock, because holding two of a session's locks is forbidden --
+#    to the screen, the detector and the history. ANY test that polls one
+#    surface and reads another is racing that gap. Nine rows were.
+#
+#    That second one has a deterministic amplifier, and it is worth more
+#    than any failure rate: insert a ~150 ms sleep in the reader between
+#    `buffer.push` and the later publication, and every row of the class
+#    goes red on demand. Use it as a CLASS DETECTOR, not a reproducer --
+#    sweeping a whole test binary with it turned one known flake into
+#    three fixes, and a later sweep found five more in one file. Revert it
+#    before committing; it is a probe, not a change.
+#
 # Usage: ./scripts/ci-flake-hunt.sh [iterations]   (default 20)
 #
 # TO REPRODUCE A NIGHTLY FAILURE LOCALLY, CONSTRAIN THE CORES:

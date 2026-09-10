@@ -63,13 +63,18 @@ on:
     # unchanged tree can only catch runner or toolchain drift, for which
     # weekly is plenty — but a flake hunt is the exception, because
     # repetition IS the measurement. Weekly at the old count would have
-    # dropped monthly samples from ~600 to ~87, and the sensitivity that
-    # buys is currently pointed at GH #42, which `KNOWN-INTERMITTENTS.md`
-    # records as *possibly* not a simple flake: the hypothesis is that a rescan reads the session
-    # buffer rather than confirming the reader has caught up, which would
-    # make `wait_for_pattern` answer `SessionDied` over output a real
-    # child produced. Cutting the sampling rate 7x on the one job that
-    # would catch that is the wrong direction.
+    # dropped monthly samples from ~600 to ~87.
+    #
+    # **This used to be justified by one open issue, GH #42, and that
+    # anchor is gone — the issue was diagnosed as a real product bug and
+    # fixed.** The justification that replaces it is structural rather
+    # than a bet on one row: this job runs `cargo test`, and CI's own
+    # suite runs `cargo nextest run`, which gives every test its own
+    # process. A defect needing a sibling `fork` in the *same* process is
+    # therefore invisible to CI and visible only here. GH #52 was exactly
+    # that, and nextest made its natural failure unreachable. Cutting the
+    # sampling rate on the one job that can still see that class is the
+    # wrong direction, whether or not a specific issue is open today.
     #
     # So the repetition count rises with the cadence, though not far
     # enough to hold the sample count flat: 4.33 runs x 100 = ~433 a
