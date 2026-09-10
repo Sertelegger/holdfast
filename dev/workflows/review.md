@@ -75,6 +75,45 @@ Things this lane has actually caught, as a prompt for what to look for:
   in 41.
 - A scenario **set up perfectly and then never asserted on**.
 
+## The timing lane, when the diff touches a reader or a wait
+
+The mutation lane above applies a wrong *implementation* and asks whether a
+test notices. There is a matching move for timing, and it has found more in
+this repository than sampling ever has: **delay one component and predict the
+failure.**
+
+Nineteen intermittents were closed this way. Sampling could not reach several
+of them — one row was green in 60 isolated and 8 contended runs, and a 150 ms
+delay in front of the session reader's `buffer.push` made it fail 10 times in
+10, with the exact signature CI had reported. One variable, one prediction,
+both directions.
+
+**The structural fact it exploits.** The session reader publishes to the
+buffer *first*, then — outside the buffer lock, because holding two of a
+session's locks at once is forbidden — to the screen, the detector and the
+history. **Any test that polls one surface and reads another is racing that
+gap.** Three boundaries have produced flakes: `buffer -> history`,
+`detector -> history`, `buffer -> screen`.
+
+**Use the delay as a class detector, not a reproducer.** Sweeping a whole test
+binary with it turned one known flake into three fixes; a later sweep of one
+file found five more. Revert it before committing — it is a probe, not a
+change, and `git status` is the check.
+
+Two failure modes to name, because both have happened here:
+
+- **A wait on a correlated fact rather than a positive one.** Waiting for a
+  mode that *usually* means the thing you need is how most of these rows were
+  written. Wait on the fact itself — the history entry, the drained flag, the
+  rendered grid.
+- **A repaired row that no longer catches its original defect.** After fixing
+  the timing, re-apply the mutation the row was written against. A row that
+  went green by ceasing to test anything is worse than the flake.
+
+`scripts/ci-flake-hunt.sh`'s header carries the measurements: fork density
+rather than CPU starvation, and why that script must keep running `cargo test`
+rather than nextest.
+
 ## Then
 
 Fix what is confirmed, and **re-run the affected mutations** to prove the fix.
