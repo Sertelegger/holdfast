@@ -146,7 +146,21 @@ fn unique_token(tag: &str) -> String {
 fn long_lived(token: &str) -> PtySpawnConfig {
     PtySpawnConfig {
         command: "/bin/sh".to_string(),
-        args: vec!["-c".to_string(), format!("sleep 60 # {token}")],
+        // **`; :` and not a trailing comment, because a shell may `exec`
+        // the token away.** `sh -c '<one simple command>'` is exactly the
+        // case a shell optimises by `exec`ing rather than forking — the
+        // process replaces its argv with `sleep 60`, and the token that
+        // `any_process_matching` looks for goes with it. Linux `/bin/sh`
+        // is dash and does not do it here; macOS `/bin/sh` is bash and
+        // does, so the child existed under an argv nothing was searching
+        // for and the control arm reported "never produced a child".
+        //
+        // A second command after `sleep 60` removes the optimisation's
+        // precondition: the shell must survive the sleep to run it, so it
+        // stays alive holding the whole `-c` string — token included — in
+        // its own argv. Verified on dash: the token is visible either way
+        // there, which is why this was invisible until a BSD job existed.
+        args: vec!["-c".to_string(), format!("sleep 60; : {token}")],
         cwd: None,
         env: Vec::new(),
         cols: 80,
