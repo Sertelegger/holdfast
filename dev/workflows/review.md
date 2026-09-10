@@ -100,12 +100,23 @@ binary with it turned one known flake into three fixes; a later sweep of one
 file found five more. Revert it before committing — it is a probe, not a
 change, and `git status` is the check.
 
-Two failure modes to name, because both have happened here:
+Three failure modes to name, because all three have happened here:
 
 - **A wait on a correlated fact rather than a positive one.** Waiting for a
   mode that *usually* means the thing you need is how most of these rows were
   written. Wait on the fact itself — the history entry, the drained flag, the
   rendered grid.
+- **A deadline asserted against a wall clock the test is racing.** A row that
+  says *"this session is not past its 60 ms idle deadline"* and manufactures
+  that freshness with a `sleep(10)` write loop asserts that the loop kept pace
+  and that the reader thread got scheduled — not anything about Holdfast. It
+  is green on an idle Linux box and intermittently red on a three-core macOS
+  runner. Measured on
+  `session::tests::a_session_whose_only_traffic_is_queries_still_reaps_on_schedule`:
+  one descheduled sleep, 10 ms raised to 70, turns it red on Linux **every**
+  run with its own message. `SessionConfig::clock` accepts a `Clock::manual`,
+  and a hand the row moves is the fix; no sleep is long enough to be one,
+  because the failure is the machine declining to run a thread.
 - **A repaired row that no longer catches its original defect.** After fixing
   the timing, re-apply the mutation the row was written against. A row that
   went green by ceasing to test anything is worse than the flake.
