@@ -3293,8 +3293,23 @@ mod tests {
     /// §4.5.1's reply, byte for byte.
     const DA1_REPLY: &[u8] = b"\x1b[?6c";
 
-    /// A session over `pty` with the §4.5.1 knobs set explicitly.
+    /// A session over `pty` with the §4.5.1 knobs set explicitly, on wall
+    /// time — which is what every row here wants except the one whose
+    /// subject is a deadline.
     fn query_session(pty: &Arc<MockPty>, terminal_queries: bool) -> Arc<Session> {
+        query_session_on(pty, terminal_queries, Clock::system())
+    }
+
+    /// The same session, on a clock the caller holds.
+    ///
+    /// `SessionConfig::clock` is what the reader writes `last_activity`
+    /// from, so handing it a `Clock::manual` is what turns "wait for the
+    /// stamp to get old" into "move the hand". A row that asserts a
+    /// session is *not* past its deadline cannot be written any other
+    /// way: on wall time that claim decays on its own between the last
+    /// thing the row did and the assertion, and the only question is
+    /// whether the machine is fast enough that day.
+    fn query_session_on(pty: &Arc<MockPty>, terminal_queries: bool, clock: Clock) -> Arc<Session> {
         Session::new(
             new_session_id(),
             None,
@@ -3303,6 +3318,7 @@ mod tests {
             Arc::clone(pty) as Arc<dyn PtyBackend>,
             SessionConfig {
                 terminal_queries,
+                clock,
                 ..SessionConfig::with_buffer_capacity(4096)
             },
         )
@@ -3509,32 +3525,105 @@ mod tests {
     /// and the replies add nothing after it — a reply path that stamped
     /// would leave a queried session's deadline running from whenever
     /// Holdfast last answered rather than from when the child last spoke.
+    ///
+    /// **Every time here is a hand this row moves, and none of it is wall
+    /// time.** It used to be the other way round, and both halves of that
+    /// were wrong.
+    ///
+    /// *The control was a race.* It was fed `.` on a 10 ms timer and then
+    /// asserted — against `SystemTime::now()` — to be inside a 60 ms
+    /// deadline, so what it actually asserted was *"the writer loop kept
+    /// pace and the reader thread got scheduled"*. That is true on an idle
+    /// Linux box and it is not a fact about Holdfast; it went red on macOS
+    /// intermittently, on PRs that touched nothing near it. Measured: the
+    /// old arrangement turns red on Linux **on demand** from a single
+    /// descheduled sleep — raise that 10 ms to 70 and the control is idle
+    /// every run, with this row's own message. There is no sleep long
+    /// enough to be safe, because the failure is the machine declining to
+    /// run a thread, so **do not put a wall clock back in here**.
+    ///
+    /// *And the control was vacuous anyway.* It was created **after** the
+    /// queried session went quiet, so `Session::new`'s own creation stamp
+    /// was already newer than the stamp the deadline ran from — by itself
+    /// enough to hold it inside the window. Measured: delete
+    /// `activity.store(…)` from the reader entirely, so that no output
+    /// stamps anything ever, and the old row still passed *both* arms.
+    /// That is the exact implementation its comment claimed it excluded.
+    /// The `past_deadline(&busy)` assertion below is what closes it — the
+    /// control has to be past its deadline until its own reader stamps it.
     #[test]
     fn a_session_whose_only_traffic_is_queries_still_reaps_on_schedule() {
         const IDLE_MS: i64 = 60;
-        let past_deadline = |s: &Session| now_ms() - s.last_activity_ms() >= IDLE_MS;
+
+        // One hand, both sessions, both arms. `Session::new` seeds
+        // `last_activity` from this clock and the reader writes every
+        // later stamp from it, so "60 ms have passed" is something this
+        // row states rather than something it waits for.
+        let clock = Clock::manual(Instant::now());
+        let past_deadline = |s: &Session| clock.now_ms() - s.last_activity_ms() >= IDLE_MS;
 
         // Queried, then quiet.
         let queried_pty = Arc::new(MockPty::new());
-        let queried = query_session(&queried_pty, true);
-        for _ in 0..8 {
-            queried_pty.queue_output(b"\x1b[0c");
-        }
+        let queried = query_session_on(&queried_pty, true, clock.clone());
+
+        // The control, created **before** the hand moves, so it starts
+        // from the same stamp the queried session does and cannot coast on
+        // a fresher birthday. Its reader is deliberately slow to be
+        // scheduled — that is what the macOS runner was doing to it — and
+        // the row has to prove what it proves anyway.
+        let busy_pty = Arc::new(MockPty::new());
+        busy_pty.set_read_delay(Duration::from_millis(25));
+        let busy = query_session_on(&busy_pty, true, clock.clone());
+
+        // One tick off the creation stamp, so a stamp written by a reader
+        // and a stamp written by `Session::new` are different numbers.
+        // Without it, every wait below is satisfied by a session whose
+        // reader has never run.
+        clock.advance(Duration::from_millis(1));
+        let spoken_at = clock.now_ms();
+
+        // Queued in one call on purpose: `MockPty::read` drains its queue
+        // whole under one lock, so a burst queued by one `extend` arrives
+        // as exactly one chunk. "The reader has finished with these bytes"
+        // is then one observable rather than eight overlapping ones, and
+        // the hand can be moved on the far side of it.
+        queried_pty.queue_output(&b"\x1b[0c".repeat(8));
         wait_until("every query to be answered", || {
             queried_pty.written().len() == 8 * DA1_REPLY.len()
         });
+        // The reply is written from the middle of the reader's body and
+        // the activity stamp is the last statement of it, so the wait
+        // above returns with a stamp still in flight. Moving the hand
+        // there would stamp the queried session on the far side of its own
+        // deadline and fail the arm below for the wrong reason.
+        wait_until("the queried session's chunk to be stamped", || {
+            queried.last_activity_ms() == spoken_at
+        });
 
-        // Ordinary output on a schedule, which is the control: a session
-        // still being spoken to is *not* past its deadline, so an
-        // implementation whose stamp never advances cannot pass both arms.
-        let busy_pty = Arc::new(MockPty::new());
-        let busy = query_session(&busy_pty, true);
+        // Exactly the deadline. Nothing else in this row moves time.
+        clock.advance(Duration::from_millis(IDLE_MS as u64));
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !past_deadline(&queried) && Instant::now() < deadline {
-            busy_pty.queue_output(b".");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // The anti-vacuity arm, and it belongs *before* the control is
+        // fed: at this instant the control has had no output at all, so a
+        // control still inside its deadline here would carry the arm at
+        // the bottom on its creation stamp — and that arm would then hold
+        // against a reader that stamps nothing.
+        assert!(
+            past_deadline(&busy),
+            "the control was inside its deadline before one byte reached \
+             it, so the control arm below is its birthday and not its \
+             reader"
+        );
+
+        // Now the control's ordinary output — and the row waits for the
+        // **stamp**, not for the write. Queued bytes are not activity;
+        // read ones are. This wait is the whole of what the old timer loop
+        // was hoping for, stated instead of hoped for.
+        busy_pty.queue_output(b".");
+        wait_until("the control session's output to be stamped", || {
+            busy.last_activity_ms() == clock.now_ms()
+        });
+
         assert!(
             past_deadline(&queried),
             "a session whose only traffic was queries never went idle: \
