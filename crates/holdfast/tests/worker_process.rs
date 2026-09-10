@@ -162,11 +162,17 @@ fn long_lived(token: &str) -> PtySpawnConfig {
 /// (`CLAUDE.md`'s macOS section, where it has already cost a wrong
 /// diagnosis).
 fn any_process_matching(token: &str) -> bool {
+    // **`-A -ww`, not `-eo`, and both halves are load-bearing on BSD.**
+    // `-e` lists only processes with a controlling terminal there, and the
+    // worker is spawned with null stdio — so on macOS it was invisible and
+    // this returned `false` for a child that existed. `-ww` stops `ps`
+    // clamping the argv column to the terminal width, which would cut the
+    // token this matches on. `tests/daemon_cli.rs` already spells it this
+    // way for the same reason; this file diverged from it.
     let out = Command::new("ps")
-        .arg("-eo")
-        .arg("args=")
+        .args(["-A", "-ww", "-o", "args="])
         .output()
-        .expect("ps -eo args=");
+        .expect("ps -A -ww -o args=");
     String::from_utf8_lossy(&out.stdout)
         .lines()
         // The `ps` invocation itself cannot match — it carries `args=`
@@ -178,13 +184,12 @@ fn any_process_matching(token: &str) -> bool {
 
 /// One process's argv, as `ps` reports it. Empty when the process is gone.
 fn ps_args(pid: u32) -> String {
+    // `-ww` for the same reason as above: naming the pid avoids the
+    // controlling-terminal filter, but not the width clamp on the argv.
     let out = Command::new("ps")
-        .arg("-p")
-        .arg(pid.to_string())
-        .arg("-o")
-        .arg("args=")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
         .output()
-        .expect("ps -p <pid> -o args=");
+        .expect("ps -ww -p <pid> -o args=");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
