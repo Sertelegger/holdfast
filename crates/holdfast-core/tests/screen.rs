@@ -152,6 +152,97 @@ fn lines_of(data: &Value) -> Vec<String> {
         .collect()
 }
 
+/// How long the three screen-side waits below are allowed to take. The
+/// same budget `read_until` carries, because they run beside it against
+/// the same shells.
+const SCREEN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Poll `get_screen_state` until the rendered grid satisfies `ready`, and
+/// return **that** response.
+///
+/// **`read_until` is not this wait, and every row below needs this one.**
+/// The session reader pushes a chunk into the ring buffer and only then —
+/// outside the buffer lock, because §4.3 forbids holding two of a
+/// session's locks at once — feeds that same chunk to the Tier-B tracker,
+/// with the `wait_for_pattern` fan-out sitting in between. `read_until`
+/// polls the *buffer*, so it returns inside that gap and a
+/// `get_screen_state` issued straight afterwards renders a grid the chunk
+/// has not reached yet. That is the publication skew `schema.rs`'s
+/// `every_emitted_unix_field_is_a_number` was repaired for, one
+/// publication earlier in the same loop, and the rule is the same: wait
+/// on the surface being read, never on an earlier one that merely
+/// correlates with it.
+///
+/// The returned value is the **last** capture this made, so a caller that
+/// goes on to hold a `base_revision` holds the newest retained one and
+/// the polling cannot have evicted it.
+async fn screen_showing(
+    server: &HoldfastServer,
+    session: &str,
+    what: &str,
+    ready: impl Fn(&[String]) -> bool,
+) -> Value {
+    let deadline = Instant::now() + SCREEN_DEADLINE;
+    let mut last: Vec<String> = Vec::new();
+    while Instant::now() < deadline {
+        let state = screen_state(server, session, None).await;
+        last = lines_of(&state);
+        if ready(&last) {
+            return state;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the screen never showed {what}; the grid was {last:?}");
+}
+
+/// Poll `Session::cursor_signal` until Tier B's parser has its cursor at
+/// `(row, col)` — where the fixture's own paint leaves it, and therefore
+/// a positive statement that the screen has absorbed that paint.
+///
+/// **Why not [`screen_showing`] here.** Every `get_screen_state`
+/// allocates a retained revision and the deque keeps
+/// `screen::DEFAULT_RETAINED_REVISIONS` (four) of them, so a poll that ran
+/// four times would evict the `base_revision` its caller is about to diff
+/// against and `get_screen_state` would answer with a full grid instead —
+/// one flake traded for another. `cursor_signal` reads the live parser
+/// and retains nothing.
+///
+/// It does cost one adaptive-policy `evaluate` per call, and that is
+/// safe in both directions inside this deadline: `DEFAULT_IDLE_DISABLE`
+/// is 300 s so Tier B cannot be turned *off* under us, and both callers
+/// are alt-screen fixtures whose Tier B is already on, so the 3 s
+/// no-signal trigger has nothing left to turn on.
+async fn wait_for_screen_cursor(session: &Session, row: u16, col: u16) {
+    let deadline = Instant::now() + SCREEN_DEADLINE;
+    let mut last = None;
+    while Instant::now() < deadline {
+        last = session.cursor_signal().map(|s| (s.row, s.col));
+        if last == Some((row, col)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the screen's cursor never reached ({row}, {col}); it was at {last:?}");
+}
+
+/// Poll `Session::screen_tracking` until Tier B is running.
+///
+/// **Not a `get_screen_state` poll, and that is the whole point of the
+/// row that uses it**: `get_screen_state` *enables* Tier B, so asking it
+/// would destroy the property under test. `screen_tracking` reads the
+/// policy flag the reader thread sets inside `ScreenTracker::feed` and
+/// evaluates nothing.
+async fn wait_for_tier_b(session: &Session) {
+    let deadline = Instant::now() + SCREEN_DEADLINE;
+    while Instant::now() < deadline {
+        if session.screen_tracking() == "on" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("Tier B never came on");
+}
+
 fn kill_all(server: &HoldfastServer) {
     for s in server.registry.all() {
         let _ = s.signal(Signal::Kill);
@@ -275,7 +366,15 @@ async fn resize_reflows_the_tracked_grid() {
         .write_input(format!("printf '\\033[H\\033[2JNARROW''_{filler}'\n").as_bytes())
         .unwrap();
     read_until(&server, &id, &format!("NARROW_{filler}")).await;
-    let narrow = screen_state(&server, &id, None).await;
+    // **The grid, not the ring buffer.** See [`screen_showing`]: the
+    // marker being readable through `read_output` says the reader pushed
+    // the chunk, not that it has fed the tracker. The marker prefix is
+    // enough to say the paint landed — the wrap assertions below are what
+    // this row is actually measuring, and they stay sharp.
+    let narrow = screen_showing(&server, &id, "the narrow paint", |lines| {
+        lines[0].starts_with("NARROW_")
+    })
+    .await;
     assert_eq!(narrow["data"]["cols"], COLS);
     let narrow_lines = lines_of(&narrow);
     assert_eq!(
@@ -299,7 +398,17 @@ async fn resize_reflows_the_tracked_grid() {
     let painted = format!("WIDE_{filler}");
     read_until(&server, &id, &painted).await;
 
-    let state = screen_state(&server, &id, None).await;
+    // Waited on the **marker prefix** and asserted on the whole line: the
+    // wait says the tracker absorbed the paint, and the assertion below
+    // says it absorbed it at 132 columns rather than clipping it at 80.
+    // Red 3 times in 3 with a 150 ms sleep between the reader's
+    // `buffer.push` and its `screen.feed` — "the line was clipped at the
+    // old width", with the *previous* paint still on row 0 — and green
+    // under the same probe once waited on here.
+    let state = screen_showing(&server, &id, "the reflowed paint", |lines| {
+        lines[0].starts_with("WIDE_")
+    })
+    .await;
     assert_eq!(state["data"]["cols"], WIDE_COLS, "{}", state["data"]);
     assert_eq!(state["data"]["rows"], WIDE_ROWS, "{}", state["data"]);
     let lines = lines_of(&state);
@@ -511,12 +620,25 @@ async fn entering_the_alternate_screen_enables_tier_b_with_no_agent_call() {
         .unwrap();
     read_until(&server, &id, "PAGER_VIEW").await;
 
+    // **The policy flag, not the ring buffer.** `?1049h` reaching the ring
+    // buffer is not the same event as the reader feeding it to the
+    // tracker, and it is the *feed* that turns Tier B on — so this row's
+    // whole subject is published one step after the bytes `read_until`
+    // polls for. Red 3 times in 3 with a 150 ms sleep between the
+    // reader's `buffer.push` and its `screen.feed` ("alt-screen entry did
+    // not enable Tier B", left `"off"`), green under the same probe once
+    // waited on here. `wait_for_tier_b` and not a `get_screen_state` poll
+    // because that call would enable Tier B itself — see its doc.
+    wait_for_tier_b(&session).await;
     assert_eq!(
         session.screen_tracking(),
         "on",
         "alt-screen entry did not enable Tier B"
     );
-    let state = screen_state(&server, &id, None).await;
+    let state = screen_showing(&server, &id, "PAGER_VIEW", |lines| {
+        lines[0].starts_with("PAGER_VIEW")
+    })
+    .await;
     assert_eq!(state["data"]["alt_screen"], true);
     assert_eq!(lines_of(&state)[0].trim_end(), "PAGER_VIEW");
 
@@ -619,7 +741,23 @@ async fn a_single_cell_change_diffs_small_and_replays_to_the_new_screen() {
     let session = server.registry.get(&id).unwrap();
 
     read_until(&server, &id, "PAINT_DONE").await;
-    let first = screen_state(&server, &id, None).await;
+    // **The grid, not the ring buffer** — see [`screen_showing`]. This is
+    // the row that named the class: `PAINT_DONE` is readable through
+    // `read_output` one publication before the tracker has been fed the
+    // chunk that carries it, and a base grid captured in that gap is
+    // empty. Red 3 times in 3 under a 150 ms sleep between the reader's
+    // `buffer.push` and its `screen.feed` — the "TUI never painted" guard
+    // below firing on 24 empty rows — and green under the same probe once
+    // waited on here.
+    //
+    // The **last** row, because `TUI_SCRIPT` paints rows 1..24 in order
+    // and the tracker consumes the stream in order: row 24 on the grid
+    // means every row before it is too. The guard on row 1 stays, and is
+    // now satisfied honestly rather than by luck.
+    let first = screen_showing(&server, &id, "the 24-row paint", |lines| {
+        lines.last().is_some_and(|l| l.starts_with("row 24"))
+    })
+    .await;
     let base_lines = lines_of(&first);
     let base_revision = first["data"]["screen_revision"].as_u64().unwrap();
     let full_grid_bytes: usize = base_lines.iter().map(|l| l.len() + 1).sum();
@@ -631,6 +769,14 @@ async fn a_single_cell_change_diffs_small_and_replays_to_the_new_screen() {
     // Step the script: one cell changes and nothing else.
     session.write_input(b"\n").unwrap();
     read_until(&server, &id, "KEY_DONE").await;
+    // The same skew again, and the reason this half waits on the cursor
+    // rather than on the grid is `base_revision`: a `get_screen_state`
+    // poll would allocate retained revisions and evict it, so the diff
+    // below would degrade to a full grid. `printf '\033[12;70HX'` is one
+    // character written at row 12, column 70, so the parser's cursor
+    // lands at `(11, 70)` zero-based exactly when the X has been placed —
+    // which is the change this row goes on to assert.
+    wait_for_screen_cursor(&session, 11, 70).await;
 
     let delta = screen_state(&server, &id, Some(base_revision)).await;
     let diff = delta["data"]["diff"]
@@ -717,7 +863,12 @@ async fn a_secret_on_screen_is_redacted_in_both_the_grid_and_the_diff() {
     let session = server.registry.get(&id).unwrap();
 
     read_until(&server, &id, "CLEAN_DONE").await;
-    let first = screen_state(&server, &id, None).await;
+    // **The grid, not the ring buffer** — see [`screen_showing`]. The
+    // prefix is the wait; the equality below is the assertion.
+    let first = screen_showing(&server, &id, "the header line", |lines| {
+        lines[0].starts_with("harmless")
+    })
+    .await;
     let base_lines = lines_of(&first);
     let base_revision = first["data"]["screen_revision"].as_u64().unwrap();
     assert_eq!(base_lines[0].trim_end(), "harmless header line");
@@ -726,6 +877,19 @@ async fn a_secret_on_screen_is_redacted_in_both_the_grid_and_the_diff() {
     // inside the changed region the diff has to describe.
     session.write_input(b"\n").unwrap();
     read_until(&server, &id, "SECRET_DONE").await;
+    // Waited on the cursor and not on the grid for `base_revision`'s
+    // sake, exactly as in `a_single_cell_change_…` — four retained
+    // revisions is all there are, and a `get_screen_state` poll would
+    // spend them. `printf '\033[2;1Hexport GH_TOKEN=<secret>'` writes
+    // `export GH_TOKEN=` plus the token from column 1 of row 2, so the
+    // parser's cursor lands there once the secret is on the screen. The
+    // tracker holds the child's raw bytes — redaction happens at capture
+    // — so this counts the unredacted width. Red 3 times in 3 under a
+    // 150 ms sleep between the reader's `buffer.push` and its
+    // `screen.feed` ("the diff carries no redaction marker", diff `""`),
+    // green under the same probe once waited on here.
+    let painted_cols = ("export GH_TOKEN=".len() + SECRET.len()) as u16;
+    wait_for_screen_cursor(&session, 1, painted_cols).await;
 
     let delta = screen_state(&server, &id, Some(base_revision)).await;
     let diff = delta["data"]["diff"]
@@ -816,7 +980,19 @@ async fn disabling_redaction_on_a_screen_read_returns_the_secret_and_is_audited(
     read_until(&server, &id, "SECRET_DONE").await;
 
     // The default first, so the pair is measured against one screen.
-    let redacted = screen_state(&server, &id, None).await;
+    //
+    // **The grid, not the ring buffer** — see [`screen_showing`]. Red 3
+    // times in 3 under a 150 ms sleep between the reader's `buffer.push`
+    // and its `screen.feed`, with row 1 still empty; green under the same
+    // probe once waited on here. `screen_showing` polls with `redact`
+    // absent, so it writes no §9.4 entry and the "exactly one
+    // `redaction_disabled` entry" assertion below still means what it
+    // says. The wait is the prefix; which marker the row carries is the
+    // assertion.
+    let redacted = screen_showing(&server, &id, "the secret line", |lines| {
+        lines[1].starts_with("export GH_TOKEN=")
+    })
+    .await;
     assert_eq!(
         lines_of(&redacted)[1].trim_end(),
         "export GH_TOKEN=[REDACTED:github]"

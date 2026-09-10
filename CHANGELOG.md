@@ -109,6 +109,55 @@ trigger as a side effect of writing release notes.
   land in one chunk, `now_awaiting` still reads `true`, and neither the
   `Left` nor the second `Entered` is ever sent (1 in 12).
 
+- **Five `screen.rs` rows no longer read the Tier-B grid after waiting on
+  the ring buffer.** The session reader pushes a chunk into the buffer and
+  only *then* — outside the buffer lock, because §4.3 forbids holding two
+  of a session's locks at once — feeds that same chunk to `ScreenTracker`,
+  with the `wait_for_pattern` fan-out sitting in the gap. Every row here
+  polled `read_output` for a marker and then called `get_screen_state`, so
+  each was reading one surface after waiting on an earlier one that merely
+  correlates with it: the same publication skew as
+  `every_emitted_unix_field_is_a_number` below, one publication earlier in
+  the same loop. Natural rate **0 failures in 200 whole-binary runs** —
+  `taskset -c 0,1 <screen test binary> --test-threads=16`, eight lanes in
+  parallel on distinct core pairs — which is why this was reported by
+  that fix rather than folded into it.
+
+  **Proved causally, not by sampling.** A 150 ms sleep in the reader
+  between `buffer.push` and `screen.feed` turns the whole class
+  deterministic: **5 rows red in every one of 3 runs before, 0 red in 6
+  runs and then in a further 200 after**, same probe both sides. Each row
+  failed on its own assertion and none on a timeout —
+  `a_single_cell_change_diffs_small_and_replays_to_the_new_screen` on
+  "the TUI never painted" with 24 empty rows,
+  `a_secret_on_screen_is_redacted_in_both_the_grid_and_the_diff` on "the
+  diff carries no redaction marker" with an empty diff,
+  `disabling_redaction_on_a_screen_read_returns_the_secret_and_is_audited`
+  on an empty row 1, `resize_reflows_the_tracked_grid` on "the line was
+  clipped at the old width" with the *previous* paint still on row 0, and
+  `entering_the_alternate_screen_enables_tier_b_with_no_agent_call` on
+  `screen_tracking` still reading `"off"`, because it is the feed that
+  turns Tier B on.
+
+  Each row now waits on the surface it reads. Three poll the rendered grid
+  for the paint's own marker; the alt-screen row waits on
+  `Session::screen_tracking`, which reads the policy flag the reader sets
+  and — unlike `get_screen_state` — does not enable Tier B, the property
+  that row exists to prove. The two rows holding a `base_revision` wait on
+  `Session::cursor_signal` instead, because only four revisions are
+  retained and a `get_screen_state` poll would evict the base and degrade
+  the diff to a full grid: one flake traded for another. The waits are
+  bounded and their elapsed arms fail (10.6 s and 10.5 s observed, with
+  the grid and the last cursor in the message).
+
+  **No product change, and no new accessor.** The reader's ordering is the
+  documented one, the rendered grids were never wrong, and the fix lives
+  entirely in the test file on accessors that already ship. Every
+  anti-vacuity guard is untouched and still fires: neutering the new wait
+  to a predicate that is always true fails the named row 3 times in 3 on
+  its own "the TUI never painted" guard, and deleting the fixture's
+  one-cell paint fails it 2 times in 2 on the cursor wait.
+
 - **A fulfilled secret request is no longer reported as `cancelled`**
   (GH #105). Two producers can close a secret request and they race:
   §9.6's autofill through `take_if_unadopted_matching`, and a connection's
