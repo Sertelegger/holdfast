@@ -209,6 +209,67 @@ impl Term {
         );
     }
 
+    /// Ask the child a question until its answer says what we are waiting
+    /// for, re-asking on a cadence rather than staring at the transcript.
+    ///
+    /// **[`wait_for`](Self::wait_for) is the wrong tool for a one-shot
+    /// command, and this row is why.** `wait_for` polls the accumulated
+    /// buffer, which is right for output that arrives on its own — a prompt,
+    /// a banner, a line the child decides to print. `stty size` is not that:
+    /// it answers exactly once. If it answers *before* the state under test
+    /// has changed, the needle can never appear, and the deadline stops being
+    /// a timeout and becomes fifteen seconds of waiting for something already
+    /// impossible. It reads as generous and it is a coin flip.
+    ///
+    /// That is not hypothetical. The 2026-09-06 nightly flake hunt died on
+    /// **iteration 1 of 100** with `"43 132" never appeared within 15s`, and
+    /// its transcript ends:
+    ///
+    /// ```text
+    /// bash-5.2$ stty size
+    /// 30 100          <- after resize(132, 43)
+    /// bash-5.2$
+    /// ```
+    ///
+    /// The resize simply lost a race against the keystroke. `--test-threads=16`
+    /// on a 4-vCPU runner is 4x oversubscription, and reaching the child takes
+    /// five hops — SIGWINCH, client, `Resize` frame, daemon, session pty,
+    /// SIGWINCH again — while the keystroke takes one.
+    ///
+    /// Re-asking fixes the race *and* makes the failure mean something: if the
+    /// answer never changes across the whole deadline, the resize genuinely
+    /// never arrived, and that is a product bug this row is now able to report
+    /// instead of masking.
+    fn wait_for_answer(&mut self, ask: &[u8], needle: &[u8], secs: u64) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut asked = 0u32;
+        loop {
+            self.type_keys(ask);
+            asked += 1;
+            // Long enough for a shell to answer, short enough that the
+            // deadline is spent asking rather than waiting.
+            let settle = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < settle {
+                let seen = self.snapshot();
+                if contains(&seen, needle) {
+                    return seen;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "{:?} never appeared within {secs}s, across {asked} asks of {:?}. \
+                     The child was asked repeatedly and never gave this answer, so this \
+                     is a resize that did not arrive rather than one that arrived late. \
+                     Seen so far:\n{}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(ask),
+                    String::from_utf8_lossy(&self.snapshot())
+                );
+            }
+        }
+    }
+
     fn wait_exit(&mut self, secs: u64) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < deadline {
@@ -739,12 +800,10 @@ async fn a_local_resize_reaches_the_child() {
     // The opening `Resize` reached the child. Nothing else asserts that,
     // and without it "a local resize reaches the child" is satisfied by a
     // client that only sends the `SIGWINCH` one.
-    term.type_keys(b"stty size\n");
-    term.wait_for(b"30 100", 15);
+    term.wait_for_answer(b"stty size\n", b"30 100", 15);
 
     term.resize(132, 43);
-    term.type_keys(b"stty size\n");
-    let seen = term.wait_for(b"43 132", 15);
+    let seen = term.wait_for_answer(b"stty size\n", b"43 132", 15);
     assert!(
         contains(&seen, b"43 132"),
         "the child never saw 43 rows by 132 columns"
