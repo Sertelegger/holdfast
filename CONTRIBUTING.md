@@ -243,3 +243,75 @@ Grep the value, not the key. `"outputSchema"` being present says nothing.
   ordered, and work that lands out of order usually has to be redone.
 - Say in the PR which of the four checks you ran, and — for a new test — which
   defect you injected to watch it fail.
+
+## Releases
+
+`CHANGELOG.md` is the release. A GitHub Release is a pointer to it: the body is
+that version's section verbatim, and nothing that matters about a release lives
+only in the GitHub object — release prose is not in the repository, is not
+reviewed with the code, and does not survive the repository being recreated.
+
+Cutting one is therefore:
+
+1. Rename `## [Unreleased]` to `## [X.Y.Z] — YYYY-MM-DD`.
+2. Add the matching link definition at the foot of the file, and repoint
+   `[Unreleased]` at the new tag's compare range. **Every version needs a
+   definition** — a missing one is why `[0.0.5]` and `[0.0.6]` rendered with
+   visible brackets for two releases while `[0.0.7]` did not.
+3. Open a fresh empty `## [Unreleased]`.
+4. Bump the workspace version in `Cargo.toml` to match, and commit.
+5. Tag `vX.Y.Z` and push the tag. That triggers
+   `.github/workflows/release.yml`, which checks that the tag, the crate
+   version and a non-empty changelog section all agree, then publishes the
+   release with that section as the body.
+
+### Naming
+
+**`holdfast X.Y.Z (Codename)`.** No `v` prefix, and no descriptive suffix —
+the codename is the only thing after the number. The tag keeps its `v`
+(`v0.0.7`); the release *name* does not.
+
+Three releases shipped before this was settled and still read
+`holdfast 0.0.5`, `holdfast 0.0.6 — the attach protocol` and
+`holdfast v0.0.7` — three conventions in three releases. Renaming them is
+outstanding.
+
+**The workflow does not yet apply this convention.** `release.yml` titles the
+release `holdfast $GITHUB_REF_NAME`, which is the `holdfast vX.Y.Z` form. Until
+that line is changed, the title has to be corrected by hand after the workflow
+publishes.
+
+### Codenames
+
+Fasteners and rigging hardware, alphabetically, one per release in order.
+A holdfast is itself a fastener, so the category names the project rather
+than decorating it.
+
+| | | | |
+|---|---|---|---|
+| A Anchor | B Bolt | C Carabiner | D Dowel |
+| E Eyebolt | F Ferrule | G Grommet | H Hasp |
+| I Insert | J Jig | K Keeper | L Latch |
+| M Mandrel | N Nut | O O-ring | P Pin |
+| Q Quicklink | R Rivet | S Shackle | T Turnbuckle |
+| U U-bolt | V Vise | W Washer | X — |
+| Y Yoke | Z Zip-tie | | |
+
+Assigned so far: **0.0.5 Anchor**, **0.0.6 Bolt**, **0.0.7 Carabiner**. None of
+the three release objects carries its codename yet; see the renaming note
+above.
+
+**X is deliberately unfilled.** No fastener or rigging term starts with it,
+and inventing one would break the only rule the list has. It is twenty
+releases away; decide it then, and record what was decided here rather than
+leaving the next person to rediscover the problem.
+
+### No binary assets
+
+Releases carry none, and none of the three shipped ones has any. The event that
+binds this project's compatibility promises is **first external
+distribution**, and several deliberate escapes — the wire-shape record's
+in-place corrections most of all — are conditioned on it not having happened. A
+downloadable binary *is* that event, and it is not one to trigger as a side
+effect of writing release notes. When it is time, it is a decision, and it
+changes what those escapes are allowed to do.
