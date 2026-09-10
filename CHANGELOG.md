@@ -194,7 +194,6 @@ trigger as a side effect of writing release notes.
   episode counter on both edges, which no row can see and which the code
   now states as a non-property rather than a guarantee.
 
-||||||| 5824dfa
 - **`every_emitted_unix_field_is_a_number` no longer waits on the output
   bytes for a fact only the command history carries.** The row walks every
   payload asserting each `*_unix_*` field is a number, and refuses to pass
@@ -250,7 +249,6 @@ trigger as a side effect of writing release notes.
   With all three repaired the binary is green 63/63 under the probe, where
   before it was 3 red.
 
-||||||| 574f9f8
 - **`interrupt`'s row no longer gates on a mode the shell raises before it
   has handed over the terminal.** `interrupt` signals
   `tcgetpgrp(master)`, and a shell raises `Executing` — `PS0`'s OSC 133
