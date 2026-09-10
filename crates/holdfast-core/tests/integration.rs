@@ -1555,15 +1555,35 @@ fn line_discipline_reports_echo_and_canonical_as_separate_flags() {
     let out = read_until(&pty, "STTY_DONE", Duration::from_secs(5));
     assert!(out.contains("STTY_DONE"), "stty never ran: {out:?}");
 
-    let mut samples = Vec::new();
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < deadline {
+    // **A count, not a window.** This loop used to sample for a fixed
+    // 1500 ms and then assert it had collected at least ten — which is an
+    // assertion about how fast the machine is, not about the line
+    // discipline. On a macOS runner it collected **9** and the row failed
+    // having observed nothing wrong. Taking the samples directly makes the
+    // count a fact rather than a hope, and the deadline below is a
+    // liveness bound rather than the thing being measured.
+    //
+    // The budget is set against the child's own `sleep 3`: twelve samples
+    // 60 ms apart is ~720 ms of sampling, so every one of them lands
+    // inside the echo-off region with room to spare even if each
+    // `tcgetattr` is far slower than measured.
+    const SAMPLES: usize = 12;
+    let mut samples = Vec::with_capacity(SAMPLES);
+    let deadline = Instant::now() + Duration::from_millis(2_500);
+    while samples.len() < SAMPLES {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {SAMPLES} samples in 2.5s — `line_discipline` is not \
+             answering, which is a different defect from the one this row \
+             covers",
+            samples.len()
+        );
         samples.push(pty.line_discipline());
         std::thread::sleep(Duration::from_millis(60));
     }
     pty.signal(Signal::Kill).unwrap();
 
-    assert!(samples.len() >= 10, "too few samples: {}", samples.len());
+    assert_eq!(samples.len(), SAMPLES);
     assert!(
         samples.iter().all(|s| *s
             == LineDiscipline {
