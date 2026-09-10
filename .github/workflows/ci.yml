@@ -721,7 +721,20 @@ jobs:
           # passed on macOS at the commit that added this job; the floor is
           # below that on purpose, because an equality is a line every added
           # test breaks.
-          line="$(grep -E 'tests run:' macos-test.log | tail -1)"
+          # **Strip SGR before parsing, or this guard reads zero.**
+          # `CARGO_TERM_COLOR: always` is set for the whole workflow, so
+          # nextest's summary arrives as `<esc>[1m1361<esc>[0m <esc>[32;1mpassed`
+          # — the escapes sit *between* the number and the word, and
+          # `[0-9]+ passed` therefore matches nothing. `passed` came back
+          # empty, `${passed:-0}` made it 0, and a suite that had gone
+          # 1361/1361 failed its own count check.
+          #
+          # This is the third time colour has broken a grep in this repo:
+          # the skip census's binary-name token was the first, and its
+          # trailing space the second. Anything parsing a cargo or nextest
+          # log here strips SGR first.
+          plain="$(sed 's/\x1b\[[0-9;]*m//g' macos-test.log)"
+          line="$(printf '%s\n' "$plain" | grep -E 'tests run:' | tail -1)"
           if [ -z "$line" ]; then
             echo "no nextest summary line — the run produced no verdict" >&2
             exit 1
