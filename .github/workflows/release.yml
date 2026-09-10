@@ -76,6 +76,16 @@ jobs:
             on && /^## / { exit }
             on { print }
           ' CHANGELOG.md > release-notes.md
+          # **The definitions, or every `[#45]` renders as literal text.**
+          # Reference-style links are defined once at the foot of the file,
+          # after every version section, so the extractor above cannot reach
+          # them — it stops at the next `## `. A body carrying `[#45]` with
+          # no matching definition shows the brackets, which is precisely the
+          # defect the changelog rewrite existed to fix, reintroduced one
+          # surface over. Appending every definition is safe: Markdown
+          # ignores ones nothing references.
+          printf '\n' >> release-notes.md
+          grep -E '^\[[^]]+\]: https?://' CHANGELOG.md >> release-notes.md
           if [ ! -s release-notes.md ]; then
             echo "CHANGELOG.md has no '## [$version]' section with content." >&2
             echo "Cutting a release is: rename [Unreleased] to the version with" >&2
