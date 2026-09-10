@@ -7308,6 +7308,467 @@ mod tests {
         let _ = s.signal(Signal::Kill);
     }
 
+    // ==================== GH #106: the window ahead of the subscription
+    //
+    // **Every autofill row above this comment gates its child**, and
+    // [`start_session_arms_the_echo_drop_watcher`] — the one row that
+    // touches the production wiring — opens its gate *after*
+    // `start_session` has returned, deliberately. That is what made the
+    // suite structurally blind to GH #106: one statement inserted between
+    // `Session::new` and the `subscribe_events()` in `watch_for_autofill`
+    // silently disabled autofill for every child fast enough to prompt
+    // inside it, with all of the above green.
+    //
+    // The three rows below are the ones a gate cannot express. All three
+    // drive `HoldfastServer::autofill_arm_delay`, which is the width of
+    // that window turned into an argument, and between them they pin the
+    // replay from every side: an edge that is **lost** must still be
+    // answered, an edge that is **delivered** must not be answered twice,
+    // and a region that is **over** must not be answered at all.
+
+    /// How long `start_session` waits before arming, in the **lost-edge**
+    /// row below.
+    ///
+    /// **A constant because every assertion about that row's arrangement
+    /// is relative to it**, not because five seconds is special. The issue
+    /// measured 15 ms taking an ungated row to 6/6 red and 5 ms to 0/8, so
+    /// the window only has to outlast one `fork`/`exec`; the rest is
+    /// margin, and margin is what lets the row *prove* the ordering from a
+    /// monotonic clock rather than assume it. Overrunning it is an
+    /// assertion about the arrangement and never a quiet pass.
+    const LOST_EDGE_WINDOW: Duration = Duration::from_secs(5);
+
+    /// The same, for the **delivered-edge** row — and five times as long,
+    /// which is measured rather than cautious.
+    ///
+    /// That row has to get its child from *gated* to *prompting* inside
+    /// the window, and [`gated`] polls with `sleep 1`: the budget is a
+    /// second of granularity plus however long a loaded box takes to
+    /// schedule a shell, not one `fork`/`exec`. At two seconds it failed
+    /// **3 runs in 12** of the whole `secret::binding` set at
+    /// `--test-threads=16` pinned to two cores, as *"the child is not at
+    /// its first echo-off region"*.
+    const DELIVERED_EDGE_WINDOW: Duration = Duration::from_secs(10);
+
+    /// The same, for the **armed-late** row, which budgets no child work
+    /// at all: it exists only so the row can wait past a replay check that
+    /// has provably run. Twice this is the whole of that row's waiting.
+    const ARM_ORDERING_DELAY: Duration = Duration::from_secs(1);
+
+    /// The **production wiring with nothing gated**: a child that draws
+    /// its credential prompt before `start_session` has armed the
+    /// listener is still autofilled (GH #106).
+    ///
+    /// The defect: `InProcessPty::spawn` starts the child and
+    /// `Session::new` starts the reader **on a dedicated OS thread**, so
+    /// the echo-drop edge needs no `.await` to fire — while
+    /// `set_screen_config` takes the `screen.lock()` the reader holds per
+    /// chunk and `registry.insert` runs an O(live sessions) `waitpid`
+    /// sweep before `watch_for_autofill` subscribes to anything. A
+    /// `broadcast` keeps nothing for a receiver that does not exist yet,
+    /// the send discards its `Err`, and `awaiting_secret` has already
+    /// latched — so **no second edge ever fires for that prompt** and the
+    /// child sits there until the idle timeout with no client, no raise,
+    /// no audit line and no error.
+    ///
+    /// **The ordering is proved from a monotonic clock, not raced.**
+    /// `started_at` is read before the call; the delay begins after it, so
+    /// the earliest this session's listener can subscribe is
+    /// `started_at + LOST_EDGE_WINDOW`. Every wait below therefore carries that
+    /// instant as its deadline, and reaching it is an assertion failure
+    /// about the *arrangement* — which is the failure a row that merely
+    /// hoped would report as a product defect.
+    ///
+    /// **Red without the fix**, and its message is the issue's own:
+    /// `"got=HUNTER2" never reached the buffer` after the child sat at
+    /// `read x` for the full 20 s with `Password: ` drawn.
+    #[tokio::test]
+    async fn start_session_autofills_a_prompt_drawn_before_the_listener_was_armed() {
+        let mut sc = Scratch::new("armwindow");
+        const WINDOW_PROFILE: &str = "ungated-shell";
+        let b = sc.binding("shell", WINDOW_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let mut security = autofill_mode(vec![b], true);
+        // **Ungated**, which is the whole point: the operator declares
+        // `sh -c <the one echo-off fixture>` and the child races the
+        // daemon from the instant it is forked.
+        security.profiles = vec![crate::config::SessionProfile {
+            name: WINDOW_PROFILE.to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), ECHO_OFF_FIXTURE.to_string()],
+            vars: Default::default(),
+            env: Default::default(),
+            cwd: None,
+        }];
+        let server =
+            server_with(security, &sc.audit_log()).with_autofill_arm_delay(LOST_EDGE_WINDOW);
+
+        let started_at = tokio::time::Instant::now();
+        let call = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .start_session(Parameters(crate::mcp::tools::StartSessionArgs {
+                        profile: Some(WINDOW_PROFILE.into()),
+                        ..Default::default()
+                    }))
+                    .await
+            })
+        };
+
+        // `registry.insert` runs **before** the delay, so the session is
+        // reachable while its listener does not yet exist — which is also
+        // the only way this row can hold the session before the call it is
+        // racing has returned.
+        let s = await_only_session(&server, started_at + LOST_EDGE_WINDOW).await;
+        // **The edge, observed while the listener provably is not there.**
+        while !s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < started_at + LOST_EDGE_WINDOW,
+                "the child had not reached its echo-off prompt within {LOST_EDGE_WINDOW:?} of \
+                 `start_session` being called, so this row did not exercise the window \
+                 it exists for"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            s.secret_episode(),
+            1,
+            "the child ran more than one echo-off region before the listener was armed, \
+             so the replay below is not the one this row is about"
+        );
+
+        let started = tokio::time::timeout(Duration::from_secs(60), call)
+            .await
+            .expect("`start_session` never returned")
+            .expect("the `start_session` task")
+            .expect("start_session");
+        // **The witness that the window was real**, and not a second copy
+        // of [`start_session_arms_the_echo_drop_watcher`] with its gate
+        // deleted. The only thing that can make this call take
+        // `LOST_EDGE_WINDOW` is the delay it is supposed to wait *before* arming;
+        // delete that statement and the two waits above still pass on any
+        // machine, because a delivered edge works fine.
+        assert!(
+            started_at.elapsed() >= LOST_EDGE_WINDOW,
+            "`start_session` returned in {:?}, so it did not wait {LOST_EDGE_WINDOW:?} before \
+             arming and the edge above was never at risk of being missed",
+            started_at.elapsed()
+        );
+        assert_eq!(
+            body(&started)["data"]["session_id"]
+                .as_str()
+                .expect("a session id"),
+            s.id,
+            "the row held a different session from the one the call created"
+        );
+
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert_eq!(
+            occurrences(&seen, b"got="),
+            1,
+            "the child completed more than one read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "echo was off, so the value must not be in the buffer:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(sc.ran("shell"), "the binding's provider never ran");
+        assert_eq!(
+            sc.kinds(&s.id)
+                .iter()
+                .filter(|k| *k == "binding_resolved")
+                .count(),
+            1,
+            "one lost edge is one resolution: {:?}",
+            sc.kinds(&s.id)
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **A replayed edge and the delivered edge for the same read are one
+    /// autofill — and the next episode is still its own** (GH #106).
+    ///
+    /// This is the half a bare `if is_awaiting_secret() { autofill }`
+    /// gets wrong, and the reason the issue's own note called that
+    /// caution correct. The listener subscribes *first* here, so the edge
+    /// is delivered rather than lost; the delay then sits between the
+    /// subscription and the replay check, so by the time the check runs
+    /// the same episode is readable off the flag **and** sitting unread in
+    /// the receiver. Without the `episode <= answered` guard that is two
+    /// provider runs, two `max_uses` claims and two `binding_resolved`
+    /// lines for one child read — the second *injection* is refused by
+    /// `SecretIfUnread`'s `expect_writes`, but nothing refuses the rest.
+    ///
+    /// **The second episode is what bounds the first one's count**, and
+    /// that is why the child reads twice — behind its own gate, so the
+    /// row opens it rather than racing it. An absence has to be bounded
+    /// by something that provably happens after it, and a queue is
+    /// ordered: the listener cannot reach `Entered { episode: 2 }`
+    /// without having already passed `Entered { episode: 1 }`. So waiting
+    /// for the second `got=` is a wait for the guard to have been
+    /// *evaluated*, not a sleep hoping the duplicate had time to appear.
+    ///
+    /// It is also the negative that stops the repair from inverting: a
+    /// guard that suppressed everything after a replay leaves the child
+    /// blocked at its second prompt, and this row times out on
+    /// `got=` × 2 rather than passing quietly.
+    #[tokio::test]
+    async fn a_replayed_edge_and_its_delivered_twin_are_one_autofill() {
+        let mut sc = Scratch::new("replaydedup");
+        let child_gate = sc.path("child.gate");
+        let second_gate = sc.path("second.gate");
+        let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log())
+            .with_autofill_arm_delay(DELIVERED_EDGE_WINDOW);
+        // Two `stty -echo` runs, so **two** episodes — not the
+        // `echo_off_two_reads_second_abandoned` shape, which is two reads
+        // inside *one*.
+        //
+        // **The gate between them is what makes the second edge exist at
+        // all.** §8.3's edges are computed per output chunk against the
+        // tty's `ECHO` bit *sampled when that chunk is processed*, so a
+        // child that prints `got=…` and turns echo straight back off can
+        // have both land in one chunk read after the `stty -echo` — and
+        // then `now_awaiting` still reads `true`, no transition is seen,
+        // and neither `AwaitingSecretLeft` nor `Entered { episode: 2 }`
+        // is ever sent. Measured on an ungated first draft of this row:
+        // 1 failure in 12 whole-set runs at `--test-threads=16` on two
+        // cores, as *"`got=` reached the buffer 1 time(s), wanted 2"*
+        // with the second `Password: ` sitting in the buffer unanswered.
+        // Holding the child with echo **on** guarantees a chunk in
+        // between.
+        let two_episodes = format!(
+            "{ECHO_OFF_FIXTURE}; {}",
+            gated(&second_gate, ECHO_OFF_FIXTURE)
+        );
+        let s = session_running(
+            Some(PROD_PROFILE),
+            "ssh",
+            &["prod-01"],
+            &gated(&child_gate, &two_episodes),
+        );
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let armed_at = tokio::time::Instant::now();
+        // Subscribes synchronously — so nothing here is lost — and then
+        // sleeps `DELIVERED_EDGE_WINDOW` before its replay check.
+        server.watch_for_autofill(&s);
+        std::fs::write(&child_gate, b"go").expect("release the child");
+
+        // **The collision, proved rather than assumed.** The child is at
+        // its first prompt, the *detector* says so, and the listener has
+        // not acted — so the replay check, when it runs, reads episode 1
+        // off the flag with episode 1 already queued behind it.
+        //
+        // **`is_awaiting_secret` and not [`await_prompt`], and the
+        // difference is one publication.** That helper waits on the ring
+        // buffer and then on a **live** `tcgetattr`, both of which can
+        // answer before the reader thread has classified the chunk that
+        // moves the episode counter — measured: `assert_eq!(secret_episode(),
+        // 1)` placed directly after it failed **2 runs in 12** contended,
+        // `left: 0`. The edge is what this row needs, so the edge is what
+        // it waits for.
+        await_prompt(&s, b"Password: ").await;
+        while !s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < armed_at + DELIVERED_EDGE_WINDOW,
+                "the listener's replay check ran before the child's echo drop was \
+                 classified, so the edge this row needs it to collide with had not \
+                 fired yet"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            s.secret_episode(),
+            1,
+            "the child is not at its first echo-off region"
+        );
+        assert!(
+            !sc.ran("prod-ssh"),
+            "the listener answered before its replay check — the delay is not in force, \
+             and this row is measuring an ordinary delivered edge"
+        );
+
+        // **The witness that the replay answered the first read, and not
+        // the delivered edge.** The listener's own sleep sits between its
+        // `subscribe_events` and its replay check, so nothing it does can
+        // land before `armed_at + DELIVERED_EDGE_WINDOW`; delete that statement and
+        // this credential arrives in milliseconds, from the `Entered` arm,
+        // with no collision for the guard to resolve.
+        buffer_until_count(&s, b"got=", 1, 60).await;
+        assert!(
+            armed_at.elapsed() >= DELIVERED_EDGE_WINDOW,
+            "the first read was answered {:?} after the listener was armed, which is \
+             less than the {DELIVERED_EDGE_WINDOW:?} it is supposed to wait before its replay check",
+            armed_at.elapsed()
+        );
+
+        // The second region, which the listener can only reach by having
+        // already passed `Entered { episode: 1 }`.
+        std::fs::write(&second_gate, b"go").expect("open the second gate");
+        let seen = buffer_until_count(&s, b"got=", 2, 60).await;
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "echo was off for both reads, so the value must not be in the buffer:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(
+            occurrences(&seen, b"got=HUNTER2"),
+            2,
+            "both reads must have received the credential:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(
+            sc.kinds(&s.id),
+            vec!["binding_resolved".to_string(); 2],
+            "two episodes are two resolutions — a third is the replay firing again for \
+             the read it had already answered"
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **The replay is a replay of a prompt that is still up, not of the
+    /// last one there was** (GH #106).
+    ///
+    /// The listener asks [`Session::awaiting_secret_episode`], which is
+    /// the flag and the counter read as one fact, and the flag half is
+    /// what this row pins: the counter alone says *"there has been an
+    /// echo-off region"*, and resolving a credential on the strength of
+    /// that puts a provider run, a `max_uses` claim and a
+    /// `binding_resolved` line behind a prompt that is already answered
+    /// and gone. The write itself would be declined `NotEchoOff` —
+    /// nothing else would be.
+    ///
+    /// **It is also the only row that reaches the rule the `Lagged` arm
+    /// uses.** A listener armed by `start_session` always starts at
+    /// episode `0`, so the flag check makes no difference there —
+    /// verified by mutation, which is why this row exists rather than an
+    /// explanation. A listener that *lost its place* is the case where the
+    /// session can be at episode `n` with echo long since back, and there
+    /// is no way to force a `broadcast` lag without a capacity knob; this
+    /// arranges the same **state** by arming late instead.
+    ///
+    /// **The absence is bounded by the knob rather than by a sleep.** The
+    /// listener's replay check runs `ARM_ORDERING_DELAY` after it is armed, so at
+    /// twice that it has provably run; what follows it is a second
+    /// echo-off region that *must* be answered, which is what stops the
+    /// row passing against a listener that does nothing at all.
+    #[tokio::test]
+    async fn a_listener_armed_after_the_prompt_is_gone_resolves_nothing() {
+        let mut sc = Scratch::new("armedlate");
+        let leave = sc.path("leave.gate");
+        let gate = sc.path("second.gate");
+        let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log())
+            .with_autofill_arm_delay(ARM_ORDERING_DELAY);
+        // One echo-off region the child leaves **visibly** — the print
+        // after `stty echo` is what produces the `AwaitingSecretLeft` edge
+        // at all — and then a second one it holds at a gate.
+        let first = echo_off_then(&format!(
+            "until [ -f '{}' ]; do sleep 1; done; stty echo; printf 'left=1\\n'",
+            leave.display()
+        ));
+        let child = format!("{first}; {}", gated(&gate, ECHO_OFF_FIXTURE));
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], &child);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+
+        // Region one, opened and closed with nothing armed.
+        //
+        // **Both halves wait on the detector**, not on the ring buffer and
+        // not on a live `tcgetattr`: those are published earlier, and a
+        // row that let the child leave before the *entry* was classified
+        // could see the whole region coalesced into one chunk and no
+        // episode at all.
+        await_prompt(&s, b"Password: ").await;
+        let entered_by = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < entered_by,
+                "the child drew its prompt with `ECHO` off and the detector never \
+                 classified the region this row needs it to have left"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::write(&leave, b"go").expect("release the child");
+        buffer_until(&s, b"left=1", 20).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child printed after `stty echo` and the session is still latched \
+                 in `AwaitingSecret`"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            s.secret_episode(),
+            1,
+            "the child is not one echo-off region past its start"
+        );
+
+        let armed_at = tokio::time::Instant::now();
+        server.watch_for_autofill(&s);
+        tokio::time::sleep_until(armed_at + ARM_ORDERING_DELAY * 2).await;
+        assert!(
+            !sc.ran("prod-ssh"),
+            "the listener resolved a credential for an echo-off region that was over \
+             before it was armed"
+        );
+        assert!(
+            sc.kinds(&s.id).is_empty(),
+            "the trail records work for a prompt that no longer exists: {:?}",
+            sc.kinds(&s.id)
+        );
+
+        // **The clock for that absence**: the listener is alive and the
+        // next region proves it.
+        std::fs::write(&gate, b"go").expect("open the second gate");
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert_eq!(
+            occurrences(&seen, b"got="),
+            1,
+            "the child completed more than one read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(
+            sc.kinds(&s.id),
+            vec!["binding_resolved".to_string()],
+            "one live region is one resolution"
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// The one session this server has, as soon as it has one.
+    ///
+    /// **A poll on the registry and not on the call's return value**,
+    /// because the lost-edge row above holds the session while the
+    /// `start_session` that created it is still running: the insert
+    /// happens before the window it measures, and the response after it.
+    async fn await_only_session(
+        server: &HoldfastServer,
+        deadline: tokio::time::Instant,
+    ) -> Arc<Session> {
+        loop {
+            let all = server.registry.all();
+            assert!(
+                all.len() < 2,
+                "this server was supposed to have one session"
+            );
+            if let Some(s) = all.into_iter().next() {
+                return s;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "`start_session` had not registered its session in time"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
     // ================================= GH #55: the agent's environment
     //
     // **Profiles stopped the agent authoring the command line and left it

@@ -22,6 +22,93 @@ trigger as a side effect of writing release notes.
 
 ### Fixed
 
+- **§9.6's autofill no longer misses a credential prompt drawn before its
+  listener was armed** (GH #106). `start_session` spawns the child,
+  `Session::new` starts the reader on a **dedicated OS thread** — so the
+  echo-drop edge needs no `.await` to fire — and only three statements
+  later does `watch_for_autofill` call `subscribe_events`. In between sit
+  a `set_screen_config` that takes the `screen.lock()` the reader holds
+  per chunk and a registry insert that is O(live sessions) `waitpid`s. A
+  `tokio::sync::broadcast` keeps nothing for a receiver that does not
+  exist yet and the send discards its `Err`, so an edge that fired in
+  there was gone — and because `awaiting_secret` had already latched, **no
+  second edge ever fired for that prompt**. The child sat at its
+  credential prompt until the idle timeout with no client, no raise, no
+  audit line and no error: the failure mode is silence, on a path whose
+  whole premise is that nobody is watching. Measured on the issue with a
+  delay inserted above the call: 3/3 red at 500 ms, 6/6 red at 15 ms, 0/8
+  at 5 ms. The threshold is the child's `fork`/`exec` cost, so *narrow*
+  was a property of the machine rather than a guarantee — the identical
+  window in `attach::conn::forward_events` was a few instructions wide
+  until one unrelated audit write made it ~1.5 ms.
+
+  **Closed by a replay that is de-duplicated against GH #105's episode.**
+  The listener asks the session, once, whether it is *currently* inside an
+  echo-off region and which one; it answers that prompt and remembers the
+  number. The naive form — a bare `if is_awaiting_secret() { autofill }` —
+  is wrong and was correctly refused before: on an Entered/Left/Entered
+  sequence straddling the check it answers the second prompt twice, which
+  is two provider runs, two `max_uses` claims and two `binding_resolved`
+  lines for one child read. Only the second *injection* is refused, by
+  `SecretIfUnread`'s `expect_writes`; nothing refuses the rest.
+
+  **The key had to be an episode and the read of it had to be atomic.**
+  `Session::awaiting_secret_episode` publishes the flag and the counter as
+  one fact: the flag is read **first**, because a caller that reads the
+  counter first can have a new episode start between its two loads and
+  then label the prompt in front of it with the number of the one before.
+  The reader thread now bumps the counter *before* it latches the flag and
+  stores the flag `Release` against that read's `Acquire`, which needs the
+  transition test to be a load and a store rather than a `swap` — sound
+  because this loop is the only writer of that flag in the tree, and
+  stated on both sides so a second writer is a change somebody has to
+  make deliberately.
+
+  **A lagged receiver is the same loss through a different door** and is
+  closed by the same function: a listener that fell behind while a
+  provider ran would otherwise leave that child blocked for good, for the
+  same reason — no next edge comes for a prompt that is still up. The
+  trigger has no row, because forcing a `broadcast` lag wants a capacity
+  knob that does not exist; the **rule** is the one the replay uses and
+  has three.
+
+  **The suite could not have caught this, and that was the harder half.**
+  Every autofill row gates its child and opens the gate after
+  `start_session` returns — including `start_session_arms_the_echo_drop_watcher`,
+  the one row on the production wiring, whose own doc says the gate is
+  deliberate. So one statement inserted between `Session::new` and the
+  subscribe silently disabled autofill for every fast child with all rows
+  green. Three new rows drive it with the window as an argument rather
+  than a race, through a `#[cfg(test)]` knob that widens it: an **ungated**
+  child through the real `start_session`, whose ordering is proved from a
+  monotonic clock and which is red without the fix with the issue's own
+  message; a delivered edge colliding with the replay, which must be one
+  autofill and not two, bounded by a second episode that cannot be reached
+  without the guard having been evaluated; and a listener armed after the
+  prompt is gone, which must resolve nothing.
+
+  Ten injected mutations, seven caught — each by the row that should catch
+  it and by no others, including both directions of the guard, the
+  pre-fix code restored, and each of the two `#[cfg(test)]` sleep sites
+  deleted, which is what stops a row that no longer arranges anything from
+  passing quietly. **The three survivors are the memory orderings
+  themselves**: `Relaxed` for the `Release`/`Acquire` pair, the counter
+  published after the flag rather than before it, and the two loads
+  reversed. All three are differences x86 cannot exhibit, and every CI job
+  is `ubuntu-24.04` on x86 — so they are recorded here rather than claimed
+  as covered.
+
+  Swept as the whole `secret::binding` set at `--test-threads=16` pinned
+  to two cores: **3 red in 12**, then **0 in 24** after the two defects
+  that sweep found in the new rows, neither of which was visible by
+  reading. A `secret_episode` assertion placed straight after
+  `await_prompt` — which waits on the ring buffer and then on a *live*
+  `tcgetattr`, both published before the reader has classified the chunk
+  that moves the counter (2 in 12, `left: 0`). And a two-episode child
+  with nothing between its regions: `got=…` and the next `stty -echo` can
+  land in one chunk, `now_awaiting` still reads `true`, and neither the
+  `Left` nor the second `Entered` is ever sent (1 in 12).
+
 - **Five `screen.rs` rows no longer read the Tier-B grid after waiting on
   the ring buffer.** The session reader pushes a chunk into the buffer and
   only *then* — outside the buffer lock, because §4.3 forbids holding two

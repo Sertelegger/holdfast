@@ -480,6 +480,15 @@ impl HoldfastServer {
         //
         // Spawns nothing at all unless the operator opted in — see
         // [`Self::watch_for_autofill`].
+        //
+        // **The statement above this one is GH #106's whole cost**, which
+        // is why the knob that widens the gap sits here and not somewhere
+        // tidier: see `HoldfastServer::autofill_arm_delay`. Zero for every
+        // caller that is not the row measuring it.
+        #[cfg(test)]
+        if !self.autofill_arm_delay.is_zero() {
+            tokio::time::sleep(self.autofill_arm_delay).await;
+        }
         self.watch_for_autofill(&session);
 
         // §9.4's `session_start`, with its field list verbatim.
@@ -2647,30 +2656,57 @@ impl HoldfastServer {
     /// "fulfilled" }` §7.5 promises; with nobody attached there is no raise
     /// to close and no client to tell.
     ///
-    /// **The subscription has a window ahead of it, and it is the one
-    /// `attach::conn` already closed for its own copy.** `start_session`
-    /// spawns the child, `Session::new` starts the reader, and this call
-    /// happens three statements later; a `tokio::sync::broadcast` keeps
-    /// nothing for a receiver that does not yet exist, so a child that
-    /// drops `ECHO` and prints inside that window loses its autofill
-    /// silently and for good — there is no replay here, only the
-    /// `Lagged` arm below, which is about a different thing. The window
-    /// is a handful of lock-guarded statements wide today and no test has
-    /// lost it. It is recorded because the identical one in
+    /// **The subscription has a window ahead of it, and the replay below
+    /// is what closes it** (GH #106). `start_session` spawns the child,
+    /// `Session::new` starts the reader **on a dedicated OS thread** — so
+    /// no `.await` is needed for the edge to fire — and this call happens
+    /// three statements later, behind a `screen.lock()` the reader takes
+    /// per chunk and a registry insert that is O(live sessions)
+    /// `waitpid`s. A `tokio::sync::broadcast` keeps nothing for a
+    /// receiver that does not yet exist and the send discards its `Err`,
+    /// so an edge that fires in there is gone; and because
+    /// `awaiting_secret` has already latched, **no second edge ever
+    /// fires for that prompt**. The child then sits at its credential
+    /// prompt until the idle timeout with no client, no raise, no audit
+    /// line and no error.
+    ///
+    /// Measured on the issue: a delay inserted immediately above this
+    /// call took an ungated row to 3/3 red at 500 ms and 6/6 red at
+    /// 15 ms, and 0/8 at 5 ms. The threshold is the child's `fork`/`exec`
+    /// cost, so *narrow* is a property of the machine rather than a
+    /// guarantee — the identical window in
     /// `attach::conn::forward_events` was also a few instructions wide
     /// until §9.4's `attach_connect` write landed in the middle of it and
-    /// made it ~1.5 ms, at which point a row failed 3/3 — so the cost of
-    /// widening it is one unrelated statement inserted above.
+    /// made it ~1.5 ms, at which point a row failed 3/3.
     ///
-    /// It is **not** closed here, and that is a decision rather than an
-    /// oversight: `attach::conn` de-duplicates its replay against the
-    /// request id it replayed, and this path has no id to compare. A
-    /// replay that fired alongside a delivered edge would run the
-    /// provider twice, spend two `max_uses` claims and write two
-    /// `binding_resolved` lines for one prompt — the second write is
-    /// refused by `SecretIfUnread`'s `expect_writes`, but the claims and
-    /// the trail are not. Closing it wants its own design and its own
-    /// rows.
+    /// **`awaiting_secret_episode()` and not `is_awaiting_secret()`, and
+    /// the difference is the whole of why this took two issues.** A bare
+    /// `if is_awaiting_secret() { autofill }` after the subscribe
+    /// double-fires on an Entered/Left/Entered sequence straddling the
+    /// check: the replay answers the second prompt and the *delivered*
+    /// edge for it answers it again, running the provider twice, spending
+    /// two `max_uses` claims and writing two `binding_resolved` lines for
+    /// one read. GH #105's `Session::secret_episode` is the id that was
+    /// missing — monotonic, bumped inside the one transition that latches
+    /// the flag — so the replay records the episode it answered and the loop
+    /// skips any `AwaitingSecretEntered` that does not name a **later**
+    /// one.
+    ///
+    /// **`<=` and not `==`, because the read is allowed to be one
+    /// episode ahead of the queue.** The flag can still be set for
+    /// episode *n+1* while `Entered { episode: n }` is sitting unread in
+    /// this receiver — the whole of episode *n* having happened inside
+    /// the window. Episode *n* is then over by construction, echo is
+    /// back, and an autofill for it would be refused at the write
+    /// anyway; suppressing it is the direction that does not spend a
+    /// claim on a prompt that no longer exists.
+    ///
+    /// **The duplicate this guards against is bounded but not harmless.**
+    /// `WriteRequest::SecretIfUnread` compares `writes_performed`, so a
+    /// second *injection* is refused — but the second provider run, the
+    /// second `max_uses` claim and the second `binding_resolved` line all
+    /// stand, because §9.6 counts resolutions from the store and not
+    /// writes to a PTY.
     pub(crate) fn watch_for_autofill(&self, session: &Arc<Session>) {
         if !self.config.security.autofill_on_echo_off
             || !crate::secret::binding::keychain_step_runs(&self.config.security.secret_provider)
@@ -2694,9 +2730,35 @@ impl HoldfastServer {
         tokio::spawn(async move {
             use crate::session::SessionEvent;
             use tokio::sync::broadcast::error::RecvError;
+
+            // See `HoldfastServer::autofill_arm_delay`. This is the half
+            // that arranges a **delivered** edge sitting in `events`
+            // while the replay check below reads the same episode off the
+            // flag — the double-fire the guard exists for.
+            #[cfg(test)]
+            if !server.autofill_arm_delay.is_zero() {
+                tokio::time::sleep(server.autofill_arm_delay).await;
+            }
+
+            // **The last episode this listener has answered** (GH #106).
+            // `0` is not an episode — the counter is `1` at the first echo
+            // drop — so a session that is not at a prompt starts with
+            // nothing suppressed.
+            let mut answered = 0u64;
+            server
+                .replay_missed_echo_drop(&session, &mut answered)
+                .await;
+
             loop {
                 match events.recv().await {
-                    Ok(SessionEvent::AwaitingSecretEntered { .. }) => {
+                    Ok(SessionEvent::AwaitingSecretEntered { episode, .. }) => {
+                        // The replay above already answered this prompt,
+                        // or answered a later one and this edge names a
+                        // read that is over. See the doc.
+                        if episode <= answered {
+                            continue;
+                        }
+                        answered = episode;
                         // **The prompt text is not carried across.** It is
                         // read off the session inside step 1, from the
                         // detector's own line, exactly as a tool-call
@@ -2709,16 +2771,57 @@ impl HoldfastServer {
                     // PTY.
                     Ok(SessionEvent::Exited { .. }) => return,
                     Ok(SessionEvent::AwaitingSecretLeft) => {}
-                    // An edge is not a stream. A lagged listener has missed
-                    // an echo drop, and there is nothing to replay: the
-                    // session is the authority on whether it is still
-                    // blocked, and it says so on the next edge.
+                    // **A lag is the same loss through a different door,
+                    // and it is now closed by the same three lines**
+                    // (GH #106). This arm used to say there was nothing to
+                    // replay because *"the session says so on the next
+                    // edge"* — which is the premise the issue disproves:
+                    // `awaiting_secret` has already latched, so no next
+                    // edge comes for a prompt that is still up. A listener
+                    // that fell behind while a provider ran and lost an
+                    // `Entered` would leave that child blocked for good.
+                    //
+                    // Not rowed, and this is the whole of that admission:
+                    // forcing a `broadcast` lag here wants a capacity knob
+                    // that does not exist. It is the **same function** the
+                    // replay above calls and the same `answered` guard, so
+                    // what is untested is the trigger and not the rule.
                     Err(RecvError::Lagged(_)) if !session.is_alive() => return,
-                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Lagged(_)) => {
+                        server
+                            .replay_missed_echo_drop(&session, &mut answered)
+                            .await;
+                    }
                     Err(RecvError::Closed) => return,
                 }
             }
         });
+    }
+
+    /// Answer the echo-off prompt this listener is looking at, if it has
+    /// not already answered it — GH #106's replay, as one rule with two
+    /// triggers.
+    ///
+    /// `answered` is the episode this listener last acted on, and it is
+    /// updated in place. **The two callers must not be able to disagree
+    /// about the guard**, which is why this is a function rather than a
+    /// condition written twice: one is the subscription window, which has
+    /// rows; the other is a `Lagged` receiver, which cannot be arranged
+    /// deterministically without a broadcast-capacity knob.
+    ///
+    /// A no-op when echo is not off — [`Session::awaiting_secret_episode`]
+    /// answers `None` — and a no-op when the episode is not newer than
+    /// what this listener already handled. See
+    /// [`Self::watch_for_autofill`] for why `<=` rather than `==`.
+    async fn replay_missed_echo_drop(&self, session: &Arc<Session>, answered: &mut u64) {
+        let Some(episode) = session.awaiting_secret_episode() else {
+            return;
+        };
+        if episode <= *answered {
+            return;
+        }
+        *answered = episode;
+        self.autofill_on_echo_drop(session).await;
     }
 
     /// One echo drop, resolved and injected with no tool call in sight.
