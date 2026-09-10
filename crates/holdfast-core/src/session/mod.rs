@@ -281,6 +281,19 @@ pub struct Session {
     /// `PromptDetector` is a pure classifier with no previous mode and an
     /// edge is not computable from its state.
     awaiting_secret: Arc<std::sync::atomic::AtomicBool>,
+    /// Which echo-off read this session is on — see
+    /// [`Session::secret_episode`].
+    secret_episode: Arc<AtomicU64>,
+    /// Set once the reader thread has left its loop, which is the only
+    /// moment at which "no further output will ever arrive" becomes true.
+    ///
+    /// **Not the same fact as `is_alive()`, and conflating them was GH
+    /// #42.** The child's death and the reader's completion are separated
+    /// by however long the scheduler takes to run one more `read` — the
+    /// reader breaks only once `read` returns 0 *and* the backend is dead,
+    /// so it always drains first, but a caller polling `is_alive()` can
+    /// look in between and see a buffer missing the child's last line.
+    reader_finished: Arc<std::sync::atomic::AtomicBool>,
     /// How many writes this session's PTY has actually **taken**, bumped
     /// in [`Session::write_input_acked`] after the backend accepted them.
     ///
@@ -566,8 +579,19 @@ pub enum SessionEvent {
     /// classified the session as `AwaitingSecret` (REQ-SEC-010). Carries
     /// the redacted prompt line the child had just drawn, which may
     /// legitimately be empty (REQ-O-013).
-    AwaitingSecretEntered { prompt_text: String },
-    /// Echo came back without a submission — §5.2's supersede case.
+    ///
+    /// `episode` names this echo-off read — see
+    /// [`Session::secret_episode`].
+    AwaitingSecretEntered { episode: u64, prompt_text: String },
+    /// Echo came back — §5.2's supersede case, *if* nothing answered.
+    ///
+    /// **Whether anything answered is not knowable from this edge**, and
+    /// reading it as "the human cancelled" is GH #105: an autofill that
+    /// wrote the credential is precisely *why* echo came back. The closer
+    /// reads [`crate::secret::RaisedRequest::answered`] off the request it
+    /// closes instead — **not** an episode carried here, because an
+    /// episode is one contiguous run of echo-off and `sudo` asking twice
+    /// puts two child reads inside one.
     AwaitingSecretLeft,
     /// The child ended. **The only place in the tree where a session's
     /// exit is an *event* rather than a poll.**
@@ -664,6 +688,8 @@ impl Session {
         let (events_tx, _) = broadcast::channel(SESSION_EVENT_FRAMES);
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_FRAMES);
         let awaiting_secret = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let secret_episode = Arc::new(AtomicU64::new(0));
+        let reader_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writes_performed = Arc::new(AtomicU64::new(0));
 
         // Geometry and mode are applied by `set_screen_config` right
@@ -708,6 +734,8 @@ impl Session {
             output_tx: output_tx.clone(),
             events_tx: events_tx.clone(),
             awaiting_secret: Arc::clone(&awaiting_secret),
+            secret_episode: Arc::clone(&secret_episode),
+            reader_finished: Arc::clone(&reader_finished),
             writes_performed: Arc::clone(&writes_performed),
             write_tx,
             last_activity_ms: Arc::clone(&last_activity_ms),
@@ -733,6 +761,7 @@ impl Session {
         let deadline = Arc::clone(&idle_deadline_ms);
         let reader_clock = clock.clone();
         let reader_backend = Arc::clone(&backend);
+        let reader_finished_flag = Arc::clone(&reader_finished);
         let reader_rules = Arc::clone(&session.rules);
         // §4.5.1's responder is used from the reader thread alone, so it
         // needs no `Mutex` and no `Weak` — it is moved into the closure
@@ -899,7 +928,55 @@ impl Session {
                 let prompt_line = snap.last_line.clone();
                 drop(detector_guard);
 
-                if awaiting_secret.swap(now_awaiting, Ordering::Relaxed) != now_awaiting {
+                // **A load and a store rather than a `swap`, and that is
+                // load-bearing** (GH #106). This loop is the only writer
+                // of `awaiting_secret` in the tree — `Session` holds a
+                // read-only handle and every other reference is a `load`
+                // — so the read-modify-write buys nothing that a plain
+                // pair does not, and splitting it is what lets the
+                // episode be **published before the flag it names**.
+                //
+                // A `swap` cannot: the transition is only known once the
+                // flag has already been latched, so the `fetch_add` is
+                // necessarily behind it and a thread that observes
+                // `is_awaiting_secret() == true` may still read the
+                // *previous* episode. See
+                // [`Session::awaiting_secret_episode`], which is the
+                // reader that cannot tolerate that — it would de-duplicate
+                // a replay against a number one episode short and fire
+                // twice for one prompt, which is the direction that costs
+                // a provider run and a `max_uses` claim.
+                //
+                // **A second writer of this flag breaks the transition
+                // test**, which the `swap` made atomic and this does not.
+                // There is none, and there must not be one.
+                if awaiting_secret.load(Ordering::Relaxed) != now_awaiting {
+                    // **The episode id, allocated in the same transition
+                    // that latches the flag** (GH #105). This block is
+                    // the only writer of `awaiting_secret` in the tree, so
+                    // a counter bumped here names exactly one *run* of
+                    // echo-off — which is not the same thing as one child
+                    // read, and [`Session::secret_episode`] says so.
+                    //
+                    // **The property anything depends on is that every
+                    // `AwaitingSecretEntered` carries a number no other
+                    // one has**, not the economy of bumping on one edge.
+                    // Bumping on both would satisfy it too and is
+                    // deliberately not treated as a regression: measured,
+                    // no row can tell the two apart, because nothing reads
+                    // this on the way *out* — `AwaitingSecretLeft` carries
+                    // no episode, and the closer reads the answer off the
+                    // request it closes.
+                    if now_awaiting {
+                        secret_episode.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // **`Release`, and the `fetch_add` above is what it
+                    // publishes** (GH #106). Paired with the `Acquire` in
+                    // [`Session::is_awaiting_secret`], it is what makes
+                    // *"the flag is set"* imply *"and the episode that
+                    // names it is visible"* on a machine whose store
+                    // order is not x86's.
+                    awaiting_secret.store(now_awaiting, Ordering::Release);
                     // Fired **after** the guard is released: a subscriber
                     // that reacted by calling back into the session would
                     // otherwise re-enter the detector lock from inside it.
@@ -909,6 +986,7 @@ impl Session {
                         // is the child's own bytes and a password prompt
                         // is not the only thing that turns echo off.
                         SessionEvent::AwaitingSecretEntered {
+                            episode: secret_episode.load(Ordering::Relaxed),
                             // `redact_for_display` and not `redact_str`:
                             // this line becomes `AwaitingSecret.prompt_text`
                             // on every attached client, and `holdfast
@@ -979,6 +1057,19 @@ impl Session {
                 // reaper's sweep must not have to hold anything.
                 deadline.store(deadline_from(at, idle_timeout_ms), Ordering::Relaxed);
             }
+
+            // **Raised here, before the reap grace below, because the two
+            // answer different questions.** This flag means *the PTY is
+            // drained and nothing further will be published*; the block
+            // below waits for a wait-status so the exit **code** is right.
+            // A waiter that needs the final bytes must not be held for
+            // `EXIT_REAP_GRACE` to learn a number it never asked for.
+            //
+            // `Release`, paired with the `Acquire` in
+            // [`Session::reader_finished`]: every `buffer.push` above must
+            // be visible to a thread that observes this flag, which is the
+            // entire guarantee `wait::for_pattern`'s final rescan rests on.
+            reader_finished_flag.store(true, Ordering::Release);
 
             // **§7.5's `SessionExited { code }`, at the one place a
             // session's end is observed rather than asked about.**
@@ -1248,6 +1339,18 @@ impl Session {
         self.backend.exit_code()
     }
 
+    /// Whether the reader has left its loop, and with it whether the
+    /// output buffer is final.
+    ///
+    /// **`is_alive() == false` does not imply this**, which is GH #42:
+    /// the child's death is observable one scheduler slice before the
+    /// reader has run the `read` that moves the child's last bytes into
+    /// the buffer. A consumer that needs *all* of a dead session's output
+    /// must wait for this, not for the child.
+    pub fn reader_finished(&self) -> bool {
+        self.reader_finished.load(Ordering::Acquire)
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.backend.pid()
     }
@@ -1304,8 +1407,83 @@ impl Session {
     /// case the edge cannot serve: a client that attaches while a secret
     /// prompt is already up missed the transition, and §7.5 requires it
     /// to be told anyway.
+    ///
+    /// **`Acquire`, and it is not decoration** — see
+    /// [`awaiting_secret_episode`](Self::awaiting_secret_episode) for the
+    /// caller that needs the episode this flag belongs to and not the one
+    /// before it.
     pub fn is_awaiting_secret(&self) -> bool {
-        self.awaiting_secret.load(Ordering::Relaxed)
+        self.awaiting_secret.load(Ordering::Acquire)
+    }
+
+    /// The episode this session is **currently** inside, or `None` if
+    /// echo is not off — [`is_awaiting_secret`](Self::is_awaiting_secret)
+    /// and [`secret_episode`](Self::secret_episode) read as one fact.
+    ///
+    /// **Two loads that could be written at any call site, published as
+    /// one because the order and the ordering both matter** (GH #106).
+    ///
+    /// * The flag is read **first**. A caller that reads the episode
+    ///   first can have the reader thread start a *new* episode between
+    ///   the two loads, and it would then label the prompt it is looking
+    ///   at with the number of the one before — off by one, in the
+    ///   direction that makes a de-duplication key match nothing.
+    /// * The flag is read with `Acquire` against the reader's `Release`
+    ///   store, so the `fetch_add` sequenced before that store is visible
+    ///   here. Both are `Relaxed` on x86 anyway; neither is on aarch64,
+    ///   and no CI job runs on one.
+    ///
+    /// **Still a cache, exactly as the flag is.** Its writer is the
+    /// reader thread, which runs only when a chunk arrives, so `Some` for
+    /// a child that has since restored echo in silence is expected — the
+    /// live question is [`line_discipline`](Self::line_discipline), and
+    /// the write itself is gated on it by
+    /// [`crate::pty::WriteRequest::SecretIfUnread`]. What this answers is
+    /// *"which prompt am I looking at"*, which is a question about
+    /// identity and not about liveness.
+    pub fn awaiting_secret_episode(&self) -> Option<u64> {
+        self.is_awaiting_secret().then(|| self.secret_episode())
+    }
+
+    /// Which echo-off read this session is on — `0` before the first.
+    ///
+    /// **An identity for one `AwaitingSecret` episode**, bumped inside
+    /// the same transition that latches
+    /// [`is_awaiting_secret`](Self::is_awaiting_secret) — and published
+    /// just *before* it, so the two can be read as one fact — and carried
+    /// on both edges that bracket it. It exists because a *state* cannot
+    /// answer "is this the read I was told about?", and two of this
+    /// milestone's defects are that question asked with the wrong tool:
+    ///
+    /// * GH #105 — a credential §9.6's autofill wrote with no raise to
+    ///   close has to be matched to the raise that announces *the same
+    ///   edge*, and to nothing else. This number is that match.
+    /// * GH #106 — `watch_for_autofill` could not replay a missed edge
+    ///   because a bare `if is_awaiting_secret()` double-fires across an
+    ///   Entered/Left/Entered sequence. A remembered episode is the key
+    ///   that de-duplicates it, and
+    ///   [`awaiting_secret_episode`](Self::awaiting_secret_episode) is how
+    ///   that replay reads it.
+    ///
+    /// **One episode is not one child read, and reading it that way is a
+    /// measured defect.** The counter moves on the *transition*, and the
+    /// transition is computed per output chunk from the tty's `ECHO` bit,
+    /// so `stty -echo; read x; read y; stty echo` — `sudo` asking twice,
+    /// a username-then-password prompt — is **one** episode with two
+    /// reads. Anything that treats this number as naming a read will
+    /// attribute the first read's answer to the second. See
+    /// [`crate::secret::RaisedRequest::answered`], which is where that
+    /// went wrong and how it is closed.
+    ///
+    /// **A cache in the same sense the flag is**, and for the same
+    /// reason: its only writer is the reader thread, which runs when a
+    /// chunk arrives. A child that drops `ECHO` and prints nothing has
+    /// not started an episode as far as this counter is concerned. So a
+    /// caller reading it to *label* something can be one episode behind
+    /// — never ahead, because it is monotonic — which is the direction
+    /// that under-reports rather than the one that invents.
+    pub fn secret_episode(&self) -> u64 {
+        self.secret_episode.load(Ordering::Relaxed)
     }
 
     /// The child's line discipline, sampled **now** — one `tcgetattr`.
@@ -2880,23 +3058,60 @@ mod tests {
         // requires. Without this half the test would also pass against a
         // backend that dropped the bytes on the floor.
         pty.set_echo(Some(true));
-        wait_until("the submitted command to be classified", || {
-            s.detection().interaction_mode == InteractionMode::Executing
+        // **Waited on the history and not on the mode, because the two
+        // are published at different instants and the history is the
+        // later one.** The reader drops `detector_guard` and only *then*
+        // takes `history.lock()` to apply the events that same `feed`
+        // returned — deliberately, since §4.3 forbids holding two of a
+        // session's locks at once. Between those two statements the
+        // session answers `Executing` with an empty history, and a poll
+        // on the mode returns inside exactly that gap; the gap holds an
+        // `AtomicBool` store, a conditional `events_tx.send` and a
+        // `now_ms()`, so it is a scheduler slice wide rather than an
+        // instruction wide.
+        //
+        // That is the whole of this row's unfiled intermittent, measured:
+        // **4 failures in 200 whole-binary runs at `--test-threads=16` on
+        // 2 cores**, every one of them `left: 0, right: 1` on the count
+        // below. Causally: a 150 ms `sleep` inserted between those two
+        // reader statements fails the pre-`wait_until` form 10 times in
+        // 10 with that exact signature, and passes this form 10 times in
+        // 10. It was never the property in this row's name — `Executing`
+        // requires `!bracketed_paste`, which requires the injected chunk
+        // to have been fed, so the mode the old poll saw was always the
+        // right answer arriving before its bookkeeping.
+        //
+        // The direction that does hold is the one the header comment
+        // states: the history is applied strictly *after* `feed` returns,
+        // so a session whose history holds the command has certainly
+        // classified the chunk. Waiting on the history and then asserting
+        // the mode uses the implication in the direction that is true,
+        // which is why the mode below is a hard assertion and no longer a
+        // poll.
+        wait_until("the deferred chunk to reach the history", || {
+            s.command_count() > 0
         });
+        assert_eq!(
+            s.detection().interaction_mode,
+            InteractionMode::Executing,
+            "the deferred chunk reached the history, so the detector had \
+             already consumed it — with `ECHO` back on it is a submitted \
+             command and not a secret prompt"
+        );
         // **Both directions, because the message used to name only one
-        // of them and it was the one that never happened.** This row's
-        // every observed failure was `left: 2, right: 1` — a duplicate
-        // injected by the hook, not a chunk lost by the reader — while
-        // the message said "the chunk never reached the history". A
-        // failure message that describes the opposite of the failure
-        // sends the next reader to look at the reader thread, which is
-        // exactly where the time went.
+        // of them and it was the one that never happened.** Before the
+        // one-shot latch above, this row's every observed failure was
+        // `left: 2, right: 1` — a duplicate injected by the hook, not a
+        // chunk lost by the reader — while the message said "the chunk
+        // never reached the history". A failure message that describes
+        // the opposite of the failure sends the next reader to look at
+        // the reader thread, which is exactly where the time went. The
+        // `0` case now fails in the `wait_until` above, which says so.
         assert_eq!(
             s.command_count(),
             1,
             "the hook queues one `\\x1b]133;C` and the history must hold \
-             exactly one command for it: 0 means the deferred chunk never \
-             reached the history, and more than 1 means this test's own \
+             exactly one command for it: more than 1 means this test's own \
              hook fired twice — a defect in the hook, not in the reader"
         );
     }

@@ -25,6 +25,12 @@ unicode-width.workspace = true
 # attach` allocates no PTY — it uses the terminal it was given — which is
 # why this is a dev-dependency and not a dependency.
 [dev-dependencies]
+# NEW in 0.0.10a — `worker_process.rs` binds a real `WorkerSocket` under a
+# private runtime directory, and the socket tests in `holdfast-core` already
+# reach for the same crate for the same reason. `/tmp` by hand is not a
+# substitute: `sockaddr_un.sun_path` is 108 bytes and a leaked directory is
+# a leaked socket the next run binds beside.
+tempfile.workspace = true
 portable-pty.workspace = true
 # The banner's layout is only checkable by rendering it (see
 # `attach_banner`); `holdfast-core` already uses this emulator for screen

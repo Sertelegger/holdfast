@@ -979,6 +979,19 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// How many times `needle` appears — the question [`contains`] cannot
+    /// answer for a buffer that remembers every earlier round.
+    ///
+    /// Kept separate rather than folded into [`contains`] because the two
+    /// are different questions and `contains` short-circuits: it runs on
+    /// every 20 ms poll of a ring that may hold 256 KiB.
+    fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    }
+
     /// A scratch directory that removes itself **on unwind as well as on
     /// success**. Task 9 measured the alternative: with the removal
     /// written as a statement at the end of a row, every injected mutation
@@ -1243,16 +1256,49 @@ mod tests {
     }
 
     /// Poll the ring buffer until `needle` shows up, or fail.
+    ///
+    /// **Containment, and the ring is cumulative** — so this answers *"has
+    /// this ever appeared"*, not *"has it appeared again"*. A row driving
+    /// the same fixture twice on one session wants
+    /// [`buffer_until_count`]; see its doc for the mutation that proves
+    /// the difference is not academic.
     async fn buffer_until(s: &Session, needle: &[u8], secs: u64) -> Vec<u8> {
+        buffer_until_count(s, needle, 1, secs).await
+    }
+
+    /// Poll the ring buffer until `needle` has appeared `count` times, or
+    /// fail.
+    ///
+    /// **This is [`buffer_until`] without the assumption that the row runs
+    /// once.** The ring is cumulative, so a second round's
+    /// `buffer_until(b"got=…")` is answered by the *first* round's copy
+    /// and never observes the second at all — the same defect
+    /// [`await_prompt`] grew a second half for, one line further down the
+    /// same loop in `max_uses_is_per_session_and_bounded`. Instrumented
+    /// there: at iteration 2 the ring already held one copy before the
+    /// wait ran.
+    ///
+    /// **Load-bearing, by mutation.** A `write_secret_if_unread` that
+    /// answers `Written` while writing nothing for every write after a
+    /// session's first is a plausible wrong implementation — it makes
+    /// `request_secret_input` answer `secret_provided`, audits
+    /// `binding_resolved` and spends a `max_uses` claim while the child's
+    /// prompt sits unanswered — and it passed **all 54 rows in this
+    /// module** before this function existed. Counting is the idiom the
+    /// file already uses where it matters:
+    /// `the_listener_and_a_connections_raise_ride_the_same_edge` counts
+    /// `got=` rather than testing for it.
+    async fn buffer_until_count(s: &Session, needle: &[u8], count: usize, secs: u64) -> Vec<u8> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
         loop {
             let buf = buffered(s);
-            if contains(&buf, needle) {
+            let seen = occurrences(&buf, needle);
+            if seen >= count {
                 return buf;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "{:?} never reached the buffer:\n{}",
+                "{:?} reached the buffer {seen} time(s), wanted {count}:\n{}",
                 String::from_utf8_lossy(needle),
                 String::from_utf8_lossy(&buf)
             );
@@ -1265,8 +1311,66 @@ mod tests {
     /// would have the line discipline echo the value straight back into
     /// the ring buffer, failing the leak assertions for a reason that has
     /// nothing to do with a binding.
+    ///
+    /// **The prompt on its own does not say that, and the ring buffer is
+    /// why.** It is cumulative, so a row whose child runs the fixture
+    /// twice finds the *first* round's `Password: ` still in it and
+    /// returns with the child between reads — `stty echo` has run,
+    /// `stty -echo` has not. What follows then resolves a credential and
+    /// hands it to `write_secret_if_unread`, which reads the tty rather
+    /// than a cache of it, declines `NotEchoOff`, and drops the value;
+    /// step 1 falls through and the row waits out the human-prompt
+    /// deadline for a `secret_cancelled` it did not ask for — while the
+    /// `max_uses` claim and the `binding_resolved` line stand, because
+    /// §9.6 counts resolutions from the store and not writes to a PTY.
+    /// That is `max_uses_is_per_session_and_bounded`, and its doc carries
+    /// the measurement.
+    ///
+    /// So **both**, and the echo test is the load-bearing half: the
+    /// prompt says the child has drawn one, the line discipline says it
+    /// is the round this caller is about to write into. A positive wait
+    /// rather than a sleep, so a child that never drops echo fails
+    /// naming what it did instead.
+    ///
+    /// **The liveness arm below is an opt-out, not a completion**, and a
+    /// caller should know which of the two it got. For any row whose child
+    /// can finish before this first polls — every `autofill_on_echo_off`
+    /// row — the echo guarantee is silently off and this degrades to the
+    /// containment wait it was before. That is the right answer there,
+    /// because the exchange it was guarding has already happened, but it
+    /// is not the same promise, and a row that needs the stronger one must
+    /// keep its child alive to get it.
     async fn await_prompt(s: &Session, prompt: &[u8]) {
         buffer_until(s, prompt, 20).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let echo = s.line_discipline().echo;
+            if echo == Some(false) {
+                return;
+            }
+            // **A child that has finished is not a child to wait on**, and
+            // this arm is not defensive: an `autofill_on_echo_off` row
+            // resolves and injects with no tool call, so prompt,
+            // credential, `got=` and exit can all be over before the first
+            // poll here runs. `line_discipline` answers `UNKNOWN` for a
+            // dead child (`in_process.rs`: *"a dead child's line
+            // discipline says nothing"*), so waiting for `Some(false)`
+            // from one is waiting for the deadline and nothing else.
+            // Measured: without this arm
+            // `an_absolute_program_does_not_save_a_profile_from_an_agents_env`
+            // fails 6 in 6 on `ECHO is None`.
+            if !s.is_alive() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{:?} is in the ring buffer, the child is alive, and its `ECHO` is \
+                 {echo:?} — so a secret written now would be declined `NotEchoOff` \
+                 and dropped",
+                String::from_utf8_lossy(prompt)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Wait until the **detector** has the prompt line, not merely the
@@ -2070,6 +2174,22 @@ mod tests {
     /// the one that does not depend on that: this field is documented as
     /// one line of plain text a human reads to make a decision, and a
     /// control character in it is outside what that promises.
+    ///
+    /// **This row was the noisiest in the suite, and it was arranged
+    /// wrong rather than timing-sensitive.** It armed `spawn_forwarder`
+    /// on §8.3's echo-drop **edge** and then hoped the child had not
+    /// reached it yet — the exact defect [`gated_echo_off`]'s own doc
+    /// warns about one section down, for the listener. `session_running`
+    /// returns with the child already executing, and
+    /// `tokio::sync::broadcast` keeps nothing for a receiver that does
+    /// not yet exist, so a child that printed first left the row waiting
+    /// out `wait_for` on a frame that had already been sent to nobody:
+    /// *"no AwaitingSecret reached the client; it saw []"*. Measured at
+    /// **8 failures in 25** runs of this module at `--test-threads=16` on
+    /// two cores, and proved causally rather than by sampling — a 500 ms
+    /// delay in front of the subscription turned it into **10 failures in
+    /// 10** in isolation, with the identical message. The gate below is
+    /// the fix; the delay stays, so the gate cannot be removed quietly.
     #[tokio::test]
     async fn a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act() {
         // 8-bit CSI as the child's own bytes — `\xc2\x9b` on the wire —
@@ -2083,15 +2203,37 @@ mod tests {
 
         let sc = Scratch::new("childpromptstrip");
         let server = server_with(keychain_mode(vec![]), &sc.audit_log());
+        // **Gated, because §8.3's echo drop is an edge and this row has a
+        // consumer of it** — see [`gated`] and [`gated_echo_off`], whose
+        // doc describes this exact defect for the *listener*.
+        // `spawn_forwarder` subscribes to the same broadcast, and
+        // `session_running` returns with the child already executing: an
+        // unheld child can print its echo-off prompt before that
+        // subscription exists, and `tokio::sync::broadcast` keeps nothing
+        // for receivers that do not yet exist. The frame then never
+        // arrives and the row fails on `wait_for` with `it saw []`.
+        let child_gate = sc.path("child.gate");
         let s = session_running(
             Some(PROD_PROFILE),
             "ssh",
             &["prod-01"],
-            &echo_off_prompting(prompt),
+            &gated(&child_gate, &echo_off_prompting(prompt)),
         );
         server.registry.insert(Arc::clone(&s)).expect("register");
         let mut client = attach_fake(&server, &s.id);
+        // **This is not a wait. It is the window, held open on purpose**,
+        // and it is what makes the gate above provably load-bearing
+        // rather than merely present — the `MockPty::set_read_delay`
+        // idiom, in the one shape available here. Delete the gate and the
+        // child spends this delay printing its prompt to nobody:
+        // **10 failures in 10** isolated runs at this exact duration,
+        // with the identical message, against 8 in 25 contended runs
+        // without it. Nothing happens during it while the gate stands, so
+        // it costs the suite half a second once and buys a deterministic
+        // red.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let forwarder = spawn_forwarder(&server, &s, None);
+        std::fs::write(&child_gate, b"go").expect("release the child");
 
         // Anti-vacuity first, and it waits for the **whole** prompt, so
         // the three assertions below cannot be satisfied by a prefix.
@@ -2194,6 +2336,19 @@ mod tests {
     /// per-session budget from a global counter — a global one starves
     /// every other session on the box — and the first is what separates it
     /// from no counter at all, which passes any single-session test.
+    ///
+    /// **Its recorded flake was the ring buffer, not the budget.** The
+    /// row failed as *"resolution 2 of 2 was refused"* with a
+    /// `secret_cancelled` and a ten-second wait, and the counter was
+    /// never involved: [`buffer_until`] searches the **whole** ring, so
+    /// round two's `await_prompt` matched round *one's* `Password: ` and
+    /// returned while the child was between reads with `stty echo` on.
+    /// The credential then resolved — spending a use and writing the
+    /// audit line — and was declined `NotEchoOff` at the writer and
+    /// dropped, leaving step 1 to fall through to a human who was not
+    /// there. `await_prompt` now waits for the line discipline as well as
+    /// for the bytes; see its doc, and the `sleep` below, which is what
+    /// makes that half provably load-bearing.
     #[tokio::test]
     async fn max_uses_is_per_session_and_bounded() {
         let mut sc = Scratch::new("maxuses");
@@ -2203,7 +2358,21 @@ mod tests {
 
         // A child that answers three echo-off reads in a row, so the row
         // does not need three sessions to make three requests.
-        let three = format!("{ECHO_OFF_FIXTURE}; {ECHO_OFF_FIXTURE}; {ECHO_OFF_FIXTURE}");
+        //
+        // **The `sleep` is not a wait, it is the window held open** — the
+        // `MockPty::set_read_delay` idiom, in the shape available here.
+        // The ring buffer is cumulative, so round two's `await_prompt`
+        // finds round *one's* `Password: ` still in it and returns
+        // whatever the child happens to be doing; in the gap between the
+        // rounds that is `stty echo`, and a credential written there is
+        // declined `NotEchoOff` by the writer and dropped — step 1 falls
+        // through and this row waits out its own ten-second deadline for
+        // a `secret_cancelled` it did not ask for, with the `max_uses`
+        // claim spent and the `binding_resolved` line written. That is
+        // the recorded flake, and the second half of `await_prompt` is
+        // what closes it. Delete that half and this line turns the row
+        // from 1 failure in a campaign into 10 in 10.
+        let three = format!("{ECHO_OFF_FIXTURE}; sleep 1; {ECHO_OFF_FIXTURE}; {ECHO_OFF_FIXTURE}");
         let a = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], &three);
         server.registry.insert(Arc::clone(&a)).expect("register");
 
@@ -2214,7 +2383,15 @@ mod tests {
                 payload["status"], "secret_provided",
                 "resolution {n} of 2 was refused: {payload}"
             );
-            buffer_until(&a, b"got=HUNTER2", 20).await;
+            // **`count`, not containment.** The ring remembers round
+            // one, so `buffer_until` here is answered by round one's copy
+            // and this row never observes that the *second* credential
+            // reached the child — which is the same stale-ring defect the
+            // line above it was fixed for, and the hole a
+            // `write_secret_if_unread` that stopped writing after the
+            // first write in a session walked through with all 54 rows
+            // green.
+            buffer_until_count(&a, b"got=HUNTER2", n as usize, 20).await;
         }
         assert_eq!(a.binding_uses().get(&sc.name("prod-ssh")), Some(&2));
 
@@ -4828,8 +5005,21 @@ mod tests {
     /// and appears verbatim, in the same way the two-read rows above
     /// concatenate it.
     fn gated_echo_off(gate: &Path) -> String {
+        gated(gate, ECHO_OFF_FIXTURE)
+    }
+
+    /// [`gated_echo_off`]'s prefix, over an arbitrary child script.
+    ///
+    /// Split out because the listener is not the only consumer of §8.3's
+    /// edge that a row can arm too late: `spawn_forwarder` subscribes to
+    /// the same broadcast, and
+    /// [`a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act`]
+    /// needs [`echo_off_prompting`]'s prompt rather than
+    /// [`ECHO_OFF_FIXTURE`]'s. One spelling of the gate, whatever it
+    /// holds back.
+    fn gated(gate: &Path, script: &str) -> String {
         format!(
-            "until [ -f '{}' ]; do sleep 1; done; {ECHO_OFF_FIXTURE}",
+            "until [ -f '{}' ]; do sleep 1; done; {script}",
             gate.display()
         )
     }
@@ -5363,6 +5553,96 @@ mod tests {
         ))
     }
 
+    /// [`echo_off_then_silently_leaves`] with one line added: the child
+    /// **prints** after restoring echo, so the abandonment produces an
+    /// `AwaitingSecretLeft` edge instead of only a live line discipline.
+    ///
+    /// **The two are not interchangeable and the difference is the whole
+    /// reason both exist.** §8.3's edges are computed per read chunk, so a
+    /// child that gives echo back and writes nothing leaves the session
+    /// latched in `AwaitingSecret` until its next byte of output — which
+    /// is precisely what its sibling is *for*
+    /// (`an_unattached_autofill_does_not_write_into_a_child_that_moved_on`
+    /// asserts the daemon can be told nothing), and fatal to a row whose
+    /// subject **is** that edge.
+    fn echo_off_then_visibly_leaves(leave: &Path) -> String {
+        echo_off_then(&format!(
+            "until [ -f '{}' ]; do sleep 1; done; stty echo; printf 'left=1\\n'; \
+             read y; printf 'next=[%s]\\n' \"$y\"",
+            leave.display()
+        ))
+    }
+
+    /// [`ECHO_OFF_FIXTURE`] with a gate **between the prompt and the
+    /// read**: echo goes off, the prompt is drawn, and the child consumes
+    /// nothing until the row opens `hold` — after which the fixture runs
+    /// exactly as written.
+    ///
+    /// **The window it opens is one nothing else here can reach**: a
+    /// credential already written to the pty and *not yet read*. That is
+    /// the only state in which a second call can register a waiter after
+    /// the value was written and before echo comes back, which is the
+    /// arrangement `await_secret`'s own echo-return arm needs.
+    ///
+    /// A substitution rather than a second `stty`/`read` shape, like
+    /// [`echo_off_prompting`] and [`echo_off_then`] — Global Constraint 14
+    /// governs the spelling, not the number of variants.
+    fn echo_off_holding_before_the_read(hold: &Path) -> String {
+        let out = ECHO_OFF_FIXTURE.replace(
+            "read x;",
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done; read x;",
+                hold.display()
+            ),
+        );
+        assert_ne!(out, ECHO_OFF_FIXTURE, "the gate substitution missed");
+        out
+    }
+
+    /// [`ECHO_OFF_FIXTURE`] with a **second read inside the same
+    /// `stty -echo` region**, which the child then abandons.
+    ///
+    /// **One echo-off run, two child reads** — `sudo` asking twice, or a
+    /// username-then-password prompt. §8.3's edge is the tty's `ECHO` bit
+    /// sampled per output chunk, so the reader sees one `AwaitingSecret`
+    /// region here and one `AwaitingSecretLeft`, and `Session::secret_episode`
+    /// counts **one** episode across both reads. That is what makes this
+    /// the shape in which "was this episode answered?" is the wrong
+    /// question: the first read is answered and the second is not.
+    ///
+    /// The child prints between the two reads (`second=1`) so the row can
+    /// tell them apart, and prints again after restoring echo (`left=1`)
+    /// so the `AwaitingSecretLeft` edge is produced at all — a child that
+    /// gives echo back in silence never produces one, which is what
+    /// [`echo_off_then_silently_leaves`] is for.
+    fn echo_off_two_reads_second_abandoned(leave: &Path) -> String {
+        echo_off_then(&format!(
+            "read x; printf 'second=1\\n'; until [ -f '{}' ]; do sleep 1; done; \
+             stty echo; printf 'left=1;got=%s\\n' \"$(printf %s \"$x\" | tr a-z A-Z)\"",
+            leave.display()
+        ))
+    }
+
+    /// Poll until this session's PTY has **taken** `n` writes.
+    ///
+    /// The `binding_resolved` audit line is not the same signal: §9.6
+    /// counts resolutions from the credential store, and
+    /// `audit_binding_resolved` runs inside `autofill`, before
+    /// `inject_resolved` has looked at the slot. A row that needs the
+    /// autofill to have already found the slot vacant has to wait for the
+    /// writer, which is what [`Session::writes_performed`] reports.
+    async fn await_writes(s: &Session, n: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while s.writes_performed() < n {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session took {} write(s), wanted {n}",
+                s.writes_performed()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Poll the **live** line discipline until echo is back on.
     ///
     /// `is_awaiting_secret()` cannot be used for this and that is the
@@ -5858,10 +6138,21 @@ mod tests {
     /// **same** `SessionEvent` stream a real connection subscribes to.
     ///
     /// Not the real function — that takes an `Arc<Daemon>`, which this
-    /// target does not build — but the same two hub calls in the same two
-    /// arms, woken by the same `broadcast::send` that wakes the listener.
-    /// That is the point: every other row here raises by hand *before* the
-    /// edge, so the two consumers never actually ride one edge.
+    /// target does not build — but **the same two hub calls**, in the same
+    /// two arms, woken by the same `broadcast::send` that wakes the
+    /// listener. That is the point: every other row here raises by hand
+    /// *before* the edge, so the two consumers never actually ride one
+    /// edge.
+    ///
+    /// **The two calls are `AttachHub::raise_secret_on_edge` and
+    /// `AttachHub::close_secret_on_echo_return`, and the production arms
+    /// are one line each for exactly this reason.** An earlier revision of
+    /// this function re-implemented the closing arm — take the slot,
+    /// answer the waiter, broadcast the word — and a review measured what
+    /// that buys: reverting the **production** arm to its pre-fix form
+    /// left every GH #105 row and all 120 `secret::` rows green, because
+    /// none of them reached it. A copy of a code path is a copy that stays
+    /// green while the original rots.
     ///
     /// `hold` places the raise inside the listener's provider window
     /// deterministically: with `Some(path)` the arm waits for that file
@@ -5880,30 +6171,26 @@ mod tests {
             use tokio::sync::broadcast::error::RecvError;
             loop {
                 match events.recv().await {
-                    Ok(SessionEvent::AwaitingSecretEntered { prompt_text }) => {
+                    Ok(SessionEvent::AwaitingSecretEntered {
+                        episode,
+                        prompt_text,
+                    }) => {
                         if let Some(p) = &hold {
                             while !p.exists() {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }
                         let hub = server.attach_hub();
-                        let (req, _first) = hub.raise_secret(&session.id, &prompt_text);
+                        let (req, _first) =
+                            hub.raise_secret_on_edge(&session.id, &prompt_text, episode);
                         hub.broadcast_awaiting_secret(
                             &session.id,
                             &req.request_id,
                             &req.prompt_text,
                         );
                     }
-                    // §5.2's supersede: echo came back with no submission.
                     Ok(SessionEvent::AwaitingSecretLeft) => {
-                        let hub = server.attach_hub();
-                        if let Some(raised) = hub.close_secret(&session.id, None) {
-                            let id = raised.request_id().to_string();
-                            raised.answer(crate::secret::Resolution::Cancelled(
-                                crate::secret::CancelReason::UserCancelled,
-                            ));
-                            hub.broadcast_secret_closed(&session.id, &id, "cancelled");
-                        }
+                        server.attach_hub().close_secret_on_echo_return(&session.id);
                     }
                     Ok(SessionEvent::Exited { .. }) | Err(RecvError::Closed) => return,
                     Err(RecvError::Lagged(_)) => {}
@@ -5959,11 +6246,17 @@ mod tests {
     /// What the concurrent half is therefore for: the invariant is
     /// evaluated against a **real edge with two real consumers on it**
     /// rather than a hand-raise, several times, which is what the prose it
-    /// replaces was asserting without driving. The `cancelled` closure —
-    /// the forwarder's `AwaitingSecretLeft` arm — belongs to a *late*
-    /// forwarder rather than to an ordering, and
-    /// `a_declined_write_closes_the_request_cancelled_rather_than_fulfilled`
-    /// is where that word is pinned.
+    /// replaces was asserting without driving.
+    ///
+    /// **This row was red 1 run in 50 and nothing here was wrong** — the
+    /// convergence argument holds, but the forwarder's
+    /// `AwaitingSecretLeft` arm used to close a *late* raise `cancelled`
+    /// for a credential the child had received (GH #105). The two orderings
+    /// converge on the write and diverge on the **word**, which is what
+    /// this row's last assertion measures. `a_late_raise_for_a_prompt_the_autofill_answered_closes_fulfilled`
+    /// drives that ordering deterministically instead of waiting for it,
+    /// and `a_late_raise_for_a_prompt_nothing_answered_still_closes_cancelled`
+    /// is the negative that stops the repair from inverting.
     #[tokio::test]
     async fn the_listener_and_a_connections_raise_ride_the_same_edge() {
         // ---- arranged: the raise lands inside the provider window
@@ -6103,6 +6396,850 @@ mod tests {
         );
     }
 
+    /// **GH #105, arranged rather than waited for: a raise made *after*
+    /// the autofill wrote is not a cancellation.**
+    ///
+    /// [`the_listener_and_a_connections_raise_ride_the_same_edge`]'s raced
+    /// half reaches this ordering about 1 run in 50. The autofill listener
+    /// and a connection's forwarder are independent receivers on one
+    /// broadcast and `broadcast::send` wakes them one at a time, so the
+    /// reader thread can be preempted between waking the two — after which
+    /// the listener runs its **whole** provider and satisfies a read the
+    /// forwarder has not yet been woken to raise for. The forwarder then
+    /// raises late, and its `AwaitingSecretLeft` arm used to close that
+    /// raise `cancelled` for a credential the child had received.
+    ///
+    /// This row makes that ordering the arrangement: the forwarder's raise
+    /// is held on a gate the test opens only once the child has printed
+    /// the digest of the value it was given, so the raise is provably late
+    /// every run.
+    ///
+    /// **A gate and not a sleep.** The issue's 20 ms delay ahead of the
+    /// raise does reproduce it — 3 reds in 3 measured here against the row
+    /// above, and 3 greens in 3 with the same delay after the fix — but a
+    /// delay is a bet on how long a `fork`, an `exec` and a provider take:
+    /// the same species of bet as the withdrawn
+    /// *"`#[tokio::test]` is current-thread, so the forwarder must be
+    /// polled in between"*, which is what made this reachable at all.
+    ///
+    /// `a_late_raise_for_a_prompt_nothing_answered_still_closes_cancelled`
+    /// is the negative: same wiring, nothing written, and the word must go
+    /// back to `cancelled`. Neither row means much without the other —
+    /// this one alone is passed by an arm that answers `fulfilled`
+    /// unconditionally.
+    #[tokio::test]
+    async fn a_late_raise_for_a_prompt_the_autofill_answered_closes_fulfilled() {
+        let mut sc = Scratch::new("lateraise");
+        let child_gate = sc.path("child.gate");
+        let late = sc.path("late.gate");
+        let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+        let s = session_running(
+            Some(PROD_PROFILE),
+            "ssh",
+            &["prod-01"],
+            &gated_echo_off(&child_gate),
+        );
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        server.watch_for_autofill(&s);
+        // Subscribed before the child is released, so the edge is not lost;
+        // held on `late`, so the raise it makes is the late one.
+        let forwarder = spawn_forwarder(&server, &s, Some(late.clone()));
+        std::fs::write(&child_gate, b"go").expect("release the child");
+
+        // The premise: the credential reached the child, once.
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert_eq!(
+            occurrences(&seen, b"got="),
+            1,
+            "the child completed more than one read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "echo was off, so the value must not be in the buffer:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        // **The arrangement, asserted.** A forwarder that had already
+        // raised would make this the ordering that was never broken, and
+        // the row would pass without driving anything.
+        client.drain();
+        assert!(
+            !client.has(is_awaiting),
+            "the raise was not late, so this row is about the other ordering: {:?}",
+            client.seen
+        );
+
+        std::fs::write(&late, b"go").expect("release the forwarder");
+        let raised = client.wait_for("AwaitingSecret", is_awaiting).await;
+        let ServerFrame::AwaitingSecret { request_id, .. } = raised else {
+            panic!("wait_for returned the wrong frame");
+        };
+        let closed = client
+            .wait_for("SecretRequestClosed", |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { .. })
+            })
+            .await;
+        let ServerFrame::SecretRequestClosed {
+            request_id: closed_id,
+            outcome,
+        } = closed
+        else {
+            panic!("wait_for returned the wrong frame");
+        };
+        assert_eq!(
+            (closed_id.as_str(), outcome.as_str()),
+            (request_id.as_str(), "fulfilled"),
+            "an attached human was shown a prompt for a read that was already \
+             answered, and then told nobody answered it"
+        );
+        await_slot_empty(&server, &s.id).await;
+        assert_eq!(sc.kinds(&s.id), vec!["binding_resolved".to_string()]);
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+        let _ = forwarder.await;
+    }
+
+    /// **The separating negative, and the direction the repair must not
+    /// invert.**
+    ///
+    /// Identical wiring to
+    /// `a_late_raise_for_a_prompt_the_autofill_answered_closes_fulfilled`
+    /// — same listener, same held forwarder, same late raise — with one
+    /// fact different: the provider refuses, so nothing is written, so the
+    /// child leaves its echo-off read having received nothing. §7.5's
+    /// `outcome` is then `cancelled` and §18.1's reason is
+    /// `user_cancelled`.
+    ///
+    /// **Without this the fix inverts the bug rather than closing it, and
+    /// that direction is worse.** `inject_resolved`'s own note is about
+    /// exactly this side: a write the writer declines *"would otherwise
+    /// have told every attached client `fulfilled` for a value the child
+    /// never received"*. An `AwaitingSecretLeft` arm that answered
+    /// `fulfilled` whenever it found a raise passes the positive row
+    /// perfectly, and a fix that cannot tell the two apart has not fixed
+    /// anything — it has moved which case lies.
+    ///
+    /// **The provider runs and *then* refuses**, rather than there being
+    /// no binding at all: a listener that never got as far as a provider
+    /// would differ from the pair in two facts instead of one, and
+    /// `await_ran` is what makes the difference the single one this doc
+    /// claims.
+    ///
+    /// The end-to-end sibling is `tests/secrets.rs`'
+    /// `the_child_abandoning_its_read_cancels_the_call`, which drives the
+    /// same abandonment over a real socket with a call waiting on it and
+    /// asserts both words — the frame's `cancelled` and the tool's
+    /// `user_cancelled`.
+    #[tokio::test]
+    async fn a_late_raise_for_a_prompt_nothing_answered_still_closes_cancelled() {
+        let mut sc = Scratch::new("latecancel");
+        let child_gate = sc.path("child.gate");
+        let leave = sc.path("leave.gate");
+        let late = sc.path("late.gate");
+        // Records that it ran, then refuses — `FellThrough::ProviderRefused`.
+        let b = sc.binding("prod-ssh", PROD_PROFILE, "exit 3\n");
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+        let child = gated(&child_gate, &echo_off_then_visibly_leaves(&leave));
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], &child);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        server.watch_for_autofill(&s);
+        let forwarder = spawn_forwarder(&server, &s, Some(late.clone()));
+        std::fs::write(&child_gate, b"go").expect("release the child");
+
+        await_prompt(&s, b"Password: ").await;
+        // The listener took its shot; what the provider answered is the
+        // single difference from the positive row.
+        await_ran(&sc, "prod-ssh").await;
+
+        // The child gives up on the read. `left=1` is what makes the edge
+        // observable at all — see the fixture.
+        std::fs::write(&leave, b"go").expect("release the child");
+        let seen = buffer_until(&s, b"left=1", 20).await;
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "a value reached the child, so this row is not the negative:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(
+            sc.kinds(&s.id).is_empty(),
+            "a binding resolved, so nothing here was abandoned: {:?}",
+            sc.kinds(&s.id)
+        );
+
+        std::fs::write(&late, b"go").expect("release the forwarder");
+        let raised = client.wait_for("AwaitingSecret", is_awaiting).await;
+        let ServerFrame::AwaitingSecret { request_id, .. } = raised else {
+            panic!("wait_for returned the wrong frame");
+        };
+        let closed = client
+            .wait_for("SecretRequestClosed", |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { .. })
+            })
+            .await;
+        let ServerFrame::SecretRequestClosed {
+            request_id: closed_id,
+            outcome,
+        } = closed
+        else {
+            panic!("wait_for returned the wrong frame");
+        };
+        assert_eq!(
+            (closed_id.as_str(), outcome.as_str()),
+            (request_id.as_str(), "cancelled"),
+            "a prompt nobody answered was reported fulfilled — the repair inverted \
+             the defect instead of closing it"
+        );
+        await_slot_empty(&server, &s.id).await;
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+        let _ = forwarder.await;
+    }
+
+    /// **The other closer of the same edge, with nobody attached.**
+    ///
+    /// §5.2's supersede has two observers and they are not the same task.
+    /// `attach::conn::forward_events` owns it per attach connection; with
+    /// **nobody attached** — which is the deployment §9.5's rung-3 notice
+    /// exists for — there is no such task at all, and `await_secret`'s own
+    /// `secret_condition_ended` is the one that sees the echo return. That
+    /// second observer was added because the same child otherwise answered
+    /// `user_cancelled` attached and `timeout` unattended, *"decided by
+    /// whether a human happened to be watching"*.
+    ///
+    /// It carried the same false premise (GH #105) and would have
+    /// reproduced the defect one observer over: a fulfilled request
+    /// reported `user_cancelled`, this time to the **agent** rather than to
+    /// a client. Both now derive the word from
+    /// `secret::echo_return_resolution`, so the answer cannot depend on
+    /// which observer won the close.
+    ///
+    /// The arrangement is the one thing this file could not otherwise
+    /// build: `echo_off_holding_before_the_read` leaves the credential in
+    /// the pty **unread**, so a call can adopt the raise after the write
+    /// and before the echo return. `max_uses = 1` is what makes the second
+    /// call fall through to the prompt instead of resolving a credential of
+    /// its own — one write, one `binding_resolved`, and the row's subject
+    /// is the word the waiting call is answered with.
+    ///
+    /// Its negative is `tests/secrets.rs`'
+    /// `an_unattended_child_that_abandons_its_read_cancels_the_call_too`,
+    /// which drives the identical unattended echo return with **nothing**
+    /// written and requires `user_cancelled`.
+    #[tokio::test]
+    async fn an_unattended_call_is_not_told_user_cancelled_for_a_read_the_autofill_answered() {
+        let mut sc = Scratch::new("unattendedlate");
+        let child_gate = sc.path("child.gate");
+        let hold = sc.path("hold.gate");
+        let mut b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        // One use, so the call below falls through rather than resolving a
+        // second credential and answering itself.
+        b.max_uses = Some(1);
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+        // **Gated, like every other autofill row here**, and not
+        // decoratively: `session_running` returns with the child already
+        // executing and `watch_for_autofill` subscribes two statements
+        // later, so an ungated child can drop `ECHO` and print before the
+        // listener exists — a `broadcast` keeps nothing for a receiver that
+        // is not there yet, and the autofill is lost silently and for good
+        // (GH #106). Measured: **1 failure in 20** contended runs of an
+        // ungated first draft of this row, as *"no `binding_resolved` line
+        // was ever written"*, which is that window and not this row's
+        // subject.
+        let s = session_running(
+            Some(PROD_PROFILE),
+            "ssh",
+            &["prod-01"],
+            &gated(&child_gate, &echo_off_holding_before_the_read(&hold)),
+        );
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        // **No client, and that is the subject.** `forward_events` is per
+        // connection, so with none registered nothing but the waiting call
+        // observes the echo return.
+        server.watch_for_autofill(&s);
+        std::fs::write(&child_gate, b"go").expect("release the child");
+
+        await_prompt(&s, b"Password: ").await;
+        // **The write, not the audit line.** `binding_resolved` is
+        // written inside `autofill`, before `inject_resolved` has looked
+        // at the slot — measured: waiting on the audit line let the
+        // listener take *this row's* hand-raise and allocate a second
+        // request, 2 failures in 25 contended, two different `secreq_`
+        // ids. §9.6 counts resolutions from the store; the ordering this
+        // row needs is that the autofill has already seen a vacant slot,
+        // and the write is downstream of that.
+        //
+        // **It does not have to order against the *record*, and an
+        // earlier draft that assumed it did failed 2 in 25.**
+        // `writes_performed` is bumped inside `write_input`, ahead of
+        // `inject_resolved`'s record — so with the claim made at the
+        // *raise*, this row's hand-raise raced the record and the call was
+        // answered `user_cancelled`. The claim is made at the **close**
+        // now, and the close here is behind the child's whole round trip,
+        // which is a margin wide enough that this row does not measure it.
+        // `RaisedRequest::claim_episode` says how wide, and that it is a
+        // margin rather than an ordering.
+        await_writes(&s, 1).await;
+        assert_eq!(
+            s.line_discipline().echo,
+            Some(false),
+            "the child left the read before the value could be written, so the \
+             window this row needs never existed"
+        );
+
+        // The late raise a connection would have made on the same edge,
+        // arranged rather than raced — this file has no `forward_events`.
+        // **`raise_secret_on_edge`, because that is what a connection
+        // calls**: the plain door does not claim, and a hand-raise through
+        // it would be measuring a path no connection takes.
+        let (raised, first) =
+            server
+                .attach_hub()
+                .raise_secret_on_edge(&s.id, "Password: ", s.secret_episode());
+        assert!(first, "the row, not something else, raised this request");
+
+        let call = {
+            let server = server.clone();
+            let args = secret_args(&s.id, 20);
+            tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
+        };
+        // It adopts the raise and waits — its own step 1 is exhausted.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !server.attach_hub().secrets().has_waiter(&s.id) {
+            assert!(
+                !call.is_finished(),
+                "the call answered itself instead of adopting the raise and waiting"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the call never fell through to the prompt path"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Only now does the child consume what is already in its pty, and
+        // echo comes back **because the request was answered**.
+        std::fs::write(&hold, b"go").expect("release the child");
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert_eq!(
+            occurrences(&seen, b"got="),
+            1,
+            "the child completed more than one read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "echo was off, so the value must not be in the buffer:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        let payload = body(
+            &tokio::time::timeout(Duration::from_secs(60), call)
+                .await
+                .expect("the call never returned")
+                .expect("the call task")
+                .expect("request_secret_input"),
+        );
+        assert_eq!(
+            payload["status"], "secret_provided",
+            "the agent was told nobody answered a prompt the daemon answered: {payload}"
+        );
+        assert_eq!(
+            payload["data"]["request_id"], raised.request_id,
+            "the answer names a request the call did not adopt: {payload}"
+        );
+        // **The count, which nothing else on this path asserts.** It
+        // reaches the agent as `bytes_written` and §9.4's trail as the
+        // same field, so a record that carried the wrong number would put
+        // a self-contradictory `secret_provided` in front of an agent and
+        // a false write size in front of an operator.
+        assert_eq!(
+            payload["data"]["bytes_written"], 8,
+            "`hunter2` and a newline is 8 bytes; the record carried something else: \
+             {payload}"
+        );
+        // **One resolution and one call, in that order.** The single
+        // `binding_resolved` is what says the value the child received was
+        // the listener's and not a second one this call fetched; the two
+        // tool lines are §5.2's per-call pair, which the pure-autofill rows
+        // deliberately do not have.
+        assert_eq!(
+            sc.kinds(&s.id),
+            vec![
+                "binding_resolved".to_string(),
+                "secret_input_request".to_string(),
+                "secret_input_resolved".to_string(),
+            ]
+        );
+        // And §9.4's own record of the outcome, which is the trail an
+        // operator reads afterwards — `user_cancelled` here would be the
+        // defect written down rather than merely reported.
+        let resolved = sc
+            .audit(&s.id)
+            .into_iter()
+            .find(|e| e["kind"] == "secret_input_resolved")
+            .expect("the resolution line");
+        assert_eq!(
+            (
+                resolved["outcome"].as_str(),
+                resolved["bytes_written"].as_u64()
+            ),
+            (Some("secret_provided"), Some(8)),
+            "the audit trail records the call as cancelled, or the wrong size: \
+             {resolved}"
+        );
+        assert!(
+            server.attach_hub().outstanding_secret(&s.id).is_none(),
+            "the request the call was answered about is still outstanding"
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **`sudo` asking twice: the second prompt is not answered by the
+    /// first prompt's credential, and must not be reported as if it
+    /// were.**
+    ///
+    /// This is the shape that makes an *episode* the wrong key. §8.3's
+    /// edge is the tty's `ECHO` bit sampled per output chunk, so
+    /// `stty -echo; read x; read y; stty echo` is **one** episode with two
+    /// reads: `Session::secret_episode` moves once, and there is one
+    /// `AwaitingSecretLeft` for both. A closer that resolved its word by
+    /// asking *"was this episode answered?"* hands the second read's raise
+    /// the first read's credential — reporting `fulfilled`, with the first
+    /// value's byte count, for a prompt nobody answered. Measured before
+    /// the answer became a property of the raise:
+    ///
+    /// ```text
+    /// buffer  = Password: second=1 left=1;got=HUNTER2    # read one answered, read two not
+    /// frames  = AwaitingSecret(a) Closed(a, fulfilled)   # read one — correct
+    ///           AwaitingSecret(b) Closed(b, fulfilled)   # read two — a lie
+    /// ```
+    ///
+    /// It is the same lie GH #105 is about, pointed the other way, and it
+    /// is the one direction `inject_resolved`'s own note calls out: a
+    /// value the child never received must not be reported `fulfilled`.
+    ///
+    /// The claim is therefore made **once, by the raise that announces the
+    /// edge**, and the record is taken when claimed — so the second read's
+    /// raise finds nothing and closes `cancelled`, which is the truth.
+    #[tokio::test]
+    async fn the_second_read_of_one_echo_off_run_is_not_answered_by_the_firsts_credential() {
+        let mut sc = Scratch::new("tworeads");
+        let child_gate = sc.path("child.gate");
+        let leave = sc.path("leave.gate");
+        let mut b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        // One use, so the call below falls through to the prompt path and
+        // raises for the **second** read instead of resolving a credential
+        // of its own and answering it. The row is about which prompt the
+        // first credential is reported against, so there has to be exactly
+        // one credential.
+        b.max_uses = Some(1);
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+        let s = session_running(
+            Some(PROD_PROFILE),
+            "ssh",
+            &["prod-01"],
+            &gated(&child_gate, &echo_off_two_reads_second_abandoned(&leave)),
+        );
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        server.watch_for_autofill(&s);
+        let forwarder = spawn_forwarder(&server, &s, None);
+        std::fs::write(&child_gate, b"go").expect("release the child");
+
+        // Read one is answered by the autofill, and the child moves on to
+        // read two **without echo coming back** — the premise.
+        buffer_until(&s, b"second=1", 20).await;
+        assert_eq!(
+            s.line_discipline().echo,
+            Some(false),
+            "echo came back between the two reads, so this is two episodes and the \\
+             row is not about the shape it names"
+        );
+        assert_eq!(
+            s.secret_episode(),
+            1,
+            "two reads inside one `stty -echo` region are one episode; if they are \\
+             not, the key this row is about is not the one in use"
+        );
+
+        // A raise for read two. **A tool call**, which is what an agent
+        // that saw the second prompt would do, and the producer whose
+        // raise names no particular read.
+        let call = {
+            let server = server.clone();
+            let args = secret_args(&s.id, 20);
+            tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !server.attach_hub().secrets().has_waiter(&s.id) {
+            assert!(
+                !call.is_finished(),
+                "the call answered itself instead of raising for the second read"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the call never reached the prompt path"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Read two is abandoned: echo comes back with nothing written to it.
+        std::fs::write(&leave, b"go").expect("release the child");
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert_eq!(
+            occurrences(&seen, b"got="),
+            1,
+            "the child completed more than one echo-off read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        let payload = body(
+            &tokio::time::timeout(Duration::from_secs(60), call)
+                .await
+                .expect("the call never returned")
+                .expect("the call task")
+                .expect("request_secret_input"),
+        );
+        assert_eq!(
+            payload["status"], "secret_cancelled",
+            "the second prompt was reported answered by the first prompt's \\
+             credential: {payload}"
+        );
+        assert_eq!(
+            payload["data"]["reason"], "user_cancelled",
+            "the child abandoned the read, which is what `user_cancelled` names: \\
+             {payload}"
+        );
+        // And the frame every attached client saw agrees with it.
+        //
+        // **Selected by id, because there are two closures here and the
+        // first is `fulfilled` and correct**: read one's raise really was
+        // answered by the credential, and the autofill closed it itself. A
+        // `wait_for` that took the first `SecretRequestClosed` would
+        // assert against that one and never reach this row's subject.
+        let second_id = payload["data"]["request_id"]
+            .as_str()
+            .expect("the call names its request")
+            .to_string();
+        let wanted = second_id.clone();
+        let closed = client
+            .wait_for("SecretRequestClosed for the second read", move |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { request_id, .. }
+                    if *request_id == wanted)
+            })
+            .await;
+        let ServerFrame::SecretRequestClosed { outcome, .. } = closed else {
+            panic!("wait_for returned the wrong frame");
+        };
+        assert_eq!(
+            outcome, "cancelled",
+            "the client was told the second prompt was fulfilled"
+        );
+        // **The pairing, and the anti-vacuity.** Read *one* was closed
+        // `fulfilled` on this same client, so the `cancelled` above is a
+        // distinction this code drew and not a word it always sends.
+        assert!(
+            client.has(
+                |f| matches!(f, ServerFrame::SecretRequestClosed { request_id, outcome }
+                if *request_id != second_id && outcome == "fulfilled")
+            ),
+            "read one was never reported fulfilled, so the assertion above is not a \
+             distinction: {:?}",
+            client.seen
+        );
+        assert_eq!(
+            sc.kinds(&s.id).first().map(String::as_str),
+            Some("binding_resolved"),
+            "exactly one credential was resolved, and it is the first read's"
+        );
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+        let _ = forwarder.await;
+    }
+
+    /// **A write the *writer* declines records nothing, so a late raise is
+    /// still `cancelled`.**
+    ///
+    /// `a_declined_write_closes_the_request_cancelled_rather_than_fulfilled`
+    /// pins the word the autofill itself sends when it had a raise to
+    /// close. This is the other half, on GH #105's path: the slot was
+    /// **vacant**, so the autofill closes nothing and says nothing, and
+    /// the only thing that could later report `fulfilled` is a record.
+    /// There must not be one.
+    ///
+    /// **Its provider resolves and the writer refuses**, which is the case
+    /// `a_late_raise_for_a_prompt_nothing_answered_still_closes_cancelled`
+    /// cannot reach: that row's provider is an `exit 3` that never gets as
+    /// far as the write queue. Measured: recording on the `Declined` arm
+    /// survives every other row in this module, and would report
+    /// `fulfilled` with `bytes_written: 0` for a credential the child
+    /// never received — `inject_resolved`'s own note names that as the
+    /// thing not to do.
+    #[tokio::test]
+    async fn a_declined_write_records_no_answer_for_a_late_raise_to_claim() {
+        let mut sc = Scratch::new("declinedlate");
+        let child_gate = sc.path("child.gate");
+        let leave = sc.path("leave.gate");
+        let gate = sc.path("gate");
+        let late = sc.path("late.gate");
+        let b = sc.binding(
+            "prod-ssh",
+            PROD_PROFILE,
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                gate.display()
+            ),
+        );
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+        let s = session_running(
+            Some(PROD_PROFILE),
+            "ssh",
+            &["prod-01"],
+            &gated(&child_gate, &echo_off_then_visibly_leaves(&leave)),
+        );
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let mut client = attach_fake(&server, &s.id);
+        server.watch_for_autofill(&s);
+        // Held, so the raise lands after the write is refused — the
+        // ordering GH #105 is about, with nothing to report.
+        let forwarder = spawn_forwarder(&server, &s, Some(late.clone()));
+        std::fs::write(&child_gate, b"go").expect("release the child");
+
+        await_prompt(&s, b"Password: ").await;
+        await_ran(&sc, "prod-ssh").await;
+
+        // The child leaves the read while the provider is still blocked,
+        // so the write is refused `NotEchoOff` rather than never made.
+        std::fs::write(&leave, b"go").expect("release the child");
+        await_echo_on(&s).await;
+        std::fs::write(&gate, b"go").expect("open the gate");
+        await_audit_kind(&sc, &s.id, "binding_resolved").await;
+
+        std::fs::write(&late, b"go").expect("release the forwarder");
+        let raised = client.wait_for("AwaitingSecret", is_awaiting).await;
+        let ServerFrame::AwaitingSecret { request_id, .. } = raised else {
+            panic!("wait_for returned the wrong frame");
+        };
+        let closed = client
+            .wait_for("SecretRequestClosed", |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { .. })
+            })
+            .await;
+        let ServerFrame::SecretRequestClosed {
+            request_id: closed_id,
+            outcome,
+        } = closed
+        else {
+            panic!("wait_for returned the wrong frame");
+        };
+        assert_eq!(
+            (closed_id.as_str(), outcome.as_str()),
+            (request_id.as_str(), "cancelled"),
+            "a write the writer declined was reported as fulfilled"
+        );
+        // The pairing: the value really was not written, so `cancelled` is
+        // the truth rather than an accident of the arrangement.
+        assert!(
+            !contains(&buffered(&s), PROBE.as_bytes()),
+            "the credential reached the ring buffer"
+        );
+        assert_eq!(
+            s.writes_performed(),
+            0,
+            "something was written, so the writer did not decline"
+        );
+
+        client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+        let _ = forwarder.await;
+    }
+
+    /// **Three attached clients on one edge: every connection's raise is
+    /// answered, not just the first one to ask.**
+    ///
+    /// §7.5's raise is *per connection* and they do not coordinate —
+    /// `raise_secret_on_edge` is idempotent, so ordinarily the first
+    /// allocates and the rest get the same request back. But the autofill
+    /// can close that request **between** two connections reacting to the
+    /// same edge, and then the second one finds the slot vacant again and
+    /// allocates a request of its own. It announces the read the
+    /// credential answered, so it must be closed `fulfilled`.
+    ///
+    /// **This row exists because a guard was written that broke it.**
+    /// `inject_resolved` recorded the answer only when it had found the
+    /// slot `Vacant`, on the reasoning that a raise it *took* has already
+    /// been reported and there is nothing left for a later raise to learn.
+    /// That is true of one connection and false of two: with the guard,
+    /// the second client is told `cancelled` for a prompt that was
+    /// answered, which is GH #105 again with an extra connection.
+    ///
+    /// **And the third client is why the record is read rather than
+    /// taken.** A draft removed it on the first claim — "one credential
+    /// answers one prompt" — and a review lane added a third connection
+    /// and measured `outcome_c=cancelled`: the same prompt reported two
+    /// ways depending on which client a human was looking at, which is
+    /// this change's own defect one client further out. What keeps the
+    /// *next read* of an echo-off run from claiming is not the take; it is
+    /// that the next read's raise is a tool call and is never entitled
+    /// (`only_the_edge_raise_claims_a_recorded_answer`,
+    /// `the_second_read_of_one_echo_off_run_is_not_answered_by_the_firsts_credential`).
+    ///
+    /// Recording unconditionally is safe for the same reason: only a raise
+    /// reacting to the edge may claim at all, and every such raise for one
+    /// episode announces the one read the credential answered.
+    #[tokio::test]
+    async fn every_connections_raise_on_one_edge_is_answered_not_just_the_first() {
+        let mut sc = Scratch::new("twoclients");
+        let child_gate = sc.path("child.gate");
+        let gate = sc.path("gate");
+        let late = sc.path("late.gate");
+        let b = sc.binding(
+            "prod-ssh",
+            PROD_PROFILE,
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                gate.display()
+            ),
+        );
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log());
+        let s = session_running(
+            Some(PROD_PROFILE),
+            "ssh",
+            &["prod-01"],
+            &gated_echo_off(&child_gate),
+        );
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let late_c = sc.path("late-c.gate");
+        let mut a = attach_fake(&server, &s.id);
+        let mut b_client = attach_fake(&server, &s.id);
+        let mut c_client = attach_fake(&server, &s.id);
+        server.watch_for_autofill(&s);
+        // Connection A reacts at once; B and C are held until after the
+        // credential has landed, which is the ordering that gives each of
+        // them a request of its own rather than A's. C is released only
+        // after B's has been closed, so it allocates a third.
+        let fwd_a = spawn_forwarder(&server, &s, None);
+        let fwd_b = spawn_forwarder(&server, &s, Some(late.clone()));
+        let fwd_c = spawn_forwarder(&server, &s, Some(late_c.clone()));
+        std::fs::write(&child_gate, b"go").expect("release the child");
+
+        await_prompt(&s, b"Password: ").await;
+        await_ran(&sc, "prod-ssh").await;
+        // A's raise, provably inside the provider's window — so the
+        // autofill *takes* it rather than finding the slot vacant.
+        let raised = a.wait_for("AwaitingSecret", is_awaiting).await;
+        let ServerFrame::AwaitingSecret {
+            request_id: id_a, ..
+        } = raised
+        else {
+            panic!("wait_for returned the wrong frame");
+        };
+        std::fs::write(&gate, b"go").expect("open the gate");
+
+        buffer_until(&s, b"got=HUNTER2", 20).await;
+        let closed_a = a
+            .wait_for("SecretRequestClosed", |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { .. })
+            })
+            .await;
+        let ServerFrame::SecretRequestClosed {
+            request_id,
+            outcome,
+        } = closed_a
+        else {
+            panic!("wait_for returned the wrong frame");
+        };
+        assert_eq!(
+            (request_id.as_str(), outcome.as_str()),
+            (id_a.as_str(), "fulfilled"),
+            "the raise the autofill took was not closed fulfilled"
+        );
+
+        // Now B reacts to the same edge, against a slot that is vacant
+        // again.
+        std::fs::write(&late, b"go").expect("release the second forwarder");
+        let first_id = id_a.clone();
+        let raised_b = b_client
+            .wait_for("a second AwaitingSecret", move |f| {
+                matches!(f, ServerFrame::AwaitingSecret { request_id, .. } if *request_id != first_id)
+            })
+            .await;
+        let ServerFrame::AwaitingSecret {
+            request_id: id_b, ..
+        } = raised_b
+        else {
+            panic!("wait_for returned the wrong frame");
+        };
+        let wanted = id_b.clone();
+        let closed_b = b_client
+            .wait_for("SecretRequestClosed for the second raise", move |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { request_id, .. }
+                    if *request_id == wanted)
+            })
+            .await;
+        let ServerFrame::SecretRequestClosed { outcome, .. } = closed_b else {
+            panic!("wait_for returned the wrong frame");
+        };
+        assert_eq!(
+            outcome, "fulfilled",
+            "the second connection was told nobody answered a prompt that was \
+             answered — GH #105 with one more client"
+        );
+
+        // And the third, which is the one a record removed on first claim
+        // would have told `cancelled`.
+        std::fs::write(&late_c, b"go").expect("release the third forwarder");
+        let seen_ids = [id_a.clone(), id_b.clone()];
+        let raised_c = c_client
+            .wait_for("a third AwaitingSecret", move |f| {
+                matches!(f, ServerFrame::AwaitingSecret { request_id, .. }
+                    if !seen_ids.contains(request_id))
+            })
+            .await;
+        let ServerFrame::AwaitingSecret {
+            request_id: id_c, ..
+        } = raised_c
+        else {
+            panic!("wait_for returned the wrong frame");
+        };
+        let wanted_c = id_c.clone();
+        let closed_c = c_client
+            .wait_for("SecretRequestClosed for the third raise", move |f| {
+                matches!(f, ServerFrame::SecretRequestClosed { request_id, .. }
+                    if *request_id == wanted_c)
+            })
+            .await;
+        let ServerFrame::SecretRequestClosed { outcome, .. } = closed_c else {
+            panic!("wait_for returned the wrong frame");
+        };
+        assert_eq!(
+            outcome, "fulfilled",
+            "the third connection was told nobody answered a prompt the first two \
+             were told was answered — one prompt, two words, decided by which \
+             client a human is on"
+        );
+        assert_eq!(
+            sc.kinds(&s.id),
+            vec!["binding_resolved".to_string()],
+            "three raises are one resolution, not three"
+        );
+
+        a.unregister(&server);
+        b_client.unregister(&server);
+        c_client.unregister(&server);
+        let _ = s.signal(Signal::Kill);
+        let _ = fwd_a.await;
+        let _ = fwd_b.await;
+        let _ = fwd_c.await;
+    }
+
     /// **The production wiring**, which none of the rows above touches.
     ///
     /// Every row above arms the listener by hand, so all five would pass
@@ -6171,6 +7308,467 @@ mod tests {
         let _ = s.signal(Signal::Kill);
     }
 
+    // ==================== GH #106: the window ahead of the subscription
+    //
+    // **Every autofill row above this comment gates its child**, and
+    // [`start_session_arms_the_echo_drop_watcher`] — the one row that
+    // touches the production wiring — opens its gate *after*
+    // `start_session` has returned, deliberately. That is what made the
+    // suite structurally blind to GH #106: one statement inserted between
+    // `Session::new` and the `subscribe_events()` in `watch_for_autofill`
+    // silently disabled autofill for every child fast enough to prompt
+    // inside it, with all of the above green.
+    //
+    // The three rows below are the ones a gate cannot express. All three
+    // drive `HoldfastServer::autofill_arm_delay`, which is the width of
+    // that window turned into an argument, and between them they pin the
+    // replay from every side: an edge that is **lost** must still be
+    // answered, an edge that is **delivered** must not be answered twice,
+    // and a region that is **over** must not be answered at all.
+
+    /// How long `start_session` waits before arming, in the **lost-edge**
+    /// row below.
+    ///
+    /// **A constant because every assertion about that row's arrangement
+    /// is relative to it**, not because five seconds is special. The issue
+    /// measured 15 ms taking an ungated row to 6/6 red and 5 ms to 0/8, so
+    /// the window only has to outlast one `fork`/`exec`; the rest is
+    /// margin, and margin is what lets the row *prove* the ordering from a
+    /// monotonic clock rather than assume it. Overrunning it is an
+    /// assertion about the arrangement and never a quiet pass.
+    const LOST_EDGE_WINDOW: Duration = Duration::from_secs(5);
+
+    /// The same, for the **delivered-edge** row — and five times as long,
+    /// which is measured rather than cautious.
+    ///
+    /// That row has to get its child from *gated* to *prompting* inside
+    /// the window, and [`gated`] polls with `sleep 1`: the budget is a
+    /// second of granularity plus however long a loaded box takes to
+    /// schedule a shell, not one `fork`/`exec`. At two seconds it failed
+    /// **3 runs in 12** of the whole `secret::binding` set at
+    /// `--test-threads=16` pinned to two cores, as *"the child is not at
+    /// its first echo-off region"*.
+    const DELIVERED_EDGE_WINDOW: Duration = Duration::from_secs(10);
+
+    /// The same, for the **armed-late** row, which budgets no child work
+    /// at all: it exists only so the row can wait past a replay check that
+    /// has provably run. Twice this is the whole of that row's waiting.
+    const ARM_ORDERING_DELAY: Duration = Duration::from_secs(1);
+
+    /// The **production wiring with nothing gated**: a child that draws
+    /// its credential prompt before `start_session` has armed the
+    /// listener is still autofilled (GH #106).
+    ///
+    /// The defect: `InProcessPty::spawn` starts the child and
+    /// `Session::new` starts the reader **on a dedicated OS thread**, so
+    /// the echo-drop edge needs no `.await` to fire — while
+    /// `set_screen_config` takes the `screen.lock()` the reader holds per
+    /// chunk and `registry.insert` runs an O(live sessions) `waitpid`
+    /// sweep before `watch_for_autofill` subscribes to anything. A
+    /// `broadcast` keeps nothing for a receiver that does not exist yet,
+    /// the send discards its `Err`, and `awaiting_secret` has already
+    /// latched — so **no second edge ever fires for that prompt** and the
+    /// child sits there until the idle timeout with no client, no raise,
+    /// no audit line and no error.
+    ///
+    /// **The ordering is proved from a monotonic clock, not raced.**
+    /// `started_at` is read before the call; the delay begins after it, so
+    /// the earliest this session's listener can subscribe is
+    /// `started_at + LOST_EDGE_WINDOW`. Every wait below therefore carries that
+    /// instant as its deadline, and reaching it is an assertion failure
+    /// about the *arrangement* — which is the failure a row that merely
+    /// hoped would report as a product defect.
+    ///
+    /// **Red without the fix**, and its message is the issue's own:
+    /// `"got=HUNTER2" never reached the buffer` after the child sat at
+    /// `read x` for the full 20 s with `Password: ` drawn.
+    #[tokio::test]
+    async fn start_session_autofills_a_prompt_drawn_before_the_listener_was_armed() {
+        let mut sc = Scratch::new("armwindow");
+        const WINDOW_PROFILE: &str = "ungated-shell";
+        let b = sc.binding("shell", WINDOW_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let mut security = autofill_mode(vec![b], true);
+        // **Ungated**, which is the whole point: the operator declares
+        // `sh -c <the one echo-off fixture>` and the child races the
+        // daemon from the instant it is forked.
+        security.profiles = vec![crate::config::SessionProfile {
+            name: WINDOW_PROFILE.to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), ECHO_OFF_FIXTURE.to_string()],
+            vars: Default::default(),
+            env: Default::default(),
+            cwd: None,
+        }];
+        let server =
+            server_with(security, &sc.audit_log()).with_autofill_arm_delay(LOST_EDGE_WINDOW);
+
+        let started_at = tokio::time::Instant::now();
+        let call = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .start_session(Parameters(crate::mcp::tools::StartSessionArgs {
+                        profile: Some(WINDOW_PROFILE.into()),
+                        ..Default::default()
+                    }))
+                    .await
+            })
+        };
+
+        // `registry.insert` runs **before** the delay, so the session is
+        // reachable while its listener does not yet exist — which is also
+        // the only way this row can hold the session before the call it is
+        // racing has returned.
+        let s = await_only_session(&server, started_at + LOST_EDGE_WINDOW).await;
+        // **The edge, observed while the listener provably is not there.**
+        while !s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < started_at + LOST_EDGE_WINDOW,
+                "the child had not reached its echo-off prompt within {LOST_EDGE_WINDOW:?} of \
+                 `start_session` being called, so this row did not exercise the window \
+                 it exists for"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            s.secret_episode(),
+            1,
+            "the child ran more than one echo-off region before the listener was armed, \
+             so the replay below is not the one this row is about"
+        );
+
+        let started = tokio::time::timeout(Duration::from_secs(60), call)
+            .await
+            .expect("`start_session` never returned")
+            .expect("the `start_session` task")
+            .expect("start_session");
+        // **The witness that the window was real**, and not a second copy
+        // of [`start_session_arms_the_echo_drop_watcher`] with its gate
+        // deleted. The only thing that can make this call take
+        // `LOST_EDGE_WINDOW` is the delay it is supposed to wait *before* arming;
+        // delete that statement and the two waits above still pass on any
+        // machine, because a delivered edge works fine.
+        assert!(
+            started_at.elapsed() >= LOST_EDGE_WINDOW,
+            "`start_session` returned in {:?}, so it did not wait {LOST_EDGE_WINDOW:?} before \
+             arming and the edge above was never at risk of being missed",
+            started_at.elapsed()
+        );
+        assert_eq!(
+            body(&started)["data"]["session_id"]
+                .as_str()
+                .expect("a session id"),
+            s.id,
+            "the row held a different session from the one the call created"
+        );
+
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert_eq!(
+            occurrences(&seen, b"got="),
+            1,
+            "the child completed more than one read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "echo was off, so the value must not be in the buffer:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert!(sc.ran("shell"), "the binding's provider never ran");
+        assert_eq!(
+            sc.kinds(&s.id)
+                .iter()
+                .filter(|k| *k == "binding_resolved")
+                .count(),
+            1,
+            "one lost edge is one resolution: {:?}",
+            sc.kinds(&s.id)
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **A replayed edge and the delivered edge for the same read are one
+    /// autofill — and the next episode is still its own** (GH #106).
+    ///
+    /// This is the half a bare `if is_awaiting_secret() { autofill }`
+    /// gets wrong, and the reason the issue's own note called that
+    /// caution correct. The listener subscribes *first* here, so the edge
+    /// is delivered rather than lost; the delay then sits between the
+    /// subscription and the replay check, so by the time the check runs
+    /// the same episode is readable off the flag **and** sitting unread in
+    /// the receiver. Without the `episode <= answered` guard that is two
+    /// provider runs, two `max_uses` claims and two `binding_resolved`
+    /// lines for one child read — the second *injection* is refused by
+    /// `SecretIfUnread`'s `expect_writes`, but nothing refuses the rest.
+    ///
+    /// **The second episode is what bounds the first one's count**, and
+    /// that is why the child reads twice — behind its own gate, so the
+    /// row opens it rather than racing it. An absence has to be bounded
+    /// by something that provably happens after it, and a queue is
+    /// ordered: the listener cannot reach `Entered { episode: 2 }`
+    /// without having already passed `Entered { episode: 1 }`. So waiting
+    /// for the second `got=` is a wait for the guard to have been
+    /// *evaluated*, not a sleep hoping the duplicate had time to appear.
+    ///
+    /// It is also the negative that stops the repair from inverting: a
+    /// guard that suppressed everything after a replay leaves the child
+    /// blocked at its second prompt, and this row times out on
+    /// `got=` × 2 rather than passing quietly.
+    #[tokio::test]
+    async fn a_replayed_edge_and_its_delivered_twin_are_one_autofill() {
+        let mut sc = Scratch::new("replaydedup");
+        let child_gate = sc.path("child.gate");
+        let second_gate = sc.path("second.gate");
+        let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log())
+            .with_autofill_arm_delay(DELIVERED_EDGE_WINDOW);
+        // Two `stty -echo` runs, so **two** episodes — not the
+        // `echo_off_two_reads_second_abandoned` shape, which is two reads
+        // inside *one*.
+        //
+        // **The gate between them is what makes the second edge exist at
+        // all.** §8.3's edges are computed per output chunk against the
+        // tty's `ECHO` bit *sampled when that chunk is processed*, so a
+        // child that prints `got=…` and turns echo straight back off can
+        // have both land in one chunk read after the `stty -echo` — and
+        // then `now_awaiting` still reads `true`, no transition is seen,
+        // and neither `AwaitingSecretLeft` nor `Entered { episode: 2 }`
+        // is ever sent. Measured on an ungated first draft of this row:
+        // 1 failure in 12 whole-set runs at `--test-threads=16` on two
+        // cores, as *"`got=` reached the buffer 1 time(s), wanted 2"*
+        // with the second `Password: ` sitting in the buffer unanswered.
+        // Holding the child with echo **on** guarantees a chunk in
+        // between.
+        let two_episodes = format!(
+            "{ECHO_OFF_FIXTURE}; {}",
+            gated(&second_gate, ECHO_OFF_FIXTURE)
+        );
+        let s = session_running(
+            Some(PROD_PROFILE),
+            "ssh",
+            &["prod-01"],
+            &gated(&child_gate, &two_episodes),
+        );
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        let armed_at = tokio::time::Instant::now();
+        // Subscribes synchronously — so nothing here is lost — and then
+        // sleeps `DELIVERED_EDGE_WINDOW` before its replay check.
+        server.watch_for_autofill(&s);
+        std::fs::write(&child_gate, b"go").expect("release the child");
+
+        // **The collision, proved rather than assumed.** The child is at
+        // its first prompt, the *detector* says so, and the listener has
+        // not acted — so the replay check, when it runs, reads episode 1
+        // off the flag with episode 1 already queued behind it.
+        //
+        // **`is_awaiting_secret` and not [`await_prompt`], and the
+        // difference is one publication.** That helper waits on the ring
+        // buffer and then on a **live** `tcgetattr`, both of which can
+        // answer before the reader thread has classified the chunk that
+        // moves the episode counter — measured: `assert_eq!(secret_episode(),
+        // 1)` placed directly after it failed **2 runs in 12** contended,
+        // `left: 0`. The edge is what this row needs, so the edge is what
+        // it waits for.
+        await_prompt(&s, b"Password: ").await;
+        while !s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < armed_at + DELIVERED_EDGE_WINDOW,
+                "the listener's replay check ran before the child's echo drop was \
+                 classified, so the edge this row needs it to collide with had not \
+                 fired yet"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            s.secret_episode(),
+            1,
+            "the child is not at its first echo-off region"
+        );
+        assert!(
+            !sc.ran("prod-ssh"),
+            "the listener answered before its replay check — the delay is not in force, \
+             and this row is measuring an ordinary delivered edge"
+        );
+
+        // **The witness that the replay answered the first read, and not
+        // the delivered edge.** The listener's own sleep sits between its
+        // `subscribe_events` and its replay check, so nothing it does can
+        // land before `armed_at + DELIVERED_EDGE_WINDOW`; delete that statement and
+        // this credential arrives in milliseconds, from the `Entered` arm,
+        // with no collision for the guard to resolve.
+        buffer_until_count(&s, b"got=", 1, 60).await;
+        assert!(
+            armed_at.elapsed() >= DELIVERED_EDGE_WINDOW,
+            "the first read was answered {:?} after the listener was armed, which is \
+             less than the {DELIVERED_EDGE_WINDOW:?} it is supposed to wait before its replay check",
+            armed_at.elapsed()
+        );
+
+        // The second region, which the listener can only reach by having
+        // already passed `Entered { episode: 1 }`.
+        std::fs::write(&second_gate, b"go").expect("open the second gate");
+        let seen = buffer_until_count(&s, b"got=", 2, 60).await;
+        assert!(
+            !contains(&seen, PROBE.as_bytes()),
+            "echo was off for both reads, so the value must not be in the buffer:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(
+            occurrences(&seen, b"got=HUNTER2"),
+            2,
+            "both reads must have received the credential:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(
+            sc.kinds(&s.id),
+            vec!["binding_resolved".to_string(); 2],
+            "two episodes are two resolutions — a third is the replay firing again for \
+             the read it had already answered"
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **The replay is a replay of a prompt that is still up, not of the
+    /// last one there was** (GH #106).
+    ///
+    /// The listener asks [`Session::awaiting_secret_episode`], which is
+    /// the flag and the counter read as one fact, and the flag half is
+    /// what this row pins: the counter alone says *"there has been an
+    /// echo-off region"*, and resolving a credential on the strength of
+    /// that puts a provider run, a `max_uses` claim and a
+    /// `binding_resolved` line behind a prompt that is already answered
+    /// and gone. The write itself would be declined `NotEchoOff` —
+    /// nothing else would be.
+    ///
+    /// **It is also the only row that reaches the rule the `Lagged` arm
+    /// uses.** A listener armed by `start_session` always starts at
+    /// episode `0`, so the flag check makes no difference there —
+    /// verified by mutation, which is why this row exists rather than an
+    /// explanation. A listener that *lost its place* is the case where the
+    /// session can be at episode `n` with echo long since back, and there
+    /// is no way to force a `broadcast` lag without a capacity knob; this
+    /// arranges the same **state** by arming late instead.
+    ///
+    /// **The absence is bounded by the knob rather than by a sleep.** The
+    /// listener's replay check runs `ARM_ORDERING_DELAY` after it is armed, so at
+    /// twice that it has provably run; what follows it is a second
+    /// echo-off region that *must* be answered, which is what stops the
+    /// row passing against a listener that does nothing at all.
+    #[tokio::test]
+    async fn a_listener_armed_after_the_prompt_is_gone_resolves_nothing() {
+        let mut sc = Scratch::new("armedlate");
+        let leave = sc.path("leave.gate");
+        let gate = sc.path("second.gate");
+        let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let server = server_with(autofill_mode(vec![b], true), &sc.audit_log())
+            .with_autofill_arm_delay(ARM_ORDERING_DELAY);
+        // One echo-off region the child leaves **visibly** — the print
+        // after `stty echo` is what produces the `AwaitingSecretLeft` edge
+        // at all — and then a second one it holds at a gate.
+        let first = echo_off_then(&format!(
+            "until [ -f '{}' ]; do sleep 1; done; stty echo; printf 'left=1\\n'",
+            leave.display()
+        ));
+        let child = format!("{first}; {}", gated(&gate, ECHO_OFF_FIXTURE));
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], &child);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+
+        // Region one, opened and closed with nothing armed.
+        //
+        // **Both halves wait on the detector**, not on the ring buffer and
+        // not on a live `tcgetattr`: those are published earlier, and a
+        // row that let the child leave before the *entry* was classified
+        // could see the whole region coalesced into one chunk and no
+        // episode at all.
+        await_prompt(&s, b"Password: ").await;
+        let entered_by = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < entered_by,
+                "the child drew its prompt with `ECHO` off and the detector never \
+                 classified the region this row needs it to have left"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::write(&leave, b"go").expect("release the child");
+        buffer_until(&s, b"left=1", 20).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child printed after `stty echo` and the session is still latched \
+                 in `AwaitingSecret`"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            s.secret_episode(),
+            1,
+            "the child is not one echo-off region past its start"
+        );
+
+        let armed_at = tokio::time::Instant::now();
+        server.watch_for_autofill(&s);
+        tokio::time::sleep_until(armed_at + ARM_ORDERING_DELAY * 2).await;
+        assert!(
+            !sc.ran("prod-ssh"),
+            "the listener resolved a credential for an echo-off region that was over \
+             before it was armed"
+        );
+        assert!(
+            sc.kinds(&s.id).is_empty(),
+            "the trail records work for a prompt that no longer exists: {:?}",
+            sc.kinds(&s.id)
+        );
+
+        // **The clock for that absence**: the listener is alive and the
+        // next region proves it.
+        std::fs::write(&gate, b"go").expect("open the second gate");
+        let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
+        assert_eq!(
+            occurrences(&seen, b"got="),
+            1,
+            "the child completed more than one read:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        assert_eq!(
+            sc.kinds(&s.id),
+            vec!["binding_resolved".to_string()],
+            "one live region is one resolution"
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// The one session this server has, as soon as it has one.
+    ///
+    /// **A poll on the registry and not on the call's return value**,
+    /// because the lost-edge row above holds the session while the
+    /// `start_session` that created it is still running: the insert
+    /// happens before the window it measures, and the response after it.
+    async fn await_only_session(
+        server: &HoldfastServer,
+        deadline: tokio::time::Instant,
+    ) -> Arc<Session> {
+        loop {
+            let all = server.registry.all();
+            assert!(
+                all.len() < 2,
+                "this server was supposed to have one session"
+            );
+            if let Some(s) = all.into_iter().next() {
+                return s;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "`start_session` had not registered its session in time"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
     // ================================= GH #55: the agent's environment
     //
     // **Profiles stopped the agent authoring the command line and left it
@@ -6229,6 +7827,34 @@ mod tests {
              printf '%s' \"$x\" > '{}'; printf 'got=%s\\n' \"$x\"",
             sink.display()
         )
+    }
+
+    /// Poll until a capturing fixture has actually written its capture,
+    /// and hand back what it wrote.
+    ///
+    /// **The content, not the existence, and the difference is a race.**
+    /// `printf '%s' "$x" > '<sink>'` is two steps — the redirection
+    /// creates the file, the builtin fills it — with a gap the kernel may
+    /// deschedule the child in. A poll on `Path::exists` can return while
+    /// the file is still empty, and the `assert_eq!` that follows then
+    /// compares `""` against the value and reports a broken fixture for
+    /// what is a wait that stopped early. Same class as the stale ring
+    /// buffer in [`await_prompt`]: a wait on a proxy for the thing the
+    /// next line needs.
+    ///
+    /// `empty_means` is the anti-vacuity message the old existence loop
+    /// carried, and it still means the same thing — nothing was captured
+    /// — because a fixture that ran wrote a non-empty value.
+    async fn await_capture(sink: &Path, empty_means: &str) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let seen = std::fs::read_to_string(sink).unwrap_or_default();
+            if !seen.is_empty() {
+                return seen;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{empty_means}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Start one session through the **real** tool and hand back its id,
@@ -6312,17 +7938,13 @@ mod tests {
         await_prompt(&planted, b"Password: ").await;
         write_as_a_human(&planted, b"probe-value\n").await;
         // The agent's program ran and captured what was typed at it.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while !sink.exists() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the planted `sh` never captured anything, so every absence below is \
-                 a claim about a fixture that does not work"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
         assert_eq!(
-            std::fs::read_to_string(&sink).unwrap_or_default(),
+            await_capture(
+                &sink,
+                "the planted `sh` never captured anything, so every absence below is \
+                 a claim about a fixture that does not work",
+            )
+            .await,
             "probe-value",
             "the planted program captured something other than the value typed at it"
         );
@@ -6453,11 +8075,26 @@ mod tests {
         let sink = sc.path("stolen");
         // The agent's redirection: sourced by `bash` *before* the
         // operator's script, and it replaces `stty`/`read` with its own.
+        //
+        // **The two-step write is spelled out, and that is the window
+        // held open on purpose** — the `MockPty::set_read_delay` idiom,
+        // as in the two rows above. `> '<sink>'` creates the file and the
+        // builtin fills it; those are two steps in any spelling, and
+        // writing them apart is a *more* faithful model of the
+        // redirection than collapsing them. It is what makes
+        // `await_capture` provably load-bearing: with the wait written as
+        // `while !sink.exists()` this row fails **6 in 6** on `left: ""`.
+        // Without the gap, reverting `await_capture` reproduces at
+        // roughly **1 in 8** — an intermittent rather than a red, which
+        // is the state this whole section exists to get out of, and the
+        // reason the gap is committed rather than injected for one
+        // measurement and dropped.
         let preload = sc.path("preload.sh");
         std::fs::write(
             &preload,
             format!(
-                "read() {{ builtin read \"$@\"; printf '%s' \"${{!1}}\" > '{}'; }}\n",
+                "read() {{ builtin read \"$@\"; : > '{0}'; sleep 1; \
+                 printf '%s' \"${{!1}}\" > '{0}'; }}\n",
                 sink.display()
             ),
         )
@@ -6508,17 +8145,13 @@ mod tests {
         std::fs::write(&gate, b"go").expect("open the gate");
         await_prompt(&planted, b"Password: ").await;
         write_as_a_human(&planted, b"probe-value\n").await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while !sink.exists() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "`BASH_ENV` captured nothing, so every absence below is a claim about a \
-                 fixture that does not work — the operator's binary ran unmodified"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
         assert_eq!(
-            std::fs::read_to_string(&sink).unwrap_or_default(),
+            await_capture(
+                &sink,
+                "`BASH_ENV` captured nothing, so every absence below is a claim about a \
+                 fixture that does not work — the operator's binary ran unmodified",
+            )
+            .await,
             "probe-value",
             "the redirection captured something other than the value typed at it"
         );

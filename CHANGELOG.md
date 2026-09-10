@@ -22,6 +22,505 @@ trigger as a side effect of writing release notes.
 
 ### Fixed
 
+- **§9.6's autofill no longer misses a credential prompt drawn before its
+  listener was armed** (GH #106). `start_session` spawns the child,
+  `Session::new` starts the reader on a **dedicated OS thread** — so the
+  echo-drop edge needs no `.await` to fire — and only three statements
+  later does `watch_for_autofill` call `subscribe_events`. In between sit
+  a `set_screen_config` that takes the `screen.lock()` the reader holds
+  per chunk and a registry insert that is O(live sessions) `waitpid`s. A
+  `tokio::sync::broadcast` keeps nothing for a receiver that does not
+  exist yet and the send discards its `Err`, so an edge that fired in
+  there was gone — and because `awaiting_secret` had already latched, **no
+  second edge ever fired for that prompt**. The child sat at its
+  credential prompt until the idle timeout with no client, no raise, no
+  audit line and no error: the failure mode is silence, on a path whose
+  whole premise is that nobody is watching. Measured on the issue with a
+  delay inserted above the call: 3/3 red at 500 ms, 6/6 red at 15 ms, 0/8
+  at 5 ms. The threshold is the child's `fork`/`exec` cost, so *narrow*
+  was a property of the machine rather than a guarantee — the identical
+  window in `attach::conn::forward_events` was a few instructions wide
+  until one unrelated audit write made it ~1.5 ms.
+
+  **Closed by a replay that is de-duplicated against GH #105's episode.**
+  The listener asks the session, once, whether it is *currently* inside an
+  echo-off region and which one; it answers that prompt and remembers the
+  number. The naive form — a bare `if is_awaiting_secret() { autofill }` —
+  is wrong and was correctly refused before: on an Entered/Left/Entered
+  sequence straddling the check it answers the second prompt twice, which
+  is two provider runs, two `max_uses` claims and two `binding_resolved`
+  lines for one child read. Only the second *injection* is refused, by
+  `SecretIfUnread`'s `expect_writes`; nothing refuses the rest.
+
+  **The key had to be an episode and the read of it had to be atomic.**
+  `Session::awaiting_secret_episode` publishes the flag and the counter as
+  one fact: the flag is read **first**, because a caller that reads the
+  counter first can have a new episode start between its two loads and
+  then label the prompt in front of it with the number of the one before.
+  The reader thread now bumps the counter *before* it latches the flag and
+  stores the flag `Release` against that read's `Acquire`, which needs the
+  transition test to be a load and a store rather than a `swap` — sound
+  because this loop is the only writer of that flag in the tree, and
+  stated on both sides so a second writer is a change somebody has to
+  make deliberately.
+
+  **A lagged receiver is the same loss through a different door** and is
+  closed by the same function: a listener that fell behind while a
+  provider ran would otherwise leave that child blocked for good, for the
+  same reason — no next edge comes for a prompt that is still up. The
+  trigger has no row, because forcing a `broadcast` lag wants a capacity
+  knob that does not exist; the **rule** is the one the replay uses and
+  has three.
+
+  **The suite could not have caught this, and that was the harder half.**
+  Every autofill row gates its child and opens the gate after
+  `start_session` returns — including `start_session_arms_the_echo_drop_watcher`,
+  the one row on the production wiring, whose own doc says the gate is
+  deliberate. So one statement inserted between `Session::new` and the
+  subscribe silently disabled autofill for every fast child with all rows
+  green. Three new rows drive it with the window as an argument rather
+  than a race, through a `#[cfg(test)]` knob that widens it: an **ungated**
+  child through the real `start_session`, whose ordering is proved from a
+  monotonic clock and which is red without the fix with the issue's own
+  message; a delivered edge colliding with the replay, which must be one
+  autofill and not two, bounded by a second episode that cannot be reached
+  without the guard having been evaluated; and a listener armed after the
+  prompt is gone, which must resolve nothing.
+
+  Ten injected mutations, seven caught — each by the row that should catch
+  it and by no others, including both directions of the guard, the
+  pre-fix code restored, and each of the two `#[cfg(test)]` sleep sites
+  deleted, which is what stops a row that no longer arranges anything from
+  passing quietly. **The three survivors are the memory orderings
+  themselves**: `Relaxed` for the `Release`/`Acquire` pair, the counter
+  published after the flag rather than before it, and the two loads
+  reversed. All three are differences x86 cannot exhibit, and every CI job
+  is `ubuntu-24.04` on x86 — so they are recorded here rather than claimed
+  as covered.
+
+  Swept as the whole `secret::binding` set at `--test-threads=16` pinned
+  to two cores: **3 red in 12**, then **0 in 24** after the two defects
+  that sweep found in the new rows, neither of which was visible by
+  reading. A `secret_episode` assertion placed straight after
+  `await_prompt` — which waits on the ring buffer and then on a *live*
+  `tcgetattr`, both published before the reader has classified the chunk
+  that moves the counter (2 in 12, `left: 0`). And a two-episode child
+  with nothing between its regions: `got=…` and the next `stty -echo` can
+  land in one chunk, `now_awaiting` still reads `true`, and neither the
+  `Left` nor the second `Entered` is ever sent (1 in 12).
+
+- **Five `screen.rs` rows no longer read the Tier-B grid after waiting on
+  the ring buffer.** The session reader pushes a chunk into the buffer and
+  only *then* — outside the buffer lock, because §4.3 forbids holding two
+  of a session's locks at once — feeds that same chunk to `ScreenTracker`,
+  with the `wait_for_pattern` fan-out sitting in the gap. Every row here
+  polled `read_output` for a marker and then called `get_screen_state`, so
+  each was reading one surface after waiting on an earlier one that merely
+  correlates with it: the same publication skew as
+  `every_emitted_unix_field_is_a_number` below, one publication earlier in
+  the same loop. Natural rate **0 failures in 200 whole-binary runs** —
+  `taskset -c 0,1 <screen test binary> --test-threads=16`, eight lanes in
+  parallel on distinct core pairs — which is why this was reported by
+  that fix rather than folded into it.
+
+  **Proved causally, not by sampling.** A 150 ms sleep in the reader
+  between `buffer.push` and `screen.feed` turns the whole class
+  deterministic: **5 rows red in every one of 3 runs before, 0 red in 6
+  runs and then in a further 200 after**, same probe both sides. Each row
+  failed on its own assertion and none on a timeout —
+  `a_single_cell_change_diffs_small_and_replays_to_the_new_screen` on
+  "the TUI never painted" with 24 empty rows,
+  `a_secret_on_screen_is_redacted_in_both_the_grid_and_the_diff` on "the
+  diff carries no redaction marker" with an empty diff,
+  `disabling_redaction_on_a_screen_read_returns_the_secret_and_is_audited`
+  on an empty row 1, `resize_reflows_the_tracked_grid` on "the line was
+  clipped at the old width" with the *previous* paint still on row 0, and
+  `entering_the_alternate_screen_enables_tier_b_with_no_agent_call` on
+  `screen_tracking` still reading `"off"`, because it is the feed that
+  turns Tier B on.
+
+  Each row now waits on the surface it reads. Three poll the rendered grid
+  for the paint's own marker; the alt-screen row waits on
+  `Session::screen_tracking`, which reads the policy flag the reader sets
+  and — unlike `get_screen_state` — does not enable Tier B, the property
+  that row exists to prove. The two rows holding a `base_revision` wait on
+  `Session::cursor_signal` instead, because only four revisions are
+  retained and a `get_screen_state` poll would evict the base and degrade
+  the diff to a full grid: one flake traded for another. The waits are
+  bounded and their elapsed arms fail (10.6 s and 10.5 s observed, with
+  the grid and the last cursor in the message).
+
+  **No product change, and no new accessor.** The reader's ordering is the
+  documented one, the rendered grids were never wrong, and the fix lives
+  entirely in the test file on accessors that already ship. Every
+  anti-vacuity guard is untouched and still fires: neutering the new wait
+  to a predicate that is always true fails the named row 3 times in 3 on
+  its own "the TUI never painted" guard, and deleting the fixture's
+  one-cell paint fails it 2 times in 2 on the cursor wait.
+
+- **A fulfilled secret request is no longer reported as `cancelled`**
+  (GH #105). Two producers can close a secret request and they race:
+  §9.6's autofill through `take_if_unadopted_matching`, and a connection's
+  `hub.raise_secret` followed by its `AwaitingSecretLeft` arm. When the
+  autofill won, the slot answered `Vacant`, the credential was written to
+  the child **successfully**, and the connection then raised *late* — after
+  which the echo return closed that raise as `cancelled`. §7.5's `outcome`
+  said nobody answered a prompt the daemon had just answered, and the human
+  had first been shown an `AwaitingSecret` affordance for a read that was
+  already satisfied. It is the exact mirror of the case `inject_resolved`
+  already guards, where a declined write would have claimed `fulfilled` for
+  a value the child never received.
+
+  **`AwaitingSecretLeft` was inferring a fact it does not carry.** Echo
+  coming back is equally true of a human aborting, a child abandoning its
+  read, and a credential the daemon wrote — the last being the case where
+  echo came back *because* the request was answered. So the answer is now
+  carried by the request: a write that finds no raise to close records
+  `{episode, bytes_written}` on the session's slot, and the **one raise
+  that reacts to §8.3's echo-drop edge** claims it. The closer then reports
+  what the request holds rather than inferring from the edge.
+
+  **The claim is a take made by that raise at its close, and not a lookup
+  keyed by the edge** — because an episode is one contiguous run of
+  echo-off and **not one child read**. `stty -echo; read x; read y; stty echo` is a single
+  episode with two reads, which is `sudo` asking twice. A closer that asked
+  *"was this episode answered?"* handed the second read's raise the first
+  read's credential and reported `fulfilled`, with the first value's byte
+  count, to a caller that supplied nothing — the same lie pointed the other
+  way. Found by an adversarial review lane and driven by
+  `the_second_read_of_one_echo_off_run_is_not_answered_by_the_firsts_credential`.
+  For the same reason §7.5's replay, a tool call's raise and
+  `await_secret`'s re-raise may not claim: none of them names a read.
+
+  **The claim is redeemed at the close and not at the raise**, because the
+  record is written after the writer's ack and nothing orders it against a
+  raise woken by the same broadcast send — a draft that claimed at the
+  raise was red in both positive rows with 200 ms inserted ahead of the
+  record. The close is behind a whole child round trip instead, which is a
+  wider margin rather than a happens-before; the residual fails to
+  `cancelled`, which is the behaviour before this fix rather than a new
+  lie, and `RaisedRequest::claim_episode` records what closing it properly
+  would take.
+
+  **The echo return has two closers and both carried the premise.** With a
+  client attached it is `attach::conn::forward_events`; with **nobody**
+  attached — the deployment §9.5's buffer notice exists for — it is
+  `await_secret`'s own `secret_condition_ended`, the second observer added
+  so the same child did not answer `user_cancelled` attached and `timeout`
+  unattended. Both now derive the word from one function
+  (`secret::echo_return_resolution`), and the closing arm itself is one
+  call on `AttachHub`, so a test-module copy of it cannot stay green while
+  the original is reverted — measured: it did, for every row in the first
+  revision of this fix.
+
+  **No new `outcome` value.** §7.5's set is a gated surface the web UI
+  mirrors, and from the caller's side the prompt *was* answered, so the
+  existing `fulfilled` wording is the truthful one. Nor is either
+  subscriber ordered against the other: they are independent receivers on
+  one broadcast and `broadcast::send` wakes them one at a time, which is
+  what made this reachable in the first place.
+
+  Measured, raw lib binary under `taskset -c 0,1 --test-threads=16`:
+  `the_listener_and_a_connections_raise_ride_the_same_edge` fails **1 run
+  in 50** contended, is **3 red in 3** with the issue's 20 ms delay ahead
+  of the raise, and **3 green in 3** with that same delay after the fix.
+  **Neither production arm was reachable from any test**, which two
+  reverts proved: the closing arm restored to its pre-fix form, and the
+  raising arm switched back to the unentitled `raise_secret`, each left all
+  125 `secret::` and all 45 `attach::` rows green. `forward_events` needs
+  an `Arc<Daemon>` the unit target cannot build, and the integration target
+  can install no provider that resolves. Both arms are one hub call now,
+  and `source_guards.rs` asserts they are the two calls the unit target's
+  stand-in makes — the file's idiom for a guarantee invisible from inside
+  the program.
+
+  Seven new rows drive the orderings with gates rather than sleeps.
+  Fourteen injected mutations were run against them and thirteen are
+  caught, each by the rows that should catch it and by no others — including both
+  directions of the defect, the pre-fix arm restored in the production
+  code, a record written on a declined write, a claim that reads instead of
+  taking, and a claim that ignores the episode. The fourteenth is bumping the
+  episode counter on both edges, which no row can see and which the code
+  now states as a non-property rather than a guarantee.
+
+- **`every_emitted_unix_field_is_a_number` no longer waits on the output
+  bytes for a fact only the command history carries.** The row walks every
+  payload asserting each `*_unix_*` field is a number, and refuses to pass
+  when `started_at_unix_ms` never appeared — a deliberate anti-vacuity
+  guard, since an empty walk proves nothing. `started_at_unix_ms` lives on a
+  `get_command_history` entry and nowhere else on the surface, and the row
+  reached that entry by sending `echo` and polling `read_output` for its
+  output. That is the same publication skew as
+  `no_output_is_classified_between_the_echo_sample_and_the_answer` below,
+  one publication earlier: the reader pushes a chunk into the ring buffer and
+  only *then*, outside the buffer lock per §4.3, applies that chunk's OSC 133
+  events to the history. `echo`'s `C` marker and its output bytes arrive in
+  one chunk, so a poll on the buffer returns inside a gap holding the
+  subscriber fan-out, a full `screen.feed` VT100 parse, the §4.5.1 query
+  responder, the detector lock with its `feed`/`line_discipline`/`snapshot`,
+  an `AtomicBool` swap and a `now_ms()` — and `get_command_history` then
+  answered with an empty ring. The row now waits on a closed history entry
+  (`wait_for_closed_commands`) and enters at an OSC 133 prompt rather than at
+  the first `$` in the buffer, which bash prints before the §8.5 snippet has
+  run. **2 failures in 200 whole-binary runs before, 0 in 400 after**, same
+  box and same load (`taskset -c 0,1 … --test-threads=16`, eight lanes on
+  distinct core pairs), every pre-fix failure carrying the identical `seen:`
+  list.
+
+  **No product change.** The reader's ordering is the documented one and the
+  emitted values were never wrong; the row was reading across a gap the
+  product states it leaves.
+
+  **Proved causally rather than by sampling**: a 150 ms delay between the
+  reader's `buffer.push` and its `history.lock()` fails the old form 10 times
+  in 10 with the observed message and passes the new form 10 times in 10,
+  same probe both sides. The vacuity guard is untouched and still fires —
+  renaming the emitted key to `started_at_ms` fails the repaired row 3 times
+  in 3 on that guard, and emitting the value as a string fails it 2 times in
+  2 on the number assertion.
+
+  **That probe is a deterministic amplifier for the whole defect class, so
+  `schema.rs` was swept with it and two more rows were red.**
+  `every_nested_object_a_tool_returns_has_its_key_set_pinned` carried the
+  identical arrangement — poll the buffer for `NESTED_OK`, then require
+  `get_command_history` to have an entry to enumerate — and failed 6 times
+  in 6 with `unavailable` / "this shell has emitted no OSC 133 markers";
+  it now waits the same way. `exited_session`, the fixture behind
+  `get_screen_state_on_a_dead_session_matches_its_schema` and two
+  neighbours, waited for `is_alive()` to go false and then read the grid,
+  which is precisely the mistake `Session::reader_finished`'s own
+  documentation names as GH #42: the child's death is observable one
+  scheduler slice before the reader has moved its last bytes into the
+  buffer. It failed 2 times in 2 under the probe with "the final screen is
+  empty, so `session_died carries data` is untested here" — the row's own
+  anti-vacuity guard doing its job — and now waits on the drain flag, which
+  is `Release`/`Acquire` against every `buffer.push` for exactly this.
+  With all three repaired the binary is green 63/63 under the probe, where
+  before it was 3 red.
+
+- **`interrupt`'s row no longer gates on a mode the shell raises before it
+  has handed over the terminal.** `interrupt` signals
+  `tcgetpgrp(master)`, and a shell raises `Executing` — `PS0`'s OSC 133
+  `C` marker, or bracketed paste going off — *before* it expands the
+  command's words, forks, and gives the child's group the terminal. So
+  there is a gap in which every signal Holdfast offers reads `Executing`
+  while the terminal is still the shell's own, and an interrupt issued
+  there is delivered to a group the command has not joined: the command
+  runs on, `delivered: true` notwithstanding, and the shell never comes
+  back to a prompt.
+  `interrupt_stops_a_running_command_and_leaves_the_shell_alive` gated on
+  that mode, and failed 1 whole-binary run in 30 under `taskset -c 0,1
+  --test-threads=16`.
+
+  **The gap belongs to the product, not to the test, and it is the gap a
+  real terminal has**: a Ctrl+C typed in it lands on the shell too, and
+  is lost the same way. Nothing here can close it — at the instant of the
+  call the shell really is the foreground group, and a builtin that never
+  hands over is indistinguishable from a command that has not handed over
+  yet. `interrupt`'s description now says so and says the remedy, which
+  is the one a human uses: the session still reads `Executing`, so call
+  again. The row gates on output from the job instead, which a subshell
+  cannot emit until bash has handed it the terminal.
+
+  **Measured causally rather than by sampling, and it had to be.** Over
+  1360 contended trials the command survived the interrupt in exactly the
+  9 where `tcgetpgrp` was the shell's own group, and in none of the other
+  1351 — but the natural window then stopped appearing on that box, 0 in
+  a further 4700 trials including a replay of the byte-identical binary
+  that had produced the 9. So there is no matched "after" arm here and
+  none is claimed; the causal experiment is the evidence. Injecting
+  shell-side work between the marker and the fork — a `${var//x/y}`,
+  which forks nothing — opens the window in all 30 trials it was tried in
+  with no contention at all (20 at 32 KB, 10 at 200 KB), and leaves it
+  shut in 10 of 10 against the new gate.
+  `a_job_owns_the_terminal_by_its_first_output_and_not_by_its_executing_mode`
+  pins both halves with that delay in place, so neither is measuring
+  luck.
+
+  **The 0.0.1 backend row had the same hole, behind a
+  `sleep(500ms)`.** `interrupt_reaches_the_foreground_job_not_the_shell`
+  signalled 500 ms after writing `sleep 300` and asserted the job died —
+  a flat wait standing in for the handover, which is the one precondition
+  the row exists to depend on. At that layer the precondition is
+  readable, so it now polls `foreground_group()` until it leaves the
+  shell's own group and asserts that it did. The row is 0.01 s instead of
+  0.5 s as a side effect.
+
+- **`no_output_is_classified_between_the_echo_sample_and_the_answer` no
+  longer reads the session between the reader's two publications.** The row
+  polled `Session::detection()` until the mode reached `Executing` and
+  asserted `command_count() == 1` in the next statement — but the reader
+  thread publishes those two at different instants and in that order. It
+  drops `detector_guard`, which is what makes `Executing` visible, and only
+  then takes `history.lock()` to apply the events the same `feed` returned;
+  §4.3 forbids holding two of a session's locks at once, so the gap is
+  deliberate, and an `AtomicBool` swap, a conditional `events_tx.send` and a
+  `now_ms()` sit inside it. The poll returned there. **4 failures in 200
+  whole-binary runs before, 0 in 200 after**, same box and same load
+  (`taskset -c 0,1 … --test-threads=16`), every pre-fix failure carrying the
+  same `left: 0, right: 1`.
+
+  **No product change, and the property the row is named for was never
+  violated.** `Executing` is reachable only through rungs requiring
+  `!modes.bracketed_paste`, which in this row only the injected
+  `\x1b[?2004l` clears — so the mode the poll saw was always the right
+  answer, arriving ahead of its own bookkeeping, and nothing was classified
+  in §8.3's window. The row still kills the defect it exists for: sampling
+  `line_discipline` outside the detector lock in `Session::detection` gives
+  **0 passes in 10** against the repaired row, on the `AwaitingSecret`
+  assertion.
+
+  **Proved causally rather than by sampling**: a 150 ms delay between the
+  reader's `drop(detector_guard)` and its `history.lock()` fails the old
+  form 10 times in 10 with the observed signature and passes the new form 10
+  times in 10, same probe both sides. `KNOWN-INTERMITTENTS.md` carried this
+  as an unfiled, uninvestigated failure "caught in passing on the #52
+  lanes"; that section now records the diagnosis.
+
+- **A settle threshold at or above the deadline no longer makes a
+  pattern-less wait time out beside a true `AtPrompt`.** The clamp that
+  exists to stop a long `settle_threshold_ms` making short waits
+  unsatisfiable was measured from the wrong origin: `min(threshold,
+  timeout)` is relative to the *call*, while the settle window runs from
+  the first idle sample, which is strictly later. So whenever
+  `threshold >= timeout` the two were equal and the deadline won by
+  exactly that difference — the clamp bought nothing it was added for,
+  and the row failed roughly `(first sample - call) / 50 ms` of the time:
+  rare on an idle box, common on a loaded one, which is how it read as a
+  flake.
+
+  The window is now clamped against the time left from the sample itself,
+  with one poll of headroom. On a long deadline nothing changes; only a
+  deadline the window could not have fitted inside shortens it, which is
+  the trade the clamp already chose.
+
+  **Measured causally rather than by sampling**: delaying the first idle
+  sample by 300 ms makes the row fail 6 times in 6 before the change and
+  0 in 6 after it, same probe both sides.
+
+- **`wait_for_pattern` no longer reports a death over output the child
+  really produced ([#42]).** The pattern path's final rescan fired on
+  `!session.is_alive()`, which flips the instant the child exits — but the
+  reader thread breaks only once `read` returns 0 **and** the backend is
+  dead, so it drains the child's last bytes strictly afterwards. A waiter
+  that looked in the window between those two events searched a buffer that
+  did not yet hold them, and answered `session_died` for a pattern that had
+  in fact matched. `read_output` would return those same bytes a moment
+  later, so the tool contradicted the session it was reporting on.
+
+  **Tracked as an intermittent for weeks, and it was never one.**
+  `KNOWN-INTERMITTENTS.md` recorded the right hypothesis — *"the final
+  rescan reads the session buffer rather than confirming the reader has
+  caught up"* — and warned against closing it by raising a timeout, which
+  would have hidden it. Confirmed causally rather than by sampling: the row
+  is green in 60 isolated and 8 whole-lib contended runs on a 2-core box,
+  and inserting a 150 ms delay ahead of the reader's `buffer.push` makes it
+  fail 10 times out of 10 with the observed signature.
+
+  The obvious repair does not work and is recorded so it is not retried:
+  `RecvError::Closed` cannot mean "the reader is done", because `Session`
+  holds `output_tx` itself and the sender outlives the reader thread. The
+  fix is `Session::reader_finished()` — stored `Release` as the reader
+  leaves its loop, read `Acquire` by the rescan, so every `buffer.push`
+  before it is visible. A session that dies with a reader that never
+  finishes still answers `session_died` at the caller's deadline rather
+  than inventing a timeout.
+
+- **Three `secret::binding` rows were flaky arrangements, not flaky
+  timing.** `KNOWN-INTERMITTENTS.md` recorded the module as the noisiest in
+  the suite at 9 failures to `daemon::server`'s 2. Triage found one mistake
+  in three spellings, all in the tests and none in the product: **a row
+  synchronising with a real `sh` child through a signal that does not mean
+  what its next line needs.**
+
+  `a_childs_prompt_line_reaches_the_terminal_with_nothing_that_can_act`
+  armed `spawn_forwarder` on §8.3's echo-drop **edge** after
+  `session_running` had already released the child; `tokio::sync::broadcast`
+  keeps nothing for a receiver that does not yet exist, so a child that
+  printed first left the row waiting on a frame sent to nobody. That is the
+  defect `gated_echo_off`'s own doc warns about for the *listener*, in the
+  one autofill-adjacent row that was not gated.
+  `max_uses_is_per_session_and_bounded` matched the *previous* round's
+  `Password: ` in a cumulative ring buffer and resolved a credential while
+  the child had `stty echo` on — spending a `max_uses` claim, writing the
+  `binding_resolved` line, and having the value declined `NotEchoOff` at the
+  writer and dropped.
+  `an_absolute_program_does_not_save_a_profile_from_an_agents_env` waited on
+  a capture file's *existence* and then read its *contents*, which the
+  child writes in a separate step. (That row fails 6 in 6 two different
+  ways, for two different reasons — the capture wait, and `await_prompt`'s
+  liveness arm, which is an opt-out rather than a completion and turns the
+  new echo guarantee off for any row whose child can finish early. The two
+  numbers are kept apart in `KNOWN-INTERMITTENTS.md`; an earlier draft
+  credited both to one cause.)
+
+  Closed causally rather than by sampling, on the pattern [#42] set, and
+  each row now **carries** the delay that produced its figure, so reverting
+  a fix is a red rather than a rate: 8 failures in 25 contended runs becomes
+  **10 in 10** with a 500 ms delay ahead of the subscription; one hit in a
+  campaign becomes **10 in 10** with a `sleep` between the fixture's rounds;
+  and one becomes **6 in 6** with the capture's two steps written apart.
+  All three are green at those same windows now, and the module is 0 in 25
+  where it was 8.
+
+  **A second stale-ring defect sat one line below the first**, in the same
+  loop, and only a mutation found it: `buffer_until` is containment over a
+  cumulative buffer, so `max_uses_is_per_session_and_bounded` was answered
+  at iteration 2 by round *one's* `got=` and never observed that the second
+  credential reached the child. A `write_secret_if_unread` that answers
+  `Written` while writing nothing for every write after a session's first
+  **passed all 54 rows in this module** — shipping a `request_secret_input`
+  that answers `secret_provided`, audits `binding_resolved` and spends a
+  `max_uses` claim while the child's prompt sits unanswered.
+  `buffer_until_count` catches it 3 in 3.
+
+  **The fourth row is not fixed and is not a flake in the tests.**
+  `the_listener_and_a_connections_raise_ride_the_same_edge` reproduces at 1
+  in 50 contended and 6 in 6 with a 20 ms delay ahead of the forwarder's
+  raise, and what it is catching is a §7.5 defect in the product: when the
+  autofill's slot take beats a connection's raise, the credential is written
+  and the attached client is told `SecretRequestClosed { outcome:
+  "cancelled" }` for a request that was fulfilled. The assertion is right
+  and stays; `KNOWN-INTERMITTENTS.md` carries the measurements and the
+  mistake in the reasoning that first closed it.
+
+- **`a_connection_mid_handshake_holds_off_the_client_less_exit` no longer
+  depends on what the rest of the binary is forking ([#52]).** The row's
+  recorded line, `server.rs:3552` at `38c7bf2`, is not the mid-handshake
+  claim it is named for: it is the **pairing** at the bottom — `drop(peer)`,
+  then *"the count was never given back"*. And the cause is not new. Every
+  `fork` in this binary hands its child a copy of every descriptor the
+  process holds, released at the `exec` and not before, which is the window
+  `remove_runtime_files_we_own` has documented all along for the *listening*
+  socket and GH #21 turned out to be. On a **connected** socket it means
+  `drop` closes one descriptor and releases nothing: the daemon reads no
+  EOF, `handle_connection` stays parked until `HANDSHAKE_TIMEOUT`, and
+  `in_flight` does not come back inside `yield_until`'s 500 yields — a few
+  hundred microseconds against a `fork`→`exec` latency whose tail is
+  milliseconds.
+
+  Fixed by asking for the ending rather than inferring it: `shutdown(2)`
+  acts on the socket, so every copy of the descriptor sees the half-close,
+  where `close(2)` acts on a descriptor and sends nothing while another
+  survives. **1 failure in 100 whole-binary runs before, 0 in 100 after**,
+  same box and same load — and the row now carries a `dup` of the client
+  descriptor across the drop, so the inherited copy is always present
+  instead of arriving by luck: **red 20 in 20** without the half-close,
+  green 20 in 20 with it.
+
+  No product change. The daemon is right to keep counting a connection
+  whose socket has not been released, and its one unbounded read is already
+  bounded by the handshake deadline; what was wrong was a test inferring
+  "the client is gone" from `close`.
+
+  **The runner had already hidden it**, which is not the same as fixing it.
+  The mechanism needs a sibling `fork` in the *same process*, so it is
+  reachable under libtest — `cargo test`, and `scripts/ci-flake-hunt.sh`,
+  which still runs it — and not under `cargo nextest`, which gives every
+  row its own process and has been CI's runner since `f209c97`. A
+  fragility that survives because the harness changed for another reason
+  is exactly the one nobody finds again.
+
 - **The Windows build compiles again ([#19]).** `windows-cross` — the
   `x86_64-pc-windows-gnu` clippy job — had been red on `main` since before
   0.0.6, with 0 passes in its last 20 runs, while `ROADMAP.md` said the tree
@@ -277,6 +776,8 @@ trigger as a side effect of writing release notes.
 
 [#19]: https://github.com/Sertelegger/holdfast/issues/19
 [#39]: https://github.com/Sertelegger/holdfast/issues/39
+[#42]: https://github.com/Sertelegger/holdfast/issues/42
+[#52]: https://github.com/Sertelegger/holdfast/issues/52
 
 ## [0.0.7] — 2026-09-01
 

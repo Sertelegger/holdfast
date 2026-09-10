@@ -2633,6 +2633,19 @@ mod tests {
     /// is nothing to sleep on — but a loop that never acts must be a
     /// **red** test rather than a hung one, and there is no
     /// `nextest.toml` in this repo to make that distinction for us.
+    ///
+    /// **The budget is 500 yields, which is a few hundred microseconds
+    /// of wall time, and that is the whole tolerance a caller gets.**
+    /// It is the right budget for a condition this runtime's own tasks
+    /// decide — `clock.advance` has already fired, and what is left is
+    /// scheduling. It is the wrong one for a condition that waits on
+    /// another *process*: GH #52 was this loop waiting for a socket to
+    /// be released, which cannot happen while any child of this binary
+    /// is between `fork` and `exec` holding an inherited copy. Arrange
+    /// for the event instead of polling for it, as
+    /// `a_connection_mid_handshake_holds_off_the_client_less_exit` now
+    /// does; a caller that genuinely must wait on another process wants
+    /// a wall-clock deadline, not this.
     async fn yield_until(mut cond: impl FnMut() -> bool) -> bool {
         for _ in 0..500 {
             if cond() {
@@ -3204,6 +3217,51 @@ mod tests {
         let (a_listener, a_socket) = bind_control(&paths).expect("A binds its control socket");
         drop(a_listener);
 
+        // **Wait for A to stop answering rather than assuming `drop` did
+        // it — GH #21.** The comment above says "A's listener drops, so
+        // `socket_is_live` goes false". That is true of *this* process
+        // immediately and of the machine only once every child that
+        // inherited the descriptor has reached `exec`.
+        //
+        // **The cause is a `fork`, not a slow kernel or a loaded box**,
+        // and `remove_runtime_files_we_own` below already says so for its
+        // own unlink: every `fork` in this tree briefly hands a child a
+        // copy of ours, and `SOCK_CLOEXEC` closes it at `exec`. Under a
+        // parallel suite the forks are the sibling rows' PTY spawns.
+        // Measured: 16.4% (492/3000) with eight threads spawning
+        // `/bin/true` and **no** CPU pinning, against **0 in 30,000**
+        // under `taskset -c 0,1` at 16 threads with no forks — starvation
+        // alone never produces it.
+        //
+        // The failing call is B's `bind_control`, and the `AddrInUse`
+        // comes from `bind_socket_within`'s **own** inline `connect`, not
+        // from `socket_is_live` — so the row fails in its *setup*, never
+        // in the assertion it exists to make.
+        //
+        // **Polling here rather than changing either probe.** A probe
+        // that retried until it saw a failure would still be guessing:
+        // the only thing that distinguishes "a daemon is serving" from "a
+        // dead daemon's descriptor is held by somebody's fork child" is
+        // process ownership, and the answer this tree already has for that
+        // — `holds_socket_bound_at`, intersecting `/proc/net/unix` with
+        // `/proc/<pid>/fd` — is Linux-only and far too much machinery for
+        // a test's setup.
+        //
+        // Bounded so a descriptor that is never released fails loudly
+        // instead of hanging. The spin is short when it happens at all:
+        // 2.35 ms was the longest observed, against a 5 s deadline.
+        let settled_by = std::time::Instant::now() + Duration::from_secs(5);
+        while super::super::spawn::socket_is_live(&paths) {
+            assert!(
+                std::time::Instant::now() < settled_by,
+                "A's listener was dropped but `connect(2)` still succeeds 5s \
+                 later. Expect a process holding an inherited copy of the \
+                 descriptor — a sibling row's child stalled between `fork` \
+                 and `exec` — not a daemon that refuses to die"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
         // Daemon B, through the real binder: lock, probe, unlink, bind,
         // chmod. Then its pid file, naming a process that is not us.
         let (b_listener, b_socket) =
@@ -3504,7 +3562,12 @@ mod tests {
     /// earlier, and starts nothing.
     ///
     /// The pairing at the bottom is what stops this passing against a
-    /// daemon that never exits at all.
+    /// daemon that never exits at all — and it runs against a
+    /// deliberately hostile arrangement, because that pairing is what
+    /// GH #52 was. See the comment on `dup` below: a sibling row's
+    /// `fork` used to decide whether this row passed, and the `dup` is
+    /// that inheritance held permanently so it cannot go back to being
+    /// a coin toss.
     #[tokio::test]
     async fn a_connection_mid_handshake_holds_off_the_client_less_exit() {
         let paths = scratch("inflight");
@@ -3521,7 +3584,7 @@ mod tests {
         // A peer that has connected and not yet said anything. Held in
         // scope: dropping it here would end the connection and the row
         // would be green against a daemon that counts nothing.
-        let peer = UnixStream::connect(paths.control_sock())
+        let mut peer = UnixStream::connect(paths.control_sock())
             .await
             .expect("connect to the daemon");
         assert!(
@@ -3552,10 +3615,63 @@ mod tests {
             "the daemon exited underneath a client that was still handshaking"
         );
 
+        // **The inherited copy, made deterministic — GH #52.**
+        //
+        // Every `fork` in this binary — `start_detached`, every PTY spawn
+        // — gives its child a copy of *every* descriptor this process
+        // holds, between `fork` and `exec`, and `SOCK_CLOEXEC` closes it
+        // only at the `exec`. `remove_runtime_files_we_own` documents
+        // that window for the listening socket; this is the same window
+        // on a *connected* one, and it is what GH #52 was. `drop` below
+        // closes only this process's descriptor: while a copy survives,
+        // the socket is not released, the daemon's `read_frame` sees no
+        // EOF, `handle_connection` stays parked until
+        // `handshake::HANDSHAKE_TIMEOUT` (5 s), and `in_flight` never
+        // comes back inside `yield_until`'s budget.
+        //
+        // Measured with a real `fork` whose child holds the inherited
+        // copy for a fixed time before exiting: **100 µs fails 1 run in
+        // 20, 1 ms fails 20 in 20, 200 ms fails 10 in 10**. The row's
+        // whole tolerance is therefore a few hundred microseconds — and
+        // this tree's own `fork`→`exec` latency is p50 75 µs with a
+        // 3.1 ms tail (see `spawn::socket_is_live`), which straddles it.
+        // That is why the row failed 2 runs in 54 of the whole binary and
+        // 0 in 800 filtered to this module, where almost nothing forks.
+        //
+        // `dup` rather than a real `fork`: both produce a second
+        // descriptor onto the **same open file description**, and it is
+        // the file description that holds the socket open, so the arrangement
+        // is identical where it matters — without putting a `fork` inside a
+        // multi-threaded test process. Both were measured, and both fail this
+        // row 10 times in 10 without the half-close below.
+        //
+        // **Do not delete this on the grounds that it no longer happens.**
+        // It no longer happens under `cargo nextest`, which gives every row
+        // its own process, and that is the runner CI has used since
+        // `f209c97` — but `cargo test`, the raw binary with
+        // `--test-threads=N` and `scripts/ci-flake-hunt.sh` all still put
+        // this row in one process with everything that forks. The row was
+        // hidden by a harness change made for an unrelated reason, not
+        // fixed by it, and this line is what makes that irrelevant.
+        let inherited = unsafe { libc::dup(std::os::unix::io::AsRawFd::as_raw_fd(&peer)) };
+        assert!(inherited >= 0, "dup: {}", io::Error::last_os_error());
+
         // **The pairing.** The connection is the only thing holding this
         // daemon open; with it gone the very next tick takes the exit.
         // Without this the row would be satisfied by a counter that is
         // never decremented — which would disable §7.3 outright.
+        //
+        // **`shutdown` and then `drop`, and the order is the fix.**
+        // `shutdown(2)` acts on the *socket*, so every descriptor onto it
+        // sees the half-close and the daemon reads EOF on the next poll;
+        // `close(2)` acts on a descriptor and sends nothing at all while
+        // another copy survives. Ending the connection is what this row
+        // is about, and asking for it directly is what makes the row
+        // independent of whether some other process in this binary
+        // happens to be between `fork` and `exec` right now.
+        tokio::io::AsyncWriteExt::shutdown(&mut peer)
+            .await
+            .expect("half-close the client end");
         drop(peer);
         assert!(
             yield_until(|| daemon.in_flight_connections() == 0).await,
@@ -3566,6 +3682,14 @@ mod tests {
             .await
             .expect("with no connection and no session, §7.3's window must bite")
             .expect("the serve task panicked");
+
+        // The child in the real arrangement reaches its `exec` here.
+        assert_eq!(
+            unsafe { libc::close(inherited) },
+            0,
+            "close: {}",
+            io::Error::last_os_error()
+        );
     }
 
     /// The idle reaper and REQ-R-006's exit half, both on the one tick.

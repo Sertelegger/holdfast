@@ -1,11 +1,12 @@
 //! The 0.0.10a worker link's frame catalogue and its codec (§4.1, §23.4).
 //!
-//! # Two rows of this file's test table are DEFERRED, and this block is
-//! # where the exclusion is enumerated rather than lost
+//! # The two rows this file deferred to Task 3 are WRITTEN — and they
+//! # are not in this file
 //!
-//! The milestone plan's Task 1 table has five rows. Three are here.
-//! **Two are not, and they are owed by Task 3**, the task that creates a
-//! `holdfast pty-worker` process:
+//! The milestone plan's Task 1 table has five rows. Three are here. The
+//! other two assert properties of a **running** worker, so Task 1 —
+//! which builds the catalogue and nothing that runs — could not write
+//! them and named them here instead:
 //!
 //! * `the_worker_never_constructs_a_frame_near_the_cap` — "drive a
 //!   worker with `yes` for 2 s; record the maximum encoded `Output`
@@ -14,21 +15,35 @@
 //!   recognisable string, force a worker fault, assert the `Fault`
 //!   message does not contain it".
 //!
-//! Both assert properties of a **running** worker: one needs observed
-//! frame sizes off a real PTY read loop and the other needs a fault
-//! injected into one. Task 1 builds the catalogue and nothing that runs,
-//! so neither can be written here — and writing either against a
-//! hand-constructed frame would turn an assertion about behaviour into
-//! an assertion about the fixture. `the_worker_never_constructs_a_frame_near_the_cap`
-//! is explicit that the assertion must be on *observed* sizes and not on
-//! the buffer constant, which is precisely the shape a stub would take.
+//! **Task 3 wrote both, in `crates/holdfast/tests/worker_process.rs`.**
+//! Not here, and the reason is Cargo's rather than anybody's judgement:
+//! both rows spawn the real binary, `CARGO_BIN_EXE_holdfast` is set only
+//! for the integration tests of the package that declares it, and
+//! `holdfast-core` declares no binary. Deriving `target/<profile>/holdfast`
+//! from `current_exe()` here would be the path guessing `attach_cli.rs`'s
+//! own comment says this project does not do. This block is updated
+//! rather than left saying they are still owed, because a stale exclusion
+//! list is how a suite ends up believing it runs a row nobody wrote.
 //!
-//! They are written out here, verbatim and by name, because §11.2's rule
-//! is that an exclusion is enumerated or it is not an exclusion: an
-//! unenumerated one is how a suite silently ends up running one arm.
-//! Neither is stubbed and neither is `#[ignore]`d — an ignored test is a
-//! row in the count that nobody reads, and this project has two of those
-//! already.
+//! One qualification travels with the second row and is recorded at the
+//! row itself: its named mutation —
+//! `Fault { message: format!("read failed on {:?}", buf) }` — sits in a
+//! branch that **cannot be reached** in this tree, because `portable-pty`
+//! 0.9.0 maps a pty master's `EIO` onto `Ok(0)` (`unix.rs:94`) and a
+//! `write(2)` to a master whose slave has closed succeeds on Linux. The
+//! row therefore asserts the same property at the two fault sites an
+//! ordinary session *can* reach, one of which has a `PtySpawnConfig`'s
+//! `env` in scope and does kill a real mutation.
+//!
+//! §11.2's rule is that an exclusion is enumerated or it is not an
+//! exclusion. Nothing is stubbed and nothing is `#[ignore]`d — an
+//! ignored test is a row in the count that nobody reads, and this
+//! project has two of those already.
+//!
+//! What **is** still deferred from this file is Task 2's pair, which the
+//! block above `mod per_session_socket` enumerates: they are owed by
+//! Task 12, not by Task 3, because they need `start_session` to reach a
+//! worker at all.
 //!
 //! # What the three rows here are actually separating
 //!
@@ -529,11 +544,12 @@ async fn an_unknown_frame_type_decodes_to_unknown_and_does_not_panic() {
 /// §11.2's rule is that an exclusion is enumerated or it is not an
 /// exclusion.
 ///
-/// # Two more rows are DEFERRED, and one row keeps a deferred half
+/// # Two more rows are DEFERRED, and one row's deferred half is now paid
 ///
-/// Owed by **Task 3** (the worker binary) and **Task 12** (backend
-/// selection), which is the pair that makes a session use a worker at
-/// all:
+/// Owed by **Task 12** alone (backend selection), which is what makes a
+/// session use a worker at all. Task 3 was the other half of this list
+/// until it landed; it built the worker binary, and neither row below
+/// needs one — both need `start_session` to *choose* it:
 ///
 /// * `a_started_session_gets_a_0600_worker_socket` — the end-to-end form
 ///   of `the_worker_socket_is_0600_and_owned_by_the_daemons_uid`: call
@@ -549,14 +565,17 @@ async fn an_unknown_frame_type_decodes_to_unknown_and_does_not_panic() {
 ///   the §18.1 status string is produced by `mcp::tools`, which has no
 ///   worker to fail at yet.
 ///
-/// And `a_second_process_cannot_take_the_workers_slot` keeps half of its
-/// table entry deferred: the pairing there reads "the **real worker**
-/// still attaches", and the real worker is Task 3's. The row below
-/// substitutes *this test process* for it — a genuinely different process
-/// is the impostor, and the connection that must be accepted is the one
-/// whose pid the socket was told to expect. That is the property the peer
-/// check has; "the peer was spawned with a `pty-worker` argv" is not, and
-/// asserting it needs Task 3.
+/// And `a_second_process_cannot_take_the_workers_slot`'s deferred half —
+/// the pairing that reads "the **real worker** still attaches" — **is
+/// now paid, elsewhere.** Every row in
+/// `crates/holdfast/tests/worker_process.rs` reaches its assertions
+/// through `WorkerSocket::accept_worker(worker.pid())` against a real
+/// `holdfast pty-worker`, so "the peer this socket was told to expect is
+/// accepted" is asserted eight times over by a process that was spawned
+/// with a `pty-worker` argv. The row below keeps its own substitution —
+/// *this test process* as the legitimate peer — because what it isolates
+/// is the peer check itself, and an impostor needs a genuinely different
+/// process on one side or the other.
 #[cfg(unix)]
 mod per_session_socket {
     use std::io::Read;

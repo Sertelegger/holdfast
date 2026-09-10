@@ -480,6 +480,15 @@ impl HoldfastServer {
         //
         // Spawns nothing at all unless the operator opted in — see
         // [`Self::watch_for_autofill`].
+        //
+        // **The statement above this one is GH #106's whole cost**, which
+        // is why the knob that widens the gap sits here and not somewhere
+        // tidier: see `HoldfastServer::autofill_arm_delay`. Zero for every
+        // caller that is not the row measuring it.
+        #[cfg(test)]
+        if !self.autofill_arm_delay.is_zero() {
+            tokio::time::sleep(self.autofill_arm_delay).await;
+        }
         self.watch_for_autofill(&session);
 
         // §9.4's `session_start`, with its field list verbatim.
@@ -1105,6 +1114,14 @@ impl HoldfastServer {
     /// session-state block beside it is what tells you whether it landed:
     /// a session that was `Executing` and is now `AtPrompt` is an
     /// interrupt that worked.
+    ///
+    /// `Executing` does **not** mean the command owns the terminal yet. A
+    /// shell raises it before it forks the command and hands the terminal
+    /// to it, so an interrupt issued in that gap goes to the shell's own
+    /// group and reaches nothing — measured here 9 times in 1360 trials
+    /// under load. A real terminal loses a Ctrl+C in the same gap, and
+    /// the remedy is the same: the session still reads `Executing`, so
+    /// call again.
     #[tool(
         annotations(
             title = "Send Ctrl+C to a session's process group",
@@ -2237,6 +2254,14 @@ impl HoldfastServer {
             }
         };
 
+        // **The episode this value is aimed at, read before it is
+        // queued** (GH #105). It is the key the closer of a *late* raise
+        // joins the answer against, and reading it here rather than after
+        // the ack is what makes it safe: `secret_episode` is monotonic,
+        // so a value taken now can only name this read or an earlier one,
+        // never the next prompt. See `SecretSlots::record_episode_answered`.
+        let episode = session.secret_episode();
+
         // The same write path a client's `SecretInput` takes, plus the two
         // conditions §9.6's autofill needs and a human's keystroke does
         // not: the value moves into the queue as a `SecretBytes` and is
@@ -2269,6 +2294,30 @@ impl HoldfastServer {
                 return Some(self.session_died_under_autofill(session));
             }
         };
+        // **Recorded once the writer has said `Written`, and whether or
+        // not there was a raise to close** (GH #105).
+        //
+        // `Vacant` is the case the record exists for: the credential
+        // reached the child and no raise existed to say so, so the raise
+        // that announces this same edge claims it and reports the truth.
+        //
+        // **A `request_id.is_none()` guard was written here and removed,
+        // because it is wrong in the two-client shape.** §7.5's raise is
+        // per connection: A's `forward_events` raises `R1`, this call
+        // takes it and closes it `fulfilled` below, and B's — reacting to
+        // the *same* edge, a moment later — finds the slot vacant again
+        // and raises `R2`. With the guard, B's client is told `cancelled`
+        // for a prompt that was answered, which is GH #105 with two
+        // connections instead of one. Without it, `R2` claims the record
+        // and B is told the same thing A was.
+        //
+        // Recording unconditionally is safe because **the claim is not a
+        // lookup**: only `raise_on_echo_drop_edge` takes the record, and
+        // it takes it, so at most one raise per write can be marked. A
+        // second read inside the same echo-off run is raised by a tool
+        // call or by §7.5's replay, neither of which may claim.
+        hub.secrets()
+            .record_episode_answered(&session.id, episode, bytes_written);
         close("fulfilled");
         // §4.1 counts a write as activity, or a session idle-reaps while
         // its own credential is being filled in.
@@ -2606,6 +2655,58 @@ impl HoldfastServer {
     /// `fulfilled`, which is the `SecretRequestClosed { outcome:
     /// "fulfilled" }` §7.5 promises; with nobody attached there is no raise
     /// to close and no client to tell.
+    ///
+    /// **The subscription has a window ahead of it, and the replay below
+    /// is what closes it** (GH #106). `start_session` spawns the child,
+    /// `Session::new` starts the reader **on a dedicated OS thread** — so
+    /// no `.await` is needed for the edge to fire — and this call happens
+    /// three statements later, behind a `screen.lock()` the reader takes
+    /// per chunk and a registry insert that is O(live sessions)
+    /// `waitpid`s. A `tokio::sync::broadcast` keeps nothing for a
+    /// receiver that does not yet exist and the send discards its `Err`,
+    /// so an edge that fires in there is gone; and because
+    /// `awaiting_secret` has already latched, **no second edge ever
+    /// fires for that prompt**. The child then sits at its credential
+    /// prompt until the idle timeout with no client, no raise, no audit
+    /// line and no error.
+    ///
+    /// Measured on the issue: a delay inserted immediately above this
+    /// call took an ungated row to 3/3 red at 500 ms and 6/6 red at
+    /// 15 ms, and 0/8 at 5 ms. The threshold is the child's `fork`/`exec`
+    /// cost, so *narrow* is a property of the machine rather than a
+    /// guarantee — the identical window in
+    /// `attach::conn::forward_events` was also a few instructions wide
+    /// until §9.4's `attach_connect` write landed in the middle of it and
+    /// made it ~1.5 ms, at which point a row failed 3/3.
+    ///
+    /// **`awaiting_secret_episode()` and not `is_awaiting_secret()`, and
+    /// the difference is the whole of why this took two issues.** A bare
+    /// `if is_awaiting_secret() { autofill }` after the subscribe
+    /// double-fires on an Entered/Left/Entered sequence straddling the
+    /// check: the replay answers the second prompt and the *delivered*
+    /// edge for it answers it again, running the provider twice, spending
+    /// two `max_uses` claims and writing two `binding_resolved` lines for
+    /// one read. GH #105's `Session::secret_episode` is the id that was
+    /// missing — monotonic, bumped inside the one transition that latches
+    /// the flag — so the replay records the episode it answered and the loop
+    /// skips any `AwaitingSecretEntered` that does not name a **later**
+    /// one.
+    ///
+    /// **`<=` and not `==`, because the read is allowed to be one
+    /// episode ahead of the queue.** The flag can still be set for
+    /// episode *n+1* while `Entered { episode: n }` is sitting unread in
+    /// this receiver — the whole of episode *n* having happened inside
+    /// the window. Episode *n* is then over by construction, echo is
+    /// back, and an autofill for it would be refused at the write
+    /// anyway; suppressing it is the direction that does not spend a
+    /// claim on a prompt that no longer exists.
+    ///
+    /// **The duplicate this guards against is bounded but not harmless.**
+    /// `WriteRequest::SecretIfUnread` compares `writes_performed`, so a
+    /// second *injection* is refused — but the second provider run, the
+    /// second `max_uses` claim and the second `binding_resolved` line all
+    /// stand, because §9.6 counts resolutions from the store and not
+    /// writes to a PTY.
     pub(crate) fn watch_for_autofill(&self, session: &Arc<Session>) {
         if !self.config.security.autofill_on_echo_off
             || !crate::secret::binding::keychain_step_runs(&self.config.security.secret_provider)
@@ -2629,9 +2730,35 @@ impl HoldfastServer {
         tokio::spawn(async move {
             use crate::session::SessionEvent;
             use tokio::sync::broadcast::error::RecvError;
+
+            // See `HoldfastServer::autofill_arm_delay`. This is the half
+            // that arranges a **delivered** edge sitting in `events`
+            // while the replay check below reads the same episode off the
+            // flag — the double-fire the guard exists for.
+            #[cfg(test)]
+            if !server.autofill_arm_delay.is_zero() {
+                tokio::time::sleep(server.autofill_arm_delay).await;
+            }
+
+            // **The last episode this listener has answered** (GH #106).
+            // `0` is not an episode — the counter is `1` at the first echo
+            // drop — so a session that is not at a prompt starts with
+            // nothing suppressed.
+            let mut answered = 0u64;
+            server
+                .replay_missed_echo_drop(&session, &mut answered)
+                .await;
+
             loop {
                 match events.recv().await {
-                    Ok(SessionEvent::AwaitingSecretEntered { .. }) => {
+                    Ok(SessionEvent::AwaitingSecretEntered { episode, .. }) => {
+                        // The replay above already answered this prompt,
+                        // or answered a later one and this edge names a
+                        // read that is over. See the doc.
+                        if episode <= answered {
+                            continue;
+                        }
+                        answered = episode;
                         // **The prompt text is not carried across.** It is
                         // read off the session inside step 1, from the
                         // detector's own line, exactly as a tool-call
@@ -2644,16 +2771,57 @@ impl HoldfastServer {
                     // PTY.
                     Ok(SessionEvent::Exited { .. }) => return,
                     Ok(SessionEvent::AwaitingSecretLeft) => {}
-                    // An edge is not a stream. A lagged listener has missed
-                    // an echo drop, and there is nothing to replay: the
-                    // session is the authority on whether it is still
-                    // blocked, and it says so on the next edge.
+                    // **A lag is the same loss through a different door,
+                    // and it is now closed by the same three lines**
+                    // (GH #106). This arm used to say there was nothing to
+                    // replay because *"the session says so on the next
+                    // edge"* — which is the premise the issue disproves:
+                    // `awaiting_secret` has already latched, so no next
+                    // edge comes for a prompt that is still up. A listener
+                    // that fell behind while a provider ran and lost an
+                    // `Entered` would leave that child blocked for good.
+                    //
+                    // Not rowed, and this is the whole of that admission:
+                    // forcing a `broadcast` lag here wants a capacity knob
+                    // that does not exist. It is the **same function** the
+                    // replay above calls and the same `answered` guard, so
+                    // what is untested is the trigger and not the rule.
                     Err(RecvError::Lagged(_)) if !session.is_alive() => return,
-                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Lagged(_)) => {
+                        server
+                            .replay_missed_echo_drop(&session, &mut answered)
+                            .await;
+                    }
                     Err(RecvError::Closed) => return,
                 }
             }
         });
+    }
+
+    /// Answer the echo-off prompt this listener is looking at, if it has
+    /// not already answered it — GH #106's replay, as one rule with two
+    /// triggers.
+    ///
+    /// `answered` is the episode this listener last acted on, and it is
+    /// updated in place. **The two callers must not be able to disagree
+    /// about the guard**, which is why this is a function rather than a
+    /// condition written twice: one is the subscription window, which has
+    /// rows; the other is a `Lagged` receiver, which cannot be arranged
+    /// deterministically without a broadcast-capacity knob.
+    ///
+    /// A no-op when echo is not off — [`Session::awaiting_secret_episode`]
+    /// answers `None` — and a no-op when the episode is not newer than
+    /// what this listener already handled. See
+    /// [`Self::watch_for_autofill`] for why `<=` rather than `==`.
+    async fn replay_missed_echo_drop(&self, session: &Arc<Session>, answered: &mut u64) {
+        let Some(episode) = session.awaiting_secret_episode() else {
+            return;
+        };
+        if episode <= *answered {
+            return;
+        }
+        *answered = episode;
+        self.autofill_on_echo_drop(session).await;
     }
 
     /// One echo drop, resolved and injected with no tool call in sight.
@@ -2873,7 +3041,6 @@ impl HoldfastServer {
             // own the close. We *are* the waiter, so there is nobody to
             // answer — the value is returned below.
             Some(raised) => {
-                drop(raised);
                 match woke {
                     // §5.1: the code, not `timeout` a window later. **No
                     // re-raise**: a child that has exited is not sitting
@@ -2886,14 +3053,27 @@ impl HoldfastServer {
                         }
                     }
                     // §5.2's supersede, reached without an attached
-                    // client: the echo-off condition cleared and nothing
-                    // was written. **No re-raise** — the child is not at
-                    // a prompt any more, and an affordance pointing at
-                    // one that has gone is the same defect the exit arm
+                    // client — **if** the echo-off condition cleared and
+                    // nothing was written. Echo also comes back because
+                    // §9.6's autofill answered the read, and this arm
+                    // used to call that a cancellation too (GH #105), so
+                    // it asks the record rather than inferring from the
+                    // edge. `echo_return_resolution` and not a `match`
+                    // here: `attach::conn` closes the same edge for an
+                    // attached client, and an answer that differed by
+                    // which observer won the close is the *"decided by
+                    // whether a human happened to be watching"* defect
+                    // this second observer exists to fix.
+                    //
+                    // **No re-raise** either way — the child is not at a
+                    // prompt any more, and an affordance pointing at one
+                    // that has gone is the same defect the exit arm
                     // refuses above.
                     Woke::EchoReturned => {
-                        hub.broadcast_secret_closed(&session.id, request_id, "cancelled");
-                        Resolution::Cancelled(CancelReason::UserCancelled)
+                        let answered = hub.secrets().claim_echo_return_answer(&session.id, &raised);
+                        let (resolution, outcome) = crate::secret::echo_return_resolution(answered);
+                        hub.broadcast_secret_closed(&session.id, request_id, outcome);
+                        resolution
                     }
                     Woke::Deadline => {
                         hub.broadcast_secret_closed(&session.id, request_id, "timeout");
@@ -3102,7 +3282,38 @@ impl HoldfastServer {
                         // `settle_threshold_ms` would otherwise reopen the race.
                         None => {
                             let since = *idle_since.get_or_insert_with(std::time::Instant::now);
-                            if since.elapsed() >= settle {
+                            // **Clamped against what is left from *here*, not
+                            // against the whole timeout — and the difference is
+                            // a race the outer clamp could not win.**
+                            //
+                            // `settle` above is `min(threshold, timeout)`,
+                            // measured from the *call*. This window is measured
+                            // from the first idle sample, which is strictly
+                            // later. So whenever an operator sets
+                            // `settle_threshold_ms >= timeout` the two become
+                            // equal, and the settle break needs `t0 + timeout`
+                            // while the deadline fires at `start + timeout` —
+                            // the deadline wins by exactly `t0 - start`, and the
+                            // clamp bought nothing it was added for. With a
+                            // 50 ms poll the row failed roughly
+                            // `(t0 - start) / 50 ms` of the time, which is rare
+                            // on an idle box and common on a loaded one.
+                            //
+                            // Measured: delaying the first sample by 300 ms
+                            // makes `a_long_settle_threshold_does_not_make_a_
+                            // short_wait_unsatisfiable` fail 6 times in 6.
+                            //
+                            // Leaving one poll of headroom is what makes the
+                            // clamp's promise — *"never guaranteed to lie"* —
+                            // true rather than lucky. On a long deadline `room`
+                            // exceeds `settle` and nothing changes; only a
+                            // deadline this window could not have fitted inside
+                            // shortens it, which is precisely the trade §4.5
+                            // already chose.
+                            let room = deadline
+                                .saturating_duration_since(since)
+                                .saturating_sub(IDLE_WAIT_POLL);
+                            if since.elapsed() >= settle.min(room) {
                                 break Some(mode);
                             }
                         }
@@ -3597,7 +3808,8 @@ enum Woke {
     Deadline,
     /// §5.1: the child ended while the call was waiting.
     Exited(Option<i32>),
-    /// §5.2's supersede: echo came back with no value written.
+    /// Echo came back. **Not on its own a supersede** — see
+    /// [`SecretEnded::EchoReturned`].
     EchoReturned,
 }
 
@@ -3745,7 +3957,10 @@ enum StepOne {
 enum SecretEnded {
     /// §5.1: the child ended.
     Exited(Option<i32>),
-    /// §5.2's supersede: echo came back with no submission.
+    /// Echo came back — §5.2's supersede **only if nothing answered the
+    /// read this call's request announces**, which the request itself
+    /// carries (`RaisedRequest::answered`) and this edge cannot know
+    /// (GH #105).
     EchoReturned,
 }
 
@@ -3753,10 +3968,12 @@ enum SecretEnded {
 /// echo comes back with nothing written.
 ///
 /// **The second half is I-1, and it is the same defect `session_exit`
-/// exists for, one event over.** `request.rs` states the property
-/// outright — *"`user_cancelled` has exactly one producer and it is this
-/// line"* — and that line lives in `attach::conn::forward_events`, which
-/// is **one task per attach connection** and is `abort()`ed with it. So
+/// exists for, one event over.** `attach::conn::forward_events` used to
+/// state the property outright — *"`user_cancelled` has exactly one
+/// producer and it is this line"* — and that line is **one task per
+/// attach connection**, `abort()`ed with it. (The quoted claim was also
+/// wrong on its own terms; GH #105 is the third producer it did not
+/// count, and the comment there now says so.) So
 /// with nobody attached (which is exactly the deployment §9.5's rung-3
 /// buffer notice exists for) a child that abandons its own echo-off read
 /// produced no observer at all: the event went onto the session broadcast

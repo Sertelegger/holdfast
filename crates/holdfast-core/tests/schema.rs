@@ -273,6 +273,62 @@ async fn wait_for_at_prompt(server: &HoldfastServer, session: &str) {
     }
 }
 
+/// Wait until `want` commands have been **recorded and closed**, read from
+/// the history rather than inferred from the mode.
+///
+/// **`wait_for_at_prompt` cannot do this job, and using it for it is a
+/// race.** That helper is level-triggered on `interaction_mode`, so it
+/// cannot tell *"the command I just sent has finished"* from *"the command
+/// I just sent has not started yet"*: immediately after `send_input`, a
+/// shell that has not echoed the line yet is still `AtPrompt` at
+/// `semantic` tier from the **previous** prompt, and the helper returns at
+/// once with the command still in flight.
+///
+/// That is the very race `run_wait_for_idle`'s
+/// `baseline`/`saw_executing`/settle-window machinery exists to close,
+/// reappearing in a test helper that had no equivalent guard. Measured
+/// against `a_pattern_less_wait_started_at_an_idle_prompt_does_not_resolve_early`
+/// at **4 failures in 12** contended runs of this binary
+/// (`taskset -c 0,1`, `--test-threads=16`); 25/25 green for the same row
+/// in isolation, which is why it read as load-dependent rather than as a
+/// missing synchronisation.
+///
+/// The positive signal is a history entry carrying `output_end_cursor` —
+/// the same *"started and its `D` closed it"* fact the product reads, so
+/// this helper and `run_wait_for_idle` cannot disagree about whether a
+/// command is done.
+async fn wait_for_closed_commands(server: &HoldfastServer, session: &str, want: usize) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let r = server
+            .get_command_history(Parameters(GetCommandHistoryArgs {
+                session: session.into(),
+                limit: None,
+                since_index: None,
+            }))
+            .await
+            .expect("get_command_history must not be a protocol error");
+        let data = body(&r)["data"].clone();
+        let closed = data["entries"]
+            .as_array()
+            .map(|es| {
+                es.iter()
+                    .filter(|e| !e["output_end_cursor"].is_null())
+                    .count()
+            })
+            .unwrap_or(0);
+        if closed >= want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {closed} of {want} command(s) closed within the deadline; \
+             history: {data}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn kill(server: &HoldfastServer, session: &str) {
     let _ = server
         .terminate(Parameters(TerminateArgs {
@@ -2667,11 +2723,27 @@ async fn exited_session(server: &HoldfastServer) -> String {
     wait_for(server, &id, "$").await;
     let session = server.registry.get(&id).expect("the session");
     session.write_input(b"exit 7\n").expect("write");
+    // **Waited on the reader, not on the child**, because every caller of
+    // this fixture reads the session's *output* afterwards.
+    // `Session::reader_finished` says so in as many words — GH #42: the
+    // child's death is observable one scheduler slice before the reader
+    // has run the `read` that moves its last bytes into the buffer, so a
+    // wait on `is_alive()` alone can hand back a session whose screen has
+    // not yet been painted with `exit 7`. Red 2 times in 2 with a 150 ms
+    // sleep in the reader loop ("the final screen is empty, so
+    // `session_died carries data` is untested here"), green 2 in 2 with
+    // the same probe once waited on here. The flag is `Release`/`Acquire`
+    // against every `buffer.push`, which is the whole guarantee it exists
+    // to give.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while session.is_alive() && Instant::now() < deadline {
+    while !session.reader_finished() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(!session.is_alive(), "bash never exited");
+    assert!(
+        session.reader_finished(),
+        "the reader never drained the exited session's PTY"
+    );
     id
 }
 
@@ -3024,17 +3096,31 @@ async fn status_and_a_list_sessions_entry_are_the_same_record() {
 async fn every_nested_object_a_tool_returns_has_its_key_set_pinned() {
     let server = HoldfastServer::new();
     let (id, _) = start_bash(&server).await;
-    wait_for(&server, &id, "$").await;
+    // At an OSC 133 prompt, so the §8.5 snippet has *run* before the
+    // command below is typed — bash prints the `$` of its first prompt
+    // before that, and a command typed there produces no `C` and so no
+    // history entry to enumerate.
+    wait_for_at_prompt(&server, &id).await;
     // A command, so `get_command_history` has an entry to enumerate.
     server
         .send_input(Parameters(SendInputArgs {
             session: id.clone(),
-            data: "echo NESTED''_OK".into(),
+            data: "echo NESTED_OK".into(),
             ..Default::default()
         }))
         .await
         .expect("send_input");
-    wait_for(&server, &id, "NESTED_OK").await;
+    // **The history, not the output bytes** — see
+    // `every_emitted_unix_field_is_a_number`, which carried the same
+    // arrangement and the flake that comes with it. The reader publishes a
+    // chunk to the ring buffer before it applies that chunk's OSC 133
+    // events to the history, so polling for `NESTED_OK` can return with
+    // the ring still empty and the `entries` assertion below then reports
+    // `unavailable`/"this shell has emitted no OSC 133 markers". Red 6
+    // times in 6 with a 150 ms sleep between the reader's `buffer.push`
+    // and its `history.lock()`; green 6 in 6 with the same probe once
+    // waited on here.
+    wait_for_closed_commands(&server, &id, 1).await;
 
     // `send_input.prompt` — the call above returned one, but a fresh one
     // keeps this test's own arrangement explicit.
@@ -3877,16 +3963,40 @@ fn no_declared_timestamp_carries_a_bare_name() {
 async fn every_emitted_unix_field_is_a_number() {
     let server = HoldfastServer::new();
     let (id, started) = start_bash(&server).await;
-    wait_for(&server, &id, "$").await;
+    // **`started_at_unix_ms` lives on a command-history entry and nowhere
+    // else on the surface**, so the OSC 133 integration has to be installed
+    // before the command below is typed — otherwise the ring stays empty
+    // for the life of the session and the walk has nothing to prove.
+    // `wait_for_at_prompt` is what says the snippet has *run*; a `$` in the
+    // buffer is matched by bash's very first prompt, which is printed
+    // before it.
+    wait_for_at_prompt(&server, &id).await;
     server
         .send_input(Parameters(SendInputArgs {
             session: id.clone(),
-            data: "echo UNIX''_OK".into(),
+            data: "echo UNIX_OK".into(),
             ..Default::default()
         }))
         .await
         .expect("send_input");
-    wait_for(&server, &id, "UNIX_OK").await;
+    // **Waited on the history, not on the output bytes.** This row's whole
+    // intermittent was `wait_for(&server, &id, "UNIX_OK")` here: the reader
+    // publishes a chunk to the ring buffer and only *then* — outside the
+    // buffer lock, per §4.3 — applies that same chunk's OSC 133 events to
+    // the history. Between the two sit the subscriber fan-out, a full
+    // `screen.feed` VT100 parse, the §4.5.1 query responder, the detector
+    // lock with its `feed`/`line_discipline`/`snapshot`, an `AtomicBool`
+    // swap and a `now_ms()`. `echo`'s `C` marker and its `UNIX_OK` bytes
+    // arrive in one chunk, so a poll on the buffer returns *inside* that
+    // gap and `get_command_history` below then answers with an empty ring:
+    // `started_at_unix_ms was never emitted`. Same publication skew, and
+    // the same repair, as `no_output_is_classified_between_the_echo_sample_
+    // and_the_answer`.
+    //
+    // Causally, not by sampling: a 150 ms sleep between the reader's
+    // `buffer.push` and its `history.lock()` fails the old form 10 times in
+    // 10 with that exact message and passes this one 10 times in 10.
+    wait_for_closed_commands(&server, &id, 1).await;
 
     let mut payloads = vec![body(&started)];
     payloads.push(body(
@@ -4200,7 +4310,14 @@ async fn a_pattern_less_wait_started_at_an_idle_prompt_does_not_resolve_early() 
         }))
         .await
         .expect("warm-up send_input");
-    wait_for_at_prompt(&server, &id).await;
+    // **Positive synchronisation, not a mode reading.** `wait_for_at_prompt`
+    // here returned on the *previous* prompt whenever the shell had not yet
+    // echoed `echo warmup`, so the waiter below started with the warm-up
+    // still in flight — and then correctly reported the session finished,
+    // because a command really had started since its baseline and closed.
+    // The product was right and this line was wrong; see
+    // `wait_for_closed_commands`.
+    wait_for_closed_commands(&server, &id, 1).await;
 
     let waiter = {
         let server = std::sync::Arc::clone(&server);

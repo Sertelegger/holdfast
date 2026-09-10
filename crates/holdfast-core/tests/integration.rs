@@ -240,11 +240,34 @@ fn interrupt_reaches_the_foreground_job_not_the_shell() {
     let pty = InProcessPty::spawn(&bash()).expect("spawn");
     pty.write(b"echo READY''_ONE\n").unwrap();
     read_until(&pty, "READY_ONE", Duration::from_secs(5));
+    let at_prompt = poll_foreground(&pty, |g| g.is_some(), Duration::from_secs(5));
+    assert!(at_prompt.is_some(), "the shell never took the terminal");
 
     // Foreground sleep: job control gives it its own process group, which
     // becomes the terminal's foreground group.
     pty.write(b"sleep 300\n").unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    // **Waited for, not slept through.** This was a flat 500 ms, and the
+    // thing it was guessing at is the subject of the test: `signal`
+    // targets `tcgetpgrp(master)`, and the shell owns that until it has
+    // forked the job and handed the terminal over. Its server-level twin
+    // guessed with `interaction_mode`, which the shell raises *before*
+    // the handover, and failed 1 whole-binary run in 30 under
+    // `taskset -c 0,1 --test-threads=16` for exactly that reason. Here
+    // the precondition is readable, so it is read rather than waited out.
+    //
+    // Drained across the poll, and the echo drained before it: on macOS a
+    // pty nobody reads from fills, and the shell then blocks part way
+    // through echoing the line — before the fork — so the group this is
+    // waiting on never changes. Inert on Linux.
+    read_until(&pty, "sleep 300", Duration::from_secs(5));
+    let running = draining(&pty, || {
+        poll_foreground(&pty, |g| g != at_prompt, Duration::from_secs(10))
+    });
+    assert_ne!(
+        running, at_prompt,
+        "the shell never handed the terminal to the job, so there is \
+         nothing here to tell a foreground-group signal from a session one"
+    );
 
     pty.signal(Signal::Interrupt).unwrap();
 
@@ -890,10 +913,21 @@ async fn send_input_reaches_the_shell() {
 
     // Same `''` construction as the read_output test, for the same
     // reason: a literal marker would match the terminal's echo.
+    //
+    // **The `sleep` between the two `echo`s is the arrangement, not
+    // padding — GH #10.** Each `echo` is its own `write(2)`, so a reader
+    // that wakes between them publishes `SEND_MARKER` with `42` still
+    // unwritten. The poll below used to stop on `SEND_MARKER` and the
+    // assertion after it then spoke about `42`, which is an assertion
+    // about output nothing had waited for: pulling the two writes 300 ms
+    // apart made that **10 failures in 10**, every one of them `shell did
+    // not evaluate` with the capture ending exactly at `SEND_MARKER`.
+    // Keeping the gap keeps the row honest — it now proves the poll waits
+    // for the whole command rather than for its first line.
     let r = server
         .send_input(Parameters(SendInputArgs {
             session: id.clone(),
-            data: "echo SEND''_MARKER; echo $((6*7))".into(),
+            data: "echo SEND''_MARKER; sleep 0.3; echo $((6*7))".into(),
             append_newline: None,
             ..Default::default()
         }))
@@ -901,7 +935,10 @@ async fn send_input_reaches_the_shell() {
         .unwrap();
     assert_eq!(body(&r)["status"], "ok");
 
-    let out = read_until_contains(&server, &id, "SEND_MARKER", 30).await;
+    // Polled for on the *last* thing the command prints, so both
+    // assertions below are about output this call waited for. The budget
+    // carries the 0.3 s the arrangement spends on purpose.
+    let out = read_until_contains(&server, &id, "42", 40).await;
     assert!(out.contains("SEND_MARKER"), "got: {out:?}");
     // `42` appears nowhere in the bytes we wrote, so only a shell that
     // evaluated the expression can have produced it.
@@ -3763,37 +3800,102 @@ async fn send_input_wait_for_returns_the_identical_shape() {
     let (wid, wpty) = mock_session_in(&server, "shape-wait");
     let (sid, spty) = mock_session_in(&server, "shape-send");
 
-    for pty in [Arc::clone(&wpty), Arc::clone(&spty)] {
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            pty.queue_output(b"line one\nghp_abcdef");
-        });
-    }
+    // **The bytes are queued by the write, not by a clock — GH #10.**
+    //
+    // Each arm scans from the head it sampled when it began, and the two
+    // samples are taken in different places: `wait_for_pattern` takes its
+    // own inside `wait::for_pattern`, one statement after the subscribe;
+    // `send_input` takes its `pre_write_head` on the *writer* thread, one
+    // statement before the write (§5.2). Both are right, and neither is
+    // the other's, so the arrangement has to put the output after **both**
+    // of them or the two responses are about different bytes and disagree
+    // on `matched`.
+    //
+    // This used to be a `thread::sleep(100ms)` per session, which is a
+    // guess about how long the second sample takes. It is not a constant:
+    // `send_input` reaches its through `spawn_blocking`, whose dispatch is
+    // scheduling-bound — measured here at 2.4 ms idle, 12 ms with the
+    // binary pinned to two cores at `--test-threads=16`, and unbounded
+    // above that. Inserting a 150 ms delay in front of that one sample
+    // turned this row from green in 30 contended whole-binary runs into
+    // **10 failures in 10**, always `matched` `true` vs `false` — the
+    // signature the issue records.
+    //
+    // `on_write` runs on the send session's writer thread immediately
+    // after `pre_write_head` is sampled, so queueing from inside it is
+    // the ordering the sleep was hoping for, as a fact. **Both** sessions
+    // are fed from here, so the two arms still see byte-identical
+    // buffers.
+    let wait_side = Arc::clone(&wpty);
+    let send_side = Arc::downgrade(&spty);
+    spty.on_write(move || {
+        wait_side.queue_output(b"line one\nghp_abcdef");
+        if let Some(send_side) = send_side.upgrade() {
+            send_side.queue_output(b"line one\nghp_abcdef");
+        }
+    });
 
     let mut args = wait_args(&wid, r"ghp_\w+");
     args.since_cursor = None; // live-only, like send_input's
     args.timeout_secs = Some(2);
 
-    // Concurrently, because both waits must be *running* when the bytes
-    // land: each one's scan starts at the head it saw when it began, and
-    // running them in sequence leaves the second starting after its
-    // session's output had already arrived.
-    let (waited, sent) = tokio::join!(async { wait_data(&server, args).await }, async {
-        body(
-            &server
-                .send_input(Parameters(SendInputArgs {
-                    session: sid.clone(),
-                    // Empty and no newline: nothing is typed, so the
-                    // two sessions see the same bytes.
-                    data: String::new(),
-                    append_newline: Some(false),
-                    wait_for: Some(r"ghp_\w+".into()),
-                    timeout_secs: Some(2),
-                }))
-                .await
-                .expect("send_input must not be a protocol error"),
-        )
-    });
+    // The other half of the ordering, and the reason this arm no longer
+    // has to be *raced* into position. One poll runs `wait_for_pattern`
+    // through `for_pattern`'s subscribe-then-snapshot — its scan start,
+    // and both sit before its first await — so `Pending` here is the
+    // positive fact that this arm is live with its start sampled. A
+    // `Ready` would mean output had already arrived, which is exactly the
+    // state the old arrangement raced and could not detect.
+    let mut wait_fut = std::pin::pin!(server.wait_for_pattern(Parameters(args)));
+    let first = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(wait_fut.as_mut(), cx))
+    })
+    .await;
+    assert!(
+        first.is_pending(),
+        "wait_for_pattern answered before anything had been queued"
+    );
+
+    let (waited, sent) = tokio::join!(
+        async {
+            body(
+                &wait_fut
+                    .await
+                    .expect("wait_for_pattern must not be a protocol error"),
+            )
+        },
+        async {
+            // **A delay that must not matter, and the guard on this
+            // fix.** Nothing here is on a timer any more, so pushing the
+            // write far past any clock the test could have used is free —
+            // and an arrangement that went back to queueing output on one
+            // would be red rather than lucky. 10/10 red against the
+            // arrangement this replaced.
+            //
+            // **The residual, stated rather than hidden:** the wait arm
+            // must still be inside its own 2 s deadline when the write
+            // lands, so this is not unbounded — it is 300 ms of a 2 s
+            // budget, against the ~100 ms budget the sleeps had, and the
+            // 1.7 s left is what `spawn_blocking`'s dispatch would have
+            // to burn. 0 failures in 5 with that dispatch delayed 1000 ms
+            // on purpose.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            body(
+                &server
+                    .send_input(Parameters(SendInputArgs {
+                        session: sid.clone(),
+                        // Empty and no newline: nothing is typed, so the
+                        // two sessions see the same bytes.
+                        data: String::new(),
+                        append_newline: Some(false),
+                        wait_for: Some(r"ghp_\w+".into()),
+                        timeout_secs: Some(2),
+                    }))
+                    .await
+                    .expect("send_input must not be a protocol error"),
+            )
+        }
+    );
 
     assert_eq!(waited["status"], sent["status"], "{waited} vs {sent}");
     for key in [
@@ -3886,6 +3988,124 @@ async fn interrupt(server: &HoldfastServer, id: &str) -> Value {
     body(&r)
 }
 
+/// The process group that owns a session's terminal — `tcgetpgrp(2)` of
+/// the shell's controlling terminal, which is the exact value `interrupt`
+/// signals (`InProcessPty::foreground_pgid`).
+///
+/// Read out of `/proc/<pid>/stat` field 8 (`tpgid`) rather than off the
+/// backend, because `PtyBackend::foreground_group` is not reachable
+/// through a `Session` and this is the only place a test wants it. That
+/// makes it Linux-only, and its one caller gates to Linux for that
+/// reason and no other.
+#[cfg(target_os = "linux")]
+fn terminal_owner(session: &holdfast_core::session::Session) -> i32 {
+    let pid = session.pid().expect("a live session has a pid");
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read the shell's stat");
+    // `comm` is parenthesised and may itself contain spaces and ')', so
+    // the fields after it start past the LAST ')' — the same parse as
+    // `InProcessPty::session_pgids`, for the same reason.
+    let rest = stat.rsplit_once(')').expect("stat carries a comm field").1;
+    // rest: [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr [5]=tpgid
+    rest.split_whitespace()
+        .nth(5)
+        .and_then(|f| f.parse().ok())
+        .expect("stat carries a tpgid field")
+}
+
+/// **Why the row below gates on the job's own output and never on
+/// `interaction_mode`.**
+///
+/// `interrupt` signals `tcgetpgrp(master)`. The shell raises `Executing`
+/// by writing `PS0`'s OSC 133 `C` marker, and it writes that *before* it
+/// expands the command's words, forks, and hands the terminal to the
+/// child's group — so `Executing` is reachable while the terminal is
+/// still the shell's own, and an `interrupt` there is delivered to a
+/// group the command has not joined. That was one flake, at 1 failure in
+/// 30 whole-binary runs under `taskset -c 0,1 --test-threads=16`: across
+/// 1360 contended trials the command survived the interrupt in exactly
+/// the 9 where this value was the shell's own group, and in none of the
+/// other 1351.
+///
+/// **The window is made deterministic rather than waited for.**
+/// `${var//x/y}` is shell-side work with no fork in it, so it sits
+/// between the marker and the fork and holds the terminal open against
+/// the 1 ms poll below. bash's substitution is quadratic — 7.7 s at
+/// 200 KB on the machine this was sized on — so the operand's length is
+/// the dial, and 40 KB is ~0.3 s of it. Without the pad the window is
+/// microseconds wide and both halves of this test would be measuring
+/// luck. If a future bash closes it, the first assertion fails saying so
+/// rather than going quietly green.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_job_owns_the_terminal_by_its_first_output_and_not_by_its_executing_mode() {
+    let server = HoldfastServer::new();
+    let id = start_bash(&server).await;
+    let session = server.registry.get(&id).unwrap();
+    read_until_contains(&server, &id, "$", 50).await;
+    // `setsid()` in the child makes PGID == SID == PID, so the shell's
+    // own process group is its pid.
+    let shell = session.pid().unwrap() as i32;
+
+    session
+        .write_input(b"printf -v HFPAD '%0*d' 40000 0; echo PAD''_BUILT\n")
+        .unwrap();
+    let out = read_until_contains(&server, &id, "PAD_BUILT", 100).await;
+    assert!(
+        out.contains("PAD_BUILT"),
+        "the pad was never built: {out:?}"
+    );
+
+    // The shape the flake had: a command line whose foreground job *will*
+    // be a group of its own, sampled the way a caller samples it — read
+    // the mode, then signal.
+    session.write_input(b"x=${HFPAD//0/1}; sleep 30\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut owner_when_executing = None;
+    while Instant::now() < deadline {
+        if session.detection().interaction_mode == holdfast_core::detect::InteractionMode::Executing
+        {
+            owner_when_executing = Some(terminal_owner(&session));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        owner_when_executing,
+        Some(shell),
+        "`Executing` was not reachable before the handover: the window \
+         this row pins has closed, and the row below can go back to \
+         gating on the mode"
+    );
+    let _ = session.signal(holdfast_core::pty::Signal::Interrupt);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session.detection().interaction_mode != holdfast_core::detect::InteractionMode::AtPrompt
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // And the gate that holds: `( … )` is one job, so bash hands it the
+    // terminal *before* running its body, and the marker cannot reach
+    // this buffer until the handover is done. The identical pad is in
+    // front of it, so the two halves differ in nothing but the gate.
+    session
+        .write_input(b"x=${HFPAD//0/1}; ( echo RUN''NING; sleep 30 )\n")
+        .unwrap();
+    let out = read_until_contains(&server, &id, "RUNNING", 200).await;
+    assert!(
+        out.contains("RUNNING"),
+        "the foreground job never started: {out:?}"
+    );
+    assert_ne!(
+        terminal_owner(&session),
+        shell,
+        "a job that has printed must already hold the terminal, or the \
+         row below is gating on nothing"
+    );
+
+    kill_all(&server).await;
+}
+
 /// **Unix-only, and the reason is the assertion rather than the API**: the
 /// discriminating half probes a *descendant* pid with `kill(pid, 0)`.
 /// Windows job objects are 0.0.11's and get their own test.
@@ -3926,23 +4146,49 @@ async fn interrupt_stops_a_running_command_and_leaves_the_shell_alive() {
         .unwrap_or_else(|| panic!("no background pid in: {out:?}"));
     assert!(pid_alive(bg_pid), "the background job never started");
 
-    // Foreground, so job control gives `sleep` its own process group —
+    // Foreground, so job control gives the job its own process group —
     // which is what makes this a test of the *foreground* targeting rather
     // than of signalling in general.
-    session.write_input(b"sleep 30\n").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while session.detection().interaction_mode != holdfast_core::detect::InteractionMode::Executing
-        && Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    // Asserted rather than merely waited for: if the `sleep` never
-    // started, the marker below comes back because there was nothing to
-    // interrupt, and this test proves nothing at all.
+    //
+    // **The gate is output from the job, and `interaction_mode` cannot
+    // be.** This waited for `Executing` until it was measured failing 1 in
+    // 30 whole-binary runs under `taskset -c 0,1 --test-threads=16`, and
+    // the mode is not the property this needs. `interrupt` signals
+    // `tcgetpgrp(master)`; the shell raises `Executing` by printing
+    // `PS0`'s OSC 133 `C` marker, and it prints that *before* it expands
+    // the command's words, forks, and hands the terminal to the child's
+    // group. So there is a window in which every signal Holdfast offers
+    // reads `Executing` while the terminal still belongs to the shell's
+    // own group, and an `interrupt` there is delivered to a group the
+    // command is not in yet. Measured over 1360 contended trials: the
+    // foreground group was the shell's own in 9, the command survived the
+    // interrupt in exactly those 9, and in the other 1351 it never
+    // survived once. Injecting a delay between the marker and the fork —
+    // a `${var//x/y}`, which is shell-side work with no fork in it —
+    // opens the window in all 30 trials it was tried in with no
+    // contention at all (20 at 32 KB, 10 at 200 KB), and leaves it shut
+    // in 10 of 10 against the gate below.
+    //
+    // A subshell is what closes it: `( … )` is one job, so bash gives it
+    // the terminal *before* running its body, and `RUNNING` can therefore
+    // not reach this buffer until the handover is complete. `sleep 30`
+    // then runs inside that same group, so the interrupt still has to
+    // find a group the shell does not belong to.
+    session
+        .write_input(b"( echo RUN''NING; sleep 30 )\n")
+        .unwrap();
+    let out = read_until_contains(&server, &id, "RUNNING", 60).await;
+    // Asserted rather than merely waited for: if the job never started,
+    // the marker below comes back because there was nothing to interrupt,
+    // and this test proves nothing at all.
+    assert!(
+        out.contains("RUNNING"),
+        "the shell never started the foreground job: {out:?}"
+    );
     assert_eq!(
         session.detection().interaction_mode,
         holdfast_core::detect::InteractionMode::Executing,
-        "the shell never started the `sleep`"
+        "a job that has printed is not reported as executing"
     );
 
     let r = interrupt(&server, &id).await;

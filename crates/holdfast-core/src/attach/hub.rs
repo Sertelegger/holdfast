@@ -367,6 +367,56 @@ impl AttachHub {
         self.secrets.take(session_id, expect_id)
     }
 
+    /// §8.3's echo-drop edge, raised — **the one raise entitled to claim
+    /// an answer §9.6's autofill left behind** (GH #105).
+    ///
+    /// [`raise_secret`](Self::raise_secret) stays what it is and is what
+    /// §7.5's replay and `await_secret`'s re-raise keep using. This one is
+    /// for `attach::conn::forward_events`' reaction to the edge itself,
+    /// which is the only raise tied to a particular read. See
+    /// [`crate::secret::SecretSlots::raise_on_echo_drop_edge`].
+    pub fn raise_secret_on_edge(
+        &self,
+        session_id: &str,
+        prompt_text: &str,
+        episode: u64,
+    ) -> (super::secret::SecretRequest, bool) {
+        self.secrets
+            .raise_on_echo_drop_edge(session_id, prompt_text, episode)
+    }
+
+    /// §5.2's echo return, **whole**: close the request, answer the call
+    /// waiting on it, and tell every attached client — in that order and
+    /// without the caller being able to do two of the three.
+    ///
+    /// **One function because there are two callers and they must not
+    /// drift** (GH #105). `attach::conn::forward_events` runs this per
+    /// connection; `secret::binding`'s `spawn_forwarder` runs it in a
+    /// target that cannot build an `Arc<Daemon>`. A test-module copy of
+    /// the arm is a copy that stays green while the original is reverted —
+    /// measured: reverting the production arm to its pre-fix form left
+    /// **all** of GH #105's new rows and all 120 `secret::` rows passing,
+    /// because none of them reached it.
+    ///
+    /// The word comes from [`crate::secret::echo_return_resolution`] via
+    /// the request's own [`answered`], never from this edge: echo comes
+    /// back both when a human abandons a prompt and when the daemon
+    /// answered it.
+    ///
+    /// Exactly one caller gets a `Some`, like every other close here, so
+    /// exactly one fan-out happens even though every connection tries.
+    ///
+    /// [`answered`]: crate::secret::RaisedRequest::answered
+    pub fn close_secret_on_echo_return(&self, session_id: &str) -> Option<(String, &'static str)> {
+        let raised = self.close_secret(session_id, None)?;
+        let id = raised.request_id().to_string();
+        let answered = self.secrets.claim_echo_return_answer(session_id, &raised);
+        let (resolution, outcome) = crate::secret::echo_return_resolution(answered);
+        raised.answer(resolution);
+        self.broadcast_secret_closed(session_id, &id, outcome);
+        Some((id, outcome))
+    }
+
     /// Tell every client attached to this session that a request is
     /// outstanding (§7.5).
     ///

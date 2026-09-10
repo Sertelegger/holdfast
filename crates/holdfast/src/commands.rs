@@ -2014,6 +2014,79 @@ fn unsupported(what: &str, remedy: Remedy) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
+/// What `holdfast pty-worker --help` prints.
+///
+/// **Hidden means absent from the banner, not undiagnosable.** The
+/// subcommand is not in `USAGE` because no operator runs it — the daemon
+/// does, once per session — but an operator who finds one in `ps` or in
+/// `daemon.log` and asks it what it is deserves an answer, and the answer
+/// is where the leak this task exists to prevent gets explained.
+#[cfg(unix)]
+const PTY_WORKER_USAGE: &str = "\
+holdfast pty-worker --socket <path>
+
+INTERNAL. Spawned by the daemon, one per session, to hold that session's
+PTY in its own process (milestone 0.0.10a). It is deliberately absent from
+`holdfast --help`: it is not a command to run by hand, and a worker started
+without a daemon listening on <path> exits within seconds.
+
+The session's command, arguments, working directory and environment are
+NOT on this command line. They arrive over the socket, because
+/proc/<pid>/cmdline is world-readable on Linux and `ps` shows an argv to
+every local user everywhere, while a session's environment can carry
+credentials.
+";
+
+/// `holdfast pty-worker --socket <path>` — the hidden subcommand (§3.1).
+///
+/// Nine lines over `pty::worker::child::run`, because §3.5 puts parsing
+/// and printing here and state in `holdfast-core`. Everything this
+/// process says goes to stderr through `diag!`, which the daemon drains
+/// into `daemon.log`; the one exception is `--help`, which is an answer
+/// to a human and therefore stdout.
+#[cfg(unix)]
+pub async fn pty_worker(args: &[String]) -> ExitCode {
+    use holdfast_core::pty::worker::child::{self, Argv};
+    match child::parse_argv(args) {
+        Argv::Help => {
+            print!("{PTY_WORKER_USAGE}");
+            ExitCode::SUCCESS
+        }
+        Argv::Usage(why) => {
+            diag!("holdfast pty-worker: {why}\n\n{PTY_WORKER_USAGE}");
+            ExitCode::from(EXIT_USAGE)
+        }
+        Argv::Run(socket) => match child::run(&socket).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                // The one place a worker's refusal becomes words. It
+                // reaches `daemon.log` through the stderr pipe the daemon
+                // drains, redacted like every other `diag!`, and it
+                // carries the reason and no PTY byte.
+                diag!("holdfast pty-worker: {e}");
+                ExitCode::from(EXIT_FAILED)
+            }
+        },
+    }
+}
+
+/// The Windows arm, and **deliberately not §3.6's refusal message**.
+///
+/// The seven subcommands that print "not supported on Windows native"
+/// are ones an operator types; this is not one, and the `windows-2022`
+/// job greps that substring across exactly those seven. 0.0.10a ships no
+/// Windows worker — REQ-CFG-007 defaults Windows to `in_process` until
+/// 0.0.11 — so nothing on this platform spawns one, and a human who
+/// reaches here has typed a subcommand that was never for them.
+#[cfg(not(unix))]
+pub async fn pty_worker(_args: &[String]) -> ExitCode {
+    diag!(
+        "holdfast pty-worker is an internal subcommand and has no Windows implementation \
+         in this release: Windows sessions use the in-process PTY backend."
+    );
+    ExitCode::from(EXIT_USAGE)
+}
+
 /// `holdfast version`
 pub fn version() -> ExitCode {
     println!(

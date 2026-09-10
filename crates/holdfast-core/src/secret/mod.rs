@@ -65,6 +65,6 @@ pub use provider::{resolve, ArgvProvider, ProviderError, SecretProvider};
 /// API. Widening it later is additive, narrowing it is not.
 pub(crate) use request::SlotSnapshot;
 pub use request::{
-    buffer_notice, Adopted, CancelReason, Collision, RaisedBy, RaisedRequest, Resolution,
-    SecretSlots, SlotTake,
+    buffer_notice, echo_return_resolution, Adopted, CancelReason, Collision, RaisedBy,
+    RaisedRequest, Resolution, SecretSlots, SlotTake,
 };

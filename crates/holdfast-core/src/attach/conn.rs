@@ -1489,8 +1489,21 @@ async fn forward_events(
     use tokio::sync::broadcast::error::RecvError;
     loop {
         match events.recv().await {
-            Ok(SessionEvent::AwaitingSecretEntered { prompt_text }) => {
-                let (req, _first) = daemon.attach_hub().raise_secret(&session_id, &prompt_text);
+            Ok(SessionEvent::AwaitingSecretEntered {
+                episode,
+                prompt_text,
+            }) => {
+                // **`raise_secret_on_edge` and not `raise_secret`**, and
+                // this is the only call site of it: a raise made *here* is
+                // a reaction to one echo-drop edge, so it is the one raise
+                // that may claim a credential §9.6's autofill wrote with
+                // no raise to close (GH #105). §7.5's replay in `run` and
+                // `await_secret`'s re-raise keep the plain door, because
+                // neither names a read.
+                let (req, _first) =
+                    daemon
+                        .attach_hub()
+                        .raise_secret_on_edge(&session_id, &prompt_text, episode);
                 // Exactly one suppression, and only of the id `run`
                 // already sent. A *superseded* request gets a fresh id
                 // from `SecretRequest::new`, so this cannot swallow a
@@ -1509,25 +1522,44 @@ async fn forward_events(
                     return;
                 }
             }
-            // §5.2's supersede: echo came back with no submission. Exactly
-            // one connection's `close_secret` returns `Some`, so exactly
-            // one fan-out happens even though every one of them tries.
+            // Echo came back, which ends the request — but **not always
+            // as §5.2's supersede**, and the whole of what that means is
+            // `close_secret_on_echo_return`. Exactly one connection's
+            // close returns `Some`, so exactly one fan-out happens even
+            // though every one of them tries.
+            //
+            // **`user_cancelled` is still the word this edge produces, and
+            // this edge is no longer entitled to assume it** (GH #105). An
+            // earlier revision of this comment claimed the reason had
+            // exactly one producer and that it was this line: §7.5's
+            // client-frame catalogue has no cancellation frame, so — it
+            // argued — the only way a request ends without a value while
+            // somebody is waiting is a human aborting or the child
+            // abandoning its read.
+            //
+            // There is a third way, and the premise is what hid it.
+            // §9.6's autofill can have written the credential **already**,
+            // which is precisely *why* echo came back. It reaches the slot
+            // through `take_if_unadopted_matching`, and when its snapshot
+            // predates this connection's raise it finds the slot `Vacant`,
+            // writes, and closes nothing — so the raise this arm then
+            // takes is a request the writer never saw. "Echo cleared with
+            // no submission *to this raise*" is not "the user cancelled":
+            // measured 1 failure in 50 contended runs of
+            // `the_listener_and_a_connections_raise_ride_the_same_edge`.
+            //
+            // So the raise above claims that credential when it announces
+            // the same edge, and this arm reports what the request itself
+            // carries. Not a lookup keyed by the edge — an episode is one
+            // run of echo-off and `sudo` asking twice puts two reads
+            // inside one, so a lookup hands the second read's raise the
+            // first read's answer.
+            //
+            // The two subscribers are deliberately not ordered against
+            // each other: they are independent receivers on one broadcast
+            // and `broadcast::send` wakes them one at a time.
             Ok(SessionEvent::AwaitingSecretLeft) => {
-                if let Some(raised) = daemon.attach_hub().close_secret(&session_id, None) {
-                    let id = raised.request_id().to_string();
-                    // **`user_cancelled` has exactly one producer and it
-                    // is this line.** §7.5's client-frame catalogue has no
-                    // cancellation frame, so the only way a request ends
-                    // without a value while somebody is waiting is the
-                    // echo-off condition clearing — a human aborting at an
-                    // attached client, or the child abandoning its read.
-                    raised.answer(crate::secret::Resolution::Cancelled(
-                        crate::secret::CancelReason::UserCancelled,
-                    ));
-                    daemon
-                        .attach_hub()
-                        .broadcast_secret_closed(&session_id, &id, "cancelled");
-                }
+                daemon.attach_hub().close_secret_on_echo_return(&session_id);
             }
             // **The exit is `forward_output`'s, not this task's**, and
             // the reason is the redactor: it lives in that task, one per

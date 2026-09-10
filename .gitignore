@@ -45,3 +45,9 @@ __pycache__/
 # direnv: local environment, may hold credentials — never commit
 .envrc
 .envrc.local
+
+# Agent worktrees. Each is a live `git worktree` checkout, so `git add -A`
+# from the repo root stages it as an embedded repository — a gitlink that
+# points at nothing anyone else can fetch. Ignored so a careless `-A`
+# cannot publish one, which it did once.
+.claude/worktrees/

@@ -117,9 +117,19 @@ pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> 
     // deadline. `recv` is polled with a short timeout rather than awaited
     // outright, because a child that has exited writes nothing and would
     // otherwise hold the caller until its full deadline.
+    // Whether this wait ever observed the session dead. Only used at the
+    // deadline, to keep answering `SessionDied` rather than `TimedOut` for
+    // a session that is definitely gone but whose reader never signalled
+    // completion — a stuck reader must not turn a known death into a
+    // timeout, which would be a *new* wrong answer bought with the fix for
+    // an old one.
+    let mut saw_death = false;
     loop {
         let now = Instant::now();
         if now >= deadline {
+            if saw_death {
+                return final_rescan(session, pattern, scan_start, outcome);
+            }
             outcome.end = WaitEnd::TimedOut;
             return outcome;
         }
@@ -154,22 +164,71 @@ pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> 
             }
             Err(_elapsed) => {
                 if !session.is_alive() {
-                    // One last look: the reader may have appended after the
-                    // frame we last saw and before it noticed the exit.
-                    let (tail, head) = session.buffer_extent();
-                    let start = scan_start.max(tail);
-                    let final_window = session.buffer_slice(start, head);
-                    if let Some(found) = search(pattern, &final_window, start) {
-                        outcome.end = WaitEnd::Matched;
-                        outcome.found = Some(found);
-                    } else {
-                        outcome.end = WaitEnd::SessionDied;
+                    saw_death = true;
+                    // **Wait for the reader, not for the child — GH #42.**
+                    // `is_alive()` goes false the moment the child exits,
+                    // but the reader breaks only once `read` returns 0
+                    // *and* the backend is dead, so the child's last line
+                    // is still in the pty for however long the scheduler
+                    // takes to run one more `read`. Rescanning on the
+                    // child's death alone therefore searched a buffer that
+                    // did not yet hold the bytes, and answered
+                    // `SessionDied` for output the session really produced
+                    // and `read_output` would return a moment later.
+                    //
+                    // Measured causally rather than by sampling: a 150 ms
+                    // delay inserted before the reader's `buffer.push`
+                    // turned `output_written_just_before_an_exit_still_matches`
+                    // from green into **10 failures in 10**, with exactly
+                    // the CI signature (`left: SessionDied, right:
+                    // Matched`). The row is otherwise green in 60 isolated
+                    // and 8 whole-lib contended runs on a 2-core box,
+                    // which is why it read as a flake for so long.
+                    //
+                    // `reader_finished()` is the positive fact: the reader
+                    // has left its loop, so the buffer is final. Its
+                    // `Release` store pairs with that method's `Acquire`
+                    // load, which is what makes every `buffer.push` before
+                    // it visible here.
+                    //
+                    // **Not `RecvError::Closed`**, which would be the
+                    // obvious signal and does not work: `Session` holds
+                    // `output_tx` itself, so the sender outlives the
+                    // reader thread and that arm is unreachable while the
+                    // caller holds an `Arc<Session>` — which it always
+                    // does, since `session` is borrowed from one.
+                    if session.reader_finished() {
+                        return final_rescan(session, pattern, scan_start, outcome);
                     }
-                    return outcome;
                 }
             }
         }
     }
+}
+
+/// The last look at a finished session's buffer, shared by the two places
+/// that take it so they cannot come to disagree about what "one last look"
+/// means.
+///
+/// The caller must already have established that no further output is
+/// coming — `Session::reader_finished()` — or the search races the reader
+/// that GH #42 is about.
+fn final_rescan(
+    session: &Session,
+    pattern: &Regex,
+    scan_start: u64,
+    mut outcome: WaitOutcome,
+) -> WaitOutcome {
+    let (tail, head) = session.buffer_extent();
+    let start = scan_start.max(tail);
+    let final_window = session.buffer_slice(start, head);
+    if let Some(found) = search(pattern, &final_window, start) {
+        outcome.end = WaitEnd::Matched;
+        outcome.found = Some(found);
+    } else {
+        outcome.end = WaitEnd::SessionDied;
+    }
+    outcome
 }
 
 /// The window a lagged waiter starts again from.
@@ -414,6 +473,44 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the wait ran on past the child's exit: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// **The same claim as the row below, made deterministic** (GH #42).
+    ///
+    /// That row is a coin: the window between the child's death and the
+    /// reader's next `read` is normally microseconds, so it stayed green
+    /// in 60 isolated and 8 whole-lib contended runs on a 2-core box while
+    /// failing on a slower CI host. This one widens the window on purpose,
+    /// so the assertion fails whenever the bug is present rather than
+    /// whenever the machine is unlucky.
+    ///
+    /// **The delay is the mutation, and it was measured before the fix
+    /// existed**: a 150 ms stall inserted ahead of the reader's
+    /// `buffer.push` turned the row below into 10 failures in 10, with
+    /// exactly the CI signature (`left: SessionDied, right: Matched`).
+    /// Reverting the `reader_finished()` guard in `for_pattern` reddens
+    /// this row for that reason and no other.
+    #[tokio::test]
+    async fn a_slow_reader_does_not_turn_a_match_into_a_death() {
+        let (s, pty) = mock();
+        // Long enough that the child is observably dead while its last
+        // line is still sitting unread in the pty.
+        pty.set_read_delay(Duration::from_millis(150));
+        let writer = Arc::clone(&pty);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            writer.queue_output(b"READY\n");
+            writer.exit(0);
+        });
+        // Comfortably longer than the delay, so a failure here is the
+        // wrong answer and never an impatient deadline.
+        let out = for_pattern(&s, &re("READY"), spec(None, 5000)).await;
+        assert_eq!(
+            out.end,
+            WaitEnd::Matched,
+            "the wait answered over a buffer the reader had not finished \
+             filling: the bytes were in the pty, not lost"
         );
     }
 
