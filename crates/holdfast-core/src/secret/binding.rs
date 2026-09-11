@@ -1168,6 +1168,187 @@ mod tests {
         }
     }
 
+    /// **GH #127: a call already cancelled runs no provider and raises
+    /// nothing.**
+    ///
+    /// Two claims that are one decision. A cancel can land while the
+    /// caller is still inside §5.2's step 1 — §17.5's approval is a
+    /// human-scale wait sitting there — and what happens next used to be:
+    /// spawn the provider anyway, then raise a prompt, then close it, then
+    /// re-raise it.
+    ///
+    /// * **No provider**, because `op read` wakes a biometric helper and
+    ///   `pass show` wakes `pinentry`. This module's own objection to
+    ///   speculative resolution — *"a credential read out of a store
+    ///   nobody agreed to read"* — read from the other end.
+    /// * **No raise**, because the window a prompt describes was over
+    ///   before it opened: three frames at every attached client and a
+    ///   §9.4 pair for a request that could never be answered.
+    ///
+    /// The pairing is the same arrangement without the cancel, which does
+    /// run the provider and does resolve — so neither absence is about a
+    /// fixture that never worked.
+    #[tokio::test]
+    async fn a_cancelled_call_runs_no_provider_and_raises_nothing() {
+        let mut sc = Scratch::new("cancelearly");
+        let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}'\n"));
+        let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+
+        let signal = crate::request::CancelSignal::new();
+        signal.cancel();
+        let payload = {
+            let ctx = RequestContext::with_cancel(signal);
+            let args = secret_args(&s.id, 20);
+            let r = tokio::time::timeout(
+                Duration::from_secs(20),
+                crate::request::with_context(ctx, server.request_secret_input(Parameters(args))),
+            )
+            .await
+            .expect("the cancelled call never returned")
+            .expect("request_secret_input");
+            body(&r)
+        };
+
+        assert_eq!(payload["status"], "secret_cancelled", "{payload}");
+        assert_eq!(
+            payload["data"]["reason"], "caller_cancelled",
+            "a cancelled call was reported as something else: {payload}"
+        );
+        assert!(
+            payload["data"]["request_id"].is_null(),
+            "the call named a request it never raised: {payload}"
+        );
+        assert!(
+            !sc.ran("prod-ssh"),
+            "a cancelled call read the credential store"
+        );
+        assert!(
+            server.attach_hub().outstanding_secret(&s.id).is_none(),
+            "the cancelled call left a raise nobody can answer"
+        );
+        assert!(
+            sc.kinds(&s.id).is_empty(),
+            "a cancelled call wrote §9.4 lines for a request it never raised: {:?}",
+            sc.kinds(&s.id)
+        );
+
+        // ---- the pairing: the same arrangement, uncancelled.
+        let mut sc2 = Scratch::new("cancelearlyok");
+        let b2 = sc2.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}'\n"));
+        let server2 = server_with(keychain_mode(vec![b2]), &sc2.audit_log());
+        let s2 = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server2.registry.insert(Arc::clone(&s2)).expect("register");
+        await_prompt(&s2, b"Password: ").await;
+        let payload = call(&server2, secret_args(&s2.id, 10)).await;
+        assert_eq!(
+            payload["status"], "secret_provided",
+            "the uncancelled arrangement did not resolve, so the absences above prove \
+             nothing: {payload}"
+        );
+        assert!(sc2.ran("prod-ssh"), "the control never ran its provider");
+
+        let _ = s.signal(Signal::Kill);
+        let _ = s2.signal(Signal::Kill);
+    }
+
+    /// **GH #127: a cancel ends §17.5's approval, and no human can
+    /// approve it afterwards.**
+    ///
+    /// The approval window is the lesser of
+    /// `binding_approval_timeout_secs` and half the caller's remaining
+    /// deadline — up to 60 s on shipped defaults — and a caller can go
+    /// away inside it. Without a cancellation arm the wait ran to its own
+    /// deadline with nobody waiting for the answer, **and a human could
+    /// still approve it**: a `binding_approval` entry reading `approved`,
+    /// a credential read out of a store, and no caller for either.
+    ///
+    /// Two assertions and they are different facts: the call ends
+    /// promptly, and the approval slot is *gone* — a late `ApproveBinding`
+    /// finds nothing rather than resolving a binding for a request that
+    /// no longer exists.
+    #[tokio::test]
+    async fn a_cancel_ends_the_binding_approval_and_no_one_can_approve_it() {
+        let mut sc = Scratch::new("cancelapproval");
+        let mut b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}'\n"));
+        b.require_confirm = true;
+        let server = Arc::new(server_with(keychain_mode(vec![b]), &sc.audit_log()));
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+
+        let signal = crate::request::CancelSignal::new();
+        let call = {
+            let server = Arc::clone(&server);
+            let ctx = RequestContext::with_cancel(signal.clone());
+            // Sixty seconds, so nothing but the cancel can end this
+            // inside the row's own ceiling.
+            let args = secret_args(&s.id, 60);
+            tokio::spawn(async move {
+                crate::request::with_context(ctx, server.request_secret_input(Parameters(args)))
+                    .await
+            })
+        };
+
+        // The approval is really outstanding before the cancel.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let approval_id = loop {
+            if let Some(a) = server.attach_hub().approvals().outstanding(&s.id) {
+                break a.approval_id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "§17.5's approval was never raised, so there is nothing to cancel"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let started = std::time::Instant::now();
+        signal.cancel();
+        let payload = body(
+            &tokio::time::timeout(Duration::from_secs(25), call)
+                .await
+                .expect("the cancel never ended the approval wait")
+                .expect("the call task")
+                .expect("request_secret_input"),
+        );
+        assert_eq!(payload["data"]["reason"], "caller_cancelled", "{payload}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the approval ran to its own window: {:?}",
+            started.elapsed()
+        );
+
+        // **The modal cannot be answered any more.** A human deciding
+        // after the asker has gone would otherwise read the credential
+        // and write `approved` for nobody.
+        assert!(
+            matches!(
+                server.attach_hub().approvals().decide(
+                    &s.id,
+                    &approval_id,
+                    crate::attach::frames::ApprovalDecision::Approve,
+                    "cli",
+                ),
+                crate::secret::Decide::UnknownApprovalId
+            ),
+            "a human could still approve a request whose caller had gone"
+        );
+        assert!(
+            !sc.ran("prod-ssh"),
+            "the approved-for-nobody path read the credential store"
+        );
+        assert!(
+            !sc.kinds(&s.id).iter().any(|k| k == "binding_approval"),
+            "a §9.4 approval outcome was written for a decision nobody made: {:?}",
+            sc.kinds(&s.id)
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
     /// **GH #126: the call's own `max_secret_bytes` reaches the
     /// provider.**
     ///

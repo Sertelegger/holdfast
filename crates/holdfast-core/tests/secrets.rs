@@ -2839,45 +2839,86 @@ async fn an_abandoned_call_whose_request_was_taken_closes_nothing() {
 /// endings, and the second must win — the credential really did reach the
 /// child, and telling an operator nobody answered is GH #105 exactly.
 ///
-/// **The window is held open deliberately**, in the shape
-/// `secret::binding`'s rows already use: the value is submitted first and
-/// the cancel fires after the slot has been taken, so the arrangement is
-/// always the hostile one rather than one that arrives by luck.
+/// **The first version of this row was vacuous and was proven so.** It
+/// waited for the submission to clear the slot and then cancelled, which
+/// is too late: the oneshot resolves inside the 5 ms poll, `await_secret`
+/// returns from inside its own `select!`, and `woke` is never
+/// `Woke::Cancelled` at all — a #105 regression planted in the close
+/// block survived ten consecutive runs and an `eprintln!` in that block
+/// never printed. It was re-testing ordinary fulfilment.
+///
+/// **So the window is held open rather than raced for**, the way
+/// `an_abandoned_call_whose_request_was_taken_closes_nothing` does.
+/// `attach::conn` takes the slot *before* it queues the write and answers
+/// the waiter only after the ack, so parking the writer inside
+/// `MockPty::write` freezes the call between the two: the slot is empty,
+/// the waiter is unanswered, and the cancel below lands in the close path
+/// every time. That is the only arrangement in which `woke` really is
+/// `Woke::Cancelled` and the `None` arm really does decide the word.
 #[tokio::test]
 async fn a_cancel_that_arrives_after_the_answer_does_not_overwrite_it() {
     let d = TestDaemon::start("cancelrace").await;
-    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let (s, pty) = d.mock_session();
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
-    let (id, _) = next_awaiting_secret(&mut c, 20).await;
 
     let signal = CancelSignal::new();
-    let call = spawn_cancellable_call(&d, secret_args(&s.id, 20), &signal);
+    let call = spawn_cancellable_call(&d, secret_args(&s.id, 60), &signal);
     await_waiter(&d, &s.id, "the call about to be answered").await;
+    let (id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    // The writer parks inside `write`, so the submission below takes the
+    // slot and then stops before its ack.
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        pty.on_write(move || {
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+    }
 
     send(
         &mut c,
         &ClientFrame::SecretInput {
-            request_id: id,
+            request_id: id.clone(),
             bytes: PROBE.as_bytes().to_vec(),
         },
     )
     .await;
-    // The answer has taken the slot before the cancel fires.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while d
-        .daemon
-        .server
-        .attach_hub()
-        .outstanding_secret(&s.id)
-        .is_some()
-    {
+
+    // The slot is taken and the writer is parked: the call is frozen
+    // between the two, which is the only state this row is about.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let taken = d
+            .daemon
+            .server
+            .attach_hub()
+            .outstanding_secret(&s.id)
+            .is_none();
+        if taken && entered.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the submission never cleared the slot"
+            "the submission never reached the parked writer, so the window this row \
+             needs was never open"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+
+    // **The cancel, inside the window.** `await_secret` wakes on it, finds
+    // the slot already gone, and must report what really happened rather
+    // than what woke it.
     signal.cancel();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let payload = joined(call, "the answered call").await;
     assert_eq!(
@@ -2890,12 +2931,20 @@ async fn a_cancel_that_arrives_after_the_answer_does_not_overwrite_it() {
         (PROBE.len() + 1) as u64,
         "{payload}"
     );
-    // And the child really did receive it, so the status above is not a
-    // claim about a write that never happened.
-    let seen = stream_until(&mut c, b"got=HUNTER2", 20).await;
+
+    // The client is told `fulfilled`, once, and is not then told the
+    // prompt it answered was abandoned.
+    let (closed_id, outcome) = next_secret_closed(&mut c, 20).await;
+    assert_eq!(closed_id, id);
+    assert_eq!(
+        outcome, "fulfilled",
+        "the request a client answered was closed as {outcome:?}"
+    );
+    // The pairing that makes the word above mean something: the value
+    // really did reach the child.
     assert!(
-        !contains(&seen, PROBE.as_bytes()),
-        "the submitted value reached an attached client's stream"
+        contains(&pty.written(), PROBE.as_bytes()),
+        "the submitted value never reached the PTY, so nothing was fulfilled"
     );
 
     let _ = s.signal(Signal::Kill);

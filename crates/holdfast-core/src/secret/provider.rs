@@ -2417,6 +2417,181 @@ mod tests {
         assert_eq!(value.len(), PROBE.len());
     }
 
+    /// **GH #127: an already-ended request starts no process at all.**
+    ///
+    /// The collection loop refuses a cancelled request, but it refuses it
+    /// *after* the spawn — and the spawn is the cost that matters here.
+    /// `op read` wakes a biometric helper; `pass show` wakes `gpg`, which
+    /// wakes `pinentry` and puts a modal in front of a human. Doing that
+    /// for a caller who has already gone is this module's own objection
+    /// to speculative resolution, from the other end.
+    ///
+    /// **The discriminator is a program that does not exist**, and that
+    /// is the whole design of the row. A fixture that records having run
+    /// cannot answer this: with the guard removed the child *is* spawned
+    /// and then killed at the first poll, so whether it reaches its own
+    /// first line before `kill_group` arrives is a race — measured, and
+    /// it usually loses, which would make this row pass for the wrong
+    /// reason under no load and fail under some. An absent program
+    /// answers `NotStarted` from `spawn` itself: a different error
+    /// variant, decided before any process exists, with nothing to race.
+    ///
+    /// **Driven directly, and that is stated rather than hidden.** The
+    /// window the guard covers is the `spawn_blocking` hop between
+    /// `autofill`'s selection and the fork, and `request_secret_input`'s
+    /// own pre-raise check returns before step 1 for a call cancelled
+    /// earlier — so `a_cancelled_call_runs_no_provider_and_raises_nothing`
+    /// stays green with this guard deleted. A guard nothing drives is
+    /// decoration.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_already_ended_request_starts_no_provider_process() {
+        let fx = ScriptDir::new("prespawn");
+        // Never written. `spawn` answers `NotStarted` for it, which is
+        // what makes "was the spawn attempted?" observable.
+        let absent = fx.path("not-a-program.sh");
+
+        for (label, ctx) in [
+            ("cancelled", {
+                let c = RequestContext::detached().with_max_bytes(4096);
+                c.cancel_signal().cancel();
+                c
+            }),
+            (
+                "expired",
+                RequestContext::detached()
+                    .with_max_bytes(4096)
+                    .with_deadline(std::time::Instant::now() - Duration::from_secs(1)),
+            ),
+        ] {
+            let err = resolve_off_thread_with(
+                ScriptProvider::new("pass", &absent),
+                "work/db",
+                provider_limits(10),
+                false,
+                ctx,
+            )
+            .await
+            .expect_err("an ended request resolved a credential");
+            assert!(
+                !matches!(err, ProviderError::NotStarted { .. }),
+                "{label}: the spawn was attempted for a request that was already over — \
+                 `op read` wakes a biometric helper and `pass show` wakes `pinentry`; \
+                 got {err:?}"
+            );
+        }
+
+        // **The pairing**, same absent program, a live request: the spawn
+        // *is* attempted, so the two refusals above are about the context
+        // and not about a path that never spawns anything.
+        let err = resolve_off_thread_with(
+            ScriptProvider::new("pass", &absent),
+            "work/db",
+            provider_limits(10),
+            false,
+            RequestContext::detached().with_max_bytes(4096),
+        )
+        .await
+        .expect_err("a program that does not exist resolves nothing");
+        assert!(
+            matches!(err, ProviderError::NotStarted { .. }),
+            "a live request did not reach the spawn, so the refusals above prove \
+             nothing: {err:?}"
+        );
+    }
+
+    /// **GH #127: the cancel is read after the direct child has already
+    /// exited.**
+    ///
+    /// **Written because `if ctx.is_cancelled()` survived being weakened
+    /// to `if status.is_none() && ctx.is_cancelled()`.** The symmetric
+    /// mutation on the *deadline* check is caught by two rows; this one
+    /// was not, and the asymmetry was fixture shape.
+    /// `a_cancelled_request_ends_the_provider_it_was_waiting_on` keeps its
+    /// direct child alive throughout, so `status` stays `None` and the
+    /// guard is never reached with a reaped child. The grandchild
+    /// fixtures existed but were only ever paired with a deadline.
+    ///
+    /// The scenario is the ordinary one: `pass show` exits in 40 ms and
+    /// its forked `gpg`/`pinentry` holds the inherited stdout. The agent
+    /// cancels. With `status` already `Some`, a guard that only looks
+    /// while the child is running never reads the cancel, and the call is
+    /// pinned in `spawn_blocking` for the whole
+    /// `keychain_provider_timeout_secs` — GH #127's symptom on the path
+    /// written to fix it.
+    ///
+    /// No credential reaches the PTY either way; the cost is a held slot
+    /// and the latency, which is what the elapsed assertion measures.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancel_is_read_after_the_direct_child_has_exited() {
+        let fx = ScriptDir::new("cancelcollect");
+        let ran = fx.path("ran");
+        // The shape of the bug: the direct child prints, records that it
+        // ran, and **exits**, while a backgrounded `sleep` holds the
+        // inherited stdout pipe far past this row's own ceiling.
+        let script = fx.named_script(
+            "leak.sh",
+            &format!(
+                "sleep 60 &\necho ran > '{}'\nprintf '{PROBE}'\nexit 0\n",
+                ran.display()
+            ),
+        );
+
+        let ctx = RequestContext::detached().with_max_bytes(4096);
+        let signal = ctx.cancel_signal().clone();
+        let started = std::time::Instant::now();
+        let call = tokio::spawn(resolve_off_thread_with(
+            ScriptProvider::new("pass", &script),
+            "work/db",
+            // A 120 s provider budget, so nothing but the cancel can end
+            // this inside the row's ceiling.
+            provider_limits(120),
+            false,
+            ctx,
+        ));
+
+        // The direct child has run and, being three statements long, has
+        // already exited — so `try_wait` has reaped it and `status` is
+        // `Some` by the time the cancel lands. That is the state the
+        // guard has to be read in.
+        {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while !ran.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the provider never started"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        // Two poll intervals, so the loop has certainly observed the exit
+        // before the cancel arrives.
+        tokio::time::sleep(POLL_INTERVAL * 50).await;
+        signal.cancel();
+
+        let out = tokio::time::timeout(Duration::from_secs(20), call)
+            .await
+            .expect(
+                "the cancel was never read: the collection loop stopped asking once the \
+                 direct child had exited, so the call is pinned for the provider's \
+                 whole budget",
+            )
+            .expect("the resolve task");
+        assert_eq!(
+            out.err(),
+            Some(ProviderError::Cancelled {
+                provider: "pass".to_string()
+            }),
+            "a cancelled request resolved something, or reported the wrong ending"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the cancel was noticed only at the budget: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// **GH #127: a cancelled request kills the provider it is waiting
     /// on.**
     ///
