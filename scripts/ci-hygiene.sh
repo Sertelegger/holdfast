@@ -470,6 +470,62 @@ jobs:
   want_cap_denied "two workflows claiming the exemption is refused, not just \
 all of them"
 
+  # --- the conflict-marker rule, which needs a real repository -------------
+  #
+  # Every fixture above is deliberately NOT a git repository, which is why
+  # that rule's "not a git repository" branch has to be survivable at all.
+  # The anti-vacuity for it therefore lives HERE, and it is not decoration:
+  # the rule's FIRST DRAFT put `HEAD` on the right of `git diff --check`, so
+  # it compared against the committed tree, never saw the working tree, and
+  # printed `ok` against a planted `|||||||`. It was caught because the
+  # mutation was run. A pair is the minimum -- rejected-with-marker and
+  # accepted-without -- because "no markers found" and "this rule cannot find
+  # a marker" print the same word.
+  conflict_case() { # conflict_case <label> <marker line, or empty> <fire|clean>
+    local repo out rc caught
+    repo="$(mktemp -d)"
+    # A body every other rule accepts, so a failure here is this rule's.
+    fixture "    runs-on: ubuntu-24.04"
+    cp -a "$tmp/." "$repo/"
+    if [ -n "$2" ]; then printf '\n%s\n' "$2" >> "$repo/NOTES.md"; fi
+    git -C "$repo" init -q
+    # `git add`, because `git diff` cannot see an untracked file -- the same
+    # gap the rule's own comment names. Without this the fixture would pass
+    # for the wrong reason.
+    git -C "$repo" add -A 2>/dev/null
+    out="$(cd "$repo" && "$me" 2>&1)"; rc=$?
+    rm -rf -- "$repo"
+    caught=0
+    # `: leftover conflict marker` with the colon, and not the bare phrase.
+    # git spells a finding `<file>:<line>: leftover conflict marker`, while
+    # the rule's own section header reads `--- no leftover conflict markers
+    # ---` -- which CONTAINS the bare phrase, so the first version of this
+    # helper reported the control case as catching a marker in a repository
+    # that had none. A detector that matches its own prose is the same defect
+    # this file exists to catch, arriving in the test for it.
+    if printf '%s' "$out" | grep -q ': leftover conflict marker'; then caught=1; fi
+    if [ "$3" = "fire" ] && [ "$caught" -eq 1 ] && [ "$rc" -ne 0 ]; then
+      printf '  PASS  %s\n' "$1"
+    elif [ "$3" = "clean" ] && [ "$caught" -eq 0 ] && [ "$rc" -eq 0 ]; then
+      printf '  PASS  %s\n' "$1"
+    else
+      printf '  FAIL  %s — want %s; caught=%d exit=%d\n' "$1" "$3" "$caught" "$rc"
+      printf '%s\n' "$out" | sed 's/^/          /'
+      failures=$((failures + 1))
+    fi
+  }
+
+  # The incident's exact shape first: the diff3-only marker, alone, with none
+  # of the three a resolver would have looked for.
+  conflict_case "a lone ||||||| is caught — the marker the incident left" \
+                "|||||||  merged common ancestors" fire
+  conflict_case "<<<<<<< is caught" "<<<<<<< HEAD" fire
+  conflict_case "======= is caught" "=======" fire
+  conflict_case ">>>>>>> is caught" ">>>>>>> theirs" fire
+  # The control. Without it every case above is satisfied by a rule that
+  # fires on everything.
+  conflict_case "a repository with no marker is accepted" "" clean
+
   echo
   if [ "$failures" -ne 0 ]; then
     printf 'SELF-TEST FAILED: %d case(s)\n' "$failures" >&2
@@ -479,9 +535,10 @@ all of them"
   # time. The banner read "an alias is rejected and a pinned image is not"
   # while two thirds of the cases below it were about the two markers.
   echo "SELF-TEST PASSED — a runner alias is rejected and a pinned image is not;"
-  echo "the release marker is checked rather than believed; and the calibration"
+  echo "the release marker is checked rather than believed; the calibration"
   echo "marker cannot be claimed from inside a \`run:\` body, from prose, after its"
-  echo "date, or by a second workflow."
+  echo "date, or by a second workflow; and each of the four diff3 conflict"
+  echo "markers is caught alone, while a repository carrying none is accepted."
   return 0
 }
 
@@ -883,6 +940,90 @@ else
       fails=$((fails + 1))
     fi
   done
+fi
+
+# --------------------------------------------------------------------------
+# No leftover conflict markers in tracked files
+# --------------------------------------------------------------------------
+#
+# `merge.conflictstyle = diff3` is set for this repository, so a conflict
+# carries FOUR markers and not three: `<<<<<<<`, `|||||||`, `=======`,
+# `>>>>>>>`. Two `|||||||` lines reached `main` inside CHANGELOG.md and were
+# removed by a follow-up commit whose message named the cause exactly --
+# *"the resolver and its verification shared one blind spot, which is the way
+# a check most reliably fails to be a check."* Both knew the three classic
+# markers; neither knew the fourth.
+#
+# **This rule does not re-derive that grep, and the reason is the finding.** A
+# hand-written check is overwhelmingly likely to anchor on `<<<<<<<` -- partly
+# because `=======` is genuinely ambiguous, a seven-character setext underline
+# in Markdown being byte-identical to the marker, and CHANGELOG.md is Markdown
+# and is the file that was hit. A check anchored that way finds NOTHING when a
+# resolver deletes the three it knows and leaves the one it does not, which is
+# the incident. So the detector here is `git diff --check`: a different
+# implementation, by a different author, with its own marker list. Measured on
+# a planted lone `|||||||` with no siblings -- `CHANGELOG.md:632: leftover
+# conflict marker`, exit 2. That is the case a re-derived grep misses.
+#
+# **The empty tree as the left side** (`git hash-object -t tree /dev/null`,
+# the well-known `4b825dc...`) makes every tracked file read as added, so
+# git's detector runs over the whole tree rather than over a diff. No
+# `fetch-depth` is needed: nothing but local objects is consulted, so this
+# works on the shallow checkout CI takes.
+#
+# **And NO right-hand side, which is load bearing.** Naming `HEAD` compares
+# against the committed tree and is blind to a conflicted WORKING tree;
+# omitting it compares against the working tree and catches a marker before it
+# is ever committed. The first draft of this rule named `HEAD`. Run against a
+# planted lone `|||||||` it printed `ok` -- a guard that could not fail, inside
+# the rule written to stop exactly that -- and it was caught only because the
+# mutation was actually run rather than reasoned about. Untracked files sit
+# outside `git diff` and therefore outside this rule; that gap is real and
+# named rather than papered over.
+#
+# **Filtered to the conflict message on purpose.** `--check` also reports
+# whitespace errors, and a trailing space must not turn this rule red -- a
+# guard that fails for a reason other than the one it names is a guard people
+# route around. Measured at the commit that added this: 0 findings of any kind
+# across the tree, so the filter costs nothing today and bounds what this can
+# ever fail for.
+#
+# **The skip below is not a pass, and the positive self-test case is what
+# makes that true.** `--self-test` runs this script inside a fixture directory
+# that is deliberately not a repository, so "not a git repository" has to be
+# survivable or every unrelated accepted case fails on a rule it was not
+# testing -- the exact breakage the fixture comment above records from the
+# tool-count rule. The anti-vacuity therefore lives in the self-test, which
+# builds a real repository with a planted marker and asserts this fires.
+echo
+echo "--- no leftover conflict markers ---"
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  # Loud, and named. A silent skip is how a rule stops being one.
+  printf '  skip  not a git repository, so git'"'"'s conflict detector cannot run
+'
+else
+  empty_tree="$(git hash-object -t tree /dev/null)"
+  # `|| true`: `--check` exits 2 on findings and `set -e` is in force above.
+  marker_hits="$(git diff --check "$empty_tree" 2>/dev/null     | grep 'leftover conflict marker' || true)"
+  if [ -n "$marker_hits" ]; then
+    printf '%s
+' "$marker_hits" | while IFS= read -r hit; do
+      printf '  FAIL  %s
+' "$hit"
+    done
+    # Counted outside the subshell the pipe would create.
+    n_hits="$(printf '%s
+' "$marker_hits" | grep -c .)"
+    fails=$((fails + n_hits))
+    printf '        merge.conflictstyle is diff3: a conflict leaves FOUR markers,
+'
+    printf '        and a resolver that knows three leaves the fourth behind.
+'
+  else
+    printf '  ok    no tracked file carries a conflict marker
+'
+  fi
 fi
 
 echo
