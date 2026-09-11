@@ -3347,7 +3347,16 @@ mod tests {
         server.registry.insert(Arc::clone(&s)).expect("register");
         await_prompt(&s, b"Password: ").await;
 
-        let payload = call(&server, secret_args(&s.id, 1)).await;
+        // **Three seconds and not one** (GH #126). The caller's deadline
+        // now bounds the provider step, so a row that asserts the
+        // provider *ran* must declare a window it can start inside. At 1
+        // this went red 3 times in 24 under eight concurrent whole-binary
+        // lanes on two cores, with the message below — the group was
+        // killed before the fixture's first line. It is the only row left
+        // in this module that pairs a one-second window with a positive
+        // `sc.ran`; the rest assert the negative, which no deadline can
+        // make wrong.
+        let payload = call(&server, secret_args(&s.id, 3)).await;
 
         assert!(sc.ran("prod-ssh"), "the failing provider never ran at all");
         fell_through_to_the_prompt(&payload, &sc, &s.id);
