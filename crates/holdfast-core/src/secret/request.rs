@@ -88,9 +88,11 @@ impl RaisedBy {
 /// Why a raised request ended without a value (§5.2, §18.1).
 ///
 /// Each variant has exactly one producer, and Task 4's
-/// `every_secret_cancelled_reason_is_reachable` drives all four in one
+/// `every_secret_cancelled_reason_is_reachable` drives all of them in one
 /// run against an exhaustive match over this enum — so a variant added
-/// later fails to compile until something emits it.
+/// later fails to compile until something emits it. GH #127's
+/// [`CancelReason::CallerCancelled`] is the fifth, and it arrived through
+/// exactly that failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CancelReason {
     /// The echo-off condition cleared with no value written: a human
@@ -106,6 +108,24 @@ pub enum CancelReason {
     /// tool call waiting on it. **The first caller's request is
     /// untouched.**
     ConcurrentRequestPending,
+    /// GH #127. The MCP client cancelled the request the call was made
+    /// for — `notifications/cancelled`, carried through the control
+    /// protocol to the daemon.
+    ///
+    /// **Not [`CancelReason::UserCancelled`], and the distinction is the
+    /// whole of GH #127's care.** That variant means *the echo-off
+    /// condition cleared with no value written* — a human aborting at an
+    /// attached client, or the child abandoning its read. Both are
+    /// endings at the **child's** end. This one is an ending at the
+    /// **agent's**: the child is very likely still sitting at its prompt.
+    /// Reporting one as the other is what GH #105 was, and an operator
+    /// reading a trail cannot tell a flaky script from a flaky agent
+    /// without the two words.
+    ///
+    /// **Not [`CancelReason::Timeout`] either.** A caller that went away
+    /// and a window that elapsed are different facts, and only the second
+    /// is about the clock.
+    CallerCancelled,
 }
 
 impl CancelReason {
@@ -116,15 +136,17 @@ impl CancelReason {
             Self::Timeout => "timeout",
             Self::TooLarge => "too_large",
             Self::ConcurrentRequestPending => "concurrent_request_pending",
+            Self::CallerCancelled => "caller_cancelled",
         }
     }
 
     /// Every reason, for the exhaustive-reachability guard.
-    pub const ALL: [CancelReason; 4] = [
+    pub const ALL: [CancelReason; 5] = [
         Self::UserCancelled,
         Self::Timeout,
         Self::TooLarge,
         Self::ConcurrentRequestPending,
+        Self::CallerCancelled,
     ];
 }
 
@@ -1534,6 +1556,7 @@ mod tests {
                 CancelReason::Timeout => "timeout",
                 CancelReason::TooLarge => "too_large",
                 CancelReason::ConcurrentRequestPending => "concurrent_request_pending",
+                CancelReason::CallerCancelled => "caller_cancelled",
             };
             assert_eq!(r.as_str(), expect);
         }

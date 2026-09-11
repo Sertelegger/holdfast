@@ -34,6 +34,7 @@ pub mod output;
 pub mod platform;
 pub mod protocol;
 pub mod pty;
+pub mod request;
 pub mod screen;
 pub mod secret;
 pub mod session;

@@ -741,6 +741,7 @@ async fn the_handshake_frames_carry_the_7_4_1_field_names_on_the_wire() {
         id: 0,
         method: "holdfast/handshake".into(),
         params,
+        cancel_token: None,
     };
     frame::write_frame(&mut stream, &req).await.unwrap();
     let resp: Response = frame::read_frame(&mut stream).await.unwrap();
@@ -1127,6 +1128,117 @@ async fn a_tool_call_crosses_the_socket_and_reaches_a_real_shell() {
         out.contains("RPC_MARKER"),
         "the shell behind the socket never ran the command; got: {out:?}"
     );
+}
+
+/// **GH #127, end to end over a real socket: a cancel on a second
+/// connection ends an in-flight `request_secret_input`.**
+///
+/// The one row that crosses every boundary the fix touches — MCP-side
+/// token, `holdfast/cancel` as a control-protocol method, the daemon's
+/// in-flight registry, the request-context task local, and
+/// `await_secret`'s cancellation arm. The unit rows each cover one of
+/// those; this one is what says they are connected.
+///
+/// **The connection matters and the row makes it explicit.**
+/// `handle_connection` reads one request, dispatches it to completion,
+/// and only then reads again, so the cancel *cannot* travel on the
+/// connection carrying the call. `ControlClient` checks one out per
+/// in-flight call, which is what makes a second one available — and a
+/// second `call_raw` is exactly how the shim sends its cancel.
+///
+/// **Bounded at 20 s against a 600 s call**, so a cancel that did not
+/// arrive is a red row in twenty seconds rather than a ten-minute hang.
+#[tokio::test]
+async fn a_cancel_on_a_second_connection_ends_an_in_flight_secret_request() {
+    let d = TestDaemon::start("cancel").await;
+    let client = std::sync::Arc::new(d.client().await.unwrap());
+    // A child that drops `ECHO` and reads, so the call takes §5.2's
+    // prompt path and parks rather than answering itself.
+    let id = start_script(
+        &client,
+        "cancelsess",
+        "stty -echo; printf 'Password: '; read x; stty echo; printf 'done\\n'",
+    )
+    .await;
+    read_until(&client, &id, "Password: ").await;
+
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let params = method::to_cbor(&json!({
+        "session": id,
+        "prompt_text": "a credential",
+        // Ten minutes. Nothing but the cancel can end this inside the
+        // row's own ceiling, so a green row is a cancel that worked and
+        // not a deadline that fired.
+        "timeout_secs": 600,
+    }))
+    .unwrap();
+    let call = {
+        let client = std::sync::Arc::clone(&client);
+        let token = token.clone();
+        tokio::spawn(async move {
+            client
+                .call_raw_cancellable("tool/request_secret_input", params, Some(&token))
+                .await
+        })
+    };
+
+    // The call is really parked on the prompt before the cancel fires:
+    // without this the row could be testing the pre-emptive ring instead,
+    // which has its own unit coverage and is a different claim.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if d.daemon.attach_hub().secrets().has_waiter(&id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the call never registered a waiter, so there is nothing to cancel"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let started = std::time::Instant::now();
+    assert!(
+        client.cancel(&token).await.unwrap(),
+        "the daemon did not recognise the token of a call it is running"
+    );
+
+    let resp = tokio::time::timeout(Duration::from_secs(20), call)
+        .await
+        .expect("the cancel never ended the call; it is still on its own 600 s window")
+        .expect("the call task")
+        .expect("the call");
+    assert_eq!(
+        resp.status, "secret_cancelled",
+        "a cancelled call returned something else: {}",
+        resp.details
+    );
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    assert_eq!(
+        data["reason"], "caller_cancelled",
+        "the agent was told the wrong ending: {data}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the cancel took {:?} to reach the call",
+        started.elapsed()
+    );
+
+    // The registration is gone, so a map keyed by a client-supplied
+    // string does not grow by one per cancelled call.
+    assert!(
+        !client.cancel(&token).await.unwrap(),
+        "a finished call is still registered as cancellable"
+    );
+
+    // And the connection that carried the call is still usable: the
+    // shim reads its answer rather than abandoning the round trip, so
+    // nothing was left half-read on the wire.
+    let resp = client
+        .call_raw("tool/list_sessions", CborValue::Map(Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "ok", "{}", resp.details);
 }
 
 #[tokio::test]

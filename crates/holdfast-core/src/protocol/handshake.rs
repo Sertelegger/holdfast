@@ -18,7 +18,14 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// Bumped for additive changes: new methods, new optional fields.
 ///
 /// 1.1 adds `Attach.terminal`, an optional field (GH #66).
-pub const PROTOCOL_MINOR: u32 = 1;
+///
+/// 1.2 adds `holdfast/cancel` and `Request.cancel_token`, both optional
+/// (GH #127). A 1.2 client talking to a 1.1 daemon sends a token the
+/// daemon ignores and gets `unknown_method` for the cancel, which is the
+/// same outcome as today: the call runs its window. A 1.1 client talking
+/// to a 1.2 daemon sends no token, and a call with no token is simply not
+/// cancellable. Neither direction loses anything it had.
+pub const PROTOCOL_MINOR: u32 = 2;
 
 /// How long either peer waits for the **first** frame of the handshake
 /// before giving up on the connection.

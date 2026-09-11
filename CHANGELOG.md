@@ -17,6 +17,15 @@ is cut, named and published is in
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
   still not run, because 55 of its tests spawn a real shell ([#91]).
+- Control protocol **1.2**: a `holdfast/cancel` method and an optional
+  `cancel_token` on every request, so an MCP `notifications/cancelled` reaches
+  the daemon instead of stopping at the shim. Additive in both directions — a
+  1.1 peer sends no token and is simply not cancellable, and a 1.2 client gets
+  `unknown_method` from a 1.1 daemon, which is what happens today ([#127]).
+- `secret_cancelled` gains a fifth reason, `caller_cancelled`, and §7.5's
+  `SecretRequestClosed` a fourth outcome of the same name. A request the agent
+  abandoned and a request the human or the child abandoned are different
+  endings, and `cancelled` already meant the second ([#127], [#105]).
 
 ### Changed
 
@@ -49,6 +58,20 @@ is cut, named and published is in
 
 ### Fixed
 
+- The secret **provider** path enforces the deadline and the size limit the
+  caller declared. A helper process that inherits the provider's output pipe no
+  longer outlives them: the bounded phase is pipe *collection* rather than the
+  direct child's exit, which is what the unconditional reader joins ran past.
+  Measured before the fix, against a 1 s budget with a grandchild holding the
+  pipe for 4 s: resolved successfully after 4.02 s. A `max_secret_bytes` of 1
+  accepted a 7-byte credential and wrote 8 with the newline; it is now refused
+  where the bytes are read ([#126], the same descriptor-inheritance shape as
+  [#52] and [#21]).
+- Cancelling an MCP request now cancels the work it started. A cancelled
+  `request_secret_input` closes its request, tells every attached client with
+  its own outcome word, and frees the slot — a replacement used to be refused
+  `concurrent_request_pending` for up to 120 s. A call whose future is dropped
+  rather than cancelled frees the slot too ([#127]).
 - A session that has finished no longer keeps the writer thread that only a
   running child needs. The registry now holds live sessions and completed
   records separately, and retiring a record drops the sending half of its write
@@ -567,4 +590,6 @@ residuals that are known and accepted.
 [#105]: https://github.com/Sertelegger/holdfast/issues/105
 [#106]: https://github.com/Sertelegger/holdfast/issues/106
 [#112]: https://github.com/Sertelegger/holdfast/issues/112
+[#126]: https://github.com/Sertelegger/holdfast/issues/126
+[#127]: https://github.com/Sertelegger/holdfast/issues/127
 [#129]: https://github.com/Sertelegger/holdfast/issues/129

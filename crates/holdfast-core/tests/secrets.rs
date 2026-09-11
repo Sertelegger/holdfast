@@ -138,6 +138,7 @@ use holdfast_core::platform::Capabilities;
 use holdfast_core::protocol::frame;
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use holdfast_core::pty::{InProcessPty, MockPty, PtyBackend, PtySpawnConfig, Signal};
+use holdfast_core::request::{CancelSignal, RequestContext};
 use holdfast_core::secret::{
     keychain_step_runs, resolve, select, ArgvProvider, ProviderError, SecretProvider,
 };
@@ -645,6 +646,32 @@ fn spawn_call(
             .request_secret_input(Parameters(args))
             .await
             .expect("request_secret_input")
+    })
+}
+
+/// [`spawn_call`] inside a request scope a test can cancel (GH #127).
+///
+/// **The same scope `daemon::server::dispatch_tool` opens**, and that is
+/// the point: these rows call the tool in process, so without one
+/// `request::current()` answers `detached()` and the cancellation arm
+/// under test is unreachable. `dispatch_tool`'s own half — a
+/// `cancel_token` on the wire reaching this signal — is driven over a
+/// real socket in `control_protocol.rs`.
+fn spawn_cancellable_call(
+    d: &TestDaemon,
+    args: RequestSecretInputArgs,
+    signal: &CancelSignal,
+) -> tokio::task::JoinHandle<CallToolResult> {
+    let server = d.daemon.server.clone();
+    let ctx = RequestContext::with_cancel(signal.clone());
+    tokio::spawn(async move {
+        holdfast_core::request::with_context(ctx, async move {
+            server
+                .request_secret_input(Parameters(args))
+                .await
+                .expect("request_secret_input")
+        })
+        .await
     })
 }
 
@@ -2429,6 +2456,184 @@ async fn an_arm_cancelled_on_a_full_write_queue_still_answers_the_waiting_call()
     );
 }
 
+/// **GH #127: a cancelled call closes its request, tells every attached
+/// client, and frees the slot.**
+///
+/// Three claims, and they are the issue's three requirements in order.
+/// The frame's `outcome` is the one to read closely: `caller_cancelled`
+/// and not `cancelled`, because §7.5's `cancelled` already means *the
+/// echo-off condition cleared with no value written* — a human aborting
+/// or the child abandoning its read. Both of those happen at the child's
+/// end. This one happens at the agent's, and GH #105 is what conflating
+/// two endings costs an operator.
+#[tokio::test]
+async fn a_cancelled_call_closes_its_request_and_tells_the_attached_client() {
+    let d = TestDaemon::start("cancelclose").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let (raised_id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    let signal = CancelSignal::new();
+    let call = spawn_cancellable_call(&d, secret_args(&s.id, 60), &signal);
+    await_waiter(&d, &s.id, "the call about to be cancelled").await;
+
+    let started = std::time::Instant::now();
+    signal.cancel();
+    let payload = joined(call, "the cancelled call").await;
+    let elapsed = started.elapsed();
+
+    // 1. The agent is told the request ended, by its own name.
+    assert_eq!(payload["status"], "secret_cancelled", "{payload}");
+    assert_eq!(
+        payload["data"]["reason"], "caller_cancelled",
+        "a cancelled call was reported as something else: {payload}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the cancel did not end the call; it ran on its own window: {elapsed:?}"
+    );
+
+    // 2. Every attached client is told, and told which ending it was.
+    let (request_id, outcome) = next_secret_closed(&mut c, 20).await;
+    assert_eq!(request_id, raised_id, "a different request was closed");
+    assert_eq!(
+        outcome, "caller_cancelled",
+        "the human was told the prompt they are looking at was `{outcome}`, which is \
+         the word for an ending at the child's end — see GH #105"
+    );
+
+    // 3. The slot is free: a replacement is not refused. It adopts the
+    //    re-raise the cancel left behind, so the human's affordance
+    //    survived too — which is the half a plain close would have lost.
+    let replacement = body(&d.call(secret_args(&s.id, 2)).await);
+    assert_ne!(
+        replacement["data"]["reason"], "concurrent_request_pending",
+        "the cancelled call still holds the slot: {replacement}"
+    );
+
+    let _ = s.signal(Signal::Kill);
+}
+
+/// **GH #127: a call whose future is dropped frees its slot too.**
+///
+/// The *other* way a caller goes away, and the one that reproduced the
+/// issue's own symptom without any cancel at all: `raise_or_adopt` has
+/// already parked the `oneshot::Sender` in the slot, the `Receiver` goes
+/// with the dropped future, and `has_waiter` answers `true` for a waiter
+/// that will never read — which `take_if_unadopted` is defined to refuse
+/// to sweep.
+///
+/// Measured before the fix: the replacement was refused
+/// `concurrent_request_pending` **0.5 ms** after the abandonment, and
+/// stayed refused for the abandoned call's whole window.
+#[tokio::test]
+async fn an_abandoned_call_frees_its_slot_for_a_replacement() {
+    let d = TestDaemon::start("dropped").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let _ = next_awaiting_secret(&mut c, 20).await;
+
+    let first = spawn_call(&d, secret_args(&s.id, 60));
+    await_waiter(&d, &s.id, "the first call").await;
+    first.abort();
+    let _ = first.await;
+
+    // The `Drop` runs on the aborted task, not on ours, so this is a
+    // wait for a condition rather than an assumption about scheduling.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while d.daemon.server.attach_hub().secrets().has_waiter(&s.id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the abandoned call's waiter is still in the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let replacement = body(&d.call(secret_args(&s.id, 2)).await);
+    assert_ne!(
+        replacement["data"]["reason"], "concurrent_request_pending",
+        "the abandoned call still holds the slot: {replacement}"
+    );
+    // The pairing: the replacement really did take the prompt path and
+    // wait, rather than being refused for some other reason.
+    assert_eq!(
+        replacement["data"]["reason"], "timeout",
+        "the replacement did not run as an ordinary call: {replacement}"
+    );
+
+    let _ = s.signal(Signal::Kill);
+}
+
+/// **GH #127 and GH #105 together: a cancel that loses the race to a
+/// fulfilment must not report `caller_cancelled`.**
+///
+/// The trap the issue names. A request cancelled by its caller and a
+/// request *answered* while the cancel was in flight are different
+/// endings, and the second must win — the credential really did reach the
+/// child, and telling an operator nobody answered is GH #105 exactly.
+///
+/// **The window is held open deliberately**, in the shape
+/// `secret::binding`'s rows already use: the value is submitted first and
+/// the cancel fires after the slot has been taken, so the arrangement is
+/// always the hostile one rather than one that arrives by luck.
+#[tokio::test]
+async fn a_cancel_that_arrives_after_the_answer_does_not_overwrite_it() {
+    let d = TestDaemon::start("cancelrace").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let (id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    let signal = CancelSignal::new();
+    let call = spawn_cancellable_call(&d, secret_args(&s.id, 20), &signal);
+    await_waiter(&d, &s.id, "the call about to be answered").await;
+
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id: id,
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+    // The answer has taken the slot before the cancel fires.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while d
+        .daemon
+        .server
+        .attach_hub()
+        .outstanding_secret(&s.id)
+        .is_some()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the submission never cleared the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    signal.cancel();
+
+    let payload = joined(call, "the answered call").await;
+    assert_eq!(
+        payload["status"], "secret_provided",
+        "a fulfilled request was reported as cancelled — GH #105, from the cancel \
+         side: {payload}"
+    );
+    assert_eq!(
+        payload["data"]["bytes_written"],
+        (PROBE.len() + 1) as u64,
+        "{payload}"
+    );
+    // And the child really did receive it, so the status above is not a
+    // claim about a write that never happened.
+    let seen = stream_until(&mut c, b"got=HUNTER2", 20).await;
+    assert!(
+        !contains(&seen, PROBE.as_bytes()),
+        "the submitted value reached an attached client's stream"
+    );
+
+    let _ = s.signal(Signal::Kill);
+}
+
 // --------------------------------------------- the four, all in one run
 
 /// **Every reason driven for real, in one run, against an exhaustive
@@ -2451,6 +2656,7 @@ async fn every_secret_cancelled_reason_is_reachable() {
             CancelReason::Timeout => "timeout",
             CancelReason::TooLarge => "too_large",
             CancelReason::ConcurrentRequestPending => "concurrent_request_pending",
+            CancelReason::CallerCancelled => "caller_cancelled",
         })
         .collect();
 
@@ -2501,6 +2707,19 @@ async fn every_secret_cancelled_reason_is_reachable() {
         let call = spawn_call(&d, secret_args(&s.id, 20));
         await_waiter(&d, &s.id, "the abandoned call").await;
         observed.insert(cancelled_reason(&joined(call, "the abandoned call").await));
+        let _ = s.signal(Signal::Kill);
+    }
+
+    // caller_cancelled — the MCP client cancelled the request (GH #127).
+    {
+        let s = d.shell_running(ECHO_OFF_FIXTURE);
+        let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+        let _ = next_awaiting_secret(&mut c, 20).await;
+        let signal = CancelSignal::new();
+        let call = spawn_cancellable_call(&d, secret_args(&s.id, 20), &signal);
+        await_waiter(&d, &s.id, "the cancelled call").await;
+        signal.cancel();
+        observed.insert(cancelled_reason(&joined(call, "the cancelled call").await));
         let _ = s.signal(Signal::Kill);
     }
 
@@ -3663,8 +3882,13 @@ fn each_provider_builds_the_argv_the_plan_pins() {
     };
     // `SecretBytes` has no `PartialEq` — and must not gain one, which is
     // why this compares the error rather than the `Result`.
-    let refused = resolve(&unknown, &provider_limits(10), true)
-        .expect_err("a near-miss spelling must not resolve");
+    let refused = resolve(
+        &unknown,
+        &provider_limits(10),
+        true,
+        &RequestContext::detached(),
+    )
+    .expect_err("a near-miss spelling must not resolve");
     assert_eq!(
         refused,
         ProviderError::UnknownProvider("1password".to_string()),

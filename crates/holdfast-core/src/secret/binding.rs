@@ -268,6 +268,7 @@ use std::collections::BTreeMap;
 use crate::attach::secret::SecretBytes;
 use crate::audit::AuditLog;
 use crate::config::{SecretBinding, SecurityConfig};
+use crate::request::RequestContext;
 use crate::session::Session;
 
 use super::provider::{resolve, ProviderError};
@@ -642,6 +643,7 @@ pub fn autofill(
     session: &Session,
     append_newline: bool,
     audit: &AuditLog,
+    ctx: &RequestContext,
 ) -> Autofill {
     // Step 1's gate. Checked **before** anything looks at a binding, so
     // that under the default mode no config-authored reference is even
@@ -670,7 +672,7 @@ pub fn autofill(
         });
     }
 
-    resolve_selected(security, session, binding, append_newline, audit)
+    resolve_selected(security, session, binding, append_newline, audit, ctx)
 }
 
 /// §17.5's `Approved` arm: the rest of §5.2's step 1, for a binding a
@@ -701,6 +703,7 @@ pub fn autofill_approved(
     approved_binding: &str,
     append_newline: bool,
     audit: &AuditLog,
+    ctx: &RequestContext,
 ) -> Autofill {
     if !keychain_step_runs(&security.secret_provider) {
         return Autofill::FellThrough(FellThrough::ModeIsPrompt);
@@ -726,7 +729,7 @@ pub fn autofill_approved(
         );
         return Autofill::FellThrough(FellThrough::NoBindingMatched);
     }
-    resolve_selected(security, session, binding, append_newline, audit)
+    resolve_selected(security, session, binding, append_newline, audit, ctx)
 }
 
 /// Budget, provider, audit — the tail both entry points share.
@@ -741,6 +744,7 @@ fn resolve_selected(
     binding: &SecretBinding,
     append_newline: bool,
     audit: &AuditLog,
+    ctx: &RequestContext,
 ) -> Autofill {
     // §9.6's bound, claimed **before** the spawn and under the session's
     // own lock, so that "the third prompt in this session falls through"
@@ -753,7 +757,7 @@ fn resolve_selected(
         });
     };
 
-    match run_provider(binding, security, append_newline) {
+    match run_provider(binding, security, append_newline, ctx) {
         Ok(secret) => {
             let resolved = Resolved {
                 binding_name: binding.name.clone(),
@@ -819,6 +823,7 @@ fn run_provider(
     binding: &SecretBinding,
     limits: &SecurityConfig,
     append_newline: bool,
+    ctx: &RequestContext,
 ) -> Result<SecretBytes, ProviderError> {
     // REQ-TST-007 / Global Constraint 12: `secret-tool`, `security`,
     // `pass` and `op` are tools this project neither pins nor installs,
@@ -835,9 +840,10 @@ fn run_provider(
             &binding.reference,
             limits,
             append_newline,
+            ctx,
         );
     }
-    resolve(binding, limits, append_newline)
+    resolve(binding, limits, append_newline, ctx)
 }
 
 /// The `#[cfg(test)]` fixture registry — see [`run_provider`].
@@ -1143,6 +1149,14 @@ mod tests {
     }
 
     /// `[security]` in the mode that lets step 1 run at all.
+    /// A context with no caller: the provider's own budget applies in
+    /// full, nothing cancels, and the byte budget is the stock ceiling.
+    /// What every row that is not about GH #126 wants.
+    fn unbounded() -> RequestContext {
+        RequestContext::detached()
+            .with_max_bytes(SecurityConfig::default().max_secret_bytes_ceiling)
+    }
+
     fn keychain_mode(bindings: Vec<SecretBinding>) -> SecurityConfig {
         SecurityConfig {
             secret_provider: "keychain".to_string(),
@@ -1152,6 +1166,75 @@ mod tests {
             keychain_provider_timeout_secs: 5,
             ..SecurityConfig::default()
         }
+    }
+
+    /// **GH #126: `timeout_secs` bounds the provider step, and nothing
+    /// the provider resolved late reaches the child.**
+    ///
+    /// The end-to-end reading of the row in `secret::provider`: the same
+    /// grandchild-holds-the-pipe fixture, but driven through
+    /// `request_secret_input` so that the thing measured is the
+    /// *caller's* declared window rather than the operator's provider
+    /// budget.
+    ///
+    /// Measured before the fix, on this arrangement:
+    /// **`secret_provided` after 4.016 s for a call that declared
+    /// `timeout_secs: 1`, `bytes_written: 8`, and the credential in the
+    /// child.** After: `secret_cancelled` at 1.01 s with nothing written.
+    ///
+    /// **Both halves, because either alone passes for the wrong reason.**
+    /// A call that returned on time and still wrote the value later is
+    /// the exact failure the issue describes — *"an expired credential
+    /// must be discarded before it reaches the PTY, not reported as
+    /// delivered afterwards"* — so the row waits past the provider's own
+    /// window before asserting the child never got it.
+    #[tokio::test]
+    async fn the_callers_deadline_bounds_the_provider_step() {
+        let mut sc = Scratch::new("callerdeadline");
+        // The direct child writes and exits at once; the backgrounded
+        // `sleep` inherits the stdout pipe, so collection runs on past
+        // both the provider budget and the caller's `timeout_secs`.
+        let b = sc.binding(
+            "leak",
+            PROD_PROFILE,
+            &format!("sleep 4 &\nprintf '{PROBE}\\n'\n"),
+        );
+        let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+
+        let started = std::time::Instant::now();
+        let payload = call(&server, secret_args(&s.id, 1)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "`timeout_secs: 1` did not bound the call: it returned after {elapsed:?} \
+             with status {}",
+            payload["status"]
+        );
+        assert_eq!(
+            payload["status"], "secret_cancelled",
+            "a call whose window elapsed inside the provider step reported a write: \
+             {payload}"
+        );
+        // The pairing: the provider really did run, so the row is not
+        // green because step 1 was skipped.
+        assert!(sc.ran("leak"), "the binding's provider never ran");
+
+        // **Past the grandchild's own four seconds**, which is the whole
+        // point: a value collected late must be discarded rather than
+        // written after the caller has been answered.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let seen = buffered(&s);
+        assert!(
+            !contains(&seen, b"got=HUNTER2"),
+            "the credential reached the child after the call had been told its \
+             request was cancelled:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        let _ = s.signal(Signal::Kill);
     }
 
     fn server_with(security: SecurityConfig, audit_log: &Path) -> HoldfastServer {
@@ -3118,7 +3201,7 @@ mod tests {
         session: &Session,
         audit: &AuditLog,
     ) -> FellThrough {
-        match autofill(security, session, true, audit) {
+        match autofill(security, session, true, audit, &unbounded()) {
             Autofill::FellThrough(why) => why,
             Autofill::Resolved(r) => panic!("expected a fall-through, got {r:?}"),
         }
@@ -3576,6 +3659,7 @@ mod tests {
             "some-other-binding",
             true,
             audit,
+            &unbounded(),
         );
         assert!(
             matches!(out, Autofill::FellThrough(FellThrough::NoBindingMatched)),
@@ -3594,7 +3678,14 @@ mod tests {
         // **The pairing**: the same call with the name that *was*
         // approved resolves, so the refusal above is about the name and
         // not about a function that never resolves anything.
-        let out = autofill_approved(&keychain_mode(vec![b.clone()]), &s, &b.name, true, audit);
+        let out = autofill_approved(
+            &keychain_mode(vec![b.clone()]),
+            &s,
+            &b.name,
+            true,
+            audit,
+            &unbounded(),
+        );
         match out {
             Autofill::Resolved(r) => {
                 assert_eq!(r.binding_name, b.name);

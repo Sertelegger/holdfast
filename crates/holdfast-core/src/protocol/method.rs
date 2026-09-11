@@ -18,6 +18,26 @@ pub const METHOD_HANDSHAKE: &str = "holdfast/handshake";
 pub const METHOD_DAEMON_STATUS: &str = "daemon/status";
 /// Graceful daemon shutdown, behind `holdfast daemon stop`.
 pub const METHOD_DAEMON_STOP: &str = "daemon/stop";
+/// Cancel an in-flight call, by the token its own [`Request`] carried
+/// (GH #127).
+///
+/// **A method rather than a frame, because the connection is busy.**
+/// `daemon::server::handle_connection` reads one request, dispatches it
+/// to completion, and only then reads again — so a cancel written to the
+/// *same* socket sits in the kernel buffer until the call it is
+/// cancelling has finished, which is the one moment it is useless.
+/// `ControlClient` checks out one connection per in-flight call, so a
+/// cancel is an ordinary call on a second connection and needs nothing
+/// new from the framing.
+///
+/// **Advisory, and out-of-order-safe.** An unknown token answers
+/// `cancelled: false` rather than an error: a call that has already
+/// returned is a cancel with nothing to do, not a fault, and telling the
+/// two apart would make every racing client log an error for the ordinary
+/// case. A cancel that arrives *before* its call registers is remembered
+/// — see `daemon::server`'s recently-cancelled ring — because the two
+/// travel on different connections and nothing orders them.
+pub const METHOD_CANCEL: &str = "holdfast/cancel";
 
 // §7.4.1's MCP-resource methods (§5.5). Note the spelling: the control
 // protocol says `resource/templates_list` with an **underscore**, while
@@ -30,12 +50,47 @@ pub const METHOD_RESOURCE_TEMPLATES_LIST: &str = "resource/templates_list";
 /// `resources/read` behind the socket (§5.5.3).
 pub const METHOD_RESOURCE_READ: &str = "resource/read";
 
-/// `{ id, method, params }` — spec §7.4.
+/// `{ id, method, params }` — spec §7.4, plus GH #127's `cancel_token`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub id: u64,
     pub method: String,
     pub params: CborValue,
+    /// The token [`METHOD_CANCEL`] names this call by (GH #127).
+    ///
+    /// **On the envelope and not in `params`, deliberately.** §7.4.1
+    /// fixes `params` as *the MCP `arguments`, not a wrapper around
+    /// them*, and `dispatch_tool` deserialises it straight into a tool's
+    /// own argument struct — so a field added there would be an argument
+    /// the agent could send, in a struct that must not grow one.
+    ///
+    /// **Opaque and client-allocated.** `Request.id` is per-`ControlClient`
+    /// and starts at zero, so two shims would collide on it; a v4 UUID
+    /// from the caller does not, and it is what makes the daemon's
+    /// in-flight map a flat `HashMap` rather than something keyed by a
+    /// connection identity the cancelling connection does not have.
+    ///
+    /// `None` for every method that is not cancellable and for every peer
+    /// speaking protocol 1.1 or older, which is what `skip_serializing_if`
+    /// keeps off the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_token: Option<String>,
+}
+
+/// [`METHOD_CANCEL`]'s params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelParams {
+    /// The `cancel_token` of the call to cancel.
+    pub token: String,
+}
+
+/// [`METHOD_CANCEL`]'s `data`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelOutcome {
+    /// `true` when a call was actually signalled, `false` when the token
+    /// named nothing in flight — which is the ordinary answer for a call
+    /// that had already returned.
+    pub cancelled: bool,
 }
 
 /// `{ id, status, data, details }` — spec §7.4.
@@ -258,6 +313,25 @@ impl Request {
             id,
             method: method.into(),
             params: to_cbor(params)?,
+            cancel_token: None,
+        })
+    }
+
+    /// [`Request::new`] for a call the caller intends to be able to
+    /// cancel (GH #127).
+    ///
+    /// A separate constructor rather than an `Option` on `new`, so that
+    /// every existing call site keeps producing a request with no token
+    /// and the cancellable ones are greppable.
+    pub fn new_cancellable<P: Serialize>(
+        id: u64,
+        method: impl Into<String>,
+        params: &P,
+        cancel_token: impl Into<String>,
+    ) -> Result<Self, FrameError> {
+        Ok(Self {
+            cancel_token: Some(cancel_token.into()),
+            ..Self::new(id, method, params)?
         })
     }
 
@@ -633,6 +707,7 @@ mod tests {
             id: 1,
             method: "tool/send_input".into(),
             params: params.clone(),
+            cancel_token: None,
         };
         let mut buf = Vec::new();
         frame::write_frame(&mut buf, &req).await.unwrap();

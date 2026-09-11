@@ -13,6 +13,7 @@ use crate::output::redact::{redact_for_display, redact_str};
 use crate::output::rules::RuleSet;
 use crate::output::{ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{clamp_geometry, InProcessPty, PtyBackend, PtySpawnConfig};
+use crate::request::RequestContext;
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
 use crate::secret::binding::{Autofill, Resolved};
 use crate::secret::{CancelReason, RaisedBy, Resolution, SlotSnapshot, SlotTake};
@@ -1811,6 +1812,27 @@ impl HoldfastServer {
             ));
         }
 
+        // **The request's one context** (GH #126, GH #127), built here
+        // and passed by reference from here down.
+        //
+        // `request::current()` is the cancellation the daemon's dispatch
+        // boundary scoped around this call — `None` in an in-process
+        // server, which is a context that is simply never cancelled. The
+        // two narrowings are this call's own arguments, already validated
+        // above, and `with_deadline`/`with_max_bytes` take the smaller of
+        // what they are given and what is there, so neither can widen
+        // anything.
+        //
+        // Everything below reads its bound off this: §17.5's approval
+        // window, the provider's collection budget, the byte budget
+        // applied at collection, the injection gate, and
+        // `await_secret`'s wait. Before it, each of those enforced
+        // whatever it happened to know locally, which is the sentence
+        // both issues end on.
+        let ctx = crate::request::current()
+            .with_deadline(caller_deadline)
+            .with_max_bytes(max_secret_bytes);
+
         let append_newline = args.append_newline.unwrap_or(true);
         let hub = self.attach_hub();
 
@@ -1867,7 +1889,10 @@ impl HoldfastServer {
             crate::secret::binding::keychain_step_runs(&self.config.security.secret_provider)
                 && !self.config.security.secret_bindings.is_empty();
         if step_one_possible && !hub.secrets().has_waiter(&session.id) {
-            match self.autofill_from_binding(&session, append_newline).await {
+            match self
+                .autofill_from_binding(&session, append_newline, &ctx)
+                .await
+            {
                 StepOne::Done(done) => return Ok(done),
                 // §17.5's `Pending`. **Sited here and not inside
                 // `autofill_from_binding`, because this is where
@@ -1899,7 +1924,7 @@ impl HoldfastServer {
                             &provider,
                             &approval_prompt,
                             append_newline,
-                            Some(caller_deadline),
+                            &ctx,
                             raised_before,
                         )
                         .await
@@ -2007,9 +2032,22 @@ impl HoldfastServer {
             session.inject_notice(&crate::secret::buffer_notice(&session.id));
         }
 
+        // **Armed here and not earlier** (GH #127): before
+        // `raise_or_adopt` there is no request to close, and a guard that
+        // covered the collision arm would close the *first* caller's
+        // request when the second one returned.
+        let mut abandoned = AbandonedCall {
+            hub: Arc::clone(hub),
+            session: Arc::clone(&session),
+            request_id: request_id.clone(),
+            armed: true,
+        };
         let resolution = self
-            .await_secret(&session, &request_id, adopted.rx, caller_deadline)
+            .await_secret(&session, &request_id, adopted.rx, &ctx)
             .await;
+        // The call reached an ending of its own and has already closed
+        // whatever there was to close.
+        abandoned.disarm();
 
         // **Two vocabularies for one event, and they must not be
         // unified.** This field carries the *tool status* — `secret_provided`
@@ -2086,7 +2124,12 @@ impl HoldfastServer {
     /// exactly as it would have for any other reason, and no status of
     /// its own reaches the agent (§18.1 deleted `binding_approval_denied`
     /// for that reason).
-    async fn autofill_from_binding(&self, session: &Arc<Session>, append_newline: bool) -> StepOne {
+    async fn autofill_from_binding(
+        &self,
+        session: &Arc<Session>,
+        append_newline: bool,
+        ctx: &RequestContext,
+    ) -> StepOne {
         let hub = self.attach_hub();
         // **The slot as it stands *before* the provider runs.** This call
         // is about to be away for up to `keychain_provider_timeout_secs`,
@@ -2110,8 +2153,22 @@ impl HoldfastServer {
         let security = self.config.security.clone();
         let processor = Arc::clone(&self.processor);
         let for_task = Arc::clone(session);
+        // **Cloned in, not read back out** (GH #126). A task local does
+        // not cross `spawn_blocking` — `crate::mcp::caller` states the
+        // rule and this is the hop it is about — so a provider that
+        // called `request::current()` on the far side would get
+        // `detached()`: no deadline, no byte budget, and cancellation
+        // that never fires. That is the failure mode which reads as
+        // fixed.
+        let for_provider = ctx.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::secret::binding::autofill(&security, &for_task, append_newline, &processor.audit)
+            crate::secret::binding::autofill(
+                &security,
+                &for_task,
+                append_newline,
+                &processor.audit,
+                &for_provider,
+            )
         })
         .await;
 
@@ -2139,7 +2196,7 @@ impl HoldfastServer {
         };
 
         match self
-            .inject_resolved(session, resolved, &raised_before)
+            .inject_resolved(session, resolved, &raised_before, ctx)
             .await
         {
             Some(done) => StepOne::Done(done),
@@ -2163,6 +2220,7 @@ impl HoldfastServer {
         session: &Arc<Session>,
         resolved: Resolved,
         raised_before: &AutofillGuard,
+        ctx: &RequestContext,
     ) -> Option<CallToolResult> {
         let hub = self.attach_hub();
         let Resolved {
@@ -2241,6 +2299,60 @@ impl HoldfastServer {
         // precondition before that check existed. The writer gates on the
         // echo state itself, which is the condition the harm actually
         // turns on.
+        //
+        // ## And the question that is not about the slot at all (GH #126)
+        //
+        // **Is this request still running, and does this value fit what it
+        // declared?** Everything above asks who else may have answered the
+        // prompt; neither question above notices that the caller's
+        // `timeout_secs` elapsed while a keyring was unlocking, that the
+        // caller cancelled, or that the value is larger than the
+        // `max_secret_bytes` the call named. The issue's requirement is
+        // exact: *"an expired or oversized credential must be discarded
+        // **before** it reaches the PTY, not reported as delivered after
+        // the fact"*, and this is the last statement before the write
+        // queue at which "before" is still true.
+        //
+        // **It is a second check and not the only one, deliberately.**
+        // `provider::run` already refuses both at collection, which is
+        // where the bytes are and where refusing is cheapest. This one
+        // guards the distance between *that* and the PTY — §17.5's human
+        // approval round trip sits in it, and it is human-scale. A value
+        // resolved inside the window and injected outside it is precisely
+        // the shape GH #126 reported as `secret_provided` three seconds
+        // after a one-second deadline.
+        //
+        // The fall-through is `None`, like every other non-resolution:
+        // `SecretBytes::drop` zeroes the value, and the caller's own
+        // deadline — already elapsed — answers the agent a moment later.
+        let now = self.clock.now();
+        if let Some(ended) = ctx.ended(now) {
+            crate::diag!(
+                "holdfast: the `{binding_name}` binding resolved but the request had \
+                 already ended ({ended:?}); the value was not written"
+            );
+            drop(secret);
+            return None;
+        }
+        // **The budget, plus the one newline §5.2's normalisation may have
+        // appended, and the arithmetic is stated rather than implied.**
+        // `max_secret_bytes` bounds the *credential*; the trailing `\n` is
+        // the daemon's addition and not the operator's, which is why the
+        // submission path measures received bytes *before* normalisation
+        // (`attach::conn`) and why `provider::run` measures the provider's
+        // raw stdout. This value is already normalised, so the same bound
+        // is one byte wider here. The consequence is stated exactly: this
+        // gate can never refuse a value collection accepted, and it still
+        // refuses anything materially larger — which is what it is for.
+        if !ctx.fits(secret.len().saturating_sub(1)) {
+            crate::diag!(
+                "holdfast: the `{binding_name}` binding resolved a value larger than \
+                 the request's byte budget; it was not written"
+            );
+            drop(secret);
+            return None;
+        }
+
         let request_id = match hub
             .secrets()
             .take_if_unadopted_matching(&session.id, &raised_before.slot)
@@ -2392,13 +2504,20 @@ impl HoldfastServer {
         provider: &str,
         prompt_text: &str,
         append_newline: bool,
-        caller_deadline: Option<std::time::Instant>,
+        ctx: &RequestContext,
         raised_before: AutofillGuard,
     ) -> Option<CallToolResult> {
         let hub = self.attach_hub();
+        // **`ctx.remaining` and no longer a `caller_deadline` parameter**
+        // (GH #126). It is the same number — the caller's one stamp — read
+        // off the thing that carries it everywhere else on this path
+        // rather than off a second argument that could disagree with it.
+        // `None` is still *"no caller, so nothing to halve"*, which is
+        // §9.6's unattended path, and `RequestContext::remaining` answers
+        // `None` for exactly that.
         let window = crate::secret::approval_window(
             self.config.daemon.binding_approval_timeout_secs,
-            caller_deadline.map(|d| d.saturating_duration_since(self.clock.now())),
+            ctx.remaining(self.clock.now()),
         );
         // Epoch seconds off **this daemon's clock**, so a manual-clock
         // test and the daemon agree about when this expires. `now_ms`
@@ -2603,6 +2722,7 @@ impl HoldfastServer {
         let processor = Arc::clone(&self.processor);
         let for_task = Arc::clone(session);
         let name = binding_name.to_string();
+        let for_provider = ctx.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             crate::secret::binding::autofill_approved(
                 &security,
@@ -2610,6 +2730,7 @@ impl HoldfastServer {
                 &name,
                 append_newline,
                 &processor.audit,
+                &for_provider,
             )
         })
         .await;
@@ -2622,7 +2743,7 @@ impl HoldfastServer {
             // human is asked for the value instead.
             _ => return None,
         };
-        self.inject_resolved(session, resolved, &raised_before)
+        self.inject_resolved(session, resolved, &raised_before, ctx)
             .await
     }
 
@@ -2856,10 +2977,25 @@ impl HoldfastServer {
         if self.attach_hub().secrets().has_waiter(&session.id) {
             return;
         }
+        // **The unattended path's context** (GH #126). There is no MCP
+        // caller, so there is no cancellation and no `timeout_secs` — the
+        // provider's own `keychain_provider_timeout_secs` applies in full,
+        // which is what a `None` deadline means to
+        // `RequestContext::bounded`.
+        //
+        // **The byte budget is the operator's ceiling and not `None`.**
+        // `max_secret_bytes` is a *call's* argument and there is no call,
+        // but `[security] max_secret_bytes_ceiling` is the operator's
+        // stated limit on every credential this daemon will accept from
+        // any path — so the one path with no caller to narrow it inherits
+        // the widest thing the operator agreed to rather than nothing at
+        // all.
+        let ctx = crate::request::RequestContext::detached()
+            .with_max_bytes(self.config.security.max_secret_bytes_ceiling);
         // `true`: an echo-off prompt is waiting for a *line*, which is the
         // same default `RaisedRequest` carries for a raise with no waiter.
         // There is no caller here to have expressed `append_newline`.
-        match self.autofill_from_binding(session, true).await {
+        match self.autofill_from_binding(session, true, &ctx).await {
             StepOne::Done(_) => {}
             // §17.5, with no caller. **`require_confirm` is still honoured
             // — autofill is not "skip every gate"**, which is exactly the
@@ -2882,8 +3018,9 @@ impl HoldfastServer {
                         &prompt_text,
                         true,
                         // No caller, so nothing to halve: §17.5's
-                        // configured value applies in full.
-                        None,
+                        // configured value applies in full. `ctx` carries
+                        // no deadline, which is what says so.
+                        &ctx,
                         raised_before,
                     )
                     .await;
@@ -2983,6 +3120,33 @@ impl HoldfastServer {
         );
     }
 
+    /// Put the human's affordance back when a call ends and the child is
+    /// still sitting at its prompt.
+    ///
+    /// **Q1's rule, and now two arms share it** (GH #127). §5.2 makes a
+    /// caller's ending close the *request*, not merely the call — but the
+    /// raise is edge-triggered on the transition *into* `AwaitingSecret`,
+    /// so closing it while the child waits removes the affordance and
+    /// nothing will ever put it back. New id, new broadcast, `echo_drop`,
+    /// no waiter. §5.2's invariant holds: the ids are sequential, never
+    /// concurrent.
+    ///
+    /// **One copy rather than two**, because a cancel that re-raised and a
+    /// timeout that did not — or the reverse — would make a human's
+    /// affordance depend on which ending the agent happened to produce.
+    /// The two arms differ in what they *report*, which is the whole of
+    /// GH #127's care, and not in what they leave behind.
+    fn re_raise_if_still_asking(&self, session: &Arc<Session>) {
+        if !session.is_awaiting_secret() {
+            return;
+        }
+        let hub = self.attach_hub();
+        let (re, first) = hub.raise_secret(&session.id, &session.prompt_last_line_redacted());
+        if first {
+            hub.broadcast_awaiting_secret(&session.id, &re.request_id, &re.prompt_text);
+        }
+    }
+
     /// Wait for the outstanding request to resolve, or for this call's
     /// own deadline.
     ///
@@ -3009,8 +3173,20 @@ impl HoldfastServer {
         session: &Arc<Session>,
         request_id: &str,
         rx: tokio::sync::oneshot::Receiver<Resolution>,
-        deadline: std::time::Instant,
+        ctx: &RequestContext,
     ) -> Resolution {
+        // **Read off the context rather than taken as a second
+        // argument** (GH #126/#127): one deadline, carried by the thing
+        // that carries it through collection, approval and injection, so
+        // there is no way for a second parameter to disagree with it.
+        //
+        // `None` is unreachable from `request_secret_input`, which builds
+        // this context from `caller_deadline` one statement after
+        // validating `timeout_secs`. It is answered `now` — *already
+        // over* — rather than with an invented window, because a wait
+        // that guessed its own deadline is the defect this function's
+        // `deadline`-is-passed-in rule exists to prevent.
+        let deadline = ctx.deadline().unwrap_or_else(|| self.clock.now());
         let sleep = self.clock.sleep_until(deadline);
         tokio::pin!(sleep);
         // **Not `tokio::pin!(rx)`.** See [`AnswerOnce`]: the hand-over
@@ -3039,6 +3215,13 @@ impl HoldfastServer {
             },
             // `&mut sleep`, so the receiver is still ours afterwards.
             _ = &mut sleep => Woke::Deadline,
+            // **GH #127's arm, and it is a fourth ending rather than a
+            // spelling of one of the three.** A caller that cancelled and
+            // a deadline that elapsed are different facts — one about who
+            // asked, one about the clock — and GH #105 is the bug that
+            // comes from reporting one ending as another. The close below
+            // keeps them apart all the way to the attached client's frame.
+            _ = ctx.cancelled() => Woke::Cancelled,
             end = &mut ended => match end {
                 SecretEnded::Exited(code) => Woke::Exited(code),
                 SecretEnded::EchoReturned => Woke::EchoReturned,
@@ -3088,6 +3271,35 @@ impl HoldfastServer {
                         hub.broadcast_secret_closed(&session.id, request_id, outcome);
                         resolution
                     }
+                    // **GH #127.** The caller went away, so this request
+                    // is over — and every attached human must be told,
+                    // because the alternative is a modal in front of
+                    // somebody with nobody behind it.
+                    //
+                    // **A word of its own, `caller_cancelled`, and not
+                    // §7.5's `cancelled`.** That word already means *"the
+                    // echo-off condition cleared with no value written"* —
+                    // a human aborting, or the child abandoning its read.
+                    // Both are things that happened at the *child's* end;
+                    // this happened at the agent's, and an operator who
+                    // cannot tell them apart cannot tell a flaky script
+                    // from a flaky agent. GH #105 is what conflating two
+                    // endings costs.
+                    //
+                    // **The re-raise is the deadline arm's, for the
+                    // deadline arm's reason**, and it is also what frees
+                    // the slot in the sense GH #127 asks for: the new
+                    // request carries no waiter, so a replacement
+                    // `request_secret_input` *adopts* it rather than
+                    // colliding with it. Closing without re-raising would
+                    // free the slot too and would take the human's
+                    // affordance with it, since the raise is edge-triggered
+                    // on a transition that has already happened.
+                    Woke::Cancelled => {
+                        hub.broadcast_secret_closed(&session.id, request_id, "caller_cancelled");
+                        self.re_raise_if_still_asking(session);
+                        Resolution::Cancelled(CancelReason::CallerCancelled)
+                    }
                     Woke::Deadline => {
                         hub.broadcast_secret_closed(&session.id, request_id, "timeout");
                         // **Q1: a call-driven timeout re-raises if the
@@ -3100,17 +3312,7 @@ impl HoldfastServer {
                         // back. New id, new broadcast, `echo_drop`, no
                         // waiter. §5.2's invariant holds: the ids are
                         // sequential, never concurrent.
-                        if session.is_awaiting_secret() {
-                            let (re, first) =
-                                hub.raise_secret(&session.id, &session.prompt_last_line_redacted());
-                            if first {
-                                hub.broadcast_awaiting_secret(
-                                    &session.id,
-                                    &re.request_id,
-                                    &re.prompt_text,
-                                );
-                            }
-                        }
+                        self.re_raise_if_still_asking(session);
                         Resolution::Cancelled(CancelReason::Timeout)
                     }
                 }
@@ -3810,6 +4012,88 @@ impl AnswerOnce {
     }
 }
 
+/// Closes a raised request whose waiting call was **dropped** rather
+/// than answered (GH #127).
+///
+/// ## Why a `Drop` and not a `match` arm
+///
+/// `await_secret`'s endings all run *inside* the call. A future that is
+/// dropped has no ending: `raise_or_adopt` has already put the
+/// `oneshot::Sender` in the slot, the `Receiver` goes with the dropped
+/// future, and `RaisedRequest::has_waiter` answers `true` for a waiter
+/// that will never read. Nothing sweeps that — `take_if_unadopted` is
+/// defined to refuse a slot with a waiter — so the session's one secret
+/// slot is occupied for good and every later `request_secret_input` is
+/// refused `concurrent_request_pending`. That is GH #127's reproduced
+/// symptom reached without any cancel at all.
+///
+/// rmcp does not drop a cancelled handler — it fires the token and waits
+/// — so this is not the cancellation path. It is the *other* way a
+/// caller can go away, and both have to close the slot or the fix is the
+/// half that reads as complete.
+///
+/// ## The #105 care, discharged by `take`'s own contract
+///
+/// **This guard never reports a fulfilled request as cancelled**, and it
+/// is structural rather than careful: the only thing it does is
+/// `close_on_caller_timeout`, which is `take(session, Some(request_id))`
+/// — and a request that anybody else resolved is already out of the slot,
+/// so this gets `None` and broadcasts nothing. The producer that *did*
+/// resolve it owns the word, exactly as it does for every other closer.
+struct AbandonedCall {
+    hub: Arc<crate::attach::hub::AttachHub>,
+    session: Arc<Session>,
+    request_id: String,
+    /// Cleared when the call reached an ending of its own, which is every
+    /// path but a drop.
+    armed: bool,
+}
+
+impl AbandonedCall {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AbandonedCall {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self
+            .hub
+            .secrets()
+            .close_on_caller_timeout(&self.session.id, &self.request_id)
+            .is_none()
+        {
+            return;
+        }
+        // The same word `await_secret`'s cancel arm uses, because it is
+        // the same fact: the agent's end of this request is gone. A human
+        // at an attached client is told so rather than left looking at a
+        // modal nobody is behind.
+        self.hub
+            .broadcast_secret_closed(&self.session.id, &self.request_id, "caller_cancelled");
+        // And the affordance goes back if the child is still asking —
+        // `re_raise_if_still_asking`'s rule, inlined because a `Drop` has
+        // no `&HoldfastServer`. The re-raise carries no waiter, so the
+        // replacement call adopts it instead of colliding, which is the
+        // half of GH #127 about freeing the slot.
+        if self.session.is_awaiting_secret() {
+            let (re, first) = self
+                .hub
+                .raise_secret(&self.session.id, &self.session.prompt_last_line_redacted());
+            if first {
+                self.hub.broadcast_awaiting_secret(
+                    &self.session.id,
+                    &re.request_id,
+                    &re.prompt_text,
+                );
+            }
+        }
+    }
+}
+
 /// Why [`HoldfastServer::await_secret`] stopped waiting on its receiver.
 ///
 /// Only the two that need a close. A receiver that answered returns
@@ -3819,6 +4103,15 @@ enum Woke {
     /// dropped without answering, which the close then reports truthfully
     /// rather than guessing at.
     Deadline,
+    /// GH #127: the MCP client cancelled the request that started this
+    /// call.
+    ///
+    /// **Distinct from [`Woke::Deadline`] all the way out.** It produces
+    /// `CancelReason::CallerCancelled` for the agent and
+    /// `caller_cancelled` for every attached client, because *"nobody is
+    /// asking any more"* and *"the window you asked for is up"* are
+    /// different things to be told.
+    Cancelled,
     /// §5.1: the child ended while the call was waiting.
     Exited(Option<i32>),
     /// Echo came back. **Not on its own a supersede** — see
@@ -4136,6 +4429,125 @@ mod tests {
     use crate::session::{new_session_id, Session, SessionConfig};
     use serde_json::Value;
     use std::time::Instant;
+
+    /// **GH #126's last boundary: an ended or oversized credential is
+    /// discarded before the write queue, not reported as delivered
+    /// afterwards.**
+    ///
+    /// **Driven directly, because no reachable arrangement drives it, and
+    /// that is stated rather than hidden.** `provider::run` already
+    /// refuses both at collection, which is where the bytes are — so by
+    /// the time `inject_resolved` runs, an end-to-end row has nothing
+    /// left to catch. What this gate covers is the distance between
+    /// collection and the PTY: §17.5's human approval sits in it, so does
+    /// `send().await` on a full write queue, and both are wide enough for
+    /// a deadline to elapse inside. A defensive check nothing drives is
+    /// decoration; this row is what makes it a check.
+    ///
+    /// Three endings, one arrangement each, and a fourth case that must
+    /// **not** be refused — otherwise a gate that discarded everything
+    /// would pass the first three.
+    #[tokio::test]
+    async fn an_ended_or_oversized_credential_is_discarded_before_the_pty() {
+        use crate::attach::secret::SecretBytes;
+        use crate::request::RequestContext;
+        use crate::secret::binding::Resolved;
+
+        async fn attempt(ctx: RequestContext, value: &[u8]) -> (bool, Vec<u8>) {
+            let pty = Arc::new(MockPty::new());
+            // `WriteRequest::SecretIfUnread` asks the tty whether echo is
+            // off one statement before it writes, so a mock that says
+            // `true` declines every arm and the pairing below could never
+            // be green. This is the state a `getpass` leaves behind.
+            pty.set_echo(Some(false));
+            let session = Arc::new(Session::new(
+                new_session_id(),
+                None,
+                "bash".into(),
+                vec![],
+                pty.clone() as Arc<dyn crate::pty::PtyBackend>,
+                SessionConfig::with_buffer_capacity(4096),
+            ));
+            let server = HoldfastServer::new();
+            let guard = AutofillGuard {
+                slot: server.attach_hub().secrets().snapshot(&session.id),
+                writes: session.writes_performed(),
+            };
+            let resolved = Resolved {
+                binding_name: "prod-ssh".into(),
+                provider: "pass".into(),
+                use_count: 1,
+                secret: SecretBytes::normalise(value.to_vec(), true),
+            };
+            let out = server
+                .inject_resolved(&session, resolved, &guard, &ctx)
+                .await;
+            // The writer runs on its own thread; give it room to be wrong.
+            for _ in 0..20 {
+                if !pty.written().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            (out.is_some(), pty.written())
+        }
+
+        let now = std::time::Instant::now();
+        let probe = b"hunter2";
+
+        // 1. The caller's window elapsed while the value was in hand.
+        let expired = RequestContext::detached().with_deadline(now - Duration::from_secs(1));
+        let (reported, written) = attempt(expired, probe).await;
+        assert!(
+            !reported,
+            "an expired request was told a credential had been delivered"
+        );
+        assert!(
+            !contains(&written, probe),
+            "an expired request's credential reached the PTY: {written:?}"
+        );
+
+        // 2. The caller cancelled while the value was in hand (GH #127).
+        let cancelled = RequestContext::detached();
+        cancelled.cancel_signal().cancel();
+        let (reported, written) = attempt(cancelled, probe).await;
+        assert!(!reported, "a cancelled request reported a write");
+        assert!(
+            !contains(&written, probe),
+            "a cancelled request's credential reached the PTY: {written:?}"
+        );
+
+        // 3. The value is larger than the request's budget.
+        let over = RequestContext::detached().with_max_bytes(3);
+        let (reported, written) = attempt(over, probe).await;
+        assert!(!reported, "an oversized credential reported a write");
+        assert!(
+            !contains(&written, probe),
+            "an oversized credential reached the PTY: {written:?}"
+        );
+
+        // 4. **The pairing.** A live request whose value fits is written,
+        //    so the three refusals above are about their conditions and
+        //    not about a gate that refuses everything.
+        let fine = RequestContext::detached()
+            .with_deadline(now + Duration::from_secs(60))
+            .with_max_bytes(probe.len() as u32);
+        let (reported, written) = attempt(fine, probe).await;
+        assert!(
+            reported,
+            "a live request within its budget was refused, so the refusals above prove \
+             nothing"
+        );
+        assert!(
+            contains(&written, probe),
+            "the credential never reached the PTY on the path that must write it: \
+             {written:?}"
+        );
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
 
     /// **A lost §17.5 approval is classified by the session, never by
     /// which `select!` branch woke.**

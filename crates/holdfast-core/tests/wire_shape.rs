@@ -133,7 +133,9 @@ use holdfast_core::daemon::server::{DaemonStatus, StopOutcome, StopParams};
 use holdfast_core::protocol::frame::{self, LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES};
 use holdfast_core::protocol::handshake::{ClientKind, HandshakeData, HandshakeParams};
 use holdfast_core::protocol::handshake::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
-use holdfast_core::protocol::method::{CborValue, ControlError, ErrorCode, Request, Response};
+use holdfast_core::protocol::method::{
+    CancelOutcome, CancelParams, CborValue, ControlError, ErrorCode, Request, Response,
+};
 
 /// Every protocol version whose shape is recorded under `tests/wire-shape/`.
 ///
@@ -220,6 +222,28 @@ const RECORDED_VERSIONS: &[(u32, u32)] = &[
     // is what keeps the extraordinary one credible for a change that has
     // no alternative.
     (1, 1),
+    // 1.2 — `holdfast/cancel`, plus `Request.cancel_token`: an optional
+    // field on the control-protocol envelope (GH #127).
+    //
+    // **Appended, and there was never a question of anything else.** The
+    // change is additive under the rule as written — a new method and a
+    // new optional field, nothing removed, nothing renamed, no `type` tag
+    // touched — so the ordinary green path applies and the 1.0 row's
+    // escape hatch is not in play. 1.1's row says why taking the ordinary
+    // path matters when it exists.
+    //
+    // **Two payload types come with the method**, `CancelParams` and
+    // `CancelOutcome`, and they are in `control_payloads` rather than
+    // left to the `[tokens]` scan — this file's stated blind spot is a new
+    // `daemon/*` payload struct that nobody adds to that hand-kept list,
+    // and the way not to widen it is to add them.
+    //
+    // The attach wire is untouched. `SecretRequestClosed.outcome` gains a
+    // fourth value, `caller_cancelled`, but its field is a free `String`
+    // and the golden records `"<str>"` — a peer built against the older
+    // set renders the word it is given (`commands.rs` prints it), so there
+    // is nothing here to bump for and nothing for this file to see.
+    (1, 2),
 ];
 
 /// The placeholder every opaque string field carries in this file.
@@ -452,8 +476,19 @@ fn control_payloads() -> Vec<(&'static str, String, Vec<String>)> {
         id: 1,
         method: STR.into(),
         params: CborValue::Map(vec![]),
+        // Maximal, like every sample here: GH #127's `cancel_token` is
+        // `skip_serializing_if`, so a `None` would hide it from the
+        // `wire:` line and leave the `declared:` line as the only thing
+        // that moved.
+        cancel_token: Some(STR.into()),
     };
     out.push(entry("Request", &request));
+
+    let cancel_params = CancelParams { token: STR.into() };
+    out.push(entry("CancelParams", &cancel_params));
+
+    let cancel_outcome = CancelOutcome { cancelled: true };
+    out.push(entry("CancelOutcome", &cancel_outcome));
 
     let response = Response {
         id: 1,

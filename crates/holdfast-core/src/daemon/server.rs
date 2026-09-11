@@ -15,6 +15,7 @@ use crate::mcp::{passthrough, resources, HoldfastServer};
 use crate::protocol::frame::{self, FrameError};
 use crate::protocol::handshake::{self, ClientKind, HandshakeParams};
 use crate::protocol::method::{self, ErrorCode, Request, Response};
+use crate::request::CancelSignal;
 use crate::session::Reaper;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -222,7 +223,42 @@ pub struct Daemon {
     /// had to wait 30 s to learn about the session it just started would
     /// re-list at exactly the wrong moment.
     listed_sessions: Mutex<std::collections::BTreeSet<String>>,
+    /// GH #127: the calls a `holdfast/cancel` can still reach.
+    ///
+    /// Keyed by the client-minted `Request.cancel_token`, because the
+    /// cancel arrives on a **different connection** than the call — see
+    /// `method::METHOD_CANCEL` — so nothing about the call's own
+    /// connection is available to key on.
+    ///
+    /// Entered by [`dispatch_tool`] before the tool runs and removed by
+    /// its guard on every exit path including a panic, so the map holds
+    /// one entry per call actually in flight and nothing else.
+    in_flight_calls: Mutex<std::collections::HashMap<String, CancelSignal>>,
+    /// Tokens cancelled before the call they name had registered.
+    ///
+    /// **A window that exists because nothing orders two connections.**
+    /// The shim writes the call on one socket and the cancel on another;
+    /// the daemon accepts them into separate tasks, and the cancel's task
+    /// can reach [`dispatch`] first. Without this the cancel would find
+    /// an empty map, answer `cancelled: false`, and the call would then
+    /// register a signal nobody will ever fire — a cancellation that
+    /// reached one boundary and not the next, which is the failure mode
+    /// GH #127 is about.
+    ///
+    /// A bounded ring rather than a set: an entry is only useful for as
+    /// long as the racing call takes to register, which is microseconds,
+    /// and an unbounded set keyed by an agent-supplied string is
+    /// something an agent can grow.
+    recently_cancelled: Mutex<std::collections::VecDeque<String>>,
 }
+
+/// How many pre-emptive cancels [`Daemon::recently_cancelled`] remembers.
+///
+/// The window it covers is one task scheduling hop, so the number only
+/// has to exceed the cancels that can be in it at once. 64 is two orders
+/// of magnitude above anything a shim produces and still a fixed 64
+/// strings.
+const RECENTLY_CANCELLED_CAPACITY: usize = 64;
 
 impl Daemon {
     /// **`with_audit_path`, never `new()`.** `HoldfastServer::new()` is
@@ -354,6 +390,8 @@ impl Daemon {
             clock,
             last_client_connect: Mutex::new(None),
             listed_sessions: Mutex::new(std::collections::BTreeSet::new()),
+            in_flight_calls: Mutex::new(std::collections::HashMap::new()),
+            recently_cancelled: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -568,6 +606,79 @@ impl Daemon {
     /// before either runs the §9.1 gate.
     pub(crate) fn note_accept(&self) {
         self.connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Register a cancellable call and hand back the signal its context
+    /// will carry (GH #127).
+    ///
+    /// **Born cancelled when the cancel already arrived**, which is the
+    /// whole reason [`Daemon::recently_cancelled`] exists: the call and
+    /// its cancel travel on different connections into different tasks,
+    /// and nothing orders the two. A registration that ignored the ring
+    /// would hand out a fresh signal nobody will fire again, and the call
+    /// would run its full window having been cancelled — the shape that
+    /// reads as fixed.
+    ///
+    /// **One lock order, stated because there are two locks.** The ring
+    /// is taken and released before the map is, never the other way
+    /// round, and no path takes both at once.
+    fn register_call(&self, token: &str) -> CancelSignal {
+        let already = {
+            let mut ring = self.recently_cancelled.lock();
+            // Removed on the way out. A token is one call, so a
+            // pre-emptive cancel is spent by the call it was for and
+            // cannot reach a later call that reuses the string.
+            match ring.iter().position(|t| t == token) {
+                Some(i) => {
+                    ring.remove(i);
+                    true
+                }
+                None => false,
+            }
+        };
+        let signal = CancelSignal::new();
+        if already {
+            signal.cancel();
+        }
+        self.in_flight_calls
+            .lock()
+            .insert(token.to_string(), signal.clone());
+        signal
+    }
+
+    /// Drop a finished call's registration.
+    fn finish_call(&self, token: &str) {
+        self.in_flight_calls.lock().remove(token);
+    }
+
+    /// Signal the call carrying `token`, or remember the cancel for the
+    /// call that is about to register it (GH #127).
+    ///
+    /// `true` means a call was actually signalled. A pre-emptive cancel
+    /// answers `false` — it has not cancelled anything *yet*, and saying
+    /// otherwise would report a cancellation that a call arriving on a
+    /// closed connection will never receive.
+    fn cancel_call(&self, token: &str) -> bool {
+        if let Some(signal) = self.in_flight_calls.lock().get(token) {
+            signal.cancel();
+            return true;
+        }
+        let mut ring = self.recently_cancelled.lock();
+        if ring.iter().any(|t| t == token) {
+            return false;
+        }
+        if ring.len() >= RECENTLY_CANCELLED_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(token.to_string());
+        false
+    }
+
+    /// How many cancellable calls are in flight — the property
+    /// `CallRegistration`'s `Drop` exists to keep true.
+    #[cfg(test)]
+    pub(crate) fn cancellable_calls_in_flight(&self) -> usize {
+        self.in_flight_calls.lock().len()
     }
 
     /// Connections accepted and not yet finished with — see
@@ -1879,6 +1990,7 @@ async fn dispatch(
         | method::METHOD_RESOURCE_READ => {
             (dispatch_resource(daemon, req, client_kind).await, false)
         }
+        method::METHOD_CANCEL => (dispatch_cancel(daemon, req), false),
         method::METHOD_HANDSHAKE => (
             Response::error(
                 req.id,
@@ -2071,6 +2183,60 @@ fn tool_error_response(id: u64, e: &rmcp::ErrorData) -> Response {
     )
 }
 
+/// GH #127's `holdfast/cancel`.
+///
+/// **It signals and does not abort.** Cancellation is cooperative: the
+/// token reaches every tool through
+/// [`crate::request::with_context`](crate::request::with_context) and
+/// `request_secret_input` is the one that reads it. Aborting an arbitrary
+/// tool future mid-`await` would drop `request_secret_input`'s receiver
+/// while its slot still held the sender — GH #127's own bug, arrived at
+/// from the other side — so a tool that ignores the token runs to
+/// completion exactly as it does today. That boundary is stated here
+/// rather than implied, because *"cancellation that reaches one boundary
+/// and not the next"* is worse than none.
+fn dispatch_cancel(daemon: &Arc<Daemon>, req: &Request) -> Response {
+    let params: method::CancelParams = match req.params_as() {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::error(
+                req.id,
+                ErrorCode::BadParams,
+                format!("holdfast/cancel params are not `{{ token }}`: {e}"),
+            )
+        }
+    };
+    let cancelled = daemon.cancel_call(&params.token);
+    Response::ok(
+        req.id,
+        &method::CancelOutcome { cancelled },
+        if cancelled {
+            "the call was signalled"
+        } else {
+            "no call with that token is in flight"
+        },
+    )
+    .unwrap_or_else(|e| Response::error(req.id, ErrorCode::BadParams, e.to_string()))
+}
+
+/// Deregisters a call's cancellation on every exit path, panics
+/// included.
+///
+/// A `Drop` and not a statement after the `await`, on the same reasoning
+/// [`InFlight`] carries: a tool that panics would otherwise leave its
+/// token in the map for the life of the daemon, and the map is keyed by
+/// a string a client supplies.
+struct CallRegistration {
+    daemon: Arc<Daemon>,
+    token: String,
+}
+
+impl Drop for CallRegistration {
+    fn drop(&mut self) {
+        self.daemon.finish_call(&self.token);
+    }
+}
+
 async fn dispatch_tool(
     daemon: &Arc<Daemon>,
     req: &Request,
@@ -2091,6 +2257,27 @@ async fn dispatch_tool(
     // §9.4 audit write inside the read path records who asked without
     // any tool handler having to pass it down.
     let who = caller_for(client_kind, req);
+    // **GH #127: the same move, for the same reason, one field over.**
+    // `#[tool]` generates the handler signatures and
+    // `passthrough::call_tool` builds no context of its own, so a
+    // cancellation token cannot be a parameter — it travels the way the
+    // caller identity already does. `None` when the client sent no
+    // `cancel_token`, which is every CLI call and every peer speaking
+    // protocol 1.1.
+    let registration = req.cancel_token.as_ref().map(|token| {
+        let signal = daemon.register_call(token);
+        (
+            CallRegistration {
+                daemon: Arc::clone(daemon),
+                token: token.clone(),
+            },
+            signal,
+        )
+    });
+    let ctx = match &registration {
+        Some((_, signal)) => crate::request::RequestContext::with_cancel(signal.clone()),
+        None => crate::request::RequestContext::detached(),
+    };
     let call = async {
         // Read back from *inside* the scope rather than trusting `who`.
         // Recording `who` here would still pass if the `with_caller`
@@ -2101,6 +2288,7 @@ async fn dispatch_tool(
         tests::record_observed_caller(caller::current());
         passthrough::call_tool(&daemon.server, tool, args).await
     };
+    let call = crate::request::with_context(ctx, call);
     match caller::with_caller(who, call).await {
         None => Response::error(req.id, ErrorCode::UnknownMethod, format!("no tool {tool}")),
         Some(Err(e)) => tool_error_response(req.id, &e),
@@ -2534,6 +2722,229 @@ mod tests {
             daemon.accepted_connections(),
             1,
             "the daemon must have accepted the connection before refusing it"
+        );
+
+        daemon.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------- GH #127's cancellation
+
+    fn cancel_scratch(tag: &str) -> (String, RuntimePaths) {
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let dir = format!("/tmp/holdfast-cancel-{tag}-{}", &unique[..8]);
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+        (dir, paths)
+    }
+
+    /// **GH #127: the token a call registers is the token a cancel
+    /// reaches, and the registration is gone when the call is.**
+    ///
+    /// The map is keyed by a string a *client* supplies, so a leak here
+    /// is unbounded growth on an agent-controlled key — which is why the
+    /// `Drop` on `CallRegistration` exists and why this row asserts the
+    /// count rather than only the signal.
+    #[tokio::test]
+    async fn a_registered_call_is_cancellable_and_deregistered_when_it_ends() {
+        let (dir, paths) = cancel_scratch("register");
+        let daemon = Daemon::new(paths);
+
+        assert_eq!(daemon.cancellable_calls_in_flight(), 0);
+        let signal = daemon.register_call("tok-a");
+        assert_eq!(daemon.cancellable_calls_in_flight(), 1);
+        assert!(
+            !signal.is_cancelled(),
+            "a fresh registration starts cancelled"
+        );
+
+        // A token nobody registered is not an error and cancels nothing.
+        assert!(
+            !daemon.cancel_call("tok-b"),
+            "a cancel for an unknown token claimed to have signalled something"
+        );
+        assert!(!signal.is_cancelled(), "the wrong call was signalled");
+
+        assert!(
+            daemon.cancel_call("tok-a"),
+            "the registered call was not found"
+        );
+        assert!(
+            signal.is_cancelled(),
+            "the registered call was not signalled"
+        );
+
+        daemon.finish_call("tok-a");
+        assert_eq!(
+            daemon.cancellable_calls_in_flight(),
+            0,
+            "a finished call's registration outlived it, on a map an agent supplies \
+             the keys to"
+        );
+        // And a cancel after the call is over is a no-op rather than a
+        // resurrection.
+        assert!(!daemon.cancel_call("tok-a"));
+
+        daemon.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **GH #127: a cancel that beats its own call still cancels it.**
+    ///
+    /// The call and the cancel travel on **different connections** into
+    /// different tasks, and nothing orders them — so the cancel's task
+    /// can reach `dispatch` first. Without the ring the cancel would find
+    /// an empty map, answer `cancelled: false`, and the call would then
+    /// register a signal nobody will fire again: a cancellation that
+    /// reached one boundary and not the next, which reads as fixed.
+    ///
+    /// **The ring is spent by the call it was for**, which the second
+    /// half asserts: a token is one call, and a remembered cancel that
+    /// survived its claim would cancel a later call that reused the
+    /// string.
+    #[tokio::test]
+    async fn a_cancel_that_arrives_before_its_call_is_not_lost() {
+        let (dir, paths) = cancel_scratch("preempt");
+        let daemon = Daemon::new(paths);
+
+        // Nothing registered yet — the ordinary answer, and the honest
+        // one: nothing has been cancelled *yet*.
+        assert!(
+            !daemon.cancel_call("early"),
+            "a pre-emptive cancel claimed to have signalled a call that does not exist"
+        );
+        let signal = daemon.register_call("early");
+        assert!(
+            signal.is_cancelled(),
+            "the call registered after its own cancel and never learned about it"
+        );
+
+        // Spent. A second registration under the same token is a second
+        // call and is not cancelled by the first one's cancel.
+        daemon.finish_call("early");
+        let again = daemon.register_call("early");
+        assert!(
+            !again.is_cancelled(),
+            "the remembered cancel outlived its claim and cancelled a later call"
+        );
+
+        daemon.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **GH #127: the ring is bounded, on a key an agent supplies.**
+    ///
+    /// The pairing that stops the row above from licensing an unbounded
+    /// set: a peer that sent cancels for tokens it never calls must not
+    /// be able to grow daemon memory. The oldest entry goes, which is the
+    /// one least likely to still have a call on the way.
+    #[tokio::test]
+    async fn the_pre_emptive_cancel_ring_is_bounded_and_drops_the_oldest() {
+        let (dir, paths) = cancel_scratch("ring");
+        let daemon = Daemon::new(paths);
+
+        for i in 0..RECENTLY_CANCELLED_CAPACITY + 10 {
+            daemon.cancel_call(&format!("tok-{i}"));
+        }
+        // The oldest are gone: a call registering under `tok-0` now is
+        // not cancelled.
+        assert!(
+            !daemon.register_call("tok-0").is_cancelled(),
+            "the ring kept every token it was ever given"
+        );
+        // The newest survive, so the eviction is oldest-first rather
+        // than "stop recording once full".
+        let newest = format!("tok-{}", RECENTLY_CANCELLED_CAPACITY + 9);
+        assert!(
+            daemon.register_call(&newest).is_cancelled(),
+            "the ring stopped recording instead of evicting, so a cancel that arrived \
+             under load was dropped"
+        );
+
+        daemon.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **GH #127: a call with no `cancel_token` registers nothing.**
+    ///
+    /// Every CLI call and every peer speaking protocol 1.1 is in this
+    /// shape, and a daemon that registered them all would hold an entry
+    /// per call for a cancel that can never name it.
+    #[tokio::test]
+    async fn a_call_without_a_token_registers_nothing() {
+        let (dir, paths) = cancel_scratch("notoken");
+        let daemon = Daemon::new(paths);
+
+        let req = forged_read_output("cli");
+        assert!(
+            req.cancel_token.is_none(),
+            "the fixture carries a token, so this row cannot see the difference"
+        );
+        let (_resp, _stop) = dispatch(&daemon, &req, ClientKind::Cli).await;
+        assert_eq!(
+            daemon.cancellable_calls_in_flight(),
+            0,
+            "an untokened call left a registration behind"
+        );
+
+        daemon.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **GH #127: `holdfast/cancel` answers its own shape, both ways.**
+    ///
+    /// Driven through `dispatch` rather than against `cancel_call`
+    /// directly, so the method name, the params decode and the `data`
+    /// encode are all in the path — the three things a caller on the
+    /// other side of a socket depends on and none of which the unit rows
+    /// above touch.
+    #[tokio::test]
+    async fn the_cancel_method_reports_whether_it_signalled_anything() {
+        let (dir, paths) = cancel_scratch("method");
+        let daemon = Daemon::new(paths);
+
+        let miss = Request::new(
+            1,
+            method::METHOD_CANCEL,
+            &method::CancelParams {
+                token: "nothing".into(),
+            },
+        )
+        .unwrap();
+        let (resp, stop) = dispatch(&daemon, &miss, ClientKind::Shim).await;
+        assert!(!stop, "a cancel must not stop the daemon");
+        assert!(
+            !resp.is_error(),
+            "an unknown token is not a fault: {resp:?}"
+        );
+        let outcome: method::CancelOutcome = resp.data_as().unwrap();
+        assert!(!outcome.cancelled);
+
+        let signal = daemon.register_call("live");
+        let hit = Request::new(
+            2,
+            method::METHOD_CANCEL,
+            &method::CancelParams {
+                token: "live".into(),
+            },
+        )
+        .unwrap();
+        let (resp, _) = dispatch(&daemon, &hit, ClientKind::Shim).await;
+        let outcome: method::CancelOutcome = resp.data_as().unwrap();
+        assert!(
+            outcome.cancelled,
+            "a live call was not reported as signalled"
+        );
+        assert!(signal.is_cancelled());
+
+        // And garbage params are a `bad_params`, not a panic and not an
+        // `ok` — `daemon/stop` was the method that answered `ok` to
+        // structurally garbage params, and this one does not inherit it.
+        let junk = Request::new(3, method::METHOD_CANCEL, &json!({ "nope": 1 })).unwrap();
+        let (resp, _) = dispatch(&daemon, &junk, ClientKind::Shim).await;
+        assert!(
+            resp.is_error(),
+            "garbage cancel params were accepted: {resp:?}"
         );
 
         daemon.shutdown();
