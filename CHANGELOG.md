@@ -100,8 +100,9 @@ is cut, named and published is in
   defect.** The *withholding* side — a credential still arriving with an
   escape inside it is released half-emitted — is [#142] and is open; [#138]
   (spans judged over the window while a sub-range is emitted) and [#139]
-  (8-bit C1 introducers that Holdfast's own emulator interprets and the
-  stripper does not) are open on the range and grammar axes. Redaction is not
+  (8-bit C1 introducers, which the stripper does not open a sequence on and
+  the screen emulator discards as an unhandled control — the discard being
+  what splices the token) are open on the range and grammar axes. Redaction is not
   closed as a class.
 - A session that has finished no longer keeps the writer thread that only a
   running child needs. The registry now holds live sessions and completed
