@@ -1168,6 +1168,93 @@ mod tests {
         }
     }
 
+    /// **GH #126: the call's own `max_secret_bytes` reaches the
+    /// provider.**
+    ///
+    /// **Written because deleting `.with_max_bytes(max_secret_bytes)`
+    /// from `request_secret_input`'s context left every row in this
+    /// module and every row in `tests/secrets.rs` green.** The budget was
+    /// pinned twice and both sites hand-built their own context, so
+    /// nothing drove the argument an agent actually sends through the
+    /// chain that has to honour it — and the scenario that restores is
+    /// issue #126's third reproduction verbatim: `max_secret_bytes: 1`,
+    /// a provider printing seven bytes, eight bytes into the PTY.
+    ///
+    /// The two halves differ in **one argument** and nothing else, which
+    /// is what makes the refusal about the budget rather than about the
+    /// fixture.
+    ///
+    /// `printf` without a newline on purpose: `provider::run` measures the
+    /// provider's **raw stdout**, pre-normalisation, exactly as
+    /// `attach::conn` measures a human's submission pre-normalisation. A
+    /// fixture printing `hunter2\n` would be eight raw bytes and the
+    /// "exactly at the budget" half would be measuring the newline.
+    #[tokio::test]
+    async fn the_calls_byte_budget_reaches_the_provider() {
+        // ---- one byte declared, seven printed: nothing is written.
+        let mut sc = Scratch::new("budgetlow");
+        let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}'\n"));
+        let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+
+        let payload = call(
+            &server,
+            RequestSecretInputArgs {
+                max_secret_bytes: Some(1),
+                ..secret_args(&s.id, 2)
+            },
+        )
+        .await;
+        assert_eq!(
+            payload["status"], "secret_cancelled",
+            "a seven-byte credential was accepted under a one-byte budget: {payload}"
+        );
+        // The pairing that stops the refusal being about step 1 not
+        // running: the provider really did run, and its answer really was
+        // refused rather than never fetched.
+        assert!(sc.ran("prod-ssh"), "the binding's provider never ran");
+        let seen = buffered(&s);
+        assert!(
+            !contains(&seen, b"got=HUNTER2"),
+            "the over-budget credential reached the child:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        // ---- seven declared, seven printed: written, and the child gets
+        //      it. One argument different.
+        let mut sc2 = Scratch::new("budgetfits");
+        let b2 = sc2.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}'\n"));
+        let server2 = server_with(keychain_mode(vec![b2]), &sc2.audit_log());
+        let s2 = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server2.registry.insert(Arc::clone(&s2)).expect("register");
+        await_prompt(&s2, b"Password: ").await;
+
+        let payload = call(
+            &server2,
+            RequestSecretInputArgs {
+                max_secret_bytes: Some(PROBE.len() as u32),
+                ..secret_args(&s2.id, 10)
+            },
+        )
+        .await;
+        assert_eq!(
+            payload["status"], "secret_provided",
+            "a credential exactly at the declared budget was refused, so the refusal \
+             above is not about the budget: {payload}"
+        );
+        assert_eq!(
+            payload["data"]["bytes_written"],
+            (PROBE.len() + 1) as u64,
+            "§5.2's newline is the daemon's and is not counted against the budget"
+        );
+        buffer_until(&s2, b"got=HUNTER2", 20).await;
+
+        let _ = s.signal(Signal::Kill);
+        let _ = s2.signal(Signal::Kill);
+    }
+
     /// **GH #126: `timeout_secs` bounds the provider step, and nothing
     /// the provider resolved late reaches the child.**
     ///

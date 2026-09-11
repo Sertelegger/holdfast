@@ -2456,6 +2456,127 @@ async fn an_arm_cancelled_on_a_full_write_queue_still_answers_the_waiting_call()
     );
 }
 
+/// **GH #126's class on the raise nobody is waiting on: an unadopted
+/// request is bounded by the operator's ceiling, not by nothing.**
+///
+/// `RaisedRequest.max_secret_bytes` is a *waiting call's* argument, so
+/// every raise with no call on it carries `None` — §7.5's replay, §8.3's
+/// echo drop, and the re-raise a caller's ending leaves behind, which
+/// this branch added two producers of. Read as "unbounded", the only
+/// thing left between a human's keystrokes and the child is
+/// `MAX_FRAME_BYTES`, 16 MiB, against an operator ceiling this row sets
+/// to 8.
+///
+/// Measured before the fix, on the cancel path:
+///
+/// ```text
+/// before cancel: bounds=Some((Some(16), true))
+/// after  cancel: bounds=Some((None,     true))
+/// ```
+///
+/// **Driven through the re-raise specifically**, because that is the
+/// producer this branch is responsible for: the call declares a budget,
+/// the caller cancels, and what a human may then submit into the child is
+/// the question.
+///
+/// **Two sessions, because one cannot ask both halves.** An over-ceiling
+/// submission is refused and the request closes — and §8.3's raise is
+/// edge-triggered on *entering* echo-off, which the child never left, so
+/// no second affordance appears for the pairing to use. The second
+/// session is the same arrangement with one number changed.
+#[tokio::test]
+async fn a_re_raised_request_is_bounded_by_the_operators_ceiling() {
+    const CEILING: u32 = 8;
+
+    let mut config = Config::default();
+    config.security.max_secret_bytes_ceiling = CEILING;
+    let d = TestDaemon::start_with_config("ceiling", config).await;
+
+    /// Cancel a call, then submit `len` bytes into the re-raise it left
+    /// behind. Answers the frame outcome and whether the child got them.
+    async fn submit_after_a_cancel(d: &TestDaemon, len: usize) -> (String, bool) {
+        let s = d.shell_running(ECHO_OFF_FIXTURE);
+        let mut c = attach_ok(d, &s.id, AttachMode::ReadWrite).await;
+        let _ = next_awaiting_secret(&mut c, 20).await;
+
+        let signal = CancelSignal::new();
+        let call = spawn_cancellable_call(
+            d,
+            RequestSecretInputArgs {
+                // Under the ceiling, so the *call's* bound is not the one
+                // doing the work — the re-raise's is.
+                max_secret_bytes: Some(2),
+                ..secret_args(&s.id, 60)
+            },
+            &signal,
+        );
+        await_waiter(d, &s.id, "the call about to be cancelled").await;
+        signal.cancel();
+        assert_eq!(
+            joined(call, "the cancelled call").await["data"]["reason"],
+            "caller_cancelled"
+        );
+
+        let (_, closed) = next_secret_closed(&mut c, 20).await;
+        assert_eq!(closed, "caller_cancelled");
+        // The affordance the cancel left behind, which carries no call's
+        // argument at all.
+        let (re_raised, _) = next_awaiting_secret(&mut c, 20).await;
+
+        let value = vec![b'a'; len];
+        send(
+            &mut c,
+            &ClientFrame::SecretInput {
+                request_id: re_raised.clone(),
+                bytes: value,
+            },
+        )
+        .await;
+        let (id, outcome) = next_secret_closed(&mut c, 20).await;
+        assert_eq!(id, re_raised, "a different request was closed");
+
+        // The child's own echo of what it read, on the ring rather than
+        // on the frame stream, so this does not consume frames the
+        // caller may still want.
+        let want: Vec<u8> = b"got=".iter().copied().chain(vec![b'A'; len]).collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut reached = false;
+        while tokio::time::Instant::now() < deadline {
+            if contains(&buffered(&s), &want) {
+                reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = s.signal(Signal::Kill);
+        (outcome, reached)
+    }
+
+    // One byte over the operator's ceiling, into a request that declares
+    // nothing of its own.
+    let (outcome, reached) = submit_after_a_cancel(&d, CEILING as usize + 1).await;
+    assert_eq!(
+        outcome, "cancelled",
+        "a submission over the operator's ceiling was accepted into a request that \
+         declared no budget of its own — the only bound left is a 16 MiB frame"
+    );
+    assert!(!reached, "the over-ceiling submission reached the child");
+
+    // **The pairing**, one number different: exactly at the ceiling still
+    // lands, so the refusal above is about the bound and not about a path
+    // that refuses everything.
+    let (outcome, reached) = submit_after_a_cancel(&d, CEILING as usize).await;
+    assert_eq!(
+        outcome, "fulfilled",
+        "a submission exactly at the ceiling was refused"
+    );
+    assert!(
+        reached,
+        "the at-ceiling submission never reached the child, so the refusal above \
+         proves nothing"
+    );
+}
+
 /// **GH #127: a cancelled call closes its request, tells every attached
 /// client, and frees the slot.**
 ///

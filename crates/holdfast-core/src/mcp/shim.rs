@@ -736,6 +736,163 @@ mod tests {
         assert_eq!(body["data"]["reason"], "caller_cancelled", "{body}");
     }
 
+    /// **GH #127: `call_tool` reads the cancellation rmcp hands it.**
+    ///
+    /// **Written because replacing `context.ct.cancelled()` with
+    /// `std::future::pending()` left every row in this file, in
+    /// `tests/control_protocol.rs` and in `tests/secrets.rs` green** —
+    /// warning-free, because `context` stays used by
+    /// `ToolCallContext::new`. Every other shim row calls
+    /// [`ShimServer::forward`] with a hand-supplied future, which is a
+    /// defensible seam and one statement past the defect: this module's
+    /// own doc says *"it used to be `_context`, and that one underscore
+    /// was the whole bug"*, and that underscore was exactly what nothing
+    /// could see.
+    ///
+    /// **A real `ShimServer` served over an in-memory duplex, driven by
+    /// hand-written JSON-RPC.** `RequestContext` carries a `Peer` and a
+    /// `Peer` is made by `serve()` and by nothing else, so the only way
+    /// to reach `call_tool` at all is to be a client. The client half is
+    /// written out rather than taken from rmcp because `client` is not
+    /// one of rmcp's default features — and the hand-written form is the
+    /// better assertion anyway, for this file's usual reason: it is the
+    /// bytes an agent sends, not a round trip through the same impls the
+    /// server decodes with.
+    #[tokio::test]
+    async fn call_tool_reads_the_cancellation_rmcp_hands_it() {
+        use rmcp::service::ServiceExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = scratch_dir("ctbridge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scoped = Scoped(dir.clone());
+        let sock = dir.join("control.sock");
+
+        // A daemon that accepts the tool call and never answers it, and
+        // hands back whatever arrives on the next connection.
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (called_tx, called_rx) = tokio::sync::oneshot::channel();
+        {
+            let sock = sock.clone();
+            tokio::spawn(async move {
+                let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+                let (mut first, _) = listener.accept().await.unwrap();
+                shake(&mut first).await;
+                let call: CborValue = frame::read_frame(&mut first).await.unwrap();
+                let _ = called_tx.send(call);
+
+                let (mut second, _) = listener.accept().await.unwrap();
+                shake(&mut second).await;
+                let cancel: CborValue = frame::read_frame(&mut second).await.unwrap();
+                let _ = cancel_tx.send(cancel);
+                // Hold both open: an EOF would turn a missing cancel into
+                // a framing error, which is a different failure wearing
+                // the same colour.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            });
+        }
+
+        let control = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+
+        let (server_side, client_side) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            if let Ok(running) = ShimServer::new(Arc::new(control)).serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+
+        let (rx, mut tx) = tokio::io::split(client_side);
+        let mut rx = BufReader::new(rx);
+        let mut line = String::new();
+        let mut send = |v: serde_json::Value| {
+            let mut s = v.to_string();
+            s.push('\n');
+            s
+        };
+
+        // ---- initialize, which is what makes a `Peer` exist at all.
+        tx.write_all(
+            send(json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "ct-probe", "version": "0.0.0" }
+                }
+            }))
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx.read_line(&mut line))
+            .await
+            .expect("the shim never answered `initialize`")
+            .unwrap();
+        assert!(line.contains("\"result\""), "initialize failed: {line}");
+        tx.write_all(
+            send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        // ---- a tool call the stand-in daemon will never answer.
+        tx.write_all(
+            send(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "request_secret_input",
+                    "arguments": { "session": "sess_abc", "prompt_text": "a credential" }
+                }
+            }))
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        // The call is really outstanding before the cancel, so the
+        // ordering under test is the real one.
+        tokio::time::timeout(std::time::Duration::from_secs(10), called_rx)
+            .await
+            .expect("the tool call never reached the stand-in daemon")
+            .expect("the call channel");
+
+        // ---- and the cancellation, exactly as an agent sends it.
+        tx.write_all(
+            send(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": 1, "reason": "the user interrupted" }
+            }))
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let cancel = tokio::time::timeout(std::time::Duration::from_secs(10), cancel_rx)
+            .await
+            .expect(
+                "no `holdfast/cancel` reached the daemon: `call_tool` did not read the \
+                 cancellation rmcp handed it",
+            )
+            .expect("the cancel channel");
+        assert_eq!(
+            field(&cancel, "method").as_text(),
+            Some(crate::protocol::method::METHOD_CANCEL),
+            "the second connection carried something other than a cancel"
+        );
+
+        server.abort();
+    }
+
     /// The handshake half of a stand-in daemon, which every connection
     /// pays and no assertion here is about.
     async fn shake(stream: &mut tokio::net::UnixStream) {

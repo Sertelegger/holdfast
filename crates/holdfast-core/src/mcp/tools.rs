@@ -4637,6 +4637,22 @@ mod tests {
             "an oversized credential reached the PTY: {written:?}"
         );
 
+        // 3b. **One byte over, which is where the arithmetic lives.**
+        //     The value is `probe.len() + 1` normalised, and the gate
+        //     allows the budget plus §5.2's one appended newline — so a
+        //     budget of `probe.len() - 1` must refuse. Without this the
+        //     slack is untested in the permissive direction: a
+        //     `saturating_sub(2)` reads as a harmless off-by-one, passes
+        //     every other arm here, and quietly widens every request's
+        //     budget by a byte.
+        let one_over = RequestContext::detached().with_max_bytes(probe.len() as u32 - 1);
+        let (reported, written) = attempt(one_over, probe).await;
+        assert!(
+            !reported,
+            "a credential one byte over the budget was written, so the gate's slack is              wider than the newline it exists for"
+        );
+        assert!(!contains(&written, probe), "{written:?}");
+
         // 4. **The pairing.** A live request whose value fits is written,
         //    so the three refusals above are about their conditions and
         //    not about a gate that refuses everything.
