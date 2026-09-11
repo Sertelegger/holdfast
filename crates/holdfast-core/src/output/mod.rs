@@ -242,26 +242,59 @@ impl OutputProcessor {
     /// Where a read must stop (spec §4.1). `buffer.head` unless a secret
     /// is still arriving in the trailing region.
     ///
-    /// Asked of every emittable view as well as of the raw bytes, for the
-    /// same reason `find_spans` is (GH #125): `earliest_partial` requires
-    /// that every byte after the prefix *could still belong to the value*,
-    /// and `\x1b` could not, so a token arriving with a colour reset
-    /// already inside it is not in flight by the raw region's account. It
-    /// would be released half-emitted — and the half is a real half,
-    /// since stripping removes the escape on the way out.
+    /// **Asked of the raw region only, and [`normalise`] deliberately
+    /// does not reach here (GH #142).** A revision of the GH #125 fix did
+    /// ask the views, on the reasoning that a token arriving with a
+    /// colour reset inside it is not in flight by the raw region's
+    /// account and would be released half-emitted. That reasoning is
+    /// right and the change was still wrong, because
+    /// [`PrefixIndex::earliest_partial`]'s continuation test — *every
+    /// byte from the prefix to the end of the region could still belong
+    /// to the value* — is **load-bearing on control bytes**, and every
+    /// view exists precisely to delete them.
     ///
-    /// Not over *every* view — see [`View::leaves_sequence_residue`],
-    /// which is the one this detector cannot be asked about and why.
+    /// Measured, default read path, against this method's own answer:
     ///
-    /// [`View::leaves_sequence_residue`]: normalise::View::leaves_sequence_residue
+    /// ```text
+    /// added 210 packages\r\nnpm WARN deprecated \x1b[33m@acme/key-manager@1.2.3\x1b[0m\x1b[K
+    ///   raw          boundary 75 = head, released
+    ///   stripped     boundary 51, held_back, and it never releases
+    /// ```
+    ///
+    /// `key-` is `mailgun-api-key`'s indexed prefix and the rest is
+    /// ordinary text; the trailing `\x1b[K` used to end the run and
+    /// disarm the holdback, and in the stripped view it is not there. A
+    /// progress line that ends in an escape with no newline after it —
+    /// which is most of them — strands the caller's own output behind a
+    /// `held_back` that nothing will clear. The same shape takes
+    /// `prompt.last_line` to `""` on every `status` and `list_sessions`,
+    /// and turns a `wait_for_pattern` that answered instantly into one
+    /// that burns its whole `timeout_secs`.
+    ///
+    /// **The rule that came out of it**, and the reason the two halves of
+    /// the GH #125 fix are not symmetric: *a view may add a **marker**,
+    /// because a marker is safe in every stream and costs the caller
+    /// nothing it was entitled to; a view may not add a **withhold**,
+    /// because a withhold denies the caller bytes, and the predicate that
+    /// decides withholds reads exactly the bytes a view removes.*
+    /// [`OutputProcessor::all_spans`] is the first half; this method is
+    /// the second.
+    ///
+    /// The cost of stopping here is stated rather than elided: a
+    /// credential that straddles a read boundary **with an escape inside
+    /// it** is still released half-emitted, exactly as before this fix.
+    /// That is GH #142, it is byte-identical to the behaviour at
+    /// `v0.0.7`, and closing it needs a sharper in-flight predicate
+    /// rather than a different set of views — see the issue.
+    ///
+    /// [`PrefixIndex::earliest_partial`]: prefix_index::PrefixIndex::earliest_partial
     pub fn holdback_boundary(&self, w: &WindowSnapshot<'_>, opts: &ReadOptions) -> u64 {
         if !opts.redact || w.bypass_holdback {
             return w.head;
         }
-        self.earliest_boundary(w.tail_region, w.tail_region_start, |region, start| {
-            self.index.earliest_partial(&self.rules, region, start)
-        })
-        .unwrap_or(w.head)
+        self.index
+            .earliest_partial(&self.rules, w.tail_region, w.tail_region_start)
+            .unwrap_or(w.head)
     }
 
     /// Every secret span in `region`, judged over **each byte stream a
@@ -288,45 +321,6 @@ impl OutputProcessor {
         // a raw span and a mapped one covering the same credential must
         // read as one marker, not two.
         redact::merge_spans(spans)
-    }
-
-    /// Run one of the two **in-flight** detectors over the raw region and
-    /// over the views that can be asked, and take the earliest answer.
-    ///
-    /// Both callers are *boundaries*: a smaller offset withholds more, so
-    /// the minimum is the safe combination, and a view that sees nothing
-    /// contributes nothing rather than a veto.
-    ///
-    /// **Not every view, and the exclusion carries its own reasoning at
-    /// [`View::leaves_sequence_residue`].** In short: these two ask what
-    /// bytes that have *not arrived* might do, and they answer with a
-    /// test that treats every control byte as a terminator — so the one
-    /// view that deletes a sequence's terminator while keeping its body
-    /// turns a finished window title into a credential still arriving.
-    /// `find_spans` has no such dependency and reads every view.
-    ///
-    /// [`View::leaves_sequence_residue`]: normalise::View::leaves_sequence_residue
-    fn earliest_boundary(
-        &self,
-        region: &[u8],
-        region_start: u64,
-        detect: impl Fn(&[u8], u64) -> Option<u64>,
-    ) -> Option<u64> {
-        let mut earliest = detect(region, region_start);
-        for view in normalise::emitted_views(region, region_start) {
-            if view.view.leaves_sequence_residue() {
-                continue;
-            }
-            // The detector is handed view-space offsets (`0` as the
-            // region start) and its answer is mapped back, exactly as a
-            // span is: nothing outside this module ever sees a view
-            // offset.
-            if let Some(i) = detect(view.bytes(), 0) {
-                let raw = view.raw_offset(i as usize);
-                earliest = Some(earliest.map_or(raw, |e| e.min(raw)));
-            }
-        }
-        earliest
     }
 
     /// Run the pipeline over a snapshot. Pure: no locks, no I/O.
@@ -420,9 +414,8 @@ impl OutputProcessor {
         // and is what REQ-O-005 already licenses.
         if opts.redact && window_end < w.head {
             let unresolved = self
-                .earliest_boundary(w.window, w.window_start, |region, start| {
-                    self.index.unresolved_from(&self.rules, region, start)
-                })
+                .index
+                .unresolved_from(&self.rules, w.window, w.window_start)
                 .filter(|u| !spans.iter().any(|s| s.start <= *u && s.end >= window_end));
             if let Some(u) = unresolved {
                 safety_end = safety_end.min(u);
@@ -1738,67 +1731,6 @@ mod tests {
         );
     }
 
-    /// **The holdback, with the escape already inside the arriving
-    /// token.** `earliest_partial` demands that every byte after the
-    /// prefix could still belong to the value, and `\x1b` could not, so
-    /// by the raw region's account nothing was in flight: the read ran to
-    /// `head` and emitted the arrived half of the credential in the
-    /// clear, stripped clean.
-    ///
-    /// The second arrangement is the control. A holdback that engaged
-    /// unconditionally would satisfy the first on its own, so the same
-    /// buffer with the rest of the token **and a delimiter** must release
-    /// everything, as one marker — the same pair, and the same reason for
-    /// the delimiter, as
-    /// [`the_boundary_advances_once_the_token_completes`].
-    #[test]
-    fn a_token_arriving_with_an_escape_already_inside_it_is_still_in_flight() {
-        // 39 characters of a 40-character rule, painted, and nothing
-        // after them: still arriving.
-        let arriving =
-            format!("line one\n{}\x1b[0m{}", &GITHUB[..15], &GITHUB[15..39]).into_bytes();
-        let r = read(&arriving, 0, 32 * 1024);
-        assert!(r.held_back, "an in-flight token must stop the read");
-        assert_eq!(r.output, "line one\n");
-        assert_eq!(r.cursor, 9, "the boundary is the partial's first byte");
-        assert_eq!(r.next_cursor, Some(9));
-        assert!(!r.truncated_for_size, "this is a holdback, not a size cap");
-
-        let mut complete = arriving.clone();
-        complete.extend_from_slice(&GITHUB.as_bytes()[39..]);
-        complete.push(b'\n');
-        let r = read(&complete, 0, 32 * 1024);
-        assert!(!r.held_back, "the whole token has landed; release it");
-        assert_eq!(r.output, "line one\n[REDACTED:github]\n");
-        assert_eq!(r.cursor, complete.len() as u64);
-    }
-
-    /// The in-flight half of the `lossy_printable` sibling: a token still
-    /// arriving with a **backspace** inside it.
-    ///
-    /// Only that encoding joins this one — the stripper keeps `\x08` and
-    /// the raw bytes obviously do — so this is the row that pins which
-    /// view the in-flight detectors read. It is also the row that fails
-    /// if `emitted_views` ever returns `Printable` as the survivor when
-    /// the two `lossy_printable` views coincide, because the in-flight
-    /// detectors are barred from that one and would then see no view at
-    /// all.
-    #[test]
-    fn a_token_arriving_with_a_backspace_inside_it_is_still_in_flight() {
-        let arriving = format!("line one\n{}\u{8}{}", &GITHUB[..15], &GITHUB[15..35]).into_bytes();
-        let r = read(&arriving, 0, 32 * 1024);
-        assert!(r.held_back, "an in-flight token must stop the read");
-        assert_eq!(r.output, "line one\n");
-        assert_eq!(r.cursor, 9, "the boundary is the partial's first byte");
-
-        let mut complete = arriving.clone();
-        complete.extend_from_slice(&GITHUB.as_bytes()[35..]);
-        complete.push(b'\n');
-        let r = read(&complete, 0, 32 * 1024);
-        assert!(!r.held_back, "the whole token has landed; release it");
-        assert_eq!(r.redactions.get("github"), Some(&1));
-    }
-
     /// **The other direction, which the first version of this fix got
     /// wrong.** A *terminated* window title carrying an indexed secret
     /// prefix must not stop the read.
@@ -1824,6 +1756,187 @@ mod tests {
         assert!(!r.held_back, "a finished title is not a secret in flight");
         assert_eq!(r.cursor, buf.len() as u64, "and the read reaches head");
         assert_eq!(r.output, "harmless header linedone");
+    }
+
+    /// A colourised blob with no space or newline in it, longer than
+    /// `max_bytes + lookahead`, paged at the default size.
+    ///
+    /// **The GH #14 path (`window_end < w.head`) is the only branch this
+    /// reaches, and it had no row.** `unresolved_from`'s trailing
+    /// value-run test finds the first byte the window cannot vouch for;
+    /// escapes break that run in the raw bytes and do not break it in a
+    /// stripped view, so asking the views moved the run start back to at
+    /// or before `req_start`, `read_end` came out equal to the cursor it
+    /// was given, and the read returned **zero bytes for ever**. `jq -C
+    /// -c` on a medium document is that shape.
+    ///
+    /// The stall *class* pre-exists this fix — the same probe with the
+    /// escapes removed stalls on the parent commit too, and closing that
+    /// is not this change's job. What is this change's job is not moving
+    /// colourised output, which streamed before, into it.
+    #[test]
+    fn a_colourised_blob_with_no_delimiter_still_pages_to_the_end() {
+        let mut buf = b"starting up\n".to_vec();
+        for i in 0..2000u32 {
+            buf.extend_from_slice(b"\x1b[32m");
+            buf.extend_from_slice(format!("{:016x}", i).as_bytes());
+        }
+        buf.extend_from_slice(b"\ndone\n");
+
+        let mut cursor = 0u64;
+        let mut pages = 0usize;
+        let mut seen = 0usize;
+        while cursor < buf.len() as u64 {
+            let r = read(&buf, cursor, 1024);
+            assert!(
+                r.cursor > cursor,
+                "page {pages} returned {} bytes and left the cursor at {cursor}: \
+                 a read that never completes",
+                r.bytes_returned
+            );
+            seen += r.bytes_returned;
+            cursor = r.cursor;
+            pages += 1;
+            assert!(pages < 200, "paging did not terminate");
+        }
+        assert_eq!(seen, buf.len(), "the pages must tile the buffer exactly");
+    }
+
+    /// **The row that ties the enumeration to the pipeline, so the module
+    /// header's claim is checked rather than asserted in prose.**
+    ///
+    /// `normalise`'s table says the emittable streams are the raw window
+    /// and its three views. Nothing proved that: the views were pinned
+    /// against hand-written literals, so a *fourth* filter appearing
+    /// anywhere in `render` or `encode` would go unnoticed and reopen
+    /// GH #125 for whatever stream it produced. Driven, by adding a CRLF
+    /// normalisation to `encode`'s `Utf8` arm: `deploy ghp_…\r…` came
+    /// back as a whole credential with `redactions: {}`, and the suite's
+    /// entire reaction was three `assert_eq!`s differing by `\r\n` versus
+    /// `\n` — exactly the failures somebody fixes by editing the
+    /// literals.
+    ///
+    /// So this asserts the relationship instead: with redaction off, the
+    /// bytes a read emits under **every** `ansi` × `text_encoding`
+    /// combination must be the raw window or one of the streams
+    /// `emitted_views` names. A new filter fails it on the next run.
+    ///
+    /// `redact: false` is deliberate — it is the only way to see the
+    /// pipeline's own output with no markers substituted into it — and
+    /// the fixture is ASCII so a lossy UTF-8 decode is the identity and
+    /// the comparison stays on bytes.
+    #[test]
+    fn every_option_combination_emits_a_stream_this_module_enumerates() {
+        use base64::Engine as _;
+        // One of everything the filters react to: a CSI, an OSC with a
+        // payload, a bare `\x08`, a `\x7f`, and a CRLF.
+        let buf = b"a\x1b[31mb\x08c\x7fd\x1b]0;title\x07e\r\nf\n".to_vec();
+        let p = processor();
+
+        let mut streams: Vec<Vec<u8>> = vec![buf.clone()];
+        for v in normalise::emitted_views(&buf, 0) {
+            streams.push(v.bytes().to_vec());
+        }
+
+        for ansi in [AnsiMode::Strip, AnsiMode::Raw] {
+            for text_encoding in [
+                TextEncoding::Utf8,
+                TextEncoding::Base64,
+                TextEncoding::LossyPrintable,
+            ] {
+                let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+                let r = p.process(
+                    &w,
+                    &ReadOptions {
+                        ansi,
+                        text_encoding,
+                        redact: false,
+                    },
+                );
+                let emitted = match text_encoding {
+                    TextEncoding::Base64 => base64::engine::general_purpose::STANDARD
+                        .decode(r.output.as_bytes())
+                        .expect("base64 round-trips"),
+                    _ => r.output.clone().into_bytes(),
+                };
+                assert!(
+                    streams.contains(&emitted),
+                    "{ansi:?}/{} emitted a stream `emitted_views` does not \
+                     enumerate, so redaction never judged it: {emitted:?}",
+                    text_encoding.as_str()
+                );
+            }
+        }
+    }
+
+    /// `View::Printable`'s own case — `ansi: "raw"` with
+    /// `lossy_printable`, the one combination no other view covers —
+    /// asserted on an outcome rather than on the view taxonomy.
+    ///
+    /// The stripper keeps `\x08`, so the raw and stripped streams both
+    /// carry the planted byte and neither reassembles anything; only this
+    /// combination drops it and joins the halves.
+    #[test]
+    fn the_raw_lossy_printable_stream_is_redacted_on_its_own_account() {
+        let buf = format!("deploy {}\u{8}{}\n", &GITHUB[..15], &GITHUB[15..]).into_bytes();
+        let p = processor();
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        let r = p.process(
+            &w,
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                text_encoding: TextEncoding::LossyPrintable,
+                ..Default::default()
+            },
+        );
+        assert!(!r.output.contains(GITHUB), "reassembled: {}", r.output);
+        assert_eq!(r.output, "deploy [REDACTED:github]\n");
+        assert_eq!(r.redactions.get("github"), Some(&1));
+    }
+
+    /// **Ordinary output that ends in an escape sequence must still be
+    /// released (GH #142).**
+    ///
+    /// `earliest_partial` asks whether every byte from an indexed prefix
+    /// to the end of the region could still belong to a value, and
+    /// answers with `0x21..=0x7e`; the control byte that ends a sequence
+    /// is what ends that run. Asking a *stripped* view instead removes
+    /// the terminator, the run reaches the end of the region, and the
+    /// read stops — permanently, because the line is finished and nothing
+    /// more is coming.
+    ///
+    /// `key-` is `mailgun-api-key`'s indexed prefix and the rest of this
+    /// line is an npm deprecation warning. A progress line ending in
+    /// `\x1b[K` with no newline after it is the ordinary shape, not an
+    /// exotic one, which is why this is a row and not a footnote: it
+    /// strands the caller's own output, takes `prompt.last_line` to `""`
+    /// on every `status` and `list_sessions`, and turns a
+    /// `wait_for_pattern` that answered instantly into one that burns its
+    /// whole `timeout_secs`.
+    #[test]
+    fn ordinary_output_ending_in_an_escape_sequence_is_not_held_back() {
+        let buf = b"added 210 packages\r\nnpm WARN deprecated \x1b[33m@acme/key-manager@1.2.3\x1b[0m\x1b[K".to_vec();
+        let p = processor();
+        // The premise: there really is an indexed prefix in the tail, so
+        // the row exercises the detector rather than skipping past it.
+        assert!(
+            p.index
+                .prefixes_for(&p.rules, "mailgun-api-key")
+                .iter()
+                .any(|x| x == b"key-"),
+            "`key-` must be indexed, or this line offers the scanner nothing"
+        );
+        let r = read(&buf, 0, 32 * 1024);
+        assert!(
+            !r.held_back,
+            "an ordinary warning line was withheld: {:?}",
+            r.output
+        );
+        assert_eq!(r.cursor, buf.len() as u64, "the read must reach head");
+        assert_eq!(
+            r.output,
+            "added 210 packages\r\nnpm WARN deprecated @acme/key-manager@1.2.3"
+        );
     }
 
     /// The audited opt-out is unchanged: `redact: false` disables the

@@ -20,6 +20,15 @@ is cut, named and published is in
 
 ### Changed
 
+- **`read_output` can now return more redaction markers on colourised output,
+  and this is a payload change rather than a free win.** A rule that matches
+  the stripped text but not the raw bytes now fires: `\x1b[36mpassword\x1b[0m
+  = \x1b[33mnot-set-yet\x1b[0m` returns `password = [REDACTED:generic]` where
+  it returned `password = not-set-yet`. The plain form was always redacted —
+  `generic-secret-assignment` matches on the *label* and does not inspect the
+  value — so this is that rule reaching the stream the agent actually receives,
+  but it means `grep --color` over a config file now returns markers where it
+  returned placeholders ([#125]).
 - On Windows native, seven daemon-backed subcommands — `daemon run`,
   `daemon start`, `daemon status`, `list`, `logs`, `attach`, `watch` — refuse
   with exit 64 from a single shared message; `list` and `logs` name the MCP
@@ -54,13 +63,16 @@ is cut, named and published is in
   so a colour reset planted inside a token broke the rule's anchor at match
   time and was then removed on the way out: a complete, valid credential
   reached the agent on the **default** read path, reported as
-  `redactions: {}`. Matching now runs over every byte stream a read can emit —
-  raw, stripped, and either of those under `lossy_printable`, which drops the
-  C0 controls the stripper keeps — and maps each match back to raw buffer
-  offsets, so cursors, `bytes_returned` and the holdback are unchanged. The
-  same correction applies to the in-flight holdback, which had declined to
-  call a painted token "still arriving" for the same reason. `redact: false`
-  and `--raw` are unaffected ([#125]).
+  `redactions: {}`. Matching now runs over each byte stream the read pipeline
+  derives from the window it judges — raw, stripped, and either of those under
+  `lossy_printable`, which drops the C0 controls the stripper keeps — and maps
+  every match back to raw buffer offsets, so cursors and `bytes_returned` are
+  arithmetically unchanged. The **holdback is unchanged too, deliberately**:
+  the in-flight predicate it rests on is load-bearing on the very control
+  bytes those streams remove, so it still reads the raw region alone, and a
+  credential straddling a read boundary with an escape inside it is still
+  released half-emitted ([#142]). `redact: false` and `--raw` are byte-identical
+  to before ([#125]).
 - Autofill no longer misses a credential prompt drawn before its listener was
   armed; the listener replays the current echo-off episode once, de-duplicated
   against a delivered edge, which also closes the lagged-receiver case
@@ -570,3 +582,4 @@ residuals that are known and accepted.
 [#106]: https://github.com/Sertelegger/holdfast/issues/106
 [#112]: https://github.com/Sertelegger/holdfast/issues/112
 [#125]: https://github.com/Sertelegger/holdfast/issues/125
+[#142]: https://github.com/Sertelegger/holdfast/issues/142

@@ -11,11 +11,44 @@
 //! later at [`TextEncoding::LossyPrintable`], which drops the C0 controls
 //! the stripper keeps (`\x08`, `\x7f`) after redaction has already run.
 //!
-//! **The property that closes the class, rather than the two instances of
-//! it:** *every byte stream a read can emit is matched before it is
-//! emitted.* The pipeline is `render` (strip or pass through) then
-//! [`encode`], and only two of its knobs drop bytes, so the set of
-//! emittable streams is small and enumerable:
+//! **The property, stated as narrowly as it was actually proved.** Every
+//! byte stream that `render` and [`encode`] can *derive from the matched
+//! window* is matched before it is emitted. That is a closure over the
+//! **filters this pipeline applies**; it is not a closure over "what the
+//! caller ends up seeing", and two axes are known to remain open:
+//!
+//! * **The window is not the payload (GH #138).** Spans are found over
+//!   `[window_start, window_end)` while `render` emits
+//!   `[req_start, read_end)`, so a `\b` can be decided by a lookbehind
+//!   byte the caller never receives.
+//! * **The enumeration is 7-bit (GH #139).** These views come from
+//!   [`AnsiStripper`]'s grammar, which does not interpret 8-bit C1
+//!   introducers; Holdfast's own screen emulator does, so
+//!   `get_screen_state` can redact a line `read_output` returns whole.
+//!
+//! An earlier revision of this module claimed the unqualified form —
+//! *every byte stream a read can emit is matched before it is emitted* —
+//! and review falsified it twice. The claim is worth stating only at the
+//! width it is true: the next reader will check the sentence rather than
+//! re-derive the class, which is how both of those were found.
+//!
+//! **Which view may decide what.** The two halves of the GH #125 fix are
+//! deliberately not symmetric:
+//!
+//! * A view may add a **marker**. A marker is safe in every stream and
+//!   costs the caller nothing it was entitled to, so
+//!   [`OutputProcessor::all_spans`] reads every view.
+//! * A view may **not** add a **withhold**. A withhold denies the caller
+//!   bytes, and [`PrefixIndex::earliest_partial`] — the predicate behind
+//!   every withhold — is load-bearing on exactly the control bytes a view
+//!   deletes. Asked about a stripped view it strands ordinary output
+//!   behind a `held_back` that never clears, so
+//!   `OutputProcessor::holdback_boundary` reads the raw region alone.
+//!   GH #142 carries the measurement and the residual that leaves open.
+//!
+//! The pipeline is `render` (strip or pass through) then [`encode`], and
+//! only two of its knobs drop bytes, so the set of derivable streams is
+//! small and enumerable:
 //!
 //! | `ansi` | `text_encoding` | stream |
 //! |--------|-----------------|--------|
@@ -58,19 +91,48 @@
 //! `streaming_ordinary_output_is_never_held_back` is a fair sample of it:
 //! 1 MiB of build output with a `\x1b[32m` on every fourth line, read in
 //! 33 pages of 32 KiB. Release, same machine, three runs each: **0.10 s
-//! before, 0.15 s after** — about +1.5 ms on a 32 KiB read. It buys four
-//! regex passes where there was one, and it is paid once per
-//! `read_output` call rather than once per byte the child writes.
+//! before, 0.11 s after**. It buys three regex passes where there was
+//! one, and it is paid once per `read_output` call rather than once per
+//! byte the child writes.
 //!
-//! If that ever matters, the saving to reach for first is deriving
+//! An earlier revision of this fix read **0.15 s** on the same row,
+//! because it also fed the in-flight detectors and so built every view
+//! twice on each of the pages where `window_end < head` — which is every
+//! page but the last. The views are built once now, by
+//! [`OutputProcessor::all_spans`] and nowhere else, which is a
+//! consequence of the marker/withhold rule above rather than an
+//! optimisation in its own right.
+//!
+//! If it ever matters again, the saving to reach for first is deriving
 //! [`View::StrippedPrintable`] by filtering [`View::Stripped`] instead of
 //! walking the region through the stripper a second time, and skipping it
 //! outright when that filter would drop nothing — which is the common
-//! case, since a bare `\x08` in real output is rare. That was measured as
-//! roughly a quarter of the added cost and deliberately not taken: it
-//! trades an obviously-correct loop for a derivation with its own
-//! ordering argument, inside the path whose whole job is not to be
-//! subtly wrong.
+//! case, since a bare `\x08` in real output is rare.
+//!
+//! **What it costs, measured rather than waved at.** Redaction increases
+//! on colourised output, and that is a user-visible payload change:
+//!
+//! ```text
+//! \x1b[36mpassword\x1b[0m = \x1b[33mnot-set-yet\x1b[0m
+//!   before   password = not-set-yet
+//!   after    password = [REDACTED:generic]
+//! ```
+//!
+//! The plain form was always redacted — `generic-secret-assignment`'s
+//! value class is `[^\s"';,)]{8,}` and does not care what the value looks
+//! like — so this is that rule reaching the stream it was always meant to
+//! judge. It still means `grep --color` over a config returns markers
+//! where it returned placeholders, which is a bread-and-butter agent
+//! action and belongs in the changelog rather than in a reviewer's diff.
+//!
+//! One case adds a match no stream had *as plain bytes*: `ESC =` (DECKPAM)
+//! is dropped by the printable filter and supplies the `[:=]` that
+//! `generic-secret-assignment` needs, so `password\x1b=hunter2hunter2`
+//! matches in [`View::Printable`] and nowhere else. A sweep of 16 escape
+//! and C0 shapes against 5 labels and 2 value shapes found it to be the
+//! only one. It stays: it is a real adjacency in a stream `ansi: "raw"`
+//! plus `lossy_printable` really does emit, and under the rule above a
+//! marker is the safe answer.
 //!
 //! **What a view is not.** It is a *subsequence* of the raw region: every
 //! byte in it is a byte of the region, unchanged, in order. That is what
@@ -100,45 +162,6 @@ pub enum View {
     Printable,
     /// `ansi: strip`, `text_encoding: lossy_printable`.
     StrippedPrintable,
-}
-
-impl View {
-    /// Whether this view can delete an escape sequence's **introducer and
-    /// terminator while keeping its body**, and so present the wreckage
-    /// as ordinary text.
-    ///
-    /// True of [`View::Printable`] alone, and it is a real distinction
-    /// rather than a taxonomy. `\x1b]0;SECRET_DONE\x07` is a terminated
-    /// window-title sequence; dropping the `\x1b` and the BEL around it
-    /// leaves `]0;SECRET_DONE`, which is a run of printable non-space
-    /// bytes with an indexed secret prefix inside it and no terminator
-    /// after it. To anything asking *could more bytes still complete a
-    /// value here* — [`PrefixIndex::earliest_partial`] and
-    /// [`PrefixIndex::unresolved_from`], whose continuation test is the
-    /// deliberately coarse [`is_value_byte`] — that reads as a credential
-    /// still accumulating, so the read stops at a window title.
-    ///
-    /// The two stripping views consume a sequence whole, introducer and
-    /// body and terminator together, so neither can produce that run;
-    /// and neither can the raw bytes, where the terminator is still
-    /// there to end it.
-    ///
-    /// **What excluding it from those two detectors costs, stated rather
-    /// than elided.** Nothing that either of the other filters reaches:
-    /// `Printable` and `StrippedPrintable` delete exactly the same *bare*
-    /// control bytes, and the raw scan sees escape-sequence bodies
-    /// intact. What is left is a candidate that needs a bare C0 byte
-    /// **and** an escape-sequence body inside it *and* a read boundary
-    /// in the middle of it. `find_spans` still judges this view, so a
-    /// **complete** credential there is redacted either way; only the
-    /// in-flight holdback declines to guess.
-    ///
-    /// [`PrefixIndex::earliest_partial`]: super::prefix_index::PrefixIndex::earliest_partial
-    /// [`PrefixIndex::unresolved_from`]: super::prefix_index::PrefixIndex::unresolved_from
-    /// [`is_value_byte`]: super::prefix_index
-    pub fn leaves_sequence_residue(self) -> bool {
-        matches!(self, Self::Printable)
-    }
 }
 
 /// One emitted byte stream, plus the raw offset each of its bytes came
@@ -230,14 +253,12 @@ pub fn emitted_views(region: &[u8], region_start: u64) -> Vec<NormalView> {
         return Vec::new();
     }
     let mut views = Vec::with_capacity(3);
-    // **The order is load-bearing where two of these coincide.** A region
-    // with a bare `\x08` and no escape sequence reaches the same bytes
-    // under `Printable` and `StrippedPrintable`, and the duplicate is
-    // dropped — so whichever is built first is the one that survives, and
-    // `Printable` is the one [`View::leaves_sequence_residue`] bars from
-    // the in-flight detectors. Built the other way round, the surviving
-    // representative would be invisible to them and the backspace case
-    // would lose its holdback while looking exactly as covered.
+    // Two of these can coincide — a region with a bare `\x08` and no
+    // escape sequence reaches the same bytes under `Printable` and
+    // `StrippedPrintable` — and the duplicate is dropped, so whichever is
+    // built first survives. The one caller reads every view it is given
+    // and cares only that the set of *streams* is right, not which name
+    // carries one.
     for view in [View::Stripped, View::StrippedPrintable, View::Printable] {
         let built = build(view, region, region_start);
         // A view that dropped nothing *is* the raw region, which the
@@ -342,14 +363,7 @@ mod tests {
         assert_eq!(
             views.iter().map(|v| v.view).collect::<Vec<_>>(),
             vec![View::StrippedPrintable],
-            "one distinct non-raw stream exists here, not three — and the \
-             survivor is the one the in-flight detectors may read, not the \
-             one they are barred from"
-        );
-        assert!(
-            !View::StrippedPrintable.leaves_sequence_residue()
-                && View::Printable.leaves_sequence_residue(),
-            "which is only worth anything while those two differ"
+            "one distinct non-raw stream exists here, not three"
         );
     }
 
@@ -403,6 +417,41 @@ mod tests {
             rule: 0,
         });
         assert_eq!(mapped.end, GITHUB.len() as u64);
+    }
+
+    /// The **start** side of the map, which needs a dropped byte
+    /// *immediately before* the match to mean anything.
+    ///
+    /// The row above has `xx` in front of its token, so a `map_span` that
+    /// walked its start back over dropped bytes lands on the same offset
+    /// and passes. Here the byte before the match is an OSC terminator
+    /// the printable filter removes, so walking back swallows the whole
+    /// window title — output loss rather than a leak, and invisible to
+    /// every other row in the workspace.
+    #[test]
+    fn a_mapped_span_starts_at_its_first_surviving_byte_and_no_earlier() {
+        let title = "\x1b]0;my window title\x07";
+        let region = format!("{title}{GITHUB}\n").into_bytes();
+        let printable = emitted_views(&region, 0)
+            .into_iter()
+            .find(|v| v.view == View::Printable)
+            .expect("the printable view drops the ESC and the BEL");
+        let text = printable.bytes();
+        let at = text
+            .windows(GITHUB.len())
+            .position(|w| w == GITHUB.as_bytes())
+            .expect("the token is intact in this view");
+        let mapped = printable.map_span(Span {
+            start: at as u64,
+            end: (at + GITHUB.len()) as u64,
+            rule: 0,
+        });
+        assert_eq!(
+            mapped.start,
+            title.len() as u64,
+            "the span must begin at the token, not at the terminator before it"
+        );
+        assert_eq!(mapped.end, mapped.start + GITHUB.len() as u64);
     }
 
     /// The view is a subsequence: every byte it holds is the raw byte at
