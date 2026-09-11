@@ -236,6 +236,14 @@ mod tests {
     /// The examples live beside the rule in TOML, so a rule with no
     /// examples fails to load at all (`MissingExamples`) and a rule with
     /// wrong examples fails here.
+    ///
+    /// **This is the *pattern* check and it is not the whole of the
+    /// coverage.** It hands each fixture to `rule.regex` directly, so it
+    /// proves the regex is the one its author meant and nothing about
+    /// what the pipeline does with it. The *pipeline* check over the same
+    /// fixtures is `tests/redaction_sweep.rs`, which runs them through
+    /// `process` and `StreamRedactor` and asks what a consumer can
+    /// reconstruct from the bytes that went out (GH #135, #138, #139).
     #[test]
     fn every_rule_matches_its_positives_and_rejects_its_negatives() {
         let set = RuleSet::builtin().unwrap();
