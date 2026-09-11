@@ -5,9 +5,23 @@
 //! *read*, over an expanded window `[req_start − lookbehind,
 //! req_end + lookahead]`, so a secret that straddles a cursor boundary is
 //! still redacted from both sides.
+//!
+//! **Matching runs over the bytes the caller will receive, not the bytes
+//! the buffer holds** — see [`normalise`]. Redaction used to run on the
+//! raw window while ANSI stripping ran afterwards in [`render`], so an
+//! escape planted inside a credential broke the rule's anchor at match
+//! time and was removed before the payload went out: the read
+//! *reassembled* the token and reported `redactions: {}` (GH #125). Every
+//! offset in this module is still a raw buffer offset — spans, the
+//! holdback, the cursors a caller pages through — because the buffer is
+//! the only thing two reads can agree about. `normalise` is what lets
+//! the two coexist: it matches on the emitted stream and maps back.
+//!
+//! [`render`]: OutputProcessor::render
 
 pub mod ansi;
 pub mod encoding;
+pub mod normalise;
 pub mod prefix_index;
 pub mod redact;
 pub mod rules;
@@ -227,13 +241,92 @@ impl OutputProcessor {
 
     /// Where a read must stop (spec §4.1). `buffer.head` unless a secret
     /// is still arriving in the trailing region.
+    ///
+    /// Asked of every emittable view as well as of the raw bytes, for the
+    /// same reason `find_spans` is (GH #125): `earliest_partial` requires
+    /// that every byte after the prefix *could still belong to the value*,
+    /// and `\x1b` could not, so a token arriving with a colour reset
+    /// already inside it is not in flight by the raw region's account. It
+    /// would be released half-emitted — and the half is a real half,
+    /// since stripping removes the escape on the way out.
+    ///
+    /// Not over *every* view — see [`View::leaves_sequence_residue`],
+    /// which is the one this detector cannot be asked about and why.
+    ///
+    /// [`View::leaves_sequence_residue`]: normalise::View::leaves_sequence_residue
     pub fn holdback_boundary(&self, w: &WindowSnapshot<'_>, opts: &ReadOptions) -> u64 {
         if !opts.redact || w.bypass_holdback {
             return w.head;
         }
-        self.index
-            .earliest_partial(&self.rules, w.tail_region, w.tail_region_start)
-            .unwrap_or(w.head)
+        self.earliest_boundary(w.tail_region, w.tail_region_start, |region, start| {
+            self.index.earliest_partial(&self.rules, region, start)
+        })
+        .unwrap_or(w.head)
+    }
+
+    /// Every secret span in `region`, judged over **each byte stream a
+    /// read of it could emit** and reported in raw buffer offsets
+    /// (GH #125).
+    ///
+    /// The union, not a choice: a view can hide a match as well as
+    /// create one. A credential inside an OSC title (`\x1b]0;ghp_…\x07`)
+    /// is present in the raw bytes and absent from the stripped view,
+    /// because the stripper consumes a sequence's payload — and `ansi:
+    /// raw` emits those bytes. Scanning both costs one extra pass and
+    /// owes nothing to which view found what.
+    fn all_spans(&self, region: &[u8], region_start: u64) -> Vec<Span> {
+        let mut spans = redact::find_spans(&self.rules, region, region_start);
+        for view in normalise::emitted_views(region, region_start) {
+            spans.extend(
+                redact::find_spans(&self.rules, view.bytes(), 0)
+                    .into_iter()
+                    .map(|s| view.map_span(s)),
+            );
+        }
+        // `find_spans` merges what it found; the union of several passes
+        // has to be merged again, and for the same reason (REQ-O-009):
+        // a raw span and a mapped one covering the same credential must
+        // read as one marker, not two.
+        redact::merge_spans(spans)
+    }
+
+    /// Run one of the two **in-flight** detectors over the raw region and
+    /// over the views that can be asked, and take the earliest answer.
+    ///
+    /// Both callers are *boundaries*: a smaller offset withholds more, so
+    /// the minimum is the safe combination, and a view that sees nothing
+    /// contributes nothing rather than a veto.
+    ///
+    /// **Not every view, and the exclusion carries its own reasoning at
+    /// [`View::leaves_sequence_residue`].** In short: these two ask what
+    /// bytes that have *not arrived* might do, and they answer with a
+    /// test that treats every control byte as a terminator — so the one
+    /// view that deletes a sequence's terminator while keeping its body
+    /// turns a finished window title into a credential still arriving.
+    /// `find_spans` has no such dependency and reads every view.
+    ///
+    /// [`View::leaves_sequence_residue`]: normalise::View::leaves_sequence_residue
+    fn earliest_boundary(
+        &self,
+        region: &[u8],
+        region_start: u64,
+        detect: impl Fn(&[u8], u64) -> Option<u64>,
+    ) -> Option<u64> {
+        let mut earliest = detect(region, region_start);
+        for view in normalise::emitted_views(region, region_start) {
+            if view.view.leaves_sequence_residue() {
+                continue;
+            }
+            // The detector is handed view-space offsets (`0` as the
+            // region start) and its answer is mapped back, exactly as a
+            // span is: nothing outside this module ever sees a view
+            // offset.
+            if let Some(i) = detect(view.bytes(), 0) {
+                let raw = view.raw_offset(i as usize);
+                earliest = Some(earliest.map_or(raw, |e| e.min(raw)));
+            }
+        }
+        earliest
     }
 
     /// Run the pipeline over a snapshot. Pure: no locks, no I/O.
@@ -272,7 +365,7 @@ impl OutputProcessor {
         }
 
         let spans = if opts.redact {
-            redact::find_spans(&self.rules, w.window, w.window_start)
+            self.all_spans(w.window, w.window_start)
         } else {
             Vec::new()
         };
@@ -327,8 +420,9 @@ impl OutputProcessor {
         // and is what REQ-O-005 already licenses.
         if opts.redact && window_end < w.head {
             let unresolved = self
-                .index
-                .unresolved_from(&self.rules, w.window, w.window_start)
+                .earliest_boundary(w.window, w.window_start, |region, start| {
+                    self.index.unresolved_from(&self.rules, region, start)
+                })
                 .filter(|u| !spans.iter().any(|s| s.start <= *u && s.end >= window_end));
             if let Some(u) = unresolved {
                 safety_end = safety_end.min(u);
@@ -1335,5 +1429,457 @@ mod tests {
         );
         assert_eq!(r.output, format!("t={GITHUB}\n"));
         assert!(r.redactions.is_empty());
+    }
+
+    // ------------------------------------- GH #125: the normalisation seam
+
+    /// The token as the issue plants it: a colour reset 15 characters in,
+    /// which is what any program that highlights part of a line emits.
+    fn painted(token: &str, tail: &str) -> Vec<u8> {
+        format!("{}\x1b[0m{}{tail}", &token[..15], &token[15..]).into_bytes()
+    }
+
+    /// **The premise every row below rests on, asserted once rather than
+    /// assumed eight times.** The defect is not that the rule is weak: it
+    /// is that the bytes redaction was shown are not the bytes the caller
+    /// receives. So the raw form really must not match, and the
+    /// normalised form really must — otherwise the rows that follow are
+    /// about something else and would pass against a fix that does
+    /// nothing.
+    #[test]
+    fn the_raw_bytes_do_not_match_and_the_bytes_the_caller_gets_do() {
+        let p = processor();
+        let buf = painted(GITHUB, "\n");
+        assert!(
+            redact::find_spans(&p.rules, &buf, 0).is_empty(),
+            "the planted escape must break the rule's anchor in the raw window"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&ansi::strip(&buf)),
+            format!("{GITHUB}\n"),
+            "and stripping must put the credential back together"
+        );
+    }
+
+    /// **GH #125, the issue's unit-level reproduction, as a permanent
+    /// row.** Redaction searched `w.window` — the raw buffer — while
+    /// `AnsiStripper` ran later inside `render`, so the escape defeated
+    /// the match and was then removed on the way out: a complete, valid
+    /// 40-character credential, on the default read path, reported as
+    /// `redactions: {}`.
+    #[test]
+    fn an_escape_inside_a_token_is_redacted_rather_than_stripped_back_together() {
+        let r = read(&painted(GITHUB, "\n"), 0, 32 * 1024);
+        assert!(!r.output.contains(GITHUB), "reassembled: {}", r.output);
+        assert_eq!(r.output, "[REDACTED:github]\n");
+        assert_eq!(
+            r.redactions.get("github"),
+            Some(&1),
+            "and the caller is told, which `redactions: {{}}` did not"
+        );
+    }
+
+    /// **Two credentials in one read, found by two different passes.**
+    /// The painted one matches only in a view; the clean one only ever
+    /// needed the raw bytes — and the raw pass runs first, so the union
+    /// arrives with a later span in front of an earlier one.
+    ///
+    /// `render` and the `read_end` advance are both **single forward
+    /// passes** over spans they are promised are sorted and
+    /// non-overlapping. That promise used to come free, because
+    /// `find_spans` sorts what it finds and there was one call; a union of
+    /// several calls has to be merged again to keep it. Dropping that
+    /// merge does not fail loudly — it walks past the out-of-order span
+    /// and emits the credential it covers byte for byte, which is the
+    /// original defect wearing a different hat. No other row here has
+    /// both shapes of secret in one window, so no other row notices, and
+    /// removing `merge_spans` from `all_spans` passed the whole 932-test
+    /// suite before this was written.
+    #[test]
+    fn two_secrets_found_by_different_passes_are_both_replaced() {
+        const AWS: &str = "AKIAIOSFODNN7EXAMPLE";
+        let mut buf = painted(GITHUB, " then ");
+        buf.extend_from_slice(format!("{AWS}\n").as_bytes());
+        let p = processor();
+        // The premise: one is invisible to the raw pass and the other is
+        // all the raw pass ever needed, so the union really is assembled
+        // out of order.
+        let raw_spans = redact::find_spans(&p.rules, &buf, 0);
+        assert_eq!(raw_spans.len(), 1, "only the clean token matches raw");
+        assert!(raw_spans[0].start > 0, "and it is the *later* of the two");
+
+        let r = read(&buf, 0, 32 * 1024);
+        assert!(!r.output.contains(&GITHUB[..15]), "leaked: {}", r.output);
+        assert!(!r.output.contains(AWS), "leaked: {}", r.output);
+        assert_eq!(r.output, "[REDACTED:github] then [REDACTED:aws]\n");
+        assert_eq!(r.redactions.get("github"), Some(&1));
+        assert_eq!(r.redactions.get("aws"), Some(&1));
+    }
+
+    /// The same planted escape under each `text_encoding`. Encoding runs
+    /// *after* redaction, so a fix that matched only the stripped stream
+    /// would pass `utf8` and `base64` and still hand the credential to a
+    /// `lossy_printable` caller — these are the same bytes reached by
+    /// three different last steps, and the seam is in every one of them.
+    #[test]
+    fn every_text_encoding_redacts_through_a_planted_escape() {
+        use base64::Engine as _;
+        let buf = painted(GITHUB, "\n");
+        let p = processor();
+        for encoding in [
+            TextEncoding::Utf8,
+            TextEncoding::Base64,
+            TextEncoding::LossyPrintable,
+        ] {
+            let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+            let r = p.process(
+                &w,
+                &ReadOptions {
+                    text_encoding: encoding,
+                    ..Default::default()
+                },
+            );
+            let text = match encoding {
+                TextEncoding::Base64 => String::from_utf8(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(r.output.as_bytes())
+                        .expect("base64 round-trips"),
+                )
+                .expect("the redacted stream is UTF-8"),
+                _ => r.output.clone(),
+            };
+            assert!(
+                !text.contains(GITHUB),
+                "{} reassembled the credential: {text}",
+                encoding.as_str()
+            );
+            assert_eq!(text, "[REDACTED:github]\n", "{}", encoding.as_str());
+            assert_eq!(
+                r.redactions.get("github"),
+                Some(&1),
+                "{}",
+                encoding.as_str()
+            );
+        }
+    }
+
+    /// `ansi: raw` is the other half of the same seam, and the assertion
+    /// has to be written differently to mean anything.
+    ///
+    /// A raw payload still carries the escape, so `contains(GITHUB)` is
+    /// **false against the unfixed code** — the credential is all there,
+    /// split by four bytes that vanish the moment the agent pipes the
+    /// stream to anything that renders it. The halves are therefore what
+    /// this asserts on. `ansi: raw` is a display knob, not an audited
+    /// escape hatch; `redact: false` is the hatch, and it is the row
+    /// below.
+    #[test]
+    fn raw_mode_redacts_the_credential_a_terminal_would_reassemble() {
+        let buf = painted(GITHUB, "\n");
+        let p = processor();
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        let r = p.process(
+            &w,
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !r.output.contains(&GITHUB[..15]),
+            "the first half survived: {:?}",
+            r.output
+        );
+        assert!(
+            !r.output.contains(&GITHUB[15..]),
+            "the second half survived: {:?}",
+            r.output
+        );
+        assert_eq!(
+            r.output, "[REDACTED:github]\n",
+            "one marker covers the token and the escape planted inside it"
+        );
+        assert_eq!(r.redactions.get("github"), Some(&1));
+    }
+
+    /// The sibling one step further down the pipeline: two C0 bytes the
+    /// **stripper keeps** and `lossy_printable` drops. Nothing about the
+    /// mechanism is specific to `\x1b`, so a fix aimed at escape
+    /// sequences alone would leave `read_output(text_encoding:
+    /// "lossy_printable")` reassembling credentials exactly as before.
+    #[test]
+    fn a_control_byte_only_the_encoder_drops_cannot_reassemble_a_token_either() {
+        let p = processor();
+        for planted in ['\u{8}', '\u{7f}'] {
+            let buf = format!("{}{planted}{}\n", &GITHUB[..15], &GITHUB[15..]).into_bytes();
+            // Both halves of the premise, per byte: the raw form does not
+            // match, and stripping alone does not repair it either — so
+            // this row cannot pass for the reason the row above does.
+            assert!(
+                redact::find_spans(&p.rules, &buf, 0).is_empty(),
+                "{planted:?} must break the anchor"
+            );
+            assert_eq!(
+                ansi::strip(&buf),
+                buf,
+                "{planted:?} survives the stripper; only the encoder drops it"
+            );
+
+            let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+            let r = p.process(
+                &w,
+                &ReadOptions {
+                    text_encoding: TextEncoding::LossyPrintable,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !r.output.contains(GITHUB),
+                "{planted:?} was dropped around an intact credential: {}",
+                r.output
+            );
+            assert_eq!(r.output, "[REDACTED:github]\n", "{planted:?}");
+        }
+    }
+
+    /// **The boundary row: a planted escape *and* a read boundary inside
+    /// the token.** Redaction, stripping and pagination are each tested
+    /// alone above and elsewhere; this is the seam.
+    ///
+    /// The cap at 12 lands inside the token, so `process` must advance
+    /// the continuation cursor past the *whole* span — which now includes
+    /// the four bytes of the escape — or the next read starts inside the
+    /// credential with a lookbehind that cannot reach its anchor.
+    #[test]
+    fn neither_half_of_a_split_read_leaks_through_a_planted_escape() {
+        let mut buf = b"prefix ".to_vec();
+        buf.extend_from_slice(&painted(GITHUB, " suffix"));
+        let first = read(&buf, 0, 12);
+        let second = read(&buf, first.cursor, 32 * 1024);
+        for part in [&first.output, &second.output] {
+            assert!(!part.contains(&GITHUB[..15]), "leaked: {part}");
+            assert!(!part.contains(&GITHUB[15..]), "leaked: {part}");
+        }
+        assert_eq!(first.output, "prefix [REDACTED:github]");
+        assert_eq!(
+            first.cursor,
+            (7 + GITHUB.len() + 4) as u64,
+            "the cursor must clear the token *and* the escape inside it"
+        );
+        assert_eq!(second.output, " suffix");
+        assert!(second.redactions.is_empty());
+    }
+
+    /// Paging the same buffer in 8-byte requests: every cursor is a raw
+    /// buffer offset, the pages tile the buffer exactly, and the
+    /// concatenation carries one marker and no half-credential.
+    ///
+    /// The tiling is the half that pins the mapping. A fix that reported
+    /// spans in *normalised* offsets would still redact — and would then
+    /// hand back a cursor short of, or past, the bytes it consumed, so
+    /// paging would repeat or skip output with nothing to show for it.
+    #[test]
+    fn paging_over_a_planted_escape_keeps_every_cursor_on_the_raw_stream() {
+        let mut buf = b"head ".to_vec();
+        buf.extend_from_slice(&painted(GITHUB, " tail\n"));
+        let mut cursor = 0u64;
+        let mut seen = String::new();
+        let mut pages = 0usize;
+        while cursor < buf.len() as u64 {
+            let r = read(&buf, cursor, 8);
+            assert!(r.cursor > cursor, "page {pages} made no progress");
+            assert_eq!(
+                r.bytes_returned as u64,
+                r.cursor - cursor,
+                "bytes_returned counts raw bytes consumed, page {pages}"
+            );
+            seen.push_str(&r.output);
+            cursor = r.cursor;
+            pages += 1;
+            assert!(pages < 64, "paging did not terminate");
+        }
+        assert_eq!(
+            cursor,
+            buf.len() as u64,
+            "the final cursor lands exactly on head"
+        );
+        assert_eq!(seen, "head [REDACTED:github] tail\n");
+    }
+
+    /// **A window that does not start at zero, which is the only thing
+    /// that tests the map's base.**
+    ///
+    /// Every other row here fits inside `lookbehind_bytes`, so
+    /// `window_start` is 0 and a view offset and an absolute offset are
+    /// the same number — a mapping that never added the window's own
+    /// start would land on exactly the right byte in all of them and
+    /// leak here. The padding is the whole fixture: it puts the painted
+    /// token past the lookbehind so a read of it opens a window several
+    /// hundred bytes into the buffer.
+    #[test]
+    fn a_painted_token_far_into_the_buffer_maps_back_to_absolute_offsets() {
+        let p = processor();
+        let mut buf = "filler line\n".repeat(200).into_bytes();
+        let at = buf.len() as u64;
+        assert!(
+            at > p.limits.lookbehind_bytes as u64,
+            "the arrangement must really start its window past zero"
+        );
+        buf.extend_from_slice(&painted(GITHUB, " tail\n"));
+
+        let r = read(&buf, at, 32 * 1024);
+        assert!(!r.output.contains(&GITHUB[..15]), "leaked: {}", r.output);
+        assert_eq!(r.output, "[REDACTED:github] tail\n");
+        assert_eq!(r.cursor, buf.len() as u64);
+        assert_eq!(
+            r.bytes_returned as u64,
+            buf.len() as u64 - at,
+            "bytes_returned still counts raw bytes from the request's start"
+        );
+    }
+
+    /// **The holdback, with the escape already inside the arriving
+    /// token.** `earliest_partial` demands that every byte after the
+    /// prefix could still belong to the value, and `\x1b` could not, so
+    /// by the raw region's account nothing was in flight: the read ran to
+    /// `head` and emitted the arrived half of the credential in the
+    /// clear, stripped clean.
+    ///
+    /// The second arrangement is the control. A holdback that engaged
+    /// unconditionally would satisfy the first on its own, so the same
+    /// buffer with the rest of the token **and a delimiter** must release
+    /// everything, as one marker — the same pair, and the same reason for
+    /// the delimiter, as
+    /// [`the_boundary_advances_once_the_token_completes`].
+    #[test]
+    fn a_token_arriving_with_an_escape_already_inside_it_is_still_in_flight() {
+        // 39 characters of a 40-character rule, painted, and nothing
+        // after them: still arriving.
+        let arriving =
+            format!("line one\n{}\x1b[0m{}", &GITHUB[..15], &GITHUB[15..39]).into_bytes();
+        let r = read(&arriving, 0, 32 * 1024);
+        assert!(r.held_back, "an in-flight token must stop the read");
+        assert_eq!(r.output, "line one\n");
+        assert_eq!(r.cursor, 9, "the boundary is the partial's first byte");
+        assert_eq!(r.next_cursor, Some(9));
+        assert!(!r.truncated_for_size, "this is a holdback, not a size cap");
+
+        let mut complete = arriving.clone();
+        complete.extend_from_slice(&GITHUB.as_bytes()[39..]);
+        complete.push(b'\n');
+        let r = read(&complete, 0, 32 * 1024);
+        assert!(!r.held_back, "the whole token has landed; release it");
+        assert_eq!(r.output, "line one\n[REDACTED:github]\n");
+        assert_eq!(r.cursor, complete.len() as u64);
+    }
+
+    /// The in-flight half of the `lossy_printable` sibling: a token still
+    /// arriving with a **backspace** inside it.
+    ///
+    /// Only that encoding joins this one — the stripper keeps `\x08` and
+    /// the raw bytes obviously do — so this is the row that pins which
+    /// view the in-flight detectors read. It is also the row that fails
+    /// if `emitted_views` ever returns `Printable` as the survivor when
+    /// the two `lossy_printable` views coincide, because the in-flight
+    /// detectors are barred from that one and would then see no view at
+    /// all.
+    #[test]
+    fn a_token_arriving_with_a_backspace_inside_it_is_still_in_flight() {
+        let arriving = format!("line one\n{}\u{8}{}", &GITHUB[..15], &GITHUB[15..35]).into_bytes();
+        let r = read(&arriving, 0, 32 * 1024);
+        assert!(r.held_back, "an in-flight token must stop the read");
+        assert_eq!(r.output, "line one\n");
+        assert_eq!(r.cursor, 9, "the boundary is the partial's first byte");
+
+        let mut complete = arriving.clone();
+        complete.extend_from_slice(&GITHUB.as_bytes()[35..]);
+        complete.push(b'\n');
+        let r = read(&complete, 0, 32 * 1024);
+        assert!(!r.held_back, "the whole token has landed; release it");
+        assert_eq!(r.redactions.get("github"), Some(&1));
+    }
+
+    /// **The other direction, which the first version of this fix got
+    /// wrong.** A *terminated* window title carrying an indexed secret
+    /// prefix must not stop the read.
+    ///
+    /// Asking the `Printable` view whether a secret is in flight does
+    /// stop it: that view deletes the `\x1b` and the BEL and keeps
+    /// `]0;SECRET_DONE`, which to a continuation test whose whole rule is
+    /// *printable and not a space* reads as a value still accumulating.
+    /// Nothing here is contrived — it is `screen.rs`'s own fixture, and
+    /// the read stopped four bytes into the sequence.
+    #[test]
+    fn a_terminated_window_title_is_not_a_credential_still_arriving() {
+        let p = processor();
+        assert!(
+            p.index
+                .prefixes_for(&p.rules, "generic-secret-assignment")
+                .contains(&b"secret".to_vec()),
+            "the premise: `secret` is an indexed prefix, so the title really \
+             does offer the scanner a candidate"
+        );
+        let buf = b"harmless header line\x1b[2;1Hdone\x1b]0;SECRET_DONE\x07".to_vec();
+        let r = read(&buf, 0, 32 * 1024);
+        assert!(!r.held_back, "a finished title is not a secret in flight");
+        assert_eq!(r.cursor, buf.len() as u64, "and the read reaches head");
+        assert_eq!(r.output, "harmless header linedone");
+    }
+
+    /// The audited opt-out is unchanged: `redact: false` disables the
+    /// redaction *and* the holdback, and returns the planted bytes
+    /// exactly as the child wrote them (§4.1).
+    #[test]
+    fn the_audited_opt_out_still_returns_the_planted_bytes_verbatim() {
+        let buf = painted(GITHUB, "\n");
+        let p = processor();
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        let r = p.process(
+            &w,
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                redact: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.output, String::from_utf8_lossy(&buf));
+        assert!(r.redactions.is_empty());
+        assert!(!r.held_back);
+        assert_eq!(r.cursor, buf.len() as u64);
+    }
+
+    /// A credential inside an OSC title is **absent from the stripped
+    /// view**, because the stripper consumes a sequence's payload whole —
+    /// and `ansi: raw` puts those bytes on the wire regardless. So the
+    /// span set is a *union* over the streams a read can emit, never a
+    /// move from the raw bytes to the normalised ones: a fix that
+    /// replaced `find_spans(window)` with `find_spans(stripped)` would
+    /// have traded this case for the one the issue reports, and this row
+    /// is what fails when it does.
+    ///
+    /// **What it does *not* pin, said plainly.** Deleting the raw pass
+    /// alone leaves this one green, because the `lossy_printable` view
+    /// keeps an escape sequence's body and carries the token too. That
+    /// deletion is caught many times over by the rows that predate this
+    /// work — for a buffer of plain text there is no view at all and
+    /// nothing is redacted — so it needs no row of its own here.
+    #[test]
+    fn a_secret_only_the_raw_stream_carries_is_still_redacted() {
+        let buf = format!("\x1b]0;deploy {GITHUB}\x07$ ").into_bytes();
+        let p = processor();
+        assert!(
+            !ansi::strip(&buf).windows(4).any(|w| w == b"ghp_"),
+            "the stripped view really does not carry it"
+        );
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        let r = p.process(
+            &w,
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                ..Default::default()
+            },
+        );
+        assert!(!r.output.contains(GITHUB), "leaked: {}", r.output);
+        assert_eq!(r.output, "\u{1b}]0;deploy [REDACTED:github]\u{7}$ ");
     }
 }

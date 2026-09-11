@@ -49,6 +49,18 @@ is cut, named and published is in
 
 ### Fixed
 
+- `read_output` no longer reassembles a credential it declined to redact.
+  Redaction searched the raw ring buffer while ANSI stripping ran afterwards,
+  so a colour reset planted inside a token broke the rule's anchor at match
+  time and was then removed on the way out: a complete, valid credential
+  reached the agent on the **default** read path, reported as
+  `redactions: {}`. Matching now runs over every byte stream a read can emit —
+  raw, stripped, and either of those under `lossy_printable`, which drops the
+  C0 controls the stripper keeps — and maps each match back to raw buffer
+  offsets, so cursors, `bytes_returned` and the holdback are unchanged. The
+  same correction applies to the in-flight holdback, which had declined to
+  call a painted token "still arriving" for the same reason. `redact: false`
+  and `--raw` are unaffected ([#125]).
 - Autofill no longer misses a credential prompt drawn before its listener was
   armed; the listener replays the current echo-off episode once, de-duplicated
   against a delivered edge, which also closes the lagged-receiver case
@@ -557,3 +569,4 @@ residuals that are known and accepted.
 [#105]: https://github.com/Sertelegger/holdfast/issues/105
 [#106]: https://github.com/Sertelegger/holdfast/issues/106
 [#112]: https://github.com/Sertelegger/holdfast/issues/112
+[#125]: https://github.com/Sertelegger/holdfast/issues/125
