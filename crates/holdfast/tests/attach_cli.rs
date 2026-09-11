@@ -1611,9 +1611,11 @@ async fn watching_an_already_exited_session_ends_instead_of_hanging() {
     // A first-contact bug: §5.5.1 keeps an exited session addressable
     // precisely so an operator can go and look at it, and looking at it
     // used to be a hang. `SessionEvent::Exited` is a one-shot edge that
-    // had already fired, and the output broadcast never closes because
-    // nothing ever removes a session from the registry — so the client
-    // waited on a channel nothing was ever going to end.
+    // had already fired, and the output broadcast never closes while the
+    // record is retained — so the client waited on a channel nothing was
+    // ever going to end. (An earlier revision of this line said nothing
+    // ever removes a session from the registry; GH #129 bounded that,
+    // and the hang was never about the bound.)
     //
     // `Term::wait_exit` fails on a deadline rather than blocking, so the
     // defect this row names is a **red row and not a hung CI job**.

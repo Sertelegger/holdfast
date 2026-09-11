@@ -49,6 +49,16 @@ is cut, named and published is in
 
 ### Fixed
 
+- A session that has finished no longer keeps the writer thread that only a
+  running child needs. The registry now holds live sessions and completed
+  records separately, and retiring a record drops the sending half of its write
+  queue so the thread leaves. Retained history is unchanged — `list_sessions`,
+  `status`, `read_output`, `holdfast logs`, the session resources and an attach
+  arriving after the end all answer exactly as before — but it is now bounded
+  at **64 records and 16 MiB of output**, oldest first, where it was previously
+  unbounded in both. Measured before the fix with a live limit of 1 and 24
+  further sessions created and completed: 24 parked threads and 24 MiB
+  retained; after, none and 16 MiB ([#129]).
 - Autofill no longer misses a credential prompt drawn before its listener was
   armed; the listener replays the current echo-off episode once, de-duplicated
   against a delivered edge, which also closes the lagged-receiver case
@@ -557,3 +567,4 @@ residuals that are known and accepted.
 [#105]: https://github.com/Sertelegger/holdfast/issues/105
 [#106]: https://github.com/Sertelegger/holdfast/issues/106
 [#112]: https://github.com/Sertelegger/holdfast/issues/112
+[#129]: https://github.com/Sertelegger/holdfast/issues/129

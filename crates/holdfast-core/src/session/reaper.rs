@@ -37,6 +37,15 @@
 //! reap is not this milestone's behaviour and no test asserts it.**
 //! §17.1's `Dead(reason) → (removed)` row has no implementer in v0.1.0.
 //!
+//! **What GH #129 changed, and what it did not.** §5.5.1's *"until the
+//! registry cleans up the record"* now has a bound behind it: the
+//! registry keeps a fixed number of completed records and a fixed number
+//! of their bytes, and evicts the oldest past either. That is still not
+//! this module's doing — the reaper signals and nothing else — and it
+//! is not §16.7's reading either, because eviction is a function of how
+//! many sessions have finished *since*, not of the reap. Every sentence
+//! above holds for every record the registry still has.
+//!
 //! **Surfaced, not decided:** whether the reaper should latch
 //! `Dead("reaped")`. §16.7 step 3 reads `Running → Exited(code) →
 //! Dead("reaped")` and §17.1 closes the `Dead` set at `spawn_failed`,
@@ -143,7 +152,20 @@ impl Reaper {
         let mut pending = self.pending.lock();
         let mut newly_reaped = 0;
 
-        for session in self.registry.all() {
+        let sessions = self.registry.all();
+        // **A session can now leave the registry entirely** (GH #129:
+        // completed records are bounded, so the oldest are evicted), and
+        // an id that is signalled and then evicted inside one grace
+        // would otherwise sit in `pending` for the life of the daemon —
+        // the same per-session residue this sweep's own neighbour was
+        // opened to remove. Recomputed from the registry rather than
+        // removed at the eviction site, because the registry has no
+        // business knowing the reaper exists.
+        let known: std::collections::HashSet<&str> =
+            sessions.iter().map(|s| s.id.as_str()).collect();
+        pending.retain(|id, _| known.contains(id.as_str()));
+
+        for session in &sessions {
             // A session that has already exited is not reaped — it is
             // *done*. Its registry entry stays either way (§5.5.1), and
             // signalling a corpse would put it in the count.
@@ -363,6 +385,79 @@ mod tests {
         );
         assert!(!reaper.has_pending_escalation());
         assert_eq!(reaper.next_tick(), SCAN_INTERVAL);
+    }
+
+    /// A session that is signalled and then **evicted** must not leave
+    /// its id behind in the escalation map (GH #129).
+    ///
+    /// Before the completed set had a bound, an id in `pending` was
+    /// always an id the next sweep would see and clear. Now it is not:
+    /// a session can be SIGTERMed, die, be retired and then be pushed
+    /// out of the registry by later sessions before the next sweep runs
+    /// — and the entry it leaves behind is the same per-session residue
+    /// that issue was opened about, one map over.
+    ///
+    /// **The escalation matters as much as the leak.** A stale entry is
+    /// not inert: `has_pending_escalation` is what shortens the loop
+    /// from the 30-second scan interval to the five-second grace, so one
+    /// evicted session would make the daemon tick six times as often for
+    /// the rest of its life.
+    #[test]
+    fn an_evicted_session_does_not_stay_in_the_escalation_map() {
+        let reg = Arc::new(SessionRegistry::with_retention(
+            2,
+            crate::session::Retention {
+                max_records: 1,
+                max_bytes: u64::MAX,
+            },
+        ));
+        let clock = Clock::manual(Instant::now());
+        // Traps SIGTERM, so the sweep below puts it in `pending` rather
+        // than finishing it outright.
+        let trapped = Session::new(
+            "sess_evicted".into(),
+            None,
+            "trap".into(),
+            vec![],
+            Arc::new(MockPty::ignoring_terminate()),
+            SessionConfig {
+                idle_timeout_secs: 60,
+                clock: clock.clone(),
+                ..SessionConfig::default()
+            },
+        );
+        reg.insert(Arc::clone(&trapped)).unwrap();
+        let reaper = Reaper::new(Arc::clone(&reg), clock.clone());
+
+        clock.advance(Duration::from_secs(61));
+        assert_eq!(reaper.scan_once(), 1);
+        assert!(
+            reaper.has_pending_escalation(),
+            "the fixture sent no SIGTERM"
+        );
+
+        // It dies of something else, and two later sessions push it out
+        // of the registry before the grace is up.
+        trapped.signal(Signal::Kill).unwrap();
+        assert!(!trapped.is_alive());
+        for i in 0..2 {
+            let s = session(&format!("sess_after{i}"), 0, clock.clone());
+            reg.insert(Arc::clone(&s)).unwrap();
+            s.signal(Signal::Kill).unwrap();
+        }
+        reg.retire_exited();
+        assert!(
+            reg.get("sess_evicted").is_err(),
+            "the fixture did not actually evict the signalled session"
+        );
+
+        reaper.scan_once();
+        assert!(
+            !reaper.has_pending_escalation(),
+            "an evicted session stayed in the escalation map, so the daemon tick \
+             runs on the five-second grace for the rest of its life and the entry \
+             is never freed"
+        );
     }
 
     #[test]
