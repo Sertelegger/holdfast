@@ -499,11 +499,12 @@ async fn attaching_to_an_already_exited_session_is_told_and_torn_down() {
     // arrived after it.** The row above proves the *state string* is
     // right and then abandons the connection; this one asks what happens
     // next, which used to be: nothing, ever. The output broadcast cannot
-    // close either — §5.5.1 retains exited sessions for the daemon's
-    // lifetime and `SessionRegistry::remove` has no caller anywhere in
-    // the repo — so `forward_output` parked forever and
+    // close either — §5.5.1 retains exited sessions, and the `Session`
+    // holds its own `Sender` — so `forward_output` parked forever and
     // `holdfast watch <exited-session>` hung until the user found
-    // Ctrl-C.
+    // Ctrl-C. (This line used to add that nothing ever removes a session
+    // from the registry. GH #129 bounded retention; the hang was never
+    // about the bound, and a connection holds its own `Arc<Session>`.)
     //
     // The sequence asserted is §7.5's, unchanged: the same
     // flush → `SessionExited` → `Detached` → close a client attached

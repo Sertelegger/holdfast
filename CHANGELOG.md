@@ -73,6 +73,23 @@ is cut, named and published is in
   credential straddling a read boundary with an escape inside it is still
   released half-emitted ([#142]). `redact: false` and `--raw` are byte-identical
   to before ([#125]).
+  **This closes the matching side of #125 and not every class of the
+  defect.** The *withholding* side — a credential still arriving with an
+  escape inside it is released half-emitted — is [#142] and is open; [#138]
+  (spans judged over the window while a sub-range is emitted) and [#139]
+  (8-bit C1 introducers that Holdfast's own emulator interprets and the
+  stripper does not) are open on the range and grammar axes. Redaction is not
+  closed as a class.
+- A session that has finished no longer keeps the writer thread that only a
+  running child needs. The registry now holds live sessions and completed
+  records separately, and retiring a record drops the sending half of its write
+  queue so the thread leaves. Retained history is unchanged — `list_sessions`,
+  `status`, `read_output`, `holdfast logs`, the session resources and an attach
+  arriving after the end all answer exactly as before — but it is now bounded
+  at **64 records and 16 MiB of output**, oldest first, where it was previously
+  unbounded in both. Measured before the fix with a live limit of 1 and 24
+  further sessions created and completed: 24 parked threads and 24 MiB
+  retained; after, none and 16 MiB ([#129]).
 - Autofill no longer misses a credential prompt drawn before its listener was
   armed; the listener replays the current echo-off episode once, de-duplicated
   against a delivered edge, which also closes the lagged-receiver case
@@ -582,4 +599,7 @@ residuals that are known and accepted.
 [#106]: https://github.com/Sertelegger/holdfast/issues/106
 [#112]: https://github.com/Sertelegger/holdfast/issues/112
 [#125]: https://github.com/Sertelegger/holdfast/issues/125
+[#129]: https://github.com/Sertelegger/holdfast/issues/129
+[#138]: https://github.com/Sertelegger/holdfast/issues/138
+[#139]: https://github.com/Sertelegger/holdfast/issues/139
 [#142]: https://github.com/Sertelegger/holdfast/issues/142

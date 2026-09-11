@@ -4,7 +4,7 @@ pub mod reaper;
 pub mod registry;
 pub mod wait;
 pub use reaper::Reaper;
-pub use registry::SessionRegistry;
+pub use registry::{Retention, SessionRegistry};
 
 use crate::attach::secret::SecretBytes;
 use crate::buffer::{BufferRead, OutputBuffer};
@@ -320,7 +320,23 @@ pub struct Session {
     /// and §7.5's last-writer-wins is FIFO through it and nothing more:
     /// no arbitration, no lock, and no ordering guarantee between two
     /// clients beyond the order their frames arrived.
-    write_tx: tokio::sync::mpsc::Sender<WriteRequest>,
+    /// **Behind a `Mutex` so it can be *replaced*, which is the whole of
+    /// [`Session::retire`]** (GH #129). The writer thread owns the
+    /// receiving half and parks in `blocking_recv`; the only thing that
+    /// can wake it for good is the last sender going away, and this
+    /// field is the sender a retained session would otherwise hold for
+    /// the life of the daemon.
+    ///
+    /// Uncontended on every path that reads it — `write_queue()` clones
+    /// under it and returns — so the cost is one atomic exchange per
+    /// queued frame, against a write that is about to cross a PTY.
+    write_tx: Mutex<tokio::sync::mpsc::Sender<WriteRequest>>,
+    /// The §4.3 writer thread's join handle — see [`Session::new`] for
+    /// why it is kept, and [`Session::writer_thread_finished`] for what
+    /// it answers. A `OnceLock` because the thread is spawned *after*
+    /// the `Arc<Session>` it downgrades exists, so it cannot be set in
+    /// the struct literal.
+    writer: std::sync::OnceLock<std::thread::JoinHandle<()>>,
     last_activity_ms: Arc<AtomicI64>,
     /// Unix seconds at which the exit was *first observed*, 0 while alive.
     /// Observation time, not the child's true death instant: nothing in
@@ -737,7 +753,8 @@ impl Session {
             secret_episode: Arc::clone(&secret_episode),
             reader_finished: Arc::clone(&reader_finished),
             writes_performed: Arc::clone(&writes_performed),
-            write_tx,
+            write_tx: Mutex::new(write_tx),
+            writer: std::sync::OnceLock::new(),
             last_activity_ms: Arc::clone(&last_activity_ms),
             exited_at_secs: Arc::new(AtomicI64::new(0)),
             idle_deadline_ms: Arc::clone(&idle_deadline_ms),
@@ -1149,7 +1166,7 @@ impl Session {
         // fails), which is what stops a `Sender` clone outliving its
         // session from parking this thread forever.
         let weak_session = Arc::downgrade(&session);
-        std::thread::spawn(move || {
+        let writer = std::thread::spawn(move || {
             while let Some(req) = write_rx.blocking_recv() {
                 let Some(session) = weak_session.upgrade() else {
                     break;
@@ -1192,6 +1209,22 @@ impl Session {
                 }
             }
         });
+        // **Kept rather than detached, and the handle is the observable**
+        // (GH #129). `JoinHandle::is_finished` is the standard library's
+        // own answer to *"has this thread left its closure"*, which is
+        // exactly the fact a retirement has to establish and the one
+        // fact nothing else in this struct can report: the thread owns
+        // the `Receiver`, so a `Sender` clone taken to probe the channel
+        // is itself what would keep it parked.
+        //
+        // **Per session and not a process-wide gauge**, which is what
+        // this was first written as. A `static AtomicUsize` is perturbed
+        // by every other session in the process, so a test asserting on
+        // it fails whenever it shares a process with another test that
+        // holds a session — measured at 20 failures in 20 runs under
+        // `taskset -c 0,1` with `--test-threads 8`, against a tree with
+        // no defect in it. Per session, there is nothing to share.
+        let _ = session.writer.set(writer);
 
         // Typed, not exported: rc files run after the environment is read
         // and would clobber an inherited PS1 (§8.5). A write failure here
@@ -1349,6 +1382,23 @@ impl Session {
     /// must wait for this, not for the child.
     pub fn reader_finished(&self) -> bool {
         self.reader_finished.load(Ordering::Acquire)
+    }
+
+    /// Whether this session's §4.3 writer thread has left its loop
+    /// (GH #129).
+    ///
+    /// `false` while the thread is parked on the queue **and** in the
+    /// instant between the struct being built and the thread being
+    /// spawned, which are the same answer: no writer has finished.
+    /// Becomes `true` once the last sender is gone — which is what
+    /// [`Session::retire`] arranges, and the only thing that arranges it
+    /// for a session the registry still holds.
+    ///
+    /// **Not the same fact as `is_alive() == false`.** A child can be
+    /// dead for as long as the registry takes to sweep while its writer
+    /// is still parked; that gap is the whole of what GH #129 measured.
+    pub fn writer_thread_finished(&self) -> bool {
+        self.writer.get().is_some_and(|h| h.is_finished())
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -1639,7 +1689,79 @@ impl Session {
     /// *producer* up — `send().await` on a bounded `mpsc` — and never the
     /// reader.
     pub fn write_queue(&self) -> tokio::sync::mpsc::Sender<WriteRequest> {
-        self.write_tx.clone()
+        self.write_tx.lock().clone()
+    }
+
+    /// Give up the machinery that only a **running** child needs, and
+    /// keep everything a finished one still answers (GH #129).
+    ///
+    /// ## What it gives up
+    ///
+    /// One thing: §4.3's write queue. The sending half held in this
+    /// struct is replaced by a sender whose receiver is already gone, so
+    /// (a) the writer thread sees every sender dropped, leaves
+    /// `blocking_recv` and ends, and (b) every clone handed out from
+    /// here on fails its `send` — which is precisely what already
+    /// happens to a session whose writer has left, and which every
+    /// caller of [`Session::write_queue`] already handles.
+    ///
+    /// **A replaced sender rather than an `Option`**, so the signature
+    /// of `write_queue()` does not change: its three production callers
+    /// each treat a failed `send` as "this session is over" and take the
+    /// same branch they would take for `None`, and an `Option` would buy
+    /// a second spelling of one answer at three call sites plus the
+    /// source guard that pins one of them.
+    ///
+    /// ## What it keeps, and why nothing observable is lost
+    ///
+    /// Everything. The backend stays (so `state`, `exit_code`,
+    /// `exited_at_secs`, `pid` and `detection` answer as before), the
+    /// ring buffer stays (so `read_output`, `holdfast logs`, the
+    /// `holdfast://session/{id}/buffer` resource and an attach client's
+    /// replay all still work), the command history, the screen, the
+    /// redaction tally and the broadcast channels stay.
+    ///
+    /// The one *behavioural* difference is the error a write to a
+    /// retired session reports, and it reports the same fact either way:
+    /// before, the frame was queued and the writer's
+    /// `Session::write_input` refused it with `SessionDied` because the
+    /// backend was dead; now the enqueue itself fails. There is no
+    /// ordering between the two that a caller can observe, because a
+    /// retired session is by construction one whose child has already
+    /// gone.
+    ///
+    /// **Only ever called on a session whose child is gone.**
+    /// [`SessionRegistry::retire_exited`] is the only caller and it
+    /// checks `is_alive()` first. Retiring a live session would take
+    /// away the queue two attach clients type into, which is the one
+    /// thing this must not do.
+    ///
+    /// Idempotent: a second call swaps one closed sender for another.
+    pub fn retire(&self) {
+        // Built here rather than kept as a lazy static: a session is
+        // retired once, and a shared closed channel would be a
+        // process-wide allocation held for the life of the binary to
+        // save one 64-byte allocation per finished session.
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        // The assignment drops the old sender **under the guard**, which
+        // is where it has to happen and costs nothing: dropping an
+        // `mpsc::Sender` decrements a count and may wake the receiver,
+        // and `write_queue` — the only other reader of this field —
+        // holds the same guard for one clone.
+        *self.write_tx.lock() = closed_tx;
+    }
+
+    /// Bytes of this session's output the process is still holding.
+    ///
+    /// The ring buffer's occupancy — `head - tail` — and **not its
+    /// capacity**: a session that printed one line costs one line, which
+    /// is what makes [`SessionRegistry`]'s byte budget bite on the
+    /// sessions that actually produced output rather than on the count
+    /// of sessions that have ever run.
+    pub fn retained_output_bytes(&self) -> u64 {
+        let buffer = self.buffer.lock();
+        buffer.head() - buffer.tail()
     }
 
     /// Where a read of this session must stop right now (§4.1):
@@ -2092,6 +2214,25 @@ impl Session {
     /// SIGTERM-then-SIGKILL state for exactly that reason.
     pub fn signal(&self, sig: Signal) -> Result<()> {
         self.backend.signal(sig)?;
+        self.touch();
+        Ok(())
+    }
+
+    /// Whether any process remains in the session, not merely its leader.
+    ///
+    /// Read-only, so it does **not** `touch()`: asking whether a tree is
+    /// still up is not activity on the session, and stamping it here
+    /// would let `terminate`'s own poll loop hold a session away from the
+    /// reaper. See [`Self::note_activity`] for the same distinction drawn
+    /// the other way.
+    pub fn tree_alive(&self) -> bool {
+        self.backend.tree_alive()
+    }
+
+    /// Signal every process group still in the session, including after
+    /// the leader has exited (GH #130).
+    pub fn signal_tree(&self, sig: Signal) -> Result<()> {
+        self.backend.signal_tree(sig)?;
         self.touch();
         Ok(())
     }
