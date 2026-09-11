@@ -1130,6 +1130,97 @@ async fn a_tool_call_crosses_the_socket_and_reaches_a_real_shell() {
     );
 }
 
+/// **GH #127's protocol skew, driven rather than reasoned about: a
+/// request with no `cancel_token` is answered by a 1.2 daemon, and one
+/// with a token is answered identically.**
+///
+/// §7.4.1 permits same-major different-minor skew, so 1.2 adding
+/// `Request.cancel_token` has to cost a 1.1 peer nothing. The argument is
+/// that `#[serde(default, skip_serializing_if = "Option::is_none")]` plus
+/// the absence of `deny_unknown_fields` makes the field optional in both
+/// directions — and an argument is not a test.
+///
+/// **`1.2.golden` does not cover this and cannot.** It records the
+/// encoded bytes of a *maximal* sample, every `Option` set, so it sees
+/// the field's presence, name and type. It never decodes a frame that
+/// omits the field, which is precisely the 1.1 peer's frame.
+///
+/// **Hand-built CBOR maps, not serialised structs**, for this file's
+/// stated reason: both peers are built from this crate, so a `Request`
+/// encoded through the derived impl and decoded through the same one
+/// agrees with itself whatever the shape is. The map below is literally
+/// `{id, method, params}` — the whole of protocol 1.1's request envelope
+/// — and the daemon has to parse it with its 1.2 decoder.
+///
+/// The second half is the pairing that stops the first being vacuous: a
+/// daemon that ignored `cancel_token` entirely would also answer the
+/// 1.1-shaped frame, so the row sends the 1.2-shaped one too and requires
+/// the same answer. Direction two — a 1.2 frame decoding against the 1.1
+/// *shape* — has no live 1.1 daemon to send to and is pinned in
+/// `protocol::method`'s own tests instead.
+#[tokio::test]
+async fn a_request_without_a_cancel_token_is_answered_by_a_1_2_daemon() {
+    let d = TestDaemon::start("skew").await;
+    let mut stream = d.raw().await;
+
+    // The handshake, through the typed helper: it is not this row's
+    // subject and is pinned on the wire two rows up.
+    let hs = Request::new(
+        0,
+        method::METHOD_HANDSHAKE,
+        &HandshakeParams {
+            protocol_major: handshake::PROTOCOL_MAJOR,
+            protocol_minor: handshake::PROTOCOL_MINOR,
+            client_kind: ClientKind::Cli,
+            client_version: "0.0.0".into(),
+        },
+    )
+    .unwrap();
+    frame::write_frame(&mut stream, &hs).await.unwrap();
+    let _: Response = frame::read_frame(&mut stream).await.unwrap();
+
+    // ---- protocol 1.1's request envelope, exactly: three keys.
+    let eleven = CborValue::Map(vec![
+        (CborValue::Text("id".into()), CborValue::Integer(1.into())),
+        (
+            CborValue::Text("method".into()),
+            CborValue::Text("tool/list_sessions".into()),
+        ),
+        (CborValue::Text("params".into()), CborValue::Map(Vec::new())),
+    ]);
+    frame::write_frame(&mut stream, &eleven).await.unwrap();
+    let resp: Response = frame::read_frame(&mut stream).await.unwrap();
+    assert_eq!(
+        resp.status, "ok",
+        "a 1.1 peer's request envelope — three keys, no `cancel_token` — was refused \
+         by a 1.2 daemon, so the added field is not optional after all: {}",
+        resp.details
+    );
+    assert_eq!(resp.id, 1, "the answer is for the request that was sent");
+
+    // ---- and 1.2's envelope, four keys, to the same handler.
+    let twelve = CborValue::Map(vec![
+        (CborValue::Text("id".into()), CborValue::Integer(2.into())),
+        (
+            CborValue::Text("method".into()),
+            CborValue::Text("tool/list_sessions".into()),
+        ),
+        (CborValue::Text("params".into()), CborValue::Map(Vec::new())),
+        (
+            CborValue::Text("cancel_token".into()),
+            CborValue::Text("a-token-nobody-will-cancel".into()),
+        ),
+    ]);
+    frame::write_frame(&mut stream, &twelve).await.unwrap();
+    let resp: Response = frame::read_frame(&mut stream).await.unwrap();
+    assert_eq!(
+        resp.status, "ok",
+        "a 1.2 peer's request envelope was refused: {}",
+        resp.details
+    );
+    assert_eq!(resp.id, 2);
+}
+
 /// **GH #127, end to end over a real socket: a cancel on a second
 /// connection ends an in-flight `request_secret_input`.**
 ///

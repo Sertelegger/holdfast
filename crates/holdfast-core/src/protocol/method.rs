@@ -433,6 +433,112 @@ mod tests {
         cursor: u64,
     }
 
+    /// **GH #127's other skew direction: a 1.2 request decodes against
+    /// protocol 1.1's request shape.**
+    ///
+    /// §7.4.1 permits same-major different-minor skew, so a 1.2 client
+    /// talking to a 1.1 daemon must not be a wire fault — it must be a
+    /// daemon that reads the three keys it knows and drops the one it
+    /// does not, after which the call runs uncancellable, which is
+    /// exactly today's behaviour.
+    ///
+    /// **It cannot be driven against a live daemon**, because the only
+    /// daemon this workspace can start is a 1.2 one. So the 1.1 shape is
+    /// written out here — `{id, method, params}`, no `deny_unknown_fields`,
+    /// which is the whole of what protocol 1.1's `Request` was — and the
+    /// bytes a 1.2 client really emits are decoded into it.
+    ///
+    /// **And `1.2.golden` does not cover this.** It records the encoded
+    /// bytes of a maximal sample, so it sees that `cancel_token` is on the
+    /// wire under that name; it never asks what a peer without the field
+    /// does with those bytes. The `deny_unknown_fields` this row would
+    /// catch is one attribute away and would break every 1.1 peer in the
+    /// world the moment one exists.
+    #[test]
+    fn a_1_2_request_decodes_against_protocol_1_1s_shape() {
+        /// Protocol 1.1's `Request`, verbatim: three fields and no
+        /// `deny_unknown_fields`. A local copy rather than a version of
+        /// the real type, because the real type is 1.2's and the point is
+        /// to decode against something that never heard of the field.
+        #[derive(Debug, Deserialize)]
+        struct Request11 {
+            id: u64,
+            method: String,
+            params: CborValue,
+        }
+
+        let sent = Request::new_cancellable(
+            7,
+            "tool/request_secret_input",
+            &serde_json::json!({ "session": "sess_abc" }),
+            "a-token-1-1-never-heard-of",
+        )
+        .unwrap();
+
+        // The bytes a 1.2 client really puts on the wire, through the
+        // encoder it really uses — body only, since `encode` prefixes the
+        // length and `decode` reads a body.
+        let framed = frame::encode(&sent).expect("encode the 1.2 request");
+        let bytes = &framed[frame::LENGTH_PREFIX_BYTES..];
+
+        // The control, first: the field really is on those bytes. Without
+        // it a `skip_serializing_if` that dropped the token would make the
+        // decode below succeed for the wrong reason, and this row would
+        // be asserting that 1.1 can read a 1.1 frame.
+        let back: Request = frame::decode(bytes).expect("decode as 1.2");
+        assert_eq!(
+            back.cancel_token.as_deref(),
+            Some("a-token-1-1-never-heard-of"),
+            "the token is not on the wire, so the 1.1 decode below proves nothing"
+        );
+
+        // And the claim: a peer that never heard of the field reads the
+        // three it knows.
+        let old: Request11 = frame::decode(bytes).expect(
+            "a 1.2 request was a wire fault to a 1.1 peer — §7.4.1 promises \
+             same-major skew is compatible, and `deny_unknown_fields` is one \
+             attribute away from breaking it",
+        );
+        assert_eq!(old.id, 7);
+        assert_eq!(old.method, "tool/request_secret_input");
+        assert_eq!(old.params, sent.params, "`params` did not survive the skew");
+
+        // ---- and the same promise, pointing forwards from *this* build.
+        //
+        // The two halves above are about 1.1's shape, which is a
+        // historical fact. This one is about 1.2's, which is the thing a
+        // future edit can break: §7.4.1's skew rule obliges this decoder
+        // to read a request from a **later** minor and ignore what it does
+        // not know. `#[serde(deny_unknown_fields)]` is one attribute away
+        // from making that a wire fault, it reads as a tightening rather
+        // than a break, and nothing else in the tree would notice — the
+        // golden records the bytes this build *emits*, never the bytes it
+        // must *accept*.
+        let from_the_future = CborValue::Map(vec![
+            (CborValue::Text("id".into()), CborValue::Integer(9.into())),
+            (
+                CborValue::Text("method".into()),
+                CborValue::Text("tool/list_sessions".into()),
+            ),
+            (CborValue::Text("params".into()), CborValue::Map(Vec::new())),
+            (
+                CborValue::Text("cancel_token".into()),
+                CborValue::Text("tok".into()),
+            ),
+            (
+                CborValue::Text("a_field_1_3_will_add".into()),
+                CborValue::Text("whatever it likes".into()),
+            ),
+        ]);
+        let mut body = Vec::new();
+        ciborium::into_writer(&from_the_future, &mut body).expect("encode the 1.3 request");
+        let ahead: Request = frame::decode(&body).expect(
+            "a request from a later minor was a wire fault — §7.4.1 promises              same-major skew is compatible in both directions",
+        );
+        assert_eq!(ahead.id, 9);
+        assert_eq!(ahead.cancel_token.as_deref(), Some("tok"));
+    }
+
     fn probe() -> Probe {
         Probe {
             session: "sess_abc".into(),
