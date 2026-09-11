@@ -196,6 +196,43 @@ pub trait PtyBackend: Send + Sync {
     /// leader, so descendants do not survive (spec §4.4).
     fn signal(&self, sig: Signal) -> Result<()>;
 
+    /// Whether any process remains in the child's **session** — not
+    /// merely whether the session leader is alive.
+    ///
+    /// `terminate`'s escalation asks this rather than [`PtyBackend::is_alive`].
+    /// A leader can exit while a descendant that ignored `SIGTERM` keeps
+    /// running, and answering for the leader alone reports a tree that is
+    /// still up as gone (GH #130, reproduced).
+    ///
+    /// Defaults to [`PtyBackend::is_alive`], so a backend that cannot
+    /// enumerate a session gives exactly the answer it gave before. The
+    /// stronger guarantee is opted *into* rather than silently claimed —
+    /// the same rule `session_pgids` already follows for REQ-P-006.
+    fn tree_alive(&self) -> bool {
+        self.is_alive()
+    }
+
+    /// Signal every process group still in the child's session, **even
+    /// after the leader has exited**.
+    ///
+    /// [`PtyBackend::signal`] deliberately refuses to act once the leader
+    /// is gone, because a reaped PID can be recycled and a sweep would
+    /// then target a stranger's group. This is the narrower operation that
+    /// stays safe there: it signals only groups *observed* to be in our
+    /// session, and does **not** fall back to the recorded pgid when that
+    /// observation comes back empty — an empty answer means the tree is
+    /// already gone, which is the honest reading.
+    ///
+    /// `Signal::Interrupt` is delegated to [`PtyBackend::signal`], whose
+    /// foreground-group targeting is the point of that signal; sweeping
+    /// the session with it would signal the shell hosting the command
+    /// rather than the command (REQ-PD-025).
+    ///
+    /// Defaults to [`PtyBackend::signal`], i.e. the pre-#130 behaviour.
+    fn signal_tree(&self, sig: Signal) -> Result<()> {
+        self.signal(sig)
+    }
+
     /// Resize the terminal, triggering `SIGWINCH` in the child.
     fn resize(&self, cols: u16, rows: u16) -> Result<()>;
 
