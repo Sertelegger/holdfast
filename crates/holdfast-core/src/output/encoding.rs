@@ -46,6 +46,19 @@ impl TextEncoding {
     }
 }
 
+/// Whether [`TextEncoding::LossyPrintable`] keeps this byte: the layout
+/// bytes, and everything from `0x20` up except DEL.
+///
+/// **One definition, because two surfaces read it and a drift between
+/// them is a leak.** [`encode`] uses it to build the payload;
+/// [`crate::output::normalise`] uses it to build the stream redaction is
+/// matched against, and a byte this call kept there but dropped here
+/// would be a byte the matcher saw separating a credential that the
+/// caller then receives joined (GH #125).
+pub fn lossy_printable_keeps(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | b'\r') || (b >= 0x20 && b != 0x7f)
+}
+
 /// Render processed bytes for the wire.
 pub fn encode(bytes: &[u8], encoding: TextEncoding) -> String {
     match encoding {
@@ -59,7 +72,7 @@ pub fn encode(bytes: &[u8], encoding: TextEncoding) -> String {
             let kept: Vec<u8> = bytes
                 .iter()
                 .copied()
-                .filter(|b| matches!(b, b'\t' | b'\n' | b'\r') || (*b >= 0x20 && *b != 0x7f))
+                .filter(|b| lossy_printable_keeps(*b))
                 .collect();
             String::from_utf8_lossy(&kept).into_owned()
         }

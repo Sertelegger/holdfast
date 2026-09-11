@@ -42,15 +42,27 @@ fn round3(x: f32) -> f64 {
 /// 39-character `ghp_…` came back verbatim on a response that was
 /// simultaneously withholding those very bytes from `output`. The clip
 /// runs over `last_line` itself rather than over the buffer's
-/// `holdback_boundary`, and that is deliberate: `ghp_\x1b[0m0123…` **has
-/// no holdback boundary**, because `ESC` is not a value byte, so the
-/// buffer-side scanner correctly declines to call it a token in flight
-/// while the stripped line the agent is handed reads as a contiguous
-/// 39-character partial. §9.2's screen-state rule is the one that applies
-/// — "the redactor must run on the rendered rows, not on the bytes that
-/// produced them" — because `last_line` is a *reconstruction*, the
-/// scanner's post-strip tail (§4.1's last paragraph), not a slice of the
-/// byte stream.
+/// `holdback_boundary`, and that is deliberate: `last_line` is a
+/// *reconstruction* — the scanner's post-strip tail (§4.1's last
+/// paragraph) — not a slice of the byte stream, so §9.2's screen-state
+/// rule is the one that applies: "the redactor must run on the rendered
+/// rows, not on the bytes that produced them".
+///
+/// **The example that used to carry this paragraph has moved, and the
+/// rule has not.** `ghp_\x1b[0m0123…` was named here as a line with *no*
+/// holdback boundary, because `ESC` is not a value byte and the
+/// buffer-side scanner therefore declined to call it a token in flight.
+/// That was true and it was also GH #125: the same escape defeated
+/// redaction on the byte stream, which then stripped it out and handed
+/// the agent the credential whole. Since the fix, the scanner reads the
+/// stream the caller will receive and that line *does* carry a boundary,
+/// so case 2 answers it as well. What still separates rule 1 is that the
+/// reconstruction can join text no view of the byte stream joins: a
+/// backspace un-draws the cell before it (`TailLine::backspace`), so a
+/// character planted mid-token and rubbed out again renders as a
+/// contiguous partial that no emittable stream carries.
+/// `a_partial_contiguous_only_in_the_rendering_is_dropped_too` is that
+/// fixture, and it asserts the absent boundary rather than assuming it.
 ///
 /// **2. The session's holdback is active — report nothing.** Rule 1 is a
 /// per-line predicate and cannot see an anchor on an earlier line. `cat
@@ -396,19 +408,38 @@ mod tests {
     }
 
     /// The discriminating fixture: **the input never contains the secret**
-    /// (§9.2's reconstruction rule). `ghp_\x1b[0m…` is a token in flight
-    /// only in the *rendered* line; in the byte stream an `ESC` sits in
-    /// the middle of it, which is not a value byte, so the buffer-side
-    /// holdback correctly declines to fire — asserted here, because that
-    /// is what makes this test separate the implementation that clips at
+    /// (§9.2's reconstruction rule), and the buffer-side holdback
+    /// correctly declines to fire on it — which is what makes this test
+    /// separate the implementation that clips at
     /// `Session::holdback_boundary` from the one that runs the same
     /// predicate over the rendered text. The first returns this line in
     /// full.
+    ///
+    /// **The fixture was `ghp_\x1b[0m…` and had to change, because the
+    /// premise it rested on was GH #125.** An `ESC` mid-token is not a
+    /// value byte, so the byte-stream scanner used to decline — and the
+    /// redactor used to miss the same token for the same reason, after
+    /// which stripping handed the agent the credential whole. Now that
+    /// redaction and the holdback both read the stream the caller
+    /// receives, that line *does* carry a boundary and this test would
+    /// pass against either implementation, which is the one thing it may
+    /// not do.
+    ///
+    /// **A backspace still separates them, and it keeps the original
+    /// premise intact.** `TailLine::backspace` un-draws the cell before
+    /// it, so a `Z` planted mid-token and rubbed out again renders as a
+    /// contiguous 39-character partial while no byte stream a read can
+    /// emit carries it contiguously — and every one of those that the
+    /// in-flight detectors may read either keeps the `\x08`, which no
+    /// value may contain, or drops it and reaches a **complete**
+    /// 40-character token, which is not in flight either. The
+    /// `holdback_boundary` assertion below is therefore true for a
+    /// stated reason rather than by luck.
     #[test]
     fn a_partial_contiguous_only_in_the_rendering_is_dropped_too() {
         let tail = "0123456789abcdefghijABCDEFGHIJ01234";
         let rendered = format!("ghp_{tail}");
-        let bytes = format!("building\nghp_\x1b[0m{tail}");
+        let bytes = format!("building\nghp_{}Z\u{8}{}", &tail[..9], &tail[9..]);
         assert!(
             !bytes.contains(&rendered),
             "the fixture must not contain the partial contiguously, or it \

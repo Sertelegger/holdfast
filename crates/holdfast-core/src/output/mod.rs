@@ -5,9 +5,23 @@
 //! *read*, over an expanded window `[req_start − lookbehind,
 //! req_end + lookahead]`, so a secret that straddles a cursor boundary is
 //! still redacted from both sides.
+//!
+//! **Matching runs over the bytes the caller will receive, not the bytes
+//! the buffer holds** — see [`normalise`]. Redaction used to run on the
+//! raw window while ANSI stripping ran afterwards in [`render`], so an
+//! escape planted inside a credential broke the rule's anchor at match
+//! time and was removed before the payload went out: the read
+//! *reassembled* the token and reported `redactions: {}` (GH #125). Every
+//! offset in this module is still a raw buffer offset — spans, the
+//! holdback, the cursors a caller pages through — because the buffer is
+//! the only thing two reads can agree about. `normalise` is what lets
+//! the two coexist: it matches on the emitted stream and maps back.
+//!
+//! [`render`]: OutputProcessor::render
 
 pub mod ansi;
 pub mod encoding;
+pub mod normalise;
 pub mod prefix_index;
 pub mod redact;
 pub mod rules;
@@ -227,6 +241,53 @@ impl OutputProcessor {
 
     /// Where a read must stop (spec §4.1). `buffer.head` unless a secret
     /// is still arriving in the trailing region.
+    ///
+    /// **Asked of the raw region only, and [`normalise`] deliberately
+    /// does not reach here (GH #142).** A revision of the GH #125 fix did
+    /// ask the views, on the reasoning that a token arriving with a
+    /// colour reset inside it is not in flight by the raw region's
+    /// account and would be released half-emitted. That reasoning is
+    /// right and the change was still wrong, because
+    /// [`PrefixIndex::earliest_partial`]'s continuation test — *every
+    /// byte from the prefix to the end of the region could still belong
+    /// to the value* — is **load-bearing on control bytes**, and every
+    /// view exists precisely to delete them.
+    ///
+    /// Measured, default read path, against this method's own answer:
+    ///
+    /// ```text
+    /// added 210 packages\r\nnpm WARN deprecated \x1b[33m@acme/key-manager@1.2.3\x1b[0m\x1b[K
+    ///   raw          boundary 75 = head, released
+    ///   stripped     boundary 51, held_back, and it never releases
+    /// ```
+    ///
+    /// `key-` is `mailgun-api-key`'s indexed prefix and the rest is
+    /// ordinary text; the trailing `\x1b[K` used to end the run and
+    /// disarm the holdback, and in the stripped view it is not there. A
+    /// progress line that ends in an escape with no newline after it —
+    /// which is most of them — strands the caller's own output behind a
+    /// `held_back` that nothing will clear. The same shape takes
+    /// `prompt.last_line` to `""` on every `status` and `list_sessions`,
+    /// and turns a `wait_for_pattern` that answered instantly into one
+    /// that burns its whole `timeout_secs`.
+    ///
+    /// **The rule that came out of it**, and the reason the two halves of
+    /// the GH #125 fix are not symmetric: *a view may add a **marker**,
+    /// because a marker is safe in every stream and costs the caller
+    /// nothing it was entitled to; a view may not add a **withhold**,
+    /// because a withhold denies the caller bytes, and the predicate that
+    /// decides withholds reads exactly the bytes a view removes.*
+    /// [`OutputProcessor::all_spans`] is the first half; this method is
+    /// the second.
+    ///
+    /// The cost of stopping here is stated rather than elided: a
+    /// credential that straddles a read boundary **with an escape inside
+    /// it** is still released half-emitted, exactly as before this fix.
+    /// That is GH #142, it is byte-identical to the behaviour at
+    /// `v0.0.7`, and closing it needs a sharper in-flight predicate
+    /// rather than a different set of views — see the issue.
+    ///
+    /// [`PrefixIndex::earliest_partial`]: prefix_index::PrefixIndex::earliest_partial
     pub fn holdback_boundary(&self, w: &WindowSnapshot<'_>, opts: &ReadOptions) -> u64 {
         if !opts.redact || w.bypass_holdback {
             return w.head;
@@ -234,6 +295,32 @@ impl OutputProcessor {
         self.index
             .earliest_partial(&self.rules, w.tail_region, w.tail_region_start)
             .unwrap_or(w.head)
+    }
+
+    /// Every secret span in `region`, judged over **each byte stream a
+    /// read of it could emit** and reported in raw buffer offsets
+    /// (GH #125).
+    ///
+    /// The union, not a choice: a view can hide a match as well as
+    /// create one. A credential inside an OSC title (`\x1b]0;ghp_…\x07`)
+    /// is present in the raw bytes and absent from the stripped view,
+    /// because the stripper consumes a sequence's payload — and `ansi:
+    /// raw` emits those bytes. Scanning both costs one extra pass and
+    /// owes nothing to which view found what.
+    fn all_spans(&self, region: &[u8], region_start: u64) -> Vec<Span> {
+        let mut spans = redact::find_spans(&self.rules, region, region_start);
+        for view in normalise::emitted_views(region, region_start) {
+            spans.extend(
+                redact::find_spans(&self.rules, view.bytes(), 0)
+                    .into_iter()
+                    .map(|s| view.map_span(s)),
+            );
+        }
+        // `find_spans` merges what it found; the union of several passes
+        // has to be merged again, and for the same reason (REQ-O-009):
+        // a raw span and a mapped one covering the same credential must
+        // read as one marker, not two.
+        redact::merge_spans(spans)
     }
 
     /// Run the pipeline over a snapshot. Pure: no locks, no I/O.
@@ -272,7 +359,7 @@ impl OutputProcessor {
         }
 
         let spans = if opts.redact {
-            redact::find_spans(&self.rules, w.window, w.window_start)
+            self.all_spans(w.window, w.window_start)
         } else {
             Vec::new()
         };
@@ -1335,5 +1422,577 @@ mod tests {
         );
         assert_eq!(r.output, format!("t={GITHUB}\n"));
         assert!(r.redactions.is_empty());
+    }
+
+    // ------------------------------------- GH #125: the normalisation seam
+
+    /// The token as the issue plants it: a colour reset 15 characters in,
+    /// which is what any program that highlights part of a line emits.
+    fn painted(token: &str, tail: &str) -> Vec<u8> {
+        format!("{}\x1b[0m{}{tail}", &token[..15], &token[15..]).into_bytes()
+    }
+
+    /// **The premise every row below rests on, asserted once rather than
+    /// assumed eight times.** The defect is not that the rule is weak: it
+    /// is that the bytes redaction was shown are not the bytes the caller
+    /// receives. So the raw form really must not match, and the
+    /// normalised form really must — otherwise the rows that follow are
+    /// about something else and would pass against a fix that does
+    /// nothing.
+    #[test]
+    fn the_raw_bytes_do_not_match_and_the_bytes_the_caller_gets_do() {
+        let p = processor();
+        let buf = painted(GITHUB, "\n");
+        assert!(
+            redact::find_spans(&p.rules, &buf, 0).is_empty(),
+            "the planted escape must break the rule's anchor in the raw window"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&ansi::strip(&buf)),
+            format!("{GITHUB}\n"),
+            "and stripping must put the credential back together"
+        );
+    }
+
+    /// **GH #125, the issue's unit-level reproduction, as a permanent
+    /// row.** Redaction searched `w.window` — the raw buffer — while
+    /// `AnsiStripper` ran later inside `render`, so the escape defeated
+    /// the match and was then removed on the way out: a complete, valid
+    /// 40-character credential, on the default read path, reported as
+    /// `redactions: {}`.
+    #[test]
+    fn an_escape_inside_a_token_is_redacted_rather_than_stripped_back_together() {
+        let r = read(&painted(GITHUB, "\n"), 0, 32 * 1024);
+        assert!(!r.output.contains(GITHUB), "reassembled: {}", r.output);
+        assert_eq!(r.output, "[REDACTED:github]\n");
+        assert_eq!(
+            r.redactions.get("github"),
+            Some(&1),
+            "and the caller is told, which `redactions: {{}}` did not"
+        );
+    }
+
+    /// **Two credentials in one read, found by two different passes.**
+    /// The painted one matches only in a view; the clean one only ever
+    /// needed the raw bytes — and the raw pass runs first, so the union
+    /// arrives with a later span in front of an earlier one.
+    ///
+    /// `render` and the `read_end` advance are both **single forward
+    /// passes** over spans they are promised are sorted and
+    /// non-overlapping. That promise used to come free, because
+    /// `find_spans` sorts what it finds and there was one call; a union of
+    /// several calls has to be merged again to keep it. Dropping that
+    /// merge does not fail loudly — it walks past the out-of-order span
+    /// and emits the credential it covers byte for byte, which is the
+    /// original defect wearing a different hat. No other row here has
+    /// both shapes of secret in one window, so no other row notices, and
+    /// removing `merge_spans` from `all_spans` passed the whole 932-test
+    /// suite before this was written.
+    #[test]
+    fn two_secrets_found_by_different_passes_are_both_replaced() {
+        const AWS: &str = "AKIAIOSFODNN7EXAMPLE";
+        let mut buf = painted(GITHUB, " then ");
+        buf.extend_from_slice(format!("{AWS}\n").as_bytes());
+        let p = processor();
+        // The premise: one is invisible to the raw pass and the other is
+        // all the raw pass ever needed, so the union really is assembled
+        // out of order.
+        let raw_spans = redact::find_spans(&p.rules, &buf, 0);
+        assert_eq!(raw_spans.len(), 1, "only the clean token matches raw");
+        assert!(raw_spans[0].start > 0, "and it is the *later* of the two");
+
+        let r = read(&buf, 0, 32 * 1024);
+        assert!(!r.output.contains(&GITHUB[..15]), "leaked: {}", r.output);
+        assert!(!r.output.contains(AWS), "leaked: {}", r.output);
+        assert_eq!(r.output, "[REDACTED:github] then [REDACTED:aws]\n");
+        assert_eq!(r.redactions.get("github"), Some(&1));
+        assert_eq!(r.redactions.get("aws"), Some(&1));
+    }
+
+    /// The same planted escape under each `text_encoding`. Encoding runs
+    /// *after* redaction, so a fix that matched only the stripped stream
+    /// would pass `utf8` and `base64` and still hand the credential to a
+    /// `lossy_printable` caller — these are the same bytes reached by
+    /// three different last steps, and the seam is in every one of them.
+    #[test]
+    fn every_text_encoding_redacts_through_a_planted_escape() {
+        use base64::Engine as _;
+        let buf = painted(GITHUB, "\n");
+        let p = processor();
+        for encoding in [
+            TextEncoding::Utf8,
+            TextEncoding::Base64,
+            TextEncoding::LossyPrintable,
+        ] {
+            let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+            let r = p.process(
+                &w,
+                &ReadOptions {
+                    text_encoding: encoding,
+                    ..Default::default()
+                },
+            );
+            let text = match encoding {
+                TextEncoding::Base64 => String::from_utf8(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(r.output.as_bytes())
+                        .expect("base64 round-trips"),
+                )
+                .expect("the redacted stream is UTF-8"),
+                _ => r.output.clone(),
+            };
+            assert!(
+                !text.contains(GITHUB),
+                "{} reassembled the credential: {text}",
+                encoding.as_str()
+            );
+            assert_eq!(text, "[REDACTED:github]\n", "{}", encoding.as_str());
+            assert_eq!(
+                r.redactions.get("github"),
+                Some(&1),
+                "{}",
+                encoding.as_str()
+            );
+        }
+    }
+
+    /// `ansi: raw` is the other half of the same seam, and the assertion
+    /// has to be written differently to mean anything.
+    ///
+    /// A raw payload still carries the escape, so `contains(GITHUB)` is
+    /// **false against the unfixed code** — the credential is all there,
+    /// split by four bytes that vanish the moment the agent pipes the
+    /// stream to anything that renders it. The halves are therefore what
+    /// this asserts on. `ansi: raw` is a display knob, not an audited
+    /// escape hatch; `redact: false` is the hatch, and it is the row
+    /// below.
+    #[test]
+    fn raw_mode_redacts_the_credential_a_terminal_would_reassemble() {
+        let buf = painted(GITHUB, "\n");
+        let p = processor();
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        let r = p.process(
+            &w,
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !r.output.contains(&GITHUB[..15]),
+            "the first half survived: {:?}",
+            r.output
+        );
+        assert!(
+            !r.output.contains(&GITHUB[15..]),
+            "the second half survived: {:?}",
+            r.output
+        );
+        assert_eq!(
+            r.output, "[REDACTED:github]\n",
+            "one marker covers the token and the escape planted inside it"
+        );
+        assert_eq!(r.redactions.get("github"), Some(&1));
+    }
+
+    /// The sibling one step further down the pipeline: two C0 bytes the
+    /// **stripper keeps** and `lossy_printable` drops. Nothing about the
+    /// mechanism is specific to `\x1b`, so a fix aimed at escape
+    /// sequences alone would leave `read_output(text_encoding:
+    /// "lossy_printable")` reassembling credentials exactly as before.
+    #[test]
+    fn a_control_byte_only_the_encoder_drops_cannot_reassemble_a_token_either() {
+        let p = processor();
+        for planted in ['\u{8}', '\u{7f}'] {
+            let buf = format!("{}{planted}{}\n", &GITHUB[..15], &GITHUB[15..]).into_bytes();
+            // Both halves of the premise, per byte: the raw form does not
+            // match, and stripping alone does not repair it either — so
+            // this row cannot pass for the reason the row above does.
+            assert!(
+                redact::find_spans(&p.rules, &buf, 0).is_empty(),
+                "{planted:?} must break the anchor"
+            );
+            assert_eq!(
+                ansi::strip(&buf),
+                buf,
+                "{planted:?} survives the stripper; only the encoder drops it"
+            );
+
+            let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+            let r = p.process(
+                &w,
+                &ReadOptions {
+                    text_encoding: TextEncoding::LossyPrintable,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !r.output.contains(GITHUB),
+                "{planted:?} was dropped around an intact credential: {}",
+                r.output
+            );
+            assert_eq!(r.output, "[REDACTED:github]\n", "{planted:?}");
+        }
+    }
+
+    /// **The boundary row: a planted escape *and* a read boundary inside
+    /// the token.** Redaction, stripping and pagination are each tested
+    /// alone above and elsewhere; this is the seam.
+    ///
+    /// The cap at 12 lands inside the token, so `process` must advance
+    /// the continuation cursor past the *whole* span — which now includes
+    /// the four bytes of the escape — or the next read starts inside the
+    /// credential with a lookbehind that cannot reach its anchor.
+    #[test]
+    fn neither_half_of_a_split_read_leaks_through_a_planted_escape() {
+        let mut buf = b"prefix ".to_vec();
+        buf.extend_from_slice(&painted(GITHUB, " suffix"));
+        let first = read(&buf, 0, 12);
+        let second = read(&buf, first.cursor, 32 * 1024);
+        for part in [&first.output, &second.output] {
+            assert!(!part.contains(&GITHUB[..15]), "leaked: {part}");
+            assert!(!part.contains(&GITHUB[15..]), "leaked: {part}");
+        }
+        assert_eq!(first.output, "prefix [REDACTED:github]");
+        assert_eq!(
+            first.cursor,
+            (7 + GITHUB.len() + 4) as u64,
+            "the cursor must clear the token *and* the escape inside it"
+        );
+        assert_eq!(second.output, " suffix");
+        assert!(second.redactions.is_empty());
+    }
+
+    /// Paging the same buffer in 8-byte requests: every cursor is a raw
+    /// buffer offset, the pages tile the buffer exactly, and the
+    /// concatenation carries one marker and no half-credential.
+    ///
+    /// The tiling is the half that pins the mapping. A fix that reported
+    /// spans in *normalised* offsets would still redact — and would then
+    /// hand back a cursor short of, or past, the bytes it consumed, so
+    /// paging would repeat or skip output with nothing to show for it.
+    #[test]
+    fn paging_over_a_planted_escape_keeps_every_cursor_on_the_raw_stream() {
+        let mut buf = b"head ".to_vec();
+        buf.extend_from_slice(&painted(GITHUB, " tail\n"));
+        let mut cursor = 0u64;
+        let mut seen = String::new();
+        let mut pages = 0usize;
+        while cursor < buf.len() as u64 {
+            let r = read(&buf, cursor, 8);
+            assert!(r.cursor > cursor, "page {pages} made no progress");
+            assert_eq!(
+                r.bytes_returned as u64,
+                r.cursor - cursor,
+                "bytes_returned counts raw bytes consumed, page {pages}"
+            );
+            seen.push_str(&r.output);
+            cursor = r.cursor;
+            pages += 1;
+            assert!(pages < 64, "paging did not terminate");
+        }
+        assert_eq!(
+            cursor,
+            buf.len() as u64,
+            "the final cursor lands exactly on head"
+        );
+        assert_eq!(seen, "head [REDACTED:github] tail\n");
+    }
+
+    /// **A window that does not start at zero, which is the only thing
+    /// that tests the map's base.**
+    ///
+    /// Every other row here fits inside `lookbehind_bytes`, so
+    /// `window_start` is 0 and a view offset and an absolute offset are
+    /// the same number — a mapping that never added the window's own
+    /// start would land on exactly the right byte in all of them and
+    /// leak here. The padding is the whole fixture: it puts the painted
+    /// token past the lookbehind so a read of it opens a window several
+    /// hundred bytes into the buffer.
+    #[test]
+    fn a_painted_token_far_into_the_buffer_maps_back_to_absolute_offsets() {
+        let p = processor();
+        let mut buf = "filler line\n".repeat(200).into_bytes();
+        let at = buf.len() as u64;
+        assert!(
+            at > p.limits.lookbehind_bytes as u64,
+            "the arrangement must really start its window past zero"
+        );
+        buf.extend_from_slice(&painted(GITHUB, " tail\n"));
+
+        let r = read(&buf, at, 32 * 1024);
+        assert!(!r.output.contains(&GITHUB[..15]), "leaked: {}", r.output);
+        assert_eq!(r.output, "[REDACTED:github] tail\n");
+        assert_eq!(r.cursor, buf.len() as u64);
+        assert_eq!(
+            r.bytes_returned as u64,
+            buf.len() as u64 - at,
+            "bytes_returned still counts raw bytes from the request's start"
+        );
+    }
+
+    /// **The other direction, which the first version of this fix got
+    /// wrong.** A *terminated* window title carrying an indexed secret
+    /// prefix must not stop the read.
+    ///
+    /// Asking the `Printable` view whether a secret is in flight does
+    /// stop it: that view deletes the `\x1b` and the BEL and keeps
+    /// `]0;SECRET_DONE`, which to a continuation test whose whole rule is
+    /// *printable and not a space* reads as a value still accumulating.
+    /// Nothing here is contrived — it is `screen.rs`'s own fixture, and
+    /// the read stopped four bytes into the sequence.
+    #[test]
+    fn a_terminated_window_title_is_not_a_credential_still_arriving() {
+        let p = processor();
+        assert!(
+            p.index
+                .prefixes_for(&p.rules, "generic-secret-assignment")
+                .contains(&b"secret".to_vec()),
+            "the premise: `secret` is an indexed prefix, so the title really \
+             does offer the scanner a candidate"
+        );
+        let buf = b"harmless header line\x1b[2;1Hdone\x1b]0;SECRET_DONE\x07".to_vec();
+        let r = read(&buf, 0, 32 * 1024);
+        assert!(!r.held_back, "a finished title is not a secret in flight");
+        assert_eq!(r.cursor, buf.len() as u64, "and the read reaches head");
+        assert_eq!(r.output, "harmless header linedone");
+    }
+
+    /// A colourised blob with no space or newline in it, longer than
+    /// `max_bytes + lookahead`, paged at the default size.
+    ///
+    /// **The GH #14 path (`window_end < w.head`) is the only branch this
+    /// reaches, and it had no row.** `unresolved_from`'s trailing
+    /// value-run test finds the first byte the window cannot vouch for;
+    /// escapes break that run in the raw bytes and do not break it in a
+    /// stripped view, so asking the views moved the run start back to at
+    /// or before `req_start`, `read_end` came out equal to the cursor it
+    /// was given, and the read returned **zero bytes for ever**. `jq -C
+    /// -c` on a medium document is that shape.
+    ///
+    /// The stall *class* pre-exists this fix — the same probe with the
+    /// escapes removed stalls on the parent commit too, and closing that
+    /// is not this change's job. What is this change's job is not moving
+    /// colourised output, which streamed before, into it.
+    #[test]
+    fn a_colourised_blob_with_no_delimiter_still_pages_to_the_end() {
+        let mut buf = b"starting up\n".to_vec();
+        for i in 0..2000u32 {
+            buf.extend_from_slice(b"\x1b[32m");
+            buf.extend_from_slice(format!("{:016x}", i).as_bytes());
+        }
+        buf.extend_from_slice(b"\ndone\n");
+
+        let mut cursor = 0u64;
+        let mut pages = 0usize;
+        let mut seen = 0usize;
+        while cursor < buf.len() as u64 {
+            let r = read(&buf, cursor, 1024);
+            assert!(
+                r.cursor > cursor,
+                "page {pages} returned {} bytes and left the cursor at {cursor}: \
+                 a read that never completes",
+                r.bytes_returned
+            );
+            seen += r.bytes_returned;
+            cursor = r.cursor;
+            pages += 1;
+            assert!(pages < 200, "paging did not terminate");
+        }
+        assert_eq!(seen, buf.len(), "the pages must tile the buffer exactly");
+    }
+
+    /// **The row that ties the enumeration to the pipeline, so the module
+    /// header's claim is checked rather than asserted in prose.**
+    ///
+    /// `normalise`'s table says the emittable streams are the raw window
+    /// and its three views. Nothing proved that: the views were pinned
+    /// against hand-written literals, so a *fourth* filter appearing
+    /// anywhere in `render` or `encode` would go unnoticed and reopen
+    /// GH #125 for whatever stream it produced. Driven, by adding a CRLF
+    /// normalisation to `encode`'s `Utf8` arm: `deploy ghp_…\r…` came
+    /// back as a whole credential with `redactions: {}`, and the suite's
+    /// entire reaction was three `assert_eq!`s differing by `\r\n` versus
+    /// `\n` — exactly the failures somebody fixes by editing the
+    /// literals.
+    ///
+    /// So this asserts the relationship instead: with redaction off, the
+    /// bytes a read emits under **every** `ansi` × `text_encoding`
+    /// combination must be the raw window or one of the streams
+    /// `emitted_views` names. A new filter fails it on the next run.
+    ///
+    /// `redact: false` is deliberate — it is the only way to see the
+    /// pipeline's own output with no markers substituted into it — and
+    /// the fixture is ASCII so a lossy UTF-8 decode is the identity and
+    /// the comparison stays on bytes.
+    #[test]
+    fn every_option_combination_emits_a_stream_this_module_enumerates() {
+        use base64::Engine as _;
+        // One of everything the filters react to: a CSI, an OSC with a
+        // payload, a bare `\x08`, a `\x7f`, and a CRLF.
+        let buf = b"a\x1b[31mb\x08c\x7fd\x1b]0;title\x07e\r\nf\n".to_vec();
+        let p = processor();
+
+        let mut streams: Vec<Vec<u8>> = vec![buf.clone()];
+        for v in normalise::emitted_views(&buf, 0) {
+            streams.push(v.bytes().to_vec());
+        }
+
+        for ansi in [AnsiMode::Strip, AnsiMode::Raw] {
+            for text_encoding in [
+                TextEncoding::Utf8,
+                TextEncoding::Base64,
+                TextEncoding::LossyPrintable,
+            ] {
+                let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+                let r = p.process(
+                    &w,
+                    &ReadOptions {
+                        ansi,
+                        text_encoding,
+                        redact: false,
+                    },
+                );
+                let emitted = match text_encoding {
+                    TextEncoding::Base64 => base64::engine::general_purpose::STANDARD
+                        .decode(r.output.as_bytes())
+                        .expect("base64 round-trips"),
+                    _ => r.output.clone().into_bytes(),
+                };
+                assert!(
+                    streams.contains(&emitted),
+                    "{ansi:?}/{} emitted a stream `emitted_views` does not \
+                     enumerate, so redaction never judged it: {emitted:?}",
+                    text_encoding.as_str()
+                );
+            }
+        }
+    }
+
+    /// `View::Printable`'s own case — `ansi: "raw"` with
+    /// `lossy_printable`, the one combination no other view covers —
+    /// asserted on an outcome rather than on the view taxonomy.
+    ///
+    /// The stripper keeps `\x08`, so the raw and stripped streams both
+    /// carry the planted byte and neither reassembles anything; only this
+    /// combination drops it and joins the halves.
+    #[test]
+    fn the_raw_lossy_printable_stream_is_redacted_on_its_own_account() {
+        let buf = format!("deploy {}\u{8}{}\n", &GITHUB[..15], &GITHUB[15..]).into_bytes();
+        let p = processor();
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        let r = p.process(
+            &w,
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                text_encoding: TextEncoding::LossyPrintable,
+                ..Default::default()
+            },
+        );
+        assert!(!r.output.contains(GITHUB), "reassembled: {}", r.output);
+        assert_eq!(r.output, "deploy [REDACTED:github]\n");
+        assert_eq!(r.redactions.get("github"), Some(&1));
+    }
+
+    /// **Ordinary output that ends in an escape sequence must still be
+    /// released (GH #142).**
+    ///
+    /// `earliest_partial` asks whether every byte from an indexed prefix
+    /// to the end of the region could still belong to a value, and
+    /// answers with `0x21..=0x7e`; the control byte that ends a sequence
+    /// is what ends that run. Asking a *stripped* view instead removes
+    /// the terminator, the run reaches the end of the region, and the
+    /// read stops — permanently, because the line is finished and nothing
+    /// more is coming.
+    ///
+    /// `key-` is `mailgun-api-key`'s indexed prefix and the rest of this
+    /// line is an npm deprecation warning. A progress line ending in
+    /// `\x1b[K` with no newline after it is the ordinary shape, not an
+    /// exotic one, which is why this is a row and not a footnote: it
+    /// strands the caller's own output, takes `prompt.last_line` to `""`
+    /// on every `status` and `list_sessions`, and turns a
+    /// `wait_for_pattern` that answered instantly into one that burns its
+    /// whole `timeout_secs`.
+    #[test]
+    fn ordinary_output_ending_in_an_escape_sequence_is_not_held_back() {
+        let buf = b"added 210 packages\r\nnpm WARN deprecated \x1b[33m@acme/key-manager@1.2.3\x1b[0m\x1b[K".to_vec();
+        let p = processor();
+        // The premise: there really is an indexed prefix in the tail, so
+        // the row exercises the detector rather than skipping past it.
+        assert!(
+            p.index
+                .prefixes_for(&p.rules, "mailgun-api-key")
+                .iter()
+                .any(|x| x == b"key-"),
+            "`key-` must be indexed, or this line offers the scanner nothing"
+        );
+        let r = read(&buf, 0, 32 * 1024);
+        assert!(
+            !r.held_back,
+            "an ordinary warning line was withheld: {:?}",
+            r.output
+        );
+        assert_eq!(r.cursor, buf.len() as u64, "the read must reach head");
+        assert_eq!(
+            r.output,
+            "added 210 packages\r\nnpm WARN deprecated @acme/key-manager@1.2.3"
+        );
+    }
+
+    /// The audited opt-out is unchanged: `redact: false` disables the
+    /// redaction *and* the holdback, and returns the planted bytes
+    /// exactly as the child wrote them (§4.1).
+    #[test]
+    fn the_audited_opt_out_still_returns_the_planted_bytes_verbatim() {
+        let buf = painted(GITHUB, "\n");
+        let p = processor();
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        let r = p.process(
+            &w,
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                redact: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.output, String::from_utf8_lossy(&buf));
+        assert!(r.redactions.is_empty());
+        assert!(!r.held_back);
+        assert_eq!(r.cursor, buf.len() as u64);
+    }
+
+    /// A credential inside an OSC title is **absent from the stripped
+    /// view**, because the stripper consumes a sequence's payload whole —
+    /// and `ansi: raw` puts those bytes on the wire regardless. So the
+    /// span set is a *union* over the streams a read can emit, never a
+    /// move from the raw bytes to the normalised ones: a fix that
+    /// replaced `find_spans(window)` with `find_spans(stripped)` would
+    /// have traded this case for the one the issue reports, and this row
+    /// is what fails when it does.
+    ///
+    /// **What it does *not* pin, said plainly.** Deleting the raw pass
+    /// alone leaves this one green, because the `lossy_printable` view
+    /// keeps an escape sequence's body and carries the token too. That
+    /// deletion is caught many times over by the rows that predate this
+    /// work — for a buffer of plain text there is no view at all and
+    /// nothing is redacted — so it needs no row of its own here.
+    #[test]
+    fn a_secret_only_the_raw_stream_carries_is_still_redacted() {
+        let buf = format!("\x1b]0;deploy {GITHUB}\x07$ ").into_bytes();
+        let p = processor();
+        assert!(
+            !ansi::strip(&buf).windows(4).any(|w| w == b"ghp_"),
+            "the stripped view really does not carry it"
+        );
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        let r = p.process(
+            &w,
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                ..Default::default()
+            },
+        );
+        assert!(!r.output.contains(GITHUB), "leaked: {}", r.output);
+        assert_eq!(r.output, "\u{1b}]0;deploy [REDACTED:github]\u{7}$ ");
     }
 }

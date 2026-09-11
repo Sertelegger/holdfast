@@ -1258,11 +1258,51 @@ async fn a_tool_submitted_secret_reaches_none_of_the_seven_surfaces() {
 /// directions — a response returning the value "for confirmation" is
 /// caught by the sweep, and a response returning a *wrong* count is caught
 /// by the arithmetic.
+///
+/// **[`await_detected_prompt`] is load-bearing and it is not tidiness.**
+/// Without it this row waited on [`next_awaiting_secret`] and treated
+/// that as its cue to submit — but the `AwaitingSecret` broadcast comes
+/// from `request_secret_input` itself, which raises the moment the agent
+/// calls it and never consults the child. It is evidence that the
+/// *daemon* spoke, not that the child reached `stty -echo`. Submitting on
+/// it writes the credential into a terminal that is still echoing, the
+/// line discipline puts it in the ring buffer, and `prompt.last_line`
+/// hands it back to the agent.
+///
+/// That is what the row's own `!contains(PROBE)` sweep was catching, once
+/// in roughly nine full-suite runs, reported as
+/// `append_newline=false: the response carried the value` with
+/// `prompt.last_line: "hunter2"` and `interaction_mode: "Executing"` in
+/// the payload. Measured by delaying the child's `stty -echo` by 300 ms
+/// and changing nothing else: the row fails 7/10 and the credential
+/// reaches `read_output` in the clear **10/10, on both `append_newline`
+/// directions** — the `true` direction echoes a `\n` too, which resets
+/// the tail line and hides it from this assertion while the disclosure
+/// still happened. Identical at `v0.0.7`'s `main`, so the behaviour is
+/// not new.
+///
+/// **The disclosure is a product defect and it is filed, not fixed here
+/// ([#137]).** `WriteRequest::Secret` — the client-submitted path — has
+/// no echo-state gate, on the stated grounds that a human types "at the
+/// prompt they are looking at, so it has nothing to be stale about";
+/// the prompt they are looking at is the agent's `prompt_text`, which is
+/// not evidence about the child's termios. `SecretIfUnread` already
+/// answers exactly this question for autofill, one statement before the
+/// write and against the tty rather than a cache of it.
+///
+/// Reaching that defect from *here* is an accident of scheduling, and a
+/// row that finds a leak one run in nine is not how it should be found:
+/// the wait makes this row measure its own subject, and [#137] carries a
+/// row that provokes the disclosure on purpose.
+///
+/// [#137]: https://github.com/Sertelegger/holdfast/issues/137
 #[tokio::test]
 async fn the_response_carries_a_length_and_not_a_value() {
     for (append_newline, extra) in [(true, 1usize), (false, 0)] {
         let d = TestDaemon::start(&format!("lengthonly{}", usize::from(append_newline))).await;
         let s = d.shell_running(ECHO_OFF_FIXTURE);
+        // Wait on the *child*, never on the broadcast: see the header.
+        await_detected_prompt(&s, "Password: ").await;
         let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
         let call = spawn_call(

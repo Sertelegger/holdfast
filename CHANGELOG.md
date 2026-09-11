@@ -20,6 +20,15 @@ is cut, named and published is in
 
 ### Changed
 
+- **`read_output` can now return more redaction markers on colourised output,
+  and this is a payload change rather than a free win.** A rule that matches
+  the stripped text but not the raw bytes now fires: `\x1b[36mpassword\x1b[0m
+  = \x1b[33mnot-set-yet\x1b[0m` returns `password = [REDACTED:generic]` where
+  it returned `password = not-set-yet`. The plain form was always redacted —
+  `generic-secret-assignment` matches on the *label* and does not inspect the
+  value — so this is that rule reaching the stream the agent actually receives,
+  but it means `grep --color` over a config file now returns markers where it
+  returned placeholders ([#125]).
 - On Windows native, seven daemon-backed subcommands — `daemon run`,
   `daemon start`, `daemon status`, `list`, `logs`, `attach`, `watch` — refuse
   with exit 64 from a single shared message; `list` and `logs` name the MCP
@@ -49,6 +58,28 @@ is cut, named and published is in
 
 ### Fixed
 
+- `read_output` no longer reassembles a credential it declined to redact.
+  Redaction searched the raw ring buffer while ANSI stripping ran afterwards,
+  so a colour reset planted inside a token broke the rule's anchor at match
+  time and was then removed on the way out: a complete, valid credential
+  reached the agent on the **default** read path, reported as
+  `redactions: {}`. Matching now runs over each byte stream the read pipeline
+  derives from the window it judges — raw, stripped, and either of those under
+  `lossy_printable`, which drops the C0 controls the stripper keeps — and maps
+  every match back to raw buffer offsets, so cursors and `bytes_returned` are
+  arithmetically unchanged. The **holdback is unchanged too, deliberately**:
+  the in-flight predicate it rests on is load-bearing on the very control
+  bytes those streams remove, so it still reads the raw region alone, and a
+  credential straddling a read boundary with an escape inside it is still
+  released half-emitted ([#142]). `redact: false` and `--raw` are byte-identical
+  to before ([#125]).
+  **This closes the matching side of #125 and not every class of the
+  defect.** The *withholding* side — a credential still arriving with an
+  escape inside it is released half-emitted — is [#142] and is open; [#138]
+  (spans judged over the window while a sub-range is emitted) and [#139]
+  (8-bit C1 introducers that Holdfast's own emulator interprets and the
+  stripper does not) are open on the range and grammar axes. Redaction is not
+  closed as a class.
 - A session that has finished no longer keeps the writer thread that only a
   running child needs. The registry now holds live sessions and completed
   records separately, and retiring a record drops the sending half of its write
@@ -567,4 +598,8 @@ residuals that are known and accepted.
 [#105]: https://github.com/Sertelegger/holdfast/issues/105
 [#106]: https://github.com/Sertelegger/holdfast/issues/106
 [#112]: https://github.com/Sertelegger/holdfast/issues/112
+[#125]: https://github.com/Sertelegger/holdfast/issues/125
 [#129]: https://github.com/Sertelegger/holdfast/issues/129
+[#138]: https://github.com/Sertelegger/holdfast/issues/138
+[#139]: https://github.com/Sertelegger/holdfast/issues/139
+[#142]: https://github.com/Sertelegger/holdfast/issues/142
