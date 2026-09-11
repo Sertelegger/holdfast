@@ -1196,12 +1196,19 @@ async fn forward_output(
     // `SessionEvent::Exited` is sent once, by the reader thread, and a
     // connection that subscribed afterwards can never see it. Nor does
     // the output broadcast ever close: §5.5.1 retains exited sessions
-    // for the daemon's lifetime — deliberately, so `holdfast logs` can
-    // still read one — `SessionRegistry::remove` has no caller anywhere
-    // in the tree, and the `Session` holds its own `Sender`. So without
-    // this the task parked forever on two channels that were never going
-    // to produce anything, and `holdfast watch <exited-session>` hung
-    // until the operator found Ctrl-C.
+    // — deliberately, so `holdfast logs` can still read one — and the
+    // `Session` holds its own `Sender`. So without this the task parked
+    // forever on two channels that were never going to produce
+    // anything, and `holdfast watch <exited-session>` hung until the
+    // operator found Ctrl-C.
+    //
+    // **Retention is now bounded and this is still the whole fix** (GH
+    // #129). An earlier revision of this comment said the registry never
+    // removes a session, which stopped being true when completed records
+    // gained a bound; it was never the load-bearing part. This task
+    // holds its own `Arc<Session>`, so an eviction that races it drops
+    // no channel underneath it — and a connection is only reachable
+    // through a `registry.get` that already succeeded.
     //
     // **Read the state rather than replay the edge**, because the state
     // is what the daemon already knows: `Attached.state` said `"Exited"`

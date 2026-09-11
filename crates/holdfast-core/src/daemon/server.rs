@@ -420,11 +420,13 @@ impl Daemon {
     /// all. The entry then outlives the session it names, for the life of
     /// the daemon.
     ///
-    /// **Sited on `Daemon` rather than in session teardown, because there
-    /// is no session teardown.** `SessionRegistry::remove` has no caller
-    /// anywhere in the tree and §5.5.1 retains exited sessions
-    /// deliberately, so the moment a teardown hook would run never
-    /// arrives. What the `Daemon` has is both halves of the mismatch —
+    /// **Sited on `Daemon` rather than in session teardown**, and it
+    /// stays there now that GH #129 has given a session a retirement
+    /// point: `SessionRegistry::retire_exited` holds the registry's own
+    /// write lock and knows nothing of the attach hub, so releasing a
+    /// slot from inside it would be a lock this module cannot reason
+    /// about taken under one that module owns. What the `Daemon` has is
+    /// both halves of the mismatch —
     /// the registry, which knows which sessions are over, and the hub,
     /// which holds the slots — and it is the same reasoning that puts
     /// [`poll_resource_list_changed`](Self::poll_resource_list_changed)
@@ -1231,6 +1233,15 @@ pub(crate) async fn reaper_loop(daemon: Arc<Daemon>) {
         // observed by asking, and the slot of one that died holding a
         // raise nobody adopted has no other observer.
         daemon.release_exited_secret_slots();
+        // GH #129, on the same tick and for the third time the same
+        // reason: a session's exit is observed by asking. This is the
+        // half of the sweep that `SessionRegistry::insert` cannot cover
+        // — a daemon whose last session finished and whose agent has
+        // gone to lunch makes no further inserts, and the writer thread
+        // of that session would otherwise stay parked until the process
+        // ended. **After `scan_once`**, so a session the reaper itself
+        // just SIGKILLed is retired on this pass rather than the next.
+        daemon.server.registry.retire_exited();
 
         // §7.3's conjunction, checked after the sweep so a session the
         // reaper just took down counts towards "all sessions have
@@ -3808,6 +3819,66 @@ mod tests {
              unadopted raise pins its slot for the daemon's whole life, and every \
              later call on that id answers concurrent_request_pending"
         );
+    }
+
+    /// **The sixth statement, and GH #129's half of the tick.**
+    ///
+    /// Deleting `registry.retire_exited()` from [`reaper_loop`] leaves
+    /// every row in `tests/session_retention.rs` green, because each of
+    /// them calls the sweep itself — verbatim the defect this module's
+    /// header records against its own history, and the same one the
+    /// GH #24 row above was added for. What it costs in production is
+    /// the *quiet* daemon: a session that finished and has no successor
+    /// keeps its writer thread parked until the process ends, and
+    /// `SessionRegistry::insert` is the only other caller.
+    ///
+    /// **The child dies after the loop's first pass, on purpose**, for
+    /// the same reason the GH #24 row above arranges it: the loop sweeps
+    /// once on entry, so a session already dead beforehand would be
+    /// retired by that pass and the row would be green with the *tick*
+    /// deleted. The pre-advance assertion is what says so.
+    ///
+    /// `idle_timeout_secs = 0` disables reaping for this session, so
+    /// nothing here turns on `scan_once`: the sweep is the only
+    /// statement in the loop this row can fail on, and it names it.
+    #[tokio::test]
+    async fn the_periodic_tick_retires_a_session_whose_child_has_gone() {
+        let paths = scratch("tickretire");
+        let _s = Scratch(paths.clone());
+        paths.ensure_dir().unwrap();
+        let clock = Clock::manual(Instant::now());
+        // `0` disables §7.3's exit, so the loop stays up for a second tick.
+        let daemon = Daemon::with_config_and_clock(paths, configured(0), clock.clone());
+
+        let s = mock_session("sess_tickretire", &clock);
+        daemon.server.registry.insert(Arc::clone(&s)).unwrap();
+
+        tokio::spawn(reaper_loop(Arc::clone(&daemon)));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        s.signal(crate::pty::Signal::Kill).unwrap();
+        assert!(!s.is_alive(), "the fixture left the session alive");
+
+        // The premise: nothing has retired it yet, because the loop is
+        // parked on a hand that has not moved.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            daemon.server.registry.retained_count(),
+            0,
+            "something other than the tick retired the session"
+        );
+
+        clock.advance(crate::session::reaper::SCAN_INTERVAL + Duration::from_secs(1));
+        assert!(
+            yield_until(|| daemon.server.registry.retained_count() == 1).await,
+            "the tick never ran GH #129's sweep: a daemon whose last session finished \
+             keeps that session's writer thread parked for the life of the process"
+        );
+        // §5.5.1 survives the retirement, as it does the reap above.
+        assert!(daemon.server.registry.get("sess_tickretire").is_ok());
     }
 
     /// §19.1's periodic half, and the `AuditLog::reopen` inside it.
