@@ -689,12 +689,25 @@ fn the_providers_credential_buffers_are_sized_once_and_zeroed_on_the_timeout_pat
          with extra steps: {sized:?}"
     );
     // The stack chunk the loop reads through is the one copy that is not
-    // `bytes`, and it is zeroed on the way out.
+    // `bytes`, and its zeroing is a `Drop` rather than a statement.
+    //
+    // **This used to assert the statement, and that was the defect this
+    // guard is about.** A scan for text anywhere in a file cannot see
+    // *reachability*: rewriting `Ok(0) => break` as an early return left
+    // the string in place, this row green, and the last 8 KiB of every
+    // credential on the reader thread's stack. The behavioural half now
+    // lives in `the_readers_scratch_chunk_is_zeroed_on_every_exit`, which
+    // asks the buffer rather than the source; what is left here is the
+    // *shape* that makes an added exit harmless.
     assert!(
-        code.iter()
-            .any(|l| l.starts_with("zero_bytes(&mut chunk);")),
-        "the reader's scratch chunk is no longer zeroed, so the last 8 KiB of every \
-         credential is left on a thread's stack"
+        text.contains("impl Drop for Scratch {") && text.contains("zero_bytes(&mut self.0);"),
+        "the reader's scratch buffer no longer zeroes on drop, so an exit added to \
+         `drain_bounded` leaves up to 8 KiB of the credential on a thread's stack"
+    );
+    assert!(
+        !code.iter().any(|l| l.contains("let mut chunk = [0u8;")),
+        "the scratch buffer is a bare array again, so its zeroing is a statement some \
+         exit can step around"
     );
 
     // ----------------------------- 2. the drained buffer zeroes itself

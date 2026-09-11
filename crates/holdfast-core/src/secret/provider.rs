@@ -1049,19 +1049,17 @@ impl Drop for Drained {
 fn drain_bounded(pipe: &mut impl Read, cap: usize) -> Drained {
     let limit = cap.saturating_add(1);
     let mut bytes = Vec::with_capacity(limit.min(PROVIDER_READ_CAPACITY));
-    // The one copy of the credential this loop makes that is not `bytes`,
-    // and it is zeroed on the way out.
-    let mut chunk = [0u8; 8192];
+    let mut chunk = Scratch([0u8; 8192]);
     let mut over_cap = false;
     loop {
         if bytes.len() >= limit {
             over_cap = true;
             break;
         }
-        let want = (limit - bytes.len()).min(chunk.len());
-        match pipe.read(&mut chunk[..want]) {
+        let want = (limit - bytes.len()).min(chunk.0.len());
+        match pipe.read(&mut chunk.0[..want]) {
             Ok(0) => break,
-            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Ok(n) => bytes.extend_from_slice(&chunk.0[..n]),
             // A signal, not an ending. `read_to_end` retried these and so
             // does this; without the arm a provider that answered during
             // a `SIGCHLD` would resolve a truncated credential.
@@ -1069,8 +1067,60 @@ fn drain_bounded(pipe: &mut impl Read, cap: usize) -> Drained {
             Err(_) => break,
         }
     }
-    zero_bytes(&mut chunk);
     Drained { bytes, over_cap }
+}
+
+/// The reader's scratch buffer: the one copy of the credential
+/// [`drain_bounded`] makes that is not `bytes`.
+///
+/// **A type whose `Drop` zeroes, and not a `zero_bytes` before the
+/// return.** The loop above has four exits and a natural refactor adds a
+/// fifth; a statement can be stepped around and a `Drop` cannot.
+/// Measured, which is why this is a type: rewriting `Ok(0) => break` as
+/// `Ok(0) => return Drained { bytes, over_cap }` — an ordinary early
+/// return — left `source_guards` green 8/8 and every provider unit green,
+/// while the last 8 KiB of **every** credential stayed on the reader
+/// thread's stack on the ordinary success path. A text scan cannot see
+/// reachability; this does not have to.
+struct Scratch([u8; 8192]);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        zero_bytes(&mut self.0);
+        #[cfg(test)]
+        scratch_witness::record(&self.0);
+    }
+}
+
+/// What [`Scratch`] looked like **after** its zeroing, for the one row
+/// that asserts on memory rather than on source text.
+///
+/// **Thread-local, like `attach::secret`'s `drop_witness` and for the
+/// same reason**: a process-wide record shared across parallel rows is a
+/// test that fails under load, which is worse than no test. The row that
+/// reads it calls [`drain_bounded`] on its own thread rather than through
+/// `run`, which is what makes a thread-local enough — and is also what
+/// lets it drive every exit of the loop, including the two no real
+/// provider produces on demand.
+#[cfg(test)]
+mod scratch_witness {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SEEN: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(after_zeroing: &[u8]) {
+        SEEN.with(|s| s.borrow_mut().push(after_zeroing.to_vec()));
+    }
+
+    pub(super) fn reset() {
+        SEEN.with(|s| s.borrow_mut().clear());
+    }
+
+    pub(super) fn taken() -> Vec<Vec<u8>> {
+        SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
 }
 
 /// Hand a drained pipe to [`run`], zeroing it if nobody is there to take
@@ -2137,6 +2187,107 @@ mod tests {
         assert_eq!(write_secret(&s, submitted).await, PROBE.len() + 1);
         buffer_until(&s, b"got=HUNTER2", 20).await;
         let _ = s.signal(crate::pty::Signal::Kill);
+    }
+
+    /// **F-2's last un-inspected copy: the reader's scratch chunk is
+    /// zeroed on every exit, asserted against memory rather than against
+    /// source text.**
+    ///
+    /// **Written because the text scan could not see reachability.**
+    /// `source_guards` asserted that `zero_bytes(&mut chunk)` appears
+    /// *somewhere in the file*, so rewriting `Ok(0) => break` as an
+    /// ordinary early return left it green 8/8 with every provider unit
+    /// green — and the last 8 KiB of **every** credential on the reader
+    /// thread's stack, on the ordinary success path. That is the exact
+    /// class the guard's own failure message describes.
+    ///
+    /// The remedy is a `Drop` rather than a statement, so this row asks
+    /// the only question left: *did the buffer really end up zero?*
+    /// `secret::request`'s `the_submitted_value_is_zeroed_after_the_write`
+    /// is the same idiom; the provider path had none.
+    ///
+    /// **Every exit of the loop, including the two a real provider does
+    /// not produce on demand.** `drain_bounded` is called directly rather
+    /// than through `run` for two reasons: a reader that errors or
+    /// over-runs is trivial to write and impossible to schedule, and the
+    /// witness is thread-local — which is what keeps it load-insensitive
+    /// — so the call has to be on this thread.
+    #[test]
+    fn the_readers_scratch_chunk_is_zeroed_on_every_exit() {
+        /// A reader that yields `first` and then behaves as `then`.
+        struct Then(Vec<u8>, std::io::ErrorKind, bool);
+        impl Read for Then {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.0.is_empty() {
+                    let n = self.0.len().min(buf.len());
+                    buf[..n].copy_from_slice(&self.0[..n]);
+                    self.0.drain(..n);
+                    return Ok(n);
+                }
+                if self.2 {
+                    Ok(0)
+                } else {
+                    Err(std::io::Error::from(self.1))
+                }
+            }
+        }
+
+        let probe = PROBE.as_bytes().to_vec();
+        let cases: Vec<(&str, Then, usize)> = vec![
+            // EOF — the ordinary success path, and the one the deleted
+            // statement was reachable from.
+            (
+                "eof",
+                Then(probe.clone(), std::io::ErrorKind::Other, true),
+                4096,
+            ),
+            // The byte budget, which returns from the top of the loop.
+            (
+                "over the budget",
+                Then(probe.clone(), std::io::ErrorKind::Other, true),
+                1,
+            ),
+            // A read error, which is its own arm.
+            (
+                "a read error",
+                Then(probe.clone(), std::io::ErrorKind::BrokenPipe, false),
+                4096,
+            ),
+        ];
+
+        for (label, mut reader, cap) in cases {
+            scratch_witness::reset();
+            let drained = drain_bounded(&mut reader, cap);
+            // The control: the credential really did pass through the
+            // chunk on this exit, so "the chunk is zero" is a fact about
+            // zeroing rather than about a reader that read nothing.
+            assert!(
+                !drained.bytes.is_empty(),
+                "{label}: nothing was read, so the chunk never held the value"
+            );
+            drop(drained);
+
+            let seen = scratch_witness::taken();
+            assert_eq!(
+                seen.len(),
+                1,
+                "{label}: the scratch buffer was not disposed of exactly once"
+            );
+            assert!(
+                seen[0].iter().all(|&b| b == 0),
+                "{label}: the reader's scratch chunk kept {} non-zero byte(s) — up to \
+                 8 KiB of the credential, left on a thread's stack",
+                seen[0].iter().filter(|&&b| b != 0).count()
+            );
+        }
+
+        // **The pairing, and the reason the assertion above is not
+        // vacuous**: the witness is capable of reporting a dirty buffer,
+        // and does when it is handed one.
+        scratch_witness::reset();
+        scratch_witness::record(PROBE.as_bytes());
+        let control = scratch_witness::taken();
+        assert_eq!(control, vec![PROBE.as_bytes().to_vec()]);
     }
 
     /// **GH #126: the deadline covers *collection*, not the direct
