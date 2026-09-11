@@ -20,8 +20,9 @@ use crate::output::rules::builtin_shared;
 use crate::output::OutputProcessor;
 use crate::session::SessionRegistry;
 use rmcp::model::{
-    Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
+    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{tool_handler, ErrorData, RoleServer, ServerHandler, ServiceExt};
@@ -482,6 +483,59 @@ pub fn shim_capabilities() -> ServerCapabilities {
 
 #[tool_handler]
 impl ServerHandler for HoldfastServer {
+    /// **Hand-written so the request context has a scope on this
+    /// transport too** (GH #127).
+    ///
+    /// `#[tool_handler]` generates exactly this body — `ToolCallContext::new`
+    /// then `Self::tool_router().call(tcc)` — and skips generating it when
+    /// the impl already has one, which is what makes overriding it a
+    /// two-line addition rather than a fork of the macro.
+    ///
+    /// **Without it, `--no-daemon` had no cancellation at all.**
+    /// `daemon::server::dispatch_tool` opens the
+    /// [`crate::request::with_context`] scope for the hybrid transport,
+    /// and `serve_stdio` does not go through it — so `request::current()`
+    /// answered `detached()`, a token that is never cancelled, and an MCP
+    /// `notifications/cancelled` reached nothing. The two transports now
+    /// open the same scope from the two places a cancellation can come
+    /// from.
+    ///
+    /// **rmcp does not abort the handler**, it fires `context.ct` and
+    /// still delivers whatever the handler returns, so the bridge below is
+    /// the whole mechanism: fire our signal when rmcp fires its token, and
+    /// keep awaiting the call. That keeps cancellation cooperative, which
+    /// is the property the daemon path depends on as well.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let signal = crate::request::CancelSignal::new();
+        // Cloned before `context` is moved into the tool-call context.
+        let ct = context.ct.clone();
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let router = Self::tool_router();
+        let call = crate::request::with_context(
+            crate::request::RequestContext::with_cancel(signal.clone()),
+            router.call(tcc),
+        );
+        tokio::pin!(call);
+        let mut told = false;
+        loop {
+            tokio::select! {
+                // The call first: a handler that has already answered is
+                // not one that was cancelled, and `select!` is random
+                // without this.
+                biased;
+                r = &mut call => return r,
+                () = ct.cancelled(), if !told => {
+                    told = true;
+                    signal.cancel();
+                }
+            }
+        }
+    }
+
     fn get_info(&self) -> ServerInfo {
         // ServerInfo (= InitializeResult) and Implementation are
         // #[non_exhaustive]: build from Default, then assign.

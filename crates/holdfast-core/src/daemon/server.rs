@@ -622,12 +622,27 @@ impl Daemon {
     /// **One lock order, stated because there are two locks.** The ring
     /// is taken and released before the map is, never the other way
     /// round, and no path takes both at once.
-    fn register_call(&self, token: &str) -> CancelSignal {
+    fn register_call(&self, token: &str, signal: &CancelSignal) -> bool {
+        // **Refused rather than overwritten when the token is already in
+        // flight**, and the map is keyed by a string a *client* supplies.
+        // A bare `insert` would drop the first call's signal on the floor:
+        // a `holdfast/cancel` for that token would then reach only the
+        // second, and the first would run its whole window having been
+        // asked to stop. Refusing costs the second call its
+        // *token*-addressed cancellation and nothing else -- it keeps the
+        // context, so its caller going away still ends it.
+        {
+            let mut in_flight = self.in_flight_calls.lock();
+            if in_flight.contains_key(token) {
+                return false;
+            }
+            in_flight.insert(token.to_string(), signal.clone());
+        }
+        // Removed on the way out. A token is one call, so a pre-emptive
+        // cancel is spent by the call it was for and cannot reach a later
+        // call that reuses the string.
         let already = {
             let mut ring = self.recently_cancelled.lock();
-            // Removed on the way out. A token is one call, so a
-            // pre-emptive cancel is spent by the call it was for and
-            // cannot reach a later call that reuses the string.
             match ring.iter().position(|t| t == token) {
                 Some(i) => {
                     ring.remove(i);
@@ -636,14 +651,10 @@ impl Daemon {
                 None => false,
             }
         };
-        let signal = CancelSignal::new();
         if already {
             signal.cancel();
         }
-        self.in_flight_calls
-            .lock()
-            .insert(token.to_string(), signal.clone());
-        signal
+        true
     }
 
     /// Drop a finished call's registration.
@@ -1731,6 +1742,12 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
     daemon.note_client_connect();
 
     loop {
+        // One per request, and handed to `dispatch` rather than made
+        // there: the peer-gone watch below has to be able to fire it, and
+        // it is the same signal `holdfast/cancel` reaches through the
+        // daemon's in-flight map. Two ways for a caller to go away, one
+        // ending.
+        let cancel = CancelSignal::new();
         let req: Request = match frame::read_frame(&mut stream).await {
             Ok(r) => r,
             Err(FrameError::Eof) => return,
@@ -1782,7 +1799,50 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
             return;
         }
 
-        let (resp, stop_after) = dispatch(&daemon, &req, client_kind).await;
+        // **GH #127: a peer that goes away without cancelling.**
+        //
+        // This loop reads one frame, dispatches it to completion, and only
+        // discovers the socket is gone when it writes the response -- so a
+        // shim that was killed, or a client that simply closed, leaves the
+        // call running for its whole window. For `request_secret_input`
+        // that is the session's one secret slot held for up to 120 s by a
+        // request nobody is waiting for, which is the symptom GH #127
+        // reports, reached without any cancel at all.
+        //
+        // **The remedy has to be the daemon's**, because the other end of
+        // the argument is a process that no longer exists: a shim that has
+        // been killed cannot send `holdfast/cancel`. So the dispatch is
+        // raced against the connection's own ending, and a peer that has
+        // gone is treated as a caller that cancelled -- which it is.
+        //
+        // **The call is still awaited afterwards**, and that is the whole
+        // design: cancellation stays cooperative. Dropping an arbitrary
+        // tool future here would abort it mid-`await` -- dropping
+        // `request_secret_input`'s receiver while its slot still held the
+        // sender is GH #127's own bug from the other side. A tool that
+        // reads the signal ends; one that does not runs to completion and
+        // its response is written into a socket nobody reads, exactly as
+        // today.
+        let (resp, stop_after) = {
+            let call = dispatch(&daemon, &req, client_kind, &cancel);
+            tokio::pin!(call);
+            let gone = peer_gone(&stream);
+            tokio::pin!(gone);
+            let mut told = false;
+            loop {
+                tokio::select! {
+                    // The call first: a dispatch that has already finished
+                    // is not a caller that went away, and `select!` is
+                    // random without this.
+                    biased;
+                    r = &mut call => break r,
+                    () = &mut gone, if !told => {
+                        told = true;
+                        cancel.cancel();
+                    }
+                }
+            }
+        };
         if !write_response(&mut stream, req.id, &resp).await {
             return;
         }
@@ -1792,6 +1852,65 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
         if stop_after {
             daemon.shutdown();
             return;
+        }
+    }
+}
+
+/// Resolve when this connection's peer has gone away; park otherwise.
+///
+/// **`MSG_PEEK` and not a read**, because the byte stream is not ours to
+/// consume: `handle_connection` owns the framing, and a watcher that took
+/// a byte would corrupt the next request. Peeking answers the one
+/// question asked here -- *is this socket at EOF?* -- and leaves whatever
+/// is there for the reader that owns it.
+///
+/// **Readable means "a read would not block", which includes EOF**, and
+/// that is why a readiness wait is enough: a closed peer makes the socket
+/// permanently readable with zero bytes to take.
+///
+/// Three endings, and each is deliberate:
+///
+/// * **0 bytes** -- the peer closed. This is the one the caller acts on.
+/// * **more than 0** -- the peer pipelined a request behind the one in
+///   flight. §7.4.1's control protocol is strictly request/response, so
+///   this is not a peer going away; the watcher parks for good rather
+///   than spinning on a readiness that will not clear until the reader
+///   that owns those bytes takes them.
+/// * **any error but `WouldBlock`** -- a socket this daemon cannot ask
+///   about is one it cannot answer into either, so it counts as gone.
+///   `WouldBlock` is the ordinary spurious-readiness case and is what
+///   `try_io` exists to clear.
+#[cfg(unix)]
+async fn peer_gone(stream: &UnixStream) {
+    use std::os::fd::AsRawFd;
+    loop {
+        if stream.ready(tokio::io::Interest::READABLE).await.is_err() {
+            return;
+        }
+        let peeked = stream.try_io(tokio::io::Interest::READABLE, || {
+            let mut byte = [0u8; 1];
+            // SAFETY: a valid borrowed fd, a one-byte buffer this call
+            // owns for its duration, and a flag set that neither consumes
+            // nor blocks.
+            let n = unsafe {
+                libc::recv(
+                    stream.as_raw_fd(),
+                    byte.as_mut_ptr().cast(),
+                    1,
+                    libc::MSG_PEEK,
+                )
+            };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(n)
+            }
+        });
+        match peeked {
+            Ok(0) => return,
+            Ok(_) => std::future::pending::<()>().await,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(_) => return,
         }
     }
 }
@@ -1983,6 +2102,7 @@ async fn dispatch(
     daemon: &Arc<Daemon>,
     req: &Request,
     client_kind: ClientKind,
+    cancel: &CancelSignal,
 ) -> (Response, bool) {
     match req.method.as_str() {
         method::METHOD_RESOURCE_LIST
@@ -2059,7 +2179,10 @@ async fn dispatch(
                     false,
                 );
             };
-            (dispatch_tool(daemon, req, tool, client_kind).await, false)
+            (
+                dispatch_tool(daemon, req, tool, client_kind, cancel).await,
+                false,
+            )
         }
     }
 }
@@ -2242,6 +2365,7 @@ async fn dispatch_tool(
     req: &Request,
     tool: &str,
     client_kind: ClientKind,
+    cancel: &CancelSignal,
 ) -> Response {
     let args: serde_json::Value = match method::from_cbor(&req.params) {
         Ok(v) => v,
@@ -2264,20 +2388,20 @@ async fn dispatch_tool(
     // caller identity already does. `None` when the client sent no
     // `cancel_token`, which is every CLI call and every peer speaking
     // protocol 1.1.
-    let registration = req.cancel_token.as_ref().map(|token| {
-        let signal = daemon.register_call(token);
-        (
-            CallRegistration {
-                daemon: Arc::clone(daemon),
-                token: token.clone(),
-            },
-            signal,
-        )
-    });
-    let ctx = match &registration {
-        Some((_, signal)) => crate::request::RequestContext::with_cancel(signal.clone()),
-        None => crate::request::RequestContext::detached(),
-    };
+    let _registration = req
+        .cancel_token
+        .as_ref()
+        .filter(|token| daemon.register_call(token, cancel))
+        .map(|token| CallRegistration {
+            daemon: Arc::clone(daemon),
+            token: token.clone(),
+        });
+    // **Scoped whether or not a token was registered** (GH #127). The
+    // token is how a *live* peer asks; the connection ending is how a dead
+    // one does, and `handle_connection` fires the same signal for that. A
+    // call with no token is still cancellable by its caller going away, so
+    // it still gets the context rather than `detached()`.
+    let ctx = crate::request::RequestContext::with_cancel(cancel.clone());
     let call = async {
         // Read back from *inside* the scope rather than trusting `who`.
         // Recording `who` here would still pass if the `with_caller`
@@ -2444,7 +2568,7 @@ mod tests {
         paths.ensure_dir().unwrap();
         let daemon = Daemon::new(paths);
         let req = forged_read_output("cli");
-        let (_resp, _stop) = dispatch(&daemon, &req, kind).await;
+        let (_resp, _stop) = dispatch(&daemon, &req, kind, &CancelSignal::new()).await;
         let _ = std::fs::remove_dir_all(&dir);
         OBSERVED.with(|o| o.get())
     }
@@ -2751,12 +2875,28 @@ mod tests {
         let daemon = Daemon::new(paths);
 
         assert_eq!(daemon.cancellable_calls_in_flight(), 0);
-        let signal = daemon.register_call("tok-a");
+        let signal = CancelSignal::new();
+        assert!(
+            daemon.register_call("tok-a", &signal),
+            "the first registration was refused"
+        );
         assert_eq!(daemon.cancellable_calls_in_flight(), 1);
         assert!(
             !signal.is_cancelled(),
             "a fresh registration starts cancelled"
         );
+
+        // **A token already in flight is refused, not overwritten.** A
+        // bare `insert` would orphan the first call's signal, on a map an
+        // agent supplies the keys to -- and a `holdfast/cancel` for that
+        // token would then reach only the second, leaving the first
+        // running its whole window having been asked to stop.
+        let second = CancelSignal::new();
+        assert!(
+            !daemon.register_call("tok-a", &second),
+            "a duplicate token was accepted, so the first call's signal is orphaned"
+        );
+        assert_eq!(daemon.cancellable_calls_in_flight(), 1);
 
         // A token nobody registered is not an error and cancels nothing.
         assert!(
@@ -2772,6 +2912,10 @@ mod tests {
         assert!(
             signal.is_cancelled(),
             "the registered call was not signalled"
+        );
+        assert!(
+            !second.is_cancelled(),
+            "the refused duplicate was signalled, so the map kept two owners for one key"
         );
 
         daemon.finish_call("tok-a");
@@ -2813,7 +2957,8 @@ mod tests {
             !daemon.cancel_call("early"),
             "a pre-emptive cancel claimed to have signalled a call that does not exist"
         );
-        let signal = daemon.register_call("early");
+        let signal = CancelSignal::new();
+        assert!(daemon.register_call("early", &signal));
         assert!(
             signal.is_cancelled(),
             "the call registered after its own cancel and never learned about it"
@@ -2822,7 +2967,8 @@ mod tests {
         // Spent. A second registration under the same token is a second
         // call and is not cancelled by the first one's cancel.
         daemon.finish_call("early");
-        let again = daemon.register_call("early");
+        let again = CancelSignal::new();
+        assert!(daemon.register_call("early", &again));
         assert!(
             !again.is_cancelled(),
             "the remembered cancel outlived its claim and cancelled a later call"
@@ -2848,15 +2994,19 @@ mod tests {
         }
         // The oldest are gone: a call registering under `tok-0` now is
         // not cancelled.
+        let oldest = CancelSignal::new();
+        assert!(daemon.register_call("tok-0", &oldest));
         assert!(
-            !daemon.register_call("tok-0").is_cancelled(),
+            !oldest.is_cancelled(),
             "the ring kept every token it was ever given"
         );
         // The newest survive, so the eviction is oldest-first rather
         // than "stop recording once full".
         let newest = format!("tok-{}", RECENTLY_CANCELLED_CAPACITY + 9);
+        let latest = CancelSignal::new();
+        assert!(daemon.register_call(&newest, &latest));
         assert!(
-            daemon.register_call(&newest).is_cancelled(),
+            latest.is_cancelled(),
             "the ring stopped recording instead of evicting, so a cancel that arrived \
              under load was dropped"
         );
@@ -2880,7 +3030,7 @@ mod tests {
             req.cancel_token.is_none(),
             "the fixture carries a token, so this row cannot see the difference"
         );
-        let (_resp, _stop) = dispatch(&daemon, &req, ClientKind::Cli).await;
+        let (_resp, _stop) = dispatch(&daemon, &req, ClientKind::Cli, &CancelSignal::new()).await;
         assert_eq!(
             daemon.cancellable_calls_in_flight(),
             0,
@@ -2911,7 +3061,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (resp, stop) = dispatch(&daemon, &miss, ClientKind::Shim).await;
+        let (resp, stop) = dispatch(&daemon, &miss, ClientKind::Shim, &CancelSignal::new()).await;
         assert!(!stop, "a cancel must not stop the daemon");
         assert!(
             !resp.is_error(),
@@ -2920,7 +3070,8 @@ mod tests {
         let outcome: method::CancelOutcome = resp.data_as().unwrap();
         assert!(!outcome.cancelled);
 
-        let signal = daemon.register_call("live");
+        let signal = CancelSignal::new();
+        assert!(daemon.register_call("live", &signal));
         let hit = Request::new(
             2,
             method::METHOD_CANCEL,
@@ -2929,7 +3080,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (resp, _) = dispatch(&daemon, &hit, ClientKind::Shim).await;
+        let (resp, _) = dispatch(&daemon, &hit, ClientKind::Shim, &CancelSignal::new()).await;
         let outcome: method::CancelOutcome = resp.data_as().unwrap();
         assert!(
             outcome.cancelled,
@@ -2941,7 +3092,7 @@ mod tests {
         // `ok` — `daemon/stop` was the method that answered `ok` to
         // structurally garbage params, and this one does not inherit it.
         let junk = Request::new(3, method::METHOD_CANCEL, &json!({ "nope": 1 })).unwrap();
-        let (resp, _) = dispatch(&daemon, &junk, ClientKind::Shim).await;
+        let (resp, _) = dispatch(&daemon, &junk, ClientKind::Shim, &CancelSignal::new()).await;
         assert!(
             resp.is_error(),
             "garbage cancel params were accepted: {resp:?}"

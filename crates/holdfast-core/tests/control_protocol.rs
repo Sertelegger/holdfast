@@ -1221,6 +1221,121 @@ async fn a_request_without_a_cancel_token_is_answered_by_a_1_2_daemon() {
     assert_eq!(resp.id, 2);
 }
 
+/// **GH #127's own symptom on the transport Holdfast ships: a client
+/// that disconnects without cancelling must not keep the slot.**
+///
+/// The first version of this fix handled the two ways a caller goes away
+/// in the two modes the other does not. Hybrid got `holdfast/cancel`;
+/// `--no-daemon` got `AbandonedCall`'s `Drop`. But **nothing drops the
+/// daemon-side tool future in hybrid mode** — `handle_connection` reads
+/// one frame, dispatches it to completion, and only discovers the socket
+/// is gone when it writes the response — so a shim that was killed left
+/// the request exactly as GH #127 reports it:
+///
+/// ```text
+/// after disconnect: has_waiter=true
+/// replacement after 970µs: secret_cancelled reason="concurrent_request_pending"
+/// ```
+///
+/// That is the issue's *before*, measured on the branch that claimed to
+/// fix it, on the path users take.
+///
+/// **The remedy has to be the daemon's**, because a shim that has been
+/// killed cannot send anything: `handle_connection` races the dispatch
+/// against the connection's own ending and fires the call's cancellation
+/// when the peer goes. This row is that, end to end — a real socket, a
+/// real drop, no cancel sent.
+///
+/// **Dropping the client is the whole arrangement and it is not a
+/// stand-in for one.** `ControlClient` has no "disconnect" method; this
+/// is what a killed shim does to the daemon, byte for byte.
+#[tokio::test]
+async fn a_client_that_disconnects_without_cancelling_frees_the_slot() {
+    let d = TestDaemon::start("disconnect").await;
+    let client = d.client().await.unwrap();
+    let id = start_script(
+        &client,
+        "disconnsess",
+        "stty -echo; printf 'Password: '; read x; stty echo; printf 'done\\n'",
+    )
+    .await;
+    read_until(&client, &id, "Password: ").await;
+
+    // A second client, because this one is about to be dropped and the
+    // row still has to ask the daemon questions afterwards.
+    let observer = d.client().await.unwrap();
+
+    let params = method::to_cbor(&json!({
+        "session": id,
+        "prompt_text": "a credential",
+        // Ten minutes: nothing but the disconnect can end this inside the
+        // row's ceiling, so a green row is the disconnect working and not
+        // a deadline firing.
+        "timeout_secs": 600,
+    }))
+    .unwrap();
+    // **The client is moved in**, so aborting the task drops it *and* the
+    // connection `call_raw` has checked out — which is the socket closing
+    // with a request outstanding, byte for byte what a killed shim does.
+    let task = tokio::spawn(async move {
+        let _ = client.call_raw("tool/request_secret_input", params).await;
+    });
+
+    // The call is really parked on the prompt before anything is dropped.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !d.daemon.attach_hub().secrets().has_waiter(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the call never registered a waiter, so there is nothing to abandon"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // **The caller goes away**, and sends nothing on its way out. The
+    // task holding the round trip goes with it, which is what a killed
+    // shim looks like: the socket closes with a request outstanding.
+    task.abort();
+    let _ = task.await;
+
+    // The daemon notices, and the slot comes back.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while d.daemon.attach_hub().secrets().has_waiter(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the disconnected client still holds the session's secret slot — GH #127's \
+             own symptom, on the transport Holdfast ships"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // And a replacement is not refused, which is the consequence the
+    // issue reports and the one an agent feels.
+    let params = method::to_cbor(&json!({
+        "session": id,
+        "prompt_text": "the credential it actually needs",
+        "timeout_secs": 2,
+    }))
+    .unwrap();
+    let resp = observer
+        .call_raw("tool/request_secret_input", params)
+        .await
+        .unwrap();
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    assert_ne!(
+        data["reason"], "concurrent_request_pending",
+        "the abandoned call still holds the slot: {} {data}",
+        resp.status
+    );
+    // The pairing: the replacement really did run as an ordinary call and
+    // wait out its own window, rather than being refused for some other
+    // reason.
+    assert_eq!(
+        data["reason"], "timeout",
+        "the replacement did not take the prompt path: {} {data}",
+        resp.status
+    );
+}
+
 /// **GH #127, end to end over a real socket: a cancel on a second
 /// connection ends an in-flight `request_secret_input`.**
 ///

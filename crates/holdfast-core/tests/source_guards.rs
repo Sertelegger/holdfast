@@ -841,7 +841,12 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
     // until it is named here deliberately.
     const ALLOWED: [&str; 4] = [
         "let bytes = super::secret::SecretBytes::received(bytes);",
-        ".is_some_and(|cap| bytes.len() > cap as usize);",
+        // The cap comparison. It reads a **length** and nothing else; the
+        // `is_some_and` spelling became a statement of its own when the
+        // unadopted-raise fall-back to `max_secret_bytes_ceiling` landed
+        // (GH #126's class), and the property this guard is about — no
+        // copy leaves the zeroing type — is unchanged either way.
+        "let over_cap = bytes.len() > cap as usize;",
         "drop(bytes);",
         "WriteRequest::secret(bytes.normalised(raised.append_newline));",
     ];

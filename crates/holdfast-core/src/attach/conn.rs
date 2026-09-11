@@ -879,12 +879,34 @@ async fn read_loop(
                 // newline habit put it — and an implementation that
                 // normalised first has already built the short-lived type
                 // around a value it is about to throw away.
-                let over_cap = daemon
+                //
+                // **An unadopted raise inherits the operator's ceiling
+                // rather than no bound at all** (GH #126's class, found
+                // by review of GH #127). `RaisedRequest.max_secret_bytes`
+                // is a *waiting call's* argument, so every raise with no
+                // call on it carries `None` — §7.5's replay, §8.3's echo
+                // drop, and the re-raise a caller's ending leaves behind.
+                // Read as "unbounded", the only thing left standing
+                // between a human's keystrokes and the child is
+                // `MAX_FRAME_BYTES`, 16 MiB, against an operator ceiling
+                // of 64 KiB. `[security] max_secret_bytes_ceiling` is the
+                // operator's stated limit on every credential this daemon
+                // will accept from any path, so the paths with no caller
+                // to narrow it inherit the widest thing the operator
+                // agreed to — the same reading `autofill_on_echo_drop`
+                // gives the unattended provider path, for the same
+                // reason. A limit accepted and not applied is worse than
+                // one refused.
+                let ceiling = daemon.server.config.security.max_secret_bytes_ceiling;
+                let cap = daemon
                     .attach_hub()
                     .secrets()
                     .submission_bounds(&conn.session_id, &request_id)
-                    .and_then(|(cap, _)| cap)
-                    .is_some_and(|cap| bytes.len() > cap as usize);
+                    .map_or(ceiling, |(cap, _)| cap.unwrap_or(ceiling));
+                // Widened to `usize` rather than narrowing the length:
+                // a cast the other way truncates, and a truncation here
+                // turns an oversized submission into an accepted one.
+                let over_cap = bytes.len() > cap as usize;
 
                 // The request is closed **before** the write is queued and
                 // by the same atomic step that decides whether this

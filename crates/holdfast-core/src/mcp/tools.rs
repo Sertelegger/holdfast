@@ -1944,6 +1944,37 @@ impl HoldfastServer {
         // secret-shaped value in the modal they are about to type into.
         let prompt_text = redact_for_display(&self.processor.rules, &args.prompt_text);
 
+        // **GH #127: a call already cancelled raises nothing.**
+        //
+        // Without this the cancel is noticed one step later, by
+        // `await_secret` — which is correct but loud: the raise has
+        // already broadcast `AwaitingSecret(R1)` to every attached
+        // client, the cancel arm closes it, and its re-raise broadcasts
+        // `AwaitingSecret(R2)`. Three frames and an audit pair for a
+        // request that could never be answered, because the window they
+        // describe was over before it opened. §17.5's approval is a
+        // human-scale wait sitting directly above this line, so a cancel
+        // landing inside it is the ordinary case rather than a corner.
+        //
+        // **No `request_id`, and no §9.4 pair either.** There is no
+        // request: §5.2 writes `secret_input_request` per *raised or
+        // adopted* request and this call raised none, so a lone
+        // `secret_input_resolved` would name nothing and a
+        // `secret_input_request` with no id would not be §9.4's shape.
+        // `schema::RequestSecretInput.request_id` is an `Option` and this
+        // is the one path that leaves it unset.
+        //
+        // **The child's affordance is left exactly as found.** Whatever
+        // raise §8.3's edge produced is still outstanding and still
+        // answerable by a human; this call simply never joined it.
+        if ctx.is_cancelled() {
+            return Ok(envelope::envelope(
+                Status::SecretCancelled,
+                json!({ "reason": CancelReason::CallerCancelled.as_str() }),
+                "the request was cancelled by its caller before a secret was requested",
+            ));
+        }
+
         // REQ-SEC-010a. Raise if the slot is vacant, **adopt** if an echo
         // drop already raised one — §16.4 steps 3–7 are an adoption end
         // to end, so that is the ordinary case — and collide only if the
@@ -2568,7 +2599,13 @@ impl HoldfastServer {
         let exit = session_exit(session, &mut events);
         tokio::pin!(exit);
 
+        // `biased`, and the order is `await_secret`'s for the same
+        // reason: a decision outranks everything, the session's own
+        // ending outranks the caller's, cancellation outranks the clock,
+        // and the clock is last because it is the only one of the four
+        // that is true of nothing having happened.
         let woke = tokio::select! {
+            biased;
             r = &mut rx => match r {
                 Ok(decided) => ApprovalWoke::Decided(decided),
                 // The sender went away without answering: somebody took
@@ -2576,8 +2613,17 @@ impl HoldfastServer {
                 // `Superseded` however it was reached.
                 Err(_) => ApprovalWoke::Superseded,
             },
-            _ = &mut sleep => ApprovalWoke::Deadline,
             _ = &mut exit => ApprovalWoke::Exited,
+            // **GH #127.** §17.5's window is human-scale — up to half of
+            // `timeout_secs`, 60 s on shipped defaults — and a caller can
+            // go away inside it. Without this arm the approval ran to its
+            // own deadline with nobody waiting for the answer, and a human
+            // could still **approve** it: a `binding_approval` audit line
+            // reading `approved`, a credential read out of a store, and no
+            // caller for either. This module's own words for that are
+            // *"a credential read out of a store nobody agreed to read"*.
+            _ = ctx.cancelled() => ApprovalWoke::Cancelled,
+            _ = &mut sleep => ApprovalWoke::Deadline,
         };
 
         // **Each arm is written out, and the two that may read the
@@ -2634,6 +2680,38 @@ impl HoldfastServer {
                         // normally alive, which is why the old fold's
                         // blanket `session_died` was wrong on this path.
                         _ => lost_approval(session),
+                    }
+                }
+            }
+
+            // **The caller went away** (GH #127). Same discipline as
+            // every other non-decision arm: the slot is taken under the
+            // lock *first*, because a decision that landed between the
+            // wake and this line is the truth and the cancel is not — and
+            // taking it is also what stops a human approving a request
+            // nobody is waiting for, which is the harm this arm exists
+            // for.
+            //
+            // **Classified `Discarded`, so the call falls through**, and
+            // one statement later the pre-raise check above answers the
+            // agent `caller_cancelled`. The word is produced in one place
+            // rather than two that could drift. `Discarded` also carries
+            // §17.5's *"approval discarded; no injection"* and writes no
+            // audit line, which is right: nobody decided.
+            ApprovalWoke::Cancelled => {
+                if hub
+                    .approvals()
+                    .expire(&session.id, &approval.approval_id)
+                    .is_some()
+                {
+                    ApprovalEnd::Discarded
+                } else {
+                    // Somebody decided between the wake and the lock.
+                    // Their answer is on our receiver and has not been
+                    // polled to completion, so reading it is legal.
+                    match tokio::time::timeout(SECRET_HANDOVER_GRACE, &mut rx).await {
+                        Ok(Ok(d)) => ApprovalEnd::Decided(d),
+                        _ => ApprovalEnd::Discarded,
                     }
                 }
             }
@@ -3205,7 +3283,37 @@ impl HoldfastServer {
         let ended = secret_condition_ended(session, &mut events);
         tokio::pin!(ended);
 
+        // **`biased`, and the order below is the policy rather than the
+        // order the arms were written in.**
+        //
+        // `select!` is random by default, and this is the one site where
+        // the word for how a request ended reaches the agent, every
+        // attached client's frame and the audit trail at once. Two arms
+        // are routinely ready together — a cancel and the deadline it
+        // raced — and a random choice reports one ending as the other
+        // about half the time. Measured in this arm shape: the deadline
+        // won 1127/2000 and 1041/2000. That is the GH #105 class, which
+        // this whole path exists to keep apart.
+        //
+        // The order, and why each step is where it is:
+        //
+        // 1. **`rx`** — somebody *answered*. A delivered credential
+        //    outranks every other ending there is; reporting a fulfilled
+        //    request as anything else is GH #105 itself.
+        // 2. **the session's edge** — the child exited, or echo came
+        //    back. §5.1's `session_died` is a truth about the session,
+        //    and `Woke::Exited` is deliberately the one arm that does not
+        //    re-raise, so letting a cancel preempt it would hand a human
+        //    an affordance pointing at a dead child.
+        // 3. **cancellation** — the caller is gone. This is the step the
+        //    measurement is about: it must beat the clock, exactly as
+        //    `RequestContext::ended` already says ("cancellation is
+        //    checked first ... a human at an attached client needs the
+        //    first") and as `provider::run` already does.
+        // 4. **the deadline** — the clock, last, because it is the only
+        //    one of the four that is true of *nothing that happened*.
         let woke = tokio::select! {
+            biased;
             r = rx.recv() => match r {
                 Ok(resolution) => return resolution,
                 // The answering half went away without answering. Fall
@@ -3213,8 +3321,10 @@ impl HoldfastServer {
                 // happened rather than inventing a reason here.
                 Err(_) => Woke::Deadline,
             },
-            // `&mut sleep`, so the receiver is still ours afterwards.
-            _ = &mut sleep => Woke::Deadline,
+            end = &mut ended => match end {
+                SecretEnded::Exited(code) => Woke::Exited(code),
+                SecretEnded::EchoReturned => Woke::EchoReturned,
+            },
             // **GH #127's arm, and it is a fourth ending rather than a
             // spelling of one of the three.** A caller that cancelled and
             // a deadline that elapsed are different facts — one about who
@@ -3222,10 +3332,8 @@ impl HoldfastServer {
             // comes from reporting one ending as another. The close below
             // keeps them apart all the way to the attached client's frame.
             _ = ctx.cancelled() => Woke::Cancelled,
-            end = &mut ended => match end {
-                SecretEnded::Exited(code) => Woke::Exited(code),
-                SecretEnded::EchoReturned => Woke::EchoReturned,
-            },
+            // `&mut sleep`, so the receiver is still ours afterwards.
+            _ = &mut sleep => Woke::Deadline,
         };
 
         let hub = self.attach_hub();
@@ -4135,6 +4243,9 @@ enum ApprovalWoke {
     Deadline,
     /// The child ended (§17.5's `Superseded`).
     Exited,
+    /// GH #127: the MCP request this approval was being raised for was
+    /// cancelled by its caller.
+    Cancelled,
     /// The registry entry went away without a decision, so the sender was
     /// dropped and **the receiver completed inside the `select!`**.
     ///

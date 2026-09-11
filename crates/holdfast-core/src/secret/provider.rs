@@ -618,6 +618,39 @@ fn run(
     // milestone compiles for Windows, and an uncompiled `#[cfg]` arm is
     // worse than a named gap.
 
+    // **GH #127: an ended request touches no credential store.**
+    //
+    // The bounded loop below refuses an expired or cancelled request, but
+    // it refuses it *after* the spawn — and the spawn is the whole cost
+    // that matters here. `op read` wakes a biometric helper; `pass show`
+    // wakes `gpg`, which wakes `pinentry` and puts a modal in front of a
+    // human. Doing that for a request whose caller has already gone is
+    // this module's own objection to speculative resolution — *"a
+    // credential read out of a store nobody agreed to read"* — arrived at
+    // from the other end.
+    //
+    // **Sited here, at the last statement before the fork**, so the
+    // window between the test and the `exec` is the fork itself. The
+    // §17.5 approval and the `spawn_blocking` hop both sit above it and
+    // are exactly where a cancel lands.
+    //
+    // The `max_uses` claim is `resolve_selected`'s and is refunded on
+    // every `Err` from here, including this one.
+    {
+        let now = Clock::system().now();
+        if let Some(ended) = ctx.ended(now) {
+            return Err(match ended {
+                crate::request::RequestEnded::Cancelled => ProviderError::Cancelled {
+                    provider: name.to_string(),
+                },
+                crate::request::RequestEnded::Expired => ProviderError::TimedOut {
+                    provider: name.to_string(),
+                    secs: 0,
+                },
+            });
+        }
+    }
+
     // **Not a branch, and not a behaviour: a lock acquisition that is
     // compiled out entirely.** See [`exec_guard`] for the hazard. It is
     // sited here because this is the only `fork` in the module, and the
