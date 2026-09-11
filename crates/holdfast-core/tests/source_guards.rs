@@ -594,9 +594,10 @@ fn the_secret_frame_body_is_zeroed_before_the_arm_can_be_cancelled() {
     );
 }
 
-/// F-2's two sites that no runtime row can reach: the provider's pipe
-/// buffers are sized once, and the timeout path zeroes what its readers
-/// produced rather than detaching them.
+/// F-2's sites that no runtime row can reach: the provider's pipe
+/// buffers are sized once, every drained buffer is zeroed by its own
+/// type, and the expiry path disposes of its readers rather than
+/// detaching them.
 ///
 /// **Here because the fix wave's own argument for leaving these undriven
 /// stops one option short.** Its behavioural half is right — `drop_witness`
@@ -608,19 +609,28 @@ fn the_secret_frame_body_is_zeroed_before_the_arm_can_be_cancelled() {
 /// and the same wave reached for it one commit later, to pin the
 /// `NotClone` impls. A source scan is load-insensitive.
 ///
-/// What the two sites are worth. `read_to_end` on an empty `Vec` grows by
-/// doubling, and every doubling copies the credential read so far into a
-/// new block and frees the old one **without zeroing it**: one un-zeroed
-/// copy per reallocation, in memory nothing in this process can reach
-/// again. And on the timeout path `drop(out_reader); drop(err_reader);`
-/// detaches two threads that may be holding a *complete* credential — a
-/// provider that answered a millisecond after the deadline — and leaves it
-/// to an ordinary `Vec::drop`, which does not zero.
+/// What the sites are worth. A `Vec` that grows by doubling copies the
+/// credential read so far into a new block and frees the old one
+/// **without zeroing it**: one un-zeroed copy per reallocation, in memory
+/// nothing in this process can reach again. And on the expiry path a bare
+/// `drop` of a reader's channel detaches a thread that may be holding a
+/// *complete* credential — a provider that answered a millisecond after
+/// the deadline — and leaves it to an ordinary `Vec::drop`, which does not
+/// zero.
+///
+/// **Rewritten for GH #126's shape, and it got stronger rather than
+/// weaker.** The readers were `read_to_end` into a `Vec` handed back by a
+/// `JoinHandle`; they are now [`drain_bounded`] into a `Drained` handed
+/// over a channel, because a `JoinHandle` offers only an unbounded
+/// `join()` and the deadline had to cover collection. The zeroing moved
+/// with it — from `zero_bytes` calls the expiry path had to remember, to
+/// `Drained`'s own `Drop` — so what this row pins now is the *type*
+/// rather than the call sites, which is one claim instead of seven.
 ///
 /// **Code lines only, and paired with what must be present**, for the
-/// reason the scans above give: this module discusses `Vec::new` and the
-/// `drop` it replaced in its own prose, and an absence assertion over a
-/// file that lost everything is not evidence of anything.
+/// reason the scans above give: this module discusses `read_to_end` and
+/// the `drop` it replaced in its own prose, and an absence assertion over
+/// a file that lost everything is not evidence of anything.
 #[test]
 fn the_providers_credential_buffers_are_sized_once_and_zeroed_on_the_timeout_path() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -629,7 +639,7 @@ fn the_providers_credential_buffers_are_sized_once_and_zeroed_on_the_timeout_pat
     let code: Vec<&str> = text
         .lines()
         .map(str::trim_start)
-        .filter(|l| !l.starts_with("//"))
+        .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
         .collect();
 
     // The detector's own control, both directions.
@@ -640,85 +650,117 @@ fn the_providers_credential_buffers_are_sized_once_and_zeroed_on_the_timeout_pat
     );
     assert!(
         !code.iter().any(|l| l.starts_with("//")),
-        "the code-line filter kept comment lines, so this module's prose about `Vec::new` \
-         and about the `drop` it replaced counts as code"
+        "the code-line filter kept comment lines, so this module's prose about \
+         `read_to_end` and about the `drop` it replaced counts as code"
     );
 
-    // ------------------------------------ 1. both readers size, then fill
+    // ------------------------------------ 1. one reader, and it sizes once
     //
-    // Asserted as *adjacency* rather than as two counts: a file with one
-    // `with_capacity` and two `read_to_end`s satisfies "there are two of
-    // each" and still has a doubling reader in it.
-    let reads: Vec<usize> = code
+    // **One reader and not two**, which is itself the guarantee: with two
+    // hand-written loops a later edit can size one and not the other, and
+    // the pairing that used to check adjacency could not see a third.
+    assert_eq!(
+        code.iter()
+            .filter(|l| l.starts_with("fn drain_bounded("))
+            .count(),
+        1,
+        "the provider no longer has exactly one bounded pipe reader, so everything \
+         below is checking a shape that is not there"
+    );
+    assert!(
+        !code.iter().any(|l| l.contains("read_to_end(")),
+        "a `read_to_end` is back in the provider: it is unbounded in both directions \
+         at once — no byte budget (GH #126) and a doubling `Vec` that frees un-zeroed \
+         copies of the credential (F-2)"
+    );
+    let sized: Vec<&&str> = code
         .iter()
-        .enumerate()
-        .filter(|(_, l)| l.contains("read_to_end(&mut buf)"))
-        .map(|(i, _)| i)
+        .filter(|l| l.contains("Vec::with_capacity(") && l.contains("bytes"))
         .collect();
     assert_eq!(
-        reads.len(),
-        2,
-        "the provider no longer has exactly two `read_to_end` pipe readers, so the \
-         pairing below is not checking what it was written for: {reads:?}"
+        sized.len(),
+        1,
+        "the drained buffer is no longer sized exactly once: {sized:?}"
     );
-    for i in reads {
-        assert_eq!(
-            code[i - 1],
-            "let mut buf = Vec::with_capacity(capacity);",
-            "a pipe reader fills a buffer it did not size, so `read_to_end` grows it by \
-             doubling and every doubling frees an un-zeroed copy of the credential:\n{:?}",
-            &code[i - 1..=i]
-        );
-    }
     assert!(
-        code.iter()
-            .any(|l| l.starts_with("let capacity = PROVIDER_READ_CAPACITY;")),
-        "the readers' capacity is no longer `PROVIDER_READ_CAPACITY`; the size is the \
-         whole of the guarantee, and a smaller one is a doubling reader with extra steps"
+        sized[0].contains("PROVIDER_READ_CAPACITY"),
+        "the reader's capacity is no longer bounded by `PROVIDER_READ_CAPACITY`; the \
+         size is the whole of the guarantee, and a smaller one is a doubling reader \
+         with extra steps: {sized:?}"
+    );
+    // The stack chunk the loop reads through is the one copy that is not
+    // `bytes`, and its zeroing is a `Drop` rather than a statement.
+    //
+    // **This used to assert the statement, and that was the defect this
+    // guard is about.** A scan for text anywhere in a file cannot see
+    // *reachability*: rewriting `Ok(0) => break` as an early return left
+    // the string in place, this row green, and the last 8 KiB of every
+    // credential on the reader thread's stack. The behavioural half now
+    // lives in `the_readers_scratch_chunk_is_zeroed_on_every_exit`, which
+    // asks the buffer rather than the source; what is left here is the
+    // *shape* that makes an added exit harmless.
+    assert!(
+        text.contains("impl Drop for Scratch {") && text.contains("zero_bytes(&mut self.0);"),
+        "the reader's scratch buffer no longer zeroes on drop, so an exit added to \
+         `drain_bounded` leaves up to 8 KiB of the credential on a thread's stack"
+    );
+    assert!(
+        !code.iter().any(|l| l.contains("let mut chunk = [0u8;")),
+        "the scratch buffer is a bare array again, so its zeroing is a statement some \
+         exit can step around"
     );
 
-    // ------------------- 2. the timeout path zeroes rather than detaches
-    let timeout = text
-        .split_once("let Some(status) = exited else {")
-        .expect("the provider no longer has a timeout branch at all")
+    // ----------------------------- 2. the drained buffer zeroes itself
+    assert!(
+        text.contains("impl Drop for Drained {") && text.contains("zero_bytes(&mut self.bytes);"),
+        "`Drained` no longer zeroes on drop, so every exit that discards one — and \
+         there are seven — leaks a credential to an ordinary `Vec::drop`"
+    );
+
+    // ------------------- 3. the expiry path disposes rather than detaches
+    let expiry = text
+        .split_once("if let Some(ended) = over {")
+        .expect("the provider no longer has an expiry branch at all")
         .1;
-    let timeout = timeout
-        .split_once("return Err(ProviderError::TimedOut {")
-        .expect("the timeout branch no longer ends in a `TimedOut` error")
+    let expiry = expiry
+        .split_once("let secs = budget.as_secs();")
+        .expect("the expiry branch no longer ends in the budget it reports")
         .0;
-    let tcode: Vec<&str> = timeout
+    let ecode: Vec<&str> = expiry
         .lines()
         .map(str::trim_start)
         .filter(|l| !l.starts_with("//"))
         .collect();
 
     // The anti-vacuity pairing, and it is what makes the absence below
-    // mean something: this really is rule 5's kill-and-reap branch, and it
-    // really does still name both readers.
+    // mean something: this really is rule 5's kill-and-reap branch.
     assert!(
-        tcode.iter().any(|l| l.starts_with("kill_group(&child);")),
-        "the region scanned is not the timeout branch any more: {tcode:?}"
+        ecode.iter().any(|l| l.starts_with("kill_group(group);")),
+        "the region scanned is not the expiry branch any more: {ecode:?}"
     );
     assert!(
-        tcode
+        ecode
             .iter()
-            .any(|l| l.contains("for reader in [out_reader, err_reader]")),
-        "the timeout path no longer disposes of both readers by name, so a later edit \
-         that dropped one of them would be invisible here: {tcode:?}"
+            .any(|l| l.contains("detach_and_zero([out_rx, err_rx])")),
+        "the expiry path no longer disposes of both readers by name, so a later edit \
+         that dropped one of them would be invisible here: {ecode:?}"
     );
     assert!(
-        tcode.iter().any(|l| l.contains("reader.join()"))
-            && tcode.iter().any(|l| l.contains("zero_bytes(&mut buf)")),
-        "the timeout path no longer waits for its readers and zeroes what they read; a \
-         provider that answered a millisecond late leaves a complete credential to an \
-         ordinary `Vec::drop`, which does not zero: {tcode:?}"
-    );
-    assert!(
-        !tcode
+        !ecode
             .iter()
-            .any(|l| l.contains("drop(out_reader)") || l.contains("drop(err_reader)")),
-        "the timeout path detaches its readers again — F-2's fourth site, re-entering: \
-         {tcode:?}"
+            .any(|l| l.contains("drop(out_rx)") || l.contains("drop(err_rx)")),
+        "the expiry path detaches its readers again — F-2's fourth site, re-entering: \
+         {ecode:?}"
+    );
+    // And the collected halves go too: by GH #126 the loop can break
+    // `Some(ended)` with one pipe already drained, which is a complete
+    // credential in a local this branch must not simply return past.
+    assert!(
+        ecode.iter().any(|l| l.starts_with("drop(out);"))
+            && ecode.iter().any(|l| l.starts_with("drop(err);")),
+        "the expiry path no longer disposes of what it had already collected: a \
+         provider that answered just before the deadline leaves a whole credential \
+         in a local: {ecode:?}"
     );
 }
 
@@ -812,7 +854,12 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
     // until it is named here deliberately.
     const ALLOWED: [&str; 4] = [
         "let bytes = super::secret::SecretBytes::received(bytes);",
-        ".is_some_and(|cap| bytes.len() > cap as usize);",
+        // The cap comparison. It reads a **length** and nothing else; the
+        // `is_some_and` spelling became a statement of its own when the
+        // unadopted-raise fall-back to `max_secret_bytes_ceiling` landed
+        // (GH #126's class), and the property this guard is about — no
+        // copy leaves the zeroing type — is unchanged either way.
+        "let over_cap = bytes.len() > cap as usize;",
         "drop(bytes);",
         "WriteRequest::secret(bytes.normalised(raised.append_newline));",
     ];

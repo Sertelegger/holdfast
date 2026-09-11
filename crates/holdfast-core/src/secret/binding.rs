@@ -268,6 +268,7 @@ use std::collections::BTreeMap;
 use crate::attach::secret::SecretBytes;
 use crate::audit::AuditLog;
 use crate::config::{SecretBinding, SecurityConfig};
+use crate::request::RequestContext;
 use crate::session::Session;
 
 use super::provider::{resolve, ProviderError};
@@ -642,6 +643,7 @@ pub fn autofill(
     session: &Session,
     append_newline: bool,
     audit: &AuditLog,
+    ctx: &RequestContext,
 ) -> Autofill {
     // Step 1's gate. Checked **before** anything looks at a binding, so
     // that under the default mode no config-authored reference is even
@@ -670,7 +672,7 @@ pub fn autofill(
         });
     }
 
-    resolve_selected(security, session, binding, append_newline, audit)
+    resolve_selected(security, session, binding, append_newline, audit, ctx)
 }
 
 /// §17.5's `Approved` arm: the rest of §5.2's step 1, for a binding a
@@ -701,6 +703,7 @@ pub fn autofill_approved(
     approved_binding: &str,
     append_newline: bool,
     audit: &AuditLog,
+    ctx: &RequestContext,
 ) -> Autofill {
     if !keychain_step_runs(&security.secret_provider) {
         return Autofill::FellThrough(FellThrough::ModeIsPrompt);
@@ -726,7 +729,7 @@ pub fn autofill_approved(
         );
         return Autofill::FellThrough(FellThrough::NoBindingMatched);
     }
-    resolve_selected(security, session, binding, append_newline, audit)
+    resolve_selected(security, session, binding, append_newline, audit, ctx)
 }
 
 /// Budget, provider, audit — the tail both entry points share.
@@ -741,6 +744,7 @@ fn resolve_selected(
     binding: &SecretBinding,
     append_newline: bool,
     audit: &AuditLog,
+    ctx: &RequestContext,
 ) -> Autofill {
     // §9.6's bound, claimed **before** the spawn and under the session's
     // own lock, so that "the third prompt in this session falls through"
@@ -753,7 +757,7 @@ fn resolve_selected(
         });
     };
 
-    match run_provider(binding, security, append_newline) {
+    match run_provider(binding, security, append_newline, ctx) {
         Ok(secret) => {
             let resolved = Resolved {
                 binding_name: binding.name.clone(),
@@ -819,6 +823,7 @@ fn run_provider(
     binding: &SecretBinding,
     limits: &SecurityConfig,
     append_newline: bool,
+    ctx: &RequestContext,
 ) -> Result<SecretBytes, ProviderError> {
     // REQ-TST-007 / Global Constraint 12: `secret-tool`, `security`,
     // `pass` and `op` are tools this project neither pins nor installs,
@@ -835,9 +840,10 @@ fn run_provider(
             &binding.reference,
             limits,
             append_newline,
+            ctx,
         );
     }
-    resolve(binding, limits, append_newline)
+    resolve(binding, limits, append_newline, ctx)
 }
 
 /// The `#[cfg(test)]` fixture registry — see [`run_provider`].
@@ -1143,6 +1149,14 @@ mod tests {
     }
 
     /// `[security]` in the mode that lets step 1 run at all.
+    /// A context with no caller: the provider's own budget applies in
+    /// full, nothing cancels, and the byte budget is the stock ceiling.
+    /// What every row that is not about GH #126 wants.
+    fn unbounded() -> RequestContext {
+        RequestContext::detached()
+            .with_max_bytes(SecurityConfig::default().max_secret_bytes_ceiling)
+    }
+
     fn keychain_mode(bindings: Vec<SecretBinding>) -> SecurityConfig {
         SecurityConfig {
             secret_provider: "keychain".to_string(),
@@ -1152,6 +1166,354 @@ mod tests {
             keychain_provider_timeout_secs: 5,
             ..SecurityConfig::default()
         }
+    }
+
+    /// **GH #127: a call already cancelled runs no provider and raises
+    /// nothing.**
+    ///
+    /// Two claims that are one decision. A cancel can land while the
+    /// caller is still inside §5.2's step 1 — §17.5's approval is a
+    /// human-scale wait sitting there — and what happens next used to be:
+    /// spawn the provider anyway, then raise a prompt, then close it, then
+    /// re-raise it.
+    ///
+    /// * **No provider**, because `op read` wakes a biometric helper and
+    ///   `pass show` wakes `pinentry`. This module's own objection to
+    ///   speculative resolution — *"a credential read out of a store
+    ///   nobody agreed to read"* — read from the other end.
+    /// * **No raise**, because the window a prompt describes was over
+    ///   before it opened: three frames at every attached client and a
+    ///   §9.4 pair for a request that could never be answered.
+    ///
+    /// The pairing is the same arrangement without the cancel, which does
+    /// run the provider and does resolve — so neither absence is about a
+    /// fixture that never worked.
+    #[tokio::test]
+    async fn a_cancelled_call_runs_no_provider_and_raises_nothing() {
+        let mut sc = Scratch::new("cancelearly");
+        let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}'\n"));
+        let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+
+        let signal = crate::request::CancelSignal::new();
+        signal.cancel();
+        let payload = {
+            let ctx = RequestContext::with_cancel(signal);
+            let args = secret_args(&s.id, 20);
+            let r = tokio::time::timeout(
+                Duration::from_secs(20),
+                crate::request::with_context(ctx, server.request_secret_input(Parameters(args))),
+            )
+            .await
+            .expect("the cancelled call never returned")
+            .expect("request_secret_input");
+            body(&r)
+        };
+
+        assert_eq!(payload["status"], "secret_cancelled", "{payload}");
+        assert_eq!(
+            payload["data"]["reason"], "caller_cancelled",
+            "a cancelled call was reported as something else: {payload}"
+        );
+        assert!(
+            payload["data"]["request_id"].is_null(),
+            "the call named a request it never raised: {payload}"
+        );
+        assert!(
+            !sc.ran("prod-ssh"),
+            "a cancelled call read the credential store"
+        );
+        assert!(
+            server.attach_hub().outstanding_secret(&s.id).is_none(),
+            "the cancelled call left a raise nobody can answer"
+        );
+        assert!(
+            sc.kinds(&s.id).is_empty(),
+            "a cancelled call wrote §9.4 lines for a request it never raised: {:?}",
+            sc.kinds(&s.id)
+        );
+
+        // ---- the pairing: the same arrangement, uncancelled.
+        let mut sc2 = Scratch::new("cancelearlyok");
+        let b2 = sc2.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}'\n"));
+        let server2 = server_with(keychain_mode(vec![b2]), &sc2.audit_log());
+        let s2 = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server2.registry.insert(Arc::clone(&s2)).expect("register");
+        await_prompt(&s2, b"Password: ").await;
+        let payload = call(&server2, secret_args(&s2.id, 10)).await;
+        assert_eq!(
+            payload["status"], "secret_provided",
+            "the uncancelled arrangement did not resolve, so the absences above prove \
+             nothing: {payload}"
+        );
+        assert!(sc2.ran("prod-ssh"), "the control never ran its provider");
+
+        let _ = s.signal(Signal::Kill);
+        let _ = s2.signal(Signal::Kill);
+    }
+
+    /// **GH #127: a cancel ends §17.5's approval, and no human can
+    /// approve it afterwards.**
+    ///
+    /// The approval window is the lesser of
+    /// `binding_approval_timeout_secs` and half the caller's remaining
+    /// deadline — up to 60 s on shipped defaults — and a caller can go
+    /// away inside it. Without a cancellation arm the wait ran to its own
+    /// deadline with nobody waiting for the answer, **and a human could
+    /// still approve it**: a `binding_approval` entry reading `approved`,
+    /// a credential read out of a store, and no caller for either.
+    ///
+    /// Two assertions and they are different facts: the call ends
+    /// promptly, and the approval slot is *gone* — a late `ApproveBinding`
+    /// finds nothing rather than resolving a binding for a request that
+    /// no longer exists.
+    #[tokio::test]
+    async fn a_cancel_ends_the_binding_approval_and_no_one_can_approve_it() {
+        let mut sc = Scratch::new("cancelapproval");
+        let mut b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}'\n"));
+        b.require_confirm = true;
+        let server = Arc::new(server_with(keychain_mode(vec![b]), &sc.audit_log()));
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+
+        let signal = crate::request::CancelSignal::new();
+        let call = {
+            let server = Arc::clone(&server);
+            let ctx = RequestContext::with_cancel(signal.clone());
+            // Sixty seconds, so nothing but the cancel can end this
+            // inside the row's own ceiling.
+            let args = secret_args(&s.id, 60);
+            tokio::spawn(async move {
+                crate::request::with_context(ctx, server.request_secret_input(Parameters(args)))
+                    .await
+            })
+        };
+
+        // The approval is really outstanding before the cancel.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let approval_id = loop {
+            if let Some(a) = server.attach_hub().approvals().outstanding(&s.id) {
+                break a.approval_id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "§17.5's approval was never raised, so there is nothing to cancel"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let started = std::time::Instant::now();
+        signal.cancel();
+        let payload = body(
+            &tokio::time::timeout(Duration::from_secs(25), call)
+                .await
+                .expect("the cancel never ended the approval wait")
+                .expect("the call task")
+                .expect("request_secret_input"),
+        );
+        assert_eq!(payload["data"]["reason"], "caller_cancelled", "{payload}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the approval ran to its own window: {:?}",
+            started.elapsed()
+        );
+
+        // **The modal cannot be answered any more.** A human deciding
+        // after the asker has gone would otherwise read the credential
+        // and write `approved` for nobody.
+        assert!(
+            matches!(
+                server.attach_hub().approvals().decide(
+                    &s.id,
+                    &approval_id,
+                    crate::attach::frames::ApprovalDecision::Approve,
+                    "cli",
+                ),
+                crate::secret::Decide::UnknownApprovalId
+            ),
+            "a human could still approve a request whose caller had gone"
+        );
+        assert!(
+            !sc.ran("prod-ssh"),
+            "the approved-for-nobody path read the credential store"
+        );
+        assert!(
+            !sc.kinds(&s.id).iter().any(|k| k == "binding_approval"),
+            "a §9.4 approval outcome was written for a decision nobody made: {:?}",
+            sc.kinds(&s.id)
+        );
+
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **GH #126: the call's own `max_secret_bytes` reaches the
+    /// provider.**
+    ///
+    /// **Written because deleting `.with_max_bytes(max_secret_bytes)`
+    /// from `request_secret_input`'s context left every row in this
+    /// module and every row in `tests/secrets.rs` green.** The budget was
+    /// pinned twice and both sites hand-built their own context, so
+    /// nothing drove the argument an agent actually sends through the
+    /// chain that has to honour it — and the scenario that restores is
+    /// issue #126's third reproduction verbatim: `max_secret_bytes: 1`,
+    /// a provider printing seven bytes, eight bytes into the PTY.
+    ///
+    /// The two halves differ in **one argument** and nothing else, which
+    /// is what makes the refusal about the budget rather than about the
+    /// fixture.
+    ///
+    /// `printf` without a newline on purpose: `provider::run` measures the
+    /// provider's **raw stdout**, pre-normalisation, exactly as
+    /// `attach::conn` measures a human's submission pre-normalisation. A
+    /// fixture printing `hunter2\n` would be eight raw bytes and the
+    /// "exactly at the budget" half would be measuring the newline.
+    #[tokio::test]
+    async fn the_calls_byte_budget_reaches_the_provider() {
+        // ---- one byte declared, seven printed: nothing is written.
+        let mut sc = Scratch::new("budgetlow");
+        let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}'\n"));
+        let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+
+        let payload = call(
+            &server,
+            RequestSecretInputArgs {
+                max_secret_bytes: Some(1),
+                ..secret_args(&s.id, 2)
+            },
+        )
+        .await;
+        assert_eq!(
+            payload["status"], "secret_cancelled",
+            "a seven-byte credential was accepted under a one-byte budget: {payload}"
+        );
+        // The pairing that stops the refusal being about step 1 not
+        // running: the provider really did run, and its answer really was
+        // refused rather than never fetched.
+        assert!(sc.ran("prod-ssh"), "the binding's provider never ran");
+        let seen = buffered(&s);
+        assert!(
+            !contains(&seen, b"got=HUNTER2"),
+            "the over-budget credential reached the child:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        // ---- seven declared, seven printed: written, and the child gets
+        //      it. One argument different.
+        let mut sc2 = Scratch::new("budgetfits");
+        let b2 = sc2.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}'\n"));
+        let server2 = server_with(keychain_mode(vec![b2]), &sc2.audit_log());
+        let s2 = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server2.registry.insert(Arc::clone(&s2)).expect("register");
+        await_prompt(&s2, b"Password: ").await;
+
+        let payload = call(
+            &server2,
+            RequestSecretInputArgs {
+                max_secret_bytes: Some(PROBE.len() as u32),
+                ..secret_args(&s2.id, 10)
+            },
+        )
+        .await;
+        assert_eq!(
+            payload["status"], "secret_provided",
+            "a credential exactly at the declared budget was refused, so the refusal \
+             above is not about the budget: {payload}"
+        );
+        assert_eq!(
+            payload["data"]["bytes_written"],
+            (PROBE.len() + 1) as u64,
+            "§5.2's newline is the daemon's and is not counted against the budget"
+        );
+        buffer_until(&s2, b"got=HUNTER2", 20).await;
+
+        let _ = s.signal(Signal::Kill);
+        let _ = s2.signal(Signal::Kill);
+    }
+
+    /// **GH #126: `timeout_secs` bounds the provider step, and nothing
+    /// the provider resolved late reaches the child.**
+    ///
+    /// The end-to-end reading of the row in `secret::provider`: the same
+    /// grandchild-holds-the-pipe fixture, but driven through
+    /// `request_secret_input` so that the thing measured is the
+    /// *caller's* declared window rather than the operator's provider
+    /// budget.
+    ///
+    /// Measured before the fix, on this arrangement:
+    /// **`secret_provided` after 4.016 s for a call that declared
+    /// `timeout_secs: 1`, `bytes_written: 8`, and the credential in the
+    /// child.** After: `secret_cancelled` at 1.01 s with nothing written.
+    ///
+    /// **Both halves, because either alone passes for the wrong reason.**
+    /// A call that returned on time and still wrote the value later is
+    /// the exact failure the issue describes — *"an expired credential
+    /// must be discarded before it reaches the PTY, not reported as
+    /// delivered afterwards"* — so the row waits past the provider's own
+    /// window before asserting the child never got it.
+    #[tokio::test]
+    async fn the_callers_deadline_bounds_the_provider_step() {
+        let mut sc = Scratch::new("callerdeadline");
+        // The direct child writes and exits at once; the backgrounded
+        // `sleep` inherits the stdout pipe, so collection runs on past
+        // both the provider budget and the caller's `timeout_secs`.
+        let b = sc.binding(
+            "leak",
+            PROD_PROFILE,
+            &format!("sleep 7 &\nprintf '{PROBE}\\n'\n"),
+        );
+        let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
+        let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
+        server.registry.insert(Arc::clone(&s)).expect("register");
+        await_prompt(&s, b"Password: ").await;
+
+        // **Three seconds and not one, and the reason is a contention
+        // sweep rather than taste.** The provider has to *start* inside
+        // the declared window for `sc.ran` below to mean anything, and at
+        // `timeout_secs: 1` it did not: under six concurrent whole-binary
+        // lanes on two cores this row went red with "the binding's
+        // provider never ran", because the deadline killed the group
+        // before the fixture's first line. Three is three orders of
+        // magnitude above this tree's measured `fork`→`exec` latency and
+        // still four seconds clear of the grandchild's hold.
+        let started = std::time::Instant::now();
+        let payload = call(&server, secret_args(&s.id, 3)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "`timeout_secs: 3` did not bound the call: it returned after {elapsed:?} \
+             with status {}",
+            payload["status"]
+        );
+        assert_eq!(
+            payload["status"], "secret_cancelled",
+            "a call whose window elapsed inside the provider step reported a write: \
+             {payload}"
+        );
+        // The pairing: the provider really did run, so the row is not
+        // green because step 1 was skipped.
+        assert!(sc.ran("leak"), "the binding's provider never ran");
+
+        // **Past the grandchild's own seven seconds**, which is the whole
+        // point: a value collected late must be discarded rather than
+        // written after the caller has been answered. Without outlasting
+        // the hold this half is vacuous — against the unfixed code the
+        // value arrives exactly when the grandchild lets go.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let seen = buffered(&s);
+        assert!(
+            !contains(&seen, b"got=HUNTER2"),
+            "the credential reached the child after the call had been told its \
+             request was cancelled:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        let _ = s.signal(Signal::Kill);
     }
 
     fn server_with(security: SecurityConfig, audit_log: &Path) -> HoldfastServer {
@@ -2628,7 +2990,17 @@ mod tests {
 
         let call = {
             let server = Arc::clone(&server);
-            let args = secret_args(&s.id, 2);
+            // **Eight, and it must stay above `keychain_mode`'s
+            // `keychain_provider_timeout_secs` of 5** (GH #126). The
+            // caller's deadline now bounds the provider step, so a row
+            // whose choreography happens *inside* the provider's window
+            // has to declare a window wider than the provider's own or it
+            // is measuring its own `timeout_secs` rather than the thing it
+            // is named for. At 2 this went red under six concurrent
+            // whole-binary lanes on two cores, with "the provider ran and
+            // produced a value; the trail should say so" — the gate opened
+            // after the caller's deadline had already killed the provider.
+            let args = secret_args(&s.id, 8);
             tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
         };
 
@@ -2769,7 +3141,17 @@ mod tests {
 
         let call = {
             let server = Arc::clone(&server);
-            let args = secret_args(&s.id, 2);
+            // **Eight, and it must stay above `keychain_mode`'s
+            // `keychain_provider_timeout_secs` of 5** (GH #126). The
+            // caller's deadline now bounds the provider step, so a row
+            // whose choreography happens *inside* the provider's window
+            // has to declare a window wider than the provider's own or it
+            // is measuring its own `timeout_secs` rather than the thing it
+            // is named for. At 2 this went red under six concurrent
+            // whole-binary lanes on two cores, with "the provider ran and
+            // produced a value; the trail should say so" — the gate opened
+            // after the caller's deadline had already killed the provider.
+            let args = secret_args(&s.id, 8);
             tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
         };
         await_ran(&sc, "slot").await;
@@ -2929,7 +3311,17 @@ mod tests {
 
         let call = {
             let server = Arc::clone(&server);
-            let args = secret_args(&s.id, 2);
+            // **Eight, and it must stay above `keychain_mode`'s
+            // `keychain_provider_timeout_secs` of 5** (GH #126). The
+            // caller's deadline now bounds the provider step, so a row
+            // whose choreography happens *inside* the provider's window
+            // has to declare a window wider than the provider's own or it
+            // is measuring its own `timeout_secs` rather than the thing it
+            // is named for. At 2 this went red under six concurrent
+            // whole-binary lanes on two cores, with "the provider ran and
+            // produced a value; the trail should say so" — the gate opened
+            // after the caller's deadline had already killed the provider.
+            let args = secret_args(&s.id, 8);
             tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
         };
         // The provider has started and is blocked on the gate, so
@@ -3118,7 +3510,7 @@ mod tests {
         session: &Session,
         audit: &AuditLog,
     ) -> FellThrough {
-        match autofill(security, session, true, audit) {
+        match autofill(security, session, true, audit, &unbounded()) {
             Autofill::FellThrough(why) => why,
             Autofill::Resolved(r) => panic!("expected a fall-through, got {r:?}"),
         }
@@ -3223,7 +3615,16 @@ mod tests {
         server.registry.insert(Arc::clone(&s)).expect("register");
         await_prompt(&s, b"Password: ").await;
 
-        let payload = call(&server, secret_args(&s.id, 1)).await;
+        // **Three seconds and not one** (GH #126). The caller's deadline
+        // now bounds the provider step, so a row that asserts the
+        // provider *ran* must declare a window it can start inside. At 1
+        // this went red 3 times in 24 under eight concurrent whole-binary
+        // lanes on two cores, with the message below — the group was
+        // killed before the fixture's first line. It is the only row left
+        // in this module that pairs a one-second window with a positive
+        // `sc.ran`; the rest assert the negative, which no deadline can
+        // make wrong.
+        let payload = call(&server, secret_args(&s.id, 3)).await;
 
         assert!(sc.ran("prod-ssh"), "the failing provider never ran at all");
         fell_through_to_the_prompt(&payload, &sc, &s.id);
@@ -3576,6 +3977,7 @@ mod tests {
             "some-other-binding",
             true,
             audit,
+            &unbounded(),
         );
         assert!(
             matches!(out, Autofill::FellThrough(FellThrough::NoBindingMatched)),
@@ -3594,7 +3996,14 @@ mod tests {
         // **The pairing**: the same call with the name that *was*
         // approved resolves, so the refusal above is about the name and
         // not about a function that never resolves anything.
-        let out = autofill_approved(&keychain_mode(vec![b.clone()]), &s, &b.name, true, audit);
+        let out = autofill_approved(
+            &keychain_mode(vec![b.clone()]),
+            &s,
+            &b.name,
+            true,
+            audit,
+            &unbounded(),
+        );
         match out {
             Autofill::Resolved(r) => {
                 assert_eq!(r.binding_name, b.name);

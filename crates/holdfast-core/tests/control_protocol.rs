@@ -741,6 +741,7 @@ async fn the_handshake_frames_carry_the_7_4_1_field_names_on_the_wire() {
         id: 0,
         method: "holdfast/handshake".into(),
         params,
+        cancel_token: None,
     };
     frame::write_frame(&mut stream, &req).await.unwrap();
     let resp: Response = frame::read_frame(&mut stream).await.unwrap();
@@ -1127,6 +1128,323 @@ async fn a_tool_call_crosses_the_socket_and_reaches_a_real_shell() {
         out.contains("RPC_MARKER"),
         "the shell behind the socket never ran the command; got: {out:?}"
     );
+}
+
+/// **GH #127's protocol skew, driven rather than reasoned about: a
+/// request with no `cancel_token` is answered by a 1.2 daemon, and one
+/// with a token is answered identically.**
+///
+/// §7.4.1 permits same-major different-minor skew, so 1.2 adding
+/// `Request.cancel_token` has to cost a 1.1 peer nothing. The argument is
+/// that `#[serde(default, skip_serializing_if = "Option::is_none")]` plus
+/// the absence of `deny_unknown_fields` makes the field optional in both
+/// directions — and an argument is not a test.
+///
+/// **`1.2.golden` does not cover this and cannot.** It records the
+/// encoded bytes of a *maximal* sample, every `Option` set, so it sees
+/// the field's presence, name and type. It never decodes a frame that
+/// omits the field, which is precisely the 1.1 peer's frame.
+///
+/// **Hand-built CBOR maps, not serialised structs**, for this file's
+/// stated reason: both peers are built from this crate, so a `Request`
+/// encoded through the derived impl and decoded through the same one
+/// agrees with itself whatever the shape is. The map below is literally
+/// `{id, method, params}` — the whole of protocol 1.1's request envelope
+/// — and the daemon has to parse it with its 1.2 decoder.
+///
+/// The second half is the pairing that stops the first being vacuous: a
+/// daemon that ignored `cancel_token` entirely would also answer the
+/// 1.1-shaped frame, so the row sends the 1.2-shaped one too and requires
+/// the same answer. Direction two — a 1.2 frame decoding against the 1.1
+/// *shape* — has no live 1.1 daemon to send to and is pinned in
+/// `protocol::method`'s own tests instead.
+#[tokio::test]
+async fn a_request_without_a_cancel_token_is_answered_by_a_1_2_daemon() {
+    let d = TestDaemon::start("skew").await;
+    let mut stream = d.raw().await;
+
+    // The handshake, through the typed helper: it is not this row's
+    // subject and is pinned on the wire two rows up.
+    let hs = Request::new(
+        0,
+        method::METHOD_HANDSHAKE,
+        &HandshakeParams {
+            protocol_major: handshake::PROTOCOL_MAJOR,
+            protocol_minor: handshake::PROTOCOL_MINOR,
+            client_kind: ClientKind::Cli,
+            client_version: "0.0.0".into(),
+        },
+    )
+    .unwrap();
+    frame::write_frame(&mut stream, &hs).await.unwrap();
+    let _: Response = frame::read_frame(&mut stream).await.unwrap();
+
+    // ---- protocol 1.1's request envelope, exactly: three keys.
+    let eleven = CborValue::Map(vec![
+        (CborValue::Text("id".into()), CborValue::Integer(1.into())),
+        (
+            CborValue::Text("method".into()),
+            CborValue::Text("tool/list_sessions".into()),
+        ),
+        (CborValue::Text("params".into()), CborValue::Map(Vec::new())),
+    ]);
+    frame::write_frame(&mut stream, &eleven).await.unwrap();
+    let resp: Response = frame::read_frame(&mut stream).await.unwrap();
+    assert_eq!(
+        resp.status, "ok",
+        "a 1.1 peer's request envelope — three keys, no `cancel_token` — was refused \
+         by a 1.2 daemon, so the added field is not optional after all: {}",
+        resp.details
+    );
+    assert_eq!(resp.id, 1, "the answer is for the request that was sent");
+
+    // ---- and 1.2's envelope, four keys, to the same handler.
+    let twelve = CborValue::Map(vec![
+        (CborValue::Text("id".into()), CborValue::Integer(2.into())),
+        (
+            CborValue::Text("method".into()),
+            CborValue::Text("tool/list_sessions".into()),
+        ),
+        (CborValue::Text("params".into()), CborValue::Map(Vec::new())),
+        (
+            CborValue::Text("cancel_token".into()),
+            CborValue::Text("a-token-nobody-will-cancel".into()),
+        ),
+    ]);
+    frame::write_frame(&mut stream, &twelve).await.unwrap();
+    let resp: Response = frame::read_frame(&mut stream).await.unwrap();
+    assert_eq!(
+        resp.status, "ok",
+        "a 1.2 peer's request envelope was refused: {}",
+        resp.details
+    );
+    assert_eq!(resp.id, 2);
+}
+
+/// **GH #127's own symptom on the transport Holdfast ships: a client
+/// that disconnects without cancelling must not keep the slot.**
+///
+/// The first version of this fix handled the two ways a caller goes away
+/// in the two modes the other does not. Hybrid got `holdfast/cancel`;
+/// `--no-daemon` got `AbandonedCall`'s `Drop`. But **nothing drops the
+/// daemon-side tool future in hybrid mode** — `handle_connection` reads
+/// one frame, dispatches it to completion, and only discovers the socket
+/// is gone when it writes the response — so a shim that was killed left
+/// the request exactly as GH #127 reports it:
+///
+/// ```text
+/// after disconnect: has_waiter=true
+/// replacement after 970µs: secret_cancelled reason="concurrent_request_pending"
+/// ```
+///
+/// That is the issue's *before*, measured on the branch that claimed to
+/// fix it, on the path users take.
+///
+/// **The remedy has to be the daemon's**, because a shim that has been
+/// killed cannot send anything: `handle_connection` races the dispatch
+/// against the connection's own ending and fires the call's cancellation
+/// when the peer goes. This row is that, end to end — a real socket, a
+/// real drop, no cancel sent.
+///
+/// **Dropping the client is the whole arrangement and it is not a
+/// stand-in for one.** `ControlClient` has no "disconnect" method; this
+/// is what a killed shim does to the daemon, byte for byte.
+#[tokio::test]
+async fn a_client_that_disconnects_without_cancelling_frees_the_slot() {
+    let d = TestDaemon::start("disconnect").await;
+    let client = d.client().await.unwrap();
+    let id = start_script(
+        &client,
+        "disconnsess",
+        "stty -echo; printf 'Password: '; read x; stty echo; printf 'done\\n'",
+    )
+    .await;
+    read_until(&client, &id, "Password: ").await;
+
+    // A second client, because this one is about to be dropped and the
+    // row still has to ask the daemon questions afterwards.
+    let observer = d.client().await.unwrap();
+
+    let params = method::to_cbor(&json!({
+        "session": id,
+        "prompt_text": "a credential",
+        // Ten minutes: nothing but the disconnect can end this inside the
+        // row's ceiling, so a green row is the disconnect working and not
+        // a deadline firing.
+        "timeout_secs": 600,
+    }))
+    .unwrap();
+    // **The client is moved in**, so aborting the task drops it *and* the
+    // connection `call_raw` has checked out — which is the socket closing
+    // with a request outstanding, byte for byte what a killed shim does.
+    let task = tokio::spawn(async move {
+        let _ = client.call_raw("tool/request_secret_input", params).await;
+    });
+
+    // The call is really parked on the prompt before anything is dropped.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !d.daemon.attach_hub().secrets().has_waiter(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the call never registered a waiter, so there is nothing to abandon"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // **The caller goes away**, and sends nothing on its way out. The
+    // task holding the round trip goes with it, which is what a killed
+    // shim looks like: the socket closes with a request outstanding.
+    task.abort();
+    let _ = task.await;
+
+    // The daemon notices, and the slot comes back.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while d.daemon.attach_hub().secrets().has_waiter(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the disconnected client still holds the session's secret slot — GH #127's \
+             own symptom, on the transport Holdfast ships"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // And a replacement is not refused, which is the consequence the
+    // issue reports and the one an agent feels.
+    let params = method::to_cbor(&json!({
+        "session": id,
+        "prompt_text": "the credential it actually needs",
+        "timeout_secs": 2,
+    }))
+    .unwrap();
+    let resp = observer
+        .call_raw("tool/request_secret_input", params)
+        .await
+        .unwrap();
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    assert_ne!(
+        data["reason"], "concurrent_request_pending",
+        "the abandoned call still holds the slot: {} {data}",
+        resp.status
+    );
+    // The pairing: the replacement really did run as an ordinary call and
+    // wait out its own window, rather than being refused for some other
+    // reason.
+    assert_eq!(
+        data["reason"], "timeout",
+        "the replacement did not take the prompt path: {} {data}",
+        resp.status
+    );
+}
+
+/// **GH #127, end to end over a real socket: a cancel on a second
+/// connection ends an in-flight `request_secret_input`.**
+///
+/// The one row that crosses every boundary the fix touches — MCP-side
+/// token, `holdfast/cancel` as a control-protocol method, the daemon's
+/// in-flight registry, the request-context task local, and
+/// `await_secret`'s cancellation arm. The unit rows each cover one of
+/// those; this one is what says they are connected.
+///
+/// **The connection matters and the row makes it explicit.**
+/// `handle_connection` reads one request, dispatches it to completion,
+/// and only then reads again, so the cancel *cannot* travel on the
+/// connection carrying the call. `ControlClient` checks one out per
+/// in-flight call, which is what makes a second one available — and a
+/// second `call_raw` is exactly how the shim sends its cancel.
+///
+/// **Bounded at 20 s against a 600 s call**, so a cancel that did not
+/// arrive is a red row in twenty seconds rather than a ten-minute hang.
+#[tokio::test]
+async fn a_cancel_on_a_second_connection_ends_an_in_flight_secret_request() {
+    let d = TestDaemon::start("cancel").await;
+    let client = std::sync::Arc::new(d.client().await.unwrap());
+    // A child that drops `ECHO` and reads, so the call takes §5.2's
+    // prompt path and parks rather than answering itself.
+    let id = start_script(
+        &client,
+        "cancelsess",
+        "stty -echo; printf 'Password: '; read x; stty echo; printf 'done\\n'",
+    )
+    .await;
+    read_until(&client, &id, "Password: ").await;
+
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let params = method::to_cbor(&json!({
+        "session": id,
+        "prompt_text": "a credential",
+        // Ten minutes. Nothing but the cancel can end this inside the
+        // row's own ceiling, so a green row is a cancel that worked and
+        // not a deadline that fired.
+        "timeout_secs": 600,
+    }))
+    .unwrap();
+    let call = {
+        let client = std::sync::Arc::clone(&client);
+        let token = token.clone();
+        tokio::spawn(async move {
+            client
+                .call_raw_cancellable("tool/request_secret_input", params, Some(&token))
+                .await
+        })
+    };
+
+    // The call is really parked on the prompt before the cancel fires:
+    // without this the row could be testing the pre-emptive ring instead,
+    // which has its own unit coverage and is a different claim.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if d.daemon.attach_hub().secrets().has_waiter(&id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the call never registered a waiter, so there is nothing to cancel"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let started = std::time::Instant::now();
+    assert!(
+        client.cancel(&token).await.unwrap(),
+        "the daemon did not recognise the token of a call it is running"
+    );
+
+    let resp = tokio::time::timeout(Duration::from_secs(20), call)
+        .await
+        .expect("the cancel never ended the call; it is still on its own 600 s window")
+        .expect("the call task")
+        .expect("the call");
+    assert_eq!(
+        resp.status, "secret_cancelled",
+        "a cancelled call returned something else: {}",
+        resp.details
+    );
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    assert_eq!(
+        data["reason"], "caller_cancelled",
+        "the agent was told the wrong ending: {data}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the cancel took {:?} to reach the call",
+        started.elapsed()
+    );
+
+    // The registration is gone, so a map keyed by a client-supplied
+    // string does not grow by one per cancelled call.
+    assert!(
+        !client.cancel(&token).await.unwrap(),
+        "a finished call is still registered as cancellable"
+    );
+
+    // And the connection that carried the call is still usable: the
+    // shim reads its answer rather than abandoning the round trip, so
+    // nothing was left half-read on the wire.
+    let resp = client
+        .call_raw("tool/list_sessions", CborValue::Map(Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "ok", "{}", resp.details);
 }
 
 #[tokio::test]

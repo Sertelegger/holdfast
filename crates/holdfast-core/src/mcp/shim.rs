@@ -60,19 +60,76 @@ impl ShimServer {
     /// fields. `the_shim_puts_7_4_1s_own_field_names_on_the_wire`
     /// asserts each of those against a hand-built CBOR map rather than
     /// against a round-trip through these same types.
+    ///
+    /// ## Cancellation (GH #127)
+    ///
+    /// Every forwarded call carries a fresh `cancel_token`, and this
+    /// function races the round trip against `cancelled`. On a cancel it
+    /// sends
+    /// one `holdfast/cancel` — **on another connection**, which is
+    /// available because `ControlClient` checks one out per in-flight
+    /// call — and then goes on awaiting the original.
+    ///
+    /// **It waits rather than returning, and that is deliberate.** The
+    /// daemon answers a cancelled `request_secret_input` with
+    /// `secret_cancelled { reason: "caller_cancelled" }` within
+    /// microseconds, so there is nothing to gain by abandoning the round
+    /// trip — and abandoning it would drop the checked-out connection
+    /// mid-response, which is one leaked socket per cancel and the
+    /// descriptor-discipline failure GH #21 and GH #52 were. rmcp is
+    /// already discarding whatever we return for a request the client
+    /// cancelled.
+    ///
+    /// **`cancelled` is a future rather than rmcp's token**, so this
+    /// signature names no type from a crate `holdfast-core` does not
+    /// depend on — and so a test can drive the cancelled path with
+    /// `std::future::ready(())` and the ordinary path with
+    /// `std::future::pending()`, neither of which needs an rmcp `Peer`
+    /// to construct.
+    ///
+    /// **The cancel is best-effort.** Its own failure is not the caller's
+    /// business: the call is still outstanding and will still answer,
+    /// and turning a failed cancel into a tool error would replace a
+    /// real result with a transport complaint.
     async fn forward(
         &self,
         tool: &str,
         arguments: Option<serde_json::Map<String, Value>>,
+        cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<CallToolResult, ErrorData> {
         let args = Value::Object(arguments.unwrap_or_default());
         let params =
             method::to_cbor(&args).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let resp = self
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let method_name = format!("{TOOL_METHOD_PREFIX}{tool}");
+        let call = self
             .client
-            .call_raw(&format!("{TOOL_METHOD_PREFIX}{tool}"), params)
-            .await
-            .map_err(map_client_error)?;
+            .call_raw_cancellable(&method_name, params, Some(&token));
+        tokio::pin!(call);
+        tokio::pin!(cancelled);
+        let resp = tokio::select! {
+            // **`biased`, so the call is polled before the cancel.**
+            // `select!` is random by default, and a random order lets an
+            // already-cancelled request take the cancel arm on the first
+            // poll — before `call_raw_cancellable` has written anything
+            // — so the daemon sees the cancel *first*, on the connection
+            // the call was going to use. Nothing breaks (the daemon
+            // remembers a cancel that beats its call; see
+            // `Daemon::recently_cancelled`), but it makes the ordinary
+            // case depend on a coin flip, and it cost this file's own
+            // row a spurious pass before it cost it a failure.
+            biased;
+            r = &mut call => r,
+            () = &mut cancelled => {
+                let _ = self.client.cancel(&token).await;
+                // `&mut call`, so the round trip is still ours: the
+                // response is read, the connection goes back to the pool,
+                // and the daemon's own word for how the call ended is what
+                // reaches rmcp.
+                (&mut call).await
+            }
+        }
+        .map_err(map_client_error)?;
 
         if let Some(e) = resp.control_error() {
             return Err(rebuild_tool_error(e));
@@ -278,10 +335,21 @@ impl ServerHandler for ShimServer {
         Ok(ListToolsResult::with_all_items(passthrough::tool_manifest()))
     }
 
+    /// **`context` is read rather than discarded** (GH #127).
+    ///
+    /// It used to be `_context`, and that one underscore was the whole
+    /// bug: rmcp cancels `context.ct` when the client sends
+    /// `notifications/cancelled`, and the shim is the only place in this
+    /// process that can see it. rmcp does **not** abort the handler — it
+    /// fires the token and still delivers whatever the handler eventually
+    /// returns — so ignoring it meant a cancelled `request_secret_input`
+    /// ran its whole window inside the daemon, holding the session's one
+    /// request slot, while an attached human looked at a prompt whose
+    /// asker had gone.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let name = request.name.to_string();
         // The guard reads the daemon-side manifest, so it needs no
@@ -289,7 +357,10 @@ impl ServerHandler for ShimServer {
         if !passthrough::is_passthrough_tool(&name) {
             return Err(ErrorData::invalid_params(format!("no tool {name}"), None));
         }
-        Ok(self.forward(&name, request.arguments).await?.into())
+        Ok(self
+            .forward(&name, request.arguments, context.ct.cancelled())
+            .await?
+            .into())
     }
 
     // §5.5's three methods, forwarded to §7.4.1's three control methods.
@@ -496,6 +567,348 @@ mod tests {
     /// with `Response::ok(..)` would serialise through the same derive
     /// the shim deserialises with, which proves the shim agrees with
     /// this crate rather than with §7.4.1.
+    /// **GH #127: a cancelled `call_tool` puts a `holdfast/cancel` on the
+    /// wire, and still reads the answer it was waiting for.**
+    ///
+    /// The shim is where MCP cancellation enters this system and it used
+    /// to end there — `_context`, bound and dropped. Four claims, and
+    /// each of them is a step the old code took none of:
+    ///
+    /// 1. the forwarded call carries a `cancel_token`;
+    /// 2. a cancel goes out, **on a second connection**, because the
+    ///    daemon will not read another frame from the first until the
+    ///    call it is carrying has returned;
+    /// 3. it names the same token;
+    /// 4. the shim goes on to read the original response rather than
+    ///    abandoning the round trip — which would leak the checked-out
+    ///    socket and is the descriptor discipline GH #21 and GH #52 are
+    ///    about.
+    ///
+    /// **The stand-in answers the call only after the cancel has
+    /// arrived**, so the ordering under test is always the hostile one
+    /// rather than one that happens by luck.
+    #[tokio::test]
+    async fn a_cancelled_call_tool_sends_the_daemon_a_cancel_on_another_connection() {
+        let dir = scratch_dir("cancel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scoped = Scoped(dir.clone());
+        let sock = dir.join("control.sock");
+
+        let (calls_tx, calls_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let sock = sock.clone();
+            tokio::spawn(async move {
+                let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+                // Connection 1: the tool call. Captured and held.
+                let (mut first, _) = listener.accept().await.unwrap();
+                shake(&mut first).await;
+                let call: CborValue = frame::read_frame(&mut first).await.unwrap();
+                let call_id = u64::try_from(field(&call, "id").as_integer().unwrap()).unwrap();
+                calls_tx.send(call).unwrap();
+
+                // Connection 2: the cancel. It can only arrive here,
+                // because nothing is reading connection 1 any more.
+                let (mut second, _) = listener.accept().await.unwrap();
+                shake(&mut second).await;
+                let cancel: CborValue = frame::read_frame(&mut second).await.unwrap();
+                let cancel_id = u64::try_from(field(&cancel, "id").as_integer().unwrap()).unwrap();
+                cancel_tx.send(cancel).unwrap();
+                let ack = Response::ok(
+                    cancel_id,
+                    &crate::protocol::method::CancelOutcome { cancelled: true },
+                    "the call was signalled",
+                )
+                .unwrap();
+                frame::write_frame(&mut second, &ack).await.unwrap();
+
+                // Only now does the call answer, exactly as a daemon
+                // whose `request_secret_input` has just been cancelled
+                // would.
+                let _ = release_rx.await;
+                let reply = CborValue::Map(vec![
+                    (
+                        CborValue::Text("id".into()),
+                        CborValue::Integer(call_id.into()),
+                    ),
+                    (
+                        CborValue::Text("status".into()),
+                        CborValue::Text("secret_cancelled".into()),
+                    ),
+                    (
+                        CborValue::Text("data".into()),
+                        CborValue::Map(vec![(
+                            CborValue::Text("reason".into()),
+                            CborValue::Text("caller_cancelled".into()),
+                        )]),
+                    ),
+                    (
+                        CborValue::Text("details".into()),
+                        CborValue::Text("the secret request ended: caller_cancelled".into()),
+                    ),
+                ]);
+                frame::write_frame(&mut first, &reply).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            });
+        }
+
+        let client = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        let shim = ShimServer::new(Arc::new(client));
+
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("session".into(), json!("sess_abc"));
+        arguments.insert("prompt_text".into(), json!("a credential"));
+        //
+        // **The cancellation fires only once the stand-in has the call**,
+        // which is what makes the ordering under test the real one rather
+        // than a race: `biased` makes the call arm poll first, and this
+        // makes "first" mean "the request is on the wire".
+        let (fire_tx, fire_rx) = tokio::sync::oneshot::channel::<()>();
+        let forwarded = tokio::spawn(async move {
+            shim.forward("request_secret_input", Some(arguments), async {
+                let _ = fire_rx.await;
+            })
+            .await
+        });
+
+        let call = tokio::time::timeout(std::time::Duration::from_secs(10), calls_rx)
+            .await
+            .expect("the tool call never reached the stand-in")
+            .expect("the call channel");
+        // 1. The forwarded call names itself.
+        let token = field(&call, "cancel_token")
+            .as_text()
+            .expect(
+                "the forwarded call carries no `cancel_token`, so nothing could \
+                     ever cancel it",
+            )
+            .to_string();
+        assert!(
+            !token.is_empty(),
+            "the `cancel_token` is present but empty, which names every call at once"
+        );
+
+        // Now cancel, with the call outstanding on connection 1.
+        fire_tx.send(()).unwrap();
+
+        // 2 and 3. The cancel arrived, on its own connection, for that
+        // token.
+        let cancel = tokio::time::timeout(std::time::Duration::from_secs(10), cancel_rx)
+            .await
+            .expect(
+                "no `holdfast/cancel` reached the daemon: the shim read the \
+                 cancellation and did nothing with it",
+            )
+            .expect("the cancel channel");
+        assert_eq!(
+            field(&cancel, "method").as_text(),
+            Some(crate::protocol::method::METHOD_CANCEL),
+            "the second connection carried something other than a cancel"
+        );
+        assert_eq!(
+            field(field(&cancel, "params"), "token").as_text(),
+            Some(token.as_str()),
+            "the cancel names a different call than the one it is cancelling"
+        );
+
+        // 4. And the original round trip is still the shim's: the
+        // daemon's own word for how the call ended is what comes back.
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), forwarded)
+            .await
+            .expect("the forward never returned after the cancel")
+            .expect("the forward task")
+            .expect("the stand-in answered ok");
+        let body = result
+            .structured_content
+            .expect("the envelope has structured content");
+        assert_eq!(
+            body["status"], "secret_cancelled",
+            "the shim abandoned the round trip instead of reading the answer: {body}"
+        );
+        assert_eq!(body["data"]["reason"], "caller_cancelled", "{body}");
+    }
+
+    /// **GH #127: `call_tool` reads the cancellation rmcp hands it.**
+    ///
+    /// **Written because replacing `context.ct.cancelled()` with
+    /// `std::future::pending()` left every row in this file, in
+    /// `tests/control_protocol.rs` and in `tests/secrets.rs` green** —
+    /// warning-free, because `context` stays used by
+    /// `ToolCallContext::new`. Every other shim row calls
+    /// [`ShimServer::forward`] with a hand-supplied future, which is a
+    /// defensible seam and one statement past the defect: this module's
+    /// own doc says *"it used to be `_context`, and that one underscore
+    /// was the whole bug"*, and that underscore was exactly what nothing
+    /// could see.
+    ///
+    /// **A real `ShimServer` served over an in-memory duplex, driven by
+    /// hand-written JSON-RPC.** `RequestContext` carries a `Peer` and a
+    /// `Peer` is made by `serve()` and by nothing else, so the only way
+    /// to reach `call_tool` at all is to be a client. The client half is
+    /// written out rather than taken from rmcp because `client` is not
+    /// one of rmcp's default features — and the hand-written form is the
+    /// better assertion anyway, for this file's usual reason: it is the
+    /// bytes an agent sends, not a round trip through the same impls the
+    /// server decodes with.
+    #[tokio::test]
+    async fn call_tool_reads_the_cancellation_rmcp_hands_it() {
+        use rmcp::service::ServiceExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = scratch_dir("ctbridge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scoped = Scoped(dir.clone());
+        let sock = dir.join("control.sock");
+
+        // A daemon that accepts the tool call and never answers it, and
+        // hands back whatever arrives on the next connection.
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (called_tx, called_rx) = tokio::sync::oneshot::channel();
+        {
+            let sock = sock.clone();
+            tokio::spawn(async move {
+                let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+                let (mut first, _) = listener.accept().await.unwrap();
+                shake(&mut first).await;
+                let call: CborValue = frame::read_frame(&mut first).await.unwrap();
+                let _ = called_tx.send(call);
+
+                let (mut second, _) = listener.accept().await.unwrap();
+                shake(&mut second).await;
+                let cancel: CborValue = frame::read_frame(&mut second).await.unwrap();
+                let _ = cancel_tx.send(cancel);
+                // Hold both open: an EOF would turn a missing cancel into
+                // a framing error, which is a different failure wearing
+                // the same colour.
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            });
+        }
+
+        let control = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+
+        let (server_side, client_side) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            if let Ok(running) = ShimServer::new(Arc::new(control)).serve(server_side).await {
+                let _ = running.waiting().await;
+            }
+        });
+
+        let (rx, mut tx) = tokio::io::split(client_side);
+        let mut rx = BufReader::new(rx);
+        let mut line = String::new();
+        let send = |v: serde_json::Value| {
+            let mut s = v.to_string();
+            s.push('\n');
+            s
+        };
+
+        // ---- initialize, which is what makes a `Peer` exist at all.
+        tx.write_all(
+            send(json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "ct-probe", "version": "0.0.0" }
+                }
+            }))
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx.read_line(&mut line))
+            .await
+            .expect("the shim never answered `initialize`")
+            .unwrap();
+        assert!(line.contains("\"result\""), "initialize failed: {line}");
+        tx.write_all(
+            send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        // ---- a tool call the stand-in daemon will never answer.
+        tx.write_all(
+            send(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "request_secret_input",
+                    "arguments": { "session": "sess_abc", "prompt_text": "a credential" }
+                }
+            }))
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        // The call is really outstanding before the cancel, so the
+        // ordering under test is the real one.
+        tokio::time::timeout(std::time::Duration::from_secs(10), called_rx)
+            .await
+            .expect("the tool call never reached the stand-in daemon")
+            .expect("the call channel");
+
+        // ---- and the cancellation, exactly as an agent sends it.
+        tx.write_all(
+            send(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": 1, "reason": "the user interrupted" }
+            }))
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let cancel = tokio::time::timeout(std::time::Duration::from_secs(10), cancel_rx)
+            .await
+            .expect(
+                "no `holdfast/cancel` reached the daemon: `call_tool` did not read the \
+                 cancellation rmcp handed it",
+            )
+            .expect("the cancel channel");
+        assert_eq!(
+            field(&cancel, "method").as_text(),
+            Some(crate::protocol::method::METHOD_CANCEL),
+            "the second connection carried something other than a cancel"
+        );
+
+        server.abort();
+    }
+
+    /// The handshake half of a stand-in daemon, which every connection
+    /// pays and no assertion here is about.
+    async fn shake(stream: &mut tokio::net::UnixStream) {
+        let hs: Request = frame::read_frame(stream).await.unwrap();
+        let data = HandshakeData {
+            protocol_major: handshake::PROTOCOL_MAJOR,
+            protocol_minor: handshake::PROTOCOL_MINOR,
+            daemon_version: "99.0.0".into(),
+            build: "stand-in".into(),
+            accepted: true,
+            reject_reason: None,
+        };
+        let resp = Response::ok(hs.id, &data, "handshake accepted").unwrap();
+        frame::write_frame(stream, &resp).await.unwrap();
+    }
+
     fn stand_in_daemon(
         sock: PathBuf,
         reply: CborValue,
@@ -605,7 +1018,7 @@ mod tests {
         arguments.insert("session".into(), json!("sess_abc"));
         arguments.insert("since_cursor".into(), json!(0));
         let result = shim
-            .forward("read_output", Some(arguments))
+            .forward("read_output", Some(arguments), std::future::pending())
             .await
             .expect("the stand-in answered ok");
 
@@ -710,7 +1123,7 @@ mod tests {
         let shim = ShimServer::new(Arc::new(client));
 
         let err = shim
-            .forward("read_output", None)
+            .forward("read_output", None, std::future::pending())
             .await
             .expect_err("`bad_params` is a protocol fault, not a tool status");
         // §5.1 routes a schema violation to the protocol channel. The
@@ -858,7 +1271,7 @@ mod tests {
         };
         let shim = ShimServer::new(Arc::new(client));
         let err = shim
-            .forward("inspect_screen", None)
+            .forward("inspect_screen", None, std::future::pending())
             .await
             .expect_err("a tool the daemon lacks is not an outcome");
         assert_eq!(
@@ -1070,7 +1483,7 @@ mod tests {
         let shim = ShimServer::new(Arc::new(client));
 
         let err = shim
-            .forward("send_input", None)
+            .forward("send_input", None, std::future::pending())
             .await
             .expect_err("a tool protocol fault is not a tool status");
         assert_eq!(

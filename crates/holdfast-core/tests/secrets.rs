@@ -138,6 +138,7 @@ use holdfast_core::platform::Capabilities;
 use holdfast_core::protocol::frame;
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use holdfast_core::pty::{InProcessPty, MockPty, PtyBackend, PtySpawnConfig, Signal};
+use holdfast_core::request::{CancelSignal, RequestContext};
 use holdfast_core::secret::{
     keychain_step_runs, resolve, select, ArgvProvider, ProviderError, SecretProvider,
 };
@@ -645,6 +646,32 @@ fn spawn_call(
             .request_secret_input(Parameters(args))
             .await
             .expect("request_secret_input")
+    })
+}
+
+/// [`spawn_call`] inside a request scope a test can cancel (GH #127).
+///
+/// **The same scope `daemon::server::dispatch_tool` opens**, and that is
+/// the point: these rows call the tool in process, so without one
+/// `request::current()` answers `detached()` and the cancellation arm
+/// under test is unreachable. `dispatch_tool`'s own half — a
+/// `cancel_token` on the wire reaching this signal — is driven over a
+/// real socket in `control_protocol.rs`.
+fn spawn_cancellable_call(
+    d: &TestDaemon,
+    args: RequestSecretInputArgs,
+    signal: &CancelSignal,
+) -> tokio::task::JoinHandle<CallToolResult> {
+    let server = d.daemon.server.clone();
+    let ctx = RequestContext::with_cancel(signal.clone());
+    tokio::spawn(async move {
+        holdfast_core::request::with_context(ctx, async move {
+            server
+                .request_secret_input(Parameters(args))
+                .await
+                .expect("request_secret_input")
+        })
+        .await
     })
 }
 
@@ -2469,6 +2496,500 @@ async fn an_arm_cancelled_on_a_full_write_queue_still_answers_the_waiting_call()
     );
 }
 
+/// **GH #126's class on the raise nobody is waiting on: an unadopted
+/// request is bounded by the operator's ceiling, not by nothing.**
+///
+/// `RaisedRequest.max_secret_bytes` is a *waiting call's* argument, so
+/// every raise with no call on it carries `None` — §7.5's replay, §8.3's
+/// echo drop, and the re-raise a caller's ending leaves behind, which
+/// this branch added two producers of. Read as "unbounded", the only
+/// thing left between a human's keystrokes and the child is
+/// `MAX_FRAME_BYTES`, 16 MiB, against an operator ceiling this row sets
+/// to 8.
+///
+/// Measured before the fix, on the cancel path:
+///
+/// ```text
+/// before cancel: bounds=Some((Some(16), true))
+/// after  cancel: bounds=Some((None,     true))
+/// ```
+///
+/// **Driven through the re-raise specifically**, because that is the
+/// producer this branch is responsible for: the call declares a budget,
+/// the caller cancels, and what a human may then submit into the child is
+/// the question.
+///
+/// **Two sessions, because one cannot ask both halves.** An over-ceiling
+/// submission is refused and the request closes — and §8.3's raise is
+/// edge-triggered on *entering* echo-off, which the child never left, so
+/// no second affordance appears for the pairing to use. The second
+/// session is the same arrangement with one number changed.
+#[tokio::test]
+async fn a_re_raised_request_is_bounded_by_the_operators_ceiling() {
+    const CEILING: u32 = 8;
+
+    let mut config = Config::default();
+    config.security.max_secret_bytes_ceiling = CEILING;
+    let d = TestDaemon::start_with_config("ceiling", config).await;
+
+    /// Cancel a call, then submit `len` bytes into the re-raise it left
+    /// behind. Answers the frame outcome and whether the child got them.
+    async fn submit_after_a_cancel(d: &TestDaemon, len: usize) -> (String, bool) {
+        let s = d.shell_running(ECHO_OFF_FIXTURE);
+        let mut c = attach_ok(d, &s.id, AttachMode::ReadWrite).await;
+        let _ = next_awaiting_secret(&mut c, 20).await;
+
+        let signal = CancelSignal::new();
+        let call = spawn_cancellable_call(
+            d,
+            RequestSecretInputArgs {
+                // Under the ceiling, so the *call's* bound is not the one
+                // doing the work — the re-raise's is.
+                max_secret_bytes: Some(2),
+                ..secret_args(&s.id, 60)
+            },
+            &signal,
+        );
+        await_waiter(d, &s.id, "the call about to be cancelled").await;
+        signal.cancel();
+        assert_eq!(
+            joined(call, "the cancelled call").await["data"]["reason"],
+            "caller_cancelled"
+        );
+
+        let (_, closed) = next_secret_closed(&mut c, 20).await;
+        assert_eq!(closed, "caller_cancelled");
+        // The affordance the cancel left behind, which carries no call's
+        // argument at all.
+        let (re_raised, _) = next_awaiting_secret(&mut c, 20).await;
+
+        let value = vec![b'a'; len];
+        send(
+            &mut c,
+            &ClientFrame::SecretInput {
+                request_id: re_raised.clone(),
+                bytes: value,
+            },
+        )
+        .await;
+        let (id, outcome) = next_secret_closed(&mut c, 20).await;
+        assert_eq!(id, re_raised, "a different request was closed");
+
+        // The child's own echo of what it read, on the ring rather than
+        // on the frame stream, so this does not consume frames the
+        // caller may still want.
+        let want: Vec<u8> = b"got=".iter().copied().chain(vec![b'A'; len]).collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut reached = false;
+        while tokio::time::Instant::now() < deadline {
+            if contains(&buffered(&s), &want) {
+                reached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = s.signal(Signal::Kill);
+        (outcome, reached)
+    }
+
+    // One byte over the operator's ceiling, into a request that declares
+    // nothing of its own.
+    let (outcome, reached) = submit_after_a_cancel(&d, CEILING as usize + 1).await;
+    assert_eq!(
+        outcome, "cancelled",
+        "a submission over the operator's ceiling was accepted into a request that \
+         declared no budget of its own — the only bound left is a 16 MiB frame"
+    );
+    assert!(!reached, "the over-ceiling submission reached the child");
+
+    // **The pairing**, one number different: exactly at the ceiling still
+    // lands, so the refusal above is about the bound and not about a path
+    // that refuses everything.
+    let (outcome, reached) = submit_after_a_cancel(&d, CEILING as usize).await;
+    assert_eq!(
+        outcome, "fulfilled",
+        "a submission exactly at the ceiling was refused"
+    );
+    assert!(
+        reached,
+        "the at-ceiling submission never reached the child, so the refusal above \
+         proves nothing"
+    );
+}
+
+/// **GH #127: a cancelled call closes its request, tells every attached
+/// client, and frees the slot.**
+///
+/// Three claims, and they are the issue's three requirements in order.
+/// The frame's `outcome` is the one to read closely: `caller_cancelled`
+/// and not `cancelled`, because §7.5's `cancelled` already means *the
+/// echo-off condition cleared with no value written* — a human aborting
+/// or the child abandoning its read. Both of those happen at the child's
+/// end. This one happens at the agent's, and GH #105 is what conflating
+/// two endings costs an operator.
+#[tokio::test]
+async fn a_cancelled_call_closes_its_request_and_tells_the_attached_client() {
+    let d = TestDaemon::start("cancelclose").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let (raised_id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    let signal = CancelSignal::new();
+    let call = spawn_cancellable_call(&d, secret_args(&s.id, 60), &signal);
+    await_waiter(&d, &s.id, "the call about to be cancelled").await;
+
+    let started = std::time::Instant::now();
+    signal.cancel();
+    let payload = joined(call, "the cancelled call").await;
+    let elapsed = started.elapsed();
+
+    // 1. The agent is told the request ended, by its own name.
+    assert_eq!(payload["status"], "secret_cancelled", "{payload}");
+    assert_eq!(
+        payload["data"]["reason"], "caller_cancelled",
+        "a cancelled call was reported as something else: {payload}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the cancel did not end the call; it ran on its own window: {elapsed:?}"
+    );
+
+    // 2. Every attached client is told, and told which ending it was.
+    let (request_id, outcome) = next_secret_closed(&mut c, 20).await;
+    assert_eq!(request_id, raised_id, "a different request was closed");
+    assert_eq!(
+        outcome, "caller_cancelled",
+        "the human was told the prompt they are looking at was `{outcome}`, which is \
+         the word for an ending at the child's end — see GH #105"
+    );
+
+    // 3. The human's affordance survived. The child is still sitting at
+    //    its echo-off prompt, and §8.3's raise is edge-triggered on the
+    //    transition *into* it — so a close that did not re-raise would
+    //    take the modal away with nothing able to put it back, which is
+    //    Q1's rule and is why the timeout arm re-raises too.
+    let (re_raised, _) = next_awaiting_secret(&mut c, 20).await;
+    assert_ne!(
+        re_raised, raised_id,
+        "the re-raise reused the closed request's id, so §5.2's ids are no longer \
+         sequential"
+    );
+
+    // 4. The slot is free: a replacement is not refused — and it
+    //    *adopts* the re-raise rather than raising a third request, which
+    //    is what makes "the affordance survived" and "the slot is free"
+    //    the same fact rather than two that could disagree.
+    let replacement = body(&d.call(secret_args(&s.id, 2)).await);
+    assert_ne!(
+        replacement["data"]["reason"], "concurrent_request_pending",
+        "the cancelled call still holds the slot: {replacement}"
+    );
+    assert_eq!(
+        replacement["data"]["request_id"], re_raised,
+        "the replacement raised its own request instead of adopting the one the \
+         human is looking at, so two ids name one prompt: {replacement}"
+    );
+
+    let _ = s.signal(Signal::Kill);
+}
+
+/// **GH #127: a call whose future is dropped frees its slot too.**
+///
+/// The *other* way a caller goes away, and the one that reproduced the
+/// issue's own symptom without any cancel at all: `raise_or_adopt` has
+/// already parked the `oneshot::Sender` in the slot, the `Receiver` goes
+/// with the dropped future, and `has_waiter` answers `true` for a waiter
+/// that will never read — which `take_if_unadopted` is defined to refuse
+/// to sweep.
+///
+/// Measured before the fix: the replacement was refused
+/// `concurrent_request_pending` **0.5 ms** after the abandonment, and
+/// stayed refused for the abandoned call's whole window.
+#[tokio::test]
+async fn an_abandoned_call_frees_its_slot_for_a_replacement() {
+    let d = TestDaemon::start("dropped").await;
+    let s = d.shell_running(ECHO_OFF_FIXTURE);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let _ = next_awaiting_secret(&mut c, 20).await;
+
+    let first = spawn_call(&d, secret_args(&s.id, 60));
+    await_waiter(&d, &s.id, "the first call").await;
+    first.abort();
+    let _ = first.await;
+
+    // The `Drop` runs on the aborted task, not on ours, so this is a
+    // wait for a condition rather than an assumption about scheduling.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while d.daemon.server.attach_hub().secrets().has_waiter(&s.id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the abandoned call's waiter is still in the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The human is told, with the same word a cancel gets: from an
+    // attached client's side, "the agent stopped waiting" and "the agent
+    // went away" are one fact.
+    let (_, outcome) = next_secret_closed(&mut c, 20).await;
+    assert_eq!(
+        outcome, "caller_cancelled",
+        "the human was left looking at a prompt whose asker is gone, or told the \
+         wrong ending for it"
+    );
+    // And the affordance survived, as it does on every other ending that
+    // leaves the child at its prompt.
+    let (re_raised, _) = next_awaiting_secret(&mut c, 20).await;
+
+    let replacement = body(&d.call(secret_args(&s.id, 2)).await);
+    assert_ne!(
+        replacement["data"]["reason"], "concurrent_request_pending",
+        "the abandoned call still holds the slot: {replacement}"
+    );
+    // The pairing: the replacement really did take the prompt path and
+    // wait, rather than being refused for some other reason.
+    assert_eq!(
+        replacement["data"]["reason"], "timeout",
+        "the replacement did not run as an ordinary call: {replacement}"
+    );
+    assert_eq!(
+        replacement["data"]["request_id"], re_raised,
+        "the replacement raised its own request instead of adopting the one the \
+         human is looking at: {replacement}"
+    );
+
+    let _ = s.signal(Signal::Kill);
+}
+
+/// **GH #127 and GH #105 from the third side: an abandoned call whose
+/// request another producer already took closes nothing.**
+///
+/// `AbandonedCall` is the third producer on this closing path — after
+/// the autofill's `take_if_unadopted_matching` and the attach
+/// forwarder's `AwaitingSecretLeft` — and it arrives at the same trap.
+/// A guard that broadcast its own word regardless would tell the human
+/// `caller_cancelled` for a prompt a client had just answered, which is
+/// GH #105 verbatim with a new producer.
+///
+/// **The defence is `take`'s contract rather than a check inside the
+/// guard**: a request anybody else resolved is already out of the slot,
+/// so `close_on_caller_timeout` answers `None` and there is nothing to
+/// broadcast. This row makes that structural claim a tested one.
+///
+/// **The window is held open rather than raced for**, in the shape
+/// `an_arm_cancelled_on_a_full_write_queue_still_answers_the_waiting_call`
+/// already uses. `attach::conn` takes the slot *before* it queues the
+/// write and answers the waiter only after the ack, so parking the
+/// writer inside `write` freezes the call exactly between the two: the
+/// slot is empty, the waiter is unanswered, and the abort below lands
+/// there every time instead of in a sub-millisecond gap. Without the
+/// park the arrangement is unreachable — measured: the call completes
+/// first and the guard never runs at all, so the mutation survived.
+#[tokio::test]
+async fn an_abandoned_call_whose_request_was_taken_closes_nothing() {
+    let d = TestDaemon::start("dropraced").await;
+    let (s, pty) = d.mock_session();
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    let call = spawn_call(&d, secret_args(&s.id, 60));
+    await_waiter(&d, &s.id, "the call about to be answered").await;
+    let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    // The writer parks inside `write`, so the submission below takes the
+    // slot and then stops before its ack.
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        pty.on_write(move || {
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+    }
+
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id: request_id.clone(),
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+
+    // The slot is taken and the writer is parked: the call is frozen
+    // between the two, which is the only state this row is about.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let taken = d
+            .daemon
+            .server
+            .attach_hub()
+            .outstanding_secret(&s.id)
+            .is_none();
+        if taken && entered.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the submission never reached the parked writer, so the window this row \
+             needs was never open"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The caller goes away, inside the window.
+    call.abort();
+    let _ = call.await;
+    // Room for a wrong guard to broadcast before the assertion below.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Nothing has been said to the client yet: the write has not landed,
+    // so neither producer has a word. A guard that ignored `take`'s
+    // answer would have spoken here.
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let (closed_id, outcome) = next_secret_closed(&mut c, 20).await;
+    assert_eq!(closed_id, request_id);
+    assert_eq!(
+        outcome, "fulfilled",
+        "the request a client answered was closed as {outcome:?} — GH #105, with the \
+         abandoned-call guard as the producer"
+    );
+
+    // The pairing that makes the word above mean something: the value
+    // really did reach the child.
+    assert!(
+        contains(&pty.written(), PROBE.as_bytes()),
+        "the submitted value never reached the PTY, so nothing was fulfilled"
+    );
+
+    let _ = s.signal(Signal::Kill);
+}
+
+/// **GH #127 and GH #105 together: a cancel that loses the race to a
+/// fulfilment must not report `caller_cancelled`.**
+///
+/// The trap the issue names. A request cancelled by its caller and a
+/// request *answered* while the cancel was in flight are different
+/// endings, and the second must win — the credential really did reach the
+/// child, and telling an operator nobody answered is GH #105 exactly.
+///
+/// **The first version of this row was vacuous and was proven so.** It
+/// waited for the submission to clear the slot and then cancelled, which
+/// is too late: the oneshot resolves inside the 5 ms poll, `await_secret`
+/// returns from inside its own `select!`, and `woke` is never
+/// `Woke::Cancelled` at all — a #105 regression planted in the close
+/// block survived ten consecutive runs and an `eprintln!` in that block
+/// never printed. It was re-testing ordinary fulfilment.
+///
+/// **So the window is held open rather than raced for**, the way
+/// `an_abandoned_call_whose_request_was_taken_closes_nothing` does.
+/// `attach::conn` takes the slot *before* it queues the write and answers
+/// the waiter only after the ack, so parking the writer inside
+/// `MockPty::write` freezes the call between the two: the slot is empty,
+/// the waiter is unanswered, and the cancel below lands in the close path
+/// every time. That is the only arrangement in which `woke` really is
+/// `Woke::Cancelled` and the `None` arm really does decide the word.
+#[tokio::test]
+async fn a_cancel_that_arrives_after_the_answer_does_not_overwrite_it() {
+    let d = TestDaemon::start("cancelrace").await;
+    let (s, pty) = d.mock_session();
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    let signal = CancelSignal::new();
+    let call = spawn_cancellable_call(&d, secret_args(&s.id, 60), &signal);
+    await_waiter(&d, &s.id, "the call about to be answered").await;
+    let (id, _) = next_awaiting_secret(&mut c, 20).await;
+
+    // The writer parks inside `write`, so the submission below takes the
+    // slot and then stops before its ack.
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        pty.on_write(move || {
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+    }
+
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id: id.clone(),
+            bytes: PROBE.as_bytes().to_vec(),
+        },
+    )
+    .await;
+
+    // The slot is taken and the writer is parked: the call is frozen
+    // between the two, which is the only state this row is about.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let taken = d
+            .daemon
+            .server
+            .attach_hub()
+            .outstanding_secret(&s.id)
+            .is_none();
+        if taken && entered.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the submission never reached the parked writer, so the window this row \
+             needs was never open"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // **The cancel, inside the window.** `await_secret` wakes on it, finds
+    // the slot already gone, and must report what really happened rather
+    // than what woke it.
+    signal.cancel();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let payload = joined(call, "the answered call").await;
+    assert_eq!(
+        payload["status"], "secret_provided",
+        "a fulfilled request was reported as cancelled — GH #105, from the cancel \
+         side: {payload}"
+    );
+    assert_eq!(
+        payload["data"]["bytes_written"],
+        (PROBE.len() + 1) as u64,
+        "{payload}"
+    );
+
+    // The client is told `fulfilled`, once, and is not then told the
+    // prompt it answered was abandoned.
+    let (closed_id, outcome) = next_secret_closed(&mut c, 20).await;
+    assert_eq!(closed_id, id);
+    assert_eq!(
+        outcome, "fulfilled",
+        "the request a client answered was closed as {outcome:?}"
+    );
+    // The pairing that makes the word above mean something: the value
+    // really did reach the child.
+    assert!(
+        contains(&pty.written(), PROBE.as_bytes()),
+        "the submitted value never reached the PTY, so nothing was fulfilled"
+    );
+
+    let _ = s.signal(Signal::Kill);
+}
+
 // --------------------------------------------- the four, all in one run
 
 /// **Every reason driven for real, in one run, against an exhaustive
@@ -2491,6 +3012,7 @@ async fn every_secret_cancelled_reason_is_reachable() {
             CancelReason::Timeout => "timeout",
             CancelReason::TooLarge => "too_large",
             CancelReason::ConcurrentRequestPending => "concurrent_request_pending",
+            CancelReason::CallerCancelled => "caller_cancelled",
         })
         .collect();
 
@@ -2541,6 +3063,19 @@ async fn every_secret_cancelled_reason_is_reachable() {
         let call = spawn_call(&d, secret_args(&s.id, 20));
         await_waiter(&d, &s.id, "the abandoned call").await;
         observed.insert(cancelled_reason(&joined(call, "the abandoned call").await));
+        let _ = s.signal(Signal::Kill);
+    }
+
+    // caller_cancelled — the MCP client cancelled the request (GH #127).
+    {
+        let s = d.shell_running(ECHO_OFF_FIXTURE);
+        let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+        let _ = next_awaiting_secret(&mut c, 20).await;
+        let signal = CancelSignal::new();
+        let call = spawn_cancellable_call(&d, secret_args(&s.id, 20), &signal);
+        await_waiter(&d, &s.id, "the cancelled call").await;
+        signal.cancel();
+        observed.insert(cancelled_reason(&joined(call, "the cancelled call").await));
         let _ = s.signal(Signal::Kill);
     }
 
@@ -3703,8 +4238,13 @@ fn each_provider_builds_the_argv_the_plan_pins() {
     };
     // `SecretBytes` has no `PartialEq` — and must not gain one, which is
     // why this compares the error rather than the `Result`.
-    let refused = resolve(&unknown, &provider_limits(10), true)
-        .expect_err("a near-miss spelling must not resolve");
+    let refused = resolve(
+        &unknown,
+        &provider_limits(10),
+        true,
+        &RequestContext::detached(),
+    )
+    .expect_err("a near-miss spelling must not resolve");
     assert_eq!(
         refused,
         ProviderError::UnknownProvider("1password".to_string()),

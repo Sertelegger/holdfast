@@ -18,6 +18,26 @@ pub const METHOD_HANDSHAKE: &str = "holdfast/handshake";
 pub const METHOD_DAEMON_STATUS: &str = "daemon/status";
 /// Graceful daemon shutdown, behind `holdfast daemon stop`.
 pub const METHOD_DAEMON_STOP: &str = "daemon/stop";
+/// Cancel an in-flight call, by the token its own [`Request`] carried
+/// (GH #127).
+///
+/// **A method rather than a frame, because the connection is busy.**
+/// `daemon::server::handle_connection` reads one request, dispatches it
+/// to completion, and only then reads again — so a cancel written to the
+/// *same* socket sits in the kernel buffer until the call it is
+/// cancelling has finished, which is the one moment it is useless.
+/// `ControlClient` checks out one connection per in-flight call, so a
+/// cancel is an ordinary call on a second connection and needs nothing
+/// new from the framing.
+///
+/// **Advisory, and out-of-order-safe.** An unknown token answers
+/// `cancelled: false` rather than an error: a call that has already
+/// returned is a cancel with nothing to do, not a fault, and telling the
+/// two apart would make every racing client log an error for the ordinary
+/// case. A cancel that arrives *before* its call registers is remembered
+/// — see `daemon::server`'s recently-cancelled ring — because the two
+/// travel on different connections and nothing orders them.
+pub const METHOD_CANCEL: &str = "holdfast/cancel";
 
 // §7.4.1's MCP-resource methods (§5.5). Note the spelling: the control
 // protocol says `resource/templates_list` with an **underscore**, while
@@ -30,12 +50,47 @@ pub const METHOD_RESOURCE_TEMPLATES_LIST: &str = "resource/templates_list";
 /// `resources/read` behind the socket (§5.5.3).
 pub const METHOD_RESOURCE_READ: &str = "resource/read";
 
-/// `{ id, method, params }` — spec §7.4.
+/// `{ id, method, params }` — spec §7.4, plus GH #127's `cancel_token`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub id: u64,
     pub method: String,
     pub params: CborValue,
+    /// The token [`METHOD_CANCEL`] names this call by (GH #127).
+    ///
+    /// **On the envelope and not in `params`, deliberately.** §7.4.1
+    /// fixes `params` as *the MCP `arguments`, not a wrapper around
+    /// them*, and `dispatch_tool` deserialises it straight into a tool's
+    /// own argument struct — so a field added there would be an argument
+    /// the agent could send, in a struct that must not grow one.
+    ///
+    /// **Opaque and client-allocated.** `Request.id` is per-`ControlClient`
+    /// and starts at zero, so two shims would collide on it; a v4 UUID
+    /// from the caller does not, and it is what makes the daemon's
+    /// in-flight map a flat `HashMap` rather than something keyed by a
+    /// connection identity the cancelling connection does not have.
+    ///
+    /// `None` for every method that is not cancellable and for every peer
+    /// speaking protocol 1.1 or older, which is what `skip_serializing_if`
+    /// keeps off the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_token: Option<String>,
+}
+
+/// [`METHOD_CANCEL`]'s params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelParams {
+    /// The `cancel_token` of the call to cancel.
+    pub token: String,
+}
+
+/// [`METHOD_CANCEL`]'s `data`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelOutcome {
+    /// `true` when a call was actually signalled, `false` when the token
+    /// named nothing in flight — which is the ordinary answer for a call
+    /// that had already returned.
+    pub cancelled: bool,
 }
 
 /// `{ id, status, data, details }` — spec §7.4.
@@ -258,6 +313,25 @@ impl Request {
             id,
             method: method.into(),
             params: to_cbor(params)?,
+            cancel_token: None,
+        })
+    }
+
+    /// [`Request::new`] for a call the caller intends to be able to
+    /// cancel (GH #127).
+    ///
+    /// A separate constructor rather than an `Option` on `new`, so that
+    /// every existing call site keeps producing a request with no token
+    /// and the cancellable ones are greppable.
+    pub fn new_cancellable<P: Serialize>(
+        id: u64,
+        method: impl Into<String>,
+        params: &P,
+        cancel_token: impl Into<String>,
+    ) -> Result<Self, FrameError> {
+        Ok(Self {
+            cancel_token: Some(cancel_token.into()),
+            ..Self::new(id, method, params)?
         })
     }
 
@@ -357,6 +431,112 @@ mod tests {
     struct Probe {
         session: String,
         cursor: u64,
+    }
+
+    /// **GH #127's other skew direction: a 1.2 request decodes against
+    /// protocol 1.1's request shape.**
+    ///
+    /// §7.4.1 permits same-major different-minor skew, so a 1.2 client
+    /// talking to a 1.1 daemon must not be a wire fault — it must be a
+    /// daemon that reads the three keys it knows and drops the one it
+    /// does not, after which the call runs uncancellable, which is
+    /// exactly today's behaviour.
+    ///
+    /// **It cannot be driven against a live daemon**, because the only
+    /// daemon this workspace can start is a 1.2 one. So the 1.1 shape is
+    /// written out here — `{id, method, params}`, no `deny_unknown_fields`,
+    /// which is the whole of what protocol 1.1's `Request` was — and the
+    /// bytes a 1.2 client really emits are decoded into it.
+    ///
+    /// **And `1.2.golden` does not cover this.** It records the encoded
+    /// bytes of a maximal sample, so it sees that `cancel_token` is on the
+    /// wire under that name; it never asks what a peer without the field
+    /// does with those bytes. The `deny_unknown_fields` this row would
+    /// catch is one attribute away and would break every 1.1 peer in the
+    /// world the moment one exists.
+    #[test]
+    fn a_1_2_request_decodes_against_protocol_1_1s_shape() {
+        /// Protocol 1.1's `Request`, verbatim: three fields and no
+        /// `deny_unknown_fields`. A local copy rather than a version of
+        /// the real type, because the real type is 1.2's and the point is
+        /// to decode against something that never heard of the field.
+        #[derive(Debug, Deserialize)]
+        struct Request11 {
+            id: u64,
+            method: String,
+            params: CborValue,
+        }
+
+        let sent = Request::new_cancellable(
+            7,
+            "tool/request_secret_input",
+            &serde_json::json!({ "session": "sess_abc" }),
+            "a-token-1-1-never-heard-of",
+        )
+        .unwrap();
+
+        // The bytes a 1.2 client really puts on the wire, through the
+        // encoder it really uses — body only, since `encode` prefixes the
+        // length and `decode` reads a body.
+        let framed = frame::encode(&sent).expect("encode the 1.2 request");
+        let bytes = &framed[frame::LENGTH_PREFIX_BYTES..];
+
+        // The control, first: the field really is on those bytes. Without
+        // it a `skip_serializing_if` that dropped the token would make the
+        // decode below succeed for the wrong reason, and this row would
+        // be asserting that 1.1 can read a 1.1 frame.
+        let back: Request = frame::decode(bytes).expect("decode as 1.2");
+        assert_eq!(
+            back.cancel_token.as_deref(),
+            Some("a-token-1-1-never-heard-of"),
+            "the token is not on the wire, so the 1.1 decode below proves nothing"
+        );
+
+        // And the claim: a peer that never heard of the field reads the
+        // three it knows.
+        let old: Request11 = frame::decode(bytes).expect(
+            "a 1.2 request was a wire fault to a 1.1 peer — §7.4.1 promises \
+             same-major skew is compatible, and `deny_unknown_fields` is one \
+             attribute away from breaking it",
+        );
+        assert_eq!(old.id, 7);
+        assert_eq!(old.method, "tool/request_secret_input");
+        assert_eq!(old.params, sent.params, "`params` did not survive the skew");
+
+        // ---- and the same promise, pointing forwards from *this* build.
+        //
+        // The two halves above are about 1.1's shape, which is a
+        // historical fact. This one is about 1.2's, which is the thing a
+        // future edit can break: §7.4.1's skew rule obliges this decoder
+        // to read a request from a **later** minor and ignore what it does
+        // not know. `#[serde(deny_unknown_fields)]` is one attribute away
+        // from making that a wire fault, it reads as a tightening rather
+        // than a break, and nothing else in the tree would notice — the
+        // golden records the bytes this build *emits*, never the bytes it
+        // must *accept*.
+        let from_the_future = CborValue::Map(vec![
+            (CborValue::Text("id".into()), CborValue::Integer(9.into())),
+            (
+                CborValue::Text("method".into()),
+                CborValue::Text("tool/list_sessions".into()),
+            ),
+            (CborValue::Text("params".into()), CborValue::Map(Vec::new())),
+            (
+                CborValue::Text("cancel_token".into()),
+                CborValue::Text("tok".into()),
+            ),
+            (
+                CborValue::Text("a_field_1_3_will_add".into()),
+                CborValue::Text("whatever it likes".into()),
+            ),
+        ]);
+        let mut body = Vec::new();
+        ciborium::into_writer(&from_the_future, &mut body).expect("encode the 1.3 request");
+        let ahead: Request = frame::decode(&body).expect(
+            "a request from a later minor was a wire fault — §7.4.1 promises              same-major skew is compatible in both directions",
+        );
+        assert_eq!(ahead.id, 9);
+        assert_eq!(ahead.cancel_token.as_deref(), Some("tok"));
     }
 
     fn probe() -> Probe {
@@ -633,6 +813,7 @@ mod tests {
             id: 1,
             method: "tool/send_input".into(),
             params: params.clone(),
+            cancel_token: None,
         };
         let mut buf = Vec::new();
         frame::write_frame(&mut buf, &req).await.unwrap();

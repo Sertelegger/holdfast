@@ -159,22 +159,65 @@ impl ControlClient {
     /// Send a request, wait for its response, return it verbatim —
     /// including error responses, which the caller may want to inspect.
     pub async fn call_raw(&self, method: &str, params: CborValue) -> Result<Response, ClientError> {
+        self.call_raw_cancellable(method, params, None).await
+    }
+
+    /// [`call_raw`](Self::call_raw), carrying a `cancel_token` the daemon
+    /// will accept a [`method::METHOD_CANCEL`] against (GH #127).
+    ///
+    /// **The token is the caller's to mint and the caller's to keep.**
+    /// Nothing here remembers it: this function is one round trip, and
+    /// whoever wants to cancel the call is by definition on another task
+    /// that already holds the token. A registry here would be a second
+    /// place for it to leak.
+    pub async fn call_raw_cancellable(
+        &self,
+        method: &str,
+        params: CborValue,
+        cancel_token: Option<&str>,
+    ) -> Result<Response, ClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let req = Request {
             id,
             method: method.to_string(),
             params,
+            cancel_token: cancel_token.map(str::to_string),
         };
 
         // The connection is checked out for the round trip and nothing
         // else is held — no lock spans the `await`s below, which is the
         // entire point of the change.
+        //
+        // **It is also what makes a cancel deliverable at all** (GH #127).
+        // The daemon will not read a second frame from *this* connection
+        // until this call returns, so a cancel has to travel on another
+        // one — and one connection per in-flight call is exactly the
+        // property that guarantees another is available.
         let mut stream = self.checkout().await?;
         let resp = exchange(&mut stream, &req, id).await;
         if reusable(&resp) {
             self.checkin(stream).await;
         }
         resp
+    }
+
+    /// Ask the daemon to cancel the in-flight call carrying `token`
+    /// (GH #127).
+    ///
+    /// `Ok(true)` means a call was signalled; `Ok(false)` means the token
+    /// named nothing in flight, which is the ordinary answer for a call
+    /// that had already returned and is **not** an error — see
+    /// [`method::METHOD_CANCEL`].
+    pub async fn cancel(&self, token: &str) -> Result<bool, ClientError> {
+        let outcome: method::CancelOutcome = self
+            .call(
+                method::METHOD_CANCEL,
+                &method::CancelParams {
+                    token: token.to_string(),
+                },
+            )
+            .await?;
+        Ok(outcome.cancelled)
     }
 
     /// A connection ready to carry one call: a parked one if there is

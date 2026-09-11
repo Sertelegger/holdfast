@@ -77,6 +77,7 @@ use std::time::Duration;
 use crate::attach::secret::{zero_bytes, SecretBytes};
 use crate::clock::Clock;
 use crate::config::{SecretBinding, SecurityConfig};
+use crate::request::RequestContext;
 
 /// How often the bounded wait asks whether the child has exited.
 ///
@@ -133,8 +134,32 @@ pub enum ProviderError {
     #[error("secret provider `{provider}` failed: {status}")]
     Failed { provider: String, status: String },
     /// Rule 5. The child outlived the budget and was killed.
+    ///
+    /// **`secs` is the *effective* budget, which may be the caller's
+    /// rather than the operator's** (GH #126): `resolve_with` narrows
+    /// `keychain_provider_timeout_secs` by whatever the request has left,
+    /// so a `request_secret_input(timeout_secs: 1)` against a 10 s
+    /// provider budget reports 1.
     #[error("secret provider `{provider}` did not answer within {secs}s and was killed")]
     TimedOut { provider: String, secs: u64 },
+    /// GH #126. The provider printed more than the request's
+    /// `max_secret_bytes`, and was refused **at collection** — before
+    /// normalisation, before approval, and before anything could write it
+    /// to a PTY.
+    ///
+    /// A separate variant from [`ProviderError::TimedOut`] because they
+    /// are different operator-facing facts: one says the store was slow,
+    /// the other says the item is not the shape the request declared.
+    #[error("secret provider `{provider}` printed more than the {max_bytes}-byte budget")]
+    TooLarge { provider: String, max_bytes: usize },
+    /// GH #127. The MCP request this resolution was for was cancelled by
+    /// its caller while the provider ran.
+    ///
+    /// **Not `TimedOut`.** A caller that went away and a deadline that
+    /// elapsed are different endings, and reporting one as the other is
+    /// the defect GH #105 was.
+    #[error("secret provider `{provider}` was killed: the request was cancelled")]
+    Cancelled { provider: String },
     /// Exited 0 and printed no value.
     ///
     /// **A failure and not an `Ok` of length zero**, deliberately: an
@@ -402,13 +427,18 @@ impl SecretProvider for ScriptProvider {
 /// both answers: a provider printing `hunter2\n` must resolve to 8 bytes
 /// with it and 7 without. It is **not** in the two-argument signature the
 /// plan sketched; see the task report.
+///
+/// `ctx` is the **request's** deadline, byte budget and cancellation
+/// (GH #126) — not this module's. See [`resolve_with`] for what each of
+/// the three does here.
 pub fn resolve(
     binding: &SecretBinding,
     limits: &SecurityConfig,
     append_newline: bool,
+    ctx: &RequestContext,
 ) -> Result<SecretBytes, ProviderError> {
     let provider = ArgvProvider::from_config(&binding.provider)?;
-    resolve_with(&provider, &binding.reference, limits, append_newline)
+    resolve_with(&provider, &binding.reference, limits, append_newline, ctx)
 }
 
 /// [`resolve`] over any [`SecretProvider`] — the seam a test injects a
@@ -417,11 +447,30 @@ pub fn resolve(
 /// **`pub(crate)`.** See [`resolve`]: this signature is the one an
 /// agent-supplied string must never reach, so it is not offered to
 /// anyone who is not this crate.
+///
+/// ## What `ctx` does here (GH #126)
+///
+/// Three things, and they are not decoration:
+///
+/// * **Its deadline narrows rule 5's budget.** `keychain_provider_timeout_secs`
+///   is the operator's bound on *a provider*; the context carries the
+///   caller's bound on *the request*, and a call that declared
+///   `timeout_secs: 1` must not be held for the provider's ten. The
+///   effective budget is the smaller of the two, which is
+///   [`RequestContext::bounded`].
+/// * **Its byte budget bounds collection.** The readers stop one byte
+///   past it, so an oversized answer is refused where it is *read*
+///   rather than measured after it has already been copied whole. That
+///   is the difference between `max_secret_bytes` being a limit and
+///   being a statistic.
+/// * **Its cancellation ends the wait.** A caller that went away is not
+///   waiting for a keyring to unlock.
 pub(crate) fn resolve_with(
     provider: &dyn SecretProvider,
     reference: &str,
     limits: &SecurityConfig,
     append_newline: bool,
+    ctx: &RequestContext,
 ) -> Result<SecretBytes, ProviderError> {
     let name = provider.name().to_string();
     let argv = provider.argv(reference)?;
@@ -437,7 +486,7 @@ pub(crate) fn resolve_with(
     // from here.
     let budget = Duration::from_secs(u64::from(limits.keychain_provider_timeout_secs));
 
-    let stdout = run(&name, &argv, budget)?;
+    let stdout = run(&name, &argv, budget, ctx)?;
 
     // Rule 2 and rule 4 in one statement: the `Vec<u8>` is **moved** into
     // the type whose `Drop` zeroes it, and §5.2's normalisation is the
@@ -454,13 +503,44 @@ pub(crate) fn resolve_with(
     Ok(value)
 }
 
-/// Spawn `argv`, bounded by `budget`, and hand back stdout.
+/// Spawn `argv`, bounded by `budget` **and** by `ctx`, and hand back
+/// stdout.
 ///
 /// Both pipes are drained on their own threads for the ordinary reason: a
 /// child that fills the 64 KiB pipe buffer while we are blocked in
 /// `try_wait` never exits, and a bounded wait that deadlocks is a worse
 /// bug than no bound at all.
-fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, ProviderError> {
+///
+/// ## What ends the wait, and what used to (GH #126)
+///
+/// This function used to treat the **direct child's exit** as the end of
+/// the bounded phase: `try_wait` answered `Ok(Some(status))`, the poll
+/// loop broke, and the two readers were then `join`ed unconditionally —
+/// an unbounded wait, immediately after the bound. That is not a
+/// theoretical gap. `pass` forks `gpg`, `op read` forks a biometric
+/// helper, and **a fork inherits the stdout pipe's write end**, so
+/// `read_to_end` cannot see EOF while the grandchild lives even though
+/// the process this function spawned has been reaped. Measured on this
+/// tree: a fixture whose direct child printed a credential and exited at
+/// once, with a backgrounded `sleep 4` holding the pipe, returned
+/// **`Ok` after 4.02 s against a 1 s budget**.
+///
+/// It is the descriptor-inheritance shape GH #21 and GH #52 were, seen
+/// from the other side. There the lever was `shutdown(2)` — ask for the
+/// ending rather than infer it from a `close`. Here it is the same move:
+/// the phase that is bounded is **collection**, which is the thing whose
+/// end this function actually needs, and the child's exit is one of its
+/// three conditions rather than a proxy for all of them.
+///
+/// So the loop below waits for all three — the child reaped, stdout
+/// drained, stderr drained — against one deadline, and on expiry it kills
+/// the group *and* reports. Nothing here joins a reader.
+fn run(
+    name: &str,
+    argv: &[String],
+    budget: Duration,
+    ctx: &RequestContext,
+) -> Result<Vec<u8>, ProviderError> {
     let Some((program, args)) = argv.split_first() else {
         return Err(ProviderError::MalformedReference {
             provider: name.to_string(),
@@ -538,6 +618,39 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
     // milestone compiles for Windows, and an uncompiled `#[cfg]` arm is
     // worse than a named gap.
 
+    // **GH #127: an ended request touches no credential store.**
+    //
+    // The bounded loop below refuses an expired or cancelled request, but
+    // it refuses it *after* the spawn — and the spawn is the whole cost
+    // that matters here. `op read` wakes a biometric helper; `pass show`
+    // wakes `gpg`, which wakes `pinentry` and puts a modal in front of a
+    // human. Doing that for a request whose caller has already gone is
+    // this module's own objection to speculative resolution — *"a
+    // credential read out of a store nobody agreed to read"* — arrived at
+    // from the other end.
+    //
+    // **Sited here, at the last statement before the fork**, so the
+    // window between the test and the `exec` is the fork itself. The
+    // §17.5 approval and the `spawn_blocking` hop both sit above it and
+    // are exactly where a cancel lands.
+    //
+    // The `max_uses` claim is `resolve_selected`'s and is refunded on
+    // every `Err` from here, including this one.
+    {
+        let now = Clock::system().now();
+        if let Some(ended) = ctx.ended(now) {
+            return Err(match ended {
+                crate::request::RequestEnded::Cancelled => ProviderError::Cancelled {
+                    provider: name.to_string(),
+                },
+                crate::request::RequestEnded::Expired => ProviderError::TimedOut {
+                    provider: name.to_string(),
+                    secs: 0,
+                },
+            });
+        }
+    }
+
     // **Not a branch, and not a behaviour: a lock acquisition that is
     // compiled out entirely.** See [`exec_guard`] for the hazard. It is
     // sited here because this is the only `fork` in the module, and the
@@ -563,29 +676,45 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
 
     let mut out_pipe = child.stdout.take().expect("stdout was piped");
     let mut err_pipe = child.stderr.take().expect("stderr was piped");
-    // **`with_capacity`, not `Vec::new`, and it is the F-2 class rather
-    // than a micro-optimisation.** `read_to_end` on an empty `Vec` grows
-    // by doubling, and every doubling copies what has been read so far
-    // into a new block and frees the old one **without zeroing it** —
-    // one un-zeroed copy of the credential per reallocation, in memory
-    // nothing in this process can reach again. A provider's answer is a
-    // credential, so the buffer is sized once, up front, for the largest
-    // answer this daemon will accept.
+
+    // **The size budget, applied where the bytes are read** (GH #126).
+    // `max_secret_bytes` used to be checked at the submission boundary
+    // only — `attach::conn`'s `SecretInput` arm — so a provider's answer
+    // was never measured against it at all: `read_to_end` is unbounded,
+    // and a 7-byte credential was accepted under a 1-byte budget and
+    // written to the PTY as 8 bytes with the newline. Measured on this
+    // tree, at the numbers in that sentence.
     //
-    // `read_to_end` may still grow it if a provider prints more than the
-    // ceiling. That output is over the limit and is refused downstream;
-    // what matters here is that the ordinary case never reallocates.
-    let capacity = PROVIDER_READ_CAPACITY;
+    // A context with no budget is `RequestContext::detached`, which no
+    // path a credential takes uses; the fall-back is the read capacity
+    // rather than "unbounded" so that even that path cannot be made to
+    // buffer an arbitrary amount by a provider that prints forever.
+    let cap = ctx
+        .max_bytes()
+        .map_or(PROVIDER_READ_CAPACITY, |n| n as usize);
+
+    // Each reader hands its buffer over a channel rather than through a
+    // `JoinHandle`, and that is the shape change (GH #126). A
+    // `JoinHandle` offers only `join()` — an unbounded wait — so the
+    // deadline could not cover collection at all; a `Receiver` can be
+    // polled, so the loop below asks "is it drained yet?" the same way it
+    // asks "has it exited yet?".
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
     let out_reader = std::thread::spawn(move || {
-        let mut buf = Vec::with_capacity(capacity);
-        let _ = out_pipe.read_to_end(&mut buf);
-        buf
+        hand_over(out_tx, drain_bounded(&mut out_pipe, cap));
     });
     let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::with_capacity(capacity);
-        let _ = err_pipe.read_to_end(&mut buf);
-        buf
+        // stderr is discarded whatever it holds (rule 2), so its bound is
+        // this module's read capacity and not the request's: a provider's
+        // diagnostics are not the credential and must not be able to make
+        // a 1-byte budget refuse a working lookup.
+        hand_over(err_tx, drain_bounded(&mut err_pipe, PROVIDER_READ_CAPACITY));
     });
+    // Nothing joins these. They are named so the detached-zeroing note on
+    // the expiry path below has something to point at.
+    drop(out_reader);
+    drop(err_reader);
 
     // The crate's one clock (`clock.rs`) rather than a bare
     // `Instant::now()`, so there is still exactly one answer to "what
@@ -593,94 +722,169 @@ fn run(name: &str, argv: &[String], budget: Duration) -> Result<Vec<u8>, Provide
     // purpose: this deadline bounds a real OS process, and a hand a test
     // moves cannot make a real `sleep 60` return sooner.
     let clock = Clock::system();
-    let deadline = clock.now() + budget;
-    let exited = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {}
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ProviderError::NotStarted {
-                    provider: name.to_string(),
-                    kind: e.kind(),
-                });
+    // **One budget, narrowed by the request's** (GH #126).
+    // `keychain_provider_timeout_secs` is the operator's bound on a
+    // provider; `ctx` carries the caller's bound on the whole request,
+    // and a call that declared `timeout_secs: 1` must not be held for the
+    // provider's ten. `bounded` is `min`, so this can only ever shorten.
+    let started = clock.now();
+    let budget = ctx.bounded(started, budget);
+    let deadline = started + budget;
+    // The group id, captured **before** anything can reap the child.
+    // `process_group(0)` at spawn made it the child's own pid, and after
+    // a reap `Child::id` is a number the kernel may have handed to
+    // somebody else.
+    let group = child.id();
+
+    // **Three conditions and one deadline.** The child reaped, stdout
+    // drained, stderr drained — see this function's header for why the
+    // first on its own was the bug.
+    let mut status = None;
+    let mut out: Option<Drained> = None;
+    let mut err: Option<Drained> = None;
+    let over = loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(s)) => status = Some(s),
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    detach_and_zero([out_rx, err_rx]);
+                    return Err(ProviderError::NotStarted {
+                        provider: name.to_string(),
+                        kind: e.kind(),
+                    });
+                }
             }
         }
-        if clock.now() >= deadline {
+        if out.is_none() {
+            if let Ok(d) = out_rx.try_recv() {
+                out = Some(d);
+            }
+        }
+        if err.is_none() {
+            if let Ok(d) = err_rx.try_recv() {
+                err = Some(d);
+            }
+        }
+        if status.is_some() && out.is_some() && err.is_some() {
             break None;
+        }
+        // **Cancellation before the clock**, on the same rule
+        // `RequestContext::ended` follows: a caller that went away is a
+        // fact about who asked, and the deadline is a fact about the
+        // clock.
+        if ctx.is_cancelled() {
+            break Some(crate::request::RequestEnded::Cancelled);
+        }
+        if clock.now() >= deadline {
+            break Some(crate::request::RequestEnded::Expired);
         }
         std::thread::sleep(POLL_INTERVAL);
     };
 
-    let Some(status) = exited else {
+    if let Some(ended) = over {
         // Rule 5: kill the child **and everything it forked**, then reap
         // it here so the daemon does not accumulate zombies over a
         // session's lifetime.
         //
-        // The group goes first and while the child is still un-reaped:
-        // the group id is the child's pid, and a pid that has been waited
-        // for can be recycled, so signalling `-pid` after the reap is a
-        // signal at whatever now holds that number.
-        kill_group(&child);
+        // **The group first, and the pid is the one captured at spawn.**
+        // The group id is the child's pid, and a pid that has been waited
+        // for can be recycled — so it is read before the loop above rather
+        // than off a `Child` the loop may already have reaped. What makes
+        // signalling it safe *after* a reap is the group's own lifetime:
+        // POSIX holds a process-group id reserved for as long as the group
+        // has a member, and a group with no members is holding no pipe, so
+        // the only case this path reaches the kill in is the one where the
+        // id is still the group's.
+        //
+        // It is also the thing that ends collection. A grandchild holding
+        // the inherited write end is what the readers are blocked on;
+        // killing the group releases it, so the two detached threads below
+        // finish and zero what they read.
+        kill_group(group);
         let _ = child.kill();
         let _ = child.wait();
-        // The two readers are **not** joined *here*. They are blocked on
-        // pipes the killed child has just released, so they finish on
+        // The two readers are **not** joined here. They are blocked on
+        // pipes the killed group has just released, so they finish on
         // their own; joining would reintroduce an unbounded wait on the
         // one path whose entire purpose is to be bounded — a provider
         // that left a grandchild holding the pipe would hang the session
-        // slot exactly as if there had been no timeout.
+        // slot exactly as if there had been no timeout. That is no longer
+        // hypothetical: it is GH #126, and it was reached through the
+        // *success* path rather than this one.
         //
         // **But discarded is not zeroed.** A provider that answered a
         // millisecond after the deadline has a complete credential in
-        // that buffer, and `drop`ping the `JoinHandle` detaches the
-        // thread and leaves the buffer to an ordinary `Vec::drop` — which
-        // does not zero. The success path is careful to `zero_bytes` both
-        // pipes and the failure path zeroes stdout; this path zeroed
-        // neither (security review, F-2).
-        //
-        // So the join is moved off this thread rather than dropped: two
-        // detached threads that wait for the readers and zero what they
-        // produced. The bound this path exists to keep is unaffected —
-        // nothing here waits on them.
+        // that buffer, and dropping the receiver leaves the buffer to an
+        // ordinary `Vec::drop` — which does not zero (security review,
+        // F-2). `Drained`'s own `Drop` zeroes, and `hand_over` zeroes a
+        // buffer whose receiver has gone, so the two threads below are
+        // belt and braces on a value that is already zeroed twice over;
+        // they exist so that the *timing* is bounded by the reader rather
+        // than by this thread.
         //
         // **The cost is stated exactly, because it is not free.** A reader
-        // that never finishes used to park one thread; it now parks
-        // **two**, that reader plus the joiner waiting on it, since before
-        // this change the `JoinHandle` was simply dropped and no second
-        // thread existed. Two per hung provider call, bounded by nothing
-        // in this function — the same unboundedness the un-joined version
-        // had, doubled. And `join().unwrap_or_default()` means a reader
-        // thread that *panicked* hands back an empty `Vec`: its own buffer
-        // went with the unwind and is zeroed by nobody. Both are accepted
-        // here rather than glossed — a `read_to_end` into a `Vec<u8>` has
-        // no panicking path short of an allocation failure, and the
-        // alternative to the second thread is the unbounded wait this
-        // whole path exists to avoid.
-        for reader in [out_reader, err_reader] {
-            std::thread::spawn(move || {
-                let mut buf = reader.join().unwrap_or_default();
-                zero_bytes(&mut buf);
-            });
-        }
+        // that never finishes used to park one thread; it parks **two**,
+        // that reader plus the joiner waiting on it. Two per hung provider
+        // call, bounded by nothing in this function — the same
+        // unboundedness the un-joined version had, doubled, and accepted
+        // here rather than glossed: the alternative is the unbounded wait
+        // this whole path exists to avoid.
+        detach_and_zero([out_rx, err_rx]);
+        drop(out);
+        drop(err);
         let secs = budget.as_secs();
-        crate::diag!(
-            "holdfast: secret provider `{name}` did not answer within {secs}s and was killed"
-        );
-        return Err(ProviderError::TimedOut {
-            provider: name.to_string(),
-            secs,
+        return Err(match ended {
+            crate::request::RequestEnded::Cancelled => {
+                crate::diag!(
+                    "holdfast: secret provider `{name}` was killed: the request was cancelled"
+                );
+                ProviderError::Cancelled {
+                    provider: name.to_string(),
+                }
+            }
+            crate::request::RequestEnded::Expired => {
+                crate::diag!(
+                    "holdfast: secret provider `{name}` did not answer within {secs}s \
+                     and was killed"
+                );
+                ProviderError::TimedOut {
+                    provider: name.to_string(),
+                    secs,
+                }
+            }
         });
-    };
+    }
 
-    let mut stdout = out_reader.join().unwrap_or_default();
+    let status = status.expect("the loop breaks `None` only with a status");
+    let out = out.expect("the loop breaks `None` only with stdout drained");
     // Rule 2's second half: **captured, and discarded here.** Captured so
     // the child's diagnostics cannot reach the daemon's inherited stderr,
     // which is `daemon.log`; zeroed rather than merely dropped because a
-    // provider is free to print whatever it likes into it.
-    let mut stderr = err_reader.join().unwrap_or_default();
-    zero_bytes(&mut stderr);
+    // provider is free to print whatever it likes into it. `Drained`'s
+    // `Drop` is that zeroing, so the discard is the `drop` below and not
+    // a `zero_bytes` somebody has to remember.
+    drop(err);
+
+    // **Refused at collection, before anything normalises or writes it**
+    // (GH #126). The reader stopped one byte past the budget, so this is
+    // the answer to *"did it fit"* and not a guess from a truncated
+    // buffer.
+    if out.over_cap {
+        crate::diag!(
+            "holdfast: secret provider `{name}` printed more than the request's \
+             {cap}-byte budget; resolving nothing"
+        );
+        drop(out);
+        return Err(ProviderError::TooLarge {
+            provider: name.to_string(),
+            max_bytes: cap,
+        });
+    }
+
+    let mut stdout = out.take();
 
     if !status.success() {
         // Rule 3, and this line is the whole of what a failure is allowed
@@ -799,7 +1003,158 @@ pub(crate) mod exec_guard {
     }
 }
 
-/// SIGKILL the process group the child leads, taking its forks with it.
+/// One pipe's contents, and whether the reader stopped at the byte
+/// budget rather than at EOF.
+///
+/// **The `Drop` is the zeroing**, so there is no path out of
+/// [`drain_bounded`] — returned, dropped on the floor, or lost to a
+/// receiver that has gone away — on which a credential survives in freed
+/// memory. The alternative is a `zero_bytes` at every one of the seven
+/// exits in [`run`], which is the shape F-2 was filed against.
+struct Drained {
+    bytes: Vec<u8>,
+    /// The reader hit `cap + 1` bytes and stopped. A *fact*, not an
+    /// inference from the length: a reader that stopped exactly at the
+    /// cap cannot tell a value that fits from one that was truncated.
+    over_cap: bool,
+}
+
+impl Drained {
+    /// Move the bytes out. What is left behind is empty, so the `Drop`
+    /// below zeroes nothing and the caller owns the only copy.
+    fn take(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for Drained {
+    fn drop(&mut self) {
+        zero_bytes(&mut self.bytes);
+    }
+}
+
+/// Read `pipe` to EOF or to one byte past `cap`, whichever comes first.
+///
+/// **`cap + 1` and not `cap`**, so "over the budget" is observed rather
+/// than deduced — see [`Drained::over_cap`].
+///
+/// **`with_capacity`, not `Vec::new`, and it is the F-2 class rather than
+/// a micro-optimisation.** A `Vec` that grows by doubling copies what has
+/// been read so far into a new block and frees the old one **without
+/// zeroing it** — one un-zeroed copy of the credential per reallocation,
+/// in memory nothing in this process can reach again. So the buffer is
+/// sized once, up front. A `cap` above [`PROVIDER_READ_CAPACITY`] can
+/// still grow it; that is the one case, it needs a `max_secret_bytes`
+/// ceiling raised past 64 KiB, and the ordinary case never reallocates.
+fn drain_bounded(pipe: &mut impl Read, cap: usize) -> Drained {
+    let limit = cap.saturating_add(1);
+    let mut bytes = Vec::with_capacity(limit.min(PROVIDER_READ_CAPACITY));
+    let mut chunk = Scratch([0u8; 8192]);
+    let mut over_cap = false;
+    loop {
+        if bytes.len() >= limit {
+            over_cap = true;
+            break;
+        }
+        let want = (limit - bytes.len()).min(chunk.0.len());
+        match pipe.read(&mut chunk.0[..want]) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&chunk.0[..n]),
+            // A signal, not an ending. `read_to_end` retried these and so
+            // does this; without the arm a provider that answered during
+            // a `SIGCHLD` would resolve a truncated credential.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    Drained { bytes, over_cap }
+}
+
+/// The reader's scratch buffer: the one copy of the credential
+/// [`drain_bounded`] makes that is not `bytes`.
+///
+/// **A type whose `Drop` zeroes, and not a `zero_bytes` before the
+/// return.** The loop above has four exits and a natural refactor adds a
+/// fifth; a statement can be stepped around and a `Drop` cannot.
+/// Measured, which is why this is a type: rewriting `Ok(0) => break` as
+/// `Ok(0) => return Drained { bytes, over_cap }` — an ordinary early
+/// return — left `source_guards` green 8/8 and every provider unit green,
+/// while the last 8 KiB of **every** credential stayed on the reader
+/// thread's stack on the ordinary success path. A text scan cannot see
+/// reachability; this does not have to.
+struct Scratch([u8; 8192]);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        zero_bytes(&mut self.0);
+        #[cfg(test)]
+        scratch_witness::record(&self.0);
+    }
+}
+
+/// What [`Scratch`] looked like **after** its zeroing, for the one row
+/// that asserts on memory rather than on source text.
+///
+/// **Thread-local, like `attach::secret`'s `drop_witness` and for the
+/// same reason**: a process-wide record shared across parallel rows is a
+/// test that fails under load, which is worse than no test. The row that
+/// reads it calls [`drain_bounded`] on its own thread rather than through
+/// `run`, which is what makes a thread-local enough — and is also what
+/// lets it drive every exit of the loop, including the two no real
+/// provider produces on demand.
+#[cfg(test)]
+mod scratch_witness {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SEEN: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(after_zeroing: &[u8]) {
+        SEEN.with(|s| s.borrow_mut().push(after_zeroing.to_vec()));
+    }
+
+    pub(super) fn reset() {
+        SEEN.with(|s| s.borrow_mut().clear());
+    }
+
+    pub(super) fn taken() -> Vec<Vec<u8>> {
+        SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+}
+
+/// Hand a drained pipe to [`run`], zeroing it if nobody is there to take
+/// it.
+///
+/// `SendError` carries the value back, and a value dropped out of a
+/// `SendError` would take an ordinary `Vec::drop` — which is why the
+/// error arm exists rather than a `let _ =`. It cannot actually be
+/// reached without a `Drained` in hand, so the zeroing is `Drop`'s
+/// either way; this is the line that makes that true by construction
+/// instead of by reading.
+fn hand_over(tx: std::sync::mpsc::Sender<Drained>, drained: Drained) {
+    if let Err(std::sync::mpsc::SendError(orphan)) = tx.send(drained) {
+        drop(orphan);
+    }
+}
+
+/// Wait for whatever the readers still owe us, off this thread, and zero
+/// it.
+///
+/// **Nothing here waits**, which is the whole point: the bound [`run`]
+/// exists to keep is unaffected by a reader that never finishes. See the
+/// expiry path for the cost.
+fn detach_and_zero(receivers: [std::sync::mpsc::Receiver<Drained>; 2]) {
+    for rx in receivers {
+        std::thread::spawn(move || {
+            // `Drained::drop` zeroes; `recv` erroring means the reader
+            // thread is gone and zeroed its own buffer already.
+            drop(rx.recv());
+        });
+    }
+}
+
+/// SIGKILL the process group `pid` leads, taking its forks with it.
 ///
 /// Negative pid means "the group" to `kill(2)` — the same spelling
 /// `pty::in_process::killpg` uses, kept as its own function here so the
@@ -807,21 +1162,28 @@ pub(crate) mod exec_guard {
 /// Errors are dropped: `ESRCH` means the group is already gone, which is
 /// the outcome being asked for.
 ///
+/// **It takes a pid and no longer a `&Child`** (GH #126). The caller now
+/// reaches this from a path on which the child may already have been
+/// reaped, and `Child::id` after a reap is a number the kernel is free to
+/// have handed to somebody else. Reading it once at spawn and passing it
+/// makes that impossible to get wrong here; what makes *signalling* it
+/// safe after a reap is stated at the call site.
+///
 /// **The non-Unix body is a no-op and the caller's `Child::kill` is the
 /// whole of the teardown there** — see the `#[cfg(windows)]` seam note at
 /// the spawn site.
 #[cfg(unix)]
-fn kill_group(child: &std::process::Child) {
+fn kill_group(pid: u32) {
     // `process_group(0)` at spawn made the child its own group leader, so
     // its pid *is* the group id.
-    let pid = child.id() as i32;
+    let pid = pid as i32;
     if pid > 1 {
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
 }
 
 #[cfg(not(unix))]
-fn kill_group(_child: &std::process::Child) {}
+fn kill_group(_pid: u32) {}
 
 /// `attr=val,attr=val` — §9.6's example spelling for the two
 /// attribute-addressed stores, split on the **first** `=` of each segment
@@ -940,6 +1302,7 @@ mod tests {
             "work/db",
             &SecurityConfig::default(),
             true,
+            &unbounded(),
         )
         .expect("the fixture resolves");
 
@@ -1171,9 +1534,26 @@ mod tests {
         limits: SecurityConfig,
         append_newline: bool,
     ) -> Result<SecretBytes, ProviderError> {
+        resolve_off_thread_with(provider, reference, limits, append_newline, unbounded()).await
+    }
+
+    /// A context with no caller: no deadline beyond the provider's own
+    /// budget, no cancellation, and the module's read capacity as the
+    /// byte budget. What every row that is not about GH #126 wants.
+    fn unbounded() -> RequestContext {
+        RequestContext::detached().with_max_bytes(PROVIDER_READ_CAPACITY as u32)
+    }
+
+    async fn resolve_off_thread_with(
+        provider: ScriptProvider,
+        reference: &str,
+        limits: SecurityConfig,
+        append_newline: bool,
+        ctx: RequestContext,
+    ) -> Result<SecretBytes, ProviderError> {
         let reference = reference.to_string();
         tokio::task::spawn_blocking(move || {
-            resolve_with(&provider, &reference, &limits, append_newline)
+            resolve_with(&provider, &reference, &limits, append_newline, &ctx)
         })
         .await
         .expect("the resolve task")
@@ -1502,6 +1882,7 @@ mod tests {
             &reference,
             &provider_limits(10),
             false,
+            &unbounded(),
         )
         .expect("the fixture resolves");
         assert_eq!(value.len(), 7, "the fixture's value did not arrive intact");
@@ -1808,6 +2189,479 @@ mod tests {
         let _ = s.signal(crate::pty::Signal::Kill);
     }
 
+    /// **F-2's last un-inspected copy: the reader's scratch chunk is
+    /// zeroed on every exit, asserted against memory rather than against
+    /// source text.**
+    ///
+    /// **Written because the text scan could not see reachability.**
+    /// `source_guards` asserted that `zero_bytes(&mut chunk)` appears
+    /// *somewhere in the file*, so rewriting `Ok(0) => break` as an
+    /// ordinary early return left it green 8/8 with every provider unit
+    /// green — and the last 8 KiB of **every** credential on the reader
+    /// thread's stack, on the ordinary success path. That is the exact
+    /// class the guard's own failure message describes.
+    ///
+    /// The remedy is a `Drop` rather than a statement, so this row asks
+    /// the only question left: *did the buffer really end up zero?*
+    /// `secret::request`'s `the_submitted_value_is_zeroed_after_the_write`
+    /// is the same idiom; the provider path had none.
+    ///
+    /// **Every exit of the loop, including the two a real provider does
+    /// not produce on demand.** `drain_bounded` is called directly rather
+    /// than through `run` for two reasons: a reader that errors or
+    /// over-runs is trivial to write and impossible to schedule, and the
+    /// witness is thread-local — which is what keeps it load-insensitive
+    /// — so the call has to be on this thread.
+    #[test]
+    fn the_readers_scratch_chunk_is_zeroed_on_every_exit() {
+        /// A reader that yields `first` and then behaves as `then`.
+        struct Then(Vec<u8>, std::io::ErrorKind, bool);
+        impl Read for Then {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.0.is_empty() {
+                    let n = self.0.len().min(buf.len());
+                    buf[..n].copy_from_slice(&self.0[..n]);
+                    self.0.drain(..n);
+                    return Ok(n);
+                }
+                if self.2 {
+                    Ok(0)
+                } else {
+                    Err(std::io::Error::from(self.1))
+                }
+            }
+        }
+
+        let probe = PROBE.as_bytes().to_vec();
+        let cases: Vec<(&str, Then, usize)> = vec![
+            // EOF — the ordinary success path, and the one the deleted
+            // statement was reachable from.
+            (
+                "eof",
+                Then(probe.clone(), std::io::ErrorKind::Other, true),
+                4096,
+            ),
+            // The byte budget, which returns from the top of the loop.
+            (
+                "over the budget",
+                Then(probe.clone(), std::io::ErrorKind::Other, true),
+                1,
+            ),
+            // A read error, which is its own arm.
+            (
+                "a read error",
+                Then(probe.clone(), std::io::ErrorKind::BrokenPipe, false),
+                4096,
+            ),
+        ];
+
+        for (label, mut reader, cap) in cases {
+            scratch_witness::reset();
+            let drained = drain_bounded(&mut reader, cap);
+            // The control: the credential really did pass through the
+            // chunk on this exit, so "the chunk is zero" is a fact about
+            // zeroing rather than about a reader that read nothing.
+            assert!(
+                !drained.bytes.is_empty(),
+                "{label}: nothing was read, so the chunk never held the value"
+            );
+            drop(drained);
+
+            let seen = scratch_witness::taken();
+            assert_eq!(
+                seen.len(),
+                1,
+                "{label}: the scratch buffer was not disposed of exactly once"
+            );
+            assert!(
+                seen[0].iter().all(|&b| b == 0),
+                "{label}: the reader's scratch chunk kept {} non-zero byte(s) — up to \
+                 8 KiB of the credential, left on a thread's stack",
+                seen[0].iter().filter(|&&b| b != 0).count()
+            );
+        }
+
+        // **The pairing, and the reason the assertion above is not
+        // vacuous**: the witness is capable of reporting a dirty buffer,
+        // and does when it is handed one.
+        scratch_witness::reset();
+        scratch_witness::record(PROBE.as_bytes());
+        let control = scratch_witness::taken();
+        assert_eq!(control, vec![PROBE.as_bytes().to_vec()]);
+    }
+
+    /// **GH #126: the deadline covers *collection*, not the direct
+    /// child's exit.**
+    ///
+    /// The fixture is the mechanism, minimised: the direct child prints a
+    /// credential and exits at once, and a backgrounded `sleep` inherits
+    /// the stdout pipe's write end. `try_wait` therefore answers
+    /// `Ok(Some(_))` within milliseconds — which used to end the bounded
+    /// phase — while the readers cannot see EOF for four seconds.
+    ///
+    /// Measured before the fix, on this fixture at this budget:
+    /// **`Ok` after 4.020 s against a 1 s budget**, the credential
+    /// resolved whole. After: `TimedOut` at 1.08 s.
+    ///
+    /// **Three assertions, and the last is what stops this passing for
+    /// the wrong reason.** A `run` that refused every provider outright
+    /// would satisfy the first two, so the row pairs them with the *same
+    /// fixture minus the grandchild* resolving normally — the only
+    /// difference between the two halves is who is holding the pipe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_deadline_covers_collection_and_not_only_the_direct_childs_exit() {
+        let fx = ScriptDir::new("collect");
+        let leaky = fx.named_script("leak.sh", &format!("sleep 4 &\nprintf '{PROBE}'\nexit 0\n"));
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(30),
+            resolve_off_thread(
+                ScriptProvider::new("op", &leaky),
+                "op://v/i/f",
+                provider_limits(1),
+                false,
+            ),
+        )
+        .await
+        .expect("`resolve` never returned at all: nothing bounded it");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            out.err(),
+            Some(ProviderError::TimedOut {
+                provider: "op".to_string(),
+                secs: 1
+            }),
+            "a grandchild holding the inherited stdout pipe past the budget still \
+             resolved a credential"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the budget stopped being enforced when the direct child exited: {elapsed:?} \
+             against a 1 s budget, with the pipe held for 4 s"
+        );
+        // The pairing: the provider really was given its second, so the
+        // row above is not green because nothing ran.
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "the provider was never given its second: {elapsed:?}"
+        );
+
+        // **The anti-vacuity half.** The same script without the
+        // backgrounded `sleep` resolves, so the refusal above is about
+        // the held descriptor and not about a `run` that refuses
+        // everything.
+        let plain = fx.named_script("plain.sh", &format!("printf '{PROBE}'\n"));
+        let value = resolve_off_thread(
+            ScriptProvider::new("op", &plain),
+            "op://v/i/f",
+            provider_limits(1),
+            false,
+        )
+        .await
+        .expect("the same fixture without the grandchild must resolve");
+        assert_eq!(value.len(), PROBE.len());
+    }
+
+    /// **GH #126: the request's byte budget is applied at collection.**
+    ///
+    /// `max_secret_bytes` was enforced at the submission boundary only,
+    /// so a provider's answer was never measured against it: measured
+    /// before the fix, a **1-byte budget accepted a 7-byte credential**
+    /// and normalised it to 8 with the newline.
+    ///
+    /// **The budget is the *context's* and not the config's**, which is
+    /// the whole point of the shared context: `[security]
+    /// max_secret_bytes_ceiling` is the operator's outer bound and
+    /// `request_secret_input`'s `max_secret_bytes` is the call's, and
+    /// what reaches a provider has to be whichever is narrower.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_provider_that_prints_more_than_the_requests_budget_resolves_nothing() {
+        let fx = ScriptDir::new("overcap");
+        let script = fx.named_script("big.sh", &format!("printf '{PROBE}'\n"));
+
+        let refused = resolve_off_thread_with(
+            ScriptProvider::new("op", &script),
+            "op://v/i/f",
+            provider_limits(10),
+            true,
+            RequestContext::detached().with_max_bytes(1),
+        )
+        .await
+        .expect_err("a 7-byte credential was accepted under a 1-byte budget");
+        assert_eq!(
+            refused,
+            ProviderError::TooLarge {
+                provider: "op".to_string(),
+                max_bytes: 1
+            },
+            "an over-budget provider answer must be refused as over-budget, not as \
+             something else a caller would retry differently"
+        );
+
+        // **Exactly at the budget still resolves**, which is what stops
+        // this passing against an off-by-one that refuses everything —
+        // and pins the bound as inclusive, matching `attach::conn`'s
+        // `bytes.len() > cap`.
+        let value = resolve_off_thread_with(
+            ScriptProvider::new("op", &script),
+            "op://v/i/f",
+            provider_limits(10),
+            false,
+            RequestContext::detached().with_max_bytes(PROBE.len() as u32),
+        )
+        .await
+        .expect("a value exactly at the budget must resolve");
+        assert_eq!(value.len(), PROBE.len());
+    }
+
+    /// **GH #127: an already-ended request starts no process at all.**
+    ///
+    /// The collection loop refuses a cancelled request, but it refuses it
+    /// *after* the spawn — and the spawn is the cost that matters here.
+    /// `op read` wakes a biometric helper; `pass show` wakes `gpg`, which
+    /// wakes `pinentry` and puts a modal in front of a human. Doing that
+    /// for a caller who has already gone is this module's own objection
+    /// to speculative resolution, from the other end.
+    ///
+    /// **The discriminator is a program that does not exist**, and that
+    /// is the whole design of the row. A fixture that records having run
+    /// cannot answer this: with the guard removed the child *is* spawned
+    /// and then killed at the first poll, so whether it reaches its own
+    /// first line before `kill_group` arrives is a race — measured, and
+    /// it usually loses, which would make this row pass for the wrong
+    /// reason under no load and fail under some. An absent program
+    /// answers `NotStarted` from `spawn` itself: a different error
+    /// variant, decided before any process exists, with nothing to race.
+    ///
+    /// **Driven directly, and that is stated rather than hidden.** The
+    /// window the guard covers is the `spawn_blocking` hop between
+    /// `autofill`'s selection and the fork, and `request_secret_input`'s
+    /// own pre-raise check returns before step 1 for a call cancelled
+    /// earlier — so `a_cancelled_call_runs_no_provider_and_raises_nothing`
+    /// stays green with this guard deleted. A guard nothing drives is
+    /// decoration.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_already_ended_request_starts_no_provider_process() {
+        let fx = ScriptDir::new("prespawn");
+        // Never written. `spawn` answers `NotStarted` for it, which is
+        // what makes "was the spawn attempted?" observable.
+        let absent = fx.path("not-a-program.sh");
+
+        for (label, ctx) in [
+            ("cancelled", {
+                let c = RequestContext::detached().with_max_bytes(4096);
+                c.cancel_signal().cancel();
+                c
+            }),
+            (
+                "expired",
+                RequestContext::detached()
+                    .with_max_bytes(4096)
+                    .with_deadline(std::time::Instant::now() - Duration::from_secs(1)),
+            ),
+        ] {
+            let err = resolve_off_thread_with(
+                ScriptProvider::new("pass", &absent),
+                "work/db",
+                provider_limits(10),
+                false,
+                ctx,
+            )
+            .await
+            .expect_err("an ended request resolved a credential");
+            assert!(
+                !matches!(err, ProviderError::NotStarted { .. }),
+                "{label}: the spawn was attempted for a request that was already over — \
+                 `op read` wakes a biometric helper and `pass show` wakes `pinentry`; \
+                 got {err:?}"
+            );
+        }
+
+        // **The pairing**, same absent program, a live request: the spawn
+        // *is* attempted, so the two refusals above are about the context
+        // and not about a path that never spawns anything.
+        let err = resolve_off_thread_with(
+            ScriptProvider::new("pass", &absent),
+            "work/db",
+            provider_limits(10),
+            false,
+            RequestContext::detached().with_max_bytes(4096),
+        )
+        .await
+        .expect_err("a program that does not exist resolves nothing");
+        assert!(
+            matches!(err, ProviderError::NotStarted { .. }),
+            "a live request did not reach the spawn, so the refusals above prove \
+             nothing: {err:?}"
+        );
+    }
+
+    /// **GH #127: the cancel is read after the direct child has already
+    /// exited.**
+    ///
+    /// **Written because `if ctx.is_cancelled()` survived being weakened
+    /// to `if status.is_none() && ctx.is_cancelled()`.** The symmetric
+    /// mutation on the *deadline* check is caught by two rows; this one
+    /// was not, and the asymmetry was fixture shape.
+    /// `a_cancelled_request_ends_the_provider_it_was_waiting_on` keeps its
+    /// direct child alive throughout, so `status` stays `None` and the
+    /// guard is never reached with a reaped child. The grandchild
+    /// fixtures existed but were only ever paired with a deadline.
+    ///
+    /// The scenario is the ordinary one: `pass show` exits in 40 ms and
+    /// its forked `gpg`/`pinentry` holds the inherited stdout. The agent
+    /// cancels. With `status` already `Some`, a guard that only looks
+    /// while the child is running never reads the cancel, and the call is
+    /// pinned in `spawn_blocking` for the whole
+    /// `keychain_provider_timeout_secs` — GH #127's symptom on the path
+    /// written to fix it.
+    ///
+    /// No credential reaches the PTY either way; the cost is a held slot
+    /// and the latency, which is what the elapsed assertion measures.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancel_is_read_after_the_direct_child_has_exited() {
+        let fx = ScriptDir::new("cancelcollect");
+        let ran = fx.path("ran");
+        // The shape of the bug: the direct child prints, records that it
+        // ran, and **exits**, while a backgrounded `sleep` holds the
+        // inherited stdout pipe far past this row's own ceiling.
+        let script = fx.named_script(
+            "leak.sh",
+            &format!(
+                "sleep 60 &\necho ran > '{}'\nprintf '{PROBE}'\nexit 0\n",
+                ran.display()
+            ),
+        );
+
+        let ctx = RequestContext::detached().with_max_bytes(4096);
+        let signal = ctx.cancel_signal().clone();
+        let started = std::time::Instant::now();
+        let call = tokio::spawn(resolve_off_thread_with(
+            ScriptProvider::new("pass", &script),
+            "work/db",
+            // A 120 s provider budget, so nothing but the cancel can end
+            // this inside the row's ceiling.
+            provider_limits(120),
+            false,
+            ctx,
+        ));
+
+        // The direct child has run and, being three statements long, has
+        // already exited — so `try_wait` has reaped it and `status` is
+        // `Some` by the time the cancel lands. That is the state the
+        // guard has to be read in.
+        {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while !ran.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the provider never started"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        // Two poll intervals, so the loop has certainly observed the exit
+        // before the cancel arrives.
+        tokio::time::sleep(POLL_INTERVAL * 50).await;
+        signal.cancel();
+
+        let out = tokio::time::timeout(Duration::from_secs(20), call)
+            .await
+            .expect(
+                "the cancel was never read: the collection loop stopped asking once the \
+                 direct child had exited, so the call is pinned for the provider's \
+                 whole budget",
+            )
+            .expect("the resolve task");
+        assert_eq!(
+            out.err(),
+            Some(ProviderError::Cancelled {
+                provider: "pass".to_string()
+            }),
+            "a cancelled request resolved something, or reported the wrong ending"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the cancel was noticed only at the budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// **GH #127: a cancelled request kills the provider it is waiting
+    /// on.**
+    ///
+    /// A caller that went away is not waiting for a keyring to unlock,
+    /// and the provider is holding the session's one request slot while
+    /// it runs. **Reported as `Cancelled` and not `TimedOut`**: the
+    /// budget did not elapse, and telling an operator it did would be
+    /// the same conflation of two endings GH #105 was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_request_ends_the_provider_it_was_waiting_on() {
+        let fx = ScriptDir::new("cancelprov");
+        // 30 s, which is far past this row's own ceiling: if the cancel
+        // does not end the wait, the `timeout` below fires instead and
+        // says so.
+        let ran = fx.path("ran");
+        let script = fx.named_script(
+            "slow.sh",
+            &format!(
+                "echo ran > '{}'\nsleep 30\nprintf '{PROBE}'\n",
+                ran.display()
+            ),
+        );
+
+        let ctx = RequestContext::detached().with_max_bytes(4096);
+        let signal = ctx.cancel_signal().clone();
+        let started = std::time::Instant::now();
+        let call = tokio::spawn(resolve_off_thread_with(
+            ScriptProvider::new("op", &script),
+            "op://v/i/f",
+            // A 60 s provider budget, so nothing but the cancel can end
+            // this inside the row's ceiling.
+            provider_limits(60),
+            false,
+            ctx,
+        ));
+        // The provider is really running before the cancel: without this
+        // the row could cancel a context whose `run` has not started and
+        // pass on the `is_cancelled` check at the top of the loop.
+        {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while !ran.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the provider never started, so the cancel below would be testing \
+                     the check at the top of the loop rather than the wait"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        signal.cancel();
+
+        let out = tokio::time::timeout(Duration::from_secs(20), call)
+            .await
+            .expect("the cancel never ended the provider wait")
+            .expect("the resolve task");
+        assert_eq!(
+            out.err(),
+            Some(ProviderError::Cancelled {
+                provider: "op".to_string()
+            }),
+            "a cancelled request resolved something, or reported the wrong ending"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the cancel was noticed only at the budget: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// Rule 3: the provider **name** and the exit status reach the log,
     /// and the reference and the provider's stderr do not.
     ///
@@ -1855,6 +2709,7 @@ mod tests {
                 &reference,
                 &provider_limits(10),
                 true,
+                &unbounded(),
             )
         });
         let err = outcome.expect_err("exit 2 must resolve nothing");
