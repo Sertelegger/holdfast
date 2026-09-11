@@ -166,8 +166,13 @@ use super::ansi::AnsiStripper;
 use super::encoding::lossy_printable_keeps;
 use super::redact::Span;
 
-/// Which of the three non-raw streams a [`NormalView`] holds. Named so a
-/// test can say *which* view it means and a debug dump is readable.
+/// Which non-raw stream a [`NormalView`] holds. Named so a test can say
+/// *which* view it means and a debug dump is readable.
+///
+/// The first three are the pipeline's own filters. The eight `C1` rows
+/// are each of those (and the otherwise-unfiltered stream) composed with
+/// a **consumer's** treatment of an 8-bit control — see [`C1`] and
+/// [`c1_mask`] for why there are two such treatments and not one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     /// `ansi: strip`, encoding that drops nothing.
@@ -176,6 +181,50 @@ pub enum View {
     Printable,
     /// `ansi: strip`, `text_encoding: lossy_printable`.
     StrippedPrintable,
+    /// The bytes as emitted, read by something that drops C1.
+    C1Dropped,
+    /// The bytes as emitted, read by something that consumes C1
+    /// sequences.
+    C1Stripped,
+    StrippedC1Dropped,
+    StrippedC1Stripped,
+    PrintableC1Dropped,
+    PrintableC1Stripped,
+    StrippedPrintableC1Dropped,
+    StrippedPrintableC1Stripped,
+}
+
+/// What a consumer of the bytes we hand out does with an 8-bit C1
+/// control, `0x80..=0x9f` (GH #139).
+///
+/// **Two answers, both real, and the difference decides whether a token
+/// is reassembled.** `vte` 0.15.0 documents *"Only supports 7-bit
+/// codes"*: it routes `'\u{80}'..='\u{9f}'` to `Perform::execute` rather
+/// than to CSI entry, and `vt100` 0.16.2's `execute` falls through to
+/// `unhandled_control`, whose body is empty. Holdfast's own emulator —
+/// the one behind `get_screen_state` — therefore **drops** the byte,
+/// which splices the bytes either side of it together in the grid. A
+/// real 8-bit terminal instead **consumes** `0x9b` as CSI and `0x9d` as
+/// OSC, taking the sequence's payload with it.
+///
+/// The two reach different streams from the same bytes —
+/// `ghp_…\x9b…345` re-joins under [`C1::Drop`] and loses a character
+/// under [`C1::Strip`], while `ghp_…\x9b0m…345` re-joins under
+/// [`C1::Strip`] and keeps a visible `0m` under [`C1::Drop`] — so a
+/// closure over "what a consumer can derive" needs both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C1 {
+    /// Left in place: the 7-bit enumeration this module shipped with.
+    Keep,
+    /// Deleted one control at a time — Holdfast's own emulator.
+    Drop,
+    /// Consumed as a sequence introducer — a real 8-bit terminal.
+    Strip,
+}
+
+/// `0x80..=0x9f`, the C1 range, whichever way it is spelled.
+fn is_c1(b: u8) -> bool {
+    (0x80..=0x9f).contains(&b)
 }
 
 /// One emitted byte stream, plus the raw offset each of its bytes came
@@ -258,23 +307,45 @@ impl NormalView {
 /// region opens mid-sequence both make the same wrong guess and reach the
 /// same bytes, which is the only property span mapping needs.
 pub fn emitted_views(region: &[u8], region_start: u64) -> Vec<NormalView> {
-    // The cheap question first: does any filter in the pipeline remove
-    // anything at all here? `lossy_printable` drops a superset of what
-    // the stripper drops as bare bytes — every C0 control except the
-    // three layout bytes, plus DEL — so a `no` here is a `no` for all
-    // three views, and it is the answer for almost every read.
-    if !region.iter().any(|b| !lossy_printable_keeps(*b)) {
+    // The cheap question first: does any filter remove anything at all
+    // here? `lossy_printable` drops a superset of what the stripper drops
+    // as bare bytes — every C0 control except the three layout bytes,
+    // plus DEL — so that half is a `no` for all three 7-bit views, and it
+    // is the answer for almost every read.
+    //
+    // **The C1 clause is not redundant and its absence was GH #139.**
+    // `lossy_printable_keeps(0x9b)` is `true` — it is above `0x20` and it
+    // is not DEL — so a region whose only oddity is an 8-bit introducer
+    // short-circuited here and no view was built at all, which is to say
+    // the one region that most needs the new views was the one that
+    // skipped them.
+    let has_c1 = region.iter().any(|b| is_c1(*b));
+    if !has_c1 && !region.iter().any(|b| !lossy_printable_keeps(*b)) {
         return Vec::new();
     }
-    let mut views = Vec::with_capacity(3);
-    // Two of these can coincide — a region with a bare `\x08` and no
-    // escape sequence reaches the same bytes under `Printable` and
+    // One mask per C1 treatment, shared by the four filter pairs above
+    // it, and allocated only when the region carries a C1 byte at all.
+    let masks = has_c1.then(|| [c1_mask(region, C1::Drop), c1_mask(region, C1::Strip)]);
+    let mut views = Vec::with_capacity(VIEWS.len());
+    // Views can coincide — a region with a bare `\x08` and no escape
+    // sequence reaches the same bytes under `Printable` and
     // `StrippedPrintable` — and the duplicate is dropped, so whichever is
     // built first survives. The one caller reads every view it is given
     // and cares only that the set of *streams* is right, not which name
     // carries one.
-    for view in [View::Stripped, View::StrippedPrintable, View::Printable] {
-        let built = build(view, region, region_start);
+    for (view, strip, printable, c1) in VIEWS {
+        let mask = match c1 {
+            C1::Keep => None,
+            C1::Drop => match &masks {
+                Some([dropped, _]) => Some(dropped.as_slice()),
+                None => continue,
+            },
+            C1::Strip => match &masks {
+                Some([_, stripped]) => Some(stripped.as_slice()),
+                None => continue,
+            },
+        };
+        let built = build(*view, region, region_start, *strip, *printable, mask);
         // A view that dropped nothing *is* the raw region, which the
         // caller scans anyway; two views that dropped the same bytes are
         // the same stream, since a view is a subsequence and its offsets
@@ -291,16 +362,111 @@ pub fn emitted_views(region: &[u8], region_start: u64) -> Vec<NormalView> {
     views
 }
 
-fn build(view: View, region: &[u8], region_start: u64) -> NormalView {
-    let (strip, printable) = match view {
-        View::Stripped => (true, false),
-        View::Printable => (false, true),
-        View::StrippedPrintable => (true, true),
-    };
+/// The enumeration itself: every stream that is a *pipeline* filter
+/// composed with a *consumer* filter, minus the raw region.
+///
+/// Ordered so the three 7-bit views are built first and therefore keep
+/// their names when a C1 view reaches the same bytes, which is what makes
+/// `views_that_reach_the_same_bytes_are_returned_once` stable.
+#[allow(clippy::type_complexity)]
+const VIEWS: &[(View, bool, bool, C1)] = &[
+    (View::Stripped, true, false, C1::Keep),
+    (View::StrippedPrintable, true, true, C1::Keep),
+    (View::Printable, false, true, C1::Keep),
+    (View::C1Dropped, false, false, C1::Drop),
+    (View::StrippedC1Dropped, true, false, C1::Drop),
+    (View::StrippedPrintableC1Dropped, true, true, C1::Drop),
+    (View::PrintableC1Dropped, false, true, C1::Drop),
+    (View::C1Stripped, false, false, C1::Strip),
+    (View::StrippedC1Stripped, true, false, C1::Strip),
+    (View::StrippedPrintableC1Stripped, true, true, C1::Strip),
+    (View::PrintableC1Stripped, false, true, C1::Strip),
+];
+
+/// Which bytes of `region` survive a consumer's C1 treatment: `true`
+/// keeps.
+///
+/// A mask rather than a filter in the byte loop because the two-byte
+/// UTF-8 spelling of a C1 control — `0xc2` then `0x80..=0x9f`, which is
+/// what a UTF-8 terminal actually decodes into one — is only recognised
+/// at its *second* byte, and a one-in-one-out filter cannot un-emit the
+/// first. Both spellings die together here, in one pass, so the rest of
+/// `build` stays a subsequence walk.
+///
+/// [`C1::Strip`] consumes `0x9b` (CSI) through its final byte and the
+/// string introducers `0x90`/`0x9d`/`0x9e`/`0x9f` (DCS, OSC, PM, APC)
+/// through BEL, ST or `ESC \`. An unterminated sequence consumes the
+/// rest of the region, which is the same guess `AnsiStripper` makes for
+/// an unterminated 7-bit one.
+fn c1_mask(region: &[u8], mode: C1) -> Vec<bool> {
+    let mut keep = vec![true; region.len()];
+    let mut i = 0;
+    while i < region.len() {
+        let (control, width) = match (region[i], region.get(i + 1)) {
+            (0xc2, Some(&next)) if is_c1(next) => (next, 2),
+            (b, _) if is_c1(b) => (b, 1),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        keep[i..i + width].fill(false);
+        i += width;
+        if mode == C1::Drop {
+            continue;
+        }
+        match control {
+            // CSI: parameters and intermediates, then one final byte.
+            0x9b => {
+                while i < region.len() {
+                    let byte = region[i];
+                    keep[i] = false;
+                    i += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        break;
+                    }
+                }
+            }
+            // The string sequences, terminated by BEL, ST or `ESC \`.
+            0x90 | 0x9d | 0x9e | 0x9f => {
+                while i < region.len() {
+                    let byte = region[i];
+                    keep[i] = false;
+                    i += 1;
+                    if byte == 0x07 || byte == 0x9c {
+                        break;
+                    }
+                    if byte == 0x1b && region.get(i) == Some(&b'\\') {
+                        keep[i] = false;
+                        i += 1;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    keep
+}
+
+fn build(
+    view: View,
+    region: &[u8],
+    region_start: u64,
+    strip: bool,
+    printable: bool,
+    c1_keeps: Option<&[bool]>,
+) -> NormalView {
     let mut bytes = Vec::with_capacity(region.len());
     let mut offsets = Vec::with_capacity(region.len());
     let mut stripper = AnsiStripper::new();
     for (i, raw) in region.iter().enumerate() {
+        // The consumer's filter runs first: an 8-bit introducer is a
+        // control to the machine that removes it, and that machine sees
+        // the bytes before any 7-bit stripper downstream of us does.
+        if c1_keeps.is_some_and(|keeps| !keeps[i]) {
+            continue;
+        }
         let kept = if strip {
             stripper.feed(region_start + i as u64, *raw)
         } else {
@@ -468,12 +634,113 @@ mod tests {
         assert_eq!(mapped.end, mapped.start + GITHUB.len() as u64);
     }
 
+    /// **The whole of GH #139's correctness detail.**
+    /// `lossy_printable_keeps(0x9b)` is `true`, so a region whose only
+    /// oddity is an 8-bit introducer used to satisfy the cheap guard at
+    /// the top of [`emitted_views`] and return *no views at all* — the
+    /// region that most needs the C1 views was the one that skipped them.
+    ///
+    /// Asserted on the guard's own input shape (no ESC, no C0, no DEL)
+    /// so it fails if the extra clause is dropped, whatever else changes.
+    #[test]
+    fn a_c1_introducer_does_not_short_circuit_the_guard() {
+        // Built byte-wise: `\u{9b}` in a `str` literal is the *two-byte*
+        // spelling, and the bare introducer is the shape the guard missed.
+        let mut region = GITHUB.as_bytes()[..20].to_vec();
+        region.push(0x9b);
+        region.extend_from_slice(&GITHUB.as_bytes()[20..]);
+        assert!(
+            region.iter().all(|b| lossy_printable_keeps(*b)),
+            "the fixture must contain nothing the 7-bit guard would catch"
+        );
+        let views = emitted_views(&region, 0);
+        assert!(
+            !views.is_empty(),
+            "a region carrying a C1 byte offers views; the guard must not skip it"
+        );
+        assert!(
+            views.iter().any(|v| v
+                .bytes()
+                .windows(GITHUB.len())
+                .any(|w| w == GITHUB.as_bytes())),
+            "one of those views reassembles the token; that is the defect"
+        );
+    }
+
+    /// The two C1 treatments reach **different** streams from the same
+    /// bytes, which is why both exist. `\x9b` alone is deleted by the
+    /// emulator and rejoins the text; `\x9b0m` is a whole sequence to an
+    /// 8-bit terminal and rejoins it there instead, while the emulator
+    /// leaves its `0m` behind.
+    #[test]
+    fn the_two_c1_filters_reach_different_streams() {
+        assert_eq!(
+            view_bytes(b"a\x9b0mb", View::C1Dropped).as_deref(),
+            Some("a0mb")
+        );
+        assert_eq!(
+            view_bytes(b"a\x9b0mb", View::C1Stripped).as_deref(),
+            Some("ab")
+        );
+        // The two-byte UTF-8 spelling is the same control, and both of
+        // its bytes go.
+        assert_eq!(
+            view_bytes(b"a\xc2\x9b0mb", View::C1Dropped).as_deref(),
+            Some("a0mb")
+        );
+        assert_eq!(
+            view_bytes(b"a\xc2\x9b0mb", View::C1Stripped).as_deref(),
+            Some("ab")
+        );
+        // An 8-bit OSC runs to its string terminator, not to a CSI final
+        // byte.
+        assert_eq!(
+            view_bytes(b"a\x9d0;title\x07b", View::C1Stripped).as_deref(),
+            Some("ab")
+        );
+    }
+
+    /// A C1 view composes with the pipeline's own filters rather than
+    /// replacing them: the region below needs the stripper *and* the
+    /// emulator's C1 drop before the token is whole, and neither alone
+    /// reaches it.
+    #[test]
+    fn a_c1_view_composes_with_the_pipelines_own_filters() {
+        let mut region = format!("{}\x1b[0m{}", &GITHUB[..10], &GITHUB[10..20]).into_bytes();
+        region.push(0x9b);
+        region.extend_from_slice(&GITHUB.as_bytes()[20..]);
+        let views = emitted_views(&region, 0);
+        let whole: Vec<View> = views
+            .iter()
+            .filter(|v| {
+                v.bytes()
+                    .windows(GITHUB.len())
+                    .any(|w| w == GITHUB.as_bytes())
+            })
+            .map(|v| v.view)
+            .collect();
+        assert!(
+            whole.contains(&View::StrippedC1Dropped),
+            "only the composed view reassembles this token, got {whole:?}"
+        );
+        assert!(
+            !views
+                .iter()
+                .filter(|v| matches!(v.view, View::Stripped | View::C1Dropped))
+                .any(|v| v
+                    .bytes()
+                    .windows(GITHUB.len())
+                    .any(|w| w == GITHUB.as_bytes())),
+            "neither filter alone should reach it, or the row proves nothing"
+        );
+    }
+
     /// The view is a subsequence: every byte it holds is the raw byte at
     /// the offset it reports, unchanged. `map_span` is only exact because
     /// of it, so it is asserted rather than assumed.
     #[test]
     fn every_view_byte_is_the_raw_byte_at_the_offset_it_reports() {
-        let region = b"\x1b]0;title\x07plain\x08\x7f\x1b[1mbold\x1b[0m\ttail\n";
+        let region = b"\x1b]0;title\x07plain\x08\x7f\x1b[1mbold\x1b[0m\x9b1K\xc2\x9dx\x07\ttail\n";
         for view in emitted_views(region, 7) {
             assert!(!view.bytes().is_empty(), "{:?} is empty", view.view);
             let mut previous: Option<u64> = None;
