@@ -2096,6 +2096,25 @@ impl Session {
         Ok(())
     }
 
+    /// Whether any process remains in the session, not merely its leader.
+    ///
+    /// Read-only, so it does **not** `touch()`: asking whether a tree is
+    /// still up is not activity on the session, and stamping it here
+    /// would let `terminate`'s own poll loop hold a session away from the
+    /// reaper. See [`Self::note_activity`] for the same distinction drawn
+    /// the other way.
+    pub fn tree_alive(&self) -> bool {
+        self.backend.tree_alive()
+    }
+
+    /// Signal every process group still in the session, including after
+    /// the leader has exited (GH #130).
+    pub fn signal_tree(&self, sig: Signal) -> Result<()> {
+        self.backend.signal_tree(sig)?;
+        self.touch();
+        Ok(())
+    }
+
     /// Stamp activity for an event that mutated the session without
     /// going through `write_input` or `signal` (§4.1, REQ-S-006).
     ///

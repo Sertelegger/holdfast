@@ -906,6 +906,313 @@ async fn terminate_without_force_escalates_to_sigkill_for_a_sigterm_immune_child
     assert!(!session.is_alive());
 }
 
+// Linux/macOS only: the guarantee under test is REQ-P-006's strong one,
+// and `session_pgids`' third arm deliberately cannot keep it. Gating to
+// `unix` here would assert on the BSDs a promise this tree documents as
+// degraded there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn terminate_kills_a_descendant_that_outlived_the_leader() {
+    // GH #130, reproduced. The leader does NOT trap; a descendant traps
+    // SIGTERM and SIGHUP. Both sit in the same process group, so the
+    // SIGTERM sweep *does* reach the descendant — it simply ignores it.
+    // The leader then exits, and before the fix that ended the escalation
+    // wait, so `terminate` reported "terminated" while the descendant ran
+    // on, reparented to init.
+    //
+    // Two things had to change for this to pass, which is why asserting
+    // on the descendant is the whole point: `terminate` polled
+    // `is_alive()` (the leader), and `signal()` refuses to act once the
+    // leader is reaped, so the escalation SIGKILL was *swallowed* rather
+    // than merely skipped. A fix to either alone still leaves this red.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pidfile = dir.path().join("descendant.pid");
+    let readyfile = dir.path().join("descendant.ready");
+    // `$!`, not `$$`: inside a POSIX subshell `$$` reports the *parent*
+    // shell's pid, so a pidfile written with it names the leader and the
+    // row then asserts about the wrong process — which is exactly how
+    // this looked like a non-reproduction the first time.
+    //
+    // The readiness file is the arrangement, not padding. `trap` is a
+    // command the subshell has to be scheduled to run, so "the descendant
+    // ignores SIGTERM" is not true from the instant it is forked — it
+    // becomes true when the builtin executes. Publishing readiness *after*
+    // the trap and waiting for it below is what makes this row test the
+    // product instead of a race in its own fixture.
+    let script = format!(
+        "(trap '' TERM HUP; : > {}; while :; do sleep 1; done) & echo $! > {}; wait",
+        readyfile.display(),
+        pidfile.display()
+    );
+
+    let server = HoldfastServer::new();
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("sh".into()),
+            args: vec!["-c".into(), script],
+            name: Some("orphan-maker".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["status"], "ok", "{b}");
+    let id = b["data"]["session_id"].as_str().unwrap().to_string();
+    let session = server.registry.get(&id).unwrap();
+    let leader = session.pid().expect("pid") as i32;
+
+    // Wait for the descendant to exist rather than sleeping at it.
+    let descendant = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if readyfile.exists() {
+                if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(pid) = text.trim().parse::<i32>() {
+                        if pid > 0 && pid_alive(pid) {
+                            return pid;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("descendant never started or never installed its traps");
+
+    assert_ne!(
+        descendant, leader,
+        "the pidfile named the leader, so this row would prove nothing"
+    );
+
+    let r = server
+        .terminate(Parameters(TerminateArgs {
+            session: id.clone(),
+            force: Some(false),
+            timeout_secs: Some(1),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&r)["status"], "ok");
+
+    // The leader was always killed; it is the descendant that survived.
+    let gone = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while pid_alive(descendant) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if gone.is_err() {
+        // Don't leak a spinning process into the rest of the suite.
+        unsafe { libc::kill(descendant, libc::SIGKILL) };
+    }
+    assert!(
+        gone.is_ok(),
+        "terminate reported ok while descendant {descendant} outlived          leader {leader}"
+    );
+    assert!(!session.is_alive());
+}
+
+// Companion to the row above, and it covers the *other* half of GH #130:
+// there the leader was alive when `terminate` was called, so the early
+// "already exited" return was never reached. Here the leader exits on its
+// own the moment the session starts, which is the shape that takes it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn terminate_does_not_report_already_exited_while_the_tree_is_up() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pidfile = dir.path().join("descendant.pid");
+    let readyfile = dir.path().join("descendant.ready");
+    // `exit 0`, not `wait`: the leader is gone before `terminate` is ever
+    // called, so the call arrives at a session whose `is_alive()` is
+    // already false and whose process tree is very much not.
+    //
+    // **The leader waits for the descendant's traps before exiting, and
+    // without that this row is a coin flip.** A leader exiting hangs up
+    // the terminal, which sends SIGHUP to the foreground group; if the
+    // subshell has not yet run its `trap` builtin it dies with the
+    // default disposition and there is no survivor to find. Measured: the
+    // handshake-free version failed 17 of 20 runs pinned to two CPUs, and
+    // the descendant was already dead 185 us after the pidfile appeared.
+    let script = format!(
+        "(trap '' TERM HUP; : > {ready}; while :; do sleep 1; done) & \
+         echo $! > {pid}; while [ ! -f {ready} ]; do sleep 0.02; done; exit 0",
+        ready = readyfile.display(),
+        pid = pidfile.display()
+    );
+
+    let server = HoldfastServer::new();
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("sh".into()),
+            args: vec!["-c".into(), script],
+            name: Some("early-exit".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["status"], "ok", "{b}");
+    let id = b["data"]["session_id"].as_str().unwrap().to_string();
+    let session = server.registry.get(&id).unwrap();
+
+    let descendant = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if readyfile.exists() {
+                if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(pid) = text.trim().parse::<i32>() {
+                        if pid > 0 && pid_alive(pid) {
+                            return pid;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("descendant never started or never installed its traps");
+
+    // The arrangement: wait until the leader really has gone, so the
+    // early return is the branch under test rather than a race with it.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while session.is_alive() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("leader never exited");
+    assert!(
+        pid_alive(descendant),
+        "descendant died with its leader, so this row proves nothing"
+    );
+
+    let r = server
+        .terminate(Parameters(TerminateArgs {
+            session: id.clone(),
+            force: Some(false),
+            timeout_secs: Some(1),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&r)["status"], "ok");
+
+    let gone = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while pid_alive(descendant) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if gone.is_err() {
+        unsafe { libc::kill(descendant, libc::SIGKILL) };
+    }
+    assert!(
+        gone.is_ok(),
+        "terminate took the already-exited early return while descendant          {descendant} was still running"
+    );
+}
+
+// The third GH #130 row, and the one that pins the *graceful* half: an
+// orphaned tree must still be offered SIGTERM, not just SIGKILL once the
+// grace has run out. Without it the mutation "escalate with `signal_tree`
+// but send the TERM with `signal`" passes every other row, because the
+// descendants there ignore SIGTERM anyway.
+//
+// The descendant traps HUP but **not** TERM. HUP is what a leader's exit
+// hangs up the terminal with, so trapping it is what lets the descendant
+// outlive its leader at all; leaving TERM at its default is what makes
+// "did the graceful signal arrive?" observable.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_graceful_terminate_reaches_a_tree_whose_leader_is_already_gone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pidfile = dir.path().join("descendant.pid");
+    let readyfile = dir.path().join("descendant.ready");
+    let script = format!(
+        "(trap '' HUP; : > {ready}; while :; do sleep 1; done) & \
+         echo $! > {pid}; while [ ! -f {ready} ]; do sleep 0.02; done; exit 0",
+        ready = readyfile.display(),
+        pid = pidfile.display()
+    );
+
+    let server = HoldfastServer::new();
+    let r = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("sh".into()),
+            args: vec!["-c".into(), script],
+            name: Some("graceful-orphan".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let b = body(&r);
+    assert_eq!(b["status"], "ok", "{b}");
+    let id = b["data"]["session_id"].as_str().unwrap().to_string();
+    let session = server.registry.get(&id).unwrap();
+
+    let descendant = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if readyfile.exists() {
+                if let Ok(text) = std::fs::read_to_string(&pidfile) {
+                    if let Ok(pid) = text.trim().parse::<i32>() {
+                        if pid > 0 && pid_alive(pid) {
+                            return pid;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("descendant never started or never installed its trap");
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while session.is_alive() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("leader never exited");
+    assert!(pid_alive(descendant), "descendant died with its leader");
+
+    // **A 30 s grace against a 5 s wait is the margin, and it is what
+    // keeps this off wall-clock luck.** The claim is not "SIGKILL is
+    // fast"; it is that the descendant dies from the *graceful* signal,
+    // which can only have happened long before the escalation is due. A
+    // build that swallows the TERM leaves it running for the full 30 s,
+    // so the two outcomes are six times apart rather than milliseconds.
+    let terminate = tokio::spawn({
+        let server = server.clone();
+        let id = id.clone();
+        async move {
+            server
+                .terminate(Parameters(TerminateArgs {
+                    session: id,
+                    force: Some(false),
+                    timeout_secs: Some(30),
+                }))
+                .await
+        }
+    });
+
+    let died = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while pid_alive(descendant) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    if died.is_err() {
+        unsafe { libc::kill(descendant, libc::SIGKILL) };
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(40), terminate).await;
+    assert!(
+        died.is_ok(),
+        "descendant {descendant} honours SIGTERM and outlived a graceful \
+         terminate, so the TERM never reached the orphaned tree"
+    );
+}
+
 #[tokio::test]
 async fn send_input_reaches_the_shell() {
     let server = HoldfastServer::new();

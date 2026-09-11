@@ -298,14 +298,17 @@ impl InProcessPty {
     ///
     /// Shell job control puts each background job in its own group, so
     /// this is the only set whose destruction satisfies REQ-P-006.
+    ///
+    /// `None` means *the question could not be asked* — no pid, or
+    /// `/proc` unreadable — and is distinct from `Some(vec![])`, which
+    /// means it was asked and the session is empty. `signal_tree` and
+    /// `tree_alive` both turn on that distinction: an unanswerable
+    /// question must degrade to the old behaviour, while an empty answer
+    /// is a real "nothing left to signal".
     #[cfg(target_os = "linux")]
-    fn session_pgids(&self) -> Vec<i32> {
-        let Some(sid) = self.pgid() else {
-            return Vec::new();
-        };
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return self.fallback_pgids();
-        };
+    fn session_survivors(&self) -> Option<Vec<i32>> {
+        let sid = self.pgid()?;
+        let entries = std::fs::read_dir("/proc").ok()?;
         let mut out = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -334,10 +337,27 @@ impl InProcessPty {
                 out.push(pgrp);
             }
         }
-        if out.is_empty() {
-            self.fallback_pgids()
-        } else {
-            out
+        Some(out)
+    }
+
+    /// Every distinct process group in the child's session, degrading to
+    /// the weak `{pgid, tcgetpgrp(master)}` set when the enumeration
+    /// cannot answer or finds nothing.
+    ///
+    /// **No pid means no answer at all, not the weak set.** Without a pid
+    /// we cannot name our own group, and `fallback_pgids` would then
+    /// offer the master's foreground group — a group nothing has shown to
+    /// be ours. That is the one case the pre-#130 code returned empty for,
+    /// and splitting the enumeration out of this function must not
+    /// quietly widen it.
+    #[cfg(target_os = "linux")]
+    fn session_pgids(&self) -> Vec<i32> {
+        if self.pgid().is_none() {
+            return Vec::new();
+        }
+        match self.session_survivors() {
+            Some(v) if !v.is_empty() => v,
+            _ => self.fallback_pgids(),
         }
     }
 
@@ -353,13 +373,21 @@ impl InProcessPty {
     /// `kinfo_proc`'s `e_sess` is NULL on every process besides, and libc
     /// declares no `kinfo_proc` for Apple at all, so both of the other
     /// BSD-shaped routes are shut.
+    /// See the Linux arm for what `None` vs `Some(vec![])` means.
+    ///
+    /// `proc_listallpids` returning nothing is the unanswerable case
+    /// here: it is how this route fails when the buffer cannot be sized,
+    /// and it is not distinguishable from "no processes exist", which on
+    /// a running system is never true.
     #[cfg(target_os = "macos")]
-    fn session_pgids(&self) -> Vec<i32> {
-        let Some(sid) = self.pgid() else {
-            return Vec::new();
-        };
+    fn session_survivors(&self) -> Option<Vec<i32>> {
+        let sid = self.pgid()?;
+        let pids = all_pids();
+        if pids.is_empty() {
+            return None;
+        }
         let mut out = Vec::new();
-        for pid in all_pids() {
+        for pid in pids {
             // SAFETY: `getsid` takes no pointers. A pid that exited
             // between the enumeration and here answers -1, which is no
             // session's id — the race resolves to "not mine", which is
@@ -374,10 +402,18 @@ impl InProcessPty {
                 out.push(pgrp);
             }
         }
-        if out.is_empty() {
-            self.fallback_pgids()
-        } else {
-            out
+        Some(out)
+    }
+
+    /// As the Linux arm, including the no-pid case.
+    #[cfg(target_os = "macos")]
+    fn session_pgids(&self) -> Vec<i32> {
+        if self.pgid().is_none() {
+            return Vec::new();
+        }
+        match self.session_survivors() {
+            Some(v) if !v.is_empty() => v,
+            _ => self.fallback_pgids(),
         }
     }
 
@@ -489,6 +525,65 @@ impl PtyBackend for InProcessPty {
     #[cfg(not(unix))]
     fn signal(&self, _sig: Signal) -> Result<()> {
         Err(HoldfastError::Pty("signals are Unix-only in 0.0.1".into()))
+    }
+
+    /// GH #130. Gated to the two platforms that can actually enumerate a
+    /// session: everywhere else the trait default answers `is_alive()`,
+    /// which is the pre-#130 behaviour and the same degraded promise
+    /// `session_pgids` already makes there.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn tree_alive(&self) -> bool {
+        match self.session_survivors() {
+            Some(v) => !v.is_empty(),
+            // Could not ask — answer exactly as before.
+            None => self.is_alive(),
+        }
+    }
+
+    /// GH #130. Signals the survivors and nothing else.
+    ///
+    /// **No `fallback_pgids` here, and that is the whole point.** After
+    /// the leader has been reaped, the recorded pgid is the one value
+    /// that may no longer mean us, so the fallback that makes
+    /// `session_pgids` useful is exactly what makes it unsafe on this
+    /// path. An empty enumeration therefore signals nothing.
+    ///
+    /// Why signalling the enumerated groups is safe once the leader is
+    /// gone: a group only appears here because some live process reports
+    /// our `sid`. For a *stranger* to do so, a process holding the
+    /// leader's recycled pid must have called `setsid` — and POSIX makes
+    /// that `EPERM` while any process's group id equals the caller's pid,
+    /// which our surviving descendants guarantee for as long as they are
+    /// the reason we are signalling at all. The residual window is the
+    /// ordinary TOCTOU every signal-based supervisor has, and it is
+    /// bounded by the gap between the enumeration and the `killpg` a few
+    /// microseconds later.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn signal_tree(&self, sig: Signal) -> Result<()> {
+        let signum = match sig {
+            // See the trait doc: session scope is wrong for SIGINT.
+            Signal::Interrupt => return self.signal(sig),
+            Signal::Terminate => libc::SIGTERM,
+            Signal::Kill => libc::SIGKILL,
+        };
+        let Some(groups) = self.session_survivors() else {
+            // Unanswerable, not empty. Degrade to the guarded path.
+            return self.signal(sig);
+        };
+        let mut last_err = None;
+        for g in groups {
+            match self.deliver(g, signum) {
+                Ok(()) => {}
+                // The group went away between the enumeration and the
+                // kill, which is the outcome we were asking for.
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+        match last_err {
+            None => Ok(()),
+            Some(e) => Err(HoldfastError::Io(e)),
+        }
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {

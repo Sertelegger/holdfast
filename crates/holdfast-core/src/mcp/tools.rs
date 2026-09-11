@@ -1464,7 +1464,14 @@ impl HoldfastServer {
 
         // Idempotent per REQ-T-010: an already-dead session reports its
         // cached exit info rather than an error.
-        if !session.is_alive() {
+        //
+        // **`tree_alive`, not `is_alive`** (GH #130). A leader can exit
+        // while a descendant that ignored `SIGTERM` keeps running, and
+        // taking this early return on the leader alone is what let
+        // `terminate` answer "already exited" about a tree that was still
+        // up. When the leader is gone but the tree is not, the call now
+        // falls through and does the work.
+        if !session.tree_alive() {
             return Ok(envelope::ok(
                 json!({
                     "exit_code": session.exit_code(),
@@ -1478,16 +1485,22 @@ impl HoldfastServer {
         let force = args.force.unwrap_or(false);
         let grace_ms = args.timeout_secs.unwrap_or(5) as u64 * 1000;
 
+        // Every arm below asks about — and signals — the **session**, not
+        // the leader (GH #130). `signal` refuses to act once the leader is
+        // reaped, because the recorded pgid may then name a stranger; the
+        // escalation `SIGKILL` was being swallowed by that guard rather
+        // than merely skipped by the loop, so changing only the loop
+        // condition here would still have delivered nothing.
         if force {
-            let _ = session.signal(crate::pty::Signal::Kill);
+            let _ = session.signal_tree(crate::pty::Signal::Kill);
         } else {
-            let _ = session.signal(crate::pty::Signal::Terminate);
+            let _ = session.signal_tree(crate::pty::Signal::Terminate);
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(grace_ms);
-            while session.is_alive() && std::time::Instant::now() < deadline {
+            while session.tree_alive() && std::time::Instant::now() < deadline {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            if session.is_alive() {
-                let _ = session.signal(crate::pty::Signal::Kill);
+            if session.tree_alive() {
+                let _ = session.signal_tree(crate::pty::Signal::Kill);
             }
         }
 
