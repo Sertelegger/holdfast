@@ -1197,20 +1197,29 @@ mod tests {
         let b = sc.binding(
             "leak",
             PROD_PROFILE,
-            &format!("sleep 4 &\nprintf '{PROBE}\\n'\n"),
+            &format!("sleep 7 &\nprintf '{PROBE}\\n'\n"),
         );
         let server = server_with(keychain_mode(vec![b]), &sc.audit_log());
         let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], ECHO_OFF_FIXTURE);
         server.registry.insert(Arc::clone(&s)).expect("register");
         await_prompt(&s, b"Password: ").await;
 
+        // **Three seconds and not one, and the reason is a contention
+        // sweep rather than taste.** The provider has to *start* inside
+        // the declared window for `sc.ran` below to mean anything, and at
+        // `timeout_secs: 1` it did not: under six concurrent whole-binary
+        // lanes on two cores this row went red with "the binding's
+        // provider never ran", because the deadline killed the group
+        // before the fixture's first line. Three is three orders of
+        // magnitude above this tree's measured `fork`→`exec` latency and
+        // still four seconds clear of the grandchild's hold.
         let started = std::time::Instant::now();
-        let payload = call(&server, secret_args(&s.id, 1)).await;
+        let payload = call(&server, secret_args(&s.id, 3)).await;
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed < Duration::from_secs(3),
-            "`timeout_secs: 1` did not bound the call: it returned after {elapsed:?} \
+            elapsed < Duration::from_secs(5),
+            "`timeout_secs: 3` did not bound the call: it returned after {elapsed:?} \
              with status {}",
             payload["status"]
         );
@@ -1223,10 +1232,12 @@ mod tests {
         // green because step 1 was skipped.
         assert!(sc.ran("leak"), "the binding's provider never ran");
 
-        // **Past the grandchild's own four seconds**, which is the whole
+        // **Past the grandchild's own seven seconds**, which is the whole
         // point: a value collected late must be discarded rather than
-        // written after the caller has been answered.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // written after the caller has been answered. Without outlasting
+        // the hold this half is vacuous — against the unfixed code the
+        // value arrives exactly when the grandchild lets go.
+        tokio::time::sleep(Duration::from_secs(8)).await;
         let seen = buffered(&s);
         assert!(
             !contains(&seen, b"got=HUNTER2"),
@@ -2711,7 +2722,17 @@ mod tests {
 
         let call = {
             let server = Arc::clone(&server);
-            let args = secret_args(&s.id, 2);
+            // **Eight, and it must stay above `keychain_mode`'s
+            // `keychain_provider_timeout_secs` of 5** (GH #126). The
+            // caller's deadline now bounds the provider step, so a row
+            // whose choreography happens *inside* the provider's window
+            // has to declare a window wider than the provider's own or it
+            // is measuring its own `timeout_secs` rather than the thing it
+            // is named for. At 2 this went red under six concurrent
+            // whole-binary lanes on two cores, with "the provider ran and
+            // produced a value; the trail should say so" — the gate opened
+            // after the caller's deadline had already killed the provider.
+            let args = secret_args(&s.id, 8);
             tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
         };
 
@@ -2852,7 +2873,17 @@ mod tests {
 
         let call = {
             let server = Arc::clone(&server);
-            let args = secret_args(&s.id, 2);
+            // **Eight, and it must stay above `keychain_mode`'s
+            // `keychain_provider_timeout_secs` of 5** (GH #126). The
+            // caller's deadline now bounds the provider step, so a row
+            // whose choreography happens *inside* the provider's window
+            // has to declare a window wider than the provider's own or it
+            // is measuring its own `timeout_secs` rather than the thing it
+            // is named for. At 2 this went red under six concurrent
+            // whole-binary lanes on two cores, with "the provider ran and
+            // produced a value; the trail should say so" — the gate opened
+            // after the caller's deadline had already killed the provider.
+            let args = secret_args(&s.id, 8);
             tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
         };
         await_ran(&sc, "slot").await;
@@ -3012,7 +3043,17 @@ mod tests {
 
         let call = {
             let server = Arc::clone(&server);
-            let args = secret_args(&s.id, 2);
+            // **Eight, and it must stay above `keychain_mode`'s
+            // `keychain_provider_timeout_secs` of 5** (GH #126). The
+            // caller's deadline now bounds the provider step, so a row
+            // whose choreography happens *inside* the provider's window
+            // has to declare a window wider than the provider's own or it
+            // is measuring its own `timeout_secs` rather than the thing it
+            // is named for. At 2 this went red under six concurrent
+            // whole-binary lanes on two cores, with "the provider ran and
+            // produced a value; the trail should say so" — the gate opened
+            // after the caller's deadline had already killed the provider.
+            let args = secret_args(&s.id, 8);
             tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
         };
         // The provider has started and is blocked on the gate, so
