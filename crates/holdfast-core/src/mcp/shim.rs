@@ -809,7 +809,7 @@ mod tests {
         let (rx, mut tx) = tokio::io::split(client_side);
         let mut rx = BufReader::new(rx);
         let mut line = String::new();
-        let mut send = |v: serde_json::Value| {
+        let send = |v: serde_json::Value| {
             let mut s = v.to_string();
             s.push('\n');
             s
