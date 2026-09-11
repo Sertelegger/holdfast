@@ -54,11 +54,10 @@
 //! `daemon::server::dispatch_tool`.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 /// A one-way flag that an async waiter and a blocking thread can both
 /// read.
@@ -69,19 +68,39 @@ use tokio::sync::Notify;
 /// blocking pool — asks it between polls. So the primitive has to offer
 /// an `await` *and* a load, and it has to be `Clone` because the
 /// blocking side gets its own copy.
-#[derive(Clone, Debug, Default)]
-pub struct CancelSignal(Arc<Inner>);
+///
+/// ## Why `watch` and not a flag beside a `Notify`
+///
+/// The obvious hand-rolled version is an `AtomicBool` and a `Notify`,
+/// and this was written that way first. `notify_waiters` wakes only
+/// waiters already registered and stores no permit, so such a
+/// `cancelled()` must **register before it loads the flag** — and a
+/// version that loads first is a lost wakeup: the flag set, the waiter
+/// parked forever. That is the worst available failure on a path whose
+/// entire job is to stop a wait.
+///
+/// **That ordering had no test that could catch it, and the mutation
+/// ladder is how that was found rather than argued.** Swapping the two
+/// statements left every behavioural row green, because any test that
+/// gets the waiter parked has already left the window — it is between
+/// two statements on one task. So the invariant is not defended here, it
+/// is removed: `watch::Receiver::wait_for` evaluates its predicate
+/// against the **current** value before it waits, so there is no
+/// check-then-register to get wrong and the guarantee belongs to tokio
+/// rather than to an ordering this file asserts about itself.
+#[derive(Clone, Debug)]
+pub struct CancelSignal(Arc<watch::Sender<bool>>);
 
-#[derive(Debug, Default)]
-struct Inner {
-    cancelled: AtomicBool,
-    woken: Notify,
+impl Default for CancelSignal {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CancelSignal {
     /// A signal nobody has cancelled yet.
     pub fn new() -> Self {
-        Self::default()
+        Self(Arc::new(watch::channel(false).0))
     }
 
     /// Cancel, and wake every waiter. `true` on the first call only.
@@ -89,38 +108,39 @@ impl CancelSignal {
     /// Idempotent on purpose: a cancel can arrive twice — once from the
     /// MCP client's `notifications/cancelled` and once from a retry —
     /// and the second must not be an error.
+    ///
+    /// `send_if_modified` rather than a load and then a `send`, so *"was
+    /// I first"* is decided under the same lock that sets the value.
     pub fn cancel(&self) -> bool {
-        let first = !self.0.cancelled.swap(true, Ordering::SeqCst);
-        self.0.woken.notify_waiters();
+        let mut first = false;
+        self.0.send_if_modified(|v| {
+            if *v {
+                false
+            } else {
+                *v = true;
+                first = true;
+                true
+            }
+        });
         first
     }
 
-    /// Has this request been cancelled? A plain atomic load, cheap
-    /// enough for the provider's 2 ms poll.
+    /// Has this request been cancelled? Cheap enough for the provider's
+    /// 2 ms poll.
     pub fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::SeqCst)
+        *self.0.borrow()
     }
 
-    /// Resolve once cancelled; park forever otherwise.
+    /// Resolve once cancelled; park otherwise.
     ///
-    /// **The registration happens before the load, and that ordering is
-    /// the whole correctness of this function.** `Notify::notify_waiters`
-    /// wakes only waiters that are already registered and stores no
-    /// permit, so a `cancel` landing between a load and a registration
-    /// would be lost and this future would never resolve — with the flag
-    /// set and the caller parked, which is the worst available failure.
-    /// `Notified::enable` registers without awaiting, so the flag is read
-    /// after the registration is live.
+    /// **It cannot resolve early.** `wait_for` fails when every sender is
+    /// gone, and this type *is* the sender — held in the `Arc` the
+    /// waiter's own `&self` borrows — so the channel cannot close while
+    /// anybody is waiting on it. A version that let the sender go would
+    /// resolve at once and report a cancellation nobody asked for.
     pub async fn cancelled(&self) {
-        loop {
-            let woken = self.0.woken.notified();
-            tokio::pin!(woken);
-            woken.as_mut().enable();
-            if self.is_cancelled() {
-                return;
-            }
-            woken.await;
-        }
+        let mut rx = self.0.subscribe();
+        let _ = rx.wait_for(|v| *v).await;
     }
 }
 
