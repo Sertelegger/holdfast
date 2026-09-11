@@ -6257,6 +6257,88 @@ mod tests {
         kill_everything(&server).await;
     }
 
+    /// **GH #125, the issue's end-to-end reproduction, as a permanent
+    /// row.** The default `read_output` path, default arguments, no
+    /// opt-out: a colour reset planted inside a GitHub token used to come
+    /// back as a complete, valid 40-character credential with
+    /// `redactions: {}`, because redaction searched the raw ring buffer
+    /// and `AnsiStripper` reassembled the token afterwards.
+    ///
+    /// **A `MockPty` for the bytes, where the issue ran `/bin/sh -c
+    /// printf`.** The two put the identical bytes into the identical ring
+    /// buffer and everything after that — `read_processed`,
+    /// `OutputProcessor`, this tool's envelope — is the code under test.
+    /// A real shell would add the one hazard CLAUDE.md names for macOS:
+    /// a session nobody drains stalls its child mid-write, which fails
+    /// this row for a reason that has nothing to do with redaction.
+    ///
+    /// **Three absence assertions, not one.** `contains(GITHUB_TOKEN)`
+    /// alone is satisfied by a payload that still carries both halves
+    /// four bytes apart, which is a full disclosure to anything that
+    /// renders it; and an absence that passes because the read returned
+    /// nothing is no assertion at all, so the surviving text is pinned
+    /// exactly.
+    #[tokio::test]
+    async fn read_output_does_not_reassemble_a_painted_credential() {
+        let server = HoldfastServer::new();
+        // **`deploy`, and never `token:` or `secret=`.** A label any rule
+        // keys on hands the line to `generic-secret-assignment`, which
+        // matches on the *label* and does not care what the value looks
+        // like — so every absence assertion below would pass against the
+        // unfixed code, protected by a rule this test is not about. It
+        // was written that way first and came back `[REDACTED:generic]`.
+        let painted = format!(
+            "deploy {}\x1b[0m{}\r\n",
+            &GITHUB_TOKEN[..15],
+            &GITHUB_TOKEN[15..]
+        );
+        let (id, _pty) = mock_session(&server, "gh-125", vec![], painted.as_bytes());
+        let session = server.registry.get(&id).expect("the session");
+        settle(&session, "the painted token to reach the buffer", |s| {
+            s.buffer_head() >= painted.len() as u64
+        })
+        .await;
+
+        let data = row(
+            "read_output",
+            &server
+                .read_output(Parameters(ReadOutputArgs {
+                    session: id.clone(),
+                    since_cursor: Some(0),
+                    ..Default::default()
+                }))
+                .await
+                .expect("read_output"),
+        )
+        .data;
+        let output = data["output"].as_str().expect("output is a string");
+
+        assert!(
+            !output.contains(GITHUB_TOKEN),
+            "the credential was reassembled: {output:?}"
+        );
+        assert!(
+            !output.contains(&GITHUB_TOKEN[..15]),
+            "the first half survived: {output:?}"
+        );
+        assert!(
+            !output.contains(&GITHUB_TOKEN[15..]),
+            "the second half survived: {output:?}"
+        );
+        assert_eq!(
+            output, "deploy [REDACTED:github]\r\n",
+            "one marker, and the line around it intact"
+        );
+        assert_eq!(
+            data["redactions"],
+            json!({ "github": 1 }),
+            "`redactions: {{}}` was the whole of the caller's warning that \
+             something had been missed"
+        );
+
+        kill_everything(&server).await;
+    }
+
     /// **The record of a decision that landed, kept as an assertion.**
     ///
     /// This test was written as the reverse of what it now asserts. §4.1's
