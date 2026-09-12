@@ -50,7 +50,7 @@
 //! `Config` and it changes what the daemon does. Both entry points that
 //! build one are real —
 //! `crates/holdfast-core/src/daemon/server.rs:1415` and
-//! `crates/holdfast-core/src/mcp/mod.rs:641` both call `config::load()` —
+//! `crates/holdfast-core/src/mcp/mod.rs:664` both call `config::load()` —
 //! so a read off `HoldfastServer::config` is a read of the operator's
 //! file.
 //!
@@ -172,6 +172,11 @@ fn populated() -> Config {
             ..PromptsConfig::default()
         },
         security: SecurityConfig {
+            // A rule the shipped set really has: `Config::validate`
+            // refuses a name it does not, so an invented one here fails
+            // `the_exemplar_is_a_config_an_operator_could_write` instead
+            // of enumerating a key.
+            disabled_redaction_rules: vec!["jwt".to_string()],
             profiles: vec![SessionProfile {
                 name: "enumerated".to_string(),
                 program: "true".to_string(),
@@ -248,7 +253,7 @@ const EFFECTIVE: &[(&str, &str)] = &[
     // ---- [limits]
     (
         "limits.max_concurrent_sessions",
-        "crates/holdfast-core/src/mcp/mod.rs:358 — SessionRegistry::new(config.limits.max_concurrent_sessions).",
+        "crates/holdfast-core/src/mcp/mod.rs:381 — SessionRegistry::new(config.limits.max_concurrent_sessions).",
     ),
     (
         "limits.default_idle_timeout_secs",
@@ -256,40 +261,40 @@ const EFFECTIVE: &[(&str, &str)] = &[
     ),
     (
         "limits.resource_read_max_bytes",
-        "crates/holdfast-core/src/mcp/mod.rs:605 (MCP resources/read) and crates/holdfast-core/src/daemon/server.rs:2231 (control protocol) — both pass it as read_resource's ceiling.",
+        "crates/holdfast-core/src/mcp/mod.rs:628 (MCP resources/read) and crates/holdfast-core/src/daemon/server.rs:2231 (control protocol) — both pass it as read_resource's ceiling.",
     ),
     (
         "limits.redaction_lookbehind_bytes",
-        "Renamed at the seam: crates/holdfast-core/src/config.rs:1577 maps it to ProcessingLimits::lookbehind_bytes, read on the live path at crates/holdfast-core/src/output/mod.rs:564 and crates/holdfast-core/src/session/mod.rs:1959.",
+        "Renamed at the seam: crates/holdfast-core/src/config.rs:1730 maps it to ProcessingLimits::lookbehind_bytes, read on the live path at crates/holdfast-core/src/output/mod.rs:564 and crates/holdfast-core/src/session/mod.rs:1986.",
     ),
     (
         "limits.redaction_lookahead_bytes",
-        "Renamed at the seam: crates/holdfast-core/src/config.rs:1578 maps it to ProcessingLimits::lookahead_bytes, read at crates/holdfast-core/src/output/mod.rs:565 and crates/holdfast-core/src/session/mod.rs:1962.",
+        "Renamed at the seam: crates/holdfast-core/src/config.rs:1731 maps it to ProcessingLimits::lookahead_bytes, read at crates/holdfast-core/src/output/mod.rs:565 and crates/holdfast-core/src/session/mod.rs:1989.",
     ),
     (
         "limits.partial_secret_scan_bytes",
-        "crates/holdfast-core/src/config.rs:1579 maps it onto ProcessingLimits; read at crates/holdfast-core/src/output/mod.rs:566 and crates/holdfast-core/src/session/mod.rs:1965.",
+        "crates/holdfast-core/src/config.rs:1732 maps it onto ProcessingLimits; read at crates/holdfast-core/src/output/mod.rs:566 and crates/holdfast-core/src/session/mod.rs:1992.",
     ),
     (
         "limits.ansi_incomplete_max_bytes",
-        "crates/holdfast-core/src/config.rs:1580 maps it onto ProcessingLimits; read at crates/holdfast-core/src/output/mod.rs:349, which holds back an unfinished trailing escape.",
+        "crates/holdfast-core/src/config.rs:1733 maps it onto ProcessingLimits; read at crates/holdfast-core/src/output/mod.rs:349, which holds back an unfinished trailing escape.",
     ),
     // ---- [security]
     (
-        "security.redaction_enabled",
-        "AUDIT-ROW ONLY: crates/holdfast-core/src/mcp/tools.rs:583 copies it into the §9.4 session_start record. It gates nothing — crates/holdfast-core/src/config.rs:1570 returns RuleSet::builtin() unconditionally — so `false` does not disable redaction. Effective because the audit file changes; see the module note on why that is still a GH #128 finding.",
+        "security.disabled_redaction_rules",
+        "crates/holdfast-core/src/config.rs:1688 hands it to RuleSet::builtin_without, and crates/holdfast-core/src/mcp/mod.rs:341 is where HoldfastServer takes that set for its OutputProcessor — so it changes what read_output, resources/read and every attached observer are served. crates/holdfast-core/src/mcp/tools.rs:438 hands the same Arc to each session's screen tracker (get_screen_state) and crates/holdfast-core/src/mcp/tools.rs:604 reports the resulting set in the §9.4 session_start row. Behaviourally probed through the tool surface by tests/integration.rs::a_disabled_redaction_rule_stops_redacting_and_its_neighbours_do_not.",
     ),
     (
         "security.secret_provider",
-        "crates/holdfast-core/src/mcp/tools.rs:1889 gates request_secret_input's keychain step; crates/holdfast-core/src/secret/binding.rs:651 refuses autofill when it spells `prompt`.",
+        "crates/holdfast-core/src/mcp/tools.rs:1911 gates request_secret_input's keychain step; crates/holdfast-core/src/secret/binding.rs:651 refuses autofill when it spells `prompt`.",
     ),
     (
         "security.autofill_on_echo_off",
-        "crates/holdfast-core/src/mcp/tools.rs:2923 — the first line of watch_for_autofill returns early when it is false, so the echo-drop listener is armed or is not.",
+        "crates/holdfast-core/src/mcp/tools.rs:2945 — the first line of watch_for_autofill returns early when it is false, so the echo-drop listener is armed or is not.",
     ),
     (
         "security.secret_bindings",
-        "crates/holdfast-core/src/mcp/tools.rs:1890 (emptiness fast path) and crates/holdfast-core/src/secret/binding.rs:661 — the Vec is what select() searches.",
+        "crates/holdfast-core/src/mcp/tools.rs:1912 (emptiness fast path) and crates/holdfast-core/src/secret/binding.rs:661 — the Vec is what select() searches.",
     ),
     (
         "security.secret_bindings[].name",
@@ -321,15 +326,15 @@ const EFFECTIVE: &[(&str, &str)] = &[
     ),
     (
         "security.profiles",
-        "crates/holdfast-core/src/mcp/tools.rs:725 — start_session searches it for the named profile and refuses with invalid_params at tools.rs:737 on a miss.",
+        "crates/holdfast-core/src/mcp/tools.rs:747 — start_session searches it for the named profile and refuses with invalid_params at tools.rs:737 on a miss.",
     ),
     (
         "security.profiles[].name",
-        "crates/holdfast-core/src/mcp/tools.rs:730 — the lookup key; copied onto the session at tools.rs:762, which is what binding selection later compares.",
+        "crates/holdfast-core/src/mcp/tools.rs:752 — the lookup key; copied onto the session at tools.rs:762, which is what binding selection later compares.",
     ),
     (
         "security.profiles[].program",
-        "crates/holdfast-core/src/mcp/tools.rs:746 — becomes Launch::command and then the binary PtySpawnConfig executes.",
+        "crates/holdfast-core/src/mcp/tools.rs:768 — becomes Launch::command and then the binary PtySpawnConfig executes.",
     ),
     (
         "security.profiles[].args",
@@ -341,11 +346,11 @@ const EFFECTIVE: &[(&str, &str)] = &[
     ),
     (
         "security.profiles[].env",
-        "crates/holdfast-core/src/mcp/tools.rs:751 — becomes Launch::env and then the child's environment overrides at tools.rs:339.",
+        "crates/holdfast-core/src/mcp/tools.rs:773 — becomes Launch::env and then the child's environment overrides at tools.rs:339.",
     ),
     (
         "security.profiles[].cwd",
-        "crates/holdfast-core/src/mcp/tools.rs:756 — becomes Launch::cwd, canonicalised and applied to the child at tools.rs:308.",
+        "crates/holdfast-core/src/mcp/tools.rs:778 — becomes Launch::cwd, canonicalised and applied to the child at tools.rs:308.",
     ),
     (
         "security.keychain_provider_timeout_secs",
@@ -353,11 +358,11 @@ const EFFECTIVE: &[(&str, &str)] = &[
     ),
     (
         "security.max_secret_bytes_ceiling",
-        "crates/holdfast-core/src/mcp/tools.rs:1766 rejects a larger request_secret_input argument; crates/holdfast-core/src/attach/conn.rs:900 bounds an attach client's SecretInput submission.",
+        "crates/holdfast-core/src/mcp/tools.rs:1788 rejects a larger request_secret_input argument; crates/holdfast-core/src/attach/conn.rs:900 bounds an attach client's SecretInput submission.",
     ),
     (
         "security.secret_input_max_timeout_secs",
-        "crates/holdfast-core/src/mcp/tools.rs:1745 — request_secret_input refuses a timeout_secs above it.",
+        "crates/holdfast-core/src/mcp/tools.rs:1767 — request_secret_input refuses a timeout_secs above it.",
     ),
     // ---- [daemon]
     (
@@ -366,7 +371,7 @@ const EFFECTIVE: &[(&str, &str)] = &[
     ),
     (
         "daemon.binding_approval_timeout_secs",
-        "crates/holdfast-core/src/mcp/tools.rs:2549 — run_binding_approval passes it to secret::approval_window, which sets the approval expiry.",
+        "crates/holdfast-core/src/mcp/tools.rs:2571 — run_binding_approval passes it to secret::approval_window, which sets the approval expiry.",
     ),
     (
         "daemon.audit_retention_days",
@@ -506,9 +511,14 @@ const INERT: &[(&str, Inert, &str)] = &[
     ),
     // ---- [security]
     (
+        "security.redaction_enabled",
+        Inert::NamedElsewhere,
+        "REFUSED-AT-LOAD, and inert by decision rather than by oversight (GH #128). It was classified effective here on one ground — crates/holdfast-core/src/mcp/tools.rs copied it into the §9.4 session_start row — while gating no redactor, so `false` bought an operator every rule still running and an audit trail asserting on every session that they were not. crates/holdfast-core/src/config.rs:1473 now refuses `false` at load, naming security.disabled_redaction_rules, which is the mechanism; the row describes the effective rule set instead (crates/holdfast-core/src/mcp/tools.rs:604). `true` is the only accepted value, it is the default, and nothing reads it — which is this table's own definition of inert, VALIDATE-ONLY. The single non-comment mention outside config.rs is crates/holdfast-core/src/mcp/tools.rs:4936, the assertion that the row no longer carries the field; a test of a field's absence is not a consumer of it.",
+    ),
+    (
         "security.extra_redaction_patterns",
         Inert::NamedElsewhere,
-        "GH #128 calls this the serious one, and the code is honest about it: the doc comment says \"Parsed and deliberately not passed to RuleSet\", and crates/holdfast-core/src/config.rs:2758 is the test a_user_redaction_pattern_is_accepted_and_not_yet_in_force, which asserts the rule set equals RuleSet::builtin(). The §15.1 ExtraRule → RuleSpec mapping is undecided. The one mention is the doc comment at crates/holdfast-core/src/output/rules.rs:31 saying it cannot take one.",
+        "GH #128 calls this the serious one, and the code is honest about it: the doc comment says \"Parsed and deliberately not passed to RuleSet\", and crates/holdfast-core/src/config.rs:2911 is the test a_user_redaction_pattern_is_accepted_and_not_yet_in_force, which asserts the rule set equals RuleSet::builtin(). The §15.1 ExtraRule → RuleSpec mapping is undecided. The one mention is the doc comment at crates/holdfast-core/src/output/rules.rs:31 saying it cannot take one.",
     ),
     (
         "security.strict_confirmation",
@@ -566,12 +576,12 @@ const INERT: &[(&str, Inert, &str)] = &[
     (
         "adapters",
         Inert::NeverNamed,
-        "VALIDATE-ONLY: crates/holdfast-core/src/config.rs:1536 iterates it to refuse an empty name, and nothing else in the workspace reads it. The struct doc says \"Unread — 0.0.9\". Nothing in detect/ ever receives a Config.",
+        "VALIDATE-ONLY: crates/holdfast-core/src/config.rs:1648 iterates it to refuse an empty name, and nothing else in the workspace reads it. The struct doc says \"Unread — 0.0.9\". Nothing in detect/ ever receives a Config.",
     ),
     (
         "adapters[].name",
         Inert::NamedElsewhere,
-        "VALIDATE-ONLY: the non-empty rule at crates/holdfast-core/src/config.rs:1537. `name` is also SessionProfile's and SecretBinding's override key.",
+        "VALIDATE-ONLY: the non-empty rule at crates/holdfast-core/src/config.rs:1654. `name` is also SessionProfile's and SecretBinding's override key.",
     ),
     (
         "adapters[].match_command",

@@ -31,6 +31,19 @@ pub enum RuleError {
     /// `extra_redaction_patterns` cannot take it either (§10.2).
     #[error("rule `{0}` claims the reserved kind `unresolved`, which names no rule (REQ-O-011a)")]
     ReservedKind(String),
+    /// GH #128: `[security] disabled_redaction_rules` names a rule the
+    /// built-in set does not have.
+    ///
+    /// A name that matches nothing switches off nothing, while reading
+    /// — in the operator's own file — as a decision about redaction that
+    /// has been taken. That is the shape GH #128 is about, so it is an
+    /// error rather than a no-op.
+    /// [`Config::validate`](crate::config::Config::validate) refuses it
+    /// at load, which is where an operator sees it; this variant is the
+    /// same refusal at the rule compiler, for a `Config` built in code
+    /// rather than parsed.
+    #[error("no built-in redaction rule is named `{name}`; the built-in set has {count}")]
+    UnknownRule { name: String, count: usize },
 }
 
 /// Top level of the rule file.
@@ -119,6 +132,48 @@ impl RuleSet {
         Self::compile(file)
     }
 
+    /// The vendored default set **minus** the rules an operator switched
+    /// off with `[security] disabled_redaction_rules` (GH #128).
+    ///
+    /// Deliberately shaped like [`builtin_with_extra`](Self::builtin_with_extra)
+    /// — parse the vendored file, edit the `RuleSpec` list, compile once
+    /// — rather than filtering a compiled [`RuleSet`]. The prefilter
+    /// `RegexSet` reports *indices into `rules`*, so removing a compiled
+    /// rule means rebuilding the prefilter anyway, and a filter that
+    /// forgot to would leave every later rule's index off by the number
+    /// removed: every redaction after the first disabled rule would name
+    /// the wrong kind. Editing the specs and compiling once cannot have
+    /// that bug.
+    ///
+    /// It is also what REQ-O-006 asks for. The §4.1 prefix index is
+    /// *"auto-derived from the **active** redaction rule set"*, and
+    /// `OutputProcessor::new` derives it from whatever `RuleSet` it is
+    /// handed — so the index follows the reduced set here without a
+    /// second edit, and there is no window in which rules and index
+    /// disagree (REQ-RTD-002).
+    ///
+    /// An unknown name is [`RuleError::UnknownRule`], never a silent
+    /// no-op. Disabling every rule is legal and yields an empty set: the
+    /// operator enumerated all fifty-one by name, the §9.4 row records
+    /// exactly that, and the startup line says it — which is the whole
+    /// difference between this and the `redaction_enabled = false` that
+    /// GH #128 found recording the opposite of what it did.
+    pub fn builtin_without(disabled: &[String]) -> Result<Self, RuleError> {
+        let mut file: RuleFile =
+            toml::from_str(DEFAULT_RULES_TOML).map_err(|e| RuleError::Toml(e.to_string()))?;
+        for name in disabled {
+            if !file.rules.iter().any(|r| &r.name == name) {
+                return Err(RuleError::UnknownRule {
+                    name: name.clone(),
+                    count: file.rules.len(),
+                });
+            }
+        }
+        file.rules
+            .retain(|r| !disabled.iter().any(|d| d == &r.name));
+        Self::compile(file)
+    }
+
     pub fn from_toml(toml_src: &str) -> Result<Self, RuleError> {
         let file: RuleFile =
             toml::from_str(toml_src).map_err(|e| RuleError::Toml(e.to_string()))?;
@@ -187,6 +242,76 @@ impl RuleSet {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+
+    /// The built-in rules this set does **not** carry, by name, sorted
+    /// (GH #128).
+    ///
+    /// **Read off the live set, not off the config.** This is what the
+    /// §9.4 `session_start` row and the startup line both report, and
+    /// deriving it here means neither can say a rule is off while the
+    /// read path still runs it: the only way to make them lie is to
+    /// hand the read path a different `RuleSet` than the one asked,
+    /// which is a much louder bug than a copied field. That is the
+    /// lesson of the row this replaces — `redaction_enabled` copied a
+    /// config bool that gated nothing.
+    pub fn disabled_builtin_rules(&self) -> Vec<&'static str> {
+        let present: std::collections::BTreeSet<&str> =
+            self.rules.iter().map(|r| r.name.as_str()).collect();
+        builtin_rule_names()
+            .iter()
+            .filter(|name| !present.contains(name.as_str()))
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// The line a host prints at startup when the operator has switched
+/// rules off, or `None` when the set is the shipped one (GH #128).
+///
+/// **Reject-or-report is GH #128's own guidance, and this is the report
+/// half.** The list is rejected when it is wrong (an unknown name) and
+/// reported when it is right, because a redaction rule being off is
+/// security-relevant and must not be discoverable only by reading the
+/// config back — which is the state that let `redaction_enabled = false`
+/// sit in a file for a release doing nothing.
+///
+/// Derived from the set, like [`RuleSet::disabled_builtin_rules`]: the
+/// line says what the read path will really do.
+pub fn disabled_rules_notice(set: &RuleSet) -> Option<String> {
+    let off = set.disabled_builtin_rules();
+    if off.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "holdfast: {} of {} built-in redaction rules are switched off by \
+         security.disabled_redaction_rules and will redact nothing: {} \
+         ({} rules in force)",
+        off.len(),
+        builtin_rule_names().len(),
+        off.join(", "),
+        set.len(),
+    ))
+}
+
+/// Every built-in rule's `name`, sorted — the set an operator's
+/// `[security] disabled_redaction_rules` is checked against (GH #128).
+///
+/// **Parsed from [`DEFAULT_RULES_TOML`], never a list written out here.**
+/// A hand-kept copy would accept a name the shipped rule file no longer
+/// has, or refuse one it gained, and the failure in the first direction
+/// is a config that reads as a redaction decision and takes none. It
+/// does not compile the regexes, so validating a config costs a TOML
+/// parse rather than fifty-odd `Regex::new` calls.
+pub fn builtin_rule_names() -> &'static std::collections::BTreeSet<String> {
+    static NAMES: OnceLock<std::collections::BTreeSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        // Same reasoning as `builtin_shared`: a vendored rule file that
+        // does not parse is a broken binary, and
+        // `the_builtin_set_compiles_and_is_substantial` proves it parses.
+        let file: RuleFile = toml::from_str(DEFAULT_RULES_TOML)
+            .expect("the vendored redaction rule file must be valid TOML");
+        file.rules.into_iter().map(|r| r.name).collect()
+    })
 }
 
 /// The process-wide built-in rule set.
@@ -455,6 +580,110 @@ mod tests {
         let overridden = set.rules.iter().find(|r| r.name == "github-token").unwrap();
         assert_eq!(overridden.kind, "github-overridden");
         assert!(set.rules.iter().any(|r| r.name == "internal-token"));
+    }
+
+    /// GH #128: a disabled rule leaves the set, and the set is still a
+    /// working set — every remaining rule, every remaining prefilter
+    /// index.
+    ///
+    /// **The index assertion is the one that matters.** The prefilter
+    /// reports positions into `rules`, so an implementation that removed
+    /// the rule from `rules` and kept the original `RegexSet` would pass
+    /// a length check and then name the *wrong kind* on every redaction
+    /// after the hole. `github-token` sits after `aws-access-key-id` in
+    /// the shipped file, so this pairing is exactly that case.
+    #[test]
+    fn a_disabled_rule_leaves_the_set_and_the_prefilter_still_indexes_it() {
+        let full = RuleSet::builtin().unwrap();
+        let set = RuleSet::builtin_without(&["aws-access-key-id".to_string()]).unwrap();
+
+        assert_eq!(set.len(), full.len() - 1);
+        assert!(!set.rules.iter().any(|r| r.name == "aws-access-key-id"));
+        assert!(
+            set.rules.iter().any(|r| r.name == "github-token"),
+            "disabling one rule must not take its neighbours with it"
+        );
+
+        let hay = b"token=ghp_0123456789abcdefghijABCDEFGHIJ012345 done";
+        let hits: Vec<usize> = set.prefilter.matches(hay).into_iter().collect();
+        assert!(
+            !hits.is_empty(),
+            "the prefilter was not rebuilt from the reduced set"
+        );
+        for i in &hits {
+            assert!(
+                set.rules[*i].regex.is_match(hay),
+                "prefilter index {i} names `{}`, which does not match — the RegexSet and \
+                 the rule list have drifted apart",
+                set.rules[*i].name
+            );
+        }
+        assert!(hits.iter().any(|i| set.rules[*i].name == "github-token"));
+    }
+
+    /// A name the built-in set does not carry is an error and not a
+    /// silent no-op (GH #128), and the message names it.
+    #[test]
+    fn an_unknown_disabled_rule_name_is_refused_and_named() {
+        let err = RuleSet::builtin_without(&["aws_access_key_id".to_string()])
+            .expect_err("a misspelled rule name must not compile to the full set");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("aws_access_key_id"),
+            "the operator can only fix what the message names: {msg}"
+        );
+        // The reserved pseudo-kind is not a rule name either, and the
+        // same refusal covers it (REQ-O-011a, §9.2).
+        assert!(RuleSet::builtin_without(&[UNRESOLVED_KIND.to_string()]).is_err());
+    }
+
+    /// Disabling every rule is legal, enumerated, and yields a set that
+    /// still compiles — an empty `RegexSet` matches nothing rather than
+    /// everything, which is the failure a "no rules means no prefilter"
+    /// shortcut would have.
+    #[test]
+    fn disabling_every_rule_yields_an_empty_set_that_still_answers() {
+        let all: Vec<String> = builtin_rule_names().iter().cloned().collect();
+        let set = RuleSet::builtin_without(&all).expect("an empty rule set is a rule set");
+        assert!(set.is_empty());
+        assert!(set
+            .prefilter
+            .matches(b"ghp_0123456789abcdefghijABCDEFGHIJ012345")
+            .into_iter()
+            .next()
+            .is_none());
+        assert_eq!(set.disabled_builtin_rules().len(), all.len());
+    }
+
+    /// `disabled_builtin_rules` reads the **set**, so it reports what the
+    /// read path will really do rather than what a config said.
+    #[test]
+    fn the_disabled_list_is_derived_from_the_set_and_not_from_a_config() {
+        assert!(
+            RuleSet::builtin()
+                .unwrap()
+                .disabled_builtin_rules()
+                .is_empty(),
+            "the built-in set has nothing disabled, whatever any config says"
+        );
+        let set =
+            RuleSet::builtin_without(&["jwt".to_string(), "github-token".to_string()]).unwrap();
+        assert_eq!(
+            set.disabled_builtin_rules(),
+            vec!["github-token", "jwt"],
+            "sorted, so the audit row and the startup line do not depend on config order"
+        );
+    }
+
+    /// The names are the shipped file's, not a copy kept beside it.
+    #[test]
+    fn the_built_in_names_are_the_shipped_rule_files_own() {
+        let names = builtin_rule_names();
+        let set = RuleSet::builtin().unwrap();
+        assert_eq!(names.len(), set.len());
+        for rule in &set.rules {
+            assert!(names.contains(&rule.name), "{} is missing", rule.name);
+        }
     }
 
     #[test]

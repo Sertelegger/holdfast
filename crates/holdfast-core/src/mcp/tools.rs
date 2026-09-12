@@ -430,6 +430,12 @@ impl HoldfastServer {
             // of one decision read off two clocks, which is the failure
             // `Clock::now_ms` was added to prevent one layer down.
             clock: self.clock.clone(),
+            // GH #128. The screen tracker redacts the grid with its own
+            // table, so `get_screen_state` honours
+            // `security.disabled_redaction_rules` only if the session is
+            // handed the set this server's processor runs. The same
+            // `Arc`, so the two surfaces cannot drift.
+            rules: Some(Arc::clone(&self.processor.rules)),
             ..SessionConfig::default()
         };
 
@@ -600,29 +606,45 @@ impl HoldfastServer {
                 // true while no milestone had built the reaper, and no
                 // longer true now that Task 16 has.
                 "idle_timeout_secs": idle_timeout_secs_resolved,
-                // **Read from the operator's config, not written as a
-                // literal.** This stood as `true` unconditionally, with
-                // a comment promising to wire it "when `redaction_enabled`
-                // becomes a per-session argument". `[security]
-                // redaction_enabled` is already a live, validated,
-                // operator-settable key; the literal made this row an
-                // audit record asserting a fact it had not checked, and
-                // the day the knob is honoured on the read path the one
-                // field whose job is to make the redaction posture
-                // reconstructible would have been false by construction
-                // — with no test in the tree failing. A field that is
-                // sometimes wrong is worse than no field, so it reads
-                // the same value the reader will.
+                // **The effective rule set, read off the set this
+                // session's reads will run, and not a bool copied from
+                // the config (GH #128).**
                 //
-                // What it records is the **configured posture**, which
-                // is what §9.4 asks of a `session_start` row: `read_output`
-                // and `resources/read` still take a per-call `redact`,
-                // and an individual read that opts out is recorded by
-                // §9.4's separate `redaction_disabled` entry from inside
-                // `Session::read_processed`. The two rows answer
-                // different questions and neither substitutes for the
-                // other.
-                "redaction_enabled": self.config.security.redaction_enabled,
+                // §9.4 specified `redaction_enabled` here and this row
+                // carried it. It was first the literal `true`, then the
+                // config key — and the config key gated no redactor, so
+                // an operator who set it `false` got every rule still
+                // running and a row asserting on every session that they
+                // were not. The field whose job is to make the redaction
+                // posture reconstructible recorded the opposite of the
+                // truth, which is worse than recording nothing.
+                //
+                // A bool cannot be fixed into truthfulness here, because
+                // with `redaction_enabled = false` now refused at load
+                // its only remaining value is `true` — and `true` beside
+                // three disabled rules is the same lie in a smaller
+                // size. So the row names the set: how many rules ran and
+                // which built-in ones did not. Both come from
+                // `processor.rules`, the table the read path holds, so
+                // the row cannot describe a posture the daemon does not
+                // have.
+                //
+                // **Replacing a §9.4 field is §21.6's case, not §23.3's**
+                // — the audit log is an external contract whose binding
+                // event is first distribution (§12.3), which has not
+                // happened, and §21.6 says a wrong field is fixed rather
+                // than versioned around before it does. The §9.4 table
+                // needs the same edit; it is not made here because
+                // `docs/` is a separate repository.
+                //
+                // `read_output` and `resources/read` still take a
+                // per-call `redact`, and an individual read that opts out
+                // is recorded by §9.4's separate `redaction_disabled`
+                // entry from inside `Session::read_processed`. That row
+                // and this one answer different questions and neither
+                // substitutes for the other.
+                "redaction_rules_active": self.processor.rules.len(),
+                "redaction_rules_disabled": self.processor.rules.disabled_builtin_rules(),
                 "pid": session.pid(),
             }),
         );
@@ -4943,36 +4965,49 @@ mod tests {
         entry
     }
 
-    /// §9.4's `redaction_enabled` must report the **configured** posture.
+    /// §9.4's `session_start` row must describe the **effective** rule
+    /// set (GH #128).
     ///
-    /// It was the literal `true`, with a comment promising to wire it
-    /// later. `[security] redaction_enabled` is already a live,
-    /// validated, operator-settable key, so an operator who set it
-    /// `false` got an audit trail asserting the opposite on every
-    /// session — the one field whose job is to make the redaction
-    /// posture reconstructible, false by construction, with nothing in
-    /// the tree failing.
+    /// The field here was `redaction_enabled`: first the literal `true`,
+    /// then a copy of `[security] redaction_enabled` — a key that gated
+    /// no redactor, so `false` bought an operator every rule still
+    /// running and a trail asserting on every session that they were
+    /// not. That value is now refused at load and this row names the set
+    /// instead.
     ///
-    /// **Both rows, and they are not interchangeable.** The `false` row
-    /// is the one the literal fails; the `true` row is what separates
-    /// "reads the config" from a mutation that swapped one literal for
-    /// the other. Neither alone is a test of this field.
+    /// **Both rows, and they are not interchangeable.** The default row
+    /// is what a hardcoded `disabled: ["jwt", "github-token"]` fails;
+    /// the disabled row is what a hardcoded `active: 51, disabled: []`
+    /// fails. Either alone passes against a literal, which is the bug
+    /// this field has had twice.
     #[tokio::test]
-    async fn session_start_records_the_configured_redaction_posture() {
-        let mut off = crate::config::Config::default();
-        off.security.redaction_enabled = false;
+    async fn session_start_records_the_effective_redaction_rule_set() {
+        let builtin = crate::output::rules::builtin_rule_names().len();
+
+        let stock = session_start_entry(&crate::config::Config::default()).await;
         assert_eq!(
-            session_start_entry(&off).await["redaction_enabled"],
-            serde_json::json!(false),
-            "the operator turned redaction off and §9.4 recorded that it was on"
+            stock["redaction_rules_active"],
+            serde_json::json!(builtin),
+            "a stock config runs every built-in rule and the row must say so"
+        );
+        assert_eq!(stock["redaction_rules_disabled"], serde_json::json!([]));
+        assert!(
+            stock["redaction_enabled"].is_null(),
+            "the bool that recorded a posture nothing had is gone, not renamed beside it"
         );
 
-        let mut on = crate::config::Config::default();
-        on.security.redaction_enabled = true;
+        let mut off = crate::config::Config::default();
+        off.security.disabled_redaction_rules = vec!["jwt".to_string(), "github-token".to_string()];
+        let entry = session_start_entry(&off).await;
         assert_eq!(
-            session_start_entry(&on).await["redaction_enabled"],
-            serde_json::json!(true),
-            "a row hardcoded to `false` satisfies the assertion above perfectly"
+            entry["redaction_rules_active"],
+            serde_json::json!(builtin - 2),
+            "two rules are off and the row still counts them in force"
+        );
+        assert_eq!(
+            entry["redaction_rules_disabled"],
+            serde_json::json!(["github-token", "jwt"]),
+            "the row must name what is off — sorted, so it does not depend on config order"
         );
     }
 
