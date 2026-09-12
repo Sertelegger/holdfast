@@ -789,6 +789,14 @@ impl Session {
         );
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            // **Was the backend already dead when the read below started?**
+            // (GH #149.) The loop must not exit on a liveness sample taken
+            // *after* the read it judges — see the `n == 0` arm.
+            //
+            // Starts `false` because the session has just been spawned:
+            // seeding it `true` would let the very first empty read end
+            // the reader before the child has written a byte.
+            let mut dead_before_read = false;
             // A read error ends the output stream, so `while let Ok` is
             // the whole loop condition. (`loop` + an inner `match` that
             // breaks on `Err` trips clippy::while_let_loop.)
@@ -796,14 +804,78 @@ impl Session {
                 if n == 0 {
                     // EOF for a blocking backend, "nothing yet" for a
                     // non-blocking one. Liveness decides, not the count.
-                    if !reader_backend.is_alive() {
+                    //
+                    // **And the liveness that decides must have been
+                    // sampled before this read, not after it** (GH #149).
+                    // `read` and `is_alive` are two separate lock
+                    // acquisitions on the backend. Judging a zero-read by
+                    // a liveness sample taken afterwards means a child
+                    // that does `write` then `exit` in the gap between
+                    // them ends the loop with its last line still queued —
+                    // and the loop's exit is where `reader_finished` is
+                    // published, which is the positive fact *"the buffer
+                    // is final"*. Bytes abandoned there make that flag a
+                    // lie, and `wait::for_pattern` is entitled to trust
+                    // it: it answers `SessionDied` over a buffer that is
+                    // legitimately final and legitimately empty. GH #42
+                    // closed the same hazard one layer up, in the waiter;
+                    // this is the producer half of it.
+                    //
+                    // So the exit condition is *a read returned zero and
+                    // the backend was already dead before that read* —
+                    // a death is a reason to go round once more, never a
+                    // reason to stop.
+                    //
+                    // **Which backend can actually be in that window.**
+                    // Not `InProcessPty` on Unix: `portable-pty` maps the
+                    // master's `EIO` onto `Ok(0)` (`unix.rs`, `impl Read
+                    // for PtyFd`), and `EIO` means every slave descriptor
+                    // is closed — so nothing can write after a zero read
+                    // there and this branch drains nothing. It is the
+                    // *non-blocking* reading of `n == 0` two comments up
+                    // that has the hole, which is `MockPty` today and the
+                    // process-isolated `SubprocessPty` seam tomorrow. The
+                    // extra pass costs one `read` at the end of a session
+                    // and no extra `is_alive`, because the pass that
+                    // breaks no longer samples one.
+                    //
+                    // **Termination does not rest on `is_alive()` being
+                    // monotonic, and it must not be read as if it did.**
+                    // `InProcessPty::is_alive` has an `Err(_) => false`
+                    // arm that — unlike its `Ok(Some(_))` arm — does not
+                    // cache into `self.exit`, so a `waitpid` interrupted
+                    // by a signal can answer `false` and then `true`
+                    // again. What the loop rests on instead is that
+                    // `dead_before_read` is **write-once-true**: its only
+                    // assignment is below this `break`, so once set it is
+                    // never cleared and the next empty read leaves. A
+                    // dead child queues no further bytes, so only finitely
+                    // many draining reads can follow, and the loop ends.
+                    // (A transient `false` therefore arms the exit one
+                    // read early. That is strictly better than the code
+                    // this replaced, which took the same transient as a
+                    // reason to break *immediately*, losing whatever was
+                    // queued.)
+                    if dead_before_read {
                         break;
                     }
                     // The session was dropped while we idled.
                     if weak_buffer.strong_count() == 0 {
                         break;
                     }
-                    std::thread::sleep(READER_IDLE_POLL);
+                    dead_before_read = !reader_backend.is_alive();
+                    // **Not slept on the death edge**, and that is what
+                    // keeps this from becoming a spin as much as it keeps
+                    // the shutdown prompt. The final drain has nothing to
+                    // wait for — a dead child writes no more bytes — and
+                    // the sleepless pass happens **at most once in the
+                    // life of the loop**, not merely once in a row: the
+                    // assignment above is the only one, so a flag already
+                    // set cannot be set again, and the next empty read
+                    // breaks unconditionally.
+                    if !dead_before_read {
+                        std::thread::sleep(READER_IDLE_POLL);
+                    }
                     continue;
                 }
                 // Upgrade only around the push, so the thread never holds
@@ -1100,10 +1172,14 @@ impl Session {
             //
             // **The loop ending is not the same event as the child being
             // reaped, and the difference is the whole of this block.** On
-            // Linux the master reports the slave's last close as `EIO`,
-            // which ends the `while let Ok(n)` immediately — while
-            // `exit_code` comes from a `WNOHANG` wait that may not have
-            // seen the child yet. Emitting on the read failure alone
+            // Linux the master reports the slave's last close as `EIO` —
+            // which `portable-pty` maps to `Ok(0)` rather than an error
+            // (`unix.rs`, `impl Read for PtyFd`), so the loop leaves
+            // through the `n == 0` branch above and **not** through the
+            // `Err` arm of `while let Ok(n)`; that arm is effectively dead
+            // for `InProcessPty` on Unix. Either way it ends at once —
+            // while `exit_code` comes from a `WNOHANG` wait that may not
+            // have seen the child yet. Emitting on the read failure alone
             // would report `-1` for a child that exited `7`, and a client
             // believes an exit code. So the wait is given a bounded
             // moment, the same concession `mcp::tools`'s terminate path
@@ -2363,6 +2439,125 @@ mod tests {
 
         let read = s.read_from(0, 4096);
         assert_eq!(String::from_utf8_lossy(&read.bytes), "first second");
+    }
+
+    /// **GH #149. `reader_finished` is published as the positive fact
+    /// *"the buffer is final"*, so the reader must not raise it over bytes
+    /// it never collected.**
+    ///
+    /// The window is the gap between the reader's zero-byte `read` and the
+    /// separate `is_alive()` that judges it — two lock acquisitions on the
+    /// backend. A child that does *both* `queue_output` and `exit` in that
+    /// gap left the old reader breaking with its last line still in the
+    /// pty, and then storing the flag anyway. `wait::for_pattern` is
+    /// entitled to trust that flag (GH #42), so it went on to answer
+    /// `SessionDied` over a buffer that was legitimately final and
+    /// legitimately empty. The bytes were abandoned by the producer, not
+    /// lost to a race in the waiter.
+    ///
+    /// **Pinned, not sampled, and that is the whole point of the row.**
+    /// `MockPty::on_empty_read` fires *inside* the gap — after the read
+    /// has drained nothing, before it returns — so the interleaving
+    /// happens on every run rather than when the machine is unlucky.
+    /// Sampling cannot reach this: the symptom was 0 in 360 on an idle
+    /// 12-core Linux box (200 isolated, 60 under CPU saturation, 100 under
+    /// fork density) while failing 3 times in 28 CI runs on a 3-vCPU macOS
+    /// host. Against the unfixed reader this row fails every time.
+    ///
+    /// **Deliberately not routed through `wait::for_pattern`.** What broke
+    /// is the flag's meaning, and asserting it here keeps the row honest
+    /// if someone later "fixes" the symptom in the waiter instead: the
+    /// consumer is already correct and a second guard there would leave
+    /// this red.
+    #[test]
+    fn a_child_that_writes_and_dies_in_the_read_liveness_gap_is_still_drained() {
+        // Deliberately past one `read` of the reader's 8192-byte buffer;
+        // see the queueing site below for why the size is the assertion.
+        const PAYLOAD_LEN: usize = 12_000;
+        let payload: Arc<Vec<u8>> = Arc::new(
+            b"LAST LINE\n"
+                .iter()
+                .copied()
+                .cycle()
+                .take(PAYLOAD_LEN)
+                .collect(),
+        );
+        // **Its own ring, not `mock_session()`'s 4 KiB one.** The claim is
+        // that every abandoned byte is recovered, so the buffer has to be
+        // able to hold every one of them: at 4 KiB the eviction would do
+        // the truncating and the row would report a drain defect that was
+        // really the ring doing its job.
+        let pty = Arc::new(MockPty::new());
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(32 * 1024),
+        );
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // A `Weak`, so the hook the mock owns does not own the mock back.
+        let weak_pty = Arc::downgrade(&pty);
+        let latch = Arc::clone(&fired);
+        let to_queue = Arc::clone(&payload);
+        pty.on_empty_read(move || {
+            // Exactly once. The hook runs on *every* empty read, and the
+            // firing after the final drain would re-queue the very bytes
+            // this row asserts were collected.
+            if latch.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let Some(pty) = weak_pty.upgrade() else {
+                return;
+            };
+            // The two halves of the window, in the order the issue
+            // measured them: the bytes land, then the child dies, and only
+            // then does the reader get to sample liveness.
+            //
+            // **Longer than the reader's 8192-byte `buf`, and that is the
+            // assertion rather than an incidental size.** "Drain once more"
+            // read literally — allow exactly one further read after the
+            // death — is a plausible half-fix, and against a payload that
+            // fits in one buffer it is indistinguishable from the real
+            // one. Measured: with a single post-death read the buffer ends
+            // at 8192 of these 12000 bytes, and `reader_finished` still
+            // says *final*, which is #149's own symptom for any child that
+            // writes more than 8 KiB on its way out. The exit condition is
+            // *drain until a read comes back empty*, so the row states the
+            // whole payload.
+            pty.queue_output(&to_queue);
+            pty.exit(0);
+        });
+
+        // **Waited on before the reader, so a hook that never ran is
+        // diagnosed rather than misreported.** `review.md`'s rule is that
+        // scaffolding must assert it applied; asserting it only at the end
+        // is too late, because a mock that never fires the hook leaves the
+        // child alive and this row dies at the *next* wait with a message
+        // about the reader thread. The gap is the precondition, so it is
+        // the first thing established.
+        wait_until("the read/liveness gap to be entered", || {
+            fired.load(Ordering::SeqCst)
+        });
+        wait_until("the reader thread to finish", || s.reader_finished());
+        assert!(!s.is_alive(), "the hook exited the child");
+
+        // `buffer_head()` and not a string compare: the claim is *how many
+        // of the child's last bytes survived*, and a row that only checks
+        // the first 4 KiB cannot see a drain that stopped at 8192.
+        assert_eq!(
+            s.buffer_head(),
+            PAYLOAD_LEN as u64,
+            "the reader published `reader_finished` — *the buffer is final* — \
+             over bytes that were still sitting in the pty when it left its loop"
+        );
+        let read = s.read_from(0, PAYLOAD_LEN);
+        assert_eq!(
+            read.bytes, *payload,
+            "and they are the bytes the child wrote"
+        );
     }
 
     #[test]

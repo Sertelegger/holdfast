@@ -7,13 +7,18 @@
 //! `next_cursor`. A live stream arrives in chunks the daemon does not
 //! choose, has no cursor, and a secret can straddle any two of them. The
 //! straddle problem is solved a third time here because the shape
-//! genuinely differs, and it is solved **on 0.0.3's own `pub`
-//! primitives** — `find_spans`, `marker`, `PrefixIndex::earliest_partial`
-//! — so the rule set cannot drift between the two surfaces.
+//! genuinely differs, and it is solved **on 0.0.3's own primitives** —
+//! `OutputProcessor::all_spans`, `marker`,
+//! `PrefixIndex::earliest_partial` — so the rule set cannot drift
+//! between the two surfaces. `all_spans` rather than `find_spans`
+//! deliberately (GH #135): the union over the emitted views *is* the
+//! matching primitive since GH #125, and asking the raw bytes alone here
+//! would have left this surface judging a stream the other one had
+//! stopped trusting.
 
 use std::sync::Arc;
 
-use crate::output::redact::{find_spans, marker};
+use crate::output::redact::marker;
 use crate::output::{OutputProcessor, ProcessingLimits};
 
 /// The pseudo-kind emitted for a match the window could not judge:
@@ -121,7 +126,25 @@ const WITHHOLD_WINDOW_BYTES: usize = 2 * STREAM_CARRY_BYTES;
 /// `2 × STREAM_CARRY_BYTES` of dropped output before the stream recovers.
 /// Neither licenses going back to flushing raw.
 ///
-/// **A third residual belongs to the rule set rather than to this type,
+/// **A third residual is GH #142 at *this* boundary, and it is worse
+/// here than it is at `read_output`'s (GH #135).** `all_spans` judges
+/// the bytes that have arrived; a credential whose escape-broken halves
+/// land in **different chunks** is therefore not yet a match when the
+/// first chunk is judged, and `earliest_partial`'s continuation test —
+/// which reads the raw region, because a view may not add a withhold —
+/// does not recognise the planted control byte as part of the value. The
+/// stream is released up to the escape. Measured over
+/// `ghp_…\x1b[0m…`, a 40-character token split at four points:
+/// `tests/redaction_sweep.rs`'s
+/// `the_stream_residual_at_a_chunk_split_is_bounded` prints the run of
+/// token characters that survives at each. The reason it bites harder
+/// here than on a cursor read is the unit: a read's window is
+/// `lookahead_bytes` wide and usually holds the whole token, while this
+/// stream's unit is one 8 KiB PTY read, so the straddle is the common
+/// case rather than the corner. Closing it needs a sharper in-flight
+/// predicate — the same one GH #142 needs — and not a wider window.
+///
+/// **A fourth residual belongs to the rule set rather than to this type,
 /// and it is inherited rather than introduced.** A rule whose pattern
 /// carries no literal prefix of at least `MIN_PREFIX_LEN` bytes gets no
 /// entry in the prefix index, so `earliest_partial` never reports it as
@@ -138,7 +161,7 @@ pub struct StreamRedactor {
     /// Lookbehind and carry in one allocation: `buf[..split]` is the
     /// lookbehind (already emitted, retained for context) and
     /// `buf[split..]` is the carry (not emitted yet). Keeping them
-    /// contiguous is what lets a single `find_spans` see a rule whose
+    /// contiguous is what lets a single `all_spans` see a rule whose
     /// anchor landed in one chunk and whose value landed in the next.
     buf: Vec<u8>,
     split: usize,
@@ -206,7 +229,16 @@ impl StreamRedactor {
         // best that is left is to withhold its value bytes.
         let emit_end = stop.clamp(carry_start, stream_end);
 
-        let spans = find_spans(&self.processor.rules, &self.buf, self.base);
+        // **The union of views, not the raw bytes alone (GH #135).** An
+        // escape planted inside a credential breaks the rule's anchor in
+        // the raw buffer and is gone again by the time a terminal paints
+        // it, which is GH #125's defect arriving through this surface
+        // instead of through `read_output`. `all_spans` is the primitive
+        // that closes it, and it is *the* primitive rather than a second
+        // one written here for the reason this file's header already
+        // gives: two rule sets cannot be kept from drifting, so there is
+        // one.
+        let spans = self.processor.all_spans(&self.buf, self.base);
         let mut out = self.render(&spans, emit_end);
         self.retire(emit_end);
 
@@ -242,7 +274,7 @@ impl StreamRedactor {
             return Vec::new();
         }
         let stream_end = self.base + self.buf.len() as u64;
-        let spans = find_spans(&self.processor.rules, &self.buf, self.base);
+        let spans = self.processor.all_spans(&self.buf, self.base);
         let out = self.render(&spans, stream_end);
         self.retire(stream_end);
         out
@@ -393,6 +425,42 @@ mod tests {
         }
         v.extend_from_slice(b"-----END RSA PRIVATE KEY-----\n");
         v
+    }
+
+    /// **GH #135: the stream judges the bytes a client renders, not the
+    /// bytes the carry holds.** A colour reset inside a token breaks the
+    /// rule's anchor in the raw buffer and is gone again by the time the
+    /// terminal on the other end of `holdfast watch` paints it — the
+    /// GH #125 defect, arriving through this surface.
+    ///
+    /// `find_spans` on the raw carry is the control: it is what this
+    /// type used to call, and it must find nothing here, or the row
+    /// passes against the bug it exists to catch.
+    #[test]
+    fn an_escape_planted_inside_a_token_is_redacted_on_the_stream_too() {
+        let planted = format!("{}\x1b[0m{}\n", &GH[..20], &GH[20..]);
+        let mut r = redactor();
+
+        assert!(
+            crate::output::redact::find_spans(&r.processor.rules, planted.as_bytes(), 0).is_empty(),
+            "control: the raw bytes must match nothing, or the union is \
+             not what redacted them"
+        );
+
+        let mut out = r.feed(planted.as_bytes());
+        out.extend_from_slice(&r.flush());
+        let emitted = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            emitted.contains("[REDACTED:github]"),
+            "the token a terminal would reassemble must be marked: {emitted:?}"
+        );
+        // What a terminal shows: the escape removed. No run of the token
+        // longer than its first few characters may survive that.
+        let rendered: String = emitted.replace("\x1b[0m", "");
+        assert!(
+            !rendered.contains(&GH[..24]),
+            "a terminal reassembles the token from {rendered:?}"
+        );
     }
 
     #[test]
