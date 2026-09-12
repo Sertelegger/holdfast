@@ -49,12 +49,14 @@
 //!   four `ansi`/`text_encoding` pairs, and the `observer` stream through
 //!   `StreamRedactor`.
 //!
-//! **What this target deliberately does not assert.** A credential split
-//! across two *stream chunks* with an escape inside it is released up to
-//! the escape — GH #142 at the `StreamRedactor` boundary, recorded in
-//! that type's header. [`the_stream_residual_at_a_chunk_split_is_bounded`]
-//! measures it rather than asserting it away, so the number moves when
-//! somebody closes it instead of the test quietly encoding it as correct.
+//! **What this target measures rather than asserts.** A credential split
+//! across two *stream chunks* with an escape inside it used to be
+//! released up to the escape — GH #142 at the `StreamRedactor` boundary.
+//! GH #142 has since put the emitted views behind that surface's
+//! withhold too, so the number has moved;
+//! [`the_stream_residual_at_a_chunk_split_is_bounded`] still measures it
+//! rather than asserting it away, because the twelve rules the view gate
+//! excludes keep the old behaviour and a future rule set changes the mix.
 
 use std::sync::Arc;
 
@@ -503,7 +505,7 @@ fn sweep(processor: &OutputProcessor, redact: bool) -> Tally {
 
             // The `observer` stream: one chunk, so the whole credential is
             // in the carry when it is judged. A chunk *split* inside the
-            // token is GH #142 at this boundary and is measured by
+            // token is measured by
             // `the_stream_residual_at_a_chunk_split_is_bounded` instead.
             let mut redactor = StreamRedactor::new(Arc::new(OutputProcessor::builtin().unwrap()));
             let mut out = redactor.feed(&planted);
@@ -649,12 +651,18 @@ fn no_negative_fixture_is_redacted_by_the_pipeline() {
     );
 }
 
-/// GH #142 at the `StreamRedactor` boundary, **measured and not
-/// asserted away**: a credential whose escape-broken halves arrive in
-/// different chunks is released up to the escape, because the union of
-/// views can only judge bytes that have arrived. The number is recorded
-/// here so that closing the issue moves it, rather than the sweep
-/// quietly encoding the residual as correct.
+/// GH #142 at the `StreamRedactor` boundary, **measured and not asserted
+/// away**. A credential whose escape-broken halves arrive in different
+/// chunks used to be released up to the escape: `all_spans` can only
+/// judge bytes that have arrived, and the withhold read the raw region,
+/// where the planted escape ends the value run.
+///
+/// Since GH #142 the withhold asks the emitted views as well, so the
+/// half-arrived token is held instead — and the residual moved. The row
+/// keeps measuring rather than pinning a number because the twelve rules
+/// the view gate excludes still behave the old way, so the figure is a
+/// property of the rule set and not of the mechanism. The `< 8` control
+/// below is what keeps the bound meaningful.
 #[test]
 fn the_stream_residual_at_a_chunk_split_is_bounded() {
     let processor = Arc::new(OutputProcessor::builtin().unwrap());

@@ -9,8 +9,8 @@
 //! straddle problem is solved a third time here because the shape
 //! genuinely differs, and it is solved **on 0.0.3's own primitives** —
 //! `OutputProcessor::all_spans`, `marker`,
-//! `PrefixIndex::earliest_partial` — so the rule set cannot drift
-//! between the two surfaces. `all_spans` rather than `find_spans`
+//! `OutputProcessor::earliest_partial_across_views` — so the rule set
+//! cannot drift between the two surfaces. `all_spans` rather than `find_spans`
 //! deliberately (GH #135): the union over the emitted views *is* the
 //! matching primitive since GH #125, and asking the raw bytes alone here
 //! would have left this surface judging a stream the other one had
@@ -126,23 +126,18 @@ const WITHHOLD_WINDOW_BYTES: usize = 2 * STREAM_CARRY_BYTES;
 /// `2 × STREAM_CARRY_BYTES` of dropped output before the stream recovers.
 /// Neither licenses going back to flushing raw.
 ///
-/// **A third residual is GH #142 at *this* boundary, and it is worse
-/// here than it is at `read_output`'s (GH #135).** `all_spans` judges
-/// the bytes that have arrived; a credential whose escape-broken halves
-/// land in **different chunks** is therefore not yet a match when the
-/// first chunk is judged, and `earliest_partial`'s continuation test —
-/// which reads the raw region, because a view may not add a withhold —
-/// does not recognise the planted control byte as part of the value. The
-/// stream is released up to the escape. Measured over
-/// `ghp_…\x1b[0m…`, a 40-character token split at four points:
-/// `tests/redaction_sweep.rs`'s
-/// `the_stream_residual_at_a_chunk_split_is_bounded` prints the run of
-/// token characters that survives at each. The reason it bites harder
-/// here than on a cursor read is the unit: a read's window is
-/// `lookahead_bytes` wide and usually holds the whole token, while this
-/// stream's unit is one 8 KiB PTY read, so the straddle is the common
-/// case rather than the corner. Closing it needs a sharper in-flight
-/// predicate — the same one GH #142 needs — and not a wider window.
+/// **A third residual was GH #142 at *this* boundary, and GH #142 has
+/// since closed most of it (GH #135).** `all_spans` judges the bytes
+/// that have arrived, so a credential whose escape-broken halves land in
+/// **different chunks** is not yet a match when the first chunk is
+/// judged — and the continuation test used to read the raw region alone,
+/// where the planted control byte ends the value run, so the stream was
+/// released up to the escape. `feed` now asks the emitted views as well,
+/// under the same bounded-holdback gate `read_output` uses, so a
+/// half-arrived painted token is withheld rather than streamed. What is
+/// left is the twelve rules that gate excludes and the residual at a
+/// chunk split, measured by `tests/redaction_sweep.rs`'s
+/// `the_stream_residual_at_a_chunk_split_is_bounded`.
 ///
 /// **A fourth residual belongs to the rule set rather than to this type,
 /// and it is inherited rather than introduced.** A rule whose pattern
@@ -217,13 +212,45 @@ impl StreamRedactor {
         // was released (a bare `ghp_` carries no secret material), and if
         // the value then arrives in the next chunk, only a region that
         // still contains the prefix can see the token in flight.
+        //
+        // **The composite over the views, not the raw bytes alone
+        // (GH #142)**, and for the same reason `all_spans` is used below
+        // rather than `find_spans`: an escape planted inside a credential
+        // breaks the run in the raw buffer and is gone again by the time
+        // a terminal paints it, so an observer would watch the secret
+        // arrive in a stream this surface had declared clean. The
+        // withholding *exit* test further down stays raw-only on purpose
+        // — it decides when to stop blackening an observer's stream, and
+        // the whole point of that clause is that it must be able to fire.
         let stream_end = self.base + self.buf.len() as u64;
         let carry_start = self.base + self.split as u64;
-        let stop = self
+        // **The two halves get different regions, and that is the whole
+        // of what makes the view half terminate here.** The raw half
+        // reads lookbehind plus carry, as before. The view half reads
+        // only the trailing `partial_secret_scan_bytes`, which is the
+        // window `holdback_boundary` gives it on the read path — the gate
+        // bounds a holdback in *view* bytes, and redraw-only traffic adds
+        // raw bytes that contribute none, so without the slide a
+        // view-driven hold on this surface never ends. Measured: 1,361
+        // chunks of `\x1b[s\x1b[u` after a painted partial take the carry
+        // past `STREAM_CARRY_BYTES` and reduce an observer's whole stream
+        // to one `[REDACTED:unresolved]`.
+        let raw_stop =
+            self.processor
+                .index
+                .earliest_partial(&self.processor.rules, &self.buf, self.base);
+        let view_from = self
+            .buf
+            .len()
+            .saturating_sub(self.limits.partial_secret_scan_bytes);
+        let view_stop = self
             .processor
-            .index
-            .earliest_partial(&self.processor.rules, &self.buf, self.base)
-            .unwrap_or(stream_end);
+            .earliest_partial_in_views(&self.buf[view_from..], self.base + view_from as u64);
+        let stop = match (raw_stop, view_stop) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+        .unwrap_or(stream_end);
         // Clamped below by `carry_start`: a partial that opened inside
         // the already-emitted lookbehind cannot be un-emitted, and the
         // best that is left is to withhold its value bytes.
@@ -735,5 +762,110 @@ mod tests {
             1
         );
         assert!(!out.windows(64).any(|w| w.iter().all(|b| *b == b'K')));
+    }
+    /// **GH #142 on the observer's stream.** A credential still arriving
+    /// with a control byte inside it breaks the raw value run, so the raw
+    /// predicate reports nothing in flight and the arrived half goes
+    /// straight onto an attached client's wire — where a terminal paints
+    /// it as an intact, usable prefix, because the planted escape is a
+    /// colour change and not a character.
+    ///
+    /// `read_output` had this fixture and this surface did not, which is
+    /// how reverting `feed` to the raw region alone stayed green.
+    #[test]
+    fn a_painted_partial_is_not_streamed_to_an_observer() {
+        let partial = &GH[..GH.len() - 1];
+        let painted = format!("{}\x1b[0m{}", &partial[..20], &partial[20..]);
+        let processor = Arc::new(OutputProcessor::builtin().expect("builtin processor"));
+        // The premise: the raw region really does report nothing, so the
+        // row fails against a `feed` that asks only the raw bytes.
+        assert_eq!(
+            processor
+                .index
+                .earliest_partial(&processor.rules, painted.as_bytes(), 0),
+            None,
+            "the raw region holds this on its own, so the row proves nothing"
+        );
+
+        let mut r = StreamRedactor::new(processor);
+        let out = r.feed(painted.as_bytes());
+        let seen = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            !seen.contains(&partial[..20]),
+            "the arrived half of an in-flight credential reached the \
+             observer: {seen:?}"
+        );
+        assert!(r.carried() > 0, "nothing was carried, so nothing was held");
+
+        // …and it is a holdback rather than a black hole: the rest of the
+        // token arrives, the match completes, and one marker goes out.
+        let rest = r.feed(format!("{}\n", &GH[GH.len() - 1..]).as_bytes());
+        let tail = String::from_utf8_lossy(&rest).into_owned();
+        assert!(tail.contains("[REDACTED:github]"), "got {tail:?}");
+        assert!(!tail.contains("ghp_"), "the token reached the stream");
+    }
+
+    /// **A view-driven hold on this surface has to end, and the gate is
+    /// not what ends it (GH #142).**
+    ///
+    /// The gate proves a rule's holdback dies within a bounded number of
+    /// further bytes **in the view**. A raw stream can emit unboundedly
+    /// many bytes that contribute none — `\x1b[s\x1b[u` is a cursor
+    /// save/restore and changes no stripped view at all. `read_output` is
+    /// protected by geometry: its region is the trailing
+    /// `partial_secret_scan_bytes`, so the candidate falls out of the
+    /// window. This surface's region is lookbehind plus carry and slides
+    /// only when `split` advances, which a hold is precisely what stops.
+    ///
+    /// Measured before the fix: `stop` stays pinned inside the
+    /// lookbehind, `emit_end` clamps to `carry_start`, `render` emits
+    /// nothing, the carry passes `STREAM_CARRY_BYTES`, and §9.2's
+    /// terminating rule discards 8 KiB of the session behind one
+    /// `[REDACTED:unresolved]` — on input the raw predicate calls clean.
+    #[test]
+    fn a_view_driven_hold_does_not_swallow_a_redraw_only_stream() {
+        let partial = &GH[..GH.len() - 1];
+        let painted = format!("$ {}\x1b[0m{}", &partial[..20], &partial[20..]);
+        let processor = Arc::new(OutputProcessor::builtin().expect("builtin processor"));
+        let scan = processor.limits.partial_secret_scan_bytes;
+        let mut r = StreamRedactor::new(processor);
+
+        let first = r.feed(painted.as_bytes());
+        assert!(
+            first.len() < painted.len() && r.carried() > 0,
+            "the premise: the painted partial must actually be held, or the \
+             row measures an unheld stream"
+        );
+
+        // Redraw-only traffic: raw bytes that no *stripped* view carries
+        // at all, so they cannot move a view-driven candidate one byte
+        // closer to dying. Twice the carry bound, so the terminating rule
+        // has every chance to fire.
+        let redraw = b"\x1b[s\x1b[u";
+        let rounds = 2 * STREAM_CARRY_BYTES / redraw.len();
+        assert!(rounds > scan, "the fixture must outrun the scan window");
+        let mut seen = Vec::new();
+        for _ in 0..rounds {
+            seen.extend(r.feed(redraw));
+        }
+
+        // **The assertion is about the bytes, not about the state.** The
+        // withholding this used to enter is transient — the raw-only exit
+        // test clears it on the next feed — so `is_withholding()` reads
+        // `false` afterwards either way, and only the stream itself says
+        // what happened. Measured without the bound: 8 192 bytes
+        // discarded and one marker in their place.
+        let text = String::from_utf8_lossy(&seen).into_owned();
+        assert!(
+            !text.contains("[REDACTED:unresolved]"),
+            "§9.2's terminating rule fired on redraw traffic: the observer \
+             lost the session behind a marker"
+        );
+        assert!(
+            seen.len() >= rounds * redraw.len(),
+            "the observer received {} of {} redraw bytes",
+            seen.len(),
+            rounds * redraw.len()
+        );
     }
 }

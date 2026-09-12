@@ -124,6 +124,15 @@ is cut, named and published is in
   that merely mentions the marker inside a comment — it must *be* a comment
   line — so a file can no longer exempt itself from the bans on
   `continue-on-error`, unpinned actions and `secrets.` references.
+- **`regex-automata` and `regex-syntax` are built with `opt-level = 3` in the
+  dev profile.** Compiling fifty-one DFAs at startup (see the GH #142 entry
+  below) costs 1.29 s in an unoptimized build against 66 ms in a release one,
+  and a `holdfast-core` test builds one `OutputProcessor` per row. Measured
+  with the override: `cargo test -p holdfast-core --lib` 156 s → 32 s (31 s
+  before this work), `--test redaction_sweep` 662 s → 66 s (199 s before), and
+  `crates/holdfast/tests/daemon_cli.rs` 10.5 s → 2.6 s (3.1 s before) — each
+  daemon that suite starts pays the build. Nothing about the shipped binary
+  changes; `--release` was never affected.
 
 ### Fixed
 
@@ -150,22 +159,21 @@ is cut, named and published is in
   derives from the window it judges — raw, stripped, and either of those under
   `lossy_printable`, which drops the C0 controls the stripper keeps — and maps
   every match back to raw buffer offsets, so cursors and `bytes_returned` are
-  arithmetically unchanged. The **holdback is unchanged too, deliberately**:
-  the in-flight predicate it rests on is load-bearing on the very control
-  bytes those streams remove, so it still reads the raw region alone, and a
-  credential straddling a read boundary with an escape inside it is still
-  released half-emitted ([#142]). `redact: false` and `--raw` are byte-identical
-  to before ([#125]).
+  arithmetically unchanged. The **holdback was left unchanged at the time,
+  deliberately**: the in-flight predicate it rests on was load-bearing on the
+  very control bytes those streams remove, so it read the raw region alone and
+  a credential straddling a read boundary with an escape inside it was still
+  released half-emitted ([#142] — closed for 39 of the 51 rules by the entry
+  below). `redact: false` and `--raw` are byte-identical to before ([#125]).
   **This closed the matching side of #125 and not every class of the
   defect.** The range and grammar axes — [#138] (spans judged over the
   window while a sub-range is emitted) and [#139] (8-bit C1 introducers,
   which the stripper does not open a sequence on and the screen emulator
   discards as an unhandled control — the discard being what splices the
   token) — are now closed too; see the two entries below. The *withholding*
-  side is still open: a credential still arriving with an escape inside it
-  is released half-emitted ([#142]), and a token split across reads with an
-  escape inside it is still partly released ([#135]). Redaction is not
-  closed as a class.
+  side is closed for 39 of the 51 rules ([#142], below) and open for the other
+  twelve ([#160]); a token split across reads with an escape inside it is
+  still partly released ([#135]). Redaction is not closed as a class.
 - **Redaction now judges the bytes that go out, not only the window they
   were drawn from ([#138]).** Spans were found over
   `[window_start, window_end)` while the read emits `[req_start, read_end)`,
@@ -186,6 +194,88 @@ is cut, named and published is in
   *consumes* it as a sequence introducer. Both streams are reachable and
   both are now matched. Measured: **47 of 61 fixtures leaked whole-read
   before, 0 after**; across all geometries, 4727 leaking rows → 0.
+- **A credential still arriving with a control byte inside it is withheld
+  now, instead of being handed over half-emitted ([#142]).** The in-flight
+  predicate behind every holdback asked whether every byte from an indexed
+  prefix to the end of the region was printable and not a space. That is wrong
+  in two directions at once: it held runs no rule could ever complete, and it
+  released the instant a control byte landed inside a value that was genuinely
+  still arriving. `ghp_` plus 35 characters of a 36-character minimum with a
+  `\x1b[0m` in the middle came back whole on the **default** read path, with
+  `held_back: false` and `redactions: {}` — a positive assertion that the read
+  was clean, made about bytes heading into an agent's transcript. Two changes
+  close it, and both are needed:
+  - Every rule now carries an anchored dense DFA built from its own pattern,
+    and the predicate asks *could this rule still match if more bytes
+    arrived*. That also releases what the byte-class test used to hold until
+    a delimiter arrived: `parsing key-value` and
+    `npm WARN deprecated …@acme/key-manager@1.2.3\x1b[K` are no longer secrets
+    in flight, because `\bkey-[a-f0-9]{32}` cannot reach a `v` or an `m`.
+  - `read_output`'s holdback and an attached observer's stream now ask the
+    **views** as well as the raw bytes — the same streams redaction has judged
+    since [#125] — and take the earliest answer, mapped back to raw offsets.
+    Which rules a view may withhold on is **computed** at startup rather than
+    listed: a rule qualifies only if the set of continuations keeping it alive
+    and unmatched is finite, so a view that deleted the byte which would have
+    ended the withhold cannot strand the caller for ever.
+
+  Measured release, over 20,000 lines of the repository's own source **at the
+  parent commit**, so both columns read the same bytes, at line-final
+  boundaries, four colourisation schemes, as *raw-region hold % / any-view
+  hold %*: plain `0.740 / 0.015` → `0.725 / 0.000`, trailing
+  `\x1b[K` `0.060 / 0.770` → `0.060 / 0.000`, mid-line colour
+  `0.620 / 0.760` → `0.595 / 0.000`, trailing `✔` `0.060 / 0.060` →
+  `0.060 / 0.000`. **The raw column barely moves, and that is the honest
+  summary**: this is not a lower holdback, it is a leak closed and a view path
+  that costs nothing. Per call, `earliest_partial` measures 1.08–1.14 µs
+  before and 1.14–1.16 µs after over the same 5,000 lines — no cost outside
+  run-to-run noise. The price is at startup: `PrefixIndex::build` goes
+  0.05 ms → 64–67 ms and 3.975 MiB resident, once per `OutputProcessor`, which
+  is one per daemon. Building fifty-one DFAs is almost all of that; the cycle
+  search that computes the gate is itself below the noise.
+
+  **Twelve of the 51 rules are excluded by that computation and keep the leak
+  in full**: the nine context rules with a `value` capture group, plus `jwt`,
+  `slack-webhook-url` and `private-key-block`. Each has an unbounded
+  quantifier between its indexed prefix and something the match still
+  requires. For those twelve a credential still arriving with a control byte
+  inside it is released as before, bounded by **a per-rule constant** —
+  `(that rule's minimum − 1)` characters — and it is silent. [#160] is where
+  it stops being silent.
+
+  **The other thirty-nine are proved to strand *boundedly*, not never.** A
+  view that deletes the byte which would have ended a withhold can still hold
+  one open for as long as that rule's own automaton can stay alive without
+  matching, which is again **a per-rule constant** and not a number this
+  criterion supplies: across the shipped set the worst is 116 bytes and the
+  median 37, but a user rule with a large *bounded* quantifier
+  (`\bacme_[A-Za-z0-9]{0,100000}KEY`) passes the gate with a bound of any
+  size. Zero such stranding shapes occur in the 20,000-line × 4-scheme sweep
+  above.
+
+  **[#152] is not closed and this is why.** Those nine context rules keep the
+  byte-class test on the *raw* stream, because their patterns legitimately
+  admit whitespace between the label and the value: under liveness
+  `Password: ` is alive, and a candidate that can still grow never dies at the
+  end of a region that has stopped growing. Measured, without that carve-out,
+  `"$ ssh dev@box\r\nPassword: "` takes `earliest_partial` from `None` to
+  `Some(15)`, `read_output` returns only the first line with
+  `held_back: true`, and `prompt.last_line` becomes `""` — on the most common
+  state this tool exists to handle. #152's fix and that regression are the
+  same change, so it needs its own measurement pass.
+
+  Two behaviours are re-pinned deliberately: `ghp_abcsk-ant-xy` is no longer a
+  boundary at all (a GitHub token cannot reach a `-`, and `sk-ant-` sits
+  mid-word), and `parsing key-value` moves from the documented residual to the
+  list of holdbacks liveness retired.
+
+  **An operator rule whose pattern carries a `\b` and whose prefix opens on
+  punctuation gets no automaton at all**, and keeps the byte-class test it has
+  today. The ASCII word boundary over-approximates the Unicode one only when
+  the byte on the pattern side is a word byte; for such a rule it does not,
+  and `"é-zq-ABCD"` against `\b(?:-zq-|-zr-)[A-Za-z0-9]{10,}` would be called
+  dead and released. No shipped rule has that shape.
+
 - A session that has finished no longer keeps the writer thread that only a
   running child needs. The registry now holds live sessions and completed
   records separately, and retiring a record drops the sending half of its write
@@ -725,3 +815,5 @@ residuals that are known and accepted.
 [#139]: https://github.com/Sertelegger/holdfast/issues/139
 [#142]: https://github.com/Sertelegger/holdfast/issues/142
 [#149]: https://github.com/Sertelegger/holdfast/issues/149
+[#152]: https://github.com/Sertelegger/holdfast/issues/152
+[#160]: https://github.com/Sertelegger/holdfast/issues/160
