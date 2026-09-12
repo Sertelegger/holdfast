@@ -4317,7 +4317,32 @@ async fn a_pattern_less_wait_started_at_an_idle_prompt_does_not_resolve_early() 
     // because a command really had started since its baseline and closed.
     // The product was right and this line was wrong; see
     // `wait_for_closed_commands`.
+    //
+    // **A barrier of two halves, and neither works alone** (GH #143).
+    // `wait_for_closed_commands` says the warm-up's `D` has been applied to
+    // the history; it does *not* say the detector is back at a prompt, and
+    // the reader publishes those two facts in that order — the detector
+    // guard is dropped before the chunk's events reach the history, so a
+    // closed entry only proves the detector has already *seen* the `D`.
+    // bash writes the `D` (PROMPT_COMMAND) and the `A`/`B` (PS1) as
+    // separate writes, and when the reader catches them as separate chunks
+    // the closing chunk leaves `last_marker == D`: `at_marker` is `A | B`
+    // only, so §8.3's ladder falls past the semantic-`AtPrompt` rung to
+    // `Executing`, exactly as `a_completed_command_is_not_yet_a_prompt`
+    // pins. Measured on this row: the split happened in 3 of 6
+    // instrumented runs, with the window between the two chunks a matter
+    // of microseconds — which is why it survives here and fails on CI.
+    //
+    // A wait starting inside that window samples `Executing`, latches
+    // `saw_executing`, and breaks on the *next* sample — one
+    // `IDLE_WAIT_POLL`, which is the 53 ms in the reported failure. So the
+    // history read is followed by a prompt read. The other order does not
+    // work and was tried: `wait_for_at_prompt` alone is level-triggered and
+    // returns on the *previous* prompt, which is the paragraph above.
+    // Composed this way the prompt it observes cannot be the previous one,
+    // because the `D` that superseded it has already been applied.
     wait_for_closed_commands(&server, &id, 1).await;
+    wait_for_at_prompt(&server, &id).await;
 
     let waiter = {
         let server = std::sync::Arc::clone(&server);
@@ -4338,8 +4363,18 @@ async fn a_pattern_less_wait_started_at_an_idle_prompt_does_not_resolve_early() 
         })
     };
 
-    // Long enough that the wait is certainly polling an idle prompt, short
-    // enough that the settle window above cannot have expired.
+    // **This does not establish that the wait is at an idle prompt — the
+    // barrier above does, and this comment claimed otherwise until GH #143
+    // measured it.** What is left for a duration to cover is the gap
+    // between `tokio::spawn` and the waiter's own first sample, which no
+    // observable in this test can be synchronised on: the baseline is taken
+    // inside `wait_for_pattern`.
+    //
+    // It is bounded on the other side by the `settle_threshold_ms = 1_000`
+    // set above, because a wait that sat idle for the whole settle window
+    // would break on the window rather than on the command and prove
+    // nothing. 150 ms against 1_000 ms leaves that margin ~6.6x, so
+    // **shortening this is safe and lengthening it is not**.
     tokio::time::sleep(Duration::from_millis(150)).await;
     server
         .send_input(Parameters(SendInputArgs {
