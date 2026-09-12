@@ -2,18 +2,31 @@
 
 ## Supported versions
 
-**Holdfast is pre-release. There is no released version.** The workspace is at
-`0.0.2`, which is a milestone marker rather than a published artifact: nothing
-is tagged, nothing is on crates.io, and no binaries are distributed. Fixes land
-on `main`, and there is nothing to backport them to.
+**Holdfast is pre-release.** `v0.0.5` was the first tag, `v0.0.7` is the
+newest, and the workspace version tracks it. Fixes land on `main` and are not
+backported: a tag here marks a milestone, not a support commitment.
+
+**Things are published under this name, and none of them is a Holdfast anyone
+can run.** A GitHub Release per tag, carrying that version's changelog section
+and **no binary assets** — `release.yml` creates the release and uploads
+nothing. And two `0.0.0` **name reservations** on crates.io, `holdfast` and
+`holdfast-core`, both published 2026-08-20, whose `lib.rs` says *"this version
+contains no usable code"*; `cargo install holdfast` answers *"there is nothing
+to install in `holdfast v0.0.0`, because it has no binaries"*. They were
+published by hand and no workflow can repeat it — `ci-hygiene.sh` denies
+`cargo publish` outside a release workflow, and the release workflow has no
+such step.
+
+This section said "nothing is tagged, nothing is on crates.io, and no binaries
+are distributed" from 0.0.3 until now. Only the third clause was still true.
 
 | Version | Supported |
 | ------- | --------- |
 | `main` (0.0.x, pre-release) | ✅ best effort |
-| any tagged release | none exist yet |
+| `v0.0.5` – `v0.0.7` | none — the fix goes on `main` |
 
-This table becomes a real support statement at the first release. Until then,
-"supported" means the fix goes on `main`.
+This table becomes a real support statement at the first release anyone is
+expected to install. Until then, "supported" means the fix goes on `main`.
 
 ## Reporting a vulnerability
 
@@ -55,17 +68,64 @@ The design routes secret input **client → daemon → PTY**, so a secret never
 appears in a tool argument or a tool result, and a redactor runs at every
 output boundary including the audit log.
 
-**Half of that exists as of 0.0.3. Which half, stated plainly, because a
-security policy that implies shipped protection is worse than none:**
+**Both halves ship as of 0.0.7, and neither is finished. Where each one stops,
+stated plainly, because a security policy that implies shipped protection is
+worse than none:**
 
-- **The redactor ships and runs on every read.** `read_output`,
-  `wait_for_pattern`, `send_input(wait_for:)`, `status` and `list_sessions`
-  are redacted by default: a match against the vendored rule set is replaced
-  with a `[REDACTED:<kind>]` marker before the bytes leave the process, over
-  an expanded window so a secret straddling a cursor boundary is caught from
-  both sides, and a secret still *arriving* holds the read at its first byte
-  rather than being returned in halves. Every string written to the audit log
-  goes through the same redactor unconditionally.
+- **The redactor ships and runs on every surface that reports a session to
+  somebody** — `read_output`, `wait_for_pattern`, `send_input(wait_for:)`,
+  the `holdfast://session/…/buffer` resource, `get_screen_state`, `status`,
+  `list_sessions`, `get_command_history`, `holdfast logs`, a `holdfast watch`
+  stream, and the audit log. A match against the vendored rule set is replaced
+  with a `[REDACTED:<kind>]` marker before the bytes leave the process. **One
+  boundary deliberately has no redactor, and it is not an oversight:** an
+  *interactive* `holdfast attach` connection gets the bytes raw
+  (`AttachRole::Interactive`, `attach/conn.rs`), because that client **is** the
+  terminal rather than a report about it — it has to render the escape
+  sequences a marker would replace. `holdfast watch` connects as
+  `AttachRole::Observer` instead, and that role is redacted.
+- **Those surfaces are not equally strong, and this file used to average them
+  into one sentence.** The cursor-read path — `read_output`,
+  `wait_for_pattern`, `send_input(wait_for:)` and the buffer resource — is
+  the strong one: matching runs over an expanded window, 512 bytes behind the
+  request and 8192 past its cap, so a secret straddling a cursor boundary is
+  caught from both sides, and over *every byte stream that read could emit*
+  rather than the raw bytes alone — stripped, `lossy_printable`, and the
+  8-bit C1 axis where Holdfast's own emulator and a real terminal disagree
+  (GH #125, #138, #139). An attached `watch` stream gets that same union and
+  the same lookbehind, and no lookahead, having no cap to read past. `status`,
+  `list_sessions` and `get_command_history` redact the string they are handed:
+  no window, no union. A defence one surface has is not a defence all of them
+  have, and a secret that reaches the weaker ones is worth reporting.
+- **A secret still *arriving* is held back — unless a control byte has landed
+  inside it, and then it is not.** The in-flight test asks whether every byte
+  from an indexed prefix to the end of the region could still belong to a
+  value, and answers with `0x21..=0x7e` (`is_value_byte`,
+  `output/prefix_index.rs`); `ESC` and `BEL` are outside that range, so an
+  escape spliced into a token that has not finished arriving ends the run and
+  disarms the holdback. Measured on `main` through `read_output` itself,
+  `line one\nghp_` with 39 of a GitHub token's 40 characters and a `\x1b[0m`
+  inside them: `earliest_partial` answers `None`, `holdback_boundary` returns
+  the head it was given, and the read returns those 39 characters with
+  `held_back: false` and `redactions: {}`. The **default** path is the worse
+  one, because stripping then deletes the escape and hands the agent the 39
+  characters contiguous. The same buffer without the escape holds correctly —
+  the boundary lands on the token's first byte and the read returns
+  `line one\n` with `held_back: true` — which is what this file claimed,
+  minus the exception. What escapes is bounded by the matching rule's own
+  minimum length less one byte: 39 for a GitHub token, at most 110 across the
+  shipped rules (`discord-webhook-url`). Nothing warns the caller. That is
+  **GH #142, open**, and the same hole is recorded at `watch`'s observer
+  stream, where it caps at the same (rule minimum − 1) but is reached more
+  often, the unit there being one PTY read rather than an 8 KiB lookahead
+  (GH #135).
+- **Every string written to the audit log is redacted unconditionally** —
+  including map keys, at any depth — and `[security] redaction_enabled =
+  false` is a load error rather than a switch. It is not quite *the same*
+  redactor the reads run, and saying so is wrong in both directions: no
+  window, no stream union and no holdback, but always the full built-in rule
+  set, so an operator's `disabled_redaction_rules` narrows what a client sees
+  and never what the trail records.
 - **`read_output(redact: false)` is a real escape hatch and returns raw
   bytes.** It exists because a withheld partial has to be reachable somehow.
   Each such read writes a `redaction_disabled` entry to the audit log naming
@@ -75,9 +135,34 @@ security policy that implies shipped protection is worse than none:**
   — and it cannot catch a password like `correct horse battery staple`, which
   matches no rule. Treat it as defence in depth, not as a guarantee that no
   credential reaches the transcript.
-- **There is still no secret input channel.** `send_input` writes whatever the
-  agent sends, over the MCP wire. The out-of-band `request_secret_input` path
-  is a later milestone.
+- **The out-of-band secret channel ships as of 0.0.7.** This file called it "a
+  later milestone", which was true when it was written at 0.0.3 and has been
+  false since `request_secret_input` landed as the twelfth tool. The agent
+  calls it; every attached client is told; a human or an operator-declared
+  provider answers; the tool returns a status and a byte count — never the
+  value, and never a handle that could be exchanged for one. The value travels
+  client → daemon → PTY and appears in no tool argument and no tool result.
+  It needs a daemon and an attached client, so it is refused as
+  `not_supported_on_platform` on Windows, and with nobody attached it waits
+  out its `timeout_secs` and answers `secret_cancelled`.
+- **That channel refuses to write into a terminal that is still echoing — on
+  `main`, and in no tag yet, so a `v0.0.7` install does not have it**
+  (GH #137). `request_secret_input` raises `AwaitingSecret` the moment the
+  agent calls it, without consulting the child, so an agent that asks before
+  its child reaches a password prompt could get a human to type a real
+  credential into an echoing terminal — from which the line discipline put it
+  in the buffer and `read_output`, the default and redacted path, handed it
+  back to that same agent in the clear, an arbitrary password matching no
+  rule. The write is now gated on the child's line discipline, sampled
+  against the tty one statement before the write rather than against a cache
+  of it, and a refused submission is zeroed without reaching the PTY.
+  `holdfast attach --allow-echo` is the exemption, for programs that ask for
+  a code without ever clearing echo: it is a human's decision at an attached
+  terminal, it reaches no tool argument, and it is `false` when absent so a
+  client that predates it fails closed. Under it the value is still masked on
+  the human's own terminal and still lands in the session's output.
+- **`send_input` is not that channel and never was.** It writes whatever the
+  agent sends, over the MCP wire, where the argument stays in the transcript.
 - **`start_session(env:)` values cross the MCP boundary** and the argument
   documents that ("Do not pass secrets"). Putting a credential there puts it in
   the transcript.
@@ -90,10 +175,11 @@ otherwise have landed in the transcript on every failed spawn.
 
 **A bypass of the redactor at any output boundary is squarely in scope** —
 including the paths that are easy to forget, such as error strings, the audit
-log, and (when it lands) bulk output delivered as a resource rather than
-inline. A secret reaching an MCP response through a surface that did not run
-the redactor is a report worth making; a secret the rule set simply does not
-match is the documented limit above.
+log, and bulk output delivered as a resource rather than inline — which has
+landed, and redacts by default like the rest. A secret reaching an MCP
+response through a surface that did not run the redactor is a report worth
+making; a secret the rule set simply does not match is the documented limit
+above.
 
 ### Prompt and interaction-state detection
 
