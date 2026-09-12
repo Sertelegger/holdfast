@@ -22,9 +22,23 @@
 //!   `[req_start, read_end)`, so a `\b` can be decided by a lookbehind
 //!   byte the caller never receives.
 //! * **The enumeration is 7-bit (GH #139).** These views come from
-//!   [`AnsiStripper`]'s grammar, which does not interpret 8-bit C1
-//!   introducers; Holdfast's own screen emulator does, so
-//!   `get_screen_state` can redact a line `read_output` returns whole.
+//!   [`AnsiStripper`]'s grammar, which opens a sequence only on `0x1b`, so
+//!   an 8-bit C1 introducer survives every view and no view reassembles the
+//!   token. `get_screen_state` can therefore redact a line `read_output`
+//!   returns whole.
+//!
+//!   **The emulator does NOT interpret C1, and the difference decides the
+//!   fix.** This paragraph said it did, GH #139 says it does, and both are
+//!   wrong. `vte` 0.15.0 documents *"Only supports 7-bit codes"*; it routes
+//!   `'\u{80}'..='\u{9f}'` to `Perform::execute` rather than to CSI entry,
+//!   and `vt100` 0.16.2's `execute` falls through to `unhandled_control`,
+//!   whose body is empty. So the emulator **drops** the byte — and dropping
+//!   it is precisely what splices the token back together in the grid.
+//!   A reader who takes the old sentence at face value writes a `c1_strip`
+//!   filter that consumes the introducer *as a sequence*, which models a
+//!   real 8-bit terminal but not this emulator, and so misses the very
+//!   stream `get_screen_state` redacts — the oracle the issue proposes.
+//!   Both filters are wanted; only one of them was implied.
 //!
 //! An earlier revision of this module claimed the unqualified form —
 //! *every byte stream a read can emit is matched before it is emitted* —
