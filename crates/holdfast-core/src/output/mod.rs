@@ -307,7 +307,15 @@ impl OutputProcessor {
     /// because the stripper consumes a sequence's payload — and `ansi:
     /// raw` emits those bytes. Scanning both costs one extra pass and
     /// owes nothing to which view found what.
-    fn all_spans(&self, region: &[u8], region_start: u64) -> Vec<Span> {
+    ///
+    /// **`pub(crate)` for `attach::redact_stream`, which is the second
+    /// surface that hands bytes to somebody (GH #135).** That module's
+    /// own header says it is built on this module's primitives *"so the
+    /// rule set cannot drift between the two surfaces"*, and it reached
+    /// for `find_spans` because that was the primitive at the time. The
+    /// union is the primitive now; a second hand-written one there would
+    /// be exactly the drift that argument forbids.
+    pub(crate) fn all_spans(&self, region: &[u8], region_start: u64) -> Vec<Span> {
         let mut spans = redact::find_spans(&self.rules, region, region_start);
         for view in normalise::emitted_views(region, region_start) {
             spans.extend(
@@ -358,7 +366,7 @@ impl OutputProcessor {
             }
         }
 
-        let spans = if opts.redact {
+        let mut spans = if opts.redact {
             self.all_spans(w.window, w.window_start)
         } else {
             Vec::new()
@@ -463,9 +471,67 @@ impl OutputProcessor {
         // Spans arrive sorted and non-overlapping from `merge_spans`, so
         // one forward pass suffices: after an advance every later span
         // starts at or after the new `read_end`.
-        for span in &spans {
-            if span.start < read_end && read_end < span.end {
-                read_end = span.end;
+        advance_past_straddled(&mut read_end, &spans);
+
+        // **The window is judged; the page is what goes out (GH #138).**
+        //
+        // `all_spans` above asked about `[window_start, window_end)`.
+        // `render` below emits `[req_start, read_end)`, which is a
+        // *subsequence* of it — and a subsequence can match a rule its
+        // superstring does not. A leading `\b` is the everyday case: the
+        // lookbehind supplies a word character in front of the token, the
+        // window therefore holds `…xxxghp_…` and matches nothing, and the
+        // page the caller receives begins at the `g`. GH #125 enumerated
+        // the *filter* dimension of "the bytes the caller gets"; this is
+        // its *range* dimension, and it needs no planted payload at all —
+        // 51 of the rule set's own 61 positive fixtures leak through it,
+        // measured by `tests/redaction_sweep.rs` against `v0.0.7`'s
+        // pipeline (2886 of its rows, every one of them in the `paged`
+        // geometry).
+        //
+        // **It is legal under this module's marker/withhold rule because
+        // it is cursor-neutral.** The advance above fires on
+        // `span.start < read_end && read_end < span.end`; every span
+        // found here has `span.end <= read_end` by construction, since
+        // `find_spans` cannot report past its region's end and
+        // `NormalView::map_span` reaches at most the last byte of one. So
+        // this pass can only add markers *inside* the page — never a
+        // withhold, and never a cursor move of its own.
+        //
+        // The second `advance_past_straddled` is not that, and is not
+        // redundant: `merge_spans` joins spans that merely **touch**
+        // (REQ-O-009), so a page span ending exactly at `read_end` and a
+        // window span starting exactly there become one span that does
+        // straddle. The bytes that advance consumes are all inside that
+        // span, so `render` covers them with the one marker it was
+        // already going to emit and the payload is unchanged; only the
+        // cursor moves, in the direction it was always allowed to move.
+        //
+        // Skipped when the page *is* the window, which is the common
+        // single-read case and the one where this would be a second scan
+        // of the same bytes for nothing. What it costs where it is not
+        // skipped, measured rather than asserted:
+        // `streaming_ordinary_output_is_never_held_back` — 1 MiB of
+        // colourised build output paged 33 times at 32 KiB, every page a
+        // strict subset of its window — runs in **0.12 s before and
+        // 0.15 s after**, release, six runs each, same machine. It is a
+        // second pass over the page and not over the window, so it is
+        // bounded by `max_bytes` rather than by the lookahead.
+        if opts.redact && (w.req_start > w.window_start || read_end < window_end) {
+            let page_end = read_end.clamp(w.req_start, window_end);
+            if w.req_start < page_end {
+                let at = |off: u64| (off - w.window_start) as usize;
+                let page_spans =
+                    self.all_spans(&w.window[at(w.req_start)..at(page_end)], w.req_start);
+                debug_assert!(
+                    page_spans.iter().all(|s| s.end <= page_end),
+                    "a span found in the page cannot reach past it"
+                );
+                if !page_spans.is_empty() {
+                    spans.extend(page_spans);
+                    spans = redact::merge_spans(spans);
+                    advance_past_straddled(&mut read_end, &spans);
+                }
             }
         }
 
@@ -536,6 +602,21 @@ impl OutputProcessor {
             off += 1;
         }
         (out, redactions)
+    }
+}
+
+/// Move `read_end` past any span it would otherwise end *inside*, so the
+/// continuation cursor never lands mid-secret. See the long comment at
+/// its first call site in [`OutputProcessor::process`] for why advancing
+/// rather than retreating is the only option that terminates.
+///
+/// Monotone by construction, and called twice for that reason: a second
+/// pass over a larger span set can only move `read_end` further forward.
+fn advance_past_straddled(read_end: &mut u64, spans: &[Span]) {
+    for span in spans {
+        if span.start < *read_end && *read_end < span.end {
+            *read_end = span.end;
+        }
     }
 }
 
@@ -1422,6 +1503,79 @@ mod tests {
         );
         assert_eq!(r.output, format!("t={GITHUB}\n"));
         assert!(r.redactions.is_empty());
+    }
+
+    // ------------------------------------------ GH #138: window vs. page
+
+    /// **The window matches nothing and the page matches a credential.**
+    /// The lookbehind ends in a word character, so `\bghp_` has no word
+    /// boundary to open on anywhere in `[window_start, window_end)` —
+    /// and the caller's page begins at the `g`, where it does.
+    ///
+    /// The `all_spans` call is the control: without it this row passes
+    /// against a build that never had the defect, because "the token is
+    /// absent from the output" is also what a correctly-redacting window
+    /// scan produces. 51 of the 61 shipped positive fixtures reach this
+    /// shape (`tests/redaction_sweep.rs`).
+    #[test]
+    fn a_token_whose_word_break_is_supplied_by_the_lookbehind_is_still_redacted() {
+        let mut buf = b"x".repeat(600);
+        let req_start = buf.len() as u64;
+        buf.extend_from_slice(GITHUB.as_bytes());
+        buf.extend_from_slice(b"\nbuild finished\n");
+
+        let p = processor();
+        let w = snapshot(&p, &buf, req_start, 4096, true, false);
+        assert!(
+            p.all_spans(w.window, w.window_start).is_empty(),
+            "control: the window itself must match nothing, or the page \
+             pass is not what this row is testing"
+        );
+
+        let r = p.process(&w, &ReadOptions::default());
+        assert!(
+            !r.output.contains(GITHUB),
+            "the page the caller receives must not carry the token: {:?}",
+            r.output
+        );
+        assert_eq!(r.redactions.get("github"), Some(&1));
+    }
+
+    /// The page pass adds **markers only**. A span found inside
+    /// `[req_start, read_end)` ends at or before `read_end` by
+    /// construction, so it can never move the cursor — which is what
+    /// keeps `bytes_returned` and the continuation cursor the same for
+    /// every caller, whatever display knobs they set (see `normalise`'s
+    /// third invariant).
+    #[test]
+    fn the_page_pass_moves_no_cursor() {
+        let mut buf = b"x".repeat(600);
+        let req_start = buf.len() as u64;
+        buf.extend_from_slice(GITHUB.as_bytes());
+        buf.extend_from_slice(b"\nbuild finished\n");
+
+        let p = processor();
+        let w = snapshot(&p, &buf, req_start, 4096, true, false);
+        let redacted = p.process(&w, &ReadOptions::default());
+        // `redact: false` takes the same path with no span set at all,
+        // so any cursor difference is the page pass and nothing else.
+        let raw = p.process(
+            &w,
+            &ReadOptions {
+                redact: false,
+                ..Default::default()
+            },
+        );
+        assert!(
+            raw.output.contains(GITHUB),
+            "control: the audited hatch still returns the token, so the \
+             two reads really did see the same bytes"
+        );
+        assert_eq!(
+            redacted.cursor, raw.cursor,
+            "the page pass may add a marker; it may not move the cursor"
+        );
+        assert_eq!(redacted.bytes_returned, raw.bytes_returned);
     }
 
     // ------------------------------------- GH #125: the normalisation seam
