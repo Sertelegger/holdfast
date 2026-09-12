@@ -503,11 +503,34 @@ impl HoldfastServer {
         clock: crate::clock::Clock,
         capabilities: crate::platform::Capabilities,
     ) -> Self {
-        let rules = builtin_shared();
+        // **The operator's set, not the built-in one** (GH #128). This is
+        // what makes `security.disabled_redaction_rules` a fact about the
+        // daemon rather than a line in a file: the `OutputProcessor`
+        // below derives its §4.1 prefix index from exactly this set
+        // (REQ-O-006), `attach`'s `StreamRedactor` takes the processor,
+        // and `start_session` hands the same `Arc` to each session's
+        // screen tracker.
+        let rules = config.redaction_rules_shared();
+        // Reject-or-report, the report half (GH #128). Once per server,
+        // which is once per daemon and once per shim; silent when nothing
+        // is disabled, so the tests that set no config pay nothing.
+        if let Some(line) = crate::output::rules::disabled_rules_notice(&rules) {
+            crate::diag!("{line}");
+        }
+        // **The audit log keeps the full built-in set**, and this is the
+        // one place the two differ. A disable is a statement about what a
+        // *client* is served — §9.3.3: *"turning redaction off changes
+        // what the agent may read"* — and §9.4 draws the same line for
+        // the coarser switch: *"the per-session disable affects what
+        // `read_output` returns to the agent, not what gets written to
+        // the audit log"*. An operator silencing a rule that
+        // false-positives is not asking for credentials to start landing
+        // in a file that outlives the session.
+        let audit_rules = builtin_shared();
         // The failure is *carried out* of this function rather than
         // swallowed inside it. See `audit_open_error`.
         let (audit, audit_open_error) = match path {
-            Some(p) => match AuditLog::to_path(&p, Arc::clone(&rules)) {
+            Some(p) => match AuditLog::to_path(&p, Arc::clone(&audit_rules)) {
                 Ok(log) => (Arc::new(log), None),
                 Err(e) => {
                     let why = format!("cannot open audit log {}: {e}", p.display());
@@ -520,11 +543,14 @@ impl HoldfastServer {
                     // safe to persist rather than the shape of the
                     // message.
                     crate::diag!("holdfast: {why}");
-                    (Arc::new(AuditLog::disabled(Arc::clone(&rules))), Some(why))
+                    (
+                        Arc::new(AuditLog::disabled(Arc::clone(&audit_rules))),
+                        Some(why),
+                    )
                 }
             },
             // No path asked for, so nothing failed.
-            None => (Arc::new(AuditLog::disabled(Arc::clone(&rules))), None),
+            None => (Arc::new(AuditLog::disabled(Arc::clone(&audit_rules))), None),
         };
         Self {
             registry: Arc::new(SessionRegistry::new(config.limits.max_concurrent_sessions)),

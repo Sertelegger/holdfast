@@ -152,6 +152,23 @@ pub struct SessionConfig {
     /// matches no profile is an argument error and the call never reaches
     /// a spawn.
     pub profile: Option<String>,
+    /// The §9.2 rule table this session's **screen tracker** redacts
+    /// with, or `None` for the process-wide built-in set.
+    ///
+    /// `get_screen_state` is an output boundary in its own right: the
+    /// tracker masks the grid with its own `RuleSet`, not with the
+    /// `OutputProcessor`'s. Before GH #128 the two could not disagree,
+    /// because both were `builtin_shared()`. They can now — an operator
+    /// who switches a rule off with `security.disabled_redaction_rules`
+    /// gets a `read_output` that honours it and would have got a
+    /// `get_screen_state` that did not, which is a knob honoured on one
+    /// surface and not another and is the defect GH #128 is about. So
+    /// `start_session` passes the server's set here.
+    ///
+    /// `Option`, and `None` is the built-in set, so the fifty-odd
+    /// `Session::new` call sites that predate this keep their
+    /// `..Default::default()` and the behaviour they assert.
+    pub rules: Option<Arc<RuleSet>>,
 }
 
 impl Default for SessionConfig {
@@ -169,6 +186,10 @@ impl Default for SessionConfig {
             // resolves no credential. A session has to be given one
             // deliberately.
             profile: None,
+            // The built-in set: a session built without a server is a
+            // session with no operator config to honour, and the safe
+            // default is every rule.
+            rules: None,
         }
     }
 }
@@ -227,9 +248,12 @@ pub struct Session {
     /// geometry of a client that has gone.
     desired_size: AtomicU32,
     /// Spec §9.2 rule table, shared with the screen tracker so
-    /// `set_screen_config` can rebuild it. Sourced from
-    /// `output::rules::builtin_shared()` (0.0.3) — the process-wide table
-    /// every session shares. **Not** the `Arc` an `OutputProcessor` holds:
+    /// `set_screen_config` can rebuild it. `SessionConfig::rules` when
+    /// the caller supplied one — `start_session` supplies the server's,
+    /// so an operator's `disabled_redaction_rules` reaches the grid
+    /// (GH #128) — and `output::rules::builtin_shared()` otherwise, the
+    /// process-wide table every session shared until then. **Not**
+    /// necessarily the `Arc` an `OutputProcessor` holds:
     /// `Session` owns no processor, and `OutputProcessor::builtin`
     /// compiles a fresh `RuleSet` anyway, so the two are different
     /// allocations even when they hold identical rules.
@@ -711,7 +735,10 @@ impl Session {
         // Geometry and mode are applied by `set_screen_config` right
         // after construction; the default matches `PtySpawnConfig::new`
         // so a session created without one still seeds a correct grid.
-        let rules = crate::output::rules::builtin_shared();
+        let rules = config
+            .rules
+            .clone()
+            .unwrap_or_else(crate::output::rules::builtin_shared);
         let screen = Arc::new(Mutex::new(ScreenTracker::new(
             ScreenConfig::default(),
             Arc::clone(&rules),
@@ -3583,6 +3610,9 @@ mod tests {
                 // `Option<Shell>` is another same-shaped neighbour, and
                 // `None` here is the ordinary `command`/`args` session.
                 profile: None,
+                // The built-in §9.2 table, which is what a session with
+                // no server behind it gets.
+                rules: None,
             },
         );
         pty.queue_output(&bytes);

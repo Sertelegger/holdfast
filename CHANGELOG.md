@@ -26,9 +26,31 @@ is cut, named and published is in
   `SecretRequestClosed` a fourth outcome of the same name. A request the agent
   abandoned and a request the human or the child abandoned are different
   endings, and `cancelled` already meant the second ([#127], [#105]).
+- `[security] disabled_redaction_rules`: a list of built-in §9.2 rule names to
+  switch off, for the operator whose output a rule mangles. What it names
+  leaves the set every client-facing boundary runs — `read_output`,
+  `resources/read`, `get_screen_state` and an attached observer's stream — and
+  the §4.1 prefix index is rebuilt from the reduced set with it. **A name no
+  built-in rule has is a load error naming it**: a misspelling that switched
+  off nothing would read as a decision about redaction that had been taken,
+  which is what [#128] is about. Disabled rules are reported once at startup on
+  stderr ([#128]).
 
 ### Changed
 
+- **`[security] redaction_enabled = false` is refused at load, and §9.4's
+  `session_start` row no longer carries `redaction_enabled`.** The key disabled
+  redaction nowhere: its only consumer was that row, so `false` bought an
+  operator every rule still running *and* an audit trail asserting on every
+  session that they were not. `true` and the default load exactly as before, so
+  no working config breaks; the error on `false` names
+  `disabled_redaction_rules`, which is the mechanism that does something. The
+  row now carries `redaction_rules_active` (a count) and
+  `redaction_rules_disabled` (the names), both read off the rule set the
+  session's own reads run — a bool whose only accepted value is `true` carries
+  no information, and `true` beside three disabled rules is the same wrong
+  answer in a smaller size. Replacing a §9.4 field is §21.6's case and its
+  binding event is first distribution, which has not happened ([#128]).
 - **`read_output` can now return more redaction markers on colourised output,
   and this is a payload change rather than a free win.** A rule that matches
   the stripped text but not the raw bytes now fires: `\x1b[36mpassword\x1b[0m
@@ -670,6 +692,7 @@ residuals that are known and accepted.
 [#125]: https://github.com/Sertelegger/holdfast/issues/125
 [#126]: https://github.com/Sertelegger/holdfast/issues/126
 [#127]: https://github.com/Sertelegger/holdfast/issues/127
+[#128]: https://github.com/Sertelegger/holdfast/issues/128
 [#129]: https://github.com/Sertelegger/holdfast/issues/129
 [#135]: https://github.com/Sertelegger/holdfast/issues/135
 [#138]: https://github.com/Sertelegger/holdfast/issues/138

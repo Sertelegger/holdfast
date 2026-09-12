@@ -534,14 +534,75 @@ pub struct PromptsConfig {
 /// stood here and is withdrawn: §9.3 specifies the preflight and names
 /// no way to turn it off, a working `false` would make REQ-T-002,
 /// REQ-SEC-001, REQ-SEC-001a and REQ-SEC-002 falsifiable from a config
-/// file, and — unlike `redaction_enabled`, which §9.4's `session_start`
-/// row carries on every session — nothing at all would record that the
-/// preflight was off. A config carrying the key is **rejected**.
+/// file, and nothing at all would record that the preflight was off. A
+/// config carrying the key is **rejected**.
+///
+/// **And there is no redaction kill switch either, as of GH #128.**
+/// `redaction_enabled = false` is refused at load; the mechanism is
+/// `disabled_redaction_rules`, which names what it turns off, and what
+/// it names reaches the read path, the §9.4 row and a startup line.
+/// The two withdrawals are the same rubric — a knob honoured by nothing
+/// is worse than no knob — applied to a key that had the audit trail
+/// `dangerous_commands_enabled` lacked, and was using it to record the
+/// opposite of what the daemon did.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
+    /// **Accepted only as `true`, and read by nothing (GH #128).**
+    ///
+    /// It gated no redactor. Its one consumer copied it into §9.4's
+    /// `session_start` row, so an operator who set it `false` got every
+    /// rule still running and an audit trail asserting on every session
+    /// that redaction was off — the one field whose job is to make the
+    /// redaction posture reconstructible, recording the opposite of the
+    /// truth. An audit artefact that lies is worse than an absent one,
+    /// and a `false` that disables nothing is worse than a refusal.
+    ///
+    /// So `false` is now a load error naming
+    /// [`disabled_redaction_rules`](Self::disabled_redaction_rules),
+    /// and the row describes the effective rule set instead of copying
+    /// this bool. `true` and the default load exactly as before, which
+    /// is the whole compatibility claim: no config that worked stops
+    /// working.
+    ///
+    /// **The key is kept rather than withdrawn**, and the distinction is
+    /// the point. §4.2, §5.2, §9.2 and §9.3.3 all still publish a
+    /// redaction switch, and §5.2's is a **per-session**
+    /// `start_session(redaction_enabled:)` argument that is not built —
+    /// a session-level disable, audited per session, is an honest thing
+    /// that this refusal does not foreclose. Deleting the key would make
+    /// `deny_unknown_fields` reject a config that merely spells out the
+    /// default, for no gain.
     #[serde(default = "d_redaction_enabled")]
     pub redaction_enabled: bool,
+    /// Built-in §9.2 rules the operator switches off, by `name` — the
+    /// real per-rule mechanism GH #128's kill switch was pretending to
+    /// be.
+    ///
+    /// A redaction rule that false-positives mangles the output an agent
+    /// has to read, and the answer to one bad rule is to turn off that
+    /// rule rather than the redactor. What lands here reaches
+    /// [`Config::redaction_rules`], which is the set `HoldfastServer`
+    /// hands `read_output`, `resources/read`, `get_screen_state` and
+    /// every attached observer.
+    ///
+    /// **A name the built-in set does not have is a load error naming
+    /// it** — see [`Config::validate`]. A misspelling that silently
+    /// disabled nothing would leave the operator believing a decision
+    /// had been taken that had not, which is GH #128 in a new place, and
+    /// §10.1's *"an unknown key is a load error, not a warning"* is the
+    /// same argument one level down: a key the schema does not model and
+    /// a value the rule set does not have are both statements about the
+    /// daemon that are not true.
+    ///
+    /// Two consequences worth stating where an operator will read them.
+    /// Disabling `private-key-block` gives up REQ-O-011a's multi-row PEM
+    /// coverage, which nothing else provides; and the disable applies to
+    /// what a *client* is served, not to what Holdfast persists — the
+    /// audit log keeps the full built-in set (§9.4, and §9.3.3's
+    /// *"turning redaction off changes what the agent may read"*).
+    #[serde(default)]
+    pub disabled_redaction_rules: Vec<String>,
     /// **Parsed and deliberately not passed to `RuleSet`.** The
     /// `ExtraRule` → `RuleSpec` mapping is a §15.1 open question: §10.2
     /// publishes `{ name, kind, regex }`, `RuleSpec` requires `pattern`
@@ -1209,7 +1270,7 @@ table_default!(SecurityConfig {
     keychain_provider_timeout_secs: d_keychain_provider_timeout_secs,
     max_secret_bytes_ceiling: d_max_secret_bytes_ceiling,
     secret_input_max_timeout_secs: d_secret_input_max_timeout_secs,
-}; extra_redaction_patterns, secret_bindings, profiles);
+}; disabled_redaction_rules, extra_redaction_patterns, secret_bindings, profiles);
 
 table_default!(UiConfig {
     ui_bridge_pinned_port: d_ui_bridge_pinned_port,
@@ -1403,6 +1464,40 @@ impl Config {
             self.terminal.screen_tracking_idle_disable_secs as usize,
         )?;
 
+        // GH #128. The refusal and the replacement are one check,
+        // because an operator who set the withdrawn key has to be sent
+        // somewhere: a bare "not supported" leaves them with the problem
+        // that made them reach for it.
+        if !self.security.redaction_enabled {
+            return Err(ConfigError::invalid(
+                "security.redaction_enabled = false disabled redaction nowhere — every \
+                 rule kept running and §9.4's session_start row recorded that they had \
+                 not, which is an audit trail asserting the opposite of what the daemon \
+                 did (GH #128). Use security.disabled_redaction_rules = [\"rule-name\", …] \
+                 to switch off individual built-in rules by name; that list reaches the \
+                 read path, and both the session_start row and a line at startup say \
+                 what it turned off. security.redaction_enabled = true is the only \
+                 accepted value and is the default",
+            ));
+        }
+        // A name no rule has would switch off nothing while reading as a
+        // decision that had been taken — GH #128's own shape, one level
+        // down from the unknown *key* §10.1 already refuses. Checked
+        // against the shipped rule file rather than a list kept here: a
+        // second copy of the names is a second thing to be wrong.
+        let rule_names = crate::output::rules::builtin_rule_names();
+        for name in &self.security.disabled_redaction_rules {
+            if !rule_names.contains(name) {
+                return Err(ConfigError::invalid(format!(
+                    "security.disabled_redaction_rules names {name:?}, which is not a \
+                     built-in redaction rule. The {} shipped rules are named in \
+                     holdfast-core/data/redaction_default.toml; a name that matched none \
+                     of them would switch off nothing and read as though it had",
+                    rule_names.len(),
+                )));
+            }
+        }
+
         one_of(
             "security.secret_provider",
             &self.security.secret_provider,
@@ -1565,25 +1660,68 @@ impl Config {
 
     /// The redaction rule set this config puts in force (§9.2).
     ///
-    /// Today it is exactly [`RuleSet::builtin`]:
-    /// `security.extra_redaction_patterns` is parsed, validated and
-    /// **not** in it, because §15.1 has not settled the `ExtraRule` →
-    /// `RuleSpec` mapping (see that field's own doc for why guessing is
-    /// worse than stopping).
+    /// It is the built-in set minus `security.disabled_redaction_rules`
+    /// (GH #128). `security.extra_redaction_patterns` is still parsed,
+    /// validated and **not** in it, because §15.1 has not settled the
+    /// `ExtraRule` → `RuleSpec` mapping (see that field's own doc for
+    /// why guessing is worse than stopping) — the two keys are
+    /// independent: a disable list needs only the built-in names, which
+    /// are compiled in and settled.
     ///
-    /// **This function is the seam that stop is written on.** It exists
-    /// so there is one named place a config-derived rule set is built,
+    /// **This function is the seam both are written on.** It exists so
+    /// there is one named place a config-derived rule set is built,
     /// rather than a `RuleSet::builtin()` call scattered at each
-    /// construction site: the milestone that resolves §15.1 replaces
-    /// this body with a `builtin_with_extra`-shaped call, and
+    /// construction site — and the disable list is why that seam now
+    /// carries something. The milestone that resolves §15.1 adds the
+    /// `builtin_with_extra` half here, and
     /// `a_user_redaction_pattern_is_accepted_and_not_yet_in_force`
-    /// reddens on the same commit — which is the point. That test also
+    /// reddens on that commit — which is the point. That test also
     /// watches the rule set `HoldfastServer` actually hands the read path,
-    /// so wiring the key anywhere else reddens it too.
+    /// so wiring the *extra-patterns* key anywhere else reddens it too.
+    /// It stays green through GH #128 because its config disables
+    /// nothing, and a config that disables nothing must still get
+    /// exactly the built-in set — which is the compatibility claim, and
+    /// is now asserted rather than assumed.
     pub fn redaction_rules(
         &self,
     ) -> Result<crate::output::rules::RuleSet, crate::output::rules::RuleError> {
-        crate::output::rules::RuleSet::builtin()
+        crate::output::rules::RuleSet::builtin_without(&self.security.disabled_redaction_rules)
+    }
+
+    /// [`redaction_rules`](Self::redaction_rules) as the shared `Arc`
+    /// every output boundary in one process holds.
+    ///
+    /// **The empty case returns [`builtin_shared`] itself**, by pointer,
+    /// so the overwhelmingly common config still compiles the fifty-odd
+    /// regexes once per process rather than once per server — the reason
+    /// that `OnceLock` exists, and `HoldfastServer` is constructed by
+    /// every test in the tree.
+    ///
+    /// **An unresolvable disable list degrades to the full built-in set
+    /// rather than panicking**, and says so on stderr. A name that is
+    /// not a rule is refused by [`validate`](Self::validate), so the only
+    /// way here is a `Config` built in code and never validated; the
+    /// choice between the two failures is "redact more than asked" or
+    /// "take the daemon down", and the first is the safe direction.
+    /// Nothing is left believing the rule is off either way: the §9.4
+    /// row and the startup line are both derived from the returned set,
+    /// not from the config list.
+    ///
+    /// [`builtin_shared`]: crate::output::rules::builtin_shared
+    pub fn redaction_rules_shared(&self) -> std::sync::Arc<crate::output::rules::RuleSet> {
+        if self.security.disabled_redaction_rules.is_empty() {
+            return crate::output::rules::builtin_shared();
+        }
+        match self.redaction_rules() {
+            Ok(set) => std::sync::Arc::new(set),
+            Err(e) => {
+                crate::diag!(
+                    "holdfast: security.disabled_redaction_rules could not be applied \
+                     ({e}); every built-in redaction rule stays in force"
+                );
+                crate::output::rules::builtin_shared()
+            }
+        }
     }
 
     /// The four §4.2 knobs `OutputProcessor` already takes as parameters.
@@ -2834,6 +2972,136 @@ reference = \"db/prod\"
                  is the guess this step declines to make"
             );
         }
+    }
+
+    // ====================== GH #128: the per-rule disable list
+    //
+    // Four properties, one per row: the list reaches the rule set, a
+    // name that is not a rule is refused, the withdrawn kill switch is
+    // refused, and everything that loaded before still loads. The row
+    // that proves a disabled rule stops *redacting* is not here — a
+    // `RuleSet` assertion proves the config parsed, and #128 is about
+    // the gap between parsing and behaviour, so that one runs through
+    // `read_output` in `tests/integration.rs`.
+
+    /// The named rules leave the set `Config::redaction_rules()` builds,
+    /// and nothing else does.
+    #[test]
+    fn a_disabled_rule_leaves_the_set_this_config_puts_in_force() {
+        let cfg = parse_str("[security]\ndisabled_redaction_rules = [\"jwt\", \"github-token\"]\n")
+            .expect("naming two real rules must load");
+        let set = cfg.redaction_rules().expect("the reduced set compiles");
+        let builtin = RuleSet::builtin().unwrap();
+
+        assert_eq!(set.len(), builtin.len() - 2);
+        assert_eq!(set.disabled_builtin_rules(), vec!["github-token", "jwt"]);
+        // The converse, because "removed too much" passes a length check
+        // against the wrong number just as happily: a neighbour of each
+        // disabled rule is still there.
+        for kept in ["gitlab-pat", "bearer-authorization"] {
+            assert!(
+                set.rules.iter().any(|r| r.name == kept),
+                "{kept} went with them"
+            );
+        }
+    }
+
+    /// A misspelling is refused **at load**, naming itself.
+    ///
+    /// This is the row that keeps the key from re-creating GH #128 in a
+    /// new place: a name that matched nothing would disable nothing
+    /// while reading, in the operator's own file, as a decision that had
+    /// been taken.
+    #[test]
+    fn an_unknown_disabled_rule_name_is_refused_at_load() {
+        let e = parse_str("[security]\ndisabled_redaction_rules = [\"githubtoken\"]\n")
+            .expect_err("a name no rule has must not load");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("githubtoken"),
+            "the operator can only fix what the message names: {msg}"
+        );
+        assert!(
+            msg.contains("security.disabled_redaction_rules"),
+            "and it must name the key: {msg}"
+        );
+        // The pairing: the real spelling loads, or this row passes
+        // against a validator that refuses every list.
+        parse_str("[security]\ndisabled_redaction_rules = [\"github-token\"]\n")
+            .expect("the real name must load");
+    }
+
+    /// `redaction_enabled = false` is refused, and the error hands the
+    /// operator the key that works (GH #128).
+    ///
+    /// It disabled redaction nowhere. Its one consumer was §9.4's
+    /// `session_start` row, so it did not make the daemon safer or less
+    /// safe — it made the audit trail wrong, on every session, in the
+    /// one field whose job is to record the redaction posture.
+    #[test]
+    fn the_redaction_kill_switch_is_refused_and_names_its_replacement() {
+        let e = parse_str("[security]\nredaction_enabled = false\n")
+            .expect_err("a knob that disabled nothing must not be accepted");
+        let msg = e.to_string();
+        assert!(msg.contains("security.redaction_enabled"), "{msg}");
+        assert!(
+            msg.contains("disabled_redaction_rules"),
+            "a refusal that does not say what to use instead leaves the operator with \
+             the problem that made them reach for it: {msg}"
+        );
+    }
+
+    /// **The compatibility claim, asserted rather than believed.** No
+    /// config that loaded before this key existed stops loading.
+    #[test]
+    fn every_config_that_worked_before_the_disable_list_still_works() {
+        // The default: no `[security]` table at all.
+        let bare = parse_str("").expect("the empty document is the shipped default");
+        assert!(bare.security.redaction_enabled);
+        assert!(bare.security.disabled_redaction_rules.is_empty());
+
+        // The published value, written out.
+        let explicit = parse_str("[security]\nredaction_enabled = true\n")
+            .expect("§10.2 publishes `redaction_enabled = true`, which must still load");
+        assert!(explicit.security.disabled_redaction_rules.is_empty());
+
+        // And a config that disables nothing gets **exactly** the
+        // built-in set — the property the whole of GH #128's redaction
+        // half turns on, and the reason
+        // `a_user_redaction_pattern_is_accepted_and_not_yet_in_force`
+        // stays green through this change.
+        let builtin = RuleSet::builtin().unwrap();
+        for cfg in [&bare, &explicit] {
+            let set = cfg.redaction_rules().expect("compiles");
+            assert_eq!(set.len(), builtin.len());
+            assert!(set.disabled_builtin_rules().is_empty());
+        }
+        // …and pays nothing for it: the empty case is the process-wide
+        // table by pointer, not a fresh compile per server.
+        assert!(std::sync::Arc::ptr_eq(
+            &bare.redaction_rules_shared(),
+            &crate::output::rules::builtin_shared()
+        ));
+    }
+
+    /// A non-empty list gets its own set, and `HoldfastServer` runs that
+    /// set — the seam `redaction_rules_shared` exists to be.
+    #[test]
+    fn the_server_runs_the_set_the_disable_list_describes() {
+        let cfg = parse_str("[security]\ndisabled_redaction_rules = [\"jwt\"]\n").unwrap();
+        let shared = cfg.redaction_rules_shared();
+        assert_eq!(shared.disabled_builtin_rules(), vec!["jwt"]);
+        assert!(
+            !std::sync::Arc::ptr_eq(&shared, &crate::output::rules::builtin_shared()),
+            "a config that disables a rule must not be handed the built-in table"
+        );
+
+        let server = crate::mcp::HoldfastServer::with_audit_path_and_config(None, &cfg);
+        assert_eq!(
+            server.processor.rules.disabled_builtin_rules(),
+            vec!["jwt"],
+            "the read path is still running the rule the operator switched off"
+        );
     }
 
     #[test]

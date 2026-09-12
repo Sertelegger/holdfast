@@ -347,8 +347,8 @@ fn signal_after_exit_is_a_no_op() {
 }
 
 use holdfast_core::mcp::tools::{
-    GetCommandHistoryArgs, InterruptArgs, PromptPatternArg, ReadOutputArgs, SendInputArgs,
-    StartSessionArgs, StatusArgs, TerminateArgs, WaitForPatternArgs,
+    GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, PromptPatternArg, ReadOutputArgs,
+    SendInputArgs, StartSessionArgs, StatusArgs, TerminateArgs, WaitForPatternArgs,
 };
 use holdfast_core::mcp::HoldfastServer;
 use holdfast_core::pty::MockPty;
@@ -3080,7 +3080,17 @@ async fn session_start_records_the_field_set_9_4_names() {
             // be told from one a writer forgot and the negative case is
             // what an operator is reading for.
             "profile",
-            "redaction_enabled",
+            // §9.4 specified `redaction_enabled` and this row carried
+            // it, copied from a config key that gated no redactor — so
+            // an operator who set it `false` got every rule still
+            // running and a trail asserting the opposite (GH #128). The
+            // bool is replaced by a description of the set that really
+            // ran: `false` is refused at load now, which leaves the bool
+            // one possible value and no information in it, while a count
+            // beside the names makes "three rules were off" something
+            // the trail can answer.
+            "redaction_rules_active",
+            "redaction_rules_disabled",
             "session_id",
             "ts",
         ],
@@ -3102,7 +3112,16 @@ async fn session_start_records_the_field_set_9_4_names() {
     // a field's absence. `mcp::tools::tests::the_trail_tells_a_profile_started_session_from_an_agent_authored_one`
     // is the paired positive.
     assert_eq!(entries[0]["profile"], serde_json::Value::Null);
-    assert_eq!(entries[0]["redaction_enabled"], true);
+    // The set this session's reads really ran with. `server_with_audit`
+    // builds a stock config, so that is every built-in rule and nothing
+    // disabled — and the count is read off the rule file rather than
+    // written here, because a literal would have to be edited every time
+    // a rule is added and would be edited by whoever added it.
+    assert_eq!(
+        entries[0]["redaction_rules_active"],
+        json!(holdfast_core::output::rules::builtin_rule_names().len())
+    );
+    assert_eq!(entries[0]["redaction_rules_disabled"], json!([]));
     // The **resolved** timeout, not the argument. This asserted `null`
     // through 0.0.4, with a comment saying a number would be "a promise
     // nothing keeps" — true while no milestone had built the reaper, and
@@ -3121,6 +3140,54 @@ async fn session_start_records_the_field_set_9_4_names() {
         json!(server.registry.get(&id).unwrap().pid()),
         "the entry names the child that was actually spawned"
     );
+
+    kill_all(&server).await;
+}
+
+/// A rule an operator disabled still redacts **in the audit log**, and
+/// the row says which rules the *session* ran without (GH #128).
+///
+/// The disable is a statement about what a client is served, not about
+/// what Holdfast persists: §9.3.3 puts the switch's subject as *"what
+/// the agent may read"*, and §9.4 already says of the coarser one that
+/// it *"affects what `read_output` returns to the agent, not what gets
+/// written to the audit log"*. An operator silencing a rule that
+/// false-positives on their output is not asking for credentials to
+/// start landing in a file that outlives the session — so the two rule
+/// sets differ here, deliberately, and this row is where that decision
+/// is written down.
+#[tokio::test]
+async fn a_disabled_rule_still_redacts_the_audit_trail_and_the_row_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.log");
+    let mut cfg = holdfast_core::config::Config::default();
+    cfg.security.disabled_redaction_rules = vec!["github-token".to_string()];
+    let server = HoldfastServer::with_audit_path_and_config(Some(path.clone()), &cfg);
+
+    let token = format!("ghp_{TOKEN_TAIL}");
+    server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("echo".into()),
+            args: vec![format!("t={token}")],
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session");
+
+    let entries = audit_entries(&path, "session_start");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0]["args"],
+        json!(["t=[REDACTED:github]"]),
+        "the agent may read this rule's matches; the trail still must not carry them"
+    );
+    assert_eq!(
+        entries[0]["redaction_rules_disabled"],
+        json!(["github-token"]),
+        "and the row has to say which set the session's own reads ran with"
+    );
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains(&token), "the trail carried the token: {raw}");
 
     kill_all(&server).await;
 }
@@ -3522,6 +3589,225 @@ async fn read_outputs_redact_argument_is_honoured_on_every_arm() {
     assert!(raw["output"].as_str().unwrap().contains(partial));
 
     let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+}
+
+// ------------------------------- GH #128: `disabled_redaction_rules`
+//
+// **Behaviourally, through the tool.** GH #128's whole subject is the
+// gap between a config that parses and a daemon that behaves, and its
+// testing note says so: *"What none of them had was a test asserting the
+// setting changes observable behaviour, which is the only kind that
+// could have caught this."* A row that inspects the `RuleSet` proves the
+// config parsed. These two read `read_output`.
+
+/// One session, two secrets, one disabled rule — and a control run of
+/// the same bytes on a stock config.
+///
+/// **The control is what makes it an assertion.** Without it, "the
+/// GitHub token came back in the clear" also passes when the harness
+/// never produced a token the rule would have caught, which is the
+/// failure mode every absence assertion in this repo is paired against.
+/// So the same bytes go through a stock server first, where *both* must
+/// be markers.
+#[tokio::test]
+async fn a_disabled_redaction_rule_stops_redacting_and_its_neighbours_do_not() {
+    let github = format!("ghp_{TOKEN_TAIL}");
+    // A second rule, untouched by the config: `anthropic-api-key`, whose
+    // pattern wants `sk-ant-` and 24 or more characters. Assembled at
+    // runtime for the reason `TOKEN_TAIL` is.
+    let anthropic = format!("sk-ant-{TOKEN_TAIL}");
+    // `done\n` after both, so neither token sits at the buffer head
+    // where §4.1's partial-secret holdback would withhold it for a
+    // reason that has nothing to do with this test.
+    let bytes = format!("a={github}\nb={anthropic}\ndone\n");
+
+    async fn output(server: &HoldfastServer, name: &str, bytes: &str) -> String {
+        let (id, pty) = mock_session_in(server, name);
+        pty.queue_output(bytes.as_bytes());
+        wait_until_head(&server.registry.get(&id).unwrap(), bytes.len() as u64);
+        let read = body(
+            &server
+                .read_output(Parameters(read_args(&id)))
+                .await
+                .expect("read_output must not be a protocol error"),
+        );
+        let _ = server.registry.get(&id).unwrap().signal(Signal::Kill);
+        read["data"]["output"]
+            .as_str()
+            .expect("read_output returns text")
+            .to_string()
+    }
+
+    // The control: a stock config redacts both.
+    let stock = output(&HoldfastServer::new(), "stock", &bytes).await;
+    assert!(
+        !stock.contains(&github) && !stock.contains(&anthropic),
+        "the stock server leaked one of them, so nothing below means anything: {stock}"
+    );
+    assert!(stock.contains("[REDACTED:github]") && stock.contains("[REDACTED:anthropic]"));
+
+    let mut cfg = holdfast_core::config::Config::default();
+    cfg.security.disabled_redaction_rules = vec!["github-token".to_string()];
+    cfg.validate().expect("the operator's config must load");
+    let server = HoldfastServer::with_audit_path_and_config(None, &cfg);
+    let out = output(&server, "one-rule-off", &bytes).await;
+
+    assert!(
+        out.contains(&github),
+        "`github-token` is switched off and read_output still redacted it — the key \
+         parses and changes nothing, which is GH #128 in a new place: {out}"
+    );
+    assert!(
+        !out.contains("[REDACTED:github]"),
+        "a marker for a rule that is not in the set: {out}"
+    );
+    // The neighbour, and the half that stops this from being a global
+    // kill switch wearing a list's clothes.
+    assert!(
+        !out.contains(&anthropic),
+        "disabling one rule disabled another: {out}"
+    );
+    assert!(out.contains("[REDACTED:anthropic]"), "{out}");
+}
+
+/// The same knob at the **other** boundary an agent reads a session
+/// through.
+///
+/// `get_screen_state` masks the grid with the *session's* rule table,
+/// not the processor's, so it is a second place the same config has to
+/// arrive. Before GH #128 the two could not disagree — both were
+/// `builtin_shared()` — and a fix that wired only `read_output` would
+/// leave an operator with a knob honoured on one surface and not the
+/// other, which is the same defect one surface along.
+#[tokio::test]
+async fn a_disabled_rule_reaches_get_screen_state_as_well_as_read_output() {
+    let github = format!("ghp_{TOKEN_TAIL}");
+    let mut cfg = holdfast_core::config::Config::default();
+    cfg.security.disabled_redaction_rules = vec!["github-token".to_string()];
+    let server = HoldfastServer::with_audit_path_and_config(None, &cfg);
+
+    // Through `start_session`, because that is the call that hands a
+    // session its rule table; a registry insert of a hand-built
+    // `Session` would test `SessionConfig::default()` instead.
+    let started = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("cat".into()),
+            screen_tracking: Some("on".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session");
+    let id = body(&started)["data"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let session = server.registry.get(&id).unwrap();
+
+    // `cat` echoes what it is given, so the grid carries the token
+    // without a shell in the way.
+    let line = format!("a={github}\n");
+    session.write_input(line.as_bytes()).unwrap();
+    wait_until_head(&session, line.len() as u64);
+
+    let screen = body(
+        &server
+            .get_screen_state(Parameters(GetScreenStateArgs {
+                session: id.clone(),
+                diff_from: None,
+                redact: None,
+            }))
+            .await
+            .expect("get_screen_state must not be a protocol error"),
+    );
+    let text = screen["data"]["lines"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a full grid, got {}", screen["data"]))
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains(&github),
+        "the grid redacted a rule the operator switched off: {text}"
+    );
+
+    let _ = session.signal(Signal::Kill);
+}
+
+/// Set in the child, absent in the parent — the whole of what tells the
+/// two runs of [`the_startup_report_probe_child`] apart.
+const STARTUP_PROBE_ENV: &str = "HOLDFAST_TEST_STARTUP_PROBE";
+
+/// The child half of
+/// [`a_disabled_rule_is_reported_at_startup_and_a_stock_config_is_silent`].
+///
+/// Builds a stock server and then one with a rule disabled, in that
+/// order, and lets each write whatever it writes to fd 2.
+#[test]
+fn the_startup_report_probe_child() {
+    if std::env::var_os(STARTUP_PROBE_ENV).is_none() {
+        // The parent's own run of this row. Doing the work here as well
+        // would be harmless, and would also make the row look as though
+        // it asserts something, which it does not.
+        return;
+    }
+    let _stock =
+        HoldfastServer::with_audit_path_and_config(None, &holdfast_core::config::Config::default());
+    let mut cfg = holdfast_core::config::Config::default();
+    cfg.security.disabled_redaction_rules = vec!["github-token".to_string()];
+    let _reduced = HoldfastServer::with_audit_path_and_config(None, &cfg);
+}
+
+/// GH #128's *report* half: switching a redaction rule off is
+/// security-relevant, so it must not be discoverable only by reading the
+/// config back.
+///
+/// **A subprocess, and not an fd-2 redirect.** `diag::emit` writes
+/// through `std::io::stderr()` precisely to bypass libtest's capture, so
+/// the line is reachable only by owning the descriptor — and this target
+/// runs its rows on threads of one process, where two overlapping
+/// `dup2`s each restore the other's saved descriptor.
+/// `secret::provider::tests::with_captured_stderr` carries that warning
+/// for the library target and names this idiom as the one a second
+/// stderr-asserting row must use; `diag.rs` already uses it.
+///
+/// **The count is the assertion.** `contains` alone passes against a
+/// line printed unconditionally, which is the same defect pointing the
+/// other way: an operator who changed nothing, told at every startup
+/// that something is off, learns to scroll past the line.
+#[test]
+fn a_disabled_rule_is_reported_at_startup_and_a_stock_config_is_silent() {
+    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([
+            "--exact",
+            "the_startup_report_probe_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(STARTUP_PROBE_ENV, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .output()
+        .expect("spawn the probe child");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the probe child failed: {err}");
+
+    assert_eq!(
+        err.matches("built-in redaction rules are switched off")
+            .count(),
+        1,
+        "the child built a stock server and then a reduced one, so exactly one of the \
+         two may report: {err}"
+    );
+    assert!(
+        err.contains("github-token"),
+        "a report that does not name the rule leaves an operator with a number: {err}"
+    );
+    assert!(
+        err.contains("security.disabled_redaction_rules"),
+        "and it must name the key that did it, or the line says nothing about how to \
+         undo it: {err}"
+    );
 }
 
 /// `status.redaction_stats` as the agent sees it.
