@@ -1031,8 +1031,9 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
 /// view composite (GH #14, GH #142), asserted against the tree because
 /// neither can be asserted against behaviour.**
 ///
-/// `OutputProcessor::earliest_partial_across_views` asks every emitted
-/// view whether a secret is still arriving and takes the earliest answer.
+/// `OutputProcessor::earliest_partial_across_views` and its view half
+/// `earliest_partial_in_views` ask every emitted view whether a secret is
+/// still arriving and take the earliest answer.
 /// That is correct for the two surfaces that hand bytes to somebody —
 /// `holdback_boundary` and `StreamRedactor::feed` — whose region is a
 /// bounded tail. It is wrong for the other two callers of the same
@@ -1073,7 +1074,9 @@ fn the_view_composite_reaches_only_the_two_surfaces_that_hand_over_bytes() {
             if code.starts_with("//") {
                 continue;
             }
-            if !code.contains("earliest_partial_across_views") {
+            if !code.contains("earliest_partial_across_views")
+                && !code.contains("earliest_partial_in_views")
+            {
                 continue;
             }
             let rel = file
@@ -1084,20 +1087,23 @@ fn the_view_composite_reaches_only_the_two_surfaces_that_hand_over_bytes() {
             sites.push(format!("{rel}:{}", n + 1));
         }
     }
-    // The definition plus exactly two call sites. Anything else is either
-    // a third consumer or one of the two named above having acquired it.
+    // Four sites: the two definitions, `holdback_boundary`'s call, the
+    // composite's own call to its view half, and `StreamRedactor::feed`'s.
+    // Anything else is either a third consumer, or one of the two named
+    // above having acquired it.
     assert_eq!(
         sites.len(),
-        3,
-        "unexpected set of `earliest_partial_across_views` sites: {sites:?}"
+        5,
+        "unexpected set of view-composite sites: {sites:?}"
     );
     assert_eq!(
         sites
             .iter()
             .filter(|s| s.starts_with("output/mod.rs:"))
             .count(),
-        2,
-        "expected the definition and `holdback_boundary`: {sites:?}"
+        4,
+        "expected two definitions, `holdback_boundary`, and the composite's \
+         own call to its view half: {sites:?}"
     );
     assert_eq!(
         sites

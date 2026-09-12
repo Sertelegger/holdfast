@@ -324,9 +324,36 @@ impl OutputProcessor {
         region: &[u8],
         region_start: u64,
     ) -> Option<u64> {
-        let mut earliest = self
+        let raw = self
             .index
             .earliest_partial(&self.rules, region, region_start);
+        match (raw, self.earliest_partial_in_views(region, region_start)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// The **view half alone** of [`Self::earliest_partial_across_views`].
+    ///
+    /// Separated because the two halves want different regions, and one
+    /// caller needs them to differ. The gate proves a rule's holdback
+    /// terminates after a bounded number of further bytes **in the
+    /// view** — and a raw stream can emit unboundedly many bytes that
+    /// contribute *none*: a spinner redrawing with `\x1b[s\x1b[u`
+    /// changes no stripped view at all. `holdback_boundary` is protected
+    /// from that by geometry rather than by the gate, because its region
+    /// is the trailing `partial_secret_scan_bytes` and a candidate falls
+    /// out of that window as the buffer grows. `StreamRedactor::feed`'s
+    /// region is lookbehind plus carry and has no such slide, so it
+    /// bounds this half itself — measured, without that bound 1,361
+    /// redraw-only chunks take the carry past `STREAM_CARRY_BYTES` and
+    /// reduce an observer's whole stream to one marker.
+    pub(crate) fn earliest_partial_in_views(
+        &self,
+        region: &[u8],
+        region_start: u64,
+    ) -> Option<u64> {
+        let mut earliest: Option<u64> = None;
         for view in normalise::emitted_views(region, region_start) {
             let Some(at) = self
                 .index
@@ -1932,12 +1959,19 @@ mod tests {
     /// wrong.** A *terminated* window title carrying an indexed secret
     /// prefix must not stop the read.
     ///
-    /// Asking the `Printable` view whether a secret is in flight does
-    /// stop it: that view deletes the `\x1b` and the BEL and keeps
-    /// `]0;SECRET_DONE`, which to a continuation test whose whole rule is
-    /// *printable and not a space* reads as a value still accumulating.
-    /// Nothing here is contrived — it is `screen.rs`'s own fixture, and
-    /// the read stopped four bytes into the sequence.
+    /// Asking the `Printable` view whether a secret is in flight *finds*
+    /// one: that view deletes the `\x1b` and the BEL and keeps
+    /// `]0;SECRET_DONE`, and `generic-secret-assignment`'s leading
+    /// `[a-z0-9_.-]{0,32}` lets its keyword arrive later, so the run reads
+    /// as a value still accumulating — under liveness as much as under
+    /// the byte-class test it replaced. Nothing here is contrived: it is
+    /// `screen.rs`'s own fixture, and the read used to stop four bytes
+    /// into the sequence.
+    ///
+    /// **What releases it is the gate, not the predicate (GH #142).**
+    /// That rule's holdback is unbounded, so no view may withhold on it;
+    /// `the_gate_is_what_releases_a_terminated_window_title` asserts that
+    /// mechanism directly, and this row asserts the outcome.
     #[test]
     fn a_terminated_window_title_is_not_a_credential_still_arriving() {
         let p = processor();
@@ -2094,13 +2128,17 @@ mod tests {
     /// **Ordinary output that ends in an escape sequence must still be
     /// released (GH #142).**
     ///
-    /// `earliest_partial` asks whether every byte from an indexed prefix
-    /// to the end of the region could still belong to a value, and
-    /// answers with `0x21..=0x7e`; the control byte that ends a sequence
-    /// is what ends that run. Asking a *stripped* view instead removes
-    /// the terminator, the run reaches the end of the region, and the
-    /// read stops — permanently, because the line is finished and nothing
-    /// more is coming.
+    /// `earliest_partial` used to ask whether every byte from an indexed
+    /// prefix to the end of the region was printable and not a space; the
+    /// control byte that ends a sequence is what ended that run. Asking a
+    /// *stripped* view under that test removed the terminator, the run
+    /// reached the end of the region, and the read stopped — permanently,
+    /// because the line is finished and nothing more is coming.
+    ///
+    /// **The stripped view is asked now, and this line is still released
+    /// (GH #142)** — by the predicate rather than by the gate:
+    /// `mailgun-api-key` is `\bkey-[a-f0-9]{32}`, which cannot reach the
+    /// `m` of `manager`, so nothing is in flight in any view of it.
     ///
     /// `key-` is `mailgun-api-key`'s indexed prefix and the rest of this
     /// line is an npm deprecation warning. A progress line ending in

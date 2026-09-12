@@ -124,6 +124,15 @@ is cut, named and published is in
   that merely mentions the marker inside a comment — it must *be* a comment
   line — so a file can no longer exempt itself from the bans on
   `continue-on-error`, unpinned actions and `secrets.` references.
+- **`regex-automata` and `regex-syntax` are built with `opt-level = 3` in the
+  dev profile.** Compiling fifty-one DFAs at startup (see the GH #142 entry
+  below) costs 1.29 s in an unoptimized build against 66 ms in a release one,
+  and a `holdfast-core` test builds one `OutputProcessor` per row. Measured
+  with the override: `cargo test -p holdfast-core --lib` 156 s → 32 s (31 s
+  before this work), `--test redaction_sweep` 662 s → 66 s (199 s before), and
+  `crates/holdfast/tests/daemon_cli.rs` 10.5 s → 2.6 s (3.1 s before) — each
+  daemon that suite starts pays the build. Nothing about the shipped binary
+  changes; `--release` was never affected.
 
 ### Fixed
 
@@ -210,18 +219,20 @@ is cut, named and published is in
     and unmatched is finite, so a view that deleted the byte which would have
     ended the withhold cannot strand the caller for ever.
 
-  Measured on this tree, release, over 20,000 lines of the repository's own
-  source at line-final boundaries, four colourisation schemes, as *raw-region
-  hold % / any-view hold %*: plain `0.740 / 0.015` → `0.725 / 0.000`, trailing
+  Measured release, over 20,000 lines of the repository's own source **at the
+  parent commit**, so both columns read the same bytes, at line-final
+  boundaries, four colourisation schemes, as *raw-region hold % / any-view
+  hold %*: plain `0.740 / 0.015` → `0.725 / 0.000`, trailing
   `\x1b[K` `0.060 / 0.770` → `0.060 / 0.000`, mid-line colour
   `0.620 / 0.760` → `0.595 / 0.000`, trailing `✔` `0.060 / 0.060` →
   `0.060 / 0.000`. **The raw column barely moves, and that is the honest
   summary**: this is not a lower holdback, it is a leak closed and a view path
-  that costs nothing. Per call, `earliest_partial` is 1.14 µs before and
-  1.14 µs after over 5,000 real source lines. The price is at startup:
-  `PrefixIndex::build` goes 0.05 ms → 66.5 ms and 3.975 MiB resident, once per
-  `OutputProcessor`, which is one per daemon. In debug that build is 1.29 s,
-  and `cargo test -p holdfast-core --lib` goes 31 s → 156 s.
+  that costs nothing. Per call, `earliest_partial` measures 1.08–1.14 µs
+  before and 1.14–1.16 µs after over the same 5,000 lines — no cost outside
+  run-to-run noise. The price is at startup: `PrefixIndex::build` goes
+  0.05 ms → 64–67 ms and 3.975 MiB resident, once per `OutputProcessor`, which
+  is one per daemon. Building fifty-one DFAs is almost all of that; the cycle
+  search that computes the gate is itself below the noise.
 
   **Twelve of the 51 rules are excluded by that computation and keep the leak
   in full**: the nine context rules with a `value` capture group, plus `jwt`,
@@ -230,9 +241,17 @@ is cut, named and published is in
   requires. For those twelve a credential still arriving with a control byte
   inside it is released as before, bounded by **a per-rule constant** —
   `(that rule's minimum − 1)` characters — and it is silent. [#160] is where
-  it stops being silent; the bound is a property of each pattern, not of the
-  criterion, so a user rule with a large bounded quantifier can have a large
-  one and still qualify.
+  it stops being silent.
+
+  **The other thirty-nine are proved to strand *boundedly*, not never.** A
+  view that deletes the byte which would have ended a withhold can still hold
+  one open for as long as that rule's own automaton can stay alive without
+  matching, which is again **a per-rule constant** and not a number this
+  criterion supplies: across the shipped set the worst is 116 bytes and the
+  median 37, but a user rule with a large *bounded* quantifier
+  (`\bacme_[A-Za-z0-9]{0,100000}KEY`) passes the gate with a bound of any
+  size. Zero such stranding shapes occur in the 20,000-line × 4-scheme sweep
+  above.
 
   **[#152] is not closed and this is why.** Those nine context rules keep the
   byte-class test on the *raw* stream, because their patterns legitimately
@@ -249,6 +268,13 @@ is cut, named and published is in
   boundary at all (a GitHub token cannot reach a `-`, and `sk-ant-` sits
   mid-word), and `parsing key-value` moves from the documented residual to the
   list of holdbacks liveness retired.
+
+  **An operator rule whose pattern carries a `\b` and whose prefix opens on
+  punctuation gets no automaton at all**, and keeps the byte-class test it has
+  today. The ASCII word boundary over-approximates the Unicode one only when
+  the byte on the pattern side is a word byte; for such a rule it does not,
+  and `"é-zq-ABCD"` against `\b(?:-zq-|-zr-)[A-Za-z0-9]{10,}` would be called
+  dead and released. No shipped rule has that shape.
 
 - A session that has finished no longer keeps the writer thread that only a
   running child needs. The registry now holds live sessions and completed

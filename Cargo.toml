@@ -32,3 +32,17 @@ toml = "1.1.4"
 unicode-width = "0.2.2"
 uuid = { version = "1", features = ["v4"] }
 vt100 = "0.16.2"
+
+# **The two crates that build GH #142's liveness automata, optimized even in
+# a debug build.** Determinizing fifty-one DFAs is 1.29 s unoptimized against
+# 66 ms optimized, `PrefixIndex::build` runs once per `OutputProcessor`, and a
+# `holdfast-core` test builds one per row — so the unoptimized figure lands on
+# every test and on every daemon a CLI test starts. Measured: the `--lib`
+# suite 156 s -> 32 s, `--test redaction_sweep` 662 s -> 66 s, and
+# `daemon_cli` 10.5 s -> 2.6 s, which is under its pre-#142 time. Nothing
+# about the shipped binary changes; `--release` already optimized both.
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3

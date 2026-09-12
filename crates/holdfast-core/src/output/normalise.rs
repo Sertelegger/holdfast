@@ -324,7 +324,8 @@ impl NormalView {
 /// Ordinary output — text, `\n`, `\r`, `\t` — returns an empty vector and
 /// costs one pass over the region, because no filter in the pipeline
 /// would remove any of it and all four rows of the table collapse onto
-/// the raw bytes. Colourised output returns one to three views.
+/// the raw bytes. Colourised output returns between one and eleven,
+/// depending on how many of the `VIEWS` rows reach distinct bytes.
 ///
 /// **The stripper starts in `Ground` at `region[0]`**, exactly as
 /// `render` does at `window_start`, so a view is byte-for-byte what that
