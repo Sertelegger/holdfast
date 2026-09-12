@@ -96,14 +96,36 @@ is cut, named and published is in
   credential straddling a read boundary with an escape inside it is still
   released half-emitted ([#142]). `redact: false` and `--raw` are byte-identical
   to before ([#125]).
-  **This closes the matching side of #125 and not every class of the
-  defect.** The *withholding* side — a credential still arriving with an
-  escape inside it is released half-emitted — is [#142] and is open; [#138]
-  (spans judged over the window while a sub-range is emitted) and [#139]
-  (8-bit C1 introducers, which the stripper does not open a sequence on and
-  the screen emulator discards as an unhandled control — the discard being
-  what splices the token) are open on the range and grammar axes. Redaction is not
+  **This closed the matching side of #125 and not every class of the
+  defect.** The range and grammar axes — [#138] (spans judged over the
+  window while a sub-range is emitted) and [#139] (8-bit C1 introducers,
+  which the stripper does not open a sequence on and the screen emulator
+  discards as an unhandled control — the discard being what splices the
+  token) — are now closed too; see the two entries below. The *withholding*
+  side is still open: a credential still arriving with an escape inside it
+  is released half-emitted ([#142]), and a token split across reads with an
+  escape inside it is still partly released ([#135]). Redaction is not
   closed as a class.
+- **Redaction now judges the bytes that go out, not only the window they
+  were drawn from ([#138]).** Spans were found over
+  `[window_start, window_end)` while the read emits `[req_start, read_end)`,
+  so a rule's `\b` could be decided by a lookbehind byte the caller never
+  receives — and the token that reached the caller therefore went
+  unredacted. The emitted page is now judged as well as the window.
+  Measured over a 61-fixture sweep: **51 of 61 leaked on paged geometry
+  before, 0 after.** The page pass adds markers only and cannot move the
+  cursor, which is pinned by a test with a `redact: false` control.
+- **An 8-bit C1 introducer planted inside a credential no longer survives
+  every view ([#139]).** The view enumeration came from the ANSI stripper's
+  grammar, which opens a sequence only on `0x1b`, so a token spliced with a
+  C1 byte matched no rule on any stream while `get_screen_state` redacted
+  the same line — the screen surface and the read surface disagreed about
+  the same bytes. The enumeration now carries a C1 axis with **two**
+  filters, not one: the emulator *discards* C1 as an unhandled control,
+  which is what splices the token in the grid, while a real 8-bit terminal
+  *consumes* it as a sequence introducer. Both streams are reachable and
+  both are now matched. Measured: **47 of 61 fixtures leaked whole-read
+  before, 0 after**; across all geometries, 4727 leaking rows → 0.
 - A session that has finished no longer keeps the writer thread that only a
   running child needs. The registry now holds live sessions and completed
   records separately, and retiring a record drops the sending half of its write
@@ -626,6 +648,7 @@ residuals that are known and accepted.
 [#126]: https://github.com/Sertelegger/holdfast/issues/126
 [#127]: https://github.com/Sertelegger/holdfast/issues/127
 [#129]: https://github.com/Sertelegger/holdfast/issues/129
+[#135]: https://github.com/Sertelegger/holdfast/issues/135
 [#138]: https://github.com/Sertelegger/holdfast/issues/138
 [#139]: https://github.com/Sertelegger/holdfast/issues/139
 [#142]: https://github.com/Sertelegger/holdfast/issues/142

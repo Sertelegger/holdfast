@@ -15,30 +15,51 @@
 //! byte stream that `render` and [`encode`] can *derive from the matched
 //! window* is matched before it is emitted. That is a closure over the
 //! **filters this pipeline applies**; it is not a closure over "what the
-//! caller ends up seeing", and two axes are known to remain open:
+//! caller ends up seeing". Two axes were open when this module landed and
+//! are now closed; each closure is stated here because the *shape* of it is
+//! what a later reader needs, not the fact of it.
 //!
-//! * **The window is not the payload (GH #138).** Spans are found over
-//!   `[window_start, window_end)` while `render` emits
-//!   `[req_start, read_end)`, so a `\b` can be decided by a lookbehind
-//!   byte the caller never receives.
-//! * **The enumeration is 7-bit (GH #139).** These views come from
+//! * **The window is not the payload (GH #138, closed).** Spans are found
+//!   over `[window_start, window_end)` while `render` emits
+//!   `[req_start, read_end)`, so a `\b` could be decided by a lookbehind
+//!   byte the caller never receives. `OutputProcessor::process` now judges
+//!   the emitted page as well as the window. The page pass adds **markers
+//!   only** — `advance_past_straddled` runs a second time *after*
+//!   `merge_spans`, because `merge_spans` joins spans that merely touch
+//!   (`span.start <= last.end`), so a page span ending at `read_end` and a
+//!   window span starting there become one span that does straddle. One
+//!   call is not enough and the reason is not visible from the call site.
+//! * **The enumeration is 7-bit (GH #139, closed).** These views come from
 //!   [`AnsiStripper`]'s grammar, which opens a sequence only on `0x1b`, so
-//!   an 8-bit C1 introducer survives every view and no view reassembles the
-//!   token. `get_screen_state` can therefore redact a line `read_output`
-//!   returns whole.
+//!   an 8-bit C1 introducer used to survive every view and no view
+//!   reassembled the token: `get_screen_state` could redact a line
+//!   `read_output` returned whole. [`View`] now carries a C1 axis, and it
+//!   carries **two** filters rather than one — [`C1::Drop`] and
+//!   [`C1::Strip`] — for the reason below.
 //!
 //!   **The emulator does NOT interpret C1, and the difference decides the
-//!   fix.** This paragraph said it did, GH #139 says it does, and both are
-//!   wrong. `vte` 0.15.0 documents *"Only supports 7-bit codes"*; it routes
+//!   fix.** An earlier revision of this paragraph said it did, GH #139 says
+//!   it does, and both are wrong. `vte` 0.15.0 documents *"Only supports
+//!   7-bit codes"*; it routes
 //!   `'\u{80}'..='\u{9f}'` to `Perform::execute` rather than to CSI entry,
 //!   and `vt100` 0.16.2's `execute` falls through to `unhandled_control`,
 //!   whose body is empty. So the emulator **drops** the byte — and dropping
 //!   it is precisely what splices the token back together in the grid.
-//!   A reader who takes the old sentence at face value writes a `c1_strip`
-//!   filter that consumes the introducer *as a sequence*, which models a
-//!   real 8-bit terminal but not this emulator, and so misses the very
-//!   stream `get_screen_state` redacts — the oracle the issue proposes.
-//!   Both filters are wanted; only one of them was implied.
+//!   A reader who takes the old sentence at face value writes only a
+//!   `c1_strip` filter that consumes the introducer *as a sequence*, which
+//!   models a real 8-bit terminal but not this emulator, and so misses the
+//!   very stream `get_screen_state` redacts — the oracle the issue
+//!   proposes. Both filters are wanted; only one of them was implied, which
+//!   is why [`C1`] has two variants and the view table has four rows per
+//!   pipeline filter rather than two.
+//!
+//! **What is still open is deliberately not listed here**, because a list
+//! of open axes in a module header is what went stale twice already. Each
+//! residual is documented where it is measured: GH #135's split-stream
+//! residual in `StreamRedactor`'s header, the tail-anchor cost at
+//! `TAIL_ANCHOR` in `tests/redaction_sweep.rs`, and the withholding side —
+//! a credential still arriving with an escape inside it — in
+//! `OutputProcessor::holdback_boundary` and GH #142.
 //!
 //! An earlier revision of this module claimed the unqualified form —
 //! *every byte stream a read can emit is matched before it is emitted* —
