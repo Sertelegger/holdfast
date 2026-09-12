@@ -98,6 +98,195 @@ pub const INSTRUCTIONS: &str = "Holdfast gives you PTY-backed shell sessions. st
 /// nothing and hold memory.
 const RESOURCE_EVENT_CAPACITY: usize = 16;
 
+/// A point in §9.6's arming path that a `#[cfg(test)]` row can meet the
+/// daemon at (GH #140).
+///
+/// **Labelled, and that is the whole design.** A bare arrival counter
+/// reads "somebody got here", which is not what any of these rows are
+/// waiting for: GH #140 measured a single-counter draft where the
+/// *listener's* arrival satisfied a wait meant for `start_session`'s, so
+/// the row went green in 0.26 s **with the statement it exists to
+/// measure deleted from `start_session`**. One name per site, and a wait
+/// for one name cannot be answered by another.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArmSite {
+    /// `start_session`, between `reservation.commit` and
+    /// `watch_for_autofill`: **GH #106's window, with the row inside
+    /// it.** A hold point — the call parks here until the row opens the
+    /// gate, so the window is as wide as the row needs rather than as
+    /// wide as a constant guessed.
+    StartSession,
+    /// `watch_for_autofill`, the statement after `subscribe_events`.
+    /// Reports and does not hold: it is how a row says *"an edge from
+    /// here on is delivered rather than lost"* as a fact about the
+    /// daemon instead of an inference from a clock.
+    Subscribed,
+    /// The listener task, between its subscription and its replay check.
+    /// A hold point — this is the half that arranges a **delivered** edge
+    /// sitting unread while the replay check reads the same episode off
+    /// the flag.
+    Listener,
+    /// The listener task, the statement after `replay_missed_echo_drop`
+    /// returns. Reports and does not hold, and it is what lets a row
+    /// bound an **absence**: *"the replay decided nothing"* becomes a
+    /// wait for the decision rather than for a duration hoped to cover
+    /// it. It is also what tells a row the replay decided *something*,
+    /// since the resolution is awaited before it is reported.
+    ReplayChecked,
+}
+
+/// Every arrival so far, plus whether the hold points are releasing.
+///
+/// `Copy` and sent whole through a [`tokio::sync::watch`], so a waiter
+/// never has to hold a lock across its `.await` and a late subscriber
+/// still sees arrivals that happened before it existed — which a
+/// `Notify` would have dropped, and dropping one is the same lost-edge
+/// bug these rows are about.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ArmLedger {
+    start_session: u32,
+    subscribed: u32,
+    listener: u32,
+    replay_checked: u32,
+    open: bool,
+}
+
+#[cfg(test)]
+impl ArmLedger {
+    fn at(&self, site: ArmSite) -> u32 {
+        match site {
+            ArmSite::StartSession => self.start_session,
+            ArmSite::Subscribed => self.subscribed,
+            ArmSite::Listener => self.listener,
+            ArmSite::ReplayChecked => self.replay_checked,
+        }
+    }
+
+    fn record(&mut self, site: ArmSite) {
+        match site {
+            ArmSite::StartSession => self.start_session += 1,
+            ArmSite::Subscribed => self.subscribed += 1,
+            ArmSite::Listener => self.listener += 1,
+            ArmSite::ReplayChecked => self.replay_checked += 1,
+        }
+    }
+}
+
+/// **`#[cfg(test)]` — GH #106's window as a rendezvous rather than a
+/// duration** (GH #140).
+///
+/// `start_session` spawns the child and arms §9.6's listener a few
+/// statements later, so a child that drops `ECHO` and prints in between
+/// loses its `AwaitingSecretEntered` to a `broadcast` with no receiver.
+/// The width of that window is the child's `fork`/`exec` cost — a
+/// property of the machine — so the three rows that exercise it have to
+/// hold the daemon still *while a real child runs*, and until GH #140
+/// they did it with a [`std::time::Duration`] this server slept.
+///
+/// **One constant cannot be both.** That duration was simultaneously the
+/// width of the production window and the row's deadline on a forked
+/// child reaching `stty -echo`; the window is wall-clock and the child
+/// is CPU-scheduled. Instrumented under an eight-lane contended run the
+/// child took **10.4–15.8 s** to reach echo-off against a 5 s window, so
+/// no constant was large enough — and because the constant *was* the
+/// window, a larger one slowed every run in the suite to buy it. The
+/// row failed **24 times in 24**.
+///
+/// A gate has no width. The call parks at its site until the row has
+/// seen what it came to see and opens it, so the ordering is an
+/// arrangement rather than a wish — the same move
+/// [`crate::secret::binding::tests::gated_echo_off`] makes on the child
+/// side, on the daemon side where a child-side gate cannot reach.
+///
+/// `#[cfg(test)]` and not a config knob, for the reason the duration was:
+/// it exists to make a defect reproducible, and a shipped binary that
+/// can be asked to hold a credential window open is a worse thing than
+/// the defect.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ArmGate {
+    ledger: tokio::sync::watch::Sender<ArmLedger>,
+}
+
+#[cfg(test)]
+impl ArmGate {
+    /// A gate that is **shut**: every hold point parks until
+    /// [`open`](ArmGate::open).
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            ledger: tokio::sync::watch::channel(ArmLedger::default()).0,
+        })
+    }
+
+    /// The daemon's side of a hold point: record the arrival, then park
+    /// until the row opens the gate.
+    ///
+    /// **Passing an already-open gate costs one `borrow` and no yield**,
+    /// which is what lets the armed-late row install a gate purely for
+    /// what it reports.
+    pub(crate) async fn hold(&self, site: ArmSite) {
+        let mut rx = self.ledger.subscribe();
+        self.ledger.send_modify(|l| l.record(site));
+        loop {
+            if rx.borrow_and_update().open {
+                return;
+            }
+            // Unreachable: both sides hold an `Arc<ArmGate>`, so the
+            // sender outlives every waiter. Returning rather than
+            // unwrapping keeps a torn-down row from turning its own
+            // cleanup into a second panic.
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// The daemon's side of a reporting point: record the arrival and
+    /// carry on.
+    pub(crate) fn passed(&self, site: ArmSite) {
+        self.ledger.send_modify(|l| l.record(site));
+    }
+
+    /// The row's side: return once `site` has been reached.
+    ///
+    /// **No deadline, on purpose.** What this waits for is one statement
+    /// of the daemon's executing, not a forked child's progress, and the
+    /// duration it replaces is the defect GH #140 is about. A row that
+    /// wants the arrival to be *impossible to have missed* asserts on
+    /// [`arrivals`](ArmGate::arrivals) instead, which fails rather than
+    /// waits.
+    pub(crate) async fn await_reached(&self, site: ArmSite) {
+        let mut rx = self.ledger.subscribe();
+        loop {
+            if rx.borrow_and_update().at(site) > 0 {
+                return;
+            }
+            // Unreachable, for the reason [`hold`](ArmGate::hold) gives.
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// The row's side: how many times `site` has been reached, **now**.
+    ///
+    /// This is the anti-deletion witness the three rows use, and it is a
+    /// fact rather than a duration: *"the listener had not subscribed
+    /// when the edge was classified"* is `arrivals(Subscribed) == 0`,
+    /// which a machine's load cannot move.
+    pub(crate) fn arrivals(&self, site: ArmSite) -> u32 {
+        self.ledger.borrow().at(site)
+    }
+
+    /// The row's side: let everything parked through, now and for the
+    /// rest of this gate's life.
+    pub(crate) fn open(&self) {
+        self.ledger.send_modify(|l| l.open = true);
+    }
+}
+
 #[derive(Clone)]
 pub struct HoldfastServer {
     pub registry: Arc<SessionRegistry>,
@@ -202,30 +391,13 @@ pub struct HoldfastServer {
     /// raise fans out to nobody and the waiting call runs out its
     /// deadline, which is the correct answer rather than a special case.
     pub attach_hub: Arc<crate::attach::hub::AttachHub>,
-    /// **`#[cfg(test)]` — the width of GH #106's window, on purpose.**
+    /// **`#[cfg(test)]` — where §9.6's arming path can be held still.**
     ///
-    /// `start_session` spawns the child and then arms §9.6's listener a
-    /// few statements later, so a child that drops `ECHO` and prints in
-    /// between loses its `AwaitingSecretEntered` to a `broadcast` with no
-    /// receiver. The window is real and its width is the child's
-    /// `fork`/`exec` cost — which is a property of the machine, not of
-    /// anything the daemon controls, so a row that merely raced it would
-    /// be green on a slow box for the wrong reason. Every existing
-    /// autofill row instead *gates* its child until after `start_session`
-    /// returns, which is why the suite was structurally blind to this.
-    ///
-    /// This is the width made an argument. Two sleeps read it —
-    /// `start_session`'s, immediately above the arming, and the listener
-    /// task's, between its `subscribe_events` and its replay check — so
-    /// one knob arranges both halves: an edge that is *lost* before the
-    /// subscription, and an edge that is *delivered* into it and must not
-    /// then be autofilled twice.
-    ///
-    /// `#[cfg(test)]` and not a config knob: it exists to make a defect
-    /// reproducible, and a shipped binary that can be asked to widen a
-    /// credential window is a worse thing than the defect.
+    /// `None` for every caller that is not one of the three GH #106 rows;
+    /// [`ArmGate`] carries the whole explanation, including why this
+    /// stopped being a [`std::time::Duration`] in GH #140.
     #[cfg(test)]
-    pub(crate) autofill_arm_delay: std::time::Duration,
+    pub(crate) autofill_arm_gate: Option<Arc<ArmGate>>,
 }
 
 impl HoldfastServer {
@@ -367,18 +539,20 @@ impl HoldfastServer {
             audit_open_error,
             capabilities,
             attach_hub: Arc::new(crate::attach::hub::AttachHub::new()),
-            // Zero, so every row that does not ask for the window pays
-            // nothing and takes no scheduler yield: both sleep sites are
-            // behind an `is_zero()` guard.
+            // `None`, so every row that does not ask for the window pays
+            // nothing and takes no scheduler yield: all four sites are
+            // behind an `Option`.
             #[cfg(test)]
-            autofill_arm_delay: std::time::Duration::ZERO,
+            autofill_arm_gate: None,
         }
     }
 
-    /// See [`autofill_arm_delay`](HoldfastServer::autofill_arm_delay).
+    /// See [`ArmGate`]. The row keeps its own handle — it has to, since
+    /// opening the gate is the row's move — so this clones rather than
+    /// takes.
     #[cfg(test)]
-    pub(crate) fn with_autofill_arm_delay(mut self, delay: std::time::Duration) -> Self {
-        self.autofill_arm_delay = delay;
+    pub(crate) fn with_autofill_arm_gate(mut self, gate: &Arc<ArmGate>) -> Self {
+        self.autofill_arm_gate = Some(Arc::clone(gate));
         self
     }
 

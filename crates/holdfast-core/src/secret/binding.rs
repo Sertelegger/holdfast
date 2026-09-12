@@ -7728,41 +7728,69 @@ mod tests {
     // silently disabled autofill for every child fast enough to prompt
     // inside it, with all of the above green.
     //
-    // The three rows below are the ones a gate cannot express. All three
-    // drive `HoldfastServer::autofill_arm_delay`, which is the width of
-    // that window turned into an argument, and between them they pin the
-    // replay from every side: an edge that is **lost** must still be
-    // answered, an edge that is **delivered** must not be answered twice,
-    // and a region that is **over** must not be answered at all.
+    // The three rows below are the ones a *child-side* gate cannot
+    // express, because the ordering they need is the **daemon's**. All
+    // three hold §9.6's arming path still through [`crate::mcp::ArmGate`],
+    // and between them they pin the replay from every side: an edge that
+    // is **lost** must still be answered, an edge that is **delivered**
+    // must not be answered twice, and a region that is **over** must not
+    // be answered at all.
+    //
+    // **They held it still with a duration until GH #140**, and one
+    // constant cannot do that job: it was simultaneously the width of the
+    // production window and the row's deadline on a forked child reaching
+    // `stty -echo`. The window is wall-clock and the child is
+    // CPU-scheduled, so under an eight-lane contended run the child took
+    // 10.4–15.8 s against a 5 s window and the first row failed **24 runs
+    // in 24** — every one of them at that deadline and none at its
+    // subject. Raising the constant was not available either, because the
+    // constant *was* the window and every run in the suite paid it. A
+    // gate has no width, so there is no constant left to be wrong.
+    //
+    // **What the gate does not remove is the need to notice a wedge**,
+    // and the pre-PR review of GH #140 measured that in both directions:
+    // with the daemon's echo-off classification broken, two of these rows
+    // spun at 2 ms forever instead of failing, and with
+    // `watch_for_autofill` returning early — GH #106's own failure mode —
+    // two of them waited on an event nobody would ever send, for 590 s
+    // and 120 s, naming nobody. `cargo test` has no per-test timeout, and
+    // `scripts/ci-flake-hunt.sh` deliberately runs `cargo test`, so a
+    // wedge there burns the job's whole 180 minutes in silence. Hence
+    // [`WEDGE_DETECTOR`] and the `arrivals(Subscribed)` assertions below,
+    // neither of which anything is measured *against*.
 
-    /// How long `start_session` waits before arming, in the **lost-edge**
-    /// row below.
+    /// **A hang detector, and emphatically not a window** (GH #140).
     ///
-    /// **A constant because every assertion about that row's arrangement
-    /// is relative to it**, not because five seconds is special. The issue
-    /// measured 15 ms taking an ungated row to 6/6 red and 5 ms to 0/8, so
-    /// the window only has to outlast one `fork`/`exec`; the rest is
-    /// margin, and margin is what lets the row *prove* the ordering from a
-    /// monotonic clock rather than assume it. Overrunning it is an
-    /// assertion about the arrangement and never a quiet pass.
-    const LOST_EDGE_WINDOW: Duration = Duration::from_secs(5);
-
-    /// The same, for the **delivered-edge** row — and five times as long,
-    /// which is measured rather than cautious.
+    /// Nothing in the three rows below is timed against this. Every
+    /// ordering they need is an arrangement now: the daemon is parked at
+    /// an [`crate::mcp::ArmGate`] site while these waits run, so nothing
+    /// is expiring and overrunning this cannot mean *"the box was slow"*.
+    /// It can only mean the child never reached its prompt or the daemon
+    /// never reached a site, which is a wedged row — and a wedged row
+    /// under `cargo test` is a silent three-hour job rather than a
+    /// failure.
     ///
-    /// That row has to get its child from *gated* to *prompting* inside
-    /// the window, and [`gated`] polls with `sleep 1`: the budget is a
-    /// second of granularity plus however long a loaded box takes to
-    /// schedule a shell, not one `fork`/`exec`. At two seconds it failed
-    /// **3 runs in 12** of the whole `secret::binding` set at
-    /// `--test-threads=16` pinned to two cores, as *"the child is not at
-    /// its first echo-off region"*.
-    const DELIVERED_EDGE_WINDOW: Duration = Duration::from_secs(10);
+    /// **Seven times the worst measurement GH #140 took**, which is the
+    /// point: that issue's child reached `stty -echo` in 10.4–15.8 s
+    /// under an eight-lane contended run, so this fires on a regression
+    /// and on nothing else. It is also inside `.config/nextest.toml`'s
+    /// 300 s `terminate-after`, so the row names itself before the
+    /// harness has to.
+    const WEDGE_DETECTOR: Duration = Duration::from_secs(120);
 
-    /// The same, for the **armed-late** row, which budgets no child work
-    /// at all: it exists only so the row can wait past a replay check that
-    /// has provably run. Twice this is the whole of that row's waiting.
-    const ARM_ORDERING_DELAY: Duration = Duration::from_secs(1);
+    /// [`crate::mcp::ArmGate::await_reached`] with [`WEDGE_DETECTOR`] on
+    /// it, because a site that nothing will ever report is a wait that
+    /// never ends.
+    async fn await_arm_site(gate: &Arc<crate::mcp::ArmGate>, site: crate::mcp::ArmSite) {
+        tokio::time::timeout(WEDGE_DETECTOR, gate.await_reached(site))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the daemon never reached {site:?} in {WEDGE_DETECTOR:?}, so this row is \
+                     wedged on a site nothing is going to report"
+                )
+            });
+    }
 
     /// The **production wiring with nothing gated**: a child that draws
     /// its credential prompt before `start_session` has armed the
@@ -7780,13 +7808,17 @@ mod tests {
     /// child sits there until the idle timeout with no client, no raise,
     /// no audit line and no error.
     ///
-    /// **The ordering is proved from a monotonic clock, not raced.**
-    /// `started_at` is read before the call; the delay begins after it, so
-    /// the earliest this session's listener can subscribe is
-    /// `started_at + LOST_EDGE_WINDOW`. Every wait below therefore carries that
-    /// instant as its deadline, and reaching it is an assertion failure
-    /// about the *arrangement* — which is the failure a row that merely
-    /// hoped would report as a product defect.
+    /// **The ordering is an arrangement, not a race and not a clock.**
+    /// The call parks at [`crate::mcp::ArmSite::StartSession`] — after
+    /// the reservation commits, before `watch_for_autofill` — and stays there
+    /// until this row opens the gate, so the window is exactly as wide as
+    /// the child needs and no wider. Two facts stand in for the elapsed
+    /// time this row used to assert (GH #140): the call is still parked
+    /// when the edge is observed, which the `select!` below proves by
+    /// failing if `start_session` returns first, and
+    /// `arrivals(Subscribed) == 0`, which is *"no listener existed to
+    /// receive that edge"* said as a fact about the daemon rather than
+    /// inferred from a duration.
     ///
     /// **Red without the fix**, and its message is the issue's own:
     /// `"got=HUNTER2" never reached the buffer` after the child sat at
@@ -7808,11 +7840,10 @@ mod tests {
             env: Default::default(),
             cwd: None,
         }];
-        let server =
-            server_with(security, &sc.audit_log()).with_autofill_arm_delay(LOST_EDGE_WINDOW);
+        let gate = crate::mcp::ArmGate::new();
+        let server = server_with(security, &sc.audit_log()).with_autofill_arm_gate(&gate);
 
-        let started_at = tokio::time::Instant::now();
-        let call = {
+        let mut call = {
             let server = server.clone();
             tokio::spawn(async move {
                 server
@@ -7824,18 +7855,37 @@ mod tests {
             })
         };
 
-        // `registry.insert` runs **before** the delay, so the session is
-        // reachable while its listener does not yet exist — which is also
-        // the only way this row can hold the session before the call it is
-        // racing has returned.
-        let s = await_only_session(&server, started_at + LOST_EDGE_WINDOW).await;
+        // **The rendezvous, and the witness that the window is real.**
+        // The only thing that can hold `start_session` short of its
+        // response is the arm site; delete that statement and the call
+        // runs to completion, which is this `select!`'s other arm and a
+        // named failure rather than a wait that never ends. It replaces
+        // an `elapsed() >= LOST_EDGE_WINDOW` that could only ever say the
+        // call was *slow* (GH #140).
+        tokio::select! {
+            () = await_arm_site(&gate, crate::mcp::ArmSite::StartSession) => {}
+            r = &mut call => panic!(
+                "`start_session` finished without parking at the arm site, so the listener \
+                 was armed before this row could look and the edge below was never at risk \
+                 of being missed: {r:?}"
+            ),
+        }
+
+        // The reservation commits **before** the arm site, so a session
+        // that is not here now is a broken arrangement and not a slow one.
+        let s = the_only_session(&server);
         // **The edge, observed while the listener provably is not there.**
+        // No *window*: what this waits for is a forked child, whose pace
+        // is the machine's, and the call it is racing is parked rather
+        // than running out a clock. [`WEDGE_DETECTOR`] is the other
+        // thing — overrunning it means the child never prompted at all.
+        let wedged_by = tokio::time::Instant::now() + WEDGE_DETECTOR;
         while !s.is_awaiting_secret() {
             assert!(
-                tokio::time::Instant::now() < started_at + LOST_EDGE_WINDOW,
-                "the child had not reached its echo-off prompt within {LOST_EDGE_WINDOW:?} of \
-                 `start_session` being called, so this row did not exercise the window \
-                 it exists for"
+                tokio::time::Instant::now() < wedged_by,
+                "the child never reached its echo-off prompt, with `start_session` parked \
+                 at its arm site for {WEDGE_DETECTOR:?} — so this is a wedged row and not \
+                 a window too narrow for it"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -7845,23 +7895,35 @@ mod tests {
             "the child ran more than one echo-off region before the listener was armed, \
              so the replay below is not the one this row is about"
         );
+        // **"Lost" is a fact here, not an inference.** The edge above was
+        // classified with nothing subscribed to receive it; a version of
+        // `start_session` that armed first would be exercising
+        // [`start_session_arms_the_echo_drop_watcher`]'s delivered edge
+        // under this row's name.
+        assert_eq!(
+            gate.arrivals(crate::mcp::ArmSite::Subscribed),
+            0,
+            "a listener had already subscribed when the child's echo drop was classified, \
+             so this row is measuring a delivered edge and not a lost one"
+        );
+
+        // Everything above happened inside the window. Let the daemon on.
+        gate.open();
 
         let started = tokio::time::timeout(Duration::from_secs(60), call)
             .await
             .expect("`start_session` never returned")
             .expect("the `start_session` task")
             .expect("start_session");
-        // **The witness that the window was real**, and not a second copy
-        // of [`start_session_arms_the_echo_drop_watcher`] with its gate
-        // deleted. The only thing that can make this call take
-        // `LOST_EDGE_WINDOW` is the delay it is supposed to wait *before* arming;
-        // delete that statement and the two waits above still pass on any
-        // machine, because a delivered edge works fine.
-        assert!(
-            started_at.elapsed() >= LOST_EDGE_WINDOW,
-            "`start_session` returned in {:?}, so it did not wait {LOST_EDGE_WINDOW:?} before \
-             arming and the edge above was never at risk of being missed",
-            started_at.elapsed()
+        // **And the listener exists.** `watch_for_autofill` returns
+        // without subscribing when autofill is not configured — which is
+        // GH #106's own failure mode — and every assertion below would
+        // then be about a server with no listener at all.
+        assert_eq!(
+            gate.arrivals(crate::mcp::ArmSite::Subscribed),
+            1,
+            "`start_session` returned without arming a listener, so nothing below is \
+             about the replay this row exists for"
         );
         assert_eq!(
             body(&started)["data"]["session_id"]
@@ -7903,7 +7965,7 @@ mod tests {
     /// This is the half a bare `if is_awaiting_secret() { autofill }`
     /// gets wrong, and the reason the issue's own note called that
     /// caution correct. The listener subscribes *first* here, so the edge
-    /// is delivered rather than lost; the delay then sits between the
+    /// is delivered rather than lost; the gate then holds it between the
     /// subscription and the replay check, so by the time the check runs
     /// the same episode is readable off the flag **and** sitting unread in
     /// the receiver. Without the `episode <= answered` guard that is two
@@ -7930,8 +7992,9 @@ mod tests {
         let child_gate = sc.path("child.gate");
         let second_gate = sc.path("second.gate");
         let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let gate = crate::mcp::ArmGate::new();
         let server = server_with(autofill_mode(vec![b], true), &sc.audit_log())
-            .with_autofill_arm_delay(DELIVERED_EDGE_WINDOW);
+            .with_autofill_arm_gate(&gate);
         // Two `stty -echo` runs, so **two** episodes — not the
         // `echo_off_two_reads_second_abandoned` shape, which is two reads
         // inside *one*.
@@ -7960,10 +8023,21 @@ mod tests {
             &gated(&child_gate, &two_episodes),
         );
         server.registry.insert(Arc::clone(&s)).expect("register");
-        let armed_at = tokio::time::Instant::now();
         // Subscribes synchronously — so nothing here is lost — and then
-        // sleeps `DELIVERED_EDGE_WINDOW` before its replay check.
+        // parks at [`crate::mcp::ArmSite::Listener`], which is between
+        // that subscription and its replay check.
         server.watch_for_autofill(&s);
+        // **That it subscribed at all is a fact, and it is checked.**
+        // `watch_for_autofill` returns early when autofill is not
+        // configured, and then `ReplayChecked` never arrives: every
+        // absence below would pass for want of a listener and the wait
+        // after them would never end.
+        assert_eq!(
+            gate.arrivals(crate::mcp::ArmSite::Subscribed),
+            1,
+            "`watch_for_autofill` returned without subscribing, so this server has no \
+             listener and this row would be measuring its absence"
+        );
         std::fs::write(&child_gate, b"go").expect("release the child");
 
         // **The collision, proved rather than assumed.** The child is at
@@ -7980,12 +8054,16 @@ mod tests {
         // `left: 0`. The edge is what this row needs, so the edge is what
         // it waits for.
         await_prompt(&s, b"Password: ").await;
+        // No *window*: the listener is parked, so nothing is expiring
+        // while this waits on a forked child (GH #140).
+        // [`WEDGE_DETECTOR`] is the other thing.
+        let wedged_by = tokio::time::Instant::now() + WEDGE_DETECTOR;
         while !s.is_awaiting_secret() {
             assert!(
-                tokio::time::Instant::now() < armed_at + DELIVERED_EDGE_WINDOW,
-                "the listener's replay check ran before the child's echo drop was \
-                 classified, so the edge this row needs it to collide with had not \
-                 fired yet"
+                tokio::time::Instant::now() < wedged_by,
+                "the child drew its prompt and the detector never classified the echo-off \
+                 region in {WEDGE_DETECTOR:?}, with the listener parked at its arm site \
+                 throughout — so this is a wedged row"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -7996,23 +8074,39 @@ mod tests {
         );
         assert!(
             !sc.ran("prod-ssh"),
-            "the listener answered before its replay check — the delay is not in force, \
+            "the listener answered before its replay check — the gate is not in force, \
              and this row is measuring an ordinary delivered edge"
         );
-
-        // **The witness that the replay answered the first read, and not
-        // the delivered edge.** The listener's own sleep sits between its
-        // `subscribe_events` and its replay check, so nothing it does can
-        // land before `armed_at + DELIVERED_EDGE_WINDOW`; delete that statement and
-        // this credential arrives in milliseconds, from the `Entered` arm,
-        // with no collision for the guard to resolve.
-        buffer_until_count(&s, b"got=", 1, 60).await;
-        assert!(
-            armed_at.elapsed() >= DELIVERED_EDGE_WINDOW,
-            "the first read was answered {:?} after the listener was armed, which is \
-             less than the {DELIVERED_EDGE_WINDOW:?} it is supposed to wait before its replay check",
-            armed_at.elapsed()
+        // **The collision is arranged rather than hoped for.** The replay
+        // check has *not run*, and the edge it will read off the flag is
+        // already classified and already queued behind it. Delete the
+        // listener's hold and this is `1` here, with this message, where
+        // an `elapsed() >= DELIVERED_EDGE_WINDOW` used to be the thing
+        // that noticed (GH #140).
+        assert_eq!(
+            gate.arrivals(crate::mcp::ArmSite::ReplayChecked),
+            0,
+            "the listener's replay check had already run when the child's echo drop was \
+             classified, so the edge this row needs it to collide with fired after it"
         );
+
+        // Let the replay check run, into the collision above.
+        gate.open();
+        // **The witness that the *replay* answered the first read and not
+        // the delivered edge**, which is the other half of what that
+        // elapsed assertion was standing in for. `ReplayChecked` is
+        // reported after `replay_missed_echo_drop` returns, and that
+        // function awaits the resolution it performs — so a provider that
+        // has not run by the time this arrives is a replay that decided
+        // nothing and an `Entered` arm that will answer the prompt
+        // instead. That is GH #106 restored, and it is red here.
+        await_arm_site(&gate, crate::mcp::ArmSite::ReplayChecked).await;
+        assert!(
+            sc.ran("prod-ssh"),
+            "the replay check ran and resolved nothing, so the first read is being left \
+             to the delivered edge and the collision this row is about never happened"
+        );
+        buffer_until_count(&s, b"got=", 1, 60).await;
 
         // The second region, which the listener can only reach by having
         // already passed `Entered { episode: 1 }`.
@@ -8060,19 +8154,32 @@ mod tests {
     /// is no way to force a `broadcast` lag without a capacity knob; this
     /// arranges the same **state** by arming late instead.
     ///
-    /// **The absence is bounded by the knob rather than by a sleep.** The
-    /// listener's replay check runs `ARM_ORDERING_DELAY` after it is armed, so at
-    /// twice that it has provably run; what follows it is a second
-    /// echo-off region that *must* be answered, which is what stops the
-    /// row passing against a listener that does nothing at all.
+    /// **The absence is bounded by the event and not by a duration**
+    /// (GH #140). This row holds nothing still — the region it cares
+    /// about is already over before the listener is armed — so it opens
+    /// the gate first and uses the one signal it actually needs:
+    /// [`crate::mcp::ArmSite::ReplayChecked`], reported the statement
+    /// after `replay_missed_echo_drop` returns. *"The replay check has
+    /// run and resolved nothing"* is then a fact, and strictly tighter
+    /// than the `2 × ARM_ORDERING_DELAY` sleep it replaces, which was a
+    /// guess that one second was more than the check would ever take.
+    /// What follows is a second echo-off region that *must* be answered,
+    /// which is what stops the row passing against a listener that does
+    /// nothing at all.
     #[tokio::test]
     async fn a_listener_armed_after_the_prompt_is_gone_resolves_nothing() {
         let mut sc = Scratch::new("armedlate");
         let leave = sc.path("leave.gate");
-        let gate = sc.path("second.gate");
+        let second_gate = sc.path("second.gate");
         let b = sc.binding("prod-ssh", PROD_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let gate = crate::mcp::ArmGate::new();
         let server = server_with(autofill_mode(vec![b], true), &sc.audit_log())
-            .with_autofill_arm_delay(ARM_ORDERING_DELAY);
+            .with_autofill_arm_gate(&gate);
+        // **Open from the start**, and the only row here that wants it
+        // that way: nothing has to be held for this arrangement, since
+        // the region is over before the listener exists. The gate is here
+        // for what it *reports*.
+        gate.open();
         // One echo-off region the child leaves **visibly** — the print
         // after `stty echo` is what produces the `AwaitingSecretLeft` edge
         // at all — and then a second one it holds at a gate.
@@ -8080,7 +8187,7 @@ mod tests {
             "until [ -f '{}' ]; do sleep 1; done; stty echo; printf 'left=1\\n'",
             leave.display()
         ));
-        let child = format!("{first}; {}", gated(&gate, ECHO_OFF_FIXTURE));
+        let child = format!("{first}; {}", gated(&second_gate, ECHO_OFF_FIXTURE));
         let s = session_running(Some(PROD_PROFILE), "ssh", &["prod-01"], &child);
         server.registry.insert(Arc::clone(&s)).expect("register");
 
@@ -8118,9 +8225,18 @@ mod tests {
             "the child is not one echo-off region past its start"
         );
 
-        let armed_at = tokio::time::Instant::now();
         server.watch_for_autofill(&s);
-        tokio::time::sleep_until(armed_at + ARM_ORDERING_DELAY * 2).await;
+        // **A listener exists**, without which every absence below is
+        // vacuous and the wait after them never ends.
+        assert_eq!(
+            gate.arrivals(crate::mcp::ArmSite::Subscribed),
+            1,
+            "`watch_for_autofill` returned without subscribing, so this server has no \
+             listener and this row would be measuring its absence"
+        );
+        // The replay check has **run**, which is the fact this absence
+        // needs; twice a duration was only ever a bet that it had.
+        await_arm_site(&gate, crate::mcp::ArmSite::ReplayChecked).await;
         assert!(
             !sc.ran("prod-ssh"),
             "the listener resolved a credential for an echo-off region that was over \
@@ -8134,7 +8250,7 @@ mod tests {
 
         // **The clock for that absence**: the listener is alive and the
         // next region proves it.
-        std::fs::write(&gate, b"go").expect("open the second gate");
+        std::fs::write(&second_gate, b"go").expect("open the second gate");
         let seen = buffer_until(&s, b"got=HUNTER2", 20).await;
         assert_eq!(
             occurrences(&seen, b"got="),
@@ -8151,31 +8267,28 @@ mod tests {
         let _ = s.signal(Signal::Kill);
     }
 
-    /// The one session this server has, as soon as it has one.
+    /// The one session this server has, **now**.
     ///
-    /// **A poll on the registry and not on the call's return value**,
+    /// **A read of the registry and not of the call's return value**,
     /// because the lost-edge row above holds the session while the
     /// `start_session` that created it is still running: the insert
-    /// happens before the window it measures, and the response after it.
-    async fn await_only_session(
-        server: &HoldfastServer,
-        deadline: tokio::time::Instant,
-    ) -> Arc<Session> {
-        loop {
-            let all = server.registry.all();
-            assert!(
-                all.len() < 2,
-                "this server was supposed to have one session"
-            );
-            if let Some(s) = all.into_iter().next() {
-                return s;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "`start_session` had not registered its session in time"
-            );
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+    /// happens before the arm site the row meets it at, and the response
+    /// after the gate opens.
+    ///
+    /// No poll and no deadline (GH #140). The row has already waited for
+    /// [`crate::mcp::ArmSite::StartSession`] and the reservation commits
+    /// upstream of it, so an empty registry here is a broken arrangement
+    /// rather than a slow one — and saying so at the assertion is worth
+    /// more than spending a timeout to say it less clearly.
+    fn the_only_session(server: &HoldfastServer) -> Arc<Session> {
+        let all = server.registry.all();
+        assert_eq!(
+            all.len(),
+            1,
+            "`start_session` parked at its arm site without leaving exactly one session \
+             in the registry"
+        );
+        all.into_iter().next().expect("the one session")
     }
 
     // ================================= GH #55: the agent's environment
