@@ -7746,6 +7746,51 @@ mod tests {
     // subject. Raising the constant was not available either, because the
     // constant *was* the window and every run in the suite paid it. A
     // gate has no width, so there is no constant left to be wrong.
+    //
+    // **What the gate does not remove is the need to notice a wedge**,
+    // and the pre-PR review of GH #140 measured that in both directions:
+    // with the daemon's echo-off classification broken, two of these rows
+    // spun at 2 ms forever instead of failing, and with
+    // `watch_for_autofill` returning early — GH #106's own failure mode —
+    // two of them waited on an event nobody would ever send, for 590 s
+    // and 120 s, naming nobody. `cargo test` has no per-test timeout, and
+    // `scripts/ci-flake-hunt.sh` deliberately runs `cargo test`, so a
+    // wedge there burns the job's whole 180 minutes in silence. Hence
+    // [`WEDGE_DETECTOR`] and the `arrivals(Subscribed)` assertions below,
+    // neither of which anything is measured *against*.
+
+    /// **A hang detector, and emphatically not a window** (GH #140).
+    ///
+    /// Nothing in the three rows below is timed against this. Every
+    /// ordering they need is an arrangement now: the daemon is parked at
+    /// an [`crate::mcp::ArmGate`] site while these waits run, so nothing
+    /// is expiring and overrunning this cannot mean *"the box was slow"*.
+    /// It can only mean the child never reached its prompt or the daemon
+    /// never reached a site, which is a wedged row — and a wedged row
+    /// under `cargo test` is a silent three-hour job rather than a
+    /// failure.
+    ///
+    /// **Seven times the worst measurement GH #140 took**, which is the
+    /// point: that issue's child reached `stty -echo` in 10.4–15.8 s
+    /// under an eight-lane contended run, so this fires on a regression
+    /// and on nothing else. It is also inside `.config/nextest.toml`'s
+    /// 300 s `terminate-after`, so the row names itself before the
+    /// harness has to.
+    const WEDGE_DETECTOR: Duration = Duration::from_secs(120);
+
+    /// [`crate::mcp::ArmGate::await_reached`] with [`WEDGE_DETECTOR`] on
+    /// it, because a site that nothing will ever report is a wait that
+    /// never ends.
+    async fn await_arm_site(gate: &Arc<crate::mcp::ArmGate>, site: crate::mcp::ArmSite) {
+        tokio::time::timeout(WEDGE_DETECTOR, gate.await_reached(site))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the daemon never reached {site:?} in {WEDGE_DETECTOR:?}, so this row is \
+                     wedged on a site nothing is going to report"
+                )
+            });
+    }
 
     /// The **production wiring with nothing gated**: a child that draws
     /// its credential prompt before `start_session` has armed the
@@ -7818,7 +7863,7 @@ mod tests {
         // an `elapsed() >= LOST_EDGE_WINDOW` that could only ever say the
         // call was *slow* (GH #140).
         tokio::select! {
-            () = gate.await_reached(crate::mcp::ArmSite::StartSession) => {}
+            () = await_arm_site(&gate, crate::mcp::ArmSite::StartSession) => {}
             r = &mut call => panic!(
                 "`start_session` finished without parking at the arm site, so the listener \
                  was armed before this row could look and the edge below was never at risk \
@@ -7830,10 +7875,18 @@ mod tests {
         // that is not here now is a broken arrangement and not a slow one.
         let s = the_only_session(&server);
         // **The edge, observed while the listener provably is not there.**
-        // No deadline: what this waits for is a forked child, whose pace
+        // No *window*: what this waits for is a forked child, whose pace
         // is the machine's, and the call it is racing is parked rather
-        // than running out a clock.
+        // than running out a clock. [`WEDGE_DETECTOR`] is the other
+        // thing — overrunning it means the child never prompted at all.
+        let wedged_by = tokio::time::Instant::now() + WEDGE_DETECTOR;
         while !s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < wedged_by,
+                "the child never reached its echo-off prompt, with `start_session` parked \
+                 at its arm site for {WEDGE_DETECTOR:?} — so this is a wedged row and not \
+                 a window too narrow for it"
+            );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         assert_eq!(
@@ -7862,6 +7915,16 @@ mod tests {
             .expect("`start_session` never returned")
             .expect("the `start_session` task")
             .expect("start_session");
+        // **And the listener exists.** `watch_for_autofill` returns
+        // without subscribing when autofill is not configured — which is
+        // GH #106's own failure mode — and every assertion below would
+        // then be about a server with no listener at all.
+        assert_eq!(
+            gate.arrivals(crate::mcp::ArmSite::Subscribed),
+            1,
+            "`start_session` returned without arming a listener, so nothing below is \
+             about the replay this row exists for"
+        );
         assert_eq!(
             body(&started)["data"]["session_id"]
                 .as_str()
@@ -7964,6 +8027,17 @@ mod tests {
         // parks at [`crate::mcp::ArmSite::Listener`], which is between
         // that subscription and its replay check.
         server.watch_for_autofill(&s);
+        // **That it subscribed at all is a fact, and it is checked.**
+        // `watch_for_autofill` returns early when autofill is not
+        // configured, and then `ReplayChecked` never arrives: every
+        // absence below would pass for want of a listener and the wait
+        // after them would never end.
+        assert_eq!(
+            gate.arrivals(crate::mcp::ArmSite::Subscribed),
+            1,
+            "`watch_for_autofill` returned without subscribing, so this server has no \
+             listener and this row would be measuring its absence"
+        );
         std::fs::write(&child_gate, b"go").expect("release the child");
 
         // **The collision, proved rather than assumed.** The child is at
@@ -7980,9 +8054,17 @@ mod tests {
         // `left: 0`. The edge is what this row needs, so the edge is what
         // it waits for.
         await_prompt(&s, b"Password: ").await;
-        // No deadline: the listener is parked, so nothing is expiring
+        // No *window*: the listener is parked, so nothing is expiring
         // while this waits on a forked child (GH #140).
+        // [`WEDGE_DETECTOR`] is the other thing.
+        let wedged_by = tokio::time::Instant::now() + WEDGE_DETECTOR;
         while !s.is_awaiting_secret() {
+            assert!(
+                tokio::time::Instant::now() < wedged_by,
+                "the child drew its prompt and the detector never classified the echo-off \
+                 region in {WEDGE_DETECTOR:?}, with the listener parked at its arm site \
+                 throughout — so this is a wedged row"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(
@@ -8018,7 +8100,7 @@ mod tests {
         // has not run by the time this arrives is a replay that decided
         // nothing and an `Entered` arm that will answer the prompt
         // instead. That is GH #106 restored, and it is red here.
-        gate.await_reached(crate::mcp::ArmSite::ReplayChecked).await;
+        await_arm_site(&gate, crate::mcp::ArmSite::ReplayChecked).await;
         assert!(
             sc.ran("prod-ssh"),
             "the replay check ran and resolved nothing, so the first read is being left \
@@ -8144,9 +8226,17 @@ mod tests {
         );
 
         server.watch_for_autofill(&s);
+        // **A listener exists**, without which every absence below is
+        // vacuous and the wait after them never ends.
+        assert_eq!(
+            gate.arrivals(crate::mcp::ArmSite::Subscribed),
+            1,
+            "`watch_for_autofill` returned without subscribing, so this server has no \
+             listener and this row would be measuring its absence"
+        );
         // The replay check has **run**, which is the fact this absence
         // needs; twice a duration was only ever a bet that it had.
-        gate.await_reached(crate::mcp::ArmSite::ReplayChecked).await;
+        await_arm_site(&gate, crate::mcp::ArmSite::ReplayChecked).await;
         assert!(
             !sc.ran("prod-ssh"),
             "the listener resolved a credential for an echo-off region that was over \
