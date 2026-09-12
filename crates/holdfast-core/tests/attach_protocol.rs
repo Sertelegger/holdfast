@@ -1549,6 +1549,7 @@ fn write_frames() -> Vec<(ClientFrame, &'static str)> {
             ClientFrame::SecretInput {
                 request_id: "secreq_none".into(),
                 bytes: b"XYZZY\n".to_vec(),
+                allow_echo: false,
             },
             "SecretInput",
         ),
@@ -2567,6 +2568,7 @@ async fn a_mismatched_request_id_is_rejected_and_writes_nothing() {
         &ClientFrame::SecretInput {
             request_id: "secreq_wrong".into(),
             bytes: PROBE.as_bytes().to_vec(),
+            allow_echo: false,
         },
     )
     .await;
@@ -2590,6 +2592,7 @@ async fn a_mismatched_request_id_is_rejected_and_writes_nothing() {
         &ClientFrame::SecretInput {
             request_id: real_id,
             bytes: PROBE.as_bytes().to_vec(),
+            allow_echo: false,
         },
     )
     .await;
@@ -2618,6 +2621,7 @@ async fn fulfilling_the_request_closes_it_for_every_other_client() {
         &ClientFrame::SecretInput {
             request_id: id.clone(),
             bytes: PROBE.as_bytes().to_vec(),
+            allow_echo: false,
         },
     )
     .await;
@@ -2663,6 +2667,7 @@ async fn a_secret_input_from_a_readonly_client_is_rejected() {
         &ClientFrame::SecretInput {
             request_id: id.clone(),
             bytes: PROBE.as_bytes().to_vec(),
+            allow_echo: false,
         },
     )
     .await;
@@ -2684,6 +2689,7 @@ async fn a_secret_input_from_a_readonly_client_is_rejected() {
         &ClientFrame::SecretInput {
             request_id: id,
             bytes: PROBE.as_bytes().to_vec(),
+            allow_echo: false,
         },
     )
     .await;
@@ -2769,6 +2775,7 @@ async fn a_secret_submitted_over_attach_reaches_the_child_and_none_of_the_surfac
         &ClientFrame::SecretInput {
             request_id: id,
             bytes: PROBE.as_bytes().to_vec(),
+            allow_echo: false,
         },
     )
     .await;

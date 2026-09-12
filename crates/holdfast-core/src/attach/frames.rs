@@ -148,6 +148,53 @@ pub enum ClientFrame {
         request_id: String,
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
+        /// *"I can see this terminal, I know it echoes, send it anyway"*
+        /// (GH #137).
+        ///
+        /// The daemon gates this frame's write on the child's line
+        /// discipline — `false`, the default, means *decline the write
+        /// unless the child is at an echo-off read*. A child that echoes
+        /// puts the credential in the ring buffer, and `read_output`
+        /// hands it back to the agent in the clear; an arbitrary password
+        /// matches no redaction rule, so nothing downstream removes it.
+        ///
+        /// **Additive and `#[serde(default)]`, exactly like `terminal`
+        /// and `role` above — and `false` is the safe value for the same
+        /// reason `AttachRole::Observer` is.** A client built before this
+        /// field existed sends no such key, and the frame it sends must
+        /// then fail *closed*. Unlike `terminal`, the attribute is doing
+        /// real work here: a `bool` has no `None` for serde to fall back
+        /// to, so without it a 1.2 client's frame would not deserialize
+        /// at all.
+        ///
+        /// **The other direction is a downgrade, stated rather than
+        /// assumed**: a 1.3 client sending `allow_echo: false` to a 1.2
+        /// daemon still gets the *ungated* write, because the older
+        /// daemon has no gate to ask. That is the ordinary meaning of a
+        /// minor bump — `role` has the identical shape, where an older
+        /// daemon hands an `observer` the raw stream — and the protection
+        /// this field selects is the daemon's, not the frame's.
+        ///
+        /// **It is not a client's claim about the child.** The daemon
+        /// never believes this field about the terminal; it reads the tty
+        /// itself, on the writer thread, one statement before the write.
+        /// What the field carries is that a *human* accepts the
+        /// disclosure — which is the one thing about this write the
+        /// daemon cannot work out for itself.
+        ///
+        /// **What actually enforces that is the uid, not the word
+        /// "human", and the difference is worth stating so the field is
+        /// not read as more than it is.** `attach.sock` is `0600` and
+        /// peer-credential-checked before a byte is parsed, so the set of
+        /// parties who can send `true` is *the owning user's processes* —
+        /// the same boundary `role` rests on, and the same argument §7.5
+        /// makes for it: the only person a lie reaches is the one telling
+        /// it. An agent with a shell as that user is inside it. What the
+        /// field buys is that no **tool argument**, config key or default
+        /// selects the disclosure, so it cannot be reached by an agent
+        /// doing only what the MCP surface offers.
+        #[serde(default)]
+        allow_echo: bool,
     },
     Resize {
         cols: u16,
@@ -285,7 +332,16 @@ pub enum ServerFrame {
     },
     SecretRequestClosed {
         request_id: String,
-        /// `"fulfilled" | "cancelled" | "timeout"` (§7.5).
+        /// `"fulfilled" | "cancelled" | "timeout" | "caller_cancelled" |
+        /// `"not_echo_off"` — §18.4d is the catalogue.
+        ///
+        /// **A free `String` and not an enum**, so widening the set costs
+        /// nothing on the wire: the golden records `"<str>"` and a client
+        /// renders the word it is handed. That is also how this doc came
+        /// to list three when the daemon emitted four — GH #127 added
+        /// `caller_cancelled` and updated `mcp/schema.rs` but not the one
+        /// place a consumer of *this* type reads. GH #137 adds
+        /// `not_echo_off` and repairs the omission.
         outcome: String,
     },
     /// §9.6's `require_confirm` approval, raised when a binding that
@@ -721,9 +777,63 @@ mod tests {
         let f = encode(&ClientFrame::SecretInput {
             request_id: "secreq_1".into(),
             bytes: (0u8..=255).collect(),
+            allow_echo: false,
         })
         .unwrap();
         assert!(matches!(field(&f, "bytes"), Cbor::Bytes(ref b) if b.len() == 256));
+    }
+
+    /// The same guard `the_attach_frame_key_set_is_exactly_the_spec_list`
+    /// is, for the frame GH #137 widened: a field silently dropped,
+    /// renamed or added fails here, and this file carries no
+    /// `deny_unknown_fields` to catch it instead.
+    #[test]
+    fn the_secret_input_key_set_is_exactly_the_spec_list() {
+        let f = encode(&ClientFrame::SecretInput {
+            request_id: "secreq_1".into(),
+            bytes: b"hunter2".to_vec(),
+            allow_echo: true,
+        })
+        .unwrap();
+        assert_eq!(keys(&f), vec!["allow_echo", "bytes", "request_id", "type"]);
+    }
+
+    /// **A 1.2 client sends no `allow_echo`, and it must decode as
+    /// `false`** — the gated write, not the ungated one (GH #137).
+    ///
+    /// The bytes are hand-built rather than produced by this build's own
+    /// encoder, because an encoder that emits the field cannot express
+    /// the frame a client without it sends. That is the same reason
+    /// `an_attach_frame_without_a_role_defaults_to_the_redacted_stream`
+    /// builds its map by hand, and the note it carries about `terminal`
+    /// is why this row exists at all: `#[serde(default)]` is a no-op on
+    /// an `Option`, so nothing in this file had ever asserted the
+    /// attribute doing anything. On a `bool` it is load-bearing in both
+    /// directions — without it the frame fails to decode, and with a
+    /// `Default` of `true` it would decode to the leak.
+    #[test]
+    fn a_secret_input_without_allow_echo_is_gated() {
+        let body = Cbor::Map(vec![
+            (Cbor::Text("type".into()), Cbor::Text("SecretInput".into())),
+            (
+                Cbor::Text("request_id".into()),
+                Cbor::Text("secreq_1".into()),
+            ),
+            (Cbor::Text("bytes".into()), Cbor::Bytes(b"hunter2".to_vec())),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&body, &mut buf).unwrap();
+
+        let back: ClientFrame = crate::protocol::frame::decode(&buf).expect("a 1.2 SecretInput");
+        assert_eq!(
+            back,
+            ClientFrame::SecretInput {
+                request_id: "secreq_1".into(),
+                bytes: b"hunter2".to_vec(),
+                allow_echo: false,
+            },
+            "a client that predates the field must fail closed, not open"
+        );
     }
 
     #[test]

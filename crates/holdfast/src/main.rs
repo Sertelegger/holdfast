@@ -77,8 +77,13 @@ USAGE:
     holdfast list [--json]            List sessions
     holdfast logs <session> [--tail N] [--raw]
                                       Print a session's output
-    holdfast attach <session>         Take over the session's terminal
-                                      (detach with Ctrl-B then d)
+    holdfast attach <session> [--allow-echo]
+                                      Take over the session's terminal
+                                      (detach with Ctrl-B then d).
+                                      --allow-echo submits secrets even
+                                      when the child has not turned echo
+                                      off, which lets it echo them into
+                                      the session's output
     holdfast watch <session>          Follow a session read-only and
                                       redacted (detach with Ctrl+C)
     holdfast version                  Print version information
@@ -173,7 +178,7 @@ async fn run() -> ExitCode {
             let Some(session) = args.get(1).filter(|a| !a.starts_with("--")) else {
                 return usage_error("`attach` needs a session id or name");
             };
-            commands::attach(session).await
+            commands::attach(session, flag("--allow-echo")).await
         }
         Some("watch") => {
             let Some(session) = args.get(1).filter(|a| !a.starts_with("--")) else {

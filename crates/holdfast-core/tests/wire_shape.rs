@@ -244,6 +244,30 @@ const RECORDED_VERSIONS: &[(u32, u32)] = &[
     // set renders the word it is given (`commands.rs` prints it), so there
     // is nothing here to bump for and nothing for this file to see.
     (1, 2),
+    // 1.3 — `SecretInput` gains `allow_echo`, an optional `bool` that is
+    // `false` when absent: *"I can see this terminal, I know it echoes,
+    // send it anyway"* (GH #137). The daemon otherwise declines to write a
+    // credential into a child that has not dropped `ECHO`, because the
+    // line discipline echoes it into the ring buffer and `read_output`
+    // hands it back to the agent in the clear.
+    //
+    // Additive under the rule as written — a new *optional field* on an
+    // existing client frame, not a new client frame — so the ordinary
+    // green path applies and there is nothing to argue. What is worth
+    // recording is that the two directions differ, and deliberately: a 1.2
+    // client sends no key, a 1.3 daemon reads `false`, and the write is
+    // gated, so the older peer fails **closed**. The reverse is the
+    // ordinary minor downgrade — a 1.3 client's key is ignored by a 1.2
+    // daemon, which has no gate to ask — and it is the same shape
+    // `Attach.role` has, where an older daemon hands an `observer` the raw
+    // stream.
+    //
+    // `CancelReason` also gains `not_echo_off`, its sixth value, and
+    // `SecretRequestClosed.outcome` its fifth word. Neither is visible
+    // here for the reason the `(1, 2)` note gives one line up: the
+    // `outcome` field is a free `String` recorded as `"<str>"`, and the
+    // MCP `reason` is not an attach frame at all.
+    (1, 3),
 ];
 
 /// The placeholder every opaque string field carries in this file.
@@ -573,6 +597,13 @@ fn client_frames() -> Vec<ClientFrame> {
         ClientFrame::SecretInput {
             request_id: STR.into(),
             bytes: vec![0x1b],
+            // `true`, on the same rule `terminal` above carries: this list
+            // is documented as maximal, so a field is sampled at the value
+            // that is *not* its default. It makes no difference to the
+            // document — `shape` renders either as `bool` — and that is
+            // exactly why the rule is followed rather than argued about
+            // per field.
+            allow_echo: true,
         },
         ClientFrame::Resize { cols: 1, rows: 1 },
         ClientFrame::Signal {

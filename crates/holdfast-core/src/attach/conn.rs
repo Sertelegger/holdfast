@@ -62,7 +62,7 @@ use super::handshake::{evaluate_attach, REJECT_SESSION_NOT_FOUND, REJECT_TERMINA
 use crate::daemon::server::Daemon;
 use crate::protocol::frame::{self, FrameError};
 use crate::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
-use crate::session::{Session, SessionState, WriteRequest};
+use crate::session::{SecretWrite, Session, SessionState, WriteRequest};
 
 pub use super::hub::{AttachConn, ATTACH_QUEUE_FRAMES};
 
@@ -848,7 +848,11 @@ async fn read_loop(
                         );
                 }
             }
-            ClientDecode::Frame(ClientFrame::SecretInput { request_id, bytes }) => {
+            ClientDecode::Frame(ClientFrame::SecretInput {
+                request_id,
+                bytes,
+                allow_echo,
+            }) => {
                 // **Into the zeroing type before anything else looks at
                 // it, including the cap check.** `received` does not copy
                 // or normalise; it takes the decoded allocation, so every
@@ -942,8 +946,44 @@ async fn read_loop(
                         // defaults to `true` — an echo-off prompt is
                         // waiting for a line — and is the waiting call's
                         // own argument when there is one.
-                        let (write, ack) =
-                            WriteRequest::secret(bytes.normalised(raised.append_newline));
+                        let value = bytes.normalised(raised.append_newline);
+                        // **GH #137: gated unless the human opted out.**
+                        // `WriteRequest::secret` performs the write
+                        // unconditionally, and this arm used it for every
+                        // submission — so a credential typed at a prompt
+                        // the *agent* raised, into a child that had not
+                        // dropped `ECHO`, was echoed by the line
+                        // discipline into the ring buffer and handed back
+                        // to that same agent by `read_output`. The
+                        // condition is evaluated on the writer thread one
+                        // statement before the write, against the tty
+                        // rather than a cache of it.
+                        //
+                        // **`expect_writes` is `None` and that is not the
+                        // same omission.** The counter guards a provider
+                        // round trip, and this path has none: the
+                        // keystrokes go from the socket to the queue in
+                        // this arm with no await in between. What it
+                        // shares with the autofill is only that nobody
+                        // consulted the child.
+                        //
+                        // **`allow_echo` is the human's decision, not the
+                        // agent's.** It reaches no tool argument and no
+                        // config key; it arrives on the frame a person at
+                        // an attached client sent, which is the only
+                        // party who can see whether the terminal echoes
+                        // and accept that it does. A TOTP prompt or a
+                        // REPL that never clears `ECHO` stays reachable
+                        // through the masked path this way — pushing it
+                        // to `send_input` would be strictly worse, since
+                        // that has no masking at all.
+                        let (write, ack) = if allow_echo {
+                            let (w, rx) = WriteRequest::secret(value);
+                            (w, Submitted::EchoAllowed(rx))
+                        } else {
+                            let (w, rx) = WriteRequest::secret_if_echo_off(value);
+                            (w, Submitted::Gated(rx))
+                        };
                         // The frame body still holds the value in
                         // cleartext and is about to be reused for the
                         // next frame; `SecretBytes` owns only the decoded
@@ -1002,14 +1042,114 @@ async fn read_loop(
                         // connection.
                         let for_ack = Arc::clone(session);
                         tokio::spawn(async move {
-                            match ack.await {
-                                Ok(Ok(n)) => answer.settle(
+                            match ack.resolve().await {
+                                Submission::Written(n) => answer.settle(
                                     crate::secret::Resolution::Provided {
                                         bytes_written: n as u64,
                                     },
                                     "fulfilled",
                                 ),
-                                _ => answer.settle(
+                                // **The human is told, and that is half
+                                // the fix** (GH #137). A silently dropped
+                                // secret is its own defect: the person who
+                                // typed it believes it was delivered and
+                                // the child sits at its prompt forever.
+                                //
+                                // The route is the one §9.6's autofill
+                                // already uses for a declined write — the
+                                // `SecretRequestClosed.outcome` word and a
+                                // `daemon.log` line — with the correction
+                                // that the autofill throws the reason away
+                                // and broadcasts a bare `cancelled`. The
+                                // word is the specific one here, on the
+                                // precedent `caller_cancelled` set: the
+                                // field is a free `String` whose golden
+                                // records `"<str>"`, `holdfast attach`
+                                // prints whatever word it is handed, and
+                                // the agent's `secret_cancelled.reason`
+                                // carries the same token so the two
+                                // vocabularies cannot drift.
+                                Submission::Declined(why) => {
+                                    crate::diag!(
+                                        "holdfast: a submitted secret was not written to \
+                                         the session: {why:?}"
+                                    );
+                                    // **Matched, not assumed.**
+                                    // `expect_writes` is `None`, so
+                                    // `write_secret_if_unread` cannot
+                                    // return `OtherWriteIntervened` and
+                                    // the second arm is unreachable —
+                                    // which is exactly why it is written
+                                    // out. A `_ =>` here would turn a
+                                    // third condition added later into a
+                                    // *wrong word on the wire*, silently:
+                                    // the agent's `secret_cancelled.reason`
+                                    // and every attached client's
+                                    // `SecretRequestClosed.outcome` would
+                                    // name a refusal that did not happen.
+                                    // Exhaustive, so that change is a
+                                    // compile error instead.
+                                    let reason = match why {
+                                        crate::session::DeclineReason::NotEchoOff
+                                        | crate::session::DeclineReason::OtherWriteIntervened => {
+                                            crate::secret::CancelReason::NotEchoOff
+                                        }
+                                    };
+                                    // **A dead session is not an echoing
+                                    // one, and the backend cannot tell
+                                    // them apart.** `InProcessPty::line_discipline`
+                                    // answers `UNKNOWN` for a child that
+                                    // has exited, and the gate refuses
+                                    // `!= Some(false)` — so a session that
+                                    // died between the raise and the write
+                                    // declines `NotEchoOff`. Reported as
+                                    // such it tells the human *"this
+                                    // session's terminal is still echoing,
+                                    // re-attach with `--allow-echo`"*,
+                                    // which is false and unactionable: the
+                                    // session is gone and the flag would
+                                    // change nothing.
+                                    //
+                                    // Classified by liveness, which is the
+                                    // rule `SecretAnswer::Drop` already
+                                    // applies one screen down and for the
+                                    // same reason — where the refusal came
+                                    // from says nothing about why the
+                                    // request is over.
+                                    if for_ack.is_alive() {
+                                        answer.settle(
+                                            crate::secret::Resolution::Cancelled(reason),
+                                            reason.as_str(),
+                                        );
+                                    } else {
+                                        answer.settle(
+                                            crate::secret::Resolution::SessionDied {
+                                                exit_code: for_ack.exit_code(),
+                                            },
+                                            "cancelled",
+                                        );
+                                    }
+                                }
+                                // **`"fulfilled"` is wrong here and is
+                                // left wrong deliberately** — recorded as
+                                // a divergence rather than repaired from
+                                // this lane (Global Constraint 16).
+                                //
+                                // The session died under the write, so
+                                // whether the child received the bytes is
+                                // *unknown*; the MCP call is told
+                                // `session_died`, which is honest, and
+                                // every attached client is told the
+                                // credential was delivered, which is not.
+                                // §7.5's `outcome` set carries no word for
+                                // "unknown" and `cancelled` would claim
+                                // non-delivery just as falsely, so this is
+                                // a wire-vocabulary decision on a §23.3
+                                // surface rather than a local repair, and
+                                // it predates GH #137 — this commit only
+                                // moved the expression into a named
+                                // variant. Filed rather than guessed.
+                                Submission::SessionDied => answer.settle(
                                     crate::secret::Resolution::SessionDied {
                                         exit_code: for_ack.exit_code(),
                                     },
@@ -1624,6 +1764,50 @@ async fn forward_events(
             // it would have read is still in the hub.
             Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => return,
+        }
+    }
+}
+
+/// The two acks `attach::conn`'s `SecretInput` arm can be waiting on, and
+/// the one answer it acts on (GH #137).
+///
+/// **A type rather than two `tokio::spawn`s.** The gated write and the
+/// opted-out one differ in exactly one thing — whether the writer is
+/// allowed to refuse — and everything downstream of the ack is identical:
+/// the same `SecretAnswer`, the same three outcomes, the same broadcast.
+/// Two spawned tasks would be two copies of that, and the copy that
+/// mattered would be the one nobody updated.
+enum Submitted {
+    /// `SecretInput.allow_echo: true`. [`WriteRequest::secret`], which
+    /// cannot refuse and whose ack is therefore a plain count.
+    EchoAllowed(tokio::sync::oneshot::Receiver<crate::error::Result<usize>>),
+    /// The default. [`WriteRequest::secret_if_echo_off`], whose ack can
+    /// say the write did not happen.
+    Gated(tokio::sync::oneshot::Receiver<crate::error::Result<SecretWrite>>),
+}
+
+/// What became of a submission, with the two ack shapes collapsed.
+enum Submission {
+    Written(usize),
+    Declined(crate::session::DeclineReason),
+    /// The writer never answered, or answered an error: the session died
+    /// under the write. **Not a decline** — nothing was refused, and the
+    /// caller's answer is `session_died` rather than `secret_cancelled`.
+    SessionDied,
+}
+
+impl Submitted {
+    async fn resolve(self) -> Submission {
+        match self {
+            Self::EchoAllowed(rx) => match rx.await {
+                Ok(Ok(n)) => Submission::Written(n),
+                _ => Submission::SessionDied,
+            },
+            Self::Gated(rx) => match rx.await {
+                Ok(Ok(SecretWrite::Written(n))) => Submission::Written(n),
+                Ok(Ok(SecretWrite::Declined(why))) => Submission::Declined(why),
+                _ => Submission::SessionDied,
+            },
         }
     }
 }
