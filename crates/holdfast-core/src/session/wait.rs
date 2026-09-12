@@ -541,6 +541,13 @@ mod tests {
     /// defect. `for_pattern` subscribes synchronously, ahead of its first
     /// `await`, so the stall puts five orders of magnitude between the
     /// subscription and the hook.
+    ///
+    /// **It is not a tunable margin, and the number is here so nobody
+    /// tidies it away.** Measured against the *correct* reader with the
+    /// `set_read_delay` line deleted and nothing else changed: red **5
+    /// times in 20**, with `left: SessionDied, right: Matched` — the real
+    /// defect's signature exactly. A reader who trimmed it would get a
+    /// row that is 25% flaky and reads like #149 reopening.
     #[tokio::test]
     async fn output_queued_in_the_read_liveness_gap_still_matches() {
         use std::sync::atomic::{AtomicBool, Ordering};

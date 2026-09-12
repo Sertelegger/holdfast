@@ -215,9 +215,19 @@ impl MockPty {
     ///
     /// It runs on the caller's thread — the session's reader `std::thread`
     /// — and on **every** empty read, so a hook that must act once has to
-    /// latch that itself. It holds the hook slot while it runs, exactly as
+    /// latch that itself.
+    ///
+    /// **It holds the hook slot while it runs**, exactly as
     /// [`on_write`](Self::on_write) does, so a hook must not re-register
-    /// one.
+    /// one — and, less obviously, **must not call `read` on this mock**.
+    /// `read` is the only path to this slot and `parking_lot::Mutex` is
+    /// not reentrant, so a hook that tries to "drain the rest of it"
+    /// deadlocks against itself. Note the asymmetry with
+    /// [`on_line_discipline_sample`](Self::on_line_discipline_sample),
+    /// which releases its slot before it touches `state`: an
+    /// `on_empty_read` hook that calls `line_discipline` and a
+    /// `line_discipline` hook that calls `read`, on two threads, are an
+    /// A→B/B→A pair. Nothing in tree does either.
     pub fn on_empty_read(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.on_empty_read.lock() = Some(Box::new(f));
     }
