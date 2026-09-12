@@ -25,7 +25,21 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// same outcome as today: the call runs its window. A 1.1 client talking
 /// to a 1.2 daemon sends no token, and a call with no token is simply not
 /// cancellable. Neither direction loses anything it had.
-pub const PROTOCOL_MINOR: u32 = 2;
+///
+/// 1.3 adds `SecretInput.allow_echo`, an optional `bool` defaulting to
+/// `false` (GH #137). **The two directions are not symmetric here, and
+/// the asymmetry is the security property rather than an oversight.** A
+/// 1.2 client sends no key and a 1.3 daemon reads `false`, so it gets the
+/// *gated* write: a client that predates the field fails closed rather
+/// than open, which is the whole reason the field is a defaulted `bool`
+/// and not an `Option`. A 1.3 client talking to a 1.2 daemon sends a key
+/// that daemon ignores and gets the ungated write it would have got
+/// anyway — the gate lives in the daemon, so a client cannot carry one to
+/// a daemon that has none. `Attach.role` has the identical shape one
+/// field over, where an older daemon hands an `observer` the raw stream,
+/// and neither is a reason to bump the major: the frames still parse,
+/// which is what a major means (§23.3).
+pub const PROTOCOL_MINOR: u32 = 3;
 
 /// How long either peer waits for the **first** frame of the handshake
 /// before giving up on the connection.

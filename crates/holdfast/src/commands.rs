@@ -1202,8 +1202,23 @@ fn render(bytes: &[u8]) {
 /// keyboard, no redaction (`role: interactive`, REQ-SEC-008). Detach with
 /// `Ctrl-B` then `d`; **the session keeps running** (§6.1: *"cleanly
 /// disconnects without killing the session"*).
+///
+/// `allow_echo` is `--allow-echo`, and it sets `SecretInput.allow_echo`
+/// on every secret this attachment submits (GH #137). The daemon
+/// otherwise declines to write a credential into a child that has not
+/// dropped `ECHO`, because the line discipline echoes it into the ring
+/// buffer and `read_output` hands it back to the agent in the clear.
+///
+/// **A flag and not a key chord, which is a real limitation and is stated
+/// rather than hidden.** The chord would be the better affordance — it is
+/// answerable at the moment the prompt is in front of you, which is when
+/// the terminal's behaviour is actually visible. Building one means an
+/// interactive affordance in raw mode, which is the same CLI work
+/// `ServerFrame::BindingApprovalRequired`'s arm declines to do below and
+/// for the same reason. So the decision is declared for the attachment,
+/// up front, by the person who knows which child they are attaching to.
 #[cfg(unix)]
-pub async fn attach(session: &str) -> ExitCode {
+pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
     use holdfast_core::attach::{AttachMode, AttachRole, ClientFrame, ServerFrame};
     use holdfast_core::protocol::frame;
     use std::os::unix::io::AsRawFd;
@@ -1415,6 +1430,19 @@ pub async fn attach(session: &str) -> ExitCode {
     // keeps the value off the session's echo as well as off this terminal
     // (§9.5).
     let mut secret: Option<(String, crate::attach_tty::SecretLine)> = None;
+    // The id of a request this client has already answered, held until the
+    // daemon says what became of it (GH #137).
+    //
+    // **Without this the submitting human is the one person never told.**
+    // `secret` is cleared the instant the frame goes out — it has to be,
+    // or the keyboard stays captured — and the `SecretRequestClosed` arm
+    // below is guarded on `secret` matching. So the client that answered
+    // the prompt dropped the answer to its own question on the floor,
+    // while every *other* attached client got it. That was survivable
+    // while every close a submitter could provoke was `fulfilled`; a
+    // daemon that can now decline the write makes it a silently discarded
+    // credential, which is the defect the decline exists to prevent.
+    let mut submitted: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -1458,9 +1486,33 @@ pub async fn attach(session: &str) -> ExitCode {
                         secret = Some((request_id, crate::attach_tty::SecretLine::default()));
                     }
                     ServerFrame::SecretRequestClosed { request_id, outcome } => {
-                        if secret.as_ref().is_some_and(|(id, _)| *id == request_id) {
+                        let mine = secret.as_ref().is_some_and(|(id, _)| *id == request_id)
+                            || submitted.as_deref() == Some(request_id.as_str());
+                        if mine {
                             secret = None;
-                            diag!("holdfast attach: secret request {outcome}");
+                            submitted = None;
+                            // **The one outcome that gets a sentence
+                            // rather than a token** (GH #137). Every other
+                            // word here names something the human already
+                            // knows they did or watched happen; this one
+                            // names a thing Holdfast did *instead of* what
+                            // they asked for, and `secret request
+                            // not_echo_off` does not say that a password
+                            // they typed was thrown away. The token stays
+                            // in the line so it is still greppable and
+                            // still matches the agent's
+                            // `secret_cancelled.reason`.
+                            if outcome == "not_echo_off" {
+                                diag!(
+                                    "holdfast attach: secret request not_echo_off — this \
+                                     session's terminal is still echoing, so the value was \
+                                     discarded and nothing was sent to the child. Re-attach \
+                                     with `--allow-echo` to send it anyway, accepting that \
+                                     the child will echo it into the session's output."
+                                );
+                            } else {
+                                diag!("holdfast attach: secret request {outcome}");
+                            }
                         }
                     }
                     // §17.5's binding approval, **reported and not
@@ -1548,8 +1600,12 @@ pub async fn attach(session: &str) -> ExitCode {
                         Some((id, line)) => match line.feed(&forward) {
                             crate::attach_tty::SecretKeys::Pending => {}
                             crate::attach_tty::SecretKeys::Line(bytes) => {
-                                let mut f =
-                                    ClientFrame::SecretInput { request_id: id.clone(), bytes };
+                                let mut f = ClientFrame::SecretInput {
+                                    request_id: id.clone(),
+                                    bytes,
+                                    allow_echo,
+                                };
+                                submitted = Some(id.clone());
                                 let sent = frame::write_frame(&mut wr, &f).await;
                                 // **The frame still owns the cleartext**,
                                 // and `ClientFrame` has no zeroing `Drop`
@@ -1584,6 +1640,11 @@ pub async fn attach(session: &str) -> ExitCode {
                             // and the partial value stops existing.
                             crate::attach_tty::SecretKeys::Cancelled(bytes) => {
                                 secret = None;
+                                // Nothing was submitted, so there is no
+                                // close of this client's making to wait
+                                // for; clearing it keeps a stale id from
+                                // claiming the next request's close.
+                                submitted = None;
                                 render(b"\r\n");
                                 diag!("holdfast attach: secret entry abandoned");
                                 let f = ClientFrame::Input { bytes };
@@ -1828,7 +1889,7 @@ pub async fn watch(_session: &str) -> ExitCode {
 /// rewording either copy left every job in the workflow green. There is now
 /// exactly one place in this crate that prints the sentence.
 #[cfg(windows)]
-pub async fn attach(_session: &str) -> ExitCode {
+pub async fn attach(_session: &str, _allow_echo: bool) -> ExitCode {
     unsupported("attach", Remedy::Wsl)
 }
 

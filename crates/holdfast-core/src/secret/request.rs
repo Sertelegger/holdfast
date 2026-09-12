@@ -92,7 +92,8 @@ impl RaisedBy {
 /// run against an exhaustive match over this enum — so a variant added
 /// later fails to compile until something emits it. GH #127's
 /// [`CancelReason::CallerCancelled`] is the fifth, and it arrived through
-/// exactly that failure.
+/// exactly that failure; GH #137's [`CancelReason::NotEchoOff`] is the
+/// sixth and arrived the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CancelReason {
     /// The echo-off condition cleared with no value written: a human
@@ -126,6 +127,29 @@ pub enum CancelReason {
     /// and a window that elapsed are different facts, and only the second
     /// is about the clock.
     CallerCancelled,
+    /// GH #137. A value was submitted and the writer declined to write it,
+    /// because the child was not at an echo-off read. The credential was
+    /// dropped — and therefore zeroed — without reaching the PTY.
+    ///
+    /// **Not [`CancelReason::UserCancelled`].** That one means *the
+    /// echo-off condition cleared with no value written*: an ending at the
+    /// child's end, with nobody having answered. This one is the opposite
+    /// arrangement — a human answered, and Holdfast refused to deliver the
+    /// answer. Reporting one as the other sends an agent to find a human
+    /// who is already standing there, and tells an operator reading a
+    /// trail that a prompt was abandoned when it was served.
+    ///
+    /// **Not [`CancelReason::TooLarge`] either**, which is the other
+    /// submitted-and-refused reason and the one it is easiest to file this
+    /// beside. `too_large` is a property of the *value*, and the caller
+    /// fixes it by sending fewer bytes; this is a property of the
+    /// **child**, and the identical bytes sent a moment later succeed. An
+    /// agent that retried on this the way it retries on `too_large` would
+    /// spin.
+    ///
+    /// The exit is `SecretInput.allow_echo` — a human's decision at an
+    /// attached client, reachable from no argument of any tool.
+    NotEchoOff,
 }
 
 impl CancelReason {
@@ -137,16 +161,18 @@ impl CancelReason {
             Self::TooLarge => "too_large",
             Self::ConcurrentRequestPending => "concurrent_request_pending",
             Self::CallerCancelled => "caller_cancelled",
+            Self::NotEchoOff => "not_echo_off",
         }
     }
 
     /// Every reason, for the exhaustive-reachability guard.
-    pub const ALL: [CancelReason; 5] = [
+    pub const ALL: [CancelReason; 6] = [
         Self::UserCancelled,
         Self::Timeout,
         Self::TooLarge,
         Self::ConcurrentRequestPending,
         Self::CallerCancelled,
+        Self::NotEchoOff,
     ];
 }
 
@@ -1557,6 +1583,7 @@ mod tests {
                 CancelReason::TooLarge => "too_large",
                 CancelReason::ConcurrentRequestPending => "concurrent_request_pending",
                 CancelReason::CallerCancelled => "caller_cancelled",
+                CancelReason::NotEchoOff => "not_echo_off",
             };
             assert_eq!(r.as_str(), expect);
         }

@@ -35,6 +35,14 @@ is cut, named and published is in
   off nothing would read as a decision about redaction that had been taken,
   which is what [#128] is about. Disabled rules are reported once at startup on
   stderr ([#128]).
+- Attach protocol **1.3**: `SecretInput.allow_echo`, an optional `bool` that
+  defaults to `false`. It is the deliberate opt-out from the echo gate above —
+  *"I can see this terminal, I know it echoes, send it anyway"* — so children
+  that legitimately never clear `ECHO` (a TOTP-code prompt, a REPL asking for
+  an API key) stay reachable through the masked path rather than being pushed
+  to `send_input`, which has no masking at all. Absent means `false`, so a
+  client that predates the field fails **closed**; nothing an agent sends
+  selects it. `holdfast attach --allow-echo` is the CLI spelling ([#137]).
 
 ### Changed
 
@@ -86,6 +94,26 @@ is cut, named and published is in
   method}` and the rest stay cross-platform. Nothing changes on Unix, and
   nothing is removed — `holdfast-core` did not compile for Windows at all
   before this release ([#19]).
+
+### Security
+
+- **A credential is no longer written into a child whose terminal still
+  echoes.** `request_secret_input` has no echo-state precondition — it raises
+  and broadcasts `AwaitingSecret` the moment the agent calls it, without
+  consulting the child — so an agent that called before its child reached a
+  password prompt got a human to type a real credential into an echoing
+  terminal. The line discipline put it in the ring buffer and `read_output`,
+  the default and redacted path, handed it back to that agent in the clear; an
+  arbitrary password matches no redaction rule, so nothing downstream removed
+  it. The write is now gated on the child's line discipline, sampled on the
+  writer thread one statement before the write and against the tty rather than
+  a cache of it — the check §9.6's autofill has carried since 0.0.7. A refused
+  submission is dropped and zeroed without reaching the PTY. Not a regression:
+  reproduced identically at `v0.0.7` ([#137]).
+- `secret_cancelled` gains a sixth reason, `not_echo_off`, and
+  `SecretRequestClosed` a fifth outcome of the same name, so a human whose
+  password was refused is told that rather than `cancelled` — which they would
+  read as the child having given up ([#137]).
 
 ### Fixed
 
@@ -695,6 +723,7 @@ residuals that are known and accepted.
 [#128]: https://github.com/Sertelegger/holdfast/issues/128
 [#129]: https://github.com/Sertelegger/holdfast/issues/129
 [#135]: https://github.com/Sertelegger/holdfast/issues/135
+[#137]: https://github.com/Sertelegger/holdfast/issues/137
 [#138]: https://github.com/Sertelegger/holdfast/issues/138
 [#139]: https://github.com/Sertelegger/holdfast/issues/139
 [#142]: https://github.com/Sertelegger/holdfast/issues/142

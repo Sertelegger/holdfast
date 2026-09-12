@@ -469,7 +469,21 @@ pub enum WriteRequest {
         /// decided to resolve — **before** the provider ran, not before
         /// the enqueue. Anything written to this child in between may have
         /// satisfied the read the credential was resolved for.
-        expect_writes: u64,
+        ///
+        /// **`None` selects the echo condition alone** (GH #137), which is
+        /// what `attach::conn`'s `SecretInput` arm submits. That path has
+        /// no provider round trip and therefore no interval for a write to
+        /// intervene *in*: the human's keystrokes go from the socket to
+        /// this queue in one arm with no await between them. What it does
+        /// share with the autofill is that nobody consulted the child's
+        /// termios, which is the condition the harm turns on.
+        ///
+        /// **An `Option` rather than a sentinel `u64`.** The counter is a
+        /// real value with a real zero — a session that has been written
+        /// to zero times — so `0` cannot mean *"do not check"* without
+        /// making a brand-new session the one case where the check is
+        /// silently off.
+        expect_writes: Option<u64>,
         ack: tokio::sync::oneshot::Sender<Result<SecretWrite>>,
     },
 }
@@ -488,12 +502,19 @@ pub enum SecretWrite {
     Declined(DeclineReason),
 }
 
-/// Which of [`WriteRequest::SecretIfUnread`]'s two conditions refused.
+/// Which of [`WriteRequest::SecretIfUnread`]'s conditions refused.
 ///
 /// Two, and they are **not** the same condition seen twice: a child that
 /// abandons its own read moves no counter, and bytes written ahead of the
 /// credential can satisfy the read long before the child gets far enough
 /// to restore echo. Each has its own row.
+///
+/// **Not every submission is subject to both** (GH #137). A request with
+/// `expect_writes: None` is judged on the echo condition alone, so
+/// [`DeclineReason::OtherWriteIntervened`] is unreachable for it —
+/// asserted by `a_submission_with_no_expected_write_count_is_judged_on_echo_alone`
+/// rather than left as a claim, because a caller that maps a decline to
+/// a reason for its own caller has to know which ones it can see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclineReason {
     /// The child is no longer at an echo-off read — or the backend cannot
@@ -519,13 +540,14 @@ impl WriteRequest {
         (Self::Secret { secret, ack }, rx)
     }
 
-    /// A conditional secret write — see [`WriteRequest::SecretIfUnread`].
+    /// §9.6's autofill write: both conditions — see
+    /// [`WriteRequest::SecretIfUnread`].
     ///
-    /// **Not the default spelling, deliberately.** `attach::conn`'s
-    /// `SecretInput` arm carries a value a human typed *at* the prompt
-    /// they are looking at, with no provider round trip in between, so it
-    /// has nothing to be stale about. This one is for §9.6's autofill,
-    /// which does.
+    /// **Both, because this caller went away.** The autofill decides to
+    /// resolve, then waits out `keychain_provider_timeout_secs` while a
+    /// credential store answers; anything written to the child in that
+    /// window may have satisfied the read the value was resolved for, and
+    /// the counter is the only thing that can see it.
     pub fn secret_if_unread(
         secret: SecretBytes,
         expect_writes: u64,
@@ -534,7 +556,47 @@ impl WriteRequest {
         (
             Self::SecretIfUnread {
                 secret,
-                expect_writes,
+                expect_writes: Some(expect_writes),
+                ack,
+            },
+            rx,
+        )
+    }
+
+    /// A human's submission from an attached client: the **echo**
+    /// condition and only that one (GH #137).
+    ///
+    /// **This is the default spelling for `attach::conn`'s `SecretInput`
+    /// arm, and the doc that stood here said the opposite.** It read:
+    /// *"`attach::conn`'s `SecretInput` arm carries a value a human typed
+    /// at the prompt they are looking at, with no provider round trip in
+    /// between, so it has nothing to be stale about."* The premise is
+    /// false, and GH #137 is what it cost. The prompt the human is
+    /// looking at is the agent's `prompt_text`, broadcast by
+    /// `request_secret_input` the moment the agent called it — that tool
+    /// has no echo-state precondition and never consults the child. So an
+    /// agent that calls it before its child reaches a password prompt
+    /// gets a human to type a real credential into a terminal that is
+    /// still echoing, the line discipline puts it in the ring buffer, and
+    /// `read_output` — the default, redacted path — hands it back in the
+    /// clear. An arbitrary password matches no redaction rule.
+    ///
+    /// What *was* right about that paragraph is the narrower claim it
+    /// overshot: there is no provider round trip here, so there is no
+    /// interval for another write to intervene in, and `expect_writes` is
+    /// `None`. One condition, not none.
+    ///
+    /// The opt-out is `SecretInput.allow_echo`, which reaches
+    /// [`WriteRequest::secret`] instead — chosen by a human who can see
+    /// the terminal, never by the agent and never by a default.
+    pub fn secret_if_echo_off(
+        secret: SecretBytes,
+    ) -> (Self, tokio::sync::oneshot::Receiver<Result<SecretWrite>>) {
+        let (ack, rx) = tokio::sync::oneshot::channel();
+        (
+            Self::SecretIfUnread {
+                secret,
+                expect_writes: None,
                 ack,
             },
             rx,
@@ -590,9 +652,13 @@ impl WriteRequest {
 fn write_secret_if_unread(
     session: &Arc<Session>,
     secret: SecretBytes,
-    expect_writes: u64,
+    expect_writes: Option<u64>,
 ) -> Result<SecretWrite> {
-    if session.writes_performed() != expect_writes {
+    // **`None` skips this condition and nothing else** (GH #137). The
+    // echo test below is not optional on any path: it is the one this
+    // function exists for, and the one a submission from an attached
+    // human needs just as much as the autofill does.
+    if expect_writes.is_some_and(|e| session.writes_performed() != e) {
         drop(secret);
         return Ok(SecretWrite::Declined(DeclineReason::OtherWriteIntervened));
     }
@@ -1297,7 +1363,8 @@ impl Session {
                         drop(secret);
                         let _ = ack.send(result);
                     }
-                    // §9.6's autofill. Both conditions are evaluated
+                    // §9.6's autofill, and — since GH #137 — a human's
+                    // `SecretInput` too. The conditions are evaluated
                     // **here**, on the writer thread, one statement before
                     // the write — which is the only place where "the child
                     // is at an echo-off read" and "this value is the next
@@ -2419,6 +2486,112 @@ mod tests {
             SessionConfig::with_buffer_capacity(4096),
         );
         (s, pty)
+    }
+
+    /// **GH #137.** A human's submission carries the echo condition and
+    /// **no counter**, which is a property of the constructor rather than
+    /// of any run.
+    ///
+    /// **Found by a surviving mutant.** Changing
+    /// [`WriteRequest::secret_if_echo_off`] to pass `Some(0)` left the
+    /// whole `secrets` suite green — every session those rows build has
+    /// `writes_performed == 0`, so the counter agrees by accident and the
+    /// two spellings are behaviourally identical *in the harness*. They
+    /// are not identical in the field: a session that has taken any write
+    /// at all would decline every human submission
+    /// `OtherWriteIntervened`, and `attach::conn` — whose `Declined` arm
+    /// reports `CancelReason::NotEchoOff` on the stated ground that the
+    /// counter arm is unreachable — would then put a wrong word in the
+    /// agent's transcript and a wrong word on the wire.
+    ///
+    /// A behaviour that a test can only reach by accident wants a
+    /// structural assertion, which is this one.
+    #[test]
+    fn a_human_submission_carries_no_counter_condition() {
+        let (req, _rx) =
+            WriteRequest::secret_if_echo_off(SecretBytes::normalise(b"hunter2".to_vec(), true));
+        assert!(
+            matches!(
+                req,
+                WriteRequest::SecretIfUnread {
+                    expect_writes: None,
+                    ..
+                }
+            ),
+            "a submission from an attached client acquired a counter condition it \
+             has no provider round trip to need, and whose refusal `attach::conn` \
+             would report as `not_echo_off`"
+        );
+
+        // The other direction, so this row cannot pass against a
+        // constructor pair that collapsed into one: §9.6's autofill does
+        // carry it, and that is what the counter is for.
+        let (req, _rx) =
+            WriteRequest::secret_if_unread(SecretBytes::normalise(b"hunter2".to_vec(), true), 7);
+        assert!(matches!(
+            req,
+            WriteRequest::SecretIfUnread {
+                expect_writes: Some(7),
+                ..
+            }
+        ));
+    }
+
+    /// **GH #137.** `expect_writes: None` turns off the counter condition
+    /// and **nothing else** — the echo test still runs, and
+    /// [`DeclineReason::OtherWriteIntervened`] becomes unreachable.
+    ///
+    /// Both halves matter and each is separately losable. If the echo test
+    /// were skipped too, `attach::conn`'s submissions would go back to
+    /// being unconditional, which is the whole defect. If
+    /// `OtherWriteIntervened` were still reachable, the arm in
+    /// `attach::conn` that maps a decline to `CancelReason::NotEchoOff`
+    /// would be putting a wrong word in an agent's transcript — its doc
+    /// says the case cannot arise, and this is where that claim is
+    /// checked rather than asserted in prose.
+    #[test]
+    fn a_submission_with_no_expected_write_count_is_judged_on_echo_alone() {
+        let (s, pty) = mock_session();
+
+        // A write the child has taken: under `Some(_)` this is exactly the
+        // arrangement that produces `OtherWriteIntervened`.
+        pty.set_echo(Some(false));
+        s.write_input(b"x").expect("the mock took a write");
+        let stale = s.writes_performed() - 1;
+
+        assert_eq!(
+            write_secret_if_unread(
+                &s,
+                SecretBytes::normalise(b"hunter2".to_vec(), true),
+                Some(stale)
+            )
+            .expect("the writer answered"),
+            SecretWrite::Declined(DeclineReason::OtherWriteIntervened),
+            "the counter condition is not being applied when it is asked for, so \
+             this row cannot show that `None` is what switches it off"
+        );
+        assert_eq!(
+            write_secret_if_unread(&s, SecretBytes::normalise(b"hunter2".to_vec(), true), None)
+                .expect("the writer answered"),
+            SecretWrite::Written(8),
+            "`None` refused a write on a condition it was told not to evaluate"
+        );
+
+        // ...and the echo test is untouched by `None`.
+        pty.set_echo(Some(true));
+        assert_eq!(
+            write_secret_if_unread(&s, SecretBytes::normalise(b"hunter2".to_vec(), true), None)
+                .expect("the writer answered"),
+            SecretWrite::Declined(DeclineReason::NotEchoOff),
+            "`None` switched off the echo condition too, which is GH #137 again"
+        );
+        // A backend that cannot say is refused for the same reason.
+        pty.set_echo(None);
+        assert_eq!(
+            write_secret_if_unread(&s, SecretBytes::normalise(b"hunter2".to_vec(), true), None)
+                .expect("the writer answered"),
+            SecretWrite::Declined(DeclineReason::NotEchoOff),
+        );
     }
 
     /// Poll until the session's buffer holds at least `n` bytes.

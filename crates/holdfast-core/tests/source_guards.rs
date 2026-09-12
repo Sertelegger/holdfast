@@ -523,7 +523,7 @@ fn the_secret_frame_body_is_zeroed_before_the_arm_can_be_cancelled() {
     let text = std::fs::read_to_string(src.join("attach/conn.rs")).expect("read attach/conn.rs");
 
     let arm = text
-        .split_once("ClientDecode::Frame(ClientFrame::SecretInput { request_id, bytes }) => {")
+        .split_once("ClientDecode::Frame(ClientFrame::SecretInput {\n                request_id,\n                bytes,\n                allow_echo,\n            }) => {")
         .expect("`read_loop` no longer has a SecretInput arm at all")
         .1;
     // **The submitting branch only.** The over-cap branch above it and the
@@ -787,7 +787,7 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
     let text = std::fs::read_to_string(src.join("attach/conn.rs")).expect("read attach/conn.rs");
 
     let arm = text
-        .split_once("ClientFrame::SecretInput { request_id, bytes }) => {")
+        .split_once("ClientFrame::SecretInput {\n                request_id,\n                bytes,\n                allow_echo,\n            }) => {")
         .expect("the SecretInput arm is gone or its binding was renamed")
         .1;
     let arm = arm
@@ -861,7 +861,14 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
         // copy leaves the zeroing type — is unchanged either way.
         "let over_cap = bytes.len() > cap as usize;",
         "drop(bytes);",
-        "WriteRequest::secret(bytes.normalised(raised.append_newline));",
+        // The normalisation, which is where the binding is consumed.
+        // **One line and not two, deliberately**: GH #137 made the write
+        // itself a two-armed choice (gated by default, ungated when the
+        // human sent `allow_echo`), and building the `SecretBytes` inside
+        // each arm would have put a second use of the binding in this
+        // guard's way for no gain. The value is normalised once and the
+        // arms differ only in which `WriteRequest` carries it.
+        "let value = bytes.normalised(raised.append_newline);",
     ];
     // `bytes` as an *identifier*, not as a substring. A plain `contains`
     // matches `zero_bytes`, `SecretBytes` and `bytes_written` — the last

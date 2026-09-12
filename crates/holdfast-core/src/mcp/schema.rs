@@ -369,7 +369,8 @@ pub struct RequestSecretInput {
     /// `secret_cancelled` carries one.
     pub request_id: Option<String>,
     /// `secret_cancelled` only: `user_cancelled` | `timeout` |
-    /// `too_large` | `concurrent_request_pending` | `caller_cancelled`.
+    /// `too_large` | `concurrent_request_pending` | `caller_cancelled` |
+    /// `not_echo_off`.
     pub reason: Option<String>,
     /// `session_died` only (§5.1).
     pub exit_code: Option<i32>,

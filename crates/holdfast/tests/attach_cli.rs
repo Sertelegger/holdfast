@@ -435,6 +435,10 @@ struct StubDaemon {
     got: Arc<Mutex<Vec<ClientFrame>>>,
 }
 
+/// A frame the stub sends in answer to the first client frame matching a
+/// predicate — see [`StubDaemon::start_reacting`].
+type Reaction = (fn(&ClientFrame) -> bool, Vec<u8>);
+
 impl StubDaemon {
     /// Serve exactly one connection, sending `replies` in order after the
     /// handshake and then keeping the socket open until `hold` elapses.
@@ -455,13 +459,43 @@ impl StubDaemon {
     /// coalescing timer cannot fire mid-burst whether or not it is being
     /// reset — a mutation deleting the reset entirely stayed green. At a
     /// realistic drag rate the same mutation prints one notice per frame.
+    /// As [`Self::start`], plus one reply sent **in answer to** a client
+    /// frame rather than up front: the first frame satisfying `when` is
+    /// answered with `then`.
+    ///
+    /// **A condition and not a delay.** The close a daemon sends after a
+    /// `SecretInput` arrives *is* ordered after it, and pacing the stub
+    /// with a `gap` would turn that ordering into a bet on how fast the
+    /// client types. The stub already reads every post-handshake frame;
+    /// this only lets it answer one.
+    async fn start_reacting(
+        tag: &str,
+        replies: Vec<Vec<u8>>,
+        when: fn(&ClientFrame) -> bool,
+        then: Vec<u8>,
+        hold: Duration,
+    ) -> Self {
+        Self::serve(tag, replies, Duration::ZERO, Some((when, then)), hold).await
+    }
+
     async fn start_paced(tag: &str, replies: Vec<Vec<u8>>, gap: Duration, hold: Duration) -> Self {
+        Self::serve(tag, replies, gap, None, hold).await
+    }
+
+    async fn serve(
+        tag: &str,
+        replies: Vec<Vec<u8>>,
+        gap: Duration,
+        react: Option<Reaction>,
+        hold: Duration,
+    ) -> Self {
         let paths = RuntimePaths::with_dir(scratch_dir(tag));
         paths.ensure_dir().expect("ensure the runtime dir");
         let listener =
             tokio::net::UnixListener::bind(paths.attach_sock()).expect("bind the stub socket");
         let got: Arc<Mutex<Vec<ClientFrame>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&got);
+        let mut react = react;
         tokio::spawn(async move {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
@@ -495,6 +529,20 @@ impl StubDaemon {
                 match tokio::time::timeout(left, frame::read_frame_body(&mut stream)).await {
                     Ok(Ok(b)) => {
                         if let ClientDecode::Frame(f) = decode_client_frame(&b) {
+                            // Answered **before** the frame is recorded,
+                            // so a row waiting on `frames()` cannot
+                            // observe the trigger and assert on the
+                            // client's reaction to a reply the stub has
+                            // not sent yet.
+                            if react.as_ref().is_some_and(|(when, _)| when(&f)) {
+                                use tokio::io::AsyncWriteExt;
+                                let (_, then) = react.take().expect("checked just above");
+                                if stream.write_all(&then).await.is_err()
+                                    || stream.flush().await.is_err()
+                                {
+                                    return;
+                                }
+                            }
                             sink.lock().unwrap().push(f);
                         }
                     }
@@ -1342,6 +1390,156 @@ async fn a_future_attention_frame_does_not_disturb_a_v0_1_0_client() {
 /// have to rule out. `printf 'Password: '` emits no line terminator on
 /// either side, so this framing is the client's signature.
 const SECRET_PROMPT_DRAWN: &[u8] = b"\r\nPassword: \r\n";
+
+/// **GH #137, client side.** A submission the daemon declines must reach
+/// the person who typed it.
+///
+/// Two facts, and the row would be green on either alone:
+///
+/// 1. **The client submits with `allow_echo: false`** — the gated
+///    spelling. `holdfast attach` with no flag must not be able to
+///    provoke the disclosure, and the field's `#[serde(default)]` only
+///    protects a client that omits it, never one that fills it in wrong.
+/// 2. **The decline is rendered.** This is the half the client did not
+///    have: `secret` is cleared the instant the frame goes out — it has
+///    to be, or the keyboard stays captured — and the
+///    `SecretRequestClosed` arm was guarded on `secret` still matching.
+///    So every *other* attached client was told and the one that answered
+///    was not. Harmless while every close a submitter could provoke was
+///    `fulfilled`; a discarded credential makes it the defect the decline
+///    exists to prevent.
+///
+/// The stub answers the `SecretInput` rather than sending the close up
+/// front, because sending it up front would find `secret` still set and
+/// pass against exactly the client this row is about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_declined_secret_is_reported_to_the_client_that_submitted_it() {
+    let stub = StubDaemon::start_reacting(
+        "secretdeclined",
+        vec![
+            enc(&ServerFrame::Attached {
+                session_id: "sess_stub01".into(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                state: "Running".into(),
+                exit_code: None,
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+            }),
+            enc(&ServerFrame::AwaitingSecret {
+                request_id: "req_sd99".into(),
+                prompt_text: "Password: ".into(),
+            }),
+        ],
+        |f| matches!(f, ClientFrame::SecretInput { .. }),
+        enc(&ServerFrame::SecretRequestClosed {
+            request_id: "req_sd99".into(),
+            outcome: "not_echo_off".into(),
+        }),
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_stub01"], 80, 24);
+    term.wait_for(SECRET_PROMPT_DRAWN, 10);
+    term.type_keys(b"hunter2\r");
+
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter()
+            .any(|x| matches!(x, ClientFrame::SecretInput { .. }))
+    });
+    assert!(
+        sent.iter().any(|f| matches!(
+            f,
+            ClientFrame::SecretInput {
+                allow_echo: false,
+                ..
+            }
+        )),
+        "`holdfast attach` with no flag submitted with the gate off: {sent:?}"
+    );
+
+    // The word, so the line is greppable and matches the agent's
+    // `secret_cancelled.reason`...
+    let seen = term.wait_for(b"not_echo_off", 10);
+    // ...and the sentence, because `secret request not_echo_off` does not
+    // tell a human that the password they typed was thrown away.
+    assert!(
+        contains(&seen, b"discarded"),
+        "the decline was reported as a bare token, which says nothing a human \
+         can act on:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+/// The opt-out, exercised from the one client that ships (GH #137).
+///
+/// **Without a row here the field is unreachable in practice**, and a
+/// child that legitimately never clears `ECHO` — a TOTP prompt, a REPL
+/// asking for an API key — would have no masked path at all. Pushing
+/// those to `send_input` is strictly worse: it has no masking, so the
+/// value is drawn on the local terminal as well as echoed by the child.
+///
+/// Asserted on the frame and not on the outcome: whether the write then
+/// happens is the daemon's half, and `the_documented_echo_on_leak_is_asserted_not_assumed`
+/// in `holdfast-core` is where that is measured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn allow_echo_sets_the_flag_on_the_submitted_frame() {
+    let stub = StubDaemon::start(
+        "secretallowecho",
+        vec![
+            enc(&ServerFrame::Attached {
+                session_id: "sess_stub01".into(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                state: "Running".into(),
+                exit_code: None,
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+            }),
+            enc(&ServerFrame::AwaitingSecret {
+                request_id: "req_ae01".into(),
+                prompt_text: "Password: ".into(),
+            }),
+        ],
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let mut term = Term::spawn(
+        stub.paths.dir(),
+        &["attach", "sess_stub01", "--allow-echo"],
+        80,
+        24,
+    );
+    term.wait_for(SECRET_PROMPT_DRAWN, 10);
+    term.type_keys(b"hunter2\r");
+
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter()
+            .any(|x| matches!(x, ClientFrame::SecretInput { .. }))
+    });
+    assert!(
+        sent.iter().any(|f| matches!(
+            f,
+            ClientFrame::SecretInput {
+                allow_echo: true,
+                ..
+            }
+        )),
+        "`--allow-echo` did not reach the frame, so the opt-in is unreachable \
+         from the shipped client: {sent:?}"
+    );
+    // And the value still never touches the local terminal: the flag is
+    // about what the *child* may do with it, not about masking here.
+    assert!(
+        !contains(&term.snapshot(), b"hunter2"),
+        "--allow-echo turned off the client's own masking:\n{}",
+        String::from_utf8_lossy(&term.snapshot())
+    );
+}
 
 /// The frames the stub has recorded, once `pred` holds — or a failure on
 /// a deadline. A bare `frames()` read races the client's own write.

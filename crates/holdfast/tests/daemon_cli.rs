@@ -1379,11 +1379,12 @@ fn version_reports_the_protocol_version() {
     // any bump, accidental or not; the number is a wire promise and a
     // second pair of eyes on it is the whole value of the row. Moved 1.0
     // → 1.1 for `Attach.terminal` (GH #66), and 1.1 → 1.2 for
-    // `holdfast/cancel` and `Request.cancel_token` (GH #127), each
-    // alongside a new golden — the version and the recorded shape move
-    // together or the wire-shape guard fails, which is the pairing that
-    // makes this literal safe to update rather than a rubber stamp.
-    assert!(out.contains("protocol 1.2"), "{out}");
+    // `holdfast/cancel` and `Request.cancel_token` (GH #127), and 1.2 →
+    // 1.3 for `SecretInput.allow_echo` (GH #137), each alongside a new
+    // golden — the version and the recorded shape move together or the
+    // wire-shape guard fails, which is the pairing that makes this
+    // literal safe to update rather than a rubber stamp.
+    assert!(out.contains("protocol 1.3"), "{out}");
     assert!(out.contains(env!("CARGO_PKG_VERSION")), "{out}");
 }
 
