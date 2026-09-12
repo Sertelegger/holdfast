@@ -24,6 +24,55 @@
 
 use std::path::{Path, PathBuf};
 
+/// Read a source file with its line endings normalised to `\n`.
+///
+/// **Windows checks this repository out with CRLF** — nothing pins it, there
+/// is no `.gitattributes` — so a scanner that splits on a pattern containing a
+/// literal `\n` matches on Linux and silently fails to match there. The
+/// failure is worse than it looks: the anchor is not found, the row `expect`s,
+/// and the message says the arm was renamed when in fact only the bytes
+/// between the lines differ. Two rows here learned that when `allow_echo`
+/// turned their single-line anchors into multi-line ones.
+///
+/// Normalising at the read is the fix rather than escaping each pattern,
+/// because the next multi-line anchor gets it for free.
+fn read_src(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref();
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
+}
+
+/// The helper above is load-bearing on a platform CI runs and this developer
+/// does not, so it is asserted rather than assumed: a CRLF file and an LF file
+/// with the same content must read identically, and a multi-line anchor must
+/// find itself in both.
+#[test]
+fn a_crlf_checkout_reads_the_same_as_an_lf_one() {
+    let dir = std::env::temp_dir().join(format!("hf-src-guard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let lf = dir.join("lf.rs");
+    let crlf = dir.join("crlf.rs");
+    let body = "fn f(A {\n    b,\n    c,\n}) {\n";
+    std::fs::write(&lf, body).expect("write lf");
+    std::fs::write(&crlf, body.replace('\n', "\r\n")).expect("write crlf");
+
+    let anchor = "A {\n    b,\n    c,\n}";
+    assert_eq!(read_src(&lf), read_src(&crlf), "the two checkouts disagree");
+    assert!(
+        read_src(&crlf).contains(anchor),
+        "a multi-line anchor does not match a CRLF checkout, which is the \
+         Windows-only failure this helper exists to stop"
+    );
+    // Without the normalisation the raw read must NOT match, or this row
+    // would pass against a helper that does nothing.
+    assert!(
+        !std::fs::read_to_string(&crlf).unwrap().contains(anchor),
+        "the raw CRLF read already matched, so this row proves nothing"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Every `.rs` file under `dir`, recursively.
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -108,7 +157,7 @@ fn no_module_in_this_crate_can_print_around_the_redactor() {
 
     let mut offences = Vec::new();
     for file in &files {
-        let text = std::fs::read_to_string(file).expect("read a source file");
+        let text = read_src(file);
         for (n, line) in text.lines().enumerate() {
             if calls_a_print_macro(line) {
                 offences.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
@@ -138,7 +187,7 @@ fn no_module_in_this_crate_can_print_around_the_redactor() {
     // The denial itself, at the crate root — the scope, not the rule.
     // Re-scoping it to a subtree is what happened last time, and it is
     // invisible to the scan above until someone then adds a call site.
-    let lib = std::fs::read_to_string(src.join("lib.rs")).expect("read lib.rs");
+    let lib = read_src(src.join("lib.rs"));
     assert!(
         lib.contains("#![deny(clippy::print_stderr, clippy::print_stdout)]"),
         "the crate-root denial is gone or reworded; if it moved to a subtree, this crate \
@@ -161,7 +210,7 @@ fn no_module_in_this_crate_can_print_around_the_redactor() {
 #[test]
 fn the_write_channel_carries_the_secret_as_itself() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let text = std::fs::read_to_string(src.join("session/mod.rs")).expect("read session/mod.rs");
+    let text = read_src(src.join("session/mod.rs"));
 
     assert!(
         text.contains("secret: SecretBytes,"),
@@ -217,9 +266,8 @@ fn the_write_channel_carries_the_secret_as_itself() {
 #[test]
 fn the_daemons_secret_arms_are_the_ones_the_unit_target_substitutes_for() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let conn = std::fs::read_to_string(src.join("attach/conn.rs")).expect("read attach/conn.rs");
-    let binding =
-        std::fs::read_to_string(src.join("secret/binding.rs")).expect("read secret/binding.rs");
+    let conn = read_src(src.join("attach/conn.rs"));
+    let binding = read_src(src.join("secret/binding.rs"));
 
     // Code lines only — both files discuss these names in prose, and a
     // scanner that read comments would pass on a tree that is wrong. Same
@@ -305,9 +353,8 @@ fn the_daemons_secret_arms_are_the_ones_the_unit_target_substitutes_for() {
 #[test]
 fn the_arbitrary_program_seam_is_still_out_of_the_published_api() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let provider =
-        std::fs::read_to_string(src.join("secret/provider.rs")).expect("read secret/provider.rs");
-    let module = std::fs::read_to_string(src.join("secret/mod.rs")).expect("read secret/mod.rs");
+    let provider = read_src(src.join("secret/provider.rs"));
+    let module = read_src(src.join("secret/mod.rs"));
 
     // The two files, reduced to the lines that are actually compiled.
     let code = |text: &str| -> Vec<String> {
@@ -413,8 +460,7 @@ fn the_arbitrary_program_seam_is_still_out_of_the_published_api() {
 #[test]
 fn secret_bytes_still_zeroes_itself_in_drop() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let text =
-        std::fs::read_to_string(src.join("attach/secret.rs")).expect("read attach/secret.rs");
+    let text = read_src(src.join("attach/secret.rs"));
 
     let (_, after_impl) = text
         .split_once("impl Drop for SecretBytes {")
@@ -520,7 +566,7 @@ fn secret_bytes_still_zeroes_itself_in_drop() {
 #[test]
 fn the_secret_frame_body_is_zeroed_before_the_arm_can_be_cancelled() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let text = std::fs::read_to_string(src.join("attach/conn.rs")).expect("read attach/conn.rs");
+    let text = read_src(src.join("attach/conn.rs"));
 
     let arm = text
         .split_once("ClientDecode::Frame(ClientFrame::SecretInput {\n                request_id,\n                bytes,\n                allow_echo,\n            }) => {")
@@ -634,8 +680,7 @@ fn the_secret_frame_body_is_zeroed_before_the_arm_can_be_cancelled() {
 #[test]
 fn the_providers_credential_buffers_are_sized_once_and_zeroed_on_the_timeout_path() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let text =
-        std::fs::read_to_string(src.join("secret/provider.rs")).expect("read secret/provider.rs");
+    let text = read_src(src.join("secret/provider.rs"));
     let code: Vec<&str> = text
         .lines()
         .map(str::trim_start)
@@ -784,7 +829,7 @@ fn the_providers_credential_buffers_are_sized_once_and_zeroed_on_the_timeout_pat
 #[test]
 fn the_secret_input_arm_owns_its_submission_as_a_secret() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let text = std::fs::read_to_string(src.join("attach/conn.rs")).expect("read attach/conn.rs");
+    let text = read_src(src.join("attach/conn.rs"));
 
     let arm = text
         .split_once("ClientFrame::SecretInput {\n                request_id,\n                bytes,\n                allow_echo,\n            }) => {")
