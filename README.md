@@ -48,10 +48,12 @@ over — a live session from any terminal. The web UI is still to come; see
 - `holdfast daemon start|stop|status|run` — manage the background daemon
 - `holdfast list` / `holdfast logs <session> [--tail N] [--raw]` — inspect
   sessions from any terminal
-- `holdfast attach <session>` — your terminal *becomes* the session. Full
-  colour, full TUIs, full keyboard. Detach with **Ctrl-B then d**; the
-  session keeps running. That works at a password prompt too, and
+- `holdfast attach <session> [--allow-echo]` — your terminal *becomes* the
+  session. Full colour, full TUIs, full keyboard. Detach with **Ctrl-B then
+  d**; the session keeps running. That works at a password prompt too, and
   **Ctrl+C** there abandons the prompt rather than answering it.
+  `--allow-echo` submits secrets even to a program that has not turned
+  terminal echo off — see the password note below for what that costs.
 - `holdfast watch <session>` — the same view, read-only and **redacted**.
   Detach with Ctrl+C.
 
@@ -63,7 +65,13 @@ are handed alternate keystrokes by the kernel and neither reliably sees a
 detach. Attach from another window instead. The session's size is the smallest
 attached writer's, so another client's window can narrow what a program sees. When a program asks for a password, every attached
 client is told and any of them can answer — without the value ever reaching the
-agent. `request_secret_input`, the tool an agent calls to *ask* for that
+agent, **provided the program turned terminal echo off**, as `sudo`, `ssh` and
+`gpg` do. If it did not, the terminal echoes what it is given straight into the
+session's output, where the agent reads it; so Holdfast refuses that write and
+tells you why rather than delivering it. `holdfast attach --allow-echo` sends it
+anyway, for the programs that ask for a code or an API key without ever clearing
+echo — the value is still masked on your own terminal, and it will still appear
+in the session's output. `request_secret_input`, the tool an agent calls to *ask* for that
 password, ships in 0.0.7 and is one of the twelve above.
 
 Sessions outlive the MCP client: `holdfast mcp` auto-spawns a daemon on

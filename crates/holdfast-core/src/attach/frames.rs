@@ -181,6 +181,18 @@ pub enum ClientFrame {
         /// What the field carries is that a *human* accepts the
         /// disclosure — which is the one thing about this write the
         /// daemon cannot work out for itself.
+        ///
+        /// **What actually enforces that is the uid, not the word
+        /// "human", and the difference is worth stating so the field is
+        /// not read as more than it is.** `attach.sock` is `0600` and
+        /// peer-credential-checked before a byte is parsed, so the set of
+        /// parties who can send `true` is *the owning user's processes* —
+        /// the same boundary `role` rests on, and the same argument §7.5
+        /// makes for it: the only person a lie reaches is the one telling
+        /// it. An agent with a shell as that user is inside it. What the
+        /// field buys is that no **tool argument**, config key or default
+        /// selects the disclosure, so it cannot be reached by an agent
+        /// doing only what the MCP surface offers.
         #[serde(default)]
         allow_echo: bool,
     },
@@ -320,7 +332,16 @@ pub enum ServerFrame {
     },
     SecretRequestClosed {
         request_id: String,
-        /// `"fulfilled" | "cancelled" | "timeout"` (§7.5).
+        /// `"fulfilled" | "cancelled" | "timeout" | "caller_cancelled" |
+        /// `"not_echo_off"` — §18.4d is the catalogue.
+        ///
+        /// **A free `String` and not an enum**, so widening the set costs
+        /// nothing on the wire: the golden records `"<str>"` and a client
+        /// renders the word it is handed. That is also how this doc came
+        /// to list three when the daemon emitted four — GH #127 added
+        /// `caller_cancelled` and updated `mcp/schema.rs` but not the one
+        /// place a consumer of *this* type reads. GH #137 adds
+        /// `not_echo_off` and repairs the omission.
         outcome: String,
     },
     /// §9.6's `require_confirm` approval, raised when a binding that

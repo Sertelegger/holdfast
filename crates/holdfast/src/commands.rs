@@ -1486,10 +1486,30 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                         secret = Some((request_id, crate::attach_tty::SecretLine::default()));
                     }
                     ServerFrame::SecretRequestClosed { request_id, outcome } => {
-                        let mine = secret.as_ref().is_some_and(|(id, _)| *id == request_id)
-                            || submitted.as_deref() == Some(request_id.as_str());
-                        if mine {
+                        // **Two matches, two different clears, and
+                        // collapsing them tears down a live prompt.**
+                        // The first version of this arm `if`-ed on either
+                        // and then cleared both — so a close for the
+                        // request this client *answered* (`submitted`)
+                        // arriving after a **new** `AwaitingSecret` had
+                        // raised took the mask off the new one. Every
+                        // keystroke after that goes out as ordinary
+                        // `Input`, unmasked, into the prompt the human
+                        // thinks they are typing a password at.
+                        //
+                        // The window is real rather than theoretical: the
+                        // close is broadcast from the daemon's ack task
+                        // after the *writer thread* answers, while the
+                        // next raise rides the echo-drop edge on a
+                        // different task, and the writer blocks on a full
+                        // PTY buffer — which `CLAUDE.md` records as the
+                        // ordinary macOS case, not an edge one.
+                        let answering = secret.as_ref().is_some_and(|(id, _)| *id == request_id);
+                        let mine = answering || submitted.as_deref() == Some(request_id.as_str());
+                        if answering {
                             secret = None;
+                        }
+                        if mine {
                             submitted = None;
                             // **The one outcome that gets a sentence
                             // rather than a token** (GH #137). Every other

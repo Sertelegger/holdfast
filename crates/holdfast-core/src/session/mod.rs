@@ -471,12 +471,27 @@ pub enum WriteRequest {
         /// satisfied the read the credential was resolved for.
         ///
         /// **`None` selects the echo condition alone** (GH #137), which is
-        /// what `attach::conn`'s `SecretInput` arm submits. That path has
-        /// no provider round trip and therefore no interval for a write to
-        /// intervene *in*: the human's keystrokes go from the socket to
-        /// this queue in one arm with no await between them. What it does
-        /// share with the autofill is that nobody consulted the child's
-        /// termios, which is the condition the harm turns on.
+        /// what `attach::conn`'s `SecretInput` arm submits. What it shares
+        /// with the autofill is that nobody consulted the child's termios,
+        /// which is the condition the harm turns on; what it does not
+        /// share is a number to compare against.
+        ///
+        /// **The reason is availability, not absence of risk, and the
+        /// first version of this comment got that wrong.** It claimed the
+        /// path has *"no interval for a write to intervene in: the human's
+        /// keystrokes go from the socket to this queue in one arm with no
+        /// await between them"* — which measures socket-read to enqueue,
+        /// the wrong interval. The one that matters runs from the **raise**
+        /// to the write and is human-typing-scale, and another ReadWrite
+        /// client's `Input` or the agent's `send_input` can land inside it.
+        ///
+        /// The counter is simply not available here: a `RaisedRequest`
+        /// carries no `writes` field, because a raise is not a decision to
+        /// resolve and has no *"as it stood when I decided"* moment to
+        /// sample. The residual it leaves is narrow — two consecutive
+        /// echo-off reads inside one episode, `sudo` asking twice — and it
+        /// is the same one GH #43 already records for both variants, since
+        /// neither condition can see bytes already queued and unread.
         ///
         /// **An `Option` rather than a sentinel `u64`.** The counter is a
         /// real value with a real zero — a session that has been written

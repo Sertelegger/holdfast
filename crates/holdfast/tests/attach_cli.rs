@@ -1473,6 +1473,104 @@ async fn a_declined_secret_is_reported_to_the_client_that_submitted_it() {
     );
 }
 
+/// **A close for a request this client already answered must not tear
+/// down a prompt it is currently showing** (GH #137, review finding).
+///
+/// `secret` has to be cleared the instant a `SecretInput` goes out or the
+/// keyboard stays captured, so the client remembers the id separately in
+/// order to report the close. The first version of that matched on either
+/// and then cleared **both** — so a `SecretRequestClosed` for the
+/// *answered* request, arriving after a new `AwaitingSecret` had raised,
+/// took the mask off the new one. Every keystroke after that leaves as
+/// ordinary `Input`, unmasked, into the prompt the human believes they
+/// are typing a password at.
+///
+/// The window is not theoretical: the close is broadcast from the
+/// daemon's ack task after the **writer thread** answers, while the next
+/// raise rides the echo-drop edge on a different task, and the writer
+/// blocks on a full PTY buffer — which `CLAUDE.md` records as the
+/// ordinary macOS case rather than an edge one.
+///
+/// The stub therefore answers the submission with the two frames in that
+/// order, and the row asserts on the **wire**: what is typed next must
+/// not leave as `Input`. Asserting on the screen would pass against a
+/// client that had dropped the mask but happened to draw nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_for_an_answered_request_does_not_unmask_a_new_prompt() {
+    let mut second = enc(&ServerFrame::AwaitingSecret {
+        request_id: "req_two".into(),
+        prompt_text: "Password: ".into(),
+    });
+    second.extend_from_slice(&enc(&ServerFrame::SecretRequestClosed {
+        request_id: "req_one".into(),
+        outcome: "not_echo_off".into(),
+    }));
+
+    let stub = StubDaemon::start_reacting(
+        "secretrestale",
+        vec![
+            enc(&ServerFrame::Attached {
+                session_id: "sess_stub01".into(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                state: "Running".into(),
+                exit_code: None,
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+            }),
+            enc(&ServerFrame::AwaitingSecret {
+                request_id: "req_one".into(),
+                prompt_text: "Password: ".into(),
+            }),
+        ],
+        |f| matches!(f, ClientFrame::SecretInput { .. }),
+        second,
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_stub01"], 80, 24);
+    term.wait_for(SECRET_PROMPT_DRAWN, 10);
+    term.type_keys(b"first\r");
+
+    // The client has answered `req_one` and been shown `req_two`; the
+    // stale close for `req_one` landed in between. Waited for on the
+    // screen, so the second prompt is genuinely up before anything is
+    // typed into it.
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter()
+            .any(|x| matches!(x, ClientFrame::SecretInput { .. }))
+    });
+    assert_eq!(
+        sent.iter()
+            .filter(|f| matches!(f, ClientFrame::SecretInput { .. }))
+            .count(),
+        1,
+        "the first submission did not go out as a secret: {sent:?}"
+    );
+    term.wait_for(SECRET_PROMPT_DRAWN, 10);
+
+    term.type_keys(b"second\r");
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter()
+            .filter(|x| matches!(x, ClientFrame::SecretInput { .. }))
+            .count()
+            == 2
+            || f.iter().any(|x| matches!(x, ClientFrame::Input { .. }))
+    });
+    assert!(
+        !sent.iter().any(|f| matches!(f, ClientFrame::Input { .. })),
+        "the second password left the client as unmasked `Input`: the stale \
+         close tore down a live prompt: {sent:?}"
+    );
+    assert!(
+        !contains(&term.snapshot(), b"second"),
+        "the second password was drawn on the local terminal:\n{}",
+        String::from_utf8_lossy(&term.snapshot())
+    );
+}
+
 /// The opt-out, exercised from the one client that ships (GH #137).
 ///
 /// **Without a row here the field is unreachable in practice**, and a

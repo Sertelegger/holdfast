@@ -43,7 +43,7 @@ claude mcp add --scope user holdfast -- "$(pwd)/target/debug/holdfast" mcp
 **hybrid mode**: it auto-spawns a background `holdfast daemon` that owns the
 sessions, so they outlive the MCP client that started them. `holdfast daemon
 run|start|stop [--force]|status [--json]`, `holdfast list [--json]`, `holdfast logs
-<session> [--tail N] [--raw]`, `holdfast attach <session>`, `holdfast watch
+<session> [--tail N] [--raw]`, `holdfast attach <session> [--allow-echo]`, `holdfast watch
 <session>`, and `holdfast version` are all live subcommands: **`attach` and
 `watch` shipped in 0.0.6**, which this paragraph listed as later milestones
 until it was checked against the CHANGELOG. `holdfast ui`, `holdfast confirm`

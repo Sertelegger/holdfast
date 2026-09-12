@@ -114,6 +114,16 @@ is cut, named and published is in
   `SecretRequestClosed` a fifth outcome of the same name, so a human whose
   password was refused is told that rather than `cancelled` — which they would
   read as the child having given up ([#137]).
+- A refused `SecretInput` submission is now zeroed: the `too_large` and
+  `unknown_request_id` arms dropped the decoded credential as a plain
+  `Vec<u8>`, whose `Drop` does not zero. Nothing read the value — what it broke
+  was the zeroing discipline, on the two arms a hostile submission lands on
+  ([#57]). Residuals filed from the same review: [#82], [#83], [#84], [#85],
+  [#86].
+- `ci-hygiene.sh`'s dated calibration exemption no longer applies to a workflow
+  that merely mentions the marker inside a comment — it must *be* a comment
+  line — so a file can no longer exempt itself from the bans on
+  `continue-on-error`, unpinned actions and `secrets.` references.
 
 ### Fixed
 
@@ -257,19 +267,6 @@ is cut, named and published is in
   their next line needed, and each now carries the delay that produced its
   figure. `buffer_until_count` was added alongside, and caught a
   `write_secret_if_unread` mutation that had passed all 54 rows in the module.
-
-### Security
-
-- A refused `SecretInput` submission is now zeroed: the `too_large` and
-  `unknown_request_id` arms dropped the decoded credential as a plain
-  `Vec<u8>`, whose `Drop` does not zero. Nothing read the value — what it broke
-  was the zeroing discipline, on the two arms a hostile submission lands on
-  ([#57]). Residuals filed from the same review: [#82], [#83], [#84], [#85],
-  [#86].
-- `ci-hygiene.sh`'s dated calibration exemption no longer applies to a workflow
-  that merely mentions the marker inside a comment — it must *be* a comment
-  line — so a file can no longer exempt itself from the bans on
-  `continue-on-error`, unpinned actions and `secrets.` references.
 
 ## [0.0.7] — 2026-09-01 (Carabiner)
 

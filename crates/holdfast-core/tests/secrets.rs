@@ -202,9 +202,9 @@ const ECHO_OFF_FIXTURE: &str = "stty -echo; printf 'Password: '; read x; stty ec
 /// drifts, and the assertion below catches a `replace` that matched
 /// nothing.
 fn late_echo_off_fixture() -> String {
-    let out = ECHO_OFF_FIXTURE.replace("stty -echo;", "read gate; stty -echo;");
+    let out = ECHO_OFF_FIXTURE.replace("stty -echo;", "printf 'ready\\n'; read gate; stty -echo;");
     assert!(
-        out.starts_with("read gate; stty -echo;") && out.contains(TRANSFORM),
+        out.starts_with("printf 'ready\\n'; read gate; stty -echo;") && out.contains(TRANSFORM),
         "the late-echo derivation missed: {out}"
     );
     out
@@ -275,7 +275,15 @@ fn echo_on_loop_fixture() -> String {
         ECHO_OFF_FIXTURE.contains(TRANSFORM),
         "the transform is no longer shared with the echo-off fixture"
     );
-    format!("while read x; do {TRANSFORM}; done")
+    // **`ready` is a synchronisation point and not decoration** (review
+    // of GH #137). A row that waits on [`await_echo_on`] alone is
+    // satisfied by a pty whose child has not exec'd yet — a fresh master
+    // has `ECHO` on before `sh` runs at all — so it would confirm that
+    // the *terminal* echoes without establishing that the *child* is
+    // parked in a read. The gate reads the terminal, so such a row is
+    // still sound; its narration is not, and in this codebase that is
+    // itself a defect. Printed once, before the loop.
+    format!("printf 'ready\\n'; while read x; do {TRANSFORM}; done")
 }
 
 struct TestDaemon {
@@ -677,6 +685,30 @@ async fn await_detected_prompt(s: &Session, needle: &str) -> String {
 /// *adopt* — the poller becomes the waiter, the call it was waiting for
 /// collides, and the test measures something it created. That is what
 /// `has_waiter` exists for.
+/// Wait until `needle` has appeared in the session's ring buffer.
+///
+/// **The buffer and not [`await_detected_prompt`].** The detector reports
+/// the child's *last line*, and a marker terminated with `\n` leaves that
+/// line empty — so a newline-terminated `ready` is invisible to it while
+/// being exactly the evidence wanted: the child got far enough to print
+/// it, and is therefore past its `exec` and into the read that follows.
+async fn await_output(s: &Session, needle: &[u8]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let buf = buffered(s);
+        if contains(&buf, needle) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the child never printed {:?}; its buffer is {:?}",
+            String::from_utf8_lossy(needle),
+            String::from_utf8_lossy(&buf)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Wait until the child's line discipline reports `ECHO` **on**.
 ///
 /// **The tty, not a cache of it and not a broadcast.** This is the same
@@ -705,6 +737,8 @@ fn whole_result_of(payload: &Value) -> String {
     payload.to_string()
 }
 
+/// Poll until a `request_secret_input` call is registered as waiting on
+/// this session's request.
 async fn await_waiter(d: &TestDaemon, session_id: &str, what: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !d
@@ -1114,7 +1148,14 @@ fn the_echo_on_fixtures_are_the_echo_off_one_with_the_stty_calls_removed() {
     assert!(on.contains("printf 'Password: '"), "{on}");
     let looped = echo_on_loop_fixture();
     assert!(!looped.contains("stty"), "{looped}");
-    assert!(looped.starts_with("while read x; do "), "{looped}");
+    // The `ready` marker precedes the loop and is asserted for, not
+    // tolerated: the rows that wait on it are unsound without it, and a
+    // fixture edit that dropped it would leave them waiting on a terminal
+    // whose child has not exec'd (GH #137's review).
+    assert!(
+        looped.starts_with("printf 'ready\\n'; while read x; do "),
+        "{looped}"
+    );
     assert!(looped.contains(TRANSFORM), "{looped}");
 }
 
@@ -1494,27 +1535,38 @@ async fn the_response_carries_a_length_and_not_a_value() {
 /// lose. Nothing here sleeps and nothing here races — the state the gate
 /// is judged against is the state the child is permanently in.
 ///
-/// The row asserts the whole of the answer, because each third of it is
-/// separately losable:
+/// The row asserts three things, and they are **not** equally
+/// load-bearing — which is worth saying, because the first draft of this
+/// comment claimed each was separately losable and that is not true:
 ///
-/// 1. **The write did not happen** — the child's transform never appears.
-/// 2. **The agent is told which refusal it was** — `not_echo_off`, not
+/// 1. **The agent is told which refusal it was** — `not_echo_off`, not
 ///    `user_cancelled` (an ending at the child's end, with nobody having
 ///    answered) and not `too_large` (a property of the value, which an
-///    agent fixes by retrying smaller).
-/// 3. **The human is told** — `SecretRequestClosed { outcome }` carries
+///    agent fixes by retrying smaller). This is the assertion that fails
+///    first on a revert, so it carries the row.
+/// 2. **The human is told** — `SecretRequestClosed { outcome }` carries
 ///    the same word. A silently dropped secret is its own defect: the
 ///    person who typed it believes it was delivered and the child sits at
-///    its prompt forever.
+///    its prompt forever. Independently losable: the two vocabularies are
+///    kept in step by hand.
+/// 3. **The write did not happen** — swept over the buffer. These run
+///    straight after the call returns and the reader thread writes the
+///    buffer, so they are a *belt* to (1)'s braces rather than an
+///    independent check: on a revert (1) has already fired. The row that
+///    sweeps a disclosure with the child's own timing behind it is
+///    [`the_137_reproduction_does_not_disclose_the_credential`].
 #[tokio::test]
 async fn a_secret_submitted_while_the_child_still_echoes_is_declined() {
     let d = TestDaemon::start("echogate").await;
     let s = d.shell_running(&echo_on_loop_fixture());
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
-    // The precondition, measured rather than assumed: this child is at an
-    // echoing read. Waited on the tty itself, which is the same fact the
-    // writer thread consults — not on a broadcast, and not on a clock.
+    // The precondition, measured rather than assumed, in its two halves:
+    // the **child** is parked in a read (it said so), and the **terminal**
+    // echoes (the tty says so, which is the fact the writer consults).
+    // Neither alone is the arrangement — a pty whose child has not exec'd
+    // yet satisfies the second.
+    await_output(&s, b"ready").await;
     await_echo_on(&s).await;
 
     // Nothing raises here on its own — the child never drops ECHO. The
@@ -1604,6 +1656,7 @@ async fn a_pre_1_3_client_that_omits_allow_echo_is_gated() {
     let d = TestDaemon::start("pre13client").await;
     let s = d.shell_running(&echo_on_loop_fixture());
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    await_output(&s, b"ready").await;
     await_echo_on(&s).await;
 
     let call = spawn_call(&d, secret_args(&s.id, 20));
@@ -1647,6 +1700,57 @@ async fn a_pre_1_3_client_that_omits_allow_echo_is_gated() {
     let _ = s.signal(Signal::Kill);
 }
 
+/// **GH #137: the decline reaches the clients that did *not* answer.**
+///
+/// The whole point of `SecretRequestClosed` is to clear the masked-input
+/// affordance on the other clients, and the word it carries is what tells
+/// them why. `fulfilling_the_request_closes_it_for_every_other_client`
+/// covers that fan-out for `"fulfilled"` only, so the refusal path had
+/// its broadcast asserted on the submitting connection and nowhere else
+/// — and a `broadcast_secret_closed` narrowed to the submitter would have
+/// left every row in this file green while a second human sat looking at
+/// a password box for a request that was over.
+#[tokio::test]
+async fn a_declined_write_closes_the_request_for_every_other_client() {
+    let d = TestDaemon::start("declinedfanout").await;
+    let s = d.shell_running(&echo_on_loop_fixture());
+    let mut typist = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    let mut watcher = attach_ok(&d, &s.id, AttachMode::ReadOnly).await;
+    await_output(&s, b"ready").await;
+    await_echo_on(&s).await;
+
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    let (request_id, _) = next_awaiting_secret(&mut typist, 20).await;
+    // The observer is shown the same prompt — asserted, so the close
+    // below is clearing an affordance this client actually has.
+    let (watched_id, _) = next_awaiting_secret(&mut watcher, 20).await;
+    assert_eq!(watched_id, request_id);
+
+    send(
+        &mut typist,
+        &ClientFrame::SecretInput {
+            request_id: request_id.clone(),
+            bytes: PROBE.as_bytes().to_vec(),
+            allow_echo: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        cancelled_reason(&joined(call, "the declined call").await),
+        "not_echo_off"
+    );
+
+    let (closed_id, outcome) = next_secret_closed(&mut watcher, 20).await;
+    assert_eq!(closed_id, request_id);
+    assert_eq!(
+        outcome, "not_echo_off",
+        "a client that did not answer was left holding a masked-input \
+         affordance, or was told a word that does not match what the \
+         submitter and the agent were told"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
 /// **GH #137's reproduction, as a row.** The issue reproduces by delaying
 /// [`ECHO_OFF_FIXTURE`]'s `stty -echo`; [`late_echo_off_fixture`] holds it
 /// behind a read instead, for the reason that function's doc gives — the
@@ -1685,9 +1789,11 @@ async fn the_137_reproduction_does_not_disclose_the_credential() {
     let s = d.shell_running(&late_echo_off_fixture());
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
-    // The arrangement, waited for rather than assumed: the child is
-    // parked in `read gate` with `ECHO` on, and stays there until this
-    // row says otherwise.
+    // The arrangement, waited for rather than assumed: the child has
+    // reached `read gate` — it printed `ready` on the way in — and the
+    // terminal still echoes. It stays there until this row says
+    // otherwise, so there is no window to lose.
+    await_output(&s, b"ready").await;
     await_echo_on(&s).await;
 
     let call = spawn_call(&d, secret_args(&s.id, 20));
@@ -1735,16 +1841,27 @@ async fn the_137_reproduction_does_not_disclose_the_credential() {
     // ahead of. Nothing it read can have been the credential — asserted
     // on the transform, which is the only evidence a no-echo read leaves.
     let buf = buffered(&s);
+    // **The `PROBE` sweep is the one that can see a queued write, and the
+    // transform sweep is not** (review finding). If the refused credential
+    // had been queued rather than dropped it would have satisfied `read
+    // gate`, `go` would have satisfied `read x`, and the transform would
+    // read `got=GO` — so a message about queueing on the `got=HUNTER2`
+    // assertion is attached to an assertion that cannot fire for that
+    // reason. What *does* catch it is the credential's presence in the
+    // buffer: `read gate` runs with `ECHO` on, so a queued `hunter2` is
+    // echoed there by the line discipline.
     assert!(
-        !contains(&buf, b"got=HUNTER2"),
-        "the refused credential was queued rather than dropped, and the child's \
-         *next* read took it — which is the disclosure moved one read later \
-         rather than prevented: {}",
+        !contains(&buf, PROBE.as_bytes()),
+        "the credential is in the ring buffer after the child reached its real \
+         prompt. If it was echoed by `read gate`, the refused write was queued \
+         rather than dropped — the disclosure moved one read later rather than \
+         prevented (the GH #43 class): {}",
         String::from_utf8_lossy(&buf)
     );
     assert!(
-        !contains(&buf, PROBE.as_bytes()),
-        "the credential reached the ring buffer: {}",
+        !contains(&buf, b"got=HUNTER2"),
+        "the child transformed the credential, so it reached an echo-off read \
+         after all: {}",
         String::from_utf8_lossy(&buf)
     );
     let _ = s.signal(Signal::Kill);
@@ -3533,6 +3650,7 @@ async fn every_secret_cancelled_reason_is_reachable() {
     {
         let s = d.shell_running(&echo_on_loop_fixture());
         let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+        await_output(&s, b"ready").await;
         await_echo_on(&s).await;
         let call = spawn_call(&d, secret_args(&s.id, 20));
         let (id, _) = next_awaiting_secret(&mut c, 20).await;

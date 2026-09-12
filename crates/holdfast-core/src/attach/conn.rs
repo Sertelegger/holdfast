@@ -1070,25 +1070,85 @@ async fn read_loop(
                                 // carries the same token so the two
                                 // vocabularies cannot drift.
                                 Submission::Declined(why) => {
-                                    // `{why:?}` rather than the token
-                                    // below, deliberately: `expect_writes`
-                                    // is `None` so `NotEchoOff` is the
-                                    // only decline this path can see, and
-                                    // logging the writer's own word means
-                                    // a third condition added later shows
-                                    // up in `daemon.log` as itself instead
-                                    // of being silently renamed to this
-                                    // one.
                                     crate::diag!(
                                         "holdfast: a submitted secret was not written to \
                                          the session: {why:?}"
                                     );
-                                    let reason = crate::secret::CancelReason::NotEchoOff;
-                                    answer.settle(
-                                        crate::secret::Resolution::Cancelled(reason),
-                                        reason.as_str(),
-                                    );
+                                    // **Matched, not assumed.**
+                                    // `expect_writes` is `None`, so
+                                    // `write_secret_if_unread` cannot
+                                    // return `OtherWriteIntervened` and
+                                    // the second arm is unreachable —
+                                    // which is exactly why it is written
+                                    // out. A `_ =>` here would turn a
+                                    // third condition added later into a
+                                    // *wrong word on the wire*, silently:
+                                    // the agent's `secret_cancelled.reason`
+                                    // and every attached client's
+                                    // `SecretRequestClosed.outcome` would
+                                    // name a refusal that did not happen.
+                                    // Exhaustive, so that change is a
+                                    // compile error instead.
+                                    let reason = match why {
+                                        crate::session::DeclineReason::NotEchoOff
+                                        | crate::session::DeclineReason::OtherWriteIntervened => {
+                                            crate::secret::CancelReason::NotEchoOff
+                                        }
+                                    };
+                                    // **A dead session is not an echoing
+                                    // one, and the backend cannot tell
+                                    // them apart.** `InProcessPty::line_discipline`
+                                    // answers `UNKNOWN` for a child that
+                                    // has exited, and the gate refuses
+                                    // `!= Some(false)` — so a session that
+                                    // died between the raise and the write
+                                    // declines `NotEchoOff`. Reported as
+                                    // such it tells the human *"this
+                                    // session's terminal is still echoing,
+                                    // re-attach with `--allow-echo`"*,
+                                    // which is false and unactionable: the
+                                    // session is gone and the flag would
+                                    // change nothing.
+                                    //
+                                    // Classified by liveness, which is the
+                                    // rule `SecretAnswer::Drop` already
+                                    // applies one screen down and for the
+                                    // same reason — where the refusal came
+                                    // from says nothing about why the
+                                    // request is over.
+                                    if for_ack.is_alive() {
+                                        answer.settle(
+                                            crate::secret::Resolution::Cancelled(reason),
+                                            reason.as_str(),
+                                        );
+                                    } else {
+                                        answer.settle(
+                                            crate::secret::Resolution::SessionDied {
+                                                exit_code: for_ack.exit_code(),
+                                            },
+                                            "cancelled",
+                                        );
+                                    }
                                 }
+                                // **`"fulfilled"` is wrong here and is
+                                // left wrong deliberately** — recorded as
+                                // a divergence rather than repaired from
+                                // this lane (Global Constraint 16).
+                                //
+                                // The session died under the write, so
+                                // whether the child received the bytes is
+                                // *unknown*; the MCP call is told
+                                // `session_died`, which is honest, and
+                                // every attached client is told the
+                                // credential was delivered, which is not.
+                                // §7.5's `outcome` set carries no word for
+                                // "unknown" and `cancelled` would claim
+                                // non-delivery just as falsely, so this is
+                                // a wire-vocabulary decision on a §23.3
+                                // surface rather than a local repair, and
+                                // it predates GH #137 — this commit only
+                                // moved the expression into a named
+                                // variant. Filed rather than guessed.
                                 Submission::SessionDied => answer.settle(
                                     crate::secret::Resolution::SessionDied {
                                         exit_code: for_ack.exit_code(),

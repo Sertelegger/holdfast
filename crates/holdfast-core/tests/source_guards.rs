@@ -870,20 +870,35 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
         // arms differ only in which `WriteRequest` carries it.
         "let value = bytes.normalised(raised.append_newline);",
     ];
+    // **Two bindings, not one** (GH #137, found by review of this guard
+    // rather than of the arm). `bytes` is the decoded submission;
+    // `value` is what `normalised` returns, and it is a `SecretBytes`
+    // holding the same credential. Before the echo gate the normalised
+    // form was an unnamed temporary consumed inside the
+    // `WriteRequest::secret(…)` call, so pinning `bytes` covered the whole
+    // chain; the gate made the write a two-armed choice, the value had to
+    // be named to be shared between the arms, and a
+    // `value.with_bytes(|b| b.to_vec())` would then have passed every test
+    // in this tree. That is the precise class this guard exists to kill,
+    // reintroduced by the change that made the guard's own whitelist
+    // longer.
+    //
     // `bytes` as an *identifier*, not as a substring. A plain `contains`
     // matches `zero_bytes`, `SecretBytes` and `bytes_written` — the last
     // of which caught this guard out on its first run, which is the
     // cheapest possible demonstration that the boundary check is load
     // bearing rather than pedantry.
-    let touches_binding = |l: &str| {
+    let touches = |l: &str, name: &str| {
         let b = l.as_bytes();
+        let n = name.len();
         let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-        l.match_indices("bytes").any(|(i, _)| {
+        l.match_indices(name).any(|(i, _)| {
             let before = i == 0 || !ident(b[i - 1]);
-            let after = i + 5 >= b.len() || !ident(b[i + 5]);
+            let after = i + n >= b.len() || !ident(b[i + n]);
             before && after
         })
     };
+    let touches_binding = |l: &str| touches(l, "bytes");
     for line in code.iter().filter(|l| touches_binding(l)) {
         assert!(
             ALLOWED.iter().any(|a| line.contains(a)),
@@ -911,6 +926,31 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
             .count(),
         2,
         "a refusal path no longer disposes of the submission explicitly (GH #57)"
+    );
+
+    // The normalised value, on the same inverted rule as the binding
+    // above: every use whitelisted, so a *new* way of touching it fails
+    // until it is named here deliberately.
+    const ALLOWED_VALUE: [&str; 3] = [
+        "let value = bytes.normalised(raised.append_newline);",
+        "let (w, rx) = WriteRequest::secret(value);",
+        "let (w, rx) = WriteRequest::secret_if_echo_off(value);",
+    ];
+    for line in code.iter().filter(|l| touches(l, "value")) {
+        assert!(
+            ALLOWED_VALUE.iter().any(|a| line.contains(a)),
+            "a use of the normalised credential that this guard has not seen \
+             before:\n  {line}\nIt is a `SecretBytes` holding the same value the \
+             binding above does, and the same rule applies: if it copies the \
+             value out of the zeroing type, the copy's Drop does not zero and it \
+             is GH #57 again."
+        );
+    }
+    assert_eq!(
+        code.iter().filter(|l| touches(l, "value")).count(),
+        3,
+        "the normalised credential is used a different number of times than this \
+         guard enumerates; it is checking a shape the arm no longer has"
     );
 
     // **The superseded branch zeroes the frame body before it parks.**
