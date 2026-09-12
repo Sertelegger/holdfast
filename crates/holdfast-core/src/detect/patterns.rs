@@ -67,7 +67,7 @@ const ECHOED_PATTERN_MAX: usize = 120;
 
 /// A caller-supplied pattern: `start_session(prompt_patterns: [...])` and
 /// the global config both deserialise into this.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptPattern {
     pub regex: String,

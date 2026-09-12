@@ -35,11 +35,26 @@
 //! does not mean absent** (REQ-CFG-004's second clause). Each such field
 //! carries a doc comment naming its owning milestone, so a later
 //! milestone wires the value rather than adding the field.
+//!
+//! **`Serialize` is derived on every struct here for one consumer, and
+//! removing it breaks a build gate rather than a feature.** Nothing in
+//! the daemon writes a `Config` out. `tests/config_surface.rs` walks a
+//! serialised one to enumerate the configuration surface mechanically,
+//! because that is the only way to force a *newly added* key to be
+//! classified as reaching the runtime or not (GH #128): a hand-written
+//! list of keys agrees with itself about a field it has never heard of.
+//! A `#[cfg(test)]` derive would not do — an integration test links
+//! this crate as a dependency, where `cfg(test)` is off.
+//!
+//! Do not reach for it to log a config. A `[[security.secret_bindings]]`
+//! carries a `reference`, which is a credential *locator*, and §9.6
+//! keeps locators off every surface that shows a `binding_name`
+//! (REQ-SEC-016).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::detect::{PromptPattern, MAX_EXTRA_PATTERNS};
 use crate::protocol::MAX_FRAME_BYTES;
@@ -400,7 +415,7 @@ fn parse_named(text: &str, path: &Path) -> Result<Config, ConfigError> {
 /// attribute on each table below rejects an unmodelled *key*. §10.1
 /// requires both, and a top-level-only version silently accepts
 /// `[daemon] log_dir`, which is the exact case the rule exists for.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -426,7 +441,7 @@ pub struct Config {
 }
 
 /// §4.2's limits table.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     #[serde(default = "d_max_concurrent_sessions")]
@@ -476,7 +491,7 @@ pub struct LimitsConfig {
 }
 
 /// §4.2's terminal knobs.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerminalConfig {
     /// `off` | `adaptive` | `on` (§4.5).
@@ -493,7 +508,7 @@ pub struct TerminalConfig {
 }
 
 /// §8.6's prompt-detection knobs.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptsConfig {
     #[serde(default = "d_settle_threshold_ms")]
@@ -522,7 +537,7 @@ pub struct PromptsConfig {
 /// file, and — unlike `redaction_enabled`, which §9.4's `session_start`
 /// row carries on every session — nothing at all would record that the
 /// preflight was off. A config carrying the key is **rejected**.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     #[serde(default = "d_redaction_enabled")]
@@ -647,7 +662,7 @@ pub struct SecurityConfig {
 ///
 /// Every rule is refused at load by [`Config::validate`], with the message
 /// naming the key.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionProfile {
     /// The override key. A [`SecretBinding`] attaches to a profile by this
@@ -748,7 +763,7 @@ pub struct SessionProfile {
 }
 
 /// One operator-configured secret binding (§9.6). **Unread in 0.0.5.**
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretBinding {
     /// The override key, and the only part of **the binding** any surface
@@ -864,7 +879,7 @@ pub struct SecretBinding {
 /// different `HOLDFAST_RUNTIME_DIR`s share an `http.sock` while disagreeing
 /// about which instance they are. A config carrying `http_socket_path`
 /// is **rejected**.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiConfig {
     /// `0` = ephemeral (the default); any other value pins the port.
@@ -881,7 +896,7 @@ pub struct UiConfig {
 }
 
 /// §5.8.3's notification knobs. **All unread — 0.0.9.**
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationsConfig {
     /// `desktop` | `webhook` | `command` | `none` (default).
@@ -902,7 +917,7 @@ pub struct NotificationsConfig {
 }
 
 /// One `[[adapters]]` entry (§5.8.2). **Unread — 0.0.9.**
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterSpec {
     pub name: String,
@@ -918,7 +933,7 @@ pub struct AdapterSpec {
 /// `kind` is **optional**: §5.8.2 carries it on every vendored row and
 /// §10.2's commented example does not, so a loader modelling only
 /// `{ regex, score }` rejects the normative shape.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterPromptPattern {
     pub regex: String,
@@ -935,7 +950,7 @@ pub struct AdapterPromptPattern {
 /// withdrawn and a config carrying it is **rejected**; the two retention
 /// knobs stay, because a retention window is behaviour this file
 /// configures and a path is not.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// The client-less daemon exit (§7.3, REQ-D-006). **`0` disables
