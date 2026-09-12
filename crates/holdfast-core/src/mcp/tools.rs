@@ -522,12 +522,15 @@ impl HoldfastServer {
         // [`Self::watch_for_autofill`].
         //
         // **The statement above this one is GH #106's whole cost**, which
-        // is why the knob that widens the gap sits here and not somewhere
-        // tidier: see `HoldfastServer::autofill_arm_delay`. Zero for every
-        // caller that is not the row measuring it.
+        // is why the knob that holds the gap open sits here and not
+        // somewhere tidier: see `mcp::ArmGate`. `None` for every caller
+        // that is not the row measuring it, and a rendezvous rather than
+        // a sleep because the row on the other side of it is watching a
+        // forked child, whose pace no duration can be chosen against
+        // (GH #140).
         #[cfg(test)]
-        if !self.autofill_arm_delay.is_zero() {
-            tokio::time::sleep(self.autofill_arm_delay).await;
+        if let Some(gate) = &self.autofill_arm_gate {
+            gate.hold(crate::mcp::ArmSite::StartSession).await;
         }
         self.watch_for_autofill(&session);
 
@@ -2973,6 +2976,13 @@ impl HoldfastServer {
         // on a `recv()` that can no longer produce anything, holding the
         // session alive forever.
         let mut events = session.subscribe_events();
+        // **The fact that separates a lost edge from a delivered one**,
+        // reported the statement after it becomes true so a row can
+        // assert on it rather than infer it from a clock (GH #140).
+        #[cfg(test)]
+        if let Some(gate) = &self.autofill_arm_gate {
+            gate.passed(crate::mcp::ArmSite::Subscribed);
+        }
         if !session.is_alive() {
             return;
         }
@@ -2982,13 +2992,13 @@ impl HoldfastServer {
             use crate::session::SessionEvent;
             use tokio::sync::broadcast::error::RecvError;
 
-            // See `HoldfastServer::autofill_arm_delay`. This is the half
-            // that arranges a **delivered** edge sitting in `events`
-            // while the replay check below reads the same episode off the
-            // flag — the double-fire the guard exists for.
+            // See `mcp::ArmGate`. This is the half that arranges a
+            // **delivered** edge sitting in `events` while the replay
+            // check below reads the same episode off the flag — the
+            // double-fire the guard exists for.
             #[cfg(test)]
-            if !server.autofill_arm_delay.is_zero() {
-                tokio::time::sleep(server.autofill_arm_delay).await;
+            if let Some(gate) = &server.autofill_arm_gate {
+                gate.hold(crate::mcp::ArmSite::Listener).await;
             }
 
             // **The last episode this listener has answered** (GH #106).
@@ -2999,6 +3009,16 @@ impl HoldfastServer {
             server
                 .replay_missed_echo_drop(&session, &mut answered)
                 .await;
+            // **The decision, announced** — and announced *after* the
+            // resolution it may have performed is awaited, so a row can
+            // read it either way round: "the replay resolved nothing" is
+            // an absence bounded by this, and "the replay resolved the
+            // first read, not the `Entered` arm below" is `sc.ran(..)`
+            // being true by the time it arrives (GH #140).
+            #[cfg(test)]
+            if let Some(gate) = &server.autofill_arm_gate {
+                gate.passed(crate::mcp::ArmSite::ReplayChecked);
+            }
 
             loop {
                 match events.recv().await {
