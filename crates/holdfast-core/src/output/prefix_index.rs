@@ -140,6 +140,87 @@ fn build_liveness(pattern: &str) -> Option<dense::DFA<Vec<u32>>> {
         .ok()
 }
 
+/// Whether a rule's holdback, opened at `prefix`, can only last for a
+/// bounded number of further bytes — the gate that decides which rules a
+/// **view** may drive a withhold for (GH #142).
+///
+/// **Why boundedness is the criterion.** On the raw stream a holdback is
+/// self-healing: the byte that kills the candidate is the same byte the
+/// caller was waiting to receive, so a candidate that will never complete
+/// dies as soon as the next delimiter lands. A view deletes control
+/// bytes, which is to say *it deletes the predicate's own escape hatch* —
+/// so on a view the question is not "will this candidate die?" but "can
+/// it be kept alive for ever?". `\beyJ[A-Za-z0-9_-]{10,}\.eyJ…` can: an
+/// unbounded run of base64 stands between its prefix and the `.` it still
+/// needs, so `\x1b]0;eyJxxxx\x07` strands the caller permanently in the
+/// stream that drops the BEL.
+///
+/// Mechanically that is a **cycle** in the subgraph of states that are
+/// neither dead nor matching. Dead states have already released the
+/// candidate; a match state is not withheld either, because
+/// [`PrefixIndex::earliest_partial`]'s condition 3 skips a rule whose
+/// token has landed. Anything reachable and outside both, that reaches
+/// itself, is an unbounded holdback.
+///
+/// **Computed, never declared.** Twelve of the fifty-one shipped rules
+/// fail this, and a hand-written list of those twelve would silently
+/// mis-gate every rule an operator adds through `extra_redaction_patterns`
+/// — in the unsafe direction, since a rule absent from the list would be
+/// gated by default.
+///
+/// The alphabet is every byte. A view can only ever carry a subset of
+/// those, and a larger alphabet finds more cycles, so this is the
+/// conservative reading; it also avoids the trap that classifying over
+/// `0x21..=0x7e` alone — no space — loses `bearer-authorization`, whose
+/// only cycle is the `\s+` after its keyword.
+fn holdback_is_bounded(dfa: &dense::DFA<Vec<u32>>, prefix: &[u8]) -> bool {
+    let input = Input::new(prefix).anchored(Anchored::Yes);
+    let Ok(mut sid) = dfa.start_state_forward(&input) else {
+        return false;
+    };
+    for byte in prefix {
+        sid = dfa.next_state(sid, *byte);
+        if dfa.is_dead_state(sid) || dfa.is_match_state(sid) {
+            return true;
+        }
+        if dfa.is_quit_state(sid) {
+            return false;
+        }
+    }
+    // Iterative depth-first search, colouring grey on the way down and
+    // black on the way back up: a grey successor is a back edge, which is
+    // a cycle.
+    let mut colour: HashMap<usize, bool> = HashMap::new();
+    let mut stack: Vec<(_, u16)> = vec![(sid, 0u16)];
+    colour.insert(sid.as_usize(), true);
+    while let Some(top) = stack.last_mut() {
+        if top.1 > u8::MAX as u16 {
+            let done = top.0;
+            stack.pop();
+            colour.insert(done.as_usize(), false);
+            continue;
+        }
+        let (from, byte) = (top.0, top.1 as u8);
+        top.1 += 1;
+        let to = dfa.next_state(from, byte);
+        if dfa.is_dead_state(to) || dfa.is_match_state(to) {
+            continue;
+        }
+        if dfa.is_quit_state(to) {
+            return false;
+        }
+        match colour.get(&to.as_usize()) {
+            Some(true) => return false,
+            Some(false) => continue,
+            None => {
+                colour.insert(to.as_usize(), true);
+                stack.push((to, 0));
+            }
+        }
+    }
+    true
+}
+
 /// Whether `pattern` opens with `\b` (after an optional inline-flag
 /// group). Together with a non-empty `derive_prefixes` result this means
 /// the derived literal *is* the start of the match, so a candidate that
@@ -286,6 +367,9 @@ pub struct PrefixIndex {
     /// One liveness automaton per rule, parallel to `rules.rules`. See
     /// [`build_liveness`]; `None` means the rule keeps [`is_value_byte`].
     liveness: Vec<Option<dense::DFA<Vec<u32>>>>,
+    /// Whether each rule may drive a **view**-based withhold, computed by
+    /// [`holdback_is_bounded`] at build time. Parallel to `rules.rules`.
+    gated: Vec<bool>,
 }
 
 impl PrefixIndex {
@@ -297,6 +381,7 @@ impl PrefixIndex {
             .iter()
             .map(|rule| build_liveness(&rule.pattern))
             .collect();
+        let mut gated: Vec<bool> = Vec::with_capacity(rules.rules.len());
         for (idx, rule) in rules.rules.iter().enumerate() {
             let derived = derive_prefixes(&rule.pattern, expansion_limit);
             // A derivable leading literal means the prefix is where the
@@ -310,10 +395,28 @@ impl PrefixIndex {
                 Some(declared) => declared.clone(),
                 None => derived,
             };
+            // Whether this rule's holdback is bounded is a question about
+            // its automaton driven from each of *its own* prefixes, so the
+            // answer is accumulated here rather than re-derived from
+            // `by_first_byte` afterwards.
+            //
+            // **An empty `all` is `true`, and that is the honest answer
+            // rather than a convenience.** A rule with no indexed prefix
+            // — `telegram-bot-token` is the whole of that set — can never
+            // become a candidate, so it has no holdback for a view to
+            // strand and the flag is unobservable either way.
+            let mut bounded = true;
             for prefix in prefixes {
                 if prefix.len() < MIN_PREFIX_LEN {
                     continue;
                 }
+                bounded &= match &liveness[idx] {
+                    Some(dfa) => holdback_is_bounded(dfa, &prefix),
+                    // No automaton, no proof. `is_value_byte` on the raw
+                    // stream is what this rule keeps, and a view may not
+                    // drive it.
+                    None => false,
+                };
                 total += 1;
                 by_first_byte
                     .entry(prefix[0].to_ascii_lowercase())
@@ -324,6 +427,7 @@ impl PrefixIndex {
                         requires_word_boundary,
                     });
             }
+            gated.push(bounded);
         }
         // Longest prefix first, so the most specific rule claims a
         // position when several share a first byte.
@@ -334,6 +438,7 @@ impl PrefixIndex {
             by_first_byte,
             total,
             liveness,
+            gated,
         }
     }
 
@@ -454,11 +559,56 @@ impl PrefixIndex {
         region: &[u8],
         region_start: u64,
     ) -> Option<u64> {
+        self.scan(rules, region, region_start, false)
+    }
+
+    /// [`Self::earliest_partial`] over a **normalised view** of a region
+    /// rather than over the raw bytes, restricted to the rules whose
+    /// holdback [`holdback_is_bounded`] can prove terminates (GH #142).
+    ///
+    /// The offset returned is relative to `region_start` as usual, so a
+    /// caller passing a view's bytes with `region_start = 0` gets a
+    /// view-relative index and maps it back with `NormalView::raw_offset`.
+    ///
+    /// **The restriction is the whole of the difference, and it is not an
+    /// optimisation.** On the raw stream a candidate that will never
+    /// complete is killed by the next delimiter, which is a byte the
+    /// caller wanted anyway. A view has had its control bytes deleted, so
+    /// for a rule with an unbounded holdback there may be no byte left
+    /// that can ever end it — `\x1b]0;SECRET_DONE\x07` becomes
+    /// `]0;SECRET_DONE`, nothing more arrives, and a withhold taken on
+    /// that evidence is permanent. The twelve rules that fail the gate
+    /// therefore keep GH #142's residual, loudly rather than quietly once
+    /// GH #160 lands.
+    ///
+    /// Condition 2 is liveness for every rule here, with no `binary` or
+    /// `has_value_group` arm: those classes exist because the byte-class
+    /// test is the *safer* answer on the raw stream, and a rule that
+    /// reaches this scan has already been proved unable to strand.
+    pub fn earliest_partial_in_view(
+        &self,
+        rules: &RuleSet,
+        region: &[u8],
+        region_start: u64,
+    ) -> Option<u64> {
+        self.scan(rules, region, region_start, true)
+    }
+
+    fn scan(
+        &self,
+        rules: &RuleSet,
+        region: &[u8],
+        region_start: u64,
+        in_view: bool,
+    ) -> Option<u64> {
         for (i, byte) in region.iter().enumerate() {
             let Some(bucket) = self.by_first_byte.get(&byte.to_ascii_lowercase()) else {
                 continue;
             };
             for candidate in bucket {
+                if in_view && !self.gated[candidate.rule] {
+                    continue;
+                }
                 // `\b` in the rule means the match cannot start mid-word.
                 // Position 0 is treated as a boundary: the region is a
                 // window, so the byte before it is not available and
@@ -478,7 +628,9 @@ impl PrefixIndex {
                     continue;
                 }
                 let rule = &rules.rules[candidate.rule];
-                let in_flight = if rule.binary {
+                let in_flight = if in_view {
+                    self.still_alive(candidate.rule, region, i)
+                } else if rule.binary {
                     true
                 } else if rule.has_value_group {
                     region[value_start..].iter().all(|b| is_value_byte(*b))
@@ -1150,6 +1302,175 @@ mod tests {
             }
         }
         assert!(pairs >= 100, "only {pairs} (rule, prefix) pairs judged");
+    }
+
+    /// Rules built to separate the **sound** reading of the view gate
+    /// from the cheap syntactic ones that look equivalent on the shipped
+    /// fifty-one.
+    ///
+    /// Each `infinite-*` has an unbounded quantifier standing between its
+    /// indexed prefix and something the match still requires, so the set
+    /// of continuations that keep it alive-and-unmatched has a cycle and a
+    /// view can strand it for ever. A syntactic walk that looks only at
+    /// the *immediately following* sibling, or that does not recurse
+    /// through `Repetition` / `Capture` / `Alternation`, calls all three
+    /// bounded — and the shipped rules cannot tell the two readings apart,
+    /// so pinning the shipped twelve alone is not a pin at all.
+    ///
+    /// The two `bounded-*` rules are the paired direction: without them
+    /// the row is satisfied by a gate that excludes everything.
+    const GATE_PROBE_RULES: &str = r#"
+        [[rule]]
+        name = "infinite-optional-separator"
+        kind = "acme-internal"
+        pattern = '''\bacmeinf_[A-Za-z0-9]*[_-]?KEY[0-9]{8,}'''
+        positive = ["acmeinf_ab-KEY01234567"]
+        negative = ["acmeinf_ab-KEY1"]
+
+        [[rule]]
+        name = "infinite-repeated-group"
+        kind = "acme-internal"
+        pattern = '''\bacmerep_(?:[a-z]+END)+'''
+        positive = ["acmerep_abcEND"]
+        negative = ["acmerep_END"]
+
+        [[rule]]
+        name = "infinite-nullable-sibling"
+        kind = "acme-internal"
+        pattern = '''\bacmenul_[a-z]*(?:b?)END[0-9]{4}'''
+        positive = ["acmenul_abbEND1234"]
+        negative = ["acmenul_END"]
+
+        [[rule]]
+        name = "infinite-layout-byte"
+        kind = "acme-internal"
+        pattern = '''\bacmetab_[\t]+KEY[0-9]{4}'''
+        positive = ["acmetab_\tKEY1234"]
+        negative = ["acmetab_KEY1234"]
+
+        [[rule]]
+        name = "bounded-large-repetition"
+        kind = "acme-internal"
+        pattern = '''\bacmebig_[A-Za-z0-9]{0,40}KEY[0-9]{4}'''
+        positive = ["acmebig_abcKEY1234"]
+        negative = ["acmebig_KEY"]
+
+        [[rule]]
+        name = "bounded-plain"
+        kind = "acme-internal"
+        pattern = '''\bacmeok_[a-f0-9]{16,}'''
+        positive = ["acmeok_0123456789abcdef"]
+        negative = ["acmeok_short"]
+    "#;
+
+    /// Every rule whose gate flag is `false`, by name.
+    fn ungated(rules: &RuleSet, index: &PrefixIndex) -> Vec<String> {
+        let mut names: Vec<String> = rules
+            .rules
+            .iter()
+            .zip(&index.gated)
+            .filter(|(_, g)| !**g)
+            .map(|(r, _)| r.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// **The gate that decides which rules a view may drive is computed
+    /// from the automaton, not declared (GH #142, GH #160).**
+    ///
+    /// Twelve of the shipped fifty-one fail it. That number is pinned
+    /// here, and so is the *criterion*, because the two are not the same
+    /// assertion: the shipped rules cannot discriminate the sound reading
+    /// of "an unbounded repetition stands between the prefix and a still
+    /// required element" from either of the two under-specified ones, so a
+    /// row that only pinned the twelve would pass against an
+    /// implementation that mis-gates every user rule of the three shapes
+    /// in [`GATE_PROBE_RULES`].
+    #[test]
+    fn the_view_driven_withhold_gate_is_computed_not_declared() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        assert_eq!(
+            ungated(&rules, &index),
+            vec![
+                // The nine `has_value_group` context rules: each has an
+                // unbounded `\s*` or `[^…]+` between label and value.
+                "aws-secret-access-key",
+                "bearer-authorization",
+                "cloudflare-api-token",
+                "database-connection-password",
+                "datadog-api-key",
+                "generic-secret-assignment",
+                // `[A-Za-z0-9_-]{10,}` before the `.eyJ` it still needs.
+                "jwt",
+                "powersync-token",
+                // `[\s\S]*?` before `-----END`.
+                "private-key-block",
+                "railway-token",
+                "secret-key-assignment",
+                // `[A-Za-z0-9_]+` before the `/B` it still needs.
+                "slack-webhook-url",
+            ],
+            "the twelve rules that keep GH #142's residual (GH #160)"
+        );
+
+        // The criterion, against rules built to break it. All three
+        // `infinite-*` shapes are wrongly called bounded by a syntactic
+        // walk that does not recurse, and all three can be stranded.
+        let probe = format!("{GATE_PROBE_RULES}{ADVERSARIAL_USER_RULES}");
+        let rules = RuleSet::builtin_with_extra(&probe).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let ungated = ungated(&rules, &index);
+        for name in [
+            "infinite-optional-separator",
+            "infinite-repeated-group",
+            "infinite-nullable-sibling",
+            // Only a `\t` keeps this one alive, so it is the row that
+            // makes the alphabet a decision rather than an accident: a
+            // classification over printable bytes alone calls it bounded,
+            // and a view that carries tabs — every one of them does —
+            // strands it.
+            "infinite-layout-byte",
+            // **No automaton, no proof.** `\B` is refused by
+            // `liveness_pattern`, so this rule keeps `is_value_byte` on
+            // the raw stream and must not reach a view scan at all.
+            // Defaulting an unanalysable rule *into* the gate is the one
+            // mistake here that loses bytes for ever.
+            "acme-negated-boundary",
+        ] {
+            assert!(
+                ungated.iter().any(|n| n == name),
+                "{name} can be held open for ever and was gated in: {ungated:?}"
+            );
+        }
+        for name in ["bounded-large-repetition", "bounded-plain"] {
+            assert!(
+                !ungated.iter().any(|n| n == name),
+                "{name}'s holdback is bounded, so gating it out costs \
+                 protection for nothing: {ungated:?}"
+            );
+        }
+        // …and the paired behavioural fact, so the flag is not merely a
+        // number. `acmeinf_` is ungated, so no view may withhold on it;
+        // `acmeok_` is gated, so every view may.
+        assert_eq!(
+            index.earliest_partial_in_view(&rules, b"title acmeinf_abc", 0),
+            None,
+            "an ungated rule must not drive a view-side withhold"
+        );
+        assert_eq!(
+            index.earliest_partial_in_view(&rules, b"title acmeok_0123", 0),
+            Some(6),
+            "a gated rule still does"
+        );
+        // The raw scan is unmoved by the gate: it has its own escape
+        // hatch and does not need one.
+        assert_eq!(
+            index.earliest_partial(&rules, b"title acmeinf_abc", 0),
+            Some(6),
+            "the gate must not reach the raw stream"
+        );
     }
 
     /// The rewrite reads the pattern rather than scanning it for a
