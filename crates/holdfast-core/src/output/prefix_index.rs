@@ -17,6 +17,11 @@
 //! which is the half no window size reaches.
 
 use super::rules::RuleSet;
+use regex_automata::{
+    dfa::{dense, Automaton, StartKind},
+    util::syntax,
+    Anchored, Input,
+};
 use std::collections::HashMap;
 
 /// Cap on prefixes generated per rule by character-class expansion
@@ -30,8 +35,109 @@ pub const MIN_PREFIX_LEN: usize = 3;
 /// Bytes a still-arriving value may contain by default: printable ASCII,
 /// no space and no control characters. A rule marked `binary` (a PEM
 /// block) opts out.
+///
+/// **Superseded for most rules by [`PrefixIndex::still_alive`] (GH #142)**
+/// and kept for the three places that outlive it: the nine
+/// `has_value_group` context rules on the raw stream (GH #152),
+/// [`trailing_value_run_start`], and the fallback when a rule's liveness
+/// automaton could not be built.
 fn is_value_byte(b: u8) -> bool {
     (0x21..=0x7e).contains(&b)
+}
+
+/// The pattern a rule's **liveness** automaton is built from: the rule's
+/// own source with every `\b` rewritten to its ASCII-only spelling, or
+/// `None` for a pattern this rewrite cannot be trusted on.
+///
+/// The rewrite is the difference between a usable predicate and one that
+/// is *worse* than the byte-class test it replaces. A Unicode word
+/// boundary cannot be compiled into a DFA at all without the quit set —
+/// every byte ≥ 0x80 becomes a quit byte, a quit must be read as ALIVE
+/// for soundness, and the result holds back any output carrying a glyph.
+/// With the ASCII spelling there is no quit set, and the predicate is
+/// exact on everything the rules can actually match.
+///
+/// **Why the substitution cannot release a secret early.** `\b` is
+/// *"exactly one side is a word character"*, and the two spellings differ
+/// only where one of those sides is a non-ASCII byte, which
+/// `(?-u:\b)` reads as a non-word byte and `\b` may read as a word
+/// character. Two cases, and both are safe:
+///
+/// * **At the candidate's own leading boundary** the other side is the
+///   indexed prefix's first byte, which is an ASCII word byte
+///   (`every_rule_compiles_a_liveness_automaton` asserts it, for user
+///   rules too). `\b` then reduces to *"the byte behind is not a word
+///   character"*, and "not an **ASCII** word byte" is a superset of "not
+///   a **Unicode** word character" — so `(?-u:\b)` holds wherever `\b`
+///   does and liveness over-approximates.
+/// * **At any later boundary** the divergence needs a non-ASCII byte at
+///   or after the first value byte — and [`is_value_byte`], the predicate
+///   this replaces, already releases the candidate on *any* such byte.
+///   Wherever the rewrite could under-approximate, the shipped test had
+///   already let go.
+///
+/// **`\B` gets no such argument, so a pattern carrying one gets no
+/// automaton.** `\B` is the negation, so the ASCII spelling
+/// *under*-approximates by the same reasoning, and at a *leading* `\B`
+/// the divergent byte sits behind the candidate where `is_value_byte`
+/// never looked. No shipped rule uses one; a user rule that does keeps
+/// the byte-class test, which is what it has today.
+///
+/// The walk tracks escapes rather than calling `str::replace`, so a
+/// pattern containing `\\b` — an escaped backslash followed by a literal
+/// `b` — keeps its meaning instead of acquiring a word boundary it never
+/// had.
+fn liveness_pattern(pattern: &str) -> Option<String> {
+    let mut out = String::with_capacity(pattern.len() + 16);
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('b') => out.push_str("(?-u:\\b)"),
+            Some('B') => return None,
+            Some(escaped) => {
+                out.push('\\');
+                out.push(escaped);
+            }
+            None => out.push('\\'),
+        }
+    }
+    Some(out)
+}
+
+/// A rule's liveness automaton, or `None` when it could not be built.
+///
+/// **Dense rather than lazy, and that choice is what keeps this type
+/// behind its `Arc`.** A `dfa::dense::DFA` owns no mutable search state,
+/// so it is `Send + Sync` and [`PrefixIndex::still_alive`] stays `&self`;
+/// the lazy `hybrid` DFA needs `&mut Cache` on every transition, which
+/// would put a cache pool between `OutputProcessor` — one per daemon,
+/// shared by every read path — and its callers.
+///
+/// A failure is not an error: the caller falls back to [`is_value_byte`],
+/// which is the shipped predicate and holds *more* than liveness does.
+fn build_liveness(pattern: &str) -> Option<dense::DFA<Vec<u32>>> {
+    dense::Builder::new()
+        .configure(
+            dense::DFA::config()
+                // The search always starts at a known candidate offset,
+                // so the unanchored start state is dead weight — and
+                // building it is what made an earlier probe report this
+                // engine as unusable at 9.9 GB of resident memory.
+                .start_kind(StartKind::Anchored)
+                // Explicit, though it is also the default: a Unicode word
+                // boundary must fail to build here rather than silently
+                // install a quit set. `liveness_pattern` has removed the
+                // last one, and this is what keeps a future rule from
+                // reintroducing it unnoticed.
+                .unicode_word_boundary(false),
+        )
+        .syntax(syntax::Config::new().utf8(false))
+        .build(&liveness_pattern(pattern)?)
+        .ok()
 }
 
 /// Whether `pattern` opens with `\b` (after an optional inline-flag
@@ -177,12 +283,26 @@ struct Candidate {
 pub struct PrefixIndex {
     by_first_byte: HashMap<u8, Vec<Candidate>>,
     total: usize,
+    /// One liveness automaton per rule, parallel to `rules.rules`. See
+    /// [`build_liveness`]; `None` means the rule keeps [`is_value_byte`].
+    ///
+    /// `expect` rather than `allow`: nothing outside this module's own
+    /// tests reads it **yet**, and the attribute becomes an error of its
+    /// own the moment `earliest_partial` does, so the commit that wires
+    /// the predicate up cannot leave it behind.
+    #[cfg_attr(not(test), expect(dead_code))]
+    liveness: Vec<Option<dense::DFA<Vec<u32>>>>,
 }
 
 impl PrefixIndex {
     pub fn build(rules: &RuleSet, expansion_limit: usize) -> Self {
         let mut by_first_byte: HashMap<u8, Vec<Candidate>> = HashMap::new();
         let mut total = 0usize;
+        let liveness: Vec<Option<dense::DFA<Vec<u32>>>> = rules
+            .rules
+            .iter()
+            .map(|rule| build_liveness(&rule.pattern))
+            .collect();
         for (idx, rule) in rules.rules.iter().enumerate() {
             let derived = derive_prefixes(&rule.pattern, expansion_limit);
             // A derivable leading literal means the prefix is where the
@@ -219,7 +339,66 @@ impl PrefixIndex {
         Self {
             by_first_byte,
             total,
+            liveness,
         }
+    }
+
+    /// Whether rule `rule` could still match if `region` grew — asked at
+    /// absolute position `at` within it (GH #142).
+    ///
+    /// This is the sharp form of *"every byte from the indexed prefix to
+    /// the end of the region could still belong to the value"*. The
+    /// byte-class test it replaces answers with a single range, which is
+    /// wrong in both directions at once: it holds runs no rule could ever
+    /// complete, and it releases the moment a control byte lands inside a
+    /// value that is genuinely still arriving.
+    ///
+    /// **Four things this gets right, each of which is a way to get it
+    /// wrong.**
+    ///
+    /// 1. **`next_eoi_state` is never called.** *"The haystack may
+    ///    grow"* is exactly *"do not walk end-of-input"*. Walking it asks
+    ///    whether the rule matches the bytes that have arrived, which for
+    ///    `ghp_` plus 39 of 40 characters answers DEAD — and releases the
+    ///    secret this function exists to hold.
+    /// 2. **The look-behind arrives by range, not by re-slicing.**
+    ///    `Input::range(at..)` lets the automaton read `region[at - 1]`
+    ///    when it decides the leading `\b`; handing it `&region[at..]`
+    ///    instead makes every candidate look like the start of the
+    ///    haystack, so `xghp_0123` reads as live when its `\b` forbids it.
+    /// 3. **A match is not the same question.** Liveness is stale the
+    ///    instant the rule matches, which is why the caller keeps its
+    ///    separate anchored-match test rather than folding it in here.
+    /// 4. **A quit state is ALIVE.** With the ASCII word boundary
+    ///    [`liveness_pattern`] installs there is no quit set and the arm
+    ///    is unreachable, but reading a quit as DEAD would release an
+    ///    in-flight secret the moment a glyph appeared near it, so the arm
+    ///    is written rather than assumed away.
+    ///
+    /// See the note on `PrefixIndex::liveness` for why this carries an
+    /// `expect` instead of being called: the predicate lands here first
+    /// and is wired into [`Self::earliest_partial`] in its own commit.
+    #[cfg_attr(not(test), expect(dead_code))]
+    fn still_alive(&self, rule: usize, region: &[u8], at: usize) -> bool {
+        let Some(dfa) = self.liveness.get(rule).and_then(Option::as_ref) else {
+            return region[at..].iter().all(|b| is_value_byte(*b));
+        };
+        let input = Input::new(region).range(at..).anchored(Anchored::Yes);
+        // The only failure `start_state_forward` reports is a quit byte in
+        // the look-behind — rule 4 above.
+        let Ok(mut sid) = dfa.start_state_forward(&input) else {
+            return true;
+        };
+        for byte in &region[at..] {
+            sid = dfa.next_state(sid, *byte);
+            if dfa.is_dead_state(sid) {
+                return false;
+            }
+            if dfa.is_quit_state(sid) {
+                return true;
+            }
+        }
+        true
     }
 
     pub fn len(&self) -> usize {
@@ -733,5 +912,251 @@ mod tests {
                 "the candidate must die as soon as a space arrives: {released:?}"
             );
         }
+    }
+
+    /// User rules shaped to break the GH #142 liveness engine rather than
+    /// to exercise it: an **interior** word boundary (the shipped set has
+    /// one only on the context rules), a `\B` (the shipped set has none
+    /// at all), an escaped backslash immediately before a `b` (which a
+    /// `str::replace` rewrite corrupts), and a case-folded pattern.
+    ///
+    /// REQ-O-006 puts `extra_redaction_patterns` through every mechanism
+    /// this work adds — the automaton, the soundness lemma and the gate —
+    /// and the shipped fifty-one cannot supply that coverage, so these do.
+    const ADVERSARIAL_USER_RULES: &str = r#"
+        [[rule]]
+        name = "acme-interior-boundary"
+        kind = "acme-internal"
+        pattern = '''\bACMEIB-[A-Z]{4}\b-[0-9]{8}'''
+        positive = ["ACMEIB-ABCD-01234567"]
+        negative = ["ACMEIB-ABCD"]
+
+        [[rule]]
+        name = "acme-negated-boundary"
+        kind = "acme-internal"
+        pattern = '''\bACMENB-[A-Z0-9]{6}\B[0-9]{6}'''
+        positive = ["ACMENB-ABCDEF123456"]
+        negative = ["ACMENB-ABCDEF"]
+
+        [[rule]]
+        name = "acme-escaped-backslash"
+        kind = "acme-internal"
+        pattern = '''\bACMEESC-\\bkey[0-9]{8}'''
+        positive = ['''ACMEESC-\bkey12345678''']
+        negative = ["ACMEESC-bkey12345678"]
+
+        [[rule]]
+        name = "acme-folded"
+        kind = "acme-internal"
+        pattern = '''(?i)\bacmefold_[a-z0-9]{20,}'''
+        positive = ["ACMEFOLD_abcdefghij0123456789"]
+        negative = ["acmefold_short"]
+    "#;
+
+    /// The span of `positive` that `rule` actually matches — the haystack
+    /// a liveness drive is entitled to be asked about. A rule's example
+    /// carries its context (`export DB_PASSWORD=hunter2hunter2`), and
+    /// driving from the `e` of `export` would ask a different question.
+    fn matched_span<'a>(rule: &super::super::rules::CompiledRule, positive: &'a str) -> &'a str {
+        let m = rule
+            .regex
+            .find(positive.as_bytes())
+            .unwrap_or_else(|| panic!("{}: its own positive example must match", rule.name));
+        &positive[m.start()..m.end()]
+    }
+
+    /// GH #142's engine: every rule gets a liveness automaton, and the
+    /// two structural facts that make the ASCII word boundary sound.
+    ///
+    /// **Why `(?-u:\b)` and not `\b`.** With the Unicode spelling the DFA
+    /// carries a quit set over every byte ≥ 0x80, a quit must be read as
+    /// ALIVE, and the predicate then holds back any output with a glyph
+    /// in it — measurably worse than the byte-class test it replaces, and
+    /// it fails `redaction_sweep`'s reached-rows floor. The rewrite
+    /// deletes the quit set outright.
+    ///
+    /// The soundness of that rewrite rests on *one side of every leading
+    /// boundary being an ASCII word byte*, which is a property of the
+    /// rules rather than of the engine — so it is asserted here, over
+    /// user rules as well, rather than assumed.
+    #[test]
+    fn every_rule_compiles_a_liveness_automaton() {
+        let rules = RuleSet::builtin_with_extra(ADVERSARIAL_USER_RULES).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        assert_eq!(index.liveness.len(), rules.rules.len());
+        assert!(rules.rules.len() >= 51, "{} rules", rules.rules.len());
+
+        // 1. Every rule builds — except the one carrying a `\B`, which is
+        //    refused on purpose and keeps `is_value_byte`.
+        let unbuilt: Vec<&str> = rules
+            .rules
+            .iter()
+            .zip(&index.liveness)
+            .filter(|(_, dfa)| dfa.is_none())
+            .map(|(r, _)| r.name.as_str())
+            .collect();
+        assert_eq!(
+            unbuilt,
+            vec!["acme-negated-boundary"],
+            "a rule with no automaton silently falls back to the byte-class \
+             test, so the set of them is pinned rather than counted"
+        );
+
+        // 2. **The soundness lemma.** Wherever a rule has a word boundary
+        //    at all, the indexed prefix liveness is driven from starts
+        //    with an ASCII word byte, so `(?-u:\b)` over-approximates
+        //    `\b` at the only boundary whose other side the input
+        //    supplies. `private-key-block` is the sole prefix that starts
+        //    on punctuation and its pattern has no `\b`, which is why the
+        //    lemma is stated this way round rather than as "all prefixes".
+        let mut pairs = 0usize;
+        for bucket in index.by_first_byte.values() {
+            for candidate in bucket {
+                pairs += 1;
+                let rule = &rules.rules[candidate.rule];
+                if !rule.pattern.contains(r"\b") {
+                    continue;
+                }
+                let first = candidate.prefix[0];
+                assert!(
+                    first.is_ascii_alphanumeric() || first == b'_',
+                    "{}: prefix {:?} starts on a non-word byte, so the ASCII \
+                     word boundary is no longer an over-approximation of the \
+                     rule's own `\\b`",
+                    rule.name,
+                    String::from_utf8_lossy(&candidate.prefix)
+                );
+                // 3. …and the pair is not structurally dead: some byte
+                //    keeps it alive, or its holdback could never engage.
+                let alive = (0u8..=0xff).any(|b| {
+                    let mut region = candidate.prefix.clone();
+                    region.push(b);
+                    index.still_alive(candidate.rule, &region, 0)
+                });
+                assert!(
+                    alive,
+                    "{}: no continuation byte keeps prefix {:?} alive",
+                    rule.name,
+                    String::from_utf8_lossy(&candidate.prefix)
+                );
+            }
+        }
+        assert!(pairs >= 100, "only {pairs} (rule, prefix) pairs judged");
+    }
+
+    /// The rewrite reads the pattern rather than scanning it for a
+    /// substring, and refuses what it cannot argue about.
+    ///
+    /// Row two is the one that matters: `str::replace("\\b", …)` — which
+    /// is the obvious spelling — turns an escaped backslash followed by a
+    /// literal `b` into a word boundary, and the liveness automaton then
+    /// answers about a pattern the matcher never had.
+    #[test]
+    fn the_liveness_rewrite_is_escape_aware() {
+        assert_eq!(
+            liveness_pattern(r"\bghp_[0-9A-Za-z]{36,}").as_deref(),
+            Some(r"(?-u:\b)ghp_[0-9A-Za-z]{36,}")
+        );
+        assert_eq!(
+            liveness_pattern(r"\bACMEESC-\\bkey[0-9]{8}").as_deref(),
+            Some(r"(?-u:\b)ACMEESC-\\bkey[0-9]{8}"),
+            "the escaped backslash's `b` is a literal, not a boundary"
+        );
+        assert_eq!(
+            liveness_pattern(r"(?i)\bcloudflare[a-z]{0,4}(?:token|key)\b[:=]").as_deref(),
+            Some(r"(?i)(?-u:\b)cloudflare[a-z]{0,4}(?:token|key)(?-u:\b)[:=]"),
+            "an interior boundary is rewritten too"
+        );
+        assert_eq!(
+            liveness_pattern(r"\bacme[0-9]{4}\B[a-z]{4}"),
+            None,
+            "`\\B` inverts the comparison, so no automaton is built for it"
+        );
+    }
+
+    /// **The mutation this file exists to catch.** A rule that is
+    /// genuinely still able to match must never be reported dead, and the
+    /// way to get that wrong is to walk end-of-input: `next_eoi_state`
+    /// asks *"does this match the bytes that arrived"*, which for a token
+    /// one character short of its minimum answers no — and releases it.
+    ///
+    /// Driven constructively rather than by fixture. Every truncation of
+    /// every rule's **own** positive example is alive by construction:
+    /// the rest of that example is a continuation that completes it. The
+    /// look-behind is `…` (U+2026, three non-ASCII bytes and not a word
+    /// character either way), so the row also pins the quit-set question
+    /// from the other side — a Unicode `\b` returns `MatchError(Quit)`
+    /// from `start_state_forward` here, and reading that as dead releases
+    /// an in-flight credential the moment a glyph precedes it.
+    #[test]
+    fn a_truncated_match_is_alive_behind_a_non_ascii_look_behind() {
+        let rules = RuleSet::builtin_with_extra(ADVERSARIAL_USER_RULES).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let lead = "…".as_bytes();
+        let mut checked = 0usize;
+        for (idx, rule) in rules.rules.iter().enumerate() {
+            if index.liveness[idx].is_none() {
+                continue;
+            }
+            for positive in &rule.positive {
+                let span = matched_span(rule, positive);
+                for take in 1..=span.len() {
+                    if !span.is_char_boundary(take) {
+                        continue;
+                    }
+                    let mut region = lead.to_vec();
+                    region.extend_from_slice(&span.as_bytes()[..take]);
+                    assert!(
+                        index.still_alive(idx, &region, lead.len()),
+                        "{}: {:?} can still become {span:?} and was called dead",
+                        rule.name,
+                        &span[..take]
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 2_000, "only {checked} truncations judged");
+    }
+
+    /// The other direction, and the mutation it catches: the look-behind
+    /// byte must reach the automaton by **range**, not by re-slicing the
+    /// region. `Input::new(&region[at..])` makes every candidate look like
+    /// the start of the haystack, where a `\b` always holds — so a rule
+    /// whose pattern forbids a mid-word match would be held open on text
+    /// it can never match.
+    #[test]
+    fn a_candidate_sitting_mid_word_is_dead_for_a_word_boundary_rule() {
+        let rules = RuleSet::builtin_with_extra(ADVERSARIAL_USER_RULES).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let mut checked = 0usize;
+        for (idx, rule) in rules.rules.iter().enumerate() {
+            if index.liveness[idx].is_none() || !starts_with_word_boundary(&rule.pattern) {
+                continue;
+            }
+            for positive in &rule.positive {
+                let span = matched_span(rule, positive);
+                let mut region = b"x".to_vec();
+                region.extend_from_slice(span.as_bytes());
+                assert!(
+                    !index.still_alive(idx, &region, 1),
+                    "{}: {span:?} behind a word byte can never satisfy its own \
+                     `\\b`, so the look-behind did not reach the automaton",
+                    rule.name
+                );
+                // The same bytes at a real boundary stay alive, so the row
+                // separates "the look-behind was read" from "everything is
+                // dead".
+                let mut ok = b" ".to_vec();
+                ok.extend_from_slice(span.as_bytes());
+                assert!(
+                    index.still_alive(idx, &ok, 1),
+                    "{}: {span:?} at a boundary must be alive",
+                    rule.name
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 40, "only {checked} rules judged");
     }
 }

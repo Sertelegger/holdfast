@@ -14,6 +14,7 @@ libc.workspace = true
 parking_lot.workspace = true
 portable-pty.workspace = true
 regex.workspace = true
+regex-automata.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true
