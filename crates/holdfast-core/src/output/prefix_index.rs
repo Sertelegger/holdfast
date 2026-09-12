@@ -285,12 +285,6 @@ pub struct PrefixIndex {
     total: usize,
     /// One liveness automaton per rule, parallel to `rules.rules`. See
     /// [`build_liveness`]; `None` means the rule keeps [`is_value_byte`].
-    ///
-    /// `expect` rather than `allow`: nothing outside this module's own
-    /// tests reads it **yet**, and the attribute becomes an error of its
-    /// own the moment `earliest_partial` does, so the commit that wires
-    /// the predicate up cannot leave it behind.
-    #[cfg_attr(not(test), expect(dead_code))]
     liveness: Vec<Option<dense::DFA<Vec<u32>>>>,
 }
 
@@ -374,11 +368,6 @@ impl PrefixIndex {
     ///    is unreachable, but reading a quit as DEAD would release an
     ///    in-flight secret the moment a glyph appeared near it, so the arm
     ///    is written rather than assumed away.
-    ///
-    /// See the note on `PrefixIndex::liveness` for why this carries an
-    /// `expect` instead of being called: the predicate lands here first
-    /// and is wired into [`Self::earliest_partial`] in its own commit.
-    #[cfg_attr(not(test), expect(dead_code))]
     fn still_alive(&self, rule: usize, region: &[u8], at: usize) -> bool {
         let Some(dfa) = self.liveness.get(rule).and_then(Option::as_ref) else {
             return region[at..].iter().all(|b| is_value_byte(*b));
@@ -434,13 +423,31 @@ impl PrefixIndex {
     /// 1. an indexed prefix matches there and **at least one** value byte
     ///    has arrived after it — a bare `ghp_` carries no secret material
     ///    and is not withheld;
-    /// 2. every byte from the prefix to the end of the region could still
-    ///    belong to the value, so `ghp_abc def` (a space arrived) is not a
-    ///    token in flight and releases immediately;
+    /// 2. the rule could still match if more bytes arrived
+    ///    ([`Self::still_alive`]), so `ghp_abc def` is not a token in
+    ///    flight and neither is `parsing key-value` — `v` is not a hex
+    ///    digit and `\bkey-[a-f0-9]{32}` can never reach it (GH #142);
     /// 3. the rule's own anchored regex does **not** match yet. Once the
     ///    whole token has landed the redactor covers it, so there is
     ///    nothing left to withhold. Using the rule's own regex is what
     ///    keeps this test from drifting away from the rule.
+    ///
+    /// **Two rule classes keep the old byte-class test on this — the
+    /// raw — stream, and the second of them is why GH #152 stays open.**
+    /// A `binary` rule opts out of condition 2 entirely, as before: a PEM
+    /// body's newlines defeat any value-run test at every line. And the
+    /// nine `has_value_group` context rules keep [`is_value_byte`],
+    /// because their patterns legitimately admit whitespace between the
+    /// label and the value — so liveness reports `Password: ` alive, and
+    /// a candidate that can still grow never dies at the end of a region
+    /// that has stopped growing. Measured: applying liveness there takes
+    /// `earliest_partial` on `"$ ssh dev@box\r\nPassword: "` from `None`
+    /// to `Some(15)`, `read_output` returns only the first line with
+    /// `held_back: true`, `prompt.last_line` becomes `""`, and three
+    /// shipped pty fixtures hang. A shell sitting at a password prompt is
+    /// the most common state this tool exists to handle. GH #152 asks for
+    /// the narrower widening that would fix it; the coupling is recorded
+    /// there rather than guessed at here.
     pub fn earliest_partial(
         &self,
         rules: &RuleSet,
@@ -471,7 +478,14 @@ impl PrefixIndex {
                     continue;
                 }
                 let rule = &rules.rules[candidate.rule];
-                if !rule.binary && !region[value_start..].iter().all(|b| is_value_byte(*b)) {
+                let in_flight = if rule.binary {
+                    true
+                } else if rule.has_value_group {
+                    region[value_start..].iter().all(|b| is_value_byte(*b))
+                } else {
+                    self.still_alive(candidate.rule, region, i)
+                };
+                if !in_flight {
                     continue;
                 }
                 if rule.anchored.is_match(&region[i..]) {
@@ -670,27 +684,40 @@ mod tests {
         // The first candidate is followed by a space, so only the second
         // is genuinely in flight.
         assert_eq!(index.earliest_partial(&rules, region, 100), Some(108));
-        // With no space, the earlier one qualifies and wins.
+        // **Re-pinned deliberately for GH #142**, from `Some(100)`.
+        // `earliest_partial`'s continuation test used to be *printable
+        // and not a space*, which `sk-ant-xy` satisfies, so `ghp_` read
+        // as a GitHub token still arriving. It never was one:
+        // `\bghp_[0-9A-Za-z]{36,}` cannot reach a `-`, and the rule's own
+        // automaton says so. `sk-ant-` sits mid-word behind a `c` and its
+        // `\b` forbids it. **The new expectation is that nothing here is
+        // in flight at all** — not that a different candidate wins.
         let region = b"ghp_abcsk-ant-xy";
-        assert_eq!(index.earliest_partial(&rules, region, 100), Some(100));
+        assert_eq!(index.earliest_partial(&rules, region, 100), None);
 
         // …and now the ordering itself, which neither case above pins.
         // Measured: reversing the candidate loop (`.enumerate().rev()`)
         // leaves the **whole workspace** green against the two fixtures
-        // above, because each of them has exactly one candidate that
+        // above, because each of them has at most one candidate that
         // qualifies — in the first the space kills `ghp_`, and in the
-        // second `sk-ant-` sits mid-word behind a `c` and its rule's `\b`
-        // forbids it. A scan that walks backwards answers both
-        // identically, so "earliest" was a claim in the name only.
+        // second nothing qualifies at all. A scan that walks backwards
+        // answers both identically, so "earliest" was a claim in the name
+        // only.
         //
-        // This fixture separates the two directions: `/` is a word
-        // boundary *and* a legal value byte, so `ghp_` and `sk-ant-` both
-        // qualify at the same time and only a left-to-right scan reports
-        // the first one.
-        let region = b"ghp_abc/sk-ant-xy";
+        // This fixture separates the two directions, and its shape is
+        // GH #142's doing as well: the `/` the original used is a legal
+        // value byte but not a legal *continuation* of a GitHub token, so
+        // under liveness only one candidate survived it and the row
+        // stopped separating anything. `password` is alphanumeric, so
+        // `\bghp_[0-9A-Za-z]{36,}` is genuinely still able to match
+        // across it, while `password` is `generic-secret-assignment`'s
+        // own declared prefix and qualifies on its own account. Both are
+        // in flight at the same instant and only a left-to-right scan
+        // reports the first.
+        let region = b"ghp_passwordX";
         assert_eq!(
-            index.earliest_partial(&rules, &region[7..], 107),
-            Some(108),
+            index.earliest_partial(&rules, &region[4..], 104),
+            Some(104),
             "the later candidate must qualify on its own, or the assertion \
              below separates earliest-from-nothing rather than earliest-from-latest"
         );
@@ -885,19 +912,26 @@ mod tests {
     /// The measured residual, pinned so it is visible rather than assumed
     /// absent. Each of these is a *legitimate* in-flight candidate — the
     /// rule really could still complete — and each releases the moment a
-    /// byte arrives that the value cannot contain. Narrowing them needs
-    /// the scanner to test continuation against the rule's own value class
-    /// (`\bkey-[a-f0-9]` rejects `key-v`) rather than the generic
-    /// printable-byte test; that is a follow-up, not a 0.0.3 change.
+    /// byte arrives that the value cannot contain.
     ///
-    /// This test exists so that follow-up has to update it deliberately.
+    /// **The follow-up this test was written to force has landed, and one
+    /// row has moved (GH #142).** The 0.0.3 note said narrowing these
+    /// needed "the scanner to test continuation against the rule's own
+    /// value class (`\bkey-[a-f0-9]` rejects `key-v`) rather than the
+    /// generic printable-byte test"; that is now exactly what
+    /// [`PrefixIndex::still_alive`] does, and `parsing key-value` has
+    /// moved from the residual to
+    /// `the_holdbacks_that_liveness_retired`. The two rows left are the
+    /// two the change does **not** reach: `re_exports` really is a live
+    /// `\bre_[A-Za-z0-9_]{24,}` prefix, and `$POWERSYNC_` belongs to a
+    /// `has_value_group` context rule, which keeps the byte-class test on
+    /// the raw stream (GH #152).
     #[test]
     fn the_known_transient_holdbacks_are_pinned() {
         let rules = RuleSet::builtin().unwrap();
         let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
         for text in [
             "use crate::re_exports", // resend `\bre_`
-            "parsing key-value",     // mailgun `\bkey-`
             "$ echo $POWERSYNC_",    // powersync context rule
         ] {
             assert!(
@@ -912,6 +946,80 @@ mod tests {
                 "the candidate must die as soon as a space arrives: {released:?}"
             );
         }
+    }
+
+    /// The other half of the row above: what GH #142's predicate
+    /// **stopped** withholding, pinned so it cannot silently come back.
+    ///
+    /// Both of these were held by the byte-class test and released by
+    /// nothing until a delimiter arrived. Neither was ever a credential:
+    /// `\bkey-[a-f0-9]{32}` cannot reach the `v` of `value`, and it
+    /// cannot reach the `m` of `manager` either. The second is the shape
+    /// that matters in practice — an npm progress line ending in an
+    /// escape with no newline after it, which
+    /// `ordinary_output_ending_in_an_escape_sequence_is_not_held_back`
+    /// covers end to end.
+    #[test]
+    fn the_holdbacks_that_liveness_retired() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        for text in [
+            "parsing key-value",           // mailgun `\bkey-`, `v` is not hex
+            "npm WARN @acme/key-manager",  // the same rule, the real shape
+            "a build of api-gateway v0.3", // `\b(?:sdk|mob|api)-` wants hex
+        ] {
+            assert_eq!(
+                index.earliest_partial(&rules, text.as_bytes(), 0),
+                None,
+                "no rule can still match {text:?}, so nothing is in flight"
+            );
+        }
+    }
+
+    /// **A shell sitting at a password prompt must hand over the prompt
+    /// (GH #142, GH #152).**
+    ///
+    /// This is the row the `has_value_group` carve-out exists for, and
+    /// the suite has never had it. Removing that carve-out puts liveness
+    /// on `generic-secret-assignment`, whose `["'\s]*[:=]\s*` legitimately
+    /// admits the trailing space — so the candidate is alive, the region
+    /// has stopped growing, and `earliest_partial` here goes `None` ->
+    /// `Some(15)`. `read_output` then returns `"$ ssh dev@box\r\n"` with
+    /// `held_back: true`, `safe_last_line` returns `""` through its
+    /// case-2 gate, and `echo_off_prompts_with_and_without_canonical_mode`,
+    /// `matrix_row_getpass_is_awaiting_secret_with_no_bracketed_paste_history`
+    /// and `matrix_row_bash_read_s_is_awaiting_secret_and_flags_a_write`
+    /// all fail on their 20-second deadlines.
+    ///
+    /// The second row is the same defect **still open on `main`**, kept
+    /// visible rather than assumed absent: with no trailing space the `:`
+    /// is inside `0x21..=0x7e`, so the byte-class test holds nine bytes
+    /// permanently. The three pty fixtures miss it only because all three
+    /// of their prompts happen to end in a space. GH #152 owns it.
+    #[test]
+    fn a_password_prompt_at_head_is_not_withheld() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let at_prompt = b"$ ssh dev@box\r\nPassword: ";
+        assert!(
+            index
+                .prefixes_for(&rules, "generic-secret-assignment")
+                .contains(&b"password".to_vec()),
+            "the premise: `password` is an indexed prefix, so the line really \
+             does offer the scanner a candidate"
+        );
+        assert_eq!(
+            index.earliest_partial(&rules, at_prompt, 0),
+            None,
+            "a password prompt is not a credential in flight"
+        );
+        // The pre-existing defect, pinned rather than fixed here.
+        assert_eq!(
+            index.earliest_partial(&rules, b"$ ssh dev@box\r\nEnter password:", 0),
+            Some(21),
+            "GH #152: with no trailing space the `:` keeps the byte-class \
+             run alive, so the last nine bytes are withheld permanently"
+        );
     }
 
     /// User rules shaped to break the GH #142 liveness engine rather than
