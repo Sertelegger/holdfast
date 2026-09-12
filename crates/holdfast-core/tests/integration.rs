@@ -492,6 +492,368 @@ async fn start_session_reports_spawn_failed_without_leaking_the_path() {
     assert!(details.chars().count() <= 220, "details: {details:?}");
 }
 
+// ---- GH #131: a refused `start_session` has not run its command ------
+//
+// The defect: `start_session` spawned the child and only then asked the
+// registry to admit it, so every refusal refused a process that had
+// already run. Measured against the shipped binary — a `name_taken`
+// refusal ran its command **10 times out of 10**, and against a limit of
+// 8 with 8 sessions live, **8 refusals out of 8** ran theirs, each
+// leaving a transient ninth live child.
+//
+// **No row below waits for anything.** The issue's own reproduction is a
+// marker file the refused command would create, and as a *guard* that is
+// worth nothing: a prior lane measured that recipe at 10/10 on this tree
+// against 0–93% elsewhere, so it can go green by accident on the machine
+// that runs it. What replaces it is an ordering that is decided before
+// any process exists.
+//
+// The ordering is observable because the spawn verdict used to **pre-empt**
+// the admission verdict: a call that violated the name rule *and* named a
+// program that cannot be spawned answered `spawn_failed`, because the
+// spawn happened first. With the claim taken first it answers the
+// admission verdict instead, and it can only do that by having refused
+// before reaching `InProcessPty::spawn`.
+//
+// **Rows A and B depend on a missing binary failing `InProcessPty::spawn`
+// synchronously.** That is measured on Linux and already relied on by
+// `start_session_reports_spawn_failed_without_leaking_the_path` above; it
+// is unmeasured on macOS and on Windows, where an `exec` failure could
+// instead surface in a child that spawned successfully and died. Each row
+// therefore asserts that property first, as a control on the platform it
+// is running on, so that a platform where it does not hold makes the row
+// fail loudly rather than pass vacuously.
+
+/// A command that must not exist on any machine this suite runs on.
+fn unspawnable() -> String {
+    "holdfast_definitely_not_a_real_program".to_string()
+}
+
+/// Row A — the name rule is decided before the spawn.
+///
+/// A check-then-spawn "peek" also passes this row, and that is stated
+/// rather than hidden: this pins the *sequential* property (a refusal the
+/// registry could already see must not fork). The rows that separate a
+/// claim from a peek are the two below it, which observe the window
+/// itself.
+#[tokio::test]
+async fn a_name_taken_start_session_is_refused_before_the_spawn() {
+    let server = HoldfastServer::new();
+
+    // The control. If this ever stops being `spawn_failed`, the platform
+    // does not fail a missing binary synchronously and the assertion
+    // below proves nothing — so it fails here instead of passing there.
+    let control = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some(unspawnable()),
+            args: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        body(&control)["status"],
+        "spawn_failed",
+        "this platform must fail a missing binary in the spawn itself, \
+         or the ordering below is unobservable"
+    );
+
+    let first = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("bash".into()),
+            args: bash_args(),
+            name: Some("held".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&first)["status"], "ok");
+
+    // Both rules are violated at once. Whichever verdict comes back names
+    // the step that ran first.
+    let refused = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some(unspawnable()),
+            args: vec![],
+            name: Some("held".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        body(&refused)["status"],
+        "name_taken",
+        "`spawn_failed` here means the spawn ran before the name was checked"
+    );
+
+    for s in server.registry.all() {
+        let _ = s.signal(holdfast_core::pty::Signal::Kill);
+    }
+}
+
+/// Row B — the concurrency limit is decided before the spawn.
+#[tokio::test]
+async fn an_over_limit_start_session_is_refused_before_the_spawn() {
+    let mut config = holdfast_core::config::Config::default();
+    config.limits.max_concurrent_sessions = 1;
+    let server = HoldfastServer::with_audit_path_and_config(None, &config);
+
+    let control = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some(unspawnable()),
+            args: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        body(&control)["status"],
+        "spawn_failed",
+        "this platform must fail a missing binary in the spawn itself, \
+         or the ordering below is unobservable"
+    );
+
+    let first = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("bash".into()),
+            args: bash_args(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&first)["status"], "ok");
+
+    let refused = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some(unspawnable()),
+            args: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        body(&refused)["status"],
+        "limit_reached",
+        "`spawn_failed` here means the fork ran before the limit was checked"
+    );
+
+    for s in server.registry.all() {
+        let _ = s.signal(holdfast_core::pty::Signal::Kill);
+    }
+}
+
+/// Row C — **the window itself**, which is what a peek does not have.
+///
+/// A claim is outstanding and no session exists. That is precisely the
+/// state a second concurrent `start_session` finds itself in while the
+/// first is inside `fork`/`exec`, and it is the state a peek can never
+/// produce, because between its check and its insert it holds nothing.
+/// Reproduced here as an ordering rather than as a race, so it is decided
+/// by the program's structure and not by which thread the scheduler
+/// picked.
+#[tokio::test]
+async fn a_claim_refuses_a_concurrent_start_session_for_the_same_name() {
+    let server = HoldfastServer::new();
+    let claim = server
+        .registry
+        .reserve(Some("held"))
+        .expect("the name is free");
+    assert_eq!(server.registry.reserved_count(), 1);
+    assert!(
+        server.registry.all().is_empty(),
+        "a claim is not a session; nothing has been created yet"
+    );
+
+    let refused = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("bash".into()),
+            args: bash_args(),
+            name: Some("held".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&refused)["status"], "name_taken");
+    assert!(
+        server.registry.all().is_empty(),
+        "the refusal must not have created a session"
+    );
+
+    // The separator: the name is refused *because of the claim*, not
+    // because `start_session` refuses everything. Giving the claim back
+    // is what makes the identical call succeed.
+    drop(claim);
+    assert_eq!(server.registry.reserved_count(), 0);
+    let ok = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("bash".into()),
+            args: bash_args(),
+            name: Some("held".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&ok)["status"], "ok");
+
+    for s in server.registry.all() {
+        let _ = s.signal(holdfast_core::pty::Signal::Kill);
+    }
+}
+
+/// Row D — the over-limit half of row C, and the direct statement of
+/// *"the process count must not transiently exceed
+/// `max_concurrent_sessions`"*.
+///
+/// What bounds the number of children that can be mid-`fork` at once is
+/// the number of claims that can be outstanding at once, so that is what
+/// this asserts — with, at the moment of the refusal, **no session in
+/// existence at all**. A peek bounds registry membership and nothing
+/// else, which is why K concurrent calls could all fork against it.
+#[tokio::test]
+async fn outstanding_claims_bound_start_session_with_no_session_in_existence() {
+    let mut config = holdfast_core::config::Config::default();
+    config.limits.max_concurrent_sessions = 2;
+    let server = HoldfastServer::with_audit_path_and_config(None, &config);
+
+    let a = server.registry.reserve(None).expect("first slot");
+    let b = server.registry.reserve(None).expect("second slot");
+    assert_eq!(server.registry.reserved_count(), 2);
+    assert_eq!(server.registry.live_count(), 0);
+    assert!(server.registry.all().is_empty());
+
+    let refused = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("bash".into()),
+            args: bash_args(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&refused)["status"], "limit_reached");
+    assert!(
+        server.registry.all().is_empty(),
+        "the refusal must not have created a session"
+    );
+
+    drop(a);
+    let ok = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("bash".into()),
+            args: bash_args(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&ok)["status"], "ok");
+    drop(b);
+
+    for s in server.registry.all() {
+        let _ = s.signal(holdfast_core::pty::Signal::Kill);
+    }
+}
+
+/// Row E — a failed spawn leaves its name free.
+///
+/// §4.1 makes a name unique among *live* sessions; §5.2 says a
+/// `spawn_failed` call creates no session and issues no id. A claim that
+/// outlived the failed spawn would therefore hold the name against
+/// nothing, with **no `terminate` target able to release it** — a
+/// name-space denial of service reachable by typing the name of a program
+/// that is not installed. `Reservation`'s `Drop` is what closes it, and
+/// an explicit `release()` on that early return is what would have been
+/// forgotten.
+#[tokio::test]
+async fn a_failed_spawn_leaves_its_name_free() {
+    let server = HoldfastServer::new();
+    let failed = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some(unspawnable()),
+            args: vec![],
+            name: Some("held".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&failed)["status"], "spawn_failed");
+    assert_eq!(
+        server.registry.reserved_count(),
+        0,
+        "the claim must not outlive the spawn it was taken for"
+    );
+
+    let ok = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("bash".into()),
+            args: bash_args(),
+            name: Some("held".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        body(&ok)["status"],
+        "ok",
+        "a name claimed by a spawn that failed is free again"
+    );
+
+    for s in server.registry.all() {
+        let _ = s.signal(holdfast_core::pty::Signal::Kill);
+    }
+}
+
+/// Row F — a successful `start_session` consumes **exactly one** slot.
+///
+/// The claim has to be *converted* into the session, not added alongside
+/// it. A commit that left the claim standing would halve the effective
+/// limit, and it would do so silently: every row above still passes,
+/// because each of them takes at most one claim. Two successful starts
+/// against a limit of two is the smallest arrangement that can see it,
+/// and it is an ordering rather than a count of anything timed.
+#[tokio::test]
+async fn a_successful_start_session_consumes_exactly_one_slot() {
+    let mut config = holdfast_core::config::Config::default();
+    config.limits.max_concurrent_sessions = 2;
+    let server = HoldfastServer::with_audit_path_and_config(None, &config);
+
+    for n in 0..2 {
+        let r = server
+            .start_session(Parameters(StartSessionArgs {
+                command: Some("bash".into()),
+                args: bash_args(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            body(&r)["status"],
+            "ok",
+            "session {n} of 2 against a limit of 2"
+        );
+    }
+    assert_eq!(
+        server.registry.reserved_count(),
+        0,
+        "no claim outlived its session"
+    );
+    assert_eq!(server.registry.live_count(), 2);
+
+    // And the limit still bites at the right place, so this is not
+    // passing because the limit stopped working.
+    let refused = server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("bash".into()),
+            args: bash_args(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&refused)["status"], "limit_reached");
+
+    for s in server.registry.all() {
+        let _ = s.signal(holdfast_core::pty::Signal::Kill);
+    }
+}
+
 #[tokio::test]
 async fn start_session_runs_in_the_requested_cwd_and_passes_env() {
     let server = HoldfastServer::new();
