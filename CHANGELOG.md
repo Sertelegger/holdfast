@@ -142,6 +142,29 @@ is cut, named and published is in
   ([#106]).
 - A fulfilled secret request is no longer reported as `outcome: "cancelled"`
   when autofill answered the prompt before an attached client's raise ([#105]).
+- The session reader drains the PTY once more after it observes the child die,
+  instead of breaking on the death. `read` and `is_alive` are two separate lock
+  acquisitions, so a backend that did *both* its last write and its exit in the
+  gap between them left the reader abandoning those bytes — and then publishing
+  `reader_finished`, which is the positive fact *"the buffer is final"* that
+  [#42]'s guard entitles `wait_for_pattern` to trust. The waiter then did
+  everything right over a buffer that was final and empty, and answered
+  `session_died`. The exit condition is now *a read returned zero and the
+  backend was already dead before that read*. This is [#42]'s symptom through a
+  different mechanism, one layer down, so the fix is in the producer rather
+  than the consumer.
+  **No agent-visible behaviour changes on a shipped Unix session, and the entry
+  says so rather than claiming a user-facing win it cannot support.** The hole
+  is in the *non-blocking* reading of a zero-byte read that the reader's own
+  contract allows; `InProcessPty` on Unix is blocking, and `portable-pty` maps
+  the master's `EIO` onto `Ok(0)`, so a zero read there means every slave
+  descriptor is closed and no byte can follow it. What the defect does reach is
+  the test double — it is what reddened the `macos-native` job 3 times in 28
+  runs — and the process-isolated `SubprocessPty` seam, which is the priority
+  post-v0.1.0 backend and will be non-blocking. Measured with an 80 ms probe in
+  that gap: 10 failures in 10 before and 0 in 10 after, while [#42]'s own
+  deterministic row failed 0 in 5 under the identical probe — which is what
+  makes them two windows and not one ([#149]).
 - `wait_for_pattern` no longer reports `session_died` over output the child
   really produced; the final rescan waits on `Session::reader_finished()`
   rather than on `is_alive()` ([#42]).
@@ -652,3 +675,4 @@ residuals that are known and accepted.
 [#138]: https://github.com/Sertelegger/holdfast/issues/138
 [#139]: https://github.com/Sertelegger/holdfast/issues/139
 [#142]: https://github.com/Sertelegger/holdfast/issues/142
+[#149]: https://github.com/Sertelegger/holdfast/issues/149

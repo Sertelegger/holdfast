@@ -514,6 +514,79 @@ mod tests {
         );
     }
 
+    /// **The same claim again, for the *other* of the two windows**
+    /// (GH #149).
+    ///
+    /// The row above widens the gap in which a child's output can arrive
+    /// and still be *read*: `set_read_delay` stalls the reader *before* it
+    /// drains, which is GH #42's window and was closed in the waiter. This
+    /// one pins the gap between a read that already drained nothing and
+    /// the separate `is_alive()` that judges it — two lock acquisitions on
+    /// the backend. A child that queued its last line and exited in *that*
+    /// gap had the line abandoned by the reader, which then published
+    /// `reader_finished` all the same. This wait therefore did everything
+    /// right — saw the death, honoured the `reader_finished()` guard,
+    /// rescanned — over a buffer that was final and empty, and answered
+    /// `SessionDied`. Same signature as GH #42's (`left: SessionDied,
+    /// right: Matched`), a different window, and the fix is in the reader
+    /// rather than here.
+    ///
+    /// **`on_empty_read` is the pin; `set_read_delay` is only a margin.**
+    /// The hook fires inside the gap, so the interleaving is an ordering
+    /// guarantee rather than a race a writer thread has to win. The 150 ms
+    /// stall is there for an unrelated reason: `since_cursor: None`
+    /// resolves to `buffer.head` *at subscription time*, so bytes that
+    /// reached the buffer before this wait subscribed would be correctly
+    /// unmatched and the row would go red for something that is not the
+    /// defect. `for_pattern` subscribes synchronously, ahead of its first
+    /// `await`, so the stall puts five orders of magnitude between the
+    /// subscription and the hook.
+    ///
+    /// **It is not a tunable margin, and the number is here so nobody
+    /// tidies it away.** Measured against the *correct* reader with the
+    /// `set_read_delay` line deleted and nothing else changed: red **5
+    /// times in 20**, with `left: SessionDied, right: Matched` — the real
+    /// defect's signature exactly. A reader who trimmed it would get a
+    /// row that is 25% flaky and reads like #149 reopening.
+    #[tokio::test]
+    async fn output_queued_in_the_read_liveness_gap_still_matches() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (s, pty) = mock();
+        pty.set_read_delay(Duration::from_millis(150));
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let weak_pty = Arc::downgrade(&pty);
+        let latch = Arc::clone(&fired);
+        pty.on_empty_read(move || {
+            // Once: the hook runs on every empty read, and a second firing
+            // would re-queue the bytes whose collection is under test.
+            if latch.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let Some(pty) = weak_pty.upgrade() else {
+                return;
+            };
+            pty.queue_output(b"READY\n");
+            pty.exit(0);
+        });
+
+        // Comfortably longer than two stalls, so a failure here is the
+        // wrong answer and never an impatient deadline. The CI failure
+        // this row is written against took 0.447 s against 5000 ms.
+        let out = for_pattern(&s, &re("READY"), spec(None, 5000)).await;
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the read/liveness gap was never entered, so this row proved nothing"
+        );
+        assert_eq!(
+            out.end,
+            WaitEnd::Matched,
+            "the reader abandoned the child's last line in the gap between its \
+             zero-read and its liveness check, then called the buffer final"
+        );
+    }
+
     /// A match that lands in the same breath as the exit is still a match:
     /// death is checked only after the final rescan.
     #[tokio::test]

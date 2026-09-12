@@ -36,6 +36,10 @@ type LineDisciplineSampleHook = Box<dyn Fn() + Send + Sync>;
 /// Something to run when `write` is called — see `MockPty::on_write`.
 type WriteHook = Box<dyn Fn() + Send + Sync>;
 
+/// Something to run when a `read` is about to return zero — see
+/// `MockPty::on_empty_read`.
+type EmptyReadHook = Box<dyn Fn() + Send + Sync>;
+
 pub struct MockPty {
     state: Mutex<MockState>,
     /// Run on every `line_discipline` call, with `state` **not** held.
@@ -43,6 +47,9 @@ pub struct MockPty {
     /// Run on every `write` call, before the bytes are recorded and with
     /// `state` **not** held.
     on_write: Mutex<Option<WriteHook>>,
+    /// Run after a `read` has drained nothing and before it returns 0,
+    /// with `state` **not** held.
+    on_empty_read: Mutex<Option<EmptyReadHook>>,
 }
 
 // Manual, because a boxed `Fn` is not `Debug`. Deliberately does not lock:
@@ -75,6 +82,7 @@ impl MockPty {
             }),
             on_line_discipline_sample: Mutex::new(None),
             on_write: Mutex::new(None),
+            on_empty_read: Mutex::new(None),
         }
     }
 
@@ -180,6 +188,49 @@ impl MockPty {
     pub fn on_write(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.on_write.lock() = Some(Box::new(f));
     }
+
+    /// Run `f` at the instant a `read` has found the queue empty and is
+    /// about to return `Ok(0)`, **after** the drain and with `state` not
+    /// held — so a hook may `queue_output` and `exit` the mock from
+    /// inside it.
+    ///
+    /// **This is the read/liveness gap, made into something a test drives
+    /// rather than races for** (GH #149). The session reader's exit
+    /// condition is a zero-byte `read` judged by a separate `is_alive`,
+    /// and those are two lock acquisitions: bytes queued *between* them,
+    /// by a child that then dies, are bytes the reader can abandon while
+    /// still publishing `reader_finished` — the flag that means *the
+    /// buffer is final*.
+    ///
+    /// [`set_read_delay`](Self::set_read_delay) is the nearest relative
+    /// and deliberately not the tool for this. It stalls *before* the
+    /// drain, which widens the window a child's output can arrive in and
+    /// still be read — GH #42's window, one layer up. Widening the gap
+    /// *after* the drain with a sleep would leave the interleaving to a
+    /// writer thread that has to win a race against it, which is a coin
+    /// dressed as a test. A hook that fires *inside* the gap is an
+    /// ordering guarantee: the queue was empty when the read decided, and
+    /// the bytes and the death are both in place before the reader gets
+    /// to look at liveness. Every run, on every machine.
+    ///
+    /// It runs on the caller's thread — the session's reader `std::thread`
+    /// — and on **every** empty read, so a hook that must act once has to
+    /// latch that itself.
+    ///
+    /// **It holds the hook slot while it runs**, exactly as
+    /// [`on_write`](Self::on_write) does, so a hook must not re-register
+    /// one — and, less obviously, **must not call `read` on this mock**.
+    /// `read` is the only path to this slot and `parking_lot::Mutex` is
+    /// not reentrant, so a hook that tries to "drain the rest of it"
+    /// deadlocks against itself. Note the asymmetry with
+    /// [`on_line_discipline_sample`](Self::on_line_discipline_sample),
+    /// which releases its slot before it touches `state`: an
+    /// `on_empty_read` hook that calls `line_discipline` and a
+    /// `line_discipline` hook that calls `read`, on two threads, are an
+    /// A→B/B→A pair. Nothing in tree does either.
+    pub fn on_empty_read(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_empty_read.lock() = Some(Box::new(f));
+    }
 }
 
 impl Default for MockPty {
@@ -209,10 +260,23 @@ impl PtyBackend for MockPty {
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
-        let mut s = self.state.lock();
-        let n = s.to_read.len().min(buf.len());
-        for (i, b) in s.to_read.drain(..n).enumerate() {
-            buf[i] = b;
+        let n = {
+            let mut s = self.state.lock();
+            let n = s.to_read.len().min(buf.len());
+            for (i, b) in s.to_read.drain(..n).enumerate() {
+                buf[i] = b;
+            }
+            n
+        };
+        // **After the drain and with `state` released**, because the
+        // hook's whole purpose is to `queue_output` and `exit` a mock this
+        // read has already decided is empty — both of which need `state`,
+        // and `parking_lot::Mutex` is not reentrant. See
+        // [`MockPty::on_empty_read`].
+        if n == 0 {
+            if let Some(hook) = self.on_empty_read.lock().as_ref() {
+                hook();
+            }
         }
         Ok(n)
     }
@@ -298,6 +362,60 @@ mod tests {
         let p = MockPty::new();
         p.write(b"ls\n").unwrap();
         assert_eq!(p.written(), b"ls\n");
+    }
+
+    /// The negative half of the hook's contract: a read that returned
+    /// bytes is not the gap. Without this, a hook fired unconditionally
+    /// would still satisfy the row below.
+    #[test]
+    fn the_empty_read_hook_does_not_run_on_a_read_that_drained_something() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let p = MockPty::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        p.on_empty_read(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+
+        p.queue_output(b"hello");
+        let mut buf = [0u8; 16];
+        assert_eq!(p.read(&mut buf).unwrap(), 5);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(p.read(&mut buf).unwrap(), 0, "drained");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// The ordering that makes GH #149's row a window rather than a coin:
+    /// the queue was *already* empty when the hook ran, so bytes the hook
+    /// queues belong to the next read and never to this one — and the
+    /// death it declares is in place before the caller can sample it.
+    #[test]
+    fn the_empty_read_hook_runs_after_the_drain_and_before_the_read_returns() {
+        use std::sync::Arc;
+
+        let p = Arc::new(MockPty::new());
+        let weak = Arc::downgrade(&p);
+        p.on_empty_read(move || {
+            if let Some(p) = weak.upgrade() {
+                p.queue_output(b"late");
+                p.exit(0);
+            }
+        });
+
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            p.read(&mut buf).unwrap(),
+            0,
+            "the drain had already decided when the hook queued"
+        );
+        assert!(
+            !p.is_alive(),
+            "and the death is in place by the time the read returns"
+        );
+        let n = p.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"late", "the bytes are still there to collect");
     }
 
     #[test]
