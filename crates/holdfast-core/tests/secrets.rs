@@ -165,32 +165,46 @@ const PROBE: &str = "hunter2";
 const ECHO_OFF_FIXTURE: &str = "stty -echo; printf 'Password: '; read x; stty echo; \
      printf 'got=%s\\n' \"$(printf %s \"$x\" | tr a-z A-Z)\"";
 
-/// [`ECHO_OFF_FIXTURE`] with its `stty -echo` **delayed**, which is GH
-/// #137's reproduction verbatim and the whole of the arrangement that row
-/// needs.
+/// [`ECHO_OFF_FIXTURE`] with its `stty -echo` **held behind an
+/// echo-on read**: GH #137's arrangement, with the issue's wall clock
+/// replaced by a condition the test controls.
 ///
 /// The child ends up at the same echo-off read as the ordinary fixture;
-/// it just is not there yet when the agent calls `request_secret_input`
+/// it is just not there yet when the agent calls `request_secret_input`
 /// — which raises and broadcasts `AwaitingSecret` the moment it is
-/// called, having consulted nothing. So a human answering that broadcast
-/// answers it into a terminal whose `ECHO` is still on.
+/// called, having consulted nothing. A human answering that broadcast
+/// answers it into a terminal whose `ECHO` is still on, which is the
+/// whole of the defect.
 ///
-/// **The `sleep` is in a shell command string, not in Rust**, and the
-/// distinction is the one this repo's ~23 retired intermittents turn on.
-/// It is *arrangement* — the subject under test is a child that reaches
-/// its prompt late, and a child that does so is what this spells — not a
-/// test waiting out a race it could have waited on a condition for.
-/// Nothing in the row below sleeps: it polls the session's own line
-/// discipline for the state it needs.
+/// **The issue reproduces with `sleep 0.3;` in this position and that
+/// spelling is not used here, which is a deliberate departure from the
+/// filed reproduction.** A sleep inside the command string is
+/// *arrangement* rather than a test timeout, so it is admissible on this
+/// repo's rule — but admissible is not the same as sound. It gives the
+/// row 300 ms of wall clock in which to raise a request and submit
+/// against it, and measured on this tree under a parallel `cargo build`
+/// that window closed **4 times in 10**: the child reached `stty -echo`
+/// first, the arrangement assertion fired, and the row went red against a
+/// correct implementation. A row whose failure rate is a function of how
+/// busy the machine is is an intermittent whatever its sleep is inside
+/// of, and this repo has retired ~23 of them.
+///
+/// `read gate;` blocks the child **indefinitely** in an echo-on read
+/// instead. The test waits for that state, drives the whole submission
+/// against it, and then releases the gate with an ordinary `send_input`
+/// so the child goes on to its real password prompt — which is the second
+/// half of the property and one the sleep could not express at all: the
+/// refused credential must not be sitting in the input queue waiting for
+/// the echo-off read that arrives next (the GH #43 class).
 ///
 /// Derived by substitution rather than retyped, for
 /// [`echo_on_fixture`]'s reason: a fixture typed twice is a fixture that
 /// drifts, and the assertion below catches a `replace` that matched
 /// nothing.
 fn late_echo_off_fixture() -> String {
-    let out = ECHO_OFF_FIXTURE.replace("stty -echo;", "sleep 0.3; stty -echo;");
+    let out = ECHO_OFF_FIXTURE.replace("stty -echo;", "read gate; stty -echo;");
     assert!(
-        out.starts_with("sleep 0.3; stty -echo;") && out.contains(TRANSFORM),
+        out.starts_with("read gate; stty -echo;") && out.contains(TRANSFORM),
         "the late-echo derivation missed: {out}"
     );
     out
@@ -1634,52 +1648,50 @@ async fn a_pre_1_3_client_that_omits_allow_echo_is_gated() {
 }
 
 /// **GH #137's reproduction, as a row.** The issue reproduces by delaying
-/// [`ECHO_OFF_FIXTURE`]'s `stty -echo` and changing nothing else;
-/// [`late_echo_off_fixture`] is that one-line edit, derived rather than
-/// retyped.
+/// [`ECHO_OFF_FIXTURE`]'s `stty -echo`; [`late_echo_off_fixture`] holds it
+/// behind a read instead, for the reason that function's doc gives — the
+/// delay makes the row's outcome a function of machine load.
 ///
-/// This is a different shape from the row above and both are needed. There
-/// the child *never* drops `ECHO`, so a gate that consulted a stale cache
-/// would still refuse. Here the child drops it a moment later, which is
-/// the interleaving that actually happened in the field: an agent calls
-/// `request_secret_input` before its child has reached its password
-/// prompt, the daemon raises and broadcasts on the strength of the call
-/// alone, and a human answers into a terminal that is still echoing.
+/// This is a different shape from
+/// [`a_secret_submitted_while_the_child_still_echoes_is_declined`] and
+/// both are needed. There the child *never* drops `ECHO`, so a gate that
+/// consulted a stale cache would still refuse. Here the child drops it a
+/// moment later, which is the interleaving that actually happened: an
+/// agent calls `request_secret_input` before its child has reached its
+/// password prompt, the daemon raises and broadcasts on the strength of
+/// the call alone, and a human answers into a terminal that is still
+/// echoing.
 ///
 /// Measured on the defect, 10 runs, unoptimised: the credential reached
 /// `read_output` in the clear **10/10, on both `append_newline`
-/// directions**. This row sweeps both of the surfaces that carried it.
+/// directions**. This row sweeps both surfaces that carried it.
 ///
 /// **`prompt.last_line` is swept as well as `read_output`, and the second
 /// is not redundant.** With `append_newline: true` the echoed `\n` resets
-/// the detector's tail line, so the credential sat in the ring buffer with
-/// `prompt.last_line` clean — which is why the row that first tripped over
-/// this caught it only 7 times in 10 while the disclosure happened 10.
+/// the detector's tail line, so the credential sat in the ring buffer
+/// with `prompt.last_line` clean — which is why the row that first
+/// tripped over this caught it only 7 times in 10 while the disclosure
+/// happened 10.
+///
+/// **The second half is the queue.** Neither the echo test nor a write
+/// counter can see bytes already queued and unread (`write_secret_if_unread`'s
+/// own doc, GH #43), so a refusal that merely *deferred* the write would
+/// look identical here until the child reached its echo-off read. The row
+/// therefore releases the gate, waits for the child to consume its real
+/// prompt, and sweeps again.
 #[tokio::test]
 async fn the_137_reproduction_does_not_disclose_the_credential() {
     let d = TestDaemon::start("late137").await;
     let s = d.shell_running(&late_echo_off_fixture());
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
-    // **The arrangement, asserted.** If the child has already dropped
-    // `ECHO` by now the fixture's delay was not long enough on this
-    // machine and the row is measuring the ordinary path instead of the
-    // one it was written for — which would make it pass for the wrong
-    // reason. It says so rather than passing quietly.
-    assert_ne!(
-        s.line_discipline().echo,
-        Some(false),
-        "the child reached `stty -echo` before this row could raise a request, \
-         so the disclosure window this row exists to close was never open"
-    );
+    // The arrangement, waited for rather than assumed: the child is
+    // parked in `read gate` with `ECHO` on, and stays there until this
+    // row says otherwise.
+    await_echo_on(&s).await;
 
     let call = spawn_call(&d, secret_args(&s.id, 20));
     let (request_id, _) = next_awaiting_secret(&mut c, 20).await;
-    assert_ne!(
-        s.line_discipline().echo,
-        Some(false),
-        "the child dropped ECHO between the raise and the submission"
-    );
     send(
         &mut c,
         &ClientFrame::SecretInput {
@@ -1706,10 +1718,34 @@ async fn the_137_reproduction_does_not_disclose_the_credential() {
         "the credential reached prompt.last_line: {}",
         s.detection().last_line
     );
+
+    // Release the gate. The child now does exactly what the ordinary
+    // fixture does — `stty -echo`, prompt, read — and if the refused
+    // credential were merely queued rather than dropped, this is the read
+    // that would take it.
+    assert_eq!(
+        d.send_input(&s.id, "go").await["status"],
+        "ok",
+        "the gate was never released, so the second half of this row is about a \
+         child that never reached its password prompt"
+    );
+    await_detected_prompt(&s, "Password: ").await;
+
+    // The child is now at the echo-off read the credential was refused
+    // ahead of. Nothing it read can have been the credential — asserted
+    // on the transform, which is the only evidence a no-echo read leaves.
+    let buf = buffered(&s);
     assert!(
-        !contains(&buffered(&s), PROBE.as_bytes()),
+        !contains(&buf, b"got=HUNTER2"),
+        "the refused credential was queued rather than dropped, and the child's \
+         *next* read took it — which is the disclosure moved one read later \
+         rather than prevented: {}",
+        String::from_utf8_lossy(&buf)
+    );
+    assert!(
+        !contains(&buf, PROBE.as_bytes()),
         "the credential reached the ring buffer: {}",
-        String::from_utf8_lossy(&buffered(&s))
+        String::from_utf8_lossy(&buf)
     );
     let _ = s.signal(Signal::Kill);
 }
