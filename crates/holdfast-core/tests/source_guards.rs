@@ -1026,3 +1026,99 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
          the cleartext body as a plain Vec"
     );
 }
+
+/// **The two consumers of the in-flight predicate that must *not* get the
+/// view composite (GH #14, GH #142), asserted against the tree because
+/// neither can be asserted against behaviour.**
+///
+/// `OutputProcessor::earliest_partial_across_views` asks every emitted
+/// view whether a secret is still arriving and takes the earliest answer.
+/// That is correct for the two surfaces that hand bytes to somebody —
+/// `holdback_boundary` and `StreamRedactor::feed` — whose region is a
+/// bounded tail. It is wrong for the other two callers of the same
+/// predicate, and wrong in a way no unit test of theirs would notice:
+///
+/// * **`PrefixIndex::unresolved_from`** judges the whole expanded window,
+///   up to `read_output_hard_max_bytes` plus the lookahead, so the bound
+///   that keeps a view answer cheap on a 512-byte tail is not there.
+///   Measured on a 117 KB `jq -C -c` blob, a `Printable` view answers at
+///   the head, the read returns zero bytes, and the cursor never moves —
+///   which is GH #14 reopened.
+///   `the_window_scan_stays_raw_only_so_gh14_stays_closed` is that row.
+/// * **`mcp::detection::safe_last_line`** judges a *rendered* `String`
+///   with a synthetic `region_start = 0`, and uses the offset to clip it.
+///   A view offset does not index that string: backspace un-draws the
+///   cell before it, so the reconstruction is not a subsequence of any
+///   byte stream and no offset map exists. It is not vacuous either —
+///   `TailLine` drops C0 and DEL but keeps `0x80..=0x9f`, and
+///   `emitted_views` builds views for a bare C1 byte (GH #139), so a
+///   composite there really would produce an offset into a different
+///   string.
+///
+/// A behavioural test cannot pin "this function is not called here". The
+/// tree can, so it does.
+#[test]
+fn the_view_composite_reaches_only_the_two_surfaces_that_hand_over_bytes() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sites: Vec<String> = Vec::new();
+    for file in rust_files(&src) {
+        let text = read_src(&file);
+        // Production code only: the rows that exercise the composite live
+        // in `mod tests` and are not consumers of it.
+        for (n, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            if code == "mod tests {" {
+                break;
+            }
+            if code.starts_with("//") {
+                continue;
+            }
+            if !code.contains("earliest_partial_across_views") {
+                continue;
+            }
+            let rel = file
+                .strip_prefix(&src)
+                .expect("scanned file is under src")
+                .to_string_lossy()
+                .replace('\\', "/");
+            sites.push(format!("{rel}:{}", n + 1));
+        }
+    }
+    // The definition plus exactly two call sites. Anything else is either
+    // a third consumer or one of the two named above having acquired it.
+    assert_eq!(
+        sites.len(),
+        3,
+        "unexpected set of `earliest_partial_across_views` sites: {sites:?}"
+    );
+    assert_eq!(
+        sites
+            .iter()
+            .filter(|s| s.starts_with("output/mod.rs:"))
+            .count(),
+        2,
+        "expected the definition and `holdback_boundary`: {sites:?}"
+    );
+    assert_eq!(
+        sites
+            .iter()
+            .filter(|s| s.starts_with("attach/redact_stream.rs:"))
+            .count(),
+        1,
+        "expected `StreamRedactor::feed`: {sites:?}"
+    );
+
+    // The paired direction: both carve-outs still call the raw predicate,
+    // so this guard fails on a *rename* rather than passing vacuously.
+    let detection = read_src(src.join("mcp/detection.rs"));
+    assert!(
+        detection.contains(".earliest_partial(&processor.rules, line.as_bytes(), 0)"),
+        "`safe_last_line` no longer calls the raw predicate; if it was renamed, \
+         rename it here, and if it was replaced, GH #142's carve-out is gone"
+    );
+    let index = read_src(src.join("output/prefix_index.rs"));
+    assert!(
+        index.contains("let anchored = self.earliest_partial(rules, region, region_start);"),
+        "`unresolved_from` no longer calls the raw predicate; see above"
+    );
+}

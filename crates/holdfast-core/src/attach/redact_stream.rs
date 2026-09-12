@@ -217,12 +217,21 @@ impl StreamRedactor {
         // was released (a bare `ghp_` carries no secret material), and if
         // the value then arrives in the next chunk, only a region that
         // still contains the prefix can see the token in flight.
+        //
+        // **The composite over the views, not the raw bytes alone
+        // (GH #142)**, and for the same reason `all_spans` is used below
+        // rather than `find_spans`: an escape planted inside a credential
+        // breaks the run in the raw buffer and is gone again by the time
+        // a terminal paints it, so an observer would watch the secret
+        // arrive in a stream this surface had declared clean. The
+        // withholding *exit* test further down stays raw-only on purpose
+        // — it decides when to stop blackening an observer's stream, and
+        // the whole point of that clause is that it must be able to fire.
         let stream_end = self.base + self.buf.len() as u64;
         let carry_start = self.base + self.split as u64;
         let stop = self
             .processor
-            .index
-            .earliest_partial(&self.processor.rules, &self.buf, self.base)
+            .earliest_partial_across_views(&self.buf, self.base)
             .unwrap_or(stream_end);
         // Clamped below by `carry_start`: a partial that opened inside
         // the already-emitted lookbehind cannot be un-emitted, and the
@@ -735,5 +744,46 @@ mod tests {
             1
         );
         assert!(!out.windows(64).any(|w| w.iter().all(|b| *b == b'K')));
+    }
+    /// **GH #142 on the observer's stream.** A credential still arriving
+    /// with a control byte inside it breaks the raw value run, so the raw
+    /// predicate reports nothing in flight and the arrived half goes
+    /// straight onto an attached client's wire — where a terminal paints
+    /// it as an intact, usable prefix, because the planted escape is a
+    /// colour change and not a character.
+    ///
+    /// `read_output` had this fixture and this surface did not, which is
+    /// how reverting `feed` to the raw region alone stayed green.
+    #[test]
+    fn a_painted_partial_is_not_streamed_to_an_observer() {
+        let partial = &GH[..GH.len() - 1];
+        let painted = format!("{}\x1b[0m{}", &partial[..20], &partial[20..]);
+        let processor = Arc::new(OutputProcessor::builtin().expect("builtin processor"));
+        // The premise: the raw region really does report nothing, so the
+        // row fails against a `feed` that asks only the raw bytes.
+        assert_eq!(
+            processor
+                .index
+                .earliest_partial(&processor.rules, painted.as_bytes(), 0),
+            None,
+            "the raw region holds this on its own, so the row proves nothing"
+        );
+
+        let mut r = StreamRedactor::new(processor);
+        let out = r.feed(painted.as_bytes());
+        let seen = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            !seen.contains(&partial[..20]),
+            "the arrived half of an in-flight credential reached the \
+             observer: {seen:?}"
+        );
+        assert!(r.carried() > 0, "nothing was carried, so nothing was held");
+
+        // …and it is a holdback rather than a black hole: the rest of the
+        // token arrives, the match completes, and one marker goes out.
+        let rest = r.feed(format!("{}\n", &GH[GH.len() - 1..]).as_bytes());
+        let tail = String::from_utf8_lossy(&rest).into_owned();
+        assert!(tail.contains("[REDACTED:github]"), "got {tail:?}");
+        assert!(!tail.contains("ghp_"), "the token reached the stream");
     }
 }

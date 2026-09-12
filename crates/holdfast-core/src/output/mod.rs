@@ -242,18 +242,20 @@ impl OutputProcessor {
     /// Where a read must stop (spec §4.1). `buffer.head` unless a secret
     /// is still arriving in the trailing region.
     ///
-    /// **Asked of the raw region only, and [`normalise`] deliberately
-    /// does not reach here (GH #142).** A revision of the GH #125 fix did
-    /// ask the views, on the reasoning that a token arriving with a
-    /// colour reset inside it is not in flight by the raw region's
-    /// account and would be released half-emitted. That reasoning is
-    /// right and the change was still wrong, because
-    /// [`PrefixIndex::earliest_partial`]'s continuation test — *every
-    /// byte from the prefix to the end of the region could still belong
-    /// to the value* — is **load-bearing on control bytes**, and every
-    /// view exists precisely to delete them.
+    /// **Asked of the raw region and of every emitted view of it
+    /// (GH #142), which is the half of the GH #125 fix that had to wait
+    /// for a sharper predicate.** A credential arriving with a colour
+    /// reset inside it is not in flight by the raw region's account —
+    /// `ESC` is not a value byte — so it was released half-emitted, with
+    /// `held_back: false` and `redactions: {}`, which is a positive
+    /// assertion that the read was clean made about bytes heading into an
+    /// agent's transcript.
     ///
-    /// Measured, default read path, against this method's own answer:
+    /// The first attempt at asking the views was reverted, and the reason
+    /// is worth keeping because it is what shapes this one. The old
+    /// continuation test — *every byte from the prefix to the end of the
+    /// region is printable and not a space* — was **load-bearing on
+    /// control bytes**, and every view exists precisely to delete them:
     ///
     /// ```text
     /// added 210 packages\r\nnpm WARN deprecated \x1b[33m@acme/key-manager@1.2.3\x1b[0m\x1b[K
@@ -261,40 +263,81 @@ impl OutputProcessor {
     ///   stripped     boundary 51, held_back, and it never releases
     /// ```
     ///
-    /// `key-` is `mailgun-api-key`'s indexed prefix and the rest is
-    /// ordinary text; the trailing `\x1b[K` used to end the run and
-    /// disarm the holdback, and in the stripped view it is not there. A
-    /// progress line that ends in an escape with no newline after it —
-    /// which is most of them — strands the caller's own output behind a
-    /// `held_back` that nothing will clear. The same shape takes
-    /// `prompt.last_line` to `""` on every `status` and `list_sessions`,
-    /// and turns a `wait_for_pattern` that answered instantly into one
-    /// that burns its whole `timeout_secs`.
+    /// A raw holdback is **self-healing**: the byte that kills a
+    /// candidate that will never complete is the same byte the caller was
+    /// waiting for. A view deletes that byte, so a withhold taken on a
+    /// view can be permanent — and a progress line ending in an escape
+    /// with no newline after it is the ordinary shape, not an exotic one.
     ///
-    /// **The rule that came out of it**, and the reason the two halves of
-    /// the GH #125 fix are not symmetric: *a view may add a **marker**,
-    /// because a marker is safe in every stream and costs the caller
-    /// nothing it was entitled to; a view may not add a **withhold**,
-    /// because a withhold denies the caller bytes, and the predicate that
-    /// decides withholds reads exactly the bytes a view removes.*
-    /// [`OutputProcessor::all_spans`] is the first half; this method is
-    /// the second.
+    /// **Two things make asking the views safe now, and both are
+    /// necessary.** `key-manager` releases because
+    /// [`PrefixIndex::still_alive`] knows `\bkey-[a-f0-9]{32}` cannot
+    /// reach an `m`; `\x1b]0;SECRET_DONE\x07` releases because
+    /// `generic-secret-assignment` fails
+    /// [`holdback_is_bounded`][prefix_index] and no view may withhold on
+    /// it at all. Liveness alone still holds the second one for ever.
     ///
-    /// The cost of stopping here is stated rather than elided: a
-    /// credential that straddles a read boundary **with an escape inside
-    /// it** is still released half-emitted, exactly as before this fix.
-    /// That is GH #142, it is byte-identical to the behaviour at
-    /// `v0.0.7`, and closing it needs a sharper in-flight predicate
-    /// rather than a different set of views — see the issue.
+    /// **The asymmetry rule is narrowed, not repealed.** A view may add a
+    /// marker unconditionally ([`OutputProcessor::all_spans`]); a view may
+    /// add a withhold only for a rule whose holdback is provably bounded.
+    /// The twelve rules that fail that test keep GH #142's residual in
+    /// full — bounded by `(rule minimum − 1)`, a per-rule constant — and
+    /// GH #160 is where it stops being silent.
     ///
-    /// [`PrefixIndex::earliest_partial`]: prefix_index::PrefixIndex::earliest_partial
+    /// **Two other consumers of the same predicate deliberately do not
+    /// get this composite**, because their regions are not the 512-byte
+    /// tail and the bound that protects this one does not exist there:
+    /// `unresolved_from` (whose region is the whole window, where a
+    /// `Printable` view of a 117 KB `jq -C -c` blob answers `Some(0)` and
+    /// returns zero bytes for ever — the GH #14 regression) and
+    /// `safe_last_line` (whose region is a rendered `String` that no view
+    /// offset maps into, because backspace un-draws).
+    ///
+    /// [`PrefixIndex::still_alive`]: prefix_index::PrefixIndex
+    /// [prefix_index]: prefix_index
     pub fn holdback_boundary(&self, w: &WindowSnapshot<'_>, opts: &ReadOptions) -> u64 {
         if !opts.redact || w.bypass_holdback {
             return w.head;
         }
-        self.index
-            .earliest_partial(&self.rules, w.tail_region, w.tail_region_start)
+        self.earliest_partial_across_views(w.tail_region, w.tail_region_start)
             .unwrap_or(w.head)
+    }
+
+    /// The earliest in-flight secret in `region`, judged over the raw
+    /// bytes **and** over each stream a read of them could emit, reported
+    /// in raw buffer offsets (GH #142).
+    ///
+    /// The minimum, not a choice, and the two halves ask different
+    /// questions of different rule sets: the raw pass runs every rule
+    /// under [`PrefixIndex::earliest_partial`]'s own predicate, and each
+    /// view pass runs only the rules whose holdback is bounded, under
+    /// liveness. A view answer is mapped back through
+    /// [`NormalView::raw_offset`] before it competes.
+    ///
+    /// **`pub(crate)` for `attach::redact_stream`**, which is the other
+    /// surface that hands bytes to somebody and must not disagree with
+    /// this one about what is still arriving.
+    ///
+    /// [`NormalView::raw_offset`]: normalise::NormalView::raw_offset
+    pub(crate) fn earliest_partial_across_views(
+        &self,
+        region: &[u8],
+        region_start: u64,
+    ) -> Option<u64> {
+        let mut earliest = self
+            .index
+            .earliest_partial(&self.rules, region, region_start);
+        for view in normalise::emitted_views(region, region_start) {
+            let Some(at) = self
+                .index
+                .earliest_partial_in_view(&self.rules, view.bytes(), 0)
+            else {
+                continue;
+            };
+            let raw = view.raw_offset(at as usize);
+            earliest = Some(earliest.map_or(raw, |e| e.min(raw)));
+        }
+        earliest
     }
 
     /// Every secret span in `region`, judged over **each byte stream a
@@ -2148,5 +2191,265 @@ mod tests {
         );
         assert!(!r.output.contains(GITHUB), "leaked: {}", r.output);
         assert_eq!(r.output, "\u{1b}]0;deploy [REDACTED:github]\u{7}$ ");
+    }
+
+    /// **GH #142's reproduction, which the issue deliberately left
+    /// uncovered.** A credential that is *still arriving* and carries a
+    /// control byte inside it was released half-emitted, with
+    /// `held_back: false` and `redactions: {}` — a positive assertion
+    /// that the read was clean, made about bytes an agent is about to put
+    /// in a transcript.
+    ///
+    /// Both shapes are the same defect with different control bytes: the
+    /// raw value run ends at the planted byte, so the raw predicate sees
+    /// nothing in flight, while every stream a reader will actually
+    /// receive carries `ghp_` plus 35 characters of a 36-character
+    /// minimum and is a token one keystroke from completion.
+    ///
+    /// The premise is asserted rather than assumed. If the raw region
+    /// held on its own, the row would pass against a change that never
+    /// asked a view anything.
+    #[test]
+    fn a_credential_arriving_with_a_control_byte_inside_it_is_withheld() {
+        let partial = &GITHUB[..GITHUB.len() - 1];
+        let shapes: [(&str, Vec<u8>); 2] = [
+            (
+                "CSI inside the value",
+                format!("line one\n{}\x1b[0m{}", &partial[..20], &partial[20..]).into_bytes(),
+            ),
+            (
+                "BEL inside an OSC payload",
+                format!("\x1b]0;{}\x07{}", &partial[..20], &partial[20..]).into_bytes(),
+            ),
+        ];
+        let p = processor();
+        for (what, buf) in shapes {
+            assert_eq!(
+                p.index.earliest_partial(&p.rules, &buf, 0),
+                None,
+                "{what}: the raw region must not hold on its own, or this row \
+                 passes against a change that asks no view anything"
+            );
+            let r = read(&buf, 0, 32 * 1024);
+            assert!(
+                r.held_back,
+                "{what}: the read handed over an in-flight credential: {:?}",
+                r.output
+            );
+            assert!(
+                !r.output.contains(&partial[..20]),
+                "{what}: leaked the arrived half: {:?}",
+                r.output
+            );
+            assert!(
+                r.cursor < buf.len() as u64,
+                "{what}: `held_back` with the cursor at head withholds nothing"
+            );
+        }
+    }
+
+    /// **The composite is the minimum over the raw answer and every view
+    /// answer, and the raw one can be the earliest.**
+    ///
+    /// Views only ever delete bytes, so for the *same* candidate a view
+    /// answers where raw does. The two diverge when raw's earliest
+    /// candidate belongs to a rule the gate excludes: the view scan skips
+    /// it and reports the next one along, which is later. Taking that
+    /// answer instead of the minimum releases everything between them —
+    /// bytes the raw predicate had already said were part of a secret
+    /// still arriving.
+    ///
+    /// `\x08` is the view-maker here and nothing more: `Printable` drops
+    /// it, which is what makes `emitted_views` return anything at all for
+    /// a region that is otherwise plain text.
+    #[test]
+    fn the_composite_takes_the_earliest_answer_not_the_last() {
+        let p = processor();
+        let region = b"\x08password/ghp_abcdef";
+        assert_eq!(
+            p.index.earliest_partial(&p.rules, region, 0),
+            Some(1),
+            "the raw scan holds from the `password` label"
+        );
+        let in_view = normalise::emitted_views(region, 0)
+            .into_iter()
+            .filter_map(|v| {
+                p.index
+                    .earliest_partial_in_view(&p.rules, v.bytes(), 0)
+                    .map(|a| v.raw_offset(a as usize))
+            })
+            .min();
+        assert_eq!(
+            in_view,
+            Some(10),
+            "the view scan skips the ungated `password` rule and answers \
+             later, which is what makes this row discriminate"
+        );
+        assert_eq!(
+            p.earliest_partial_across_views(region, 0),
+            Some(1),
+            "the composite must be the minimum, not whichever view spoke last"
+        );
+    }
+
+    /// **A view answer is an index into the view; a boundary is an
+    /// absolute buffer offset, and the two are not the same number.**
+    ///
+    /// They differ by everything the view deleted *and* by
+    /// `tail_region_start`, so every fixture whose buffer starts at zero
+    /// and whose window covers the whole of it sees two numbers that
+    /// differ only by the deletions — the holdback still fires, just in
+    /// the wrong place, and the row stays green. Measured: dropping the
+    /// `NormalView::raw_offset` map leaves the whole `output` suite
+    /// passing. This is the withhold's version of
+    /// `a_painted_token_far_into_the_buffer_maps_back_to_absolute_offsets`,
+    /// and the padding is the whole fixture.
+    #[test]
+    fn a_view_driven_boundary_is_an_absolute_offset() {
+        let p = processor();
+        let mut buf = "filler line\n".repeat(400).into_bytes();
+        let at = buf.len() as u64;
+        let partial = &GITHUB[..GITHUB.len() - 1];
+        buf.extend_from_slice(format!("{}\x1b[0m{}", &partial[..20], &partial[20..]).as_bytes());
+
+        let w = snapshot(&p, &buf, at, 32 * 1024, true, false);
+        assert!(
+            w.tail_region_start > 0,
+            "the arrangement must really put the token past the scan window's \
+             own start, or a boundary that forgot the base lands on it anyway"
+        );
+        assert_eq!(
+            p.holdback_boundary(&w, &ReadOptions::default()),
+            at,
+            "the boundary is the token's absolute offset, not its index in \
+             whichever view reported it"
+        );
+    }
+
+    /// The paired direction, and the reason the gate exists beside
+    /// liveness rather than instead of it: **ordinary output that ends in
+    /// an escape must still be released in every view.**
+    ///
+    /// Liveness alone releases the npm line — `\bkey-[a-f0-9]{32}` cannot
+    /// reach the `m` of `manager` — and still holds `]0;SECRET_DONE` for
+    /// ever, because `generic-secret-assignment`'s leading
+    /// `[a-z0-9_.-]{0,32}` lets the keyword arrive later and 33 bytes is
+    /// more than enough to strand an OSC title. Only the gate releases
+    /// that one, by refusing the rule a view withhold at all.
+    ///
+    /// `ordinary_output_ending_in_an_escape_sequence_is_not_held_back`
+    /// and `a_terminated_window_title_is_not_a_credential_still_arriving`
+    /// are the end-to-end rows; this asserts the mechanism they rest on,
+    /// so a regression names the cause rather than the symptom.
+    #[test]
+    fn the_gate_is_what_releases_a_terminated_window_title() {
+        let p = processor();
+        let title = b"harmless header line\x1b[2;1Hdone\x1b]0;SECRET_DONE\x07";
+        // Some view really does reassemble a live candidate here — that is
+        // the whole hazard — and the gate is what declines to act on it.
+        let ungated_hit = normalise::emitted_views(title, 0)
+            .into_iter()
+            .any(|v| p.index.earliest_partial(&p.rules, v.bytes(), 0).is_some());
+        assert!(
+            ungated_hit,
+            "no view holds this title, so the row proves nothing about the gate"
+        );
+        assert_eq!(
+            p.earliest_partial_across_views(title, 0),
+            None,
+            "the rule that fires is `generic-secret-assignment`, whose \
+             holdback is unbounded, so no view may withhold on it"
+        );
+
+        let npm = b"npm WARN deprecated \x1b[33m@acme/key-manager@1.2.3\x1b[0m\x1b[K";
+        assert_eq!(
+            p.earliest_partial_across_views(npm, 0),
+            None,
+            "`key-` is gated in, and liveness is what releases it: \
+             `\\bkey-[a-f0-9]{{32}}` cannot reach an `m`"
+        );
+    }
+
+    /// **The two consumers that must NOT get the view composite, asserted
+    /// rather than left to the call graph (GH #14, GH #142).**
+    ///
+    /// `unresolved_from`'s region is the whole expanded window — up to
+    /// `read_output_hard_max_bytes` plus the lookahead — not the 512-byte
+    /// tail, so the bound that keeps a view-driven withhold cheap on
+    /// `holdback_boundary` does not exist there. Measured on a 117 KB
+    /// `jq -C -c` blob: the `Printable` view answers `Some(0)`, the read
+    /// returns zero bytes, the cursor does not move, and it does that for
+    /// ever.
+    ///
+    /// The fixture is built so the composite really would say so — the
+    /// first assertion is the premise — and the paging loop is the
+    /// consequence a reader can check.
+    #[test]
+    fn the_window_scan_stays_raw_only_so_gh14_stays_closed() {
+        let p = processor();
+        // `jq -C -c`: colourised JSON with no space and no newline in it.
+        let mut buf = Vec::new();
+        while buf.len() < 117_000 {
+            buf.extend_from_slice(b"\x1b[34;1m\"password\"\x1b[0m:\x1b[32m\"1.2.3\"\x1b[0m,");
+        }
+        buf.extend_from_slice(b"\x1b[0m");
+
+        // **The premise**, which is GH #142's own falsification
+        // measurement: a view of this blob really does report a secret in
+        // flight at its *head*, so a `unresolved_from` that asked the
+        // views would cut the window to nothing and return zero bytes.
+        let at_head = normalise::emitted_views(&buf, 0)
+            .into_iter()
+            .filter_map(|v| {
+                p.index
+                    .earliest_partial(&p.rules, v.bytes(), 0)
+                    .map(|a| v.raw_offset(a as usize))
+            })
+            .min()
+            .expect("no view holds this blob, so the row proves nothing");
+        assert!(
+            at_head < 64,
+            "the view answers at {at_head}, not at the head"
+        );
+
+        // What `unresolved_from` answers instead: the raw tail, which is
+        // the three printable bytes of the final `\x1b[0m`.
+        let raw = p
+            .index
+            .unresolved_from(&p.rules, &buf, 0)
+            .expect("the blob ends on printable bytes, so its tail is unresolved");
+        assert!(
+            raw as usize > buf.len() - 8,
+            "the window scan must stay on the raw bytes; it answered {raw} of {}",
+            buf.len()
+        );
+
+        // The gate is the second line of defence, and worth pinning
+        // separately: a rule whose holdback is bounded cannot stay alive
+        // across 117 KB, so even the composite `holdback_boundary` uses
+        // answers `None` here.
+        assert_eq!(
+            p.earliest_partial_across_views(&buf, 0),
+            None,
+            "the gated composite must not hold a blob this size either"
+        );
+
+        // …and the behaviour that fact protects: the read pages to the end.
+        let mut cursor = 0u64;
+        let mut pages = 0usize;
+        let mut seen = 0usize;
+        while cursor < buf.len() as u64 {
+            let r = read(&buf, cursor, 4096);
+            assert!(
+                r.cursor > cursor,
+                "page {pages} returned {} bytes and left the cursor at {cursor}",
+                r.bytes_returned
+            );
+            seen += r.bytes_returned;
+            cursor = r.cursor;
+            pages += 1;
+            assert!(pages < 200, "paging did not terminate");
+        }
+        assert_eq!(seen, buf.len(), "the pages must tile the buffer exactly");
     }
 }

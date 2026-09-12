@@ -57,9 +57,10 @@
 //! of open axes in a module header is what went stale twice already. Each
 //! residual is documented where it is measured: GH #135's split-stream
 //! residual in `StreamRedactor`'s header, the tail-anchor cost at
-//! `TAIL_ANCHOR` in `tests/redaction_sweep.rs`, and the withholding side —
-//! a credential still arriving with an escape inside it — in
-//! `OutputProcessor::holdback_boundary` and GH #142.
+//! `TAIL_ANCHOR` in `tests/redaction_sweep.rs`, and what the withholding
+//! side still leaves open for twelve rules — a credential still arriving
+//! with an escape inside it — in `OutputProcessor::holdback_boundary`
+//! and GH #160.
 //!
 //! An earlier revision of this module claimed the unqualified form —
 //! *every byte stream a read can emit is matched before it is emitted* —
@@ -73,13 +74,16 @@
 //! * A view may add a **marker**. A marker is safe in every stream and
 //!   costs the caller nothing it was entitled to, so
 //!   [`OutputProcessor::all_spans`] reads every view.
-//! * A view may **not** add a **withhold**. A withhold denies the caller
-//!   bytes, and [`PrefixIndex::earliest_partial`] — the predicate behind
-//!   every withhold — is load-bearing on exactly the control bytes a view
-//!   deletes. Asked about a stripped view it strands ordinary output
-//!   behind a `held_back` that never clears, so
-//!   `OutputProcessor::holdback_boundary` reads the raw region alone.
-//!   GH #142 carries the measurement and the residual that leaves open.
+//! * A view may add a **withhold** only for a rule whose holdback is
+//!   provably bounded (GH #142). A withhold denies the caller bytes, and
+//!   a raw one is safe because it is self-healing — the byte that kills a
+//!   candidate that will never complete is the same byte the caller was
+//!   waiting for. A view deletes exactly those bytes, so for a rule whose
+//!   alive-and-unmatched continuations are infinite there may be no byte
+//!   left that can ever end the withhold, and `\x1b]0;SECRET_DONE\x07`
+//!   strands the caller for good. `PrefixIndex::build` decides which
+//!   rules those are; twelve of the shipped fifty-one fail it and keep
+//!   GH #142's residual, which GH #160 is about making audible.
 //!
 //! The pipeline is `render` (strip or pass through) then [`encode`], and
 //! only two of its knobs drop bytes, so the set of derivable streams is
