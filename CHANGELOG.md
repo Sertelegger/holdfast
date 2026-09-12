@@ -119,6 +119,21 @@ is cut, named and published is in
   ([#106]).
 - A fulfilled secret request is no longer reported as `outcome: "cancelled"`
   when autofill answered the prompt before an attached client's raise ([#105]).
+- The session reader drains the PTY once more after it observes the child die,
+  instead of breaking on the death. `read` and `is_alive` are two separate lock
+  acquisitions, so a child that did *both* its last write and its exit in the
+  gap between them left the reader abandoning those bytes — and then publishing
+  `reader_finished`, which is the positive fact *"the buffer is final"* that
+  [#42]'s guard entitles `wait_for_pattern` to trust. The waiter then did
+  everything right over a buffer that was final and empty, and answered
+  `session_died` for output the session really produced — output `read_output`
+  returned a moment later. The exit condition is now *a read returned zero and
+  the backend was already dead before that read*. This is [#42]'s symptom
+  through a different mechanism, one layer down, so the fix is in the producer
+  rather than the consumer. Measured with an 80 ms probe in that gap: 10
+  failures in 10 before and 0 in 10 after, while [#42]'s own deterministic row
+  failed 0 in 5 under the identical probe — which is what makes them two
+  windows and not one ([#149]).
 - `wait_for_pattern` no longer reports `session_died` over output the child
   really produced; the final rescan waits on `Session::reader_finished()`
   rather than on `is_alive()` ([#42]).
@@ -628,3 +643,4 @@ residuals that are known and accepted.
 [#138]: https://github.com/Sertelegger/holdfast/issues/138
 [#139]: https://github.com/Sertelegger/holdfast/issues/139
 [#142]: https://github.com/Sertelegger/holdfast/issues/142
+[#149]: https://github.com/Sertelegger/holdfast/issues/149
