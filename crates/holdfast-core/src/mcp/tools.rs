@@ -433,11 +433,49 @@ impl HoldfastServer {
             ..SessionConfig::default()
         };
 
+        // **The slot and the name are claimed before the child exists**
+        // (GH #131), which is what makes the comment sixty lines above
+        // true of the registry's rules and not only of the regex: a name
+        // that is already taken, and a limit that is already reached, are
+        // the caller's error and must not leave a live child behind
+        // either. Until this line the order was the other way round —
+        // spawn, then ask — so every `name_taken` refusal had already run
+        // its command (10 out of 10, measured against the shipped
+        // binary), and 8 of 8 over-limit refusals had each left a
+        // transient ninth live child.
+        //
+        // The two refusals it can return are the two `registry.insert`
+        // used to return, so nothing about the envelope the agent sees
+        // changes; only the point at which it is decided. **That does
+        // move one observable**, deliberately: a call that would fail
+        // both checks now reports the admission verdict where it used to
+        // report `spawn_failed`, because the spawn no longer happens
+        // first. That is the property, stated as an ordering rather than
+        // a timing, and `integration.rs` pins it there.
+        //
+        // The reservation is released by `Drop`, so the `spawn_failed`
+        // arm ten lines below needs no cleanup line — see
+        // [`Reservation`] for why an explicit `release()` there is the
+        // thing that gets forgotten.
+        let reservation = match self.registry.reserve(args.name.as_deref()) {
+            Ok(r) => r,
+            Err(e) => return envelope::from_error(&e),
+        };
+
         let backend = match InProcessPty::spawn(&cfg) {
             Ok(b) => Arc::new(b) as Arc<dyn PtyBackend>,
             Err(e) => {
                 // `brief` matters here: portable-pty's spawn error embeds
                 // the whole $PATH, which would land in the transcript.
+                //
+                // `reservation` drops on this return, so the name goes
+                // back immediately. It has to: §4.1 makes a name unique
+                // among *live* sessions, §5.2 says a `spawn_failed` call
+                // creates no session and issues no id — so a claim that
+                // outlived this return would hold a name against nothing,
+                // with no `terminate` target to release it, and typing
+                // the name of a program that is not installed would be a
+                // name-space denial of service.
                 return Ok(envelope::envelope(
                     Status::SpawnFailed,
                     json!({ "command": launch.command }),
@@ -466,11 +504,12 @@ impl HoldfastServer {
             ..ScreenConfig::default()
         });
 
-        if let Err(e) = self.registry.insert(Arc::clone(&session)) {
-            // Registry rejected it; don't leak the child.
-            let _ = session.signal(crate::pty::Signal::Kill);
-            return envelope::from_error(&e);
-        }
+        // The claim taken before the spawn becomes the session it was
+        // taken for, in one lock acquisition. **Infallible**: the slot
+        // and the name were already held, so there is nothing left to
+        // refuse — and so there is no longer a "registry rejected it,
+        // kill the child" remedy here to be forgotten or got wrong.
+        reservation.commit(Arc::clone(&session));
 
         // §9.6's `autofill_on_echo_off`, armed here because this is where a
         // session comes into existence and the edge it listens for can fire
