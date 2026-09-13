@@ -167,23 +167,37 @@ fn liveness_pattern(pattern: &str) -> Option<String> {
 ///
 /// **What this proves, and what it does not — stated because the
 /// difference is the whole of it.** It proves the match cannot begin
-/// exactly one byte before the prefix. That covers every *variable*-length
-/// lead-in, which is the entire family the hazard lives in: `{0,n}`, `*`,
-/// `?` and `+` all admit a gap of exactly one byte, so a witness at depth
-/// one exists whenever one exists at all. It does **not** cover a lead-in
-/// whose minimum length is two or more — a fixed literal (for which
-/// [`derive_prefixes`] would have produced the lead-in as the indexed
-/// prefix instead) or an alternation branch with a declared prefix
-/// starting two bytes into it.
+/// exactly one byte before the prefix. That reaches every lead-in whose
+/// minimum length is one or less, which is the family the hazard lives
+/// in: `{0,n}`, `*`, `?` and `+` all admit a gap of exactly one byte. It
+/// does **not** reach a lead-in whose minimum is two or more. Three
+/// shapes have one, and all three need the rule to **declare** its
+/// prefixes, because a derived prefix is by construction a literal every
+/// match begins with: a fixed literal lead-in, a `{2,n}` run, and an
+/// alternation branch with a declared prefix starting two bytes into it.
+/// `(?:\bacme|\bfoo)[a-z]{2,6}tok_[A-Za-z0-9]{20,}` with
+/// `prefixes = ["tok_"]` is the second, and it keeps an automaton that
+/// calls `acmexytok_ABCDEFGHIJ` dead at offset 6.
 ///
-/// **Chasing those deeper occurrences was tried and is not worth having.**
-/// The full reachability walk refuses an automaton to **23 of the 51
+/// **That residual is measured empty on the rule set, and searching one
+/// byte deeper would not find it anyway.** Sweeping the same walk at
+/// depths one through six over the shipped fifty-one plus the adversarial
+/// user rules: depths one and two refuse the *same* two rules, and depth
+/// **three** — which is [`MIN_PREFIX_LEN`], the first depth at which a
+/// rule's own value run can be entered and spell its own prefix — jumps
+/// to seven and starts refusing `openai-api-key`, `jwt` and
+/// `aws-access-key-id`. There is no depth between "reaches more real
+/// lead-ins" and "starts refusing rules that are fine".
+///
+/// **Chasing the deep occurrences was tried and is not worth having.**
+/// The unbounded reachability walk refuses an automaton to **23 of the 51
 /// shipped rules** — `\bsk-ant-[A-Za-z0-9_-]{24,}` reaches its own
 /// `sk-ant-` from inside its own value run, because that run's character
-/// class can spell it. Every one of those interior occurrences is preceded, in the same
-/// region, by that rule's *own* earlier candidate, and
-/// [`PrefixIndex::earliest_partial`] scans left to right and answers with
-/// the earliest — so the deep walk buys nothing and costs the change.
+/// class can spell it. Every one of those interior occurrences is
+/// preceded, in the same region, by that rule's *own* earlier candidate,
+/// and [`PrefixIndex::earliest_partial`] scans left to right and answers
+/// with the earliest — so the deep walk buys nothing and costs the
+/// change.
 fn rule_may_start_one_byte_before(dfa: &dense::DFA<Vec<u32>>, prefix: &[u8]) -> bool {
     fn consumes(dfa: &dense::DFA<Vec<u32>>, mut sid: StateID, prefix: &[u8]) -> bool {
         for byte in prefix {
@@ -203,11 +217,16 @@ fn rule_may_start_one_byte_before(dfa: &dense::DFA<Vec<u32>>, prefix: &[u8]) -> 
         !dfa.is_match_state(sid) || (0u8..=0xff).any(|b| !dfa.is_dead_state(dfa.next_state(sid, b)))
     }
 
-    // The four look-behinds are the only classes a DFA can tell apart:
-    // `\b` splits word from non-word, a line anchor splits newline from
-    // not, and the start of the haystack is its own case. Seeding all of
-    // them covers every start state a search can begin in.
-    for lead in [None, Some(b'a'), Some(b'-'), Some(b'\n')] {
+    // **One seed per start configuration `regex-automata` distinguishes**,
+    // read off `util::start::Start` rather than reasoned about: `Text`
+    // (the empty seed), `WordByte`, `NonWordByte`, `LineLF` and `LineCR`.
+    // `\r` is its own class and `\n` does not stand in for it — the
+    // determinizer gives `LineCR` a half-CRLF look-behind where `LineLF`
+    // gets `StartCRLF` — and on a pty `\r` is the *common* byte before a
+    // line. Missing a start state means missing a lead-in, which is the
+    // direction that releases. `CustomLineTerminator` needs a
+    // `LookMatcher` this crate never sets, so it is unreachable here.
+    for lead in [None, Some(b'a'), Some(b'-'), Some(b'\n'), Some(b'\r')] {
         let hay: Vec<u8> = lead.into_iter().collect();
         let input = Input::new(&hay).range(hay.len()..).anchored(Anchored::Yes);
         let Ok(sid) = dfa.start_state_forward(&input) else {
@@ -456,7 +475,8 @@ impl PrefixIndex {
             // **And the automaton is only asked about prefixes the rule's
             // match begins at.** `still_alive` anchors at the candidate,
             // so a prefix the match can only reach after earlier bytes is
-            // DEAD on arrival — see [`prefix_is_match_initial`], which
+            // DEAD on arrival — see `rule_may_start_one_byte_before`,
+            // which
             // measures it on `generic-secret-assignment`. Same refusal,
             // same fallback, and for the same reason: an automaton that
             // answers the wrong question is worse than no automaton.
@@ -530,8 +550,10 @@ impl PrefixIndex {
             return region[at..].iter().all(|b| is_value_byte(*b));
         };
         let input = Input::new(region).range(at..).anchored(Anchored::Yes);
-        // The only failure `start_state_forward` reports is a quit byte in
-        // the look-behind — rule 4 above.
+        // `start_state_forward` fails on a quit byte in the look-behind
+        // (rule 4 above) or on an anchored-mode mismatch, which cannot
+        // happen here — [`build_liveness`] sets `StartKind::Anchored` and
+        // the input above asks for `Anchored::Yes`. Both go the same way.
         let Ok(mut sid) = dfa.start_state_forward(&input) else {
             return true;
         };
@@ -722,7 +744,8 @@ impl PrefixIndex {
 ///
 /// The delimiter test is [`is_value_byte`], which
 /// [`PrefixIndex::earliest_partial`] shared until GH #142 and now keeps
-/// only for the `has_value_group` context rules. **The two notions have
+/// for the `has_value_group` context rules and for any rule `build`
+/// refused an automaton. **The two notions have
 /// parted, deliberately**: this function takes a region and no rule, so
 /// there is no automaton to drive and nothing sharper to ask. Narrowing
 /// the in-flight predicate therefore did *not* narrow this one, and the
@@ -1360,8 +1383,9 @@ mod tests {
     /// `str::replace` rewrite corrupts), and a case-folded pattern.
     ///
     /// REQ-O-006 puts `extra_redaction_patterns` through every mechanism
-    /// this work adds — the automaton, the soundness lemma and the gate —
-    /// and the shipped fifty-one cannot supply that coverage, so these do.
+    /// this work adds — the automaton and the two refusals that guard it
+    /// — and the shipped fifty-one cannot supply that coverage, so these
+    /// do.
     const ADVERSARIAL_USER_RULES: &str = r#"
         [[rule]]
         name = "acme-interior-boundary"
@@ -1412,8 +1436,9 @@ mod tests {
         &positive[m.start()..m.end()]
     }
 
-    /// GH #142's engine: every rule gets a liveness automaton, and the
-    /// two structural facts that make the ASCII word boundary sound.
+    /// GH #142's engine: which rules get a liveness automaton and which
+    /// are refused one, and the two structural facts that make the ASCII
+    /// word boundary sound.
     ///
     /// **Why `(?-u:\b)` and not `\b`.** With the Unicode spelling the DFA
     /// carries a quit set over every byte ≥ 0x80, a quit must be read as
@@ -1427,14 +1452,17 @@ mod tests {
     /// rules rather than of the engine — so it is asserted here, over
     /// user rules as well, rather than assumed.
     #[test]
-    fn every_rule_compiles_a_liveness_automaton() {
+    fn the_liveness_automata_and_the_refusals_are_both_pinned() {
         let rules = RuleSet::builtin_with_extra(ADVERSARIAL_USER_RULES).unwrap();
         let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
         assert_eq!(index.liveness.len(), rules.rules.len());
         assert!(rules.rules.len() >= 51, "{} rules", rules.rules.len());
 
-        // 1. Every rule builds — except the one carrying a `\B`, which is
-        //    refused on purpose and keeps `is_value_byte`.
+        // 1. Every rule builds except those `build` refuses on purpose,
+        //    each of which keeps `is_value_byte`: the `\B` (no
+        //    over-approximation argument), the punctuation-opening prefix
+        //    (the leading-boundary lemma), and the two context rules
+        //    whose match can begin before their own prefix.
         let unbuilt: Vec<&str> = rules
             .rules
             .iter()
@@ -1461,7 +1489,7 @@ mod tests {
         // does not, so an automaton for this rule would report a value
         // half-arrived as DEAD and release it — where the byte-class test
         // this work replaces held it. The offset is the `-` of `-zq-`,
-        // three bytes into a two-byte `é`.
+        // which is 2 — immediately past a two-byte `é`.
         let idx = rules
             .rules
             .iter()

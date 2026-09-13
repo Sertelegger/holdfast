@@ -103,6 +103,16 @@ is cut, named and published is in
   method}` and the rest stay cross-platform. Nothing changes on Unix, and
   nothing is removed — `holdfast-core` did not compile for Windows at all
   before this release ([#19]).
+- **`regex-automata` and `regex-syntax` are built with `opt-level = 3` in the
+  dev profile.** Determinizing the fifty-one DFAs the [#142] entry below adds is
+  the cost; `PrefixIndex::build` runs once per `OutputProcessor`, and a
+  `holdfast-core` test builds one per row — so the unoptimized figure lands on
+  every test and on every daemon a CLI test starts. Measured on this tree, with
+  the override against without it: `PrefixIndex::build` 77 ms against 1.28 s,
+  `cargo test -p holdfast-core --lib` 29 s against 145 s, and
+  `--test redaction_sweep` 50 s against a run still going at 11 minutes when it
+  was stopped. Nothing about the shipped binary changes; `--release` already
+  optimized both.
 
 ### Security
 
@@ -294,9 +304,14 @@ is cut, named and published is in
   still belong to the value"* — was decided by `is_value_byte`, a flat
   `0x21..=0x7e`. That is wrong in two directions at once: it holds runs no rule
   could ever complete, and it releases the moment a control byte lands inside a
-  value that is genuinely still arriving. Every rule now carries an anchored
-  dense DFA built from its own pattern, and the predicate asks *could this rule
-  still match if more bytes arrived*.
+  value that is genuinely still arriving. A rule now carries an anchored dense
+  DFA built from its own pattern, and the predicate asks *could this rule still
+  match if more bytes arrived*. **Not every rule, and the exceptions are
+  checked rather than listed**: 49 of the 51 build one and keep it, two are
+  refused for the reason in the paragraph below, and of those that keep one the
+  nine `has_value_group` context rules and the single `binary` rule are not
+  asked it — so the predicate decides 41 of the 51. A rule that is refused, or
+  never asked, keeps the behaviour it has today.
 
   **What it buys is the false holds, and the honest summary is that it is a
   small number.** `parsing key-value`, `npm WARN @acme/key-manager` and
@@ -397,6 +412,11 @@ is cut, named and published is in
   credential straddling a read boundary with an escape inside it is still
   released half-emitted ([#142]). *That is still true of `read_output` and no
   longer true of `get_screen_state`; see the Security entry above.* `redact: false` and `--raw` are byte-identical
+  released half-emitted ([#142]). **That predicate has since been replaced** —
+  it asks the rule rather than a byte class now, see the [#142] entry above —
+  and the sentence survives it: the rule's own automaton is load-bearing on
+  those same control bytes, so the holdback still reads the raw region alone
+  and the residual is unchanged. `redact: false` and `--raw` are byte-identical
   to before ([#125]).
   **This closed the matching side of #125 and not every class of the
   defect.** The range and grammar axes — [#138] (spans judged over the
