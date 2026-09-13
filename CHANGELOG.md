@@ -308,10 +308,10 @@ is cut, named and published is in
   DFA built from its own pattern, and the predicate asks *could this rule still
   match if more bytes arrived*. **Not every rule, and the exceptions are
   checked rather than listed**: 49 of the 51 build one and keep it, two are
-  refused for the reason in the paragraph below, and of those that keep one the
-  nine `has_value_group` context rules and the single `binary` rule are not
-  asked it — so the predicate decides 41 of the 51. A rule that is refused, or
-  never asked, keeps the behaviour it has today.
+  refused for the reason in the paragraph below, and of the 49 keepers the
+  seven remaining `has_value_group` context rules and the single `binary` rule
+  are never asked it — so the predicate decides 41 of the 51. A rule that is
+  refused, or never asked, keeps the behaviour it has today.
 
   **What it buys is the false holds, and the honest summary is that it is a
   small number.** `parsing key-value`, `npm WARN @acme/key-manager` and
