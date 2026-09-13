@@ -275,9 +275,94 @@ is cut, named and published is in
   for it** — `PROTOCOL_MINOR` "cannot start refusing anybody"
   (`attach/handshake.rs`), so a bump would not make an older daemon apply a
   holdback it has no code for ([#169]).
+- **`regex-automata` and `regex-syntax` are built with `opt-level = 3` in the
+  dev profile.** Compiling fifty-one DFAs at startup (see the [#142] entry
+  below) is the cost, `PrefixIndex::build` runs once per `OutputProcessor`, and
+  a `holdfast-core` test builds one per row — so the unoptimized figure lands on
+  every test and on every daemon a CLI test starts. Measured on this tree, with
+  the override against without it: `PrefixIndex::build` 77 ms against 1.28 s,
+  `cargo test -p holdfast-core --lib` 29 s against 145 s, and
+  `--test redaction_sweep` 50 s against a run still going at 11 minutes when it
+  was stopped. Nothing about the shipped binary changes; `--release` already
+  optimized both.
 
 ### Fixed
 
+- **The in-flight test the holdback rests on asks the rule, not a byte range
+  ([#142] — narrowed, and *not* closed).** `earliest_partial`'s continuation
+  test — *"every byte from the indexed prefix to the end of the region could
+  still belong to the value"* — was decided by `is_value_byte`, a flat
+  `0x21..=0x7e`. That is wrong in two directions at once: it holds runs no rule
+  could ever complete, and it releases the moment a control byte lands inside a
+  value that is genuinely still arriving. Every rule now carries an anchored
+  dense DFA built from its own pattern, and the predicate asks *could this rule
+  still match if more bytes arrived*.
+
+  **What it buys is the false holds, and the honest summary is that it is a
+  small number.** `parsing key-value` and
+  `npm WARN deprecated …@acme/key-manager@1.2.3\x1b[K` are no longer secrets in
+  flight, because `\bkey-[a-f0-9]{32}` can reach neither the `v` of `value` nor
+  the `m` of `manager`; nor can `launchdarkly-key`'s `sdk-` reach the `g` of
+  `gateway`. Measured over 20,000 lines of the repository's own source at the
+  parent commit, as the share of line-final boundaries that hold: plain
+  `0.885 %` → `0.860 %`, and unchanged at `0.060 %`, `0.040 %` and `0.060 %`
+  for trailing `\x1b[K`, mid-line colour and a trailing `✔`. The price is at
+  startup: `PrefixIndex::build` goes from ~0.19 ms to 77 ms and ~4 MiB, once
+  per `OutputProcessor`, which is one per daemon. (The before-figure is from
+  the parent commit without the profile override above; it builds no automata,
+  so that override is immaterial to it.)
+
+  **It strands nothing, and that is the constraint this shape was chosen for
+  rather than a happy result.** The predicate reads the raw stream, where the
+  byte that revises its answer has already arrived — an escape ends a candidate
+  no rule can take. `use crate::re_exports\x1b[0m` with no trailing newline
+  still returns all 25 bytes with `held_back: false`, and
+  `"$ cargo build\n   Compiling re_export\x1b[0m"` still reports
+  `prompt.last_line = "   Compiling "`, both byte-identical to the parent
+  commit.
+
+  **[#142]'s leak is still open and this does not close it.** A credential
+  still arriving *with an escape inside it* is still released half-emitted,
+  because the raw stream is the only one the holdback reads. Closing it needs
+  the emitted views asked as well, and **that view-driven withhold is under
+  research rather than shipped**: measured, the form of it that was written
+  strands ordinary output permanently — a session whose last output is
+  `use crate::re_exports\x1b[0m` returns 11 of 25 bytes with `held_back: true`
+  for ever, and blanks `prompt.last_line`, which is how an agent learns a
+  password is being asked for. The open question is not *which* rules a view
+  may withhold on; it is that a view has already deleted the byte that would
+  have ended the withhold, so the decision is unrevisable in a way the raw
+  stream's never is.
+
+  **Two shipped rules get no automaton and keep the byte-class test**, by a
+  check rather than by a list. `generic-secret-assignment` and
+  `secret-key-assignment` declare prefixes their own match can begin *before*,
+  so an automaton anchored at the prefix reports an ordinary
+  `MY_APP_PASSWORD=hunter2hunter2` line DEAD while the rule matches the whole
+  of it. Both are `has_value_group` rules that [#152] keeps on `is_value_byte`
+  anyway, so nothing observable moves — the check exists so that #152's fix
+  cannot land that false DEAD without noticing. A user rule from
+  `extra_redaction_patterns` whose pattern carries a `\b` and whose prefix opens
+  on punctuation is refused for the neighbouring reason: the ASCII rewrite of
+  `\b` is only an over-approximation when the prefix's first byte is a word
+  byte, and where it is not, the automaton releases a value the byte-class test
+  held.
+
+  **[#152] stays open, and for the reason it always had.** The nine context
+  rules keep the byte-class test on the raw stream because their patterns
+  legitimately admit whitespace between the label and the value: under liveness
+  `Password: ` is alive, and a candidate that can still grow never dies at the
+  end of a region that has stopped growing. Measured without that carve-out,
+  `"$ ssh dev@box\r\nPassword: "` takes `earliest_partial` from `None` to
+  `Some(15)`, `read_output` returns only the first line with
+  `held_back: true`, and `prompt.last_line` becomes `""` — on the most common
+  state this tool exists to handle.
+
+  Two behaviours are re-pinned deliberately: `ghp_abcsk-ant-xy` is no longer a
+  boundary at all (a GitHub token cannot reach a `-`, and `sk-ant-` sits
+  mid-word behind a `c` where its `\b` forbids a match), and
+  `parsing key-value` moves from the documented residual to the list of
+  holdbacks liveness retired.
 - The secret **provider** path enforces the deadline and the size limit the
   caller declared. A helper process that inherits the provider's output pipe no
   longer outlives them: the bounded phase is pipe *collection* rather than the
@@ -881,3 +966,4 @@ residuals that are known and accepted.
 [#149]: https://github.com/Sertelegger/holdfast/issues/149
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
+[#152]: https://github.com/Sertelegger/holdfast/issues/152
