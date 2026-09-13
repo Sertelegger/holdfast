@@ -2051,13 +2051,19 @@ mod tests {
     /// **Ordinary output that ends in an escape sequence must still be
     /// released (GH #142).**
     ///
-    /// `earliest_partial` asks whether every byte from an indexed prefix
-    /// to the end of the region could still belong to a value, and
-    /// answers with `0x21..=0x7e`; the control byte that ends a sequence
-    /// is what ends that run. Asking a *stripped* view instead removes
-    /// the terminator, the run reaches the end of the region, and the
-    /// read stops — permanently, because the line is finished and nothing
-    /// more is coming.
+    /// `earliest_partial` used to ask whether every byte from an indexed
+    /// prefix to the end of the region was printable and not a space; the
+    /// control byte that ends a sequence is what ended that run. Asking a
+    /// *stripped* view under that test removed the terminator, the run
+    /// reached the end of the region, and the read stopped — permanently,
+    /// because the line is finished and nothing more is coming.
+    ///
+    /// **It asks the rule now, so no run is formed on this line at all
+    /// (GH #142).** `mailgun-api-key` is `\bkey-[a-f0-9]{32}`, which
+    /// cannot reach the `m` of `manager` — the release comes from the
+    /// predicate rather than from the terminator, and would survive a
+    /// stream that deleted the terminator. No such stream is asked here:
+    /// `holdback_boundary` reads the raw bytes only.
     ///
     /// `key-` is `mailgun-api-key`'s indexed prefix and the rest of this
     /// line is an npm deprecation warning. A progress line ending in
