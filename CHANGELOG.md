@@ -148,18 +148,19 @@ is cut, named and published is in
   still match if more bytes arrived*.
 
   **What it buys is the false holds, and the honest summary is that it is a
-  small number.** `parsing key-value` and
-  `npm WARN deprecated …@acme/key-manager@1.2.3\x1b[K` are no longer secrets in
-  flight, because `\bkey-[a-f0-9]{32}` can reach neither the `v` of `value` nor
-  the `m` of `manager`; nor can `launchdarkly-key`'s `sdk-` reach the `g` of
-  `gateway`. Measured over 20,000 lines of the repository's own source at the
-  parent commit, as the share of line-final boundaries that hold: plain
-  `0.885 %` → `0.860 %`, and unchanged at `0.060 %`, `0.040 %` and `0.060 %`
-  for trailing `\x1b[K`, mid-line colour and a trailing `✔`. The price is at
-  startup: `PrefixIndex::build` goes from ~0.19 ms to 77 ms and ~4 MiB, once
-  per `OutputProcessor`, which is one per daemon. (The before-figure is from
-  the parent commit without the profile override above; it builds no automata,
-  so that override is immaterial to it.)
+  small number.** `parsing key-value`, `npm WARN @acme/key-manager` and
+  `npm WARN @acme/sdk-gateway` are no longer secrets in flight, because
+  `\bkey-[a-f0-9]{32}` can reach neither the `v` of `value` nor the `m` of
+  `manager`, and `launchdarkly-key`'s `sdk-` wants a hex UUID and cannot reach
+  the `g` of `gateway`. Measured over 20,000 lines of the repository's own
+  source at the parent commit, as the share of line-final boundaries that hold:
+  plain `0.885 %` → `0.860 %`, and unchanged at `0.060 %`, `0.040 %` and
+  `0.060 %` for trailing `\x1b[K`, mid-line colour and a trailing `✔`. The
+  price is at startup: `PrefixIndex::build` goes from ~0.19 ms to 77 ms and
+  49 automata totalling 1.93 MiB by `DFA::memory_usage()`, once per
+  `OutputProcessor`, which is one per daemon. (The before-figure is from the
+  parent commit without the profile override above; it builds no automata, so
+  that override is immaterial to it.)
 
   **It strands nothing, and that is the constraint this shape was chosen for
   rather than a happy result.** The predicate reads the raw stream, where the
@@ -199,13 +200,17 @@ is cut, named and published is in
 
   **[#152] stays open, and for the reason it always had.** The nine context
   rules keep the byte-class test on the raw stream because their patterns
-  legitimately admit whitespace between the label and the value: under liveness
-  `Password: ` is alive, and a candidate that can still grow never dies at the
-  end of a region that has stopped growing. Measured without that carve-out,
-  `"$ ssh dev@box\r\nPassword: "` takes `earliest_partial` from `None` to
-  `Some(15)`, `read_output` returns only the first line with
-  `held_back: true`, and `prompt.last_line` becomes `""` — on the most common
-  state this tool exists to handle.
+  legitimately admit whitespace between the label and the value: driven from
+  the `P` of `"$ ssh dev@box\r\nPassword: "`, `generic-secret-assignment`'s
+  automaton is ALIVE, and a candidate that can still grow never dies at the end
+  of a region that has stopped growing — `earliest_partial` would go `None` to
+  `Some(15)`, `read_output` would return only the first line with
+  `held_back: true`, and `prompt.last_line` would become `""`, on the most
+  common state this tool exists to handle. **What #152 needs is a sharper byte
+  class, not a re-routing**, and the refusal above is why: those two rules now
+  have no automaton to be re-routed onto, so removing the carve-out leaves them
+  on `is_value_byte` regardless (measured on this tree:
+  `still_alive(generic-secret-assignment, …, 15)` is `false`).
 
   Two behaviours are re-pinned deliberately: `ghp_abcsk-ant-xy` is no longer a
   boundary at all (a GitHub token cannot reach a `-`, and `sk-ant-` sits

@@ -77,8 +77,8 @@ fn is_ascii_word_byte(b: u8) -> bool {
 ///   reduces to *"the byte behind is not a word character"*, and "not an
 ///   **ASCII** word byte" is a superset of "not a **Unicode** word
 ///   character" — so `(?-u:\b)` holds wherever `\b` does, and liveness
-///   over-approximates the rule. Nothing outside this function is needed
-///   for that.
+///   over-approximates the rule. That half rests on `build`'s refusal
+///   and on nothing else.
 /// * **At every later boundary the argument is *relative*, and its
 ///   baseline is [`is_value_byte`].** Divergence there needs a non-ASCII
 ///   byte at or after the first value byte, and where it happens the
@@ -597,14 +597,24 @@ impl PrefixIndex {
     /// because their patterns legitimately admit whitespace between the
     /// label and the value — so liveness reports `Password: ` alive, and
     /// a candidate that can still grow never dies at the end of a region
-    /// that has stopped growing. Measured: applying liveness there takes
-    /// `earliest_partial` on `"$ ssh dev@box\r\nPassword: "` from `None`
-    /// to `Some(15)`, `read_output` returns only the first line with
-    /// `held_back: true`, `prompt.last_line` becomes `""`, and three
-    /// shipped pty fixtures hang. A shell sitting at a password prompt is
-    /// the most common state this tool exists to handle. GH #152 asks for
-    /// the narrower widening that would fix it; the coupling is recorded
-    /// there rather than guessed at here.
+    /// that has stopped growing. Measured against the automaton
+    /// [`PrefixIndex::build`] would install: driven from the `P` of
+    /// `"$ ssh dev@box\r\nPassword: "` it is ALIVE, `earliest_partial`
+    /// goes `None` -> `Some(15)`, `read_output` returns only the first
+    /// line with `held_back: true`, `prompt.last_line` becomes `""`, and
+    /// three shipped pty fixtures hang. A shell sitting at a password
+    /// prompt is the most common state this tool exists to handle.
+    ///
+    /// **Removing the carve-out is no longer sufficient to reintroduce
+    /// that, and #152 should not read it as sufficient to *fix* the
+    /// issue either.** `build` refuses `generic-secret-assignment` and
+    /// `secret-key-assignment` an automaton on separate grounds — their
+    /// declared prefixes sit inside their own match, see
+    /// [`rule_may_start_one_byte_before`] — so those two fall back to
+    /// [`is_value_byte`] however this branch is spelled. Measured on this
+    /// tree, `still_alive(generic-secret-assignment, …, 15)` is `false`.
+    /// #152 asks for a narrower widening of the *byte class*; the
+    /// coupling is recorded there rather than guessed at here.
     pub fn earliest_partial(
         &self,
         rules: &RuleSet,
@@ -1158,16 +1168,25 @@ mod tests {
     /// (GH #142, GH #152).**
     ///
     /// This is the row the `has_value_group` carve-out exists for, and
-    /// the suite has never had it. Removing that carve-out puts liveness
-    /// on `generic-secret-assignment`, whose `["'\s]*[:=]\s*` legitimately
-    /// admits the trailing space — so the candidate is alive, the region
-    /// has stopped growing, and `earliest_partial` here goes `None` ->
-    /// `Some(15)`. `read_output` then returns `"$ ssh dev@box\r\n"` with
-    /// `held_back: true`, `safe_last_line` returns `""` through its
+    /// the suite has never had it. `generic-secret-assignment`'s
+    /// `["'\s]*[:=]\s*` legitimately admits the trailing space, so an
+    /// automaton for it is alive here while the region has stopped
+    /// growing: `earliest_partial` would go `None` -> `Some(15)`,
+    /// `read_output` would return `"$ ssh dev@box\r\n"` with
+    /// `held_back: true`, `safe_last_line` would return `""` through its
     /// case-2 gate, and `echo_off_prompts_with_and_without_canonical_mode`,
     /// `matrix_row_getpass_is_awaiting_secret_with_no_bracketed_paste_history`
     /// and `matrix_row_bash_read_s_is_awaiting_secret_and_flags_a_write`
-    /// all fail on their 20-second deadlines.
+    /// would all fail on their 20-second deadlines.
+    ///
+    /// **Two things now stand between this row and that, not one.** The
+    /// carve-out is the first; the second is that `PrefixIndex::build`
+    /// refuses this rule an automaton at all, because its declared
+    /// prefixes sit inside its own match
+    /// ([`rule_may_start_one_byte_before`]). Removing the carve-out alone
+    /// leaves the row green, which is the safe direction and also a trap
+    /// for GH #152: the fix it needs is a sharper byte class, not a
+    /// re-routing.
     ///
     /// The second row is the same defect **still open on `main`**, kept
     /// visible rather than assumed absent: with no trailing space the `:`
