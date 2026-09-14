@@ -282,6 +282,170 @@ fn build_liveness(pattern: &str) -> Option<dense::DFA<Vec<u32>>> {
         .ok()
 }
 
+/// How many word boundaries [`liveness_pattern`] would rewrite — the same
+/// escape-aware walk, so `\\b` (an escaped backslash then a literal `b`)
+/// is not one of them.
+///
+/// Read by [`PrefixIndex::build`] to decide whether the liveness language
+/// is **equal** to the rule's rather than merely a superset of it, which
+/// is what [`holdback_is_bounded`]'s pruning at match states needs. Pinned
+/// against the rewrite itself by
+/// `the_boundary_count_agrees_with_the_rewrite`, so the two cannot drift.
+fn word_boundary_count(pattern: &str) -> usize {
+    let mut n = 0usize;
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.next() == Some('b') {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Whether a rule's holdback, opened at `prefix`, can only last for a
+/// **bounded** number of further bytes — the gate that decides which
+/// rules may raise a marker from a normalised view (GH #142).
+///
+/// **What this bounds, and why it is no longer a termination proof.**
+/// PR #162 asked this question to decide which rules a *view* could
+/// drive a **withhold** for: an unbounded holdback there stranded the
+/// caller for ever, because a view has deleted the control byte that
+/// would have killed the candidate. The shipped answer to GH #142 marks
+/// instead of withholding, and a marker never moves `read_end`
+/// backwards, so nothing strands whatever this returns. The criterion
+/// survives with a different meaning, and it is a stronger one than
+/// "precision": [`PrefixIndex::earliest_partial_in_view`] raises a
+/// marker from the candidate to the **end of the view**, so the number
+/// of view bytes a candidate can stay alive-and-unmatched for *is* the
+/// number of bytes the marker destroys. A rule whose holdback is
+/// unbounded can cover an entire read with one marker; a rule that
+/// passes here cannot cover more than its own constant.
+///
+/// Mechanically that is a **cycle** in the subgraph of states that are
+/// neither dead nor matching. Dead states have already released the
+/// candidate; a match state is not marked either, because
+/// [`PrefixIndex::earliest_partial`]'s condition 3 skips a rule whose
+/// token has landed — see the residual on that pruning below.
+///
+/// **Computed, never declared.** Twelve of the fifty-one shipped rules
+/// fail this, and a hand-written list of those twelve would silently
+/// mis-gate every rule an operator adds through `extra_redaction_patterns`
+/// — in the direction that destroys bytes, since a rule absent from the
+/// list would be gated by default.
+///
+/// **Every ASCII-case spelling of the prefix is walked, as a set.**
+/// `PrefixIndex::scan` admits a candidate with `eq_ignore_ascii_case`,
+/// so `KEY-` reaches this rule's automaton just as `key-` does; walking
+/// the declared spelling alone proves boundedness for a string the scan
+/// need never see. A rule may branch on case — `\b(?:key-[a-f0-9]{32}|KEY-[a-z]*END)`
+/// is bounded through one arm and not through the other — and the
+/// bounded arm then vouches for the unbounded one. The state *set* is
+/// bounded by the automaton, so the walk is linear in the prefix rather
+/// than exponential in its letters. Under PR #162's withhold this hole
+/// was a permanent strand; under the marker it is an unbounded marker,
+/// and the fix costs ten lines either way.
+///
+/// The alphabet is every byte. A view can only ever carry a subset of
+/// those, and a larger alphabet finds more cycles, so this is the
+/// conservative reading — and every narrowing of it that looks harmless
+/// is measurably not. Classifying over `0x21..=0x7e` alone loses
+/// `bearer-authorization` (whose only cycle is the `\s+` after its
+/// keyword) **and** `private-key-block` (which cannot reach its
+/// `[\s\S]*?` without the space in `PRIVATE KEY`); over `0x20..=0x7e` it
+/// loses a rule whose cycle runs on `\t`, and a view carries tabs.
+///
+/// **Pruning at a match state is sound only where the liveness language
+/// *equals* the rule's, and [`PrefixIndex::build`] now enforces that
+/// rather than assuming it (PR #162, review finding 9).** The prune is
+/// justified by [`PrefixIndex::earliest_partial`]'s condition 3, which
+/// tests the **rule's** own `^(?:…)` regex; [`liveness_pattern`]'s ASCII
+/// rewrite makes the liveness language a *superset*, so a cycle
+/// reachable only through states where liveness matches and the rule
+/// does not is invisible here. Reproduced:
+/// `\bacmew_(?:é\bZ[a-z]*|OK[0-9]{6})` is certified bounded and holds
+/// `x acmew_éZ` + 5,000 `a` at offset 2 with the rule matching nothing.
+/// Divergence needs a `\b` that is **not** the leading one — at the
+/// leading one both spellings read the same start-of-text look-behind
+/// that `anchored` does, and `build`'s prefix lemma puts an ASCII word
+/// byte on the pattern side, so the two languages coincide — and `build`
+/// therefore refuses to gate a rule carrying any other `\b`. Measured:
+/// five shipped rules have one and all five are ungated already, so the
+/// enforcement costs **nothing**.
+///
+/// The alternative — not pruning at match states at all — was measured
+/// and is not the fix: it ungates **42 of the 51** shipped rules,
+/// because `\bghp_[0-9A-Za-z]{36,}` cycles through its own match states.
+/// That trades the whole of GH #142's coverage for a residual a
+/// three-line check removes.
+fn holdback_is_bounded(dfa: &dense::DFA<Vec<u32>>, prefix: &[u8]) -> bool {
+    let input = Input::new(prefix).anchored(Anchored::Yes);
+    let Ok(start) = dfa.start_state_forward(&input) else {
+        return false;
+    };
+    // Walk the prefix as a *set* of states, branching on ASCII case at
+    // every letter. A spelling that dies or matches inside the prefix
+    // drops out: it opens no holdback, so it has nothing to bound.
+    let mut frontier: Vec<StateID> = vec![start];
+    for byte in prefix {
+        let mut next: Vec<StateID> = Vec::new();
+        for sid in &frontier {
+            for b in [byte.to_ascii_lowercase(), byte.to_ascii_uppercase()] {
+                let to = dfa.next_state(*sid, b);
+                if dfa.is_dead_state(to) || dfa.is_match_state(to) {
+                    continue;
+                }
+                if dfa.is_quit_state(to) {
+                    return false;
+                }
+                if !next.contains(&to) {
+                    next.push(to);
+                }
+            }
+        }
+        frontier = next;
+    }
+    // Iterative depth-first search, colouring grey on the way down and
+    // black on the way back up: a grey successor is a back edge, which is
+    // a cycle. Seeded from every spelling that survived the prefix, and
+    // `colour` is shared across those seeds because a cycle is a property
+    // of the state, not of the path that reached it.
+    let mut colour: HashMap<usize, bool> = HashMap::new();
+    let mut stack: Vec<(StateID, u16)> = Vec::new();
+    for seed in frontier {
+        if colour.contains_key(&seed.as_usize()) {
+            continue;
+        }
+        colour.insert(seed.as_usize(), true);
+        stack.push((seed, 0));
+        while let Some(top) = stack.last_mut() {
+            if top.1 > u8::MAX as u16 {
+                let done = top.0;
+                stack.pop();
+                colour.insert(done.as_usize(), false);
+                continue;
+            }
+            let (from, byte) = (top.0, top.1 as u8);
+            top.1 += 1;
+            let to = dfa.next_state(from, byte);
+            if dfa.is_dead_state(to) || dfa.is_match_state(to) {
+                continue;
+            }
+            if dfa.is_quit_state(to) {
+                return false;
+            }
+            match colour.get(&to.as_usize()) {
+                Some(true) => return false,
+                Some(false) => continue,
+                None => {
+                    colour.insert(to.as_usize(), true);
+                    stack.push((to, 0));
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Whether `pattern` opens with `\b` (after an optional inline-flag
 /// group). Together with a non-empty `derive_prefixes` result this means
 /// the derived literal *is* the start of the match, so a candidate that
@@ -428,6 +592,9 @@ pub struct PrefixIndex {
     /// One liveness automaton per rule, parallel to `rules.rules`. See
     /// [`build_liveness`]; `None` means the rule keeps [`is_value_byte`].
     liveness: Vec<Option<dense::DFA<Vec<u32>>>>,
+    /// Whether each rule may raise a marker from a **view**, computed by
+    /// [`holdback_is_bounded`] at build time. Parallel to `rules.rules`.
+    gated: Vec<bool>,
 }
 
 impl PrefixIndex {
@@ -435,6 +602,7 @@ impl PrefixIndex {
         let mut by_first_byte: HashMap<u8, Vec<Candidate>> = HashMap::new();
         let mut total = 0usize;
         let mut liveness: Vec<Option<dense::DFA<Vec<u32>>>> = Vec::with_capacity(rules.rules.len());
+        let mut gated: Vec<bool> = Vec::with_capacity(rules.rules.len());
         for (idx, rule) in rules.rules.iter().enumerate() {
             let derived = derive_prefixes(&rule.pattern, expansion_limit);
             // A derivable leading literal means the prefix is where the
@@ -489,7 +657,34 @@ impl PrefixIndex {
                         .any(|p| rule_may_start_one_byte_before(d, p))
                 });
 
+            // Whether this rule's holdback is bounded is a question about
+            // its automaton driven from each of *its own* prefixes, so the
+            // answer is accumulated here rather than re-derived from
+            // `by_first_byte` afterwards. **Every prefix must clear it**:
+            // a rule can declare one bounded prefix and one unbounded one,
+            // and a marker raised through either destroys bytes.
+            //
+            // **The seed is the pruning premise, not `true`.**
+            // `holdback_is_bounded` stops its cycle search at a match
+            // state on the strength of condition 3, which asks the
+            // *rule's* `^(?:…)` regex — so the two languages must
+            // coincide, and [`liveness_pattern`]'s rewrite only makes
+            // them coincide when the single `\b` it touched is the
+            // leading one. Any other `\b` and the rule is not gated. A
+            // rule with no indexed prefix can never become a candidate,
+            // so its flag is unobservable either way and the seed
+            // decides it; the conservative value is the right one to
+            // leave there.
+            let mut bounded = word_boundary_count(&rule.pattern)
+                <= usize::from(starts_with_word_boundary(&rule.pattern));
             for prefix in &prefixes {
+                bounded &= match &dfa {
+                    Some(d) => holdback_is_bounded(d, prefix),
+                    // No automaton, no proof. `is_value_byte` on the raw
+                    // stream is what this rule keeps, and a view may not
+                    // raise a marker it cannot bound.
+                    None => false,
+                };
                 total += 1;
                 by_first_byte
                     .entry(prefix[0].to_ascii_lowercase())
@@ -501,6 +696,7 @@ impl PrefixIndex {
                     });
             }
             liveness.push(dfa);
+            gated.push(bounded);
         }
         // Longest prefix first, so the most specific rule claims a
         // position when several share a first byte.
@@ -511,6 +707,7 @@ impl PrefixIndex {
             by_first_byte,
             total,
             liveness,
+            gated,
         }
     }
 
@@ -643,11 +840,83 @@ impl PrefixIndex {
         region: &[u8],
         region_start: u64,
     ) -> Option<u64> {
+        self.scan(rules, region, region_start, false)
+    }
+
+    /// [`Self::earliest_partial`] over a **normalised view** of a region
+    /// rather than over the raw bytes, restricted to the rules whose
+    /// holdback [`holdback_is_bounded`] can bound (GH #142).
+    ///
+    /// The offset returned is relative to `region_start` as usual, so a
+    /// caller passing a view's bytes with `region_start = 0` gets a
+    /// view-relative index and maps it back with `NormalView::map_span`.
+    ///
+    /// **This answer is a marker, never a withhold, and the distinction
+    /// is what makes the question askable at all.** A view has had its
+    /// control bytes deleted, which is to say the predicate's own escape
+    /// hatch has been deleted with them: `\x1b]0;SECRET_DONE\x07` becomes
+    /// `]0;SECRET_DONE`, nothing more ever arrives, and a *withhold*
+    /// taken on that evidence can never be revised. GH #142 settles that
+    /// no buffer-derived condition separates that case from a genuine
+    /// credential at 39 of 40 bytes, by exhibiting a single fixture that
+    /// is both. A marker needs no such separation: it terminates by
+    /// construction, because it never moves `read_end` backwards.
+    ///
+    /// **What the gate buys, now that it buys no termination.** The
+    /// marker `OutputProcessor::process` raises from this answer runs to
+    /// the end of the view, so a rule that can be kept alive and
+    /// unmatched for ever can cover an entire read with one marker.
+    /// [`holdback_is_bounded`] is what rules that out, and the twelve
+    /// rules it excludes keep GH #142's leak in full (GH #160). Measured
+    /// on this tree: gated leaves 682 leak rows in `redaction_sweep`'s
+    /// grid at a 0.0000% marker rate over 30,000 lines × 3 colourisation
+    /// schemes; ungated leaves 231 at 0.85%, and eats
+    /// `\x1b]0;SECRET_DONE\x07`, which
+    /// `a_terminated_window_title_is_not_a_credential_still_arriving`
+    /// says is not a credential.
+    ///
+    /// Condition 2 is liveness for every rule here, with no `binary` or
+    /// `has_value_group` arm: those classes exist because the byte-class
+    /// test is the *safer* answer on the raw stream, where it decides
+    /// whether the caller gets bytes at all, and both classes are
+    /// ungated anyway — `private-key-block` by its `[\s\S]*?` and the
+    /// nine context rules by their unbounded label-to-value runs — so
+    /// neither arm is reachable from here.
+    ///
+    /// **The `\b` lemma's relative half does not travel here, and the
+    /// consequence is a missed marker rather than a released byte.**
+    /// [`liveness_pattern`] proves *"liveness releases nothing the
+    /// byte-class test held"* against an [`is_value_byte`] floor that a
+    /// view does not have. Losing the floor means this scan may call
+    /// DEAD a candidate the rule could still complete, when a non-ASCII
+    /// byte sits at a non-leading `\b`. That subtracts a marker from a
+    /// path which is purely additive — `holdback_boundary` is raw-only
+    /// and byte-identical to `main` — so the failure direction is less
+    /// coverage, never fewer bytes for the caller.
+    pub fn earliest_partial_in_view(
+        &self,
+        rules: &RuleSet,
+        region: &[u8],
+        region_start: u64,
+    ) -> Option<u64> {
+        self.scan(rules, region, region_start, true)
+    }
+
+    fn scan(
+        &self,
+        rules: &RuleSet,
+        region: &[u8],
+        region_start: u64,
+        in_view: bool,
+    ) -> Option<u64> {
         for (i, byte) in region.iter().enumerate() {
             let Some(bucket) = self.by_first_byte.get(&byte.to_ascii_lowercase()) else {
                 continue;
             };
             for candidate in bucket {
+                if in_view && !self.gated[candidate.rule] {
+                    continue;
+                }
                 // `\b` in the rule means the match cannot start mid-word.
                 // Position 0 is treated as a boundary: the region is a
                 // window, so the byte before it is not available and
@@ -667,7 +936,9 @@ impl PrefixIndex {
                     continue;
                 }
                 let rule = &rules.rules[candidate.rule];
-                let in_flight = if rule.binary {
+                let in_flight = if in_view {
+                    self.still_alive(candidate.rule, region, i)
+                } else if rule.binary {
                     true
                 } else if rule.has_value_group {
                     region[value_start..].iter().all(|b| is_value_byte(*b))
@@ -1240,6 +1511,373 @@ mod tests {
             "GH #152: with no trailing space the `:` keeps the byte-class \
              run alive, so the last nine bytes are withheld permanently"
         );
+    }
+
+    /// Rules built to separate the **sound** reading of the marker gate
+    /// from the cheap syntactic ones that look equivalent on the shipped
+    /// fifty-one.
+    ///
+    /// Each `infinite-*` has an unbounded quantifier standing between its
+    /// indexed prefix and something the match still requires, so the set
+    /// of continuations that keep it alive-and-unmatched has a cycle and
+    /// a marker raised for it has no bound. A syntactic walk that looks
+    /// only at the *immediately following* sibling, or that does not
+    /// recurse through `Repetition` / `Capture` / `Alternation`, calls
+    /// all three bounded — and the shipped rules cannot tell the two
+    /// readings apart, so pinning the shipped twelve alone is not a pin
+    /// at all.
+    ///
+    /// The two `bounded-*` rules are the paired direction: without them
+    /// the row is satisfied by a gate that excludes everything.
+    ///
+    /// `case-split` and `late-boundary` are the two review findings this
+    /// branch had to reassess, each reduced to the smallest rule that
+    /// exhibits it.
+    const GATE_PROBE_RULES: &str = r#"
+        [[rule]]
+        name = "infinite-optional-separator"
+        kind = "acme-internal"
+        pattern = '''\bacmeinf_[A-Za-z0-9]*[_-]?KEY[0-9]{8,}'''
+        positive = ["acmeinf_ab-KEY01234567"]
+        negative = ["acmeinf_ab-KEY1"]
+
+        [[rule]]
+        name = "infinite-repeated-group"
+        kind = "acme-internal"
+        pattern = '''\bacmerep_(?:[a-z]+END)+'''
+        positive = ["acmerep_abcEND"]
+        negative = ["acmerep_END"]
+
+        [[rule]]
+        name = "infinite-nullable-sibling"
+        kind = "acme-internal"
+        pattern = '''\bacmenul_[a-z]*(?:b?)END[0-9]{4}'''
+        positive = ["acmenul_abbEND1234"]
+        negative = ["acmenul_END"]
+
+        [[rule]]
+        name = "infinite-layout-byte"
+        kind = "acme-internal"
+        pattern = '''\bacmetab_[\t]+KEY[0-9]{4}'''
+        positive = ["acmetab_\tKEY1234"]
+        negative = ["acmetab_KEY1234"]
+
+        [[rule]]
+        name = "bounded-large-repetition"
+        kind = "acme-internal"
+        pattern = '''\bacmebig_[A-Za-z0-9]{0,40}KEY[0-9]{4}'''
+        positive = ["acmebig_abcKEY1234"]
+        negative = ["acmebig_KEY"]
+
+        [[rule]]
+        name = "bounded-plain"
+        kind = "acme-internal"
+        pattern = '''\bacmeok_[a-f0-9]{16,}'''
+        positive = ["acmeok_0123456789abcdef"]
+        negative = ["acmeok_short"]
+
+        [[rule]]
+        name = "case-split"
+        kind = "acme-internal"
+        pattern = '''\b(?:kqz-[a-f0-9]{32}|KQZ-[a-z]*END[0-9]{4})'''
+        prefixes = ["kqz-"]
+        positive = ["kqz-0123456789abcdef0123456789abcdef"]
+        negative = ["kqz-short"]
+
+        [[rule]]
+        name = "late-boundary"
+        kind = "acme-internal"
+        pattern = '''\bacmew_(?:\u{e9}\bZ[a-z]*|OK[0-9]{6})'''
+        positive = ["acmew_OK123456"]
+        negative = ["acmew_OK"]
+    "#;
+
+    /// Every rule whose gate flag is `false`, by name.
+    fn ungated(rules: &RuleSet, index: &PrefixIndex) -> Vec<String> {
+        let mut names: Vec<String> = rules
+            .rules
+            .iter()
+            .zip(&index.gated)
+            .filter(|(_, g)| !**g)
+            .map(|(r, _)| r.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// **The gate that decides which rules may raise a view marker is
+    /// computed from the automaton, not declared (GH #142, GH #160).**
+    ///
+    /// Twelve of the shipped fifty-one fail it. That number is pinned
+    /// here, and so is the *criterion*, because the two are not the same
+    /// assertion: the shipped rules cannot discriminate the sound reading
+    /// of "an unbounded repetition stands between the prefix and a still
+    /// required element" from either of the two under-specified ones, so
+    /// a row that only pinned the twelve would pass against an
+    /// implementation that mis-gates every user rule of the three shapes
+    /// in [`GATE_PROBE_RULES`].
+    #[test]
+    fn the_view_marker_gate_is_computed_not_declared() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        assert_eq!(
+            ungated(&rules, &index),
+            vec![
+                // The nine `has_value_group` context rules: each has an
+                // unbounded `\s*` or `[^…]+` between label and value.
+                "aws-secret-access-key",
+                "bearer-authorization",
+                "cloudflare-api-token",
+                "database-connection-password",
+                "datadog-api-key",
+                "generic-secret-assignment",
+                // `[A-Za-z0-9_-]{10,}` before the `.eyJ` it still needs.
+                "jwt",
+                "powersync-token",
+                // `[\s\S]*?` before `-----END`.
+                "private-key-block",
+                "railway-token",
+                "secret-key-assignment",
+                // `[A-Za-z0-9_]+` before the `/B` it still needs.
+                "slack-webhook-url",
+            ],
+            "the twelve rules that keep GH #142's leak in full (GH #160)"
+        );
+
+        // The criterion, against rules built to break it. All three
+        // `infinite-*` shapes are wrongly called bounded by a syntactic
+        // walk that does not recurse, and a marker raised for any of them
+        // can cover an entire read.
+        let probe = format!("{GATE_PROBE_RULES}{ADVERSARIAL_USER_RULES}");
+        let rules = RuleSet::builtin_with_extra(&probe).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let ungated = ungated(&rules, &index);
+        for name in [
+            "infinite-optional-separator",
+            "infinite-repeated-group",
+            "infinite-nullable-sibling",
+            // Only a `\t` keeps this one alive, so it is the row that
+            // makes the alphabet a decision rather than an accident: a
+            // classification over printable bytes alone calls it bounded,
+            // and a view that carries tabs — every one of them does —
+            // lets its marker grow without limit.
+            "infinite-layout-byte",
+            // **No automaton, no proof.** `\B` is refused by
+            // `liveness_pattern`, so this rule keeps `is_value_byte` on
+            // the raw stream and must not reach a view scan at all.
+            // Defaulting an unanalysable rule *into* the gate is the one
+            // mistake here that destroys bytes.
+            "acme-negated-boundary",
+        ] {
+            assert!(
+                ungated.iter().any(|n| n == name),
+                "{name} can be held open for ever and was gated in: {ungated:?}"
+            );
+        }
+        for name in ["bounded-large-repetition", "bounded-plain"] {
+            assert!(
+                !ungated.iter().any(|n| n == name),
+                "{name}'s holdback is bounded, so gating it out costs \
+                 protection for nothing: {ungated:?}"
+            );
+        }
+        // …and the paired behavioural fact, so the flag is not merely a
+        // number. `acmeinf_` is ungated, so no view may mark on it;
+        // `acmeok_` is gated, so every view may.
+        assert_eq!(
+            index.earliest_partial_in_view(&rules, b"title acmeinf_abc", 0),
+            None,
+            "an ungated rule must not raise a view marker"
+        );
+        assert_eq!(
+            index.earliest_partial_in_view(&rules, b"title acmeok_0123", 0),
+            Some(6),
+            "a gated rule still does"
+        );
+        // The raw scan is unmoved by the gate: it has its own escape
+        // hatch and does not need one.
+        assert_eq!(
+            index.earliest_partial(&rules, b"title acmeinf_abc", 0),
+            Some(6),
+            "the gate must not reach the raw stream"
+        );
+    }
+
+    /// **The gate walks every ASCII-case spelling of a prefix, because
+    /// [`PrefixIndex::scan`] admits every one of them (PR #162, review
+    /// finding 6).**
+    ///
+    /// `scan` compares with `eq_ignore_ascii_case`, so `KQZ-` reaches the
+    /// automaton exactly as `kqz-` does. `case-split` is bounded through
+    /// its lowercase arm — `[a-f0-9]{32}` — and unbounded through its
+    /// uppercase one, `[a-z]*END`, and a walk of the declared spelling
+    /// alone certifies the rule on the strength of an arm the scan need
+    /// never take.
+    ///
+    /// **The consequence changed with the fix's shape and the row says
+    /// which.** Under PR #162's withhold this was a permanent strand;
+    /// under the marker it is a marker with no bound, which is the same
+    /// hole one severity down — the raw predicate below holds the
+    /// uppercase spelling at offset 6 for as many bytes as are offered,
+    /// and that count is what a marker would destroy.
+    #[test]
+    fn the_gate_walks_every_case_spelling_the_scan_admits() {
+        let rules = RuleSet::builtin_with_extra(GATE_PROBE_RULES).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let idx = rules
+            .rules
+            .iter()
+            .position(|r| r.name == "case-split")
+            .expect("the probe rule loads");
+
+        // The premise: the unbounded arm is real and is reachable only
+        // through a spelling the *declared* prefix does not contain.
+        for n in [10usize, 1_000, 10_000] {
+            let mut region = b"title KQZ-".to_vec();
+            region.extend(std::iter::repeat_n(b'a', n));
+            assert_eq!(
+                index.earliest_partial(&rules, &region, 0),
+                Some(6),
+                "{n} bytes in, the uppercase spelling is still in flight"
+            );
+        }
+        let mut lower = b"title kqz-".to_vec();
+        lower.extend(std::iter::repeat_n(b'a', 1_000));
+        assert_eq!(
+            index.earliest_partial(&rules, &lower, 0),
+            None,
+            "the premise: the declared spelling *is* bounded, which is why \
+             walking it alone certifies the rule"
+        );
+
+        assert!(
+            !index.gated[idx],
+            "a rule bounded through one case spelling and unbounded through \
+             another must not be gated in"
+        );
+        assert_eq!(
+            index.earliest_partial_in_view(&rules, b"title KQZ-aaaaaaaa", 0),
+            None,
+            "and no view may raise a marker for it"
+        );
+    }
+
+    /// **The gate prunes at a match state, so it may only gate a rule
+    /// whose liveness language *equals* its own (PR #162, review finding
+    /// 9).**
+    ///
+    /// [`holdback_is_bounded`] stops its cycle search at a match state on
+    /// the strength of [`PrefixIndex::earliest_partial`]'s condition 3 —
+    /// which asks the **rule's** `^(?:…)` regex, not the automaton's.
+    /// [`liveness_pattern`]'s ASCII rewrite makes the liveness language a
+    /// superset, so a cycle reachable only through states where liveness
+    /// matches and the rule does not is invisible to the search.
+    /// `late-boundary` is that shape at its smallest: `é` then a `\b`
+    /// then `Z[a-z]*`, which the ASCII spelling admits (`0xa9` is not an
+    /// ASCII word byte) and the Unicode one refuses (`é` and `Z` are both
+    /// word characters), so the automaton matches at `Z` — where the
+    /// search stops — and the rule never matches at all.
+    ///
+    /// Divergence needs a `\b` that is **not** the leading one: at the
+    /// leading boundary the search and `anchored` read the same
+    /// start-of-text look-behind, and `build`'s prefix lemma puts an
+    /// ASCII word byte on the pattern side. So the enforcement is a count
+    /// of boundaries, and it is free — five shipped rules carry a
+    /// non-leading `\b` and all five are already ungated.
+    #[test]
+    fn the_gate_prunes_only_where_the_two_languages_coincide() {
+        let rules = RuleSet::builtin_with_extra(GATE_PROBE_RULES).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let idx = rules
+            .rules
+            .iter()
+            .position(|r| r.name == "late-boundary")
+            .expect("the probe rule loads");
+
+        // The premise, both halves. The rule has an automaton — so this
+        // is not the refusal doing the work — and the candidate really is
+        // held for an unbounded number of bytes the rule can never match.
+        assert!(
+            index.liveness[idx].is_some(),
+            "the premise: the refusals leave this rule an automaton"
+        );
+        for n in [1usize, 1_000, 5_000] {
+            let mut region = "x acmew_\u{e9}Z".as_bytes().to_vec();
+            region.extend(std::iter::repeat_n(b'a', n));
+            assert_eq!(
+                index.earliest_partial(&rules, &region, 0),
+                Some(2),
+                "{n} bytes in, liveness still holds it"
+            );
+            assert!(
+                !rules.rules[idx].anchored.is_match(&region[2..]),
+                "{n} bytes in, the rule matches nothing, so condition 3 \
+                 never releases it"
+            );
+        }
+
+        assert!(
+            !index.gated[idx],
+            "a rule whose liveness language is a strict superset of its own \
+             must not be gated in"
+        );
+        assert_eq!(
+            index.earliest_partial_in_view(&rules, "x acmew_\u{e9}Zaaaa".as_bytes(), 0),
+            None,
+            "and no view may raise an unbounded marker for it"
+        );
+
+        // The enforcement is a boundary count, and the shipped set pays
+        // nothing for it: every rule with a non-leading `\b` is ungated
+        // on grounds of its own.
+        let builtin = RuleSet::builtin().unwrap();
+        let built = PrefixIndex::build(&builtin, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let mut with_late: Vec<&str> = Vec::new();
+        for (i, rule) in builtin.rules.iter().enumerate() {
+            if word_boundary_count(&rule.pattern)
+                > usize::from(starts_with_word_boundary(&rule.pattern))
+            {
+                with_late.push(&rule.name);
+                assert!(
+                    !built.gated[i],
+                    "{} carries a non-leading `\\b` and is gated",
+                    rule.name
+                );
+            }
+        }
+        assert_eq!(
+            with_late.len(),
+            5,
+            "the shipped rules with a non-leading `\\b`: {with_late:?}"
+        );
+    }
+
+    /// [`word_boundary_count`] and [`liveness_pattern`] must agree, or
+    /// the gate's precondition is checked against a different walk from
+    /// the one that rewrites.
+    #[test]
+    fn the_boundary_count_agrees_with_the_rewrite() {
+        let rules =
+            RuleSet::builtin_with_extra(&format!("{GATE_PROBE_RULES}{ADVERSARIAL_USER_RULES}"))
+                .unwrap();
+        let mut checked = 0usize;
+        for rule in &rules.rules {
+            let Some(rewritten) = liveness_pattern(&rule.pattern) else {
+                continue;
+            };
+            assert_eq!(
+                word_boundary_count(&rule.pattern),
+                rewritten.matches("(?-u:\\b)").count(),
+                "`{}` counts a different number of boundaries from the \
+                 rewrite that installs them",
+                rule.name
+            );
+            checked += 1;
+        }
+        assert!(checked > 40, "only {checked} rules reached the comparison");
+        // The escape-aware half, which a `matches("\\b")` count fails.
+        assert_eq!(word_boundary_count(r"\\bfoo"), 0);
+        assert_eq!(word_boundary_count(r"\bfoo\b"), 2);
     }
 
     /// User rules shaped to break the GH #142 liveness engine rather than
