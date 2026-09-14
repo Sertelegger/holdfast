@@ -46,6 +46,29 @@ fn is_value_byte(b: u8) -> bool {
     (0x21..=0x7e).contains(&b)
 }
 
+/// Bytes an emitted view reproduces verbatim: printable ASCII, space
+/// included, plus the line feed.
+///
+/// **The set is "what no view rewrites", not "what looks like text".**
+/// `\x1b` and the C1 range are removed by the stripped view; `\t` is
+/// expanded to a tab stop by the rendered one, and spaces are in
+/// `[ A-Z]`, so an expanded tab can complete a label a raw `\t` kills;
+/// `\r` moves the cursor to column 0, so the rendered row can carry
+/// text the raw byte order does not; and a byte that is not part of a
+/// well-formed UTF-8 sequence is dropped by the C1 views and is outside
+/// every Unicode class the rules are built from. Each one is a route by
+/// which a match the raw bytes cannot complete is completed in a view
+/// that `all_spans` judges.
+///
+/// Used only by [`PrefixIndex::binary_in_flight`], because it is only
+/// there that a raw byte decides a *release* (GH #166). `\n` is in the
+/// set: the grid joins real line breaks with `\n` and only a wrapped
+/// continuation is joined with nothing, so a line feed present in the
+/// raw bytes is present in every view of them.
+fn is_plain_text_byte(b: u8) -> bool {
+    (0x20..=0x7e).contains(&b) || b == b'\n'
+}
+
 /// `[A-Za-z0-9_]` — what both spellings of `\b` agree is a word character.
 fn is_ascii_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
@@ -569,6 +592,77 @@ impl PrefixIndex {
         true
     }
 
+    /// The in-flight test for a rule marked `binary` (GH #166): the
+    /// rule's own automaton where its answer can be trusted, and the
+    /// unconditional hold everywhere else.
+    ///
+    /// **Two reasons it is not simply [`Self::still_alive`], and each
+    /// one on its own releases key material.**
+    ///
+    /// 1. **No automaton means no fallback here.** `still_alive` falls
+    ///    back to [`is_value_byte`], which is the shipped predicate and
+    ///    holds strictly more *for a rule whose value is one unbroken
+    ///    run of printable bytes*. A `binary` rule is exactly the rule
+    ///    that is not: a PEM body's newlines put it outside
+    ///    `0x21..=0x7e` on its second line, so the fallback would
+    ///    release a key rather than hold it. The unconditional `true`
+    ///    this replaced is the correct answer when there is no
+    ///    automaton, and it is kept.
+    /// 2. **A DEAD state is only trustworthy on bytes every emitted view
+    ///    reproduces verbatim.** `holdback_boundary` reads the **raw**
+    ///    region and nothing else, deliberately (`OutputProcessor`,
+    ///    spec §4.1) — but redaction does not: `all_spans` judges the
+    ///    normalised views as well (GH #135, #139), so the rule can
+    ///    cover bytes its raw regex cannot. That asymmetry was harmless
+    ///    while this arm was an unconditional `true`, which no raw byte
+    ///    could change. It stops being harmless the moment a raw byte
+    ///    can *release*. Measured on this tree, with the automaton and
+    ///    without this guard: `-----BEGIN RSA PRIVATE KEY-----`, 40
+    ///    lines of body and **one `0x9b`** in the middle of it, no
+    ///    `-----END` yet — `still_alive` is `false` and
+    ///    `earliest_partial` is `None`, because `[\s\S]` is a
+    ///    *codepoint* class and a lone C1 byte is not one. The key body
+    ///    already arrived goes out in the clear, and the raw regex
+    ///    cannot redact it either, so no marker and no audit entry
+    ///    records it. `\x1b[0m` inside the header and a `\r` or `\t`
+    ///    before the dead state are the same failure by three other
+    ///    routes: each is a byte a view removes or rewrites, and the
+    ///    stripped or rendered text can complete a match the raw bytes
+    ///    cannot.
+    ///
+    /// So the walk stops at the first byte outside
+    /// [`is_plain_text_byte`] and answers ALIVE. What is left is a
+    /// verdict reached entirely on bytes that no view alters, which is
+    /// the case `-----BEGIN CERTIFICATE-----` is in — it dies on the
+    /// `-` that follows a label of plain ASCII, 27 bytes in, before any
+    /// newline and whatever colour a build prints afterwards.
+    ///
+    /// **The direction is still release-only.** Every arm above either
+    /// returns `true`, which is what this replaced, or returns `false`
+    /// having proved the rule cannot match from here.
+    fn binary_in_flight(&self, rule: usize, region: &[u8], at: usize) -> bool {
+        let Some(dfa) = self.liveness.get(rule).and_then(Option::as_ref) else {
+            return true;
+        };
+        let input = Input::new(region).range(at..).anchored(Anchored::Yes);
+        let Ok(mut sid) = dfa.start_state_forward(&input) else {
+            return true;
+        };
+        for byte in &region[at..] {
+            if !is_plain_text_byte(*byte) {
+                return true;
+            }
+            sid = dfa.next_state(sid, *byte);
+            if dfa.is_dead_state(sid) {
+                return false;
+            }
+            if dfa.is_quit_state(sid) {
+                return true;
+            }
+        }
+        true
+    }
+
     pub fn len(&self) -> usize {
         self.total
     }
@@ -611,11 +705,32 @@ impl PrefixIndex {
     ///    nothing left to withhold. Using the rule's own regex is what
     ///    keeps this test from drifting away from the rule.
     ///
-    /// **Two rule classes keep the old byte-class test on this — the
-    /// raw — stream, and the second of them is why GH #152 stays open.**
-    /// A `binary` rule opts out of condition 2 entirely, as before: a PEM
-    /// body's newlines defeat any value-run test at every line. And the
-    /// nine `has_value_group` context rules keep [`is_value_byte`],
+    /// **A `binary` rule is asked condition 2 as well, and the automaton
+    /// is the only thing that may answer it (GH #166).** The byte-class
+    /// test never could: a PEM body's newlines defeat any value-run test
+    /// at every line, which is why this arm was an unconditional `true`.
+    /// An unconditional `true` is not the conservative reading of
+    /// condition 2, it is the *absence* of it — condition 3 then asks
+    /// only *has this rule matched*, never *can it still match*, so
+    /// `-----BEGIN CERTIFICATE-----` — which matches
+    /// `private-key-block`'s indexed prefix and is its own shipped
+    /// `negative` example — pins `holdback_boundary` at that anchor for
+    /// the rest of the session, past `-----END CERTIFICATE-----` and past
+    /// every ordinary line after it. Spec §9.2's stream rule names that
+    /// exact shape as the thing its terminating clause exists to prevent.
+    /// The automaton answers the question the rule can actually be held
+    /// to, and it is the *narrowing* direction: it releases only where
+    /// `true` held, and only where the rule is in a dead state, from
+    /// which no arriving byte can produce a match. [`Self::binary_in_flight`]
+    /// and not [`Self::still_alive`], because a `binary` rule needs both
+    /// of that method's guards spelled differently — an absent automaton
+    /// keeps the unconditional hold rather than falling back to
+    /// [`is_value_byte`], and a dead state is only believed when it was
+    /// reached on bytes every emitted view reproduces verbatim. Each is
+    /// measured there against a key it otherwise releases.
+    ///
+    /// **The `has_value_group` carve-out is untouched, and it is why GH
+    /// #152 stays open.** The nine context rules keep [`is_value_byte`],
     /// because their patterns legitimately admit whitespace between the
     /// label and the value — so liveness reports `Password: ` alive, and
     /// a candidate that can still grow never dies at the end of a region
@@ -668,7 +783,10 @@ impl PrefixIndex {
                 }
                 let rule = &rules.rules[candidate.rule];
                 let in_flight = if rule.binary {
-                    true
+                    // Not `still_alive`: a `binary` rule needs both of
+                    // that method's guards spelled differently, and
+                    // each of them releases key material (GH #166).
+                    self.binary_in_flight(candidate.rule, region, i)
                 } else if rule.has_value_group {
                     region[value_start..].iter().all(|b| is_value_byte(*b))
                 } else {
@@ -1769,5 +1887,368 @@ mod tests {
             }
         }
         assert!(checked > 40, "only {checked} rules judged");
+    }
+
+    /// A PEM body long enough that the fixture cannot pass by fitting
+    /// inside one scan window — spec §9.2: *"If the fixture fits inside
+    /// one unit, it is not testing this rule."* At 64 base64 characters
+    /// per line these are the shape `openssl` emits.
+    fn pem_body(lines: usize) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        (0..lines)
+            .map(|i| {
+                let mut line: String = (0..64)
+                    .map(|k| ALPHABET[(i * 7 + k * 13 + k * k) % 64] as char)
+                    .collect();
+                line.push('\n');
+                line
+            })
+            .collect()
+    }
+
+    /// The premises every row below rests on, asserted once: which rule
+    /// owns the `-----BEGIN` anchor, that it is the `binary` arm of
+    /// [`PrefixIndex::earliest_partial`] that decides it, and that the
+    /// arm has an automaton to decide it *with*.
+    ///
+    /// Without this the three tests prove nothing: a rule set in which
+    /// `private-key-block` stopped being `binary`, or an automaton
+    /// `build` had started refusing, would send every region through a
+    /// different branch and the release/hold rows would still pass for
+    /// the wrong reason.
+    fn private_key_block(rules: &RuleSet, index: &PrefixIndex) -> usize {
+        let idx = rules
+            .rules
+            .iter()
+            .position(|r| r.name == "private-key-block")
+            .expect("the rule is shipped");
+        assert_eq!(
+            s(&index.prefixes_for(rules, "private-key-block")),
+            vec!["-----BEGIN"],
+            "the anchor these rows are about"
+        );
+        assert!(
+            rules.rules[idx].binary && !rules.rules[idx].has_value_group,
+            "the `binary` arm is the one that decides these regions"
+        );
+        assert!(
+            index.liveness[idx].is_some(),
+            "the `binary` arm falls back to the unconditional hold without \
+             an automaton, and then it decides nothing"
+        );
+        idx
+    }
+
+    /// **A streaming private key is held at its own `-----BEGIN`, and the
+    /// liveness test is what holds it** (GH #166, spec REQ-O-003).
+    ///
+    /// This is the half of the `binary` arm's narrowing that must not
+    /// move. `cat ~/.ssh/id_rsa` puts a key on the stream whose
+    /// `-----END` has not arrived; `private-key-block` can still reach it
+    /// from the anchor, so the read stops there and keeps stopping there
+    /// for as long as the key keeps arriving. REQ-O-005 settles what
+    /// happens if it never does: *"Quiescence does **not** release the
+    /// holdback. A partial secret in a session that stopped producing
+    /// output stays withheld; `read_output(redact: false)` is the audited
+    /// escape hatch."*
+    ///
+    /// **The byte-class fallback is asserted to disagree**, which is why
+    /// the `binary` arm may not simply call [`PrefixIndex::still_alive`]
+    /// and take whatever comes back: `is_value_byte` is `false` on the
+    /// newline ending the header line, so a `binary` rule that fell into
+    /// that fallback would release a key on its second line.
+    #[test]
+    fn a_streaming_private_key_is_held_at_its_begin_anchor() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let pk = private_key_block(&rules, &index);
+
+        for header in [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+            // `[ A-Z]{0,10}` after `PRIVATE KEY` is the arm this one
+            // needs, and no other header form exercises it.
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+        ] {
+            let text = format!("{header}\n{}", pem_body(50));
+            let region = text.as_bytes();
+
+            // Premises. The candidate is found at 0 (condition 1), the
+            // rule has not matched (condition 3 is not what decides
+            // this), and the region is far past `partial_secret_scan_bytes`
+            // so the row is not passing on a fixture that fits.
+            assert!(region.starts_with(b"-----BEGIN"), "{header}");
+            assert!(region.len() > 512, "{header}: {} bytes", region.len());
+            assert!(
+                !rules.rules[pk].anchored.is_match(region),
+                "{header}: the key is still arriving, so condition 3 must \
+                 not be the thing deciding this row"
+            );
+            assert!(
+                !region.iter().all(|b| is_value_byte(*b)),
+                "{header}: the byte-class fallback releases this region, so \
+                 the `binary` arm must not be reachable by falling into it"
+            );
+
+            // Conclusion.
+            assert!(
+                index.binary_in_flight(pk, region, 0),
+                "{header}: the rule can still reach `-----END` from here"
+            );
+            assert_eq!(
+                index.earliest_partial(&rules, region, 0),
+                Some(0),
+                "{header}: the read must stop at the anchor"
+            );
+        }
+
+        // And the hold is attributable to this rule rather than to some
+        // other candidate that happens to sit at offset 0.
+        let text = format!("-----BEGIN RSA PRIVATE KEY-----\n{}", pem_body(50));
+        let without = RuleSet::builtin_without(&["private-key-block".to_string()]).unwrap();
+        let without_index = PrefixIndex::build(&without, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        assert_eq!(
+            without_index.earliest_partial(&without, text.as_bytes(), 0),
+            None,
+            "with `private-key-block` disabled nothing holds this region, so \
+             the `Some(0)` above is that rule's and no other's"
+        );
+    }
+
+    /// **A streaming private key carrying a byte an emitted view removes
+    /// is still held** (GH #166; the routes are GH #135's rendered page
+    /// and GH #139's 8-bit grammar).
+    ///
+    /// This row exists because the first version of this change did not
+    /// pass it, and nothing else in the tree did either. Handing the
+    /// `binary` arm to the automaton alone releases every region below:
+    /// `[\s\S]` is a *codepoint* class, so a lone C1 byte or any other
+    /// byte that is not part of a well-formed UTF-8 sequence puts the
+    /// automaton in a dead state **inside the key body**, and the
+    /// boundary goes `Some(0)` to `None` with the body already arrived.
+    ///
+    /// **And the redactor does not catch it either**, which is the half
+    /// that makes it a leak rather than an inefficiency: the same class
+    /// keeps `rule.regex` from matching the raw bytes, so `find_spans`
+    /// returns no span, there is no marker and no audit entry. What does
+    /// cover these bytes is `all_spans` over the *normalised* views —
+    /// and only once `-----END` has landed, which by construction it has
+    /// not. `holdback_boundary` reads the raw region and nothing else
+    /// (spec §4.1), so the hold is the only thing standing here.
+    ///
+    /// The four rows are one route each: an invalid UTF-8 byte, an ANSI
+    /// escape inside the label, a tab the rendered grid expands into the
+    /// spaces `[ A-Z]` accepts, and a `\r` that moves the cursor to
+    /// column 0 so the rendered row carries text the raw byte order does
+    /// not.
+    #[test]
+    fn a_streaming_private_key_carrying_a_view_sensitive_byte_is_still_held() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let pk = private_key_block(&rules, &index);
+        let body = pem_body(40);
+
+        let mut c1 = b"-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+        c1.extend_from_slice(&body.as_bytes()[..512]);
+        c1.push(0x9b);
+        c1.extend_from_slice(&body.as_bytes()[512..]);
+
+        let mut lone_continuation = b"-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+        lone_continuation.extend_from_slice(body.as_bytes());
+        lone_continuation.push(0xbf);
+
+        let mut escape = b"-----BEGIN \x1b[0mRSA PRIVATE KEY-----\n".to_vec();
+        escape.extend_from_slice(body.as_bytes());
+
+        let mut tab = b"-----BEGIN\tRSA PRIVATE KEY-----\n".to_vec();
+        tab.extend_from_slice(body.as_bytes());
+
+        let mut carriage = b"-----BEGIN CERTIFICATE\r-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+        carriage.extend_from_slice(body.as_bytes());
+
+        for (name, region) in [
+            ("c1-in-body", &c1),
+            ("lone-utf8-continuation", &lone_continuation),
+            ("escape-in-label", &escape),
+            ("tab-in-label", &tab),
+            ("carriage-return-redraw", &carriage),
+        ] {
+            // Premises. The candidate is found, the region is far past
+            // 512 bytes, and — the one that makes this a leak — the
+            // rule's own regex cannot match these bytes, so nothing
+            // downstream of a release would have redacted them.
+            assert!(region.starts_with(b"-----BEGIN"), "{name}");
+            assert!(region.len() > 512, "{name}: {} bytes", region.len());
+            assert!(
+                !rules.rules[pk].regex.is_match(region),
+                "{name}: if the raw regex matched, `find_spans` would cover \
+                 these bytes and the hold would not be the only protection"
+            );
+            assert!(
+                !region.iter().all(|b| is_plain_text_byte(*b)),
+                "{name}: the row is about a byte a view alters, so it has to \
+                 contain one"
+            );
+
+            // Conclusion.
+            assert!(
+                index.binary_in_flight(pk, region, 0),
+                "{name}: a key is still arriving and the raw bytes cannot \
+                 decide otherwise"
+            );
+            assert_eq!(
+                index.earliest_partial(&rules, region, 0),
+                Some(0),
+                "{name}: the read must stop at the anchor"
+            );
+        }
+    }
+
+    /// **A streaming certificate is released, because the rule anchored
+    /// at its `-----BEGIN` can never match** (GH #166).
+    ///
+    /// A certificate is not a secret — it is the half of a key pair a
+    /// server hands every client that connects to it — and
+    /// `private-key-block` says so itself: `-----BEGIN CERTIFICATE-----`
+    /// is the rule's own shipped `negative` example. What it *is* is a
+    /// literal match for the rule's indexed prefix, so before GH #166 the
+    /// `binary` arm answered "in flight" about it unconditionally and
+    /// condition 3 never revisited that, because the rule had not matched
+    /// and never would. `holdback_boundary` then pinned at the anchor for
+    /// the rest of the session.
+    ///
+    /// Spec §9.2 states the shape on the stream path in the same terms:
+    /// *"Without this clause, `-----BEGIN CERTIFICATE-----` — a prefix
+    /// that matches `private-key-block`'s opening and can never complete
+    /// its pattern — blackens an observer's stream for the rest of the
+    /// session."*
+    ///
+    /// **The release is not a hole in REQ-O-003.** Its subject is *"the
+    /// earliest **in-flight secret prefix**"*; a prefix from which no
+    /// arriving byte can produce a match is not one, and a DEAD state is
+    /// that statement about this rule and this anchor exactly.
+    #[test]
+    fn a_streaming_certificate_is_released_because_its_rule_cannot_complete() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let pk = private_key_block(&rules, &index);
+        assert!(
+            rules.rules[pk]
+                .negative
+                .iter()
+                .any(|n| n == "-----BEGIN CERTIFICATE-----"),
+            "the rule declares a certificate a non-match; this row is that \
+             declaration reaching the holdback"
+        );
+
+        let text = format!("-----BEGIN CERTIFICATE-----\n{}", pem_body(50));
+        let region = text.as_bytes();
+
+        // Premises: every condition except liveness is satisfied, so
+        // liveness is the only thing that can release this region.
+        assert!(region.starts_with(b"-----BEGIN"));
+        assert!(region.len() > 512, "{} bytes", region.len());
+        assert!(
+            !rules.rules[pk].anchored.is_match(region),
+            "condition 3 cannot be what releases this — the rule has not \
+             matched and cannot"
+        );
+
+        // Conclusion.
+        assert!(
+            !index.binary_in_flight(pk, region, 0),
+            "` CERTIFICATE` fits `[ A-Z]{{0,20}}` but the `-` that follows \
+             is neither another gap byte nor the `P` of `PRIVATE KEY`, so \
+             the automaton is in a dead state"
+        );
+        assert!(
+            region[..28].iter().all(|b| is_plain_text_byte(*b)),
+            "and it dies inside that plain-ASCII label, which is what makes \
+             the dead state believable at all"
+        );
+        assert_eq!(
+            index.earliest_partial(&rules, region, 0),
+            None,
+            "nothing is in flight, so the read must not stop"
+        );
+
+        // **The narrowing is per-anchor, not per-region.** A combined PEM
+        // — a certificate followed by its key, which is what an haproxy
+        // or a stunnel bundle is — carries two candidates, and the dead
+        // one must not release the live one. `earliest_partial` walks
+        // left to right and returns the first *qualifying* position, so
+        // the certificate's bytes go out and the key's do not.
+        let bundle = format!(
+            "-----BEGIN CERTIFICATE-----\n{}-----END CERTIFICATE-----\n\
+             -----BEGIN RSA PRIVATE KEY-----\n{}",
+            pem_body(20),
+            pem_body(20)
+        );
+        let key_at = bundle
+            .find("-----BEGIN RSA")
+            .expect("the bundle carries a second anchor") as u64;
+        assert!(key_at > 512, "the key's anchor is at {key_at}");
+        assert_eq!(
+            index.earliest_partial(&rules, bundle.as_bytes(), 0),
+            Some(key_at),
+            "the boundary moves to the key's own anchor, not to the \
+             certificate's and not to nowhere"
+        );
+    }
+
+    /// **A finished certificate followed by ordinary output does not
+    /// strand the session** (GH #166).
+    ///
+    /// This is the row that separates "the holdback waited for more
+    /// bytes" from "the holdback will never release". `-----END
+    /// CERTIFICATE-----` has landed, a build has printed two lines after
+    /// it, and nothing about the session is in flight — yet the anchor is
+    /// still in the region and the rule still has not matched, so an
+    /// unconditional `binary` arm answers `held_back: true` here and at
+    /// every later read for as long as those bytes are in the scan
+    /// window.
+    ///
+    /// It is asserted at a region far wider than
+    /// `partial_secret_scan_bytes`' 512 (spec REQ-O-007: *"The
+    /// partial-secret scan is bounded by `partial_secret_scan_bytes`
+    /// (default 512)"*) because 512 is what hides it today: the anchor
+    /// falls out of the window before the certificate ends, so the strand
+    /// is prevented by accident rather than by the predicate. This row is
+    /// the one that keeps widening that window from re-introducing it.
+    #[test]
+    fn a_finished_certificate_followed_by_build_output_does_not_strand() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let pk = private_key_block(&rules, &index);
+
+        let text = format!(
+            "-----BEGIN CERTIFICATE-----\n{}-----END CERTIFICATE-----\n\
+             $ cargo build\n   Compiling holdfast-core v0.0.7\n\
+                 Finished `dev` profile in 0.41s\n",
+            pem_body(50)
+        );
+        let region = text.as_bytes();
+
+        // Premises.
+        assert!(region.starts_with(b"-----BEGIN"));
+        assert!(region.len() > 512, "{} bytes", region.len());
+        assert!(
+            !rules.rules[pk].anchored.is_match(region),
+            "`-----END CERTIFICATE-----` does not satisfy a rule that wants \
+             `-----END…PRIVATE KEY-----`, so condition 3 never fires here — \
+             which is precisely why the old arm stranded"
+        );
+
+        // Conclusion.
+        assert!(!index.binary_in_flight(pk, region, 0));
+        assert_eq!(
+            index.earliest_partial(&rules, region, 0),
+            None,
+            "the session is not withholding anything; there is nothing left \
+             that could arrive to make this rule match"
+        );
     }
 }
