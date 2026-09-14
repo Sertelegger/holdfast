@@ -527,6 +527,137 @@ all of them"
   conflict_case "a repository with no marker is accepted" "" clean
 
   echo
+  echo "ci-hygiene self-test — the README's CI job table, four directions"
+  echo
+
+  # --- the README/ci.yml enumeration rule, which needs BOTH files ---------
+  #
+  # Every fixture above writes `.github/workflows/fixture.yml` and no
+  # README.md, so the rule under test SKIPS in all of them -- which is why
+  # "neither file present" had to be a survivable skip rather than a FAIL,
+  # the same shape the conflict-marker rule's "not a git repository" branch
+  # takes and for the same reason. The anti-vacuity therefore has to live
+  # here, in fixtures that supply both halves.
+  #
+  # Each case gets its own directory, copied from the base fixture tree so
+  # the OTHER rules still find scripts/fixture-probe.sh, scripts/mcp-smoke.sh
+  # and CLAUDE.md. EVERY workflow is then removed and ci.yml written as the
+  # only one: this rule reads ci.yml by name, and a leftover fixture.yml
+  # would make the job and timeout counts depend on a file with nothing to do
+  # with the variable under test -- and on which case happened to run last.
+  #
+  # The README body deliberately carries no "<n> MCP tools" phrasing. The
+  # tool-count rule above scans README.md, and a count there would fail these
+  # fixtures on a rule they are not testing -- which is exactly what happened
+  # to the accepted cases when that rule was added.
+  #
+  # The table ROWS are built here rather than passed in, so the one place
+  # that knows the `| `job` | text |` shape is the one place that has to
+  # spell a literal backtick.
+  # shellcheck disable=SC2016
+  ci_table_case() { # ci_table_case <label> <jobs YAML> <README job names> <ok|expected text>
+    local repo out rc name
+    repo="$(mktemp -d)"
+    cp -a "$tmp/." "$repo/"
+    rm -f "$repo"/.github/workflows/*.yml
+    { cat <<'YAML'
+name: CI
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+YAML
+      printf '%s\n' "$2"
+    } > "$repo/.github/workflows/ci.yml"
+    { printf '# Fixture\n\n## Continuous integration\n\n'
+      if [ -n "$3" ]; then
+        printf '| Job | What it runs |\n|---|---|\n'
+        for name in $3; do
+          printf '| `%s` | what %s runs |\n' "$name" "$name"
+        done
+      else
+        printf 'This section has no table at all.\n'
+      fi
+      # A backticked first-column row OUTSIDE the CI section. If the README
+      # derivation ever stops bounding itself to that section this row is
+      # collected as a job, and every case here goes red -- including the
+      # accepted one, which is where a bounding failure would otherwise hide.
+      printf '\n## Something else\n\n| `not-a-job` | a row outside the CI section |\n'
+    } > "$repo/README.md"
+    out="$(cd "$repo" && "$me" 2>&1)"; rc=$?
+    rm -rf -- "$repo"
+    if [ "$4" = "ok" ]; then
+      if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF 'the README table and .github/workflows/ci.yml agree on all'; then
+        printf '  PASS  %s\n' "$1"
+        return
+      fi
+    elif [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$4"; then
+      printf '  PASS  %s\n' "$1"
+      return
+    fi
+    printf '  FAIL  %s — want %s; exit %d\n' "$1" "$4" "$rc"
+    printf '%s\n' "$out" | sed 's/^/          /'
+    failures=$((failures + 1))
+  }
+
+  # One job body, reused, so the cases differ only in WHICH jobs ci.yml
+  # defines and WHICH names the README table carries.
+  local ci_job_body='    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: ./scripts/fixture-probe.sh'
+
+  # THE NEGATIVE CONTROL, and it asserts the agreement LINE rather than merely
+  # exit 0: a rule whose two derivations both matched nothing would also exit
+  # 0 here, and the three rejections below would then prove nothing about
+  # this rule.
+  ci_table_case "a README table matching ci.yml exactly is accepted, and names \
+the agreed count — so the rejections below are not vacuous" \
+"  hygiene:
+$ci_job_body
+  fmt:
+$ci_job_body" \
+    "hygiene fmt" \
+    ok
+
+  # DIRECTION ONE: the defect that was live on this tree when the rule was
+  # written -- a job added to ci.yml and never written into the table.
+  ci_table_case "a job ci.yml defines and the README omits is rejected, by name" \
+"  hygiene:
+$ci_job_body
+  macos-native:
+$ci_job_body" \
+    "hygiene" \
+    'defines job "macos-native", which the README table does not list'
+
+  # DIRECTION TWO, and it is the worse defect: the table goes on promising a
+  # gate the pipeline no longer has.
+  ci_table_case "a job the README lists and ci.yml does not define is rejected, by name" \
+"  hygiene:
+$ci_job_body" \
+    "hygiene deleted-job" \
+    'the README table lists job "deleted-job", which .github/workflows/ci.yml does not define'
+
+  # THE ANTI-VACUITY CONTROL. A "## Continuous integration" section with no
+  # table makes the README derivation match nothing, and the comparison is
+  # then between a list of two and a list of NONE: every loop runs zero times
+  # and the section prints clean for a README that documents no job at all.
+  # That has to be a FAIL, and this is the case that proves it is.
+  ci_table_case "a README whose CI section carries no table at all is rejected, \
+not silently accepted" \
+"  hygiene:
+$ci_job_body
+  fmt:
+$ci_job_body" \
+    "" \
+    'no job rows derived from the "## Continuous integration" table'
+
+  echo
   if [ "$failures" -ne 0 ]; then
     printf 'SELF-TEST FAILED: %d case(s)\n' "$failures" >&2
     return 1
@@ -538,7 +669,9 @@ all of them"
   echo "the release marker is checked rather than believed; the calibration"
   echo "marker cannot be claimed from inside a \`run:\` body, from prose, after its"
   echo "date, or by a second workflow; and each of the four diff3 conflict"
-  echo "markers is caught alone, while a repository carrying none is accepted."
+  echo "markers is caught alone, while a repository carrying none is accepted;"
+  echo "and the README CI table is refused when it omits a job ci.yml defines,"
+  echo "when it lists one ci.yml does not, and when it carries no table to read."
   return 0
 }
 
@@ -940,6 +1073,171 @@ else
       fails=$((fails + 1))
     fi
   done
+fi
+
+# --------------------------------------------------------------------------
+# The README's CI table must name exactly the jobs ci.yml defines
+# --------------------------------------------------------------------------
+#
+# README.md carries a Markdown table under "Continuous integration" whose
+# first column is a job name and whose second describes what that job runs.
+# It is the only place a reader learns what the pipeline does without opening
+# the workflow, and it is maintained by hand, so it drifts the way every
+# hand-maintained restatement in this repository has drifted: by omission,
+# silently, in the direction that reads as authoritative. Measured at the
+# commit that added this rule -- ci.yml defined ELEVEN jobs and the table
+# listed NINE, with actionlint and macos-native missing. Both had been added
+# by commits that touched ci.yml and not README.md, which is exactly the
+# shape no reviewer catches.
+#
+# Same move as the tool-count rule above: the restatement is derived from the
+# thing it restates instead of from memory, so the table cannot be right by
+# accident and cannot go stale without going red.
+#
+# BOTH DIRECTIONS ARE CHECKED and they are different defects. A job in ci.yml
+# and not the table is an undocumented job. A job in the table and not ci.yml
+# is a job someone deleted from the pipeline while the docs went on promising
+# it, which is worse: a reader believes a gate exists that does not.
+#
+# **HOW EACH LIST IS BOUNDED**, because both derivations have an obvious
+# wrong version that reports clean:
+#
+#   ci.yml -- `grep -E '^  [a-z][a-z0-9-]*:$'` over the whole file returns the
+#   eleven jobs AND `push:`, which is a key of the `on:` block at the same
+#   indent. So the scan is bounded to a sed RANGE that opens on a column-0
+#   `jobs:` and closes on the next column-0 line, and only then takes
+#   two-space-indented keys. The same mis-count is recorded in the
+#   timeout-per-job rule above, which was corrected to count `runs-on:`
+#   instead; that proxy is not available here because the job's NAME is what
+#   this rule needs.
+#
+#   README.md -- bounded to the `## Continuous integration` section, closing
+#   on the next `## `, so a backticked identifier in unrelated prose is not
+#   collected as a job. Within that section only a row's FIRST cell is read:
+#   `| `name` | description |`. The descriptions are full of backticked
+#   command lines and would otherwise flood the list.
+#
+# **THIS RULE CANNOT MATCH ITS OWN PROSE**, which the conflict-marker rule
+# below had to learn the hard way (its section banner contained the phrase
+# its self-test grepped for, so the control case reported a catch in a
+# repository with no marker). Nothing here reads this script: the two inputs
+# are README.md and ci.yml, and neither derivation looks at anything a
+# section banner or a comment in this file can reach. ci.yml is nonetheless
+# comment-blanked the same way every other content check is, so a job
+# commented out during a bisect cannot make the README chase it.
+#
+# **WHAT STILL SLIPS PAST — stated, not papered over:**
+#
+#   * A job RENAMED IN BOTH PLACES in one commit. This checks that the two
+#     enumerations agree, not that either is a good name.
+#   * A row whose DESCRIPTION is wrong while the name matches. Only column
+#     one is read. The `windows-native` row runs to a dozen lines of claims
+#     about filters and mutation coverage and not one word of it is checked
+#     by anything.
+#   * JOBS IN THE OTHER WORKFLOWS -- nightly.yml, mutants.yml, release.yml.
+#     This rule covers ci.yml alone, because the README tabulates ci.yml
+#     alone; the scheduled workflows are described in a prose paragraph under
+#     the table and nothing verifies a word of it.
+#   * WHETHER A JOB RUNS. A job gated off with `if: false`, or orphaned
+#     behind a `needs:` that can never go green, is still a defined job and
+#     still counts as documented here.
+#   * A SECOND TABLE inside the CI section whose first column is backticked
+#     would have its rows collected as job names. That is a false RED rather
+#     than a false green, so it surfaces immediately -- but it is a reason
+#     not to put one there.
+#   * A JOB KEY THIS PATTERN CANNOT SEE: the anchor is a bare
+#     `  name:` with nothing after the colon, so `  name: &anchor` or a
+#     `jobs:` written as a flow mapping is invisible. A name outside
+#     [A-Za-z0-9_-] is invisible too. Each of those makes the job vanish from
+#     the ci.yml side and would read as "the README lists a job ci.yml does
+#     not define" -- red again, not green.
+#   * RENAMING README.md. If BOTH files are absent this rule skips, because a
+#     self-test fixture directory is legitimately neither; if exactly one is
+#     present that is a FAIL, so deleting or renaming either half of the
+#     enumeration cannot quietly disarm it.
+echo
+echo "--- the README table enumerates the jobs ci.yml defines ---"
+
+ci_wf=".github/workflows/ci.yml"
+ci_readme="README.md"
+
+if [ ! -f "$ci_readme" ] && [ ! -f "$ci_wf" ]; then
+  # Loud, and named. A silent skip is how a rule stops being one.
+  printf '  skip  neither %s nor %s is present, so there is no enumeration to compare\n' \
+    "$ci_readme" "$ci_wf"
+elif [ ! -f "$ci_readme" ]; then
+  printf '  FAIL  %s exists but %s does not — the documented half of the enumeration is gone\n' \
+    "$ci_wf" "$ci_readme"
+  fails=$((fails + 1))
+elif [ ! -f "$ci_wf" ]; then
+  printf '  FAIL  %s exists but %s does not — the workflow half of the enumeration is gone\n' \
+    "$ci_readme" "$ci_wf"
+  fails=$((fails + 1))
+else
+  # Comment-blanked exactly as the deny rules are, and into `work` so the
+  # existing EXIT trap cleans it up.
+  ci_blanked="$work/ci-jobs.yml"
+  sed -e 's/[[:space:]]#.*$//' -e 's/^[[:space:]]*#.*$//' "$ci_wf" > "$ci_blanked"
+
+  # Range opens on a column-0 `jobs:`, closes on the next column-0 line (or
+  # EOF, which is the real case -- `jobs:` is ci.yml's last block). The
+  # closing line starts with a non-space, so it can never itself match the
+  # two-space key pattern applied second.
+  mapfile -t ci_jobs < <(
+    sed -nE '/^jobs:[[:space:]]*$/,/^[^[:space:]]/p' "$ci_blanked" \
+      | sed -nE 's/^  ([A-Za-z_][A-Za-z0-9_-]*):[[:space:]]*$/\1/p' \
+      | sort -u)
+
+  # shellcheck disable=SC2016
+  # The backticks in the expression below are LITERAL -- they are the
+  # Markdown code fence around the job name in the table's first cell, not a
+  # command substitution. SC2016 cannot tell the difference.
+  mapfile -t doc_jobs < <(
+    sed -nE '/^## Continuous integration[[:space:]]*$/,/^## /p' "$ci_readme" \
+      | sed -nE 's/^\|[[:space:]]*`([A-Za-z0-9_-]+)`[[:space:]]*\|.*/\1/p' \
+      | sort -u)
+
+  # ANTI-VACUITY, both halves, and it is the whole reason this rule can be
+  # trusted when it prints ok. If either derivation matches nothing -- a
+  # renamed heading, a reworked table, a `jobs:` block written some other way
+  # -- the comparison below is between two empty lists, every loop runs zero
+  # times, and the section reports clean for a README that documents nothing.
+  # That is the defect this file exists to catch, so it is a FAIL here.
+  ci_n="${#ci_jobs[@]}"
+  doc_n="${#doc_jobs[@]}"
+  if [ "$ci_n" -eq 0 ]; then
+    printf '  FAIL  no job names derived from %s — the derivation matched nothing, so this rule would compare two empty lists\n' \
+      "$ci_wf"
+    fails=$((fails + 1))
+  fi
+  if [ "$doc_n" -eq 0 ]; then
+    printf '  FAIL  no job rows derived from the "## Continuous integration" table in %s — the derivation matched nothing, so this rule would compare two empty lists\n' \
+      "$ci_readme"
+    fails=$((fails + 1))
+  fi
+
+  if [ "$ci_n" -gt 0 ] && [ "$doc_n" -gt 0 ]; then
+    ci_table_diff=0
+    for j in "${ci_jobs[@]}"; do
+      if ! printf '%s\n' "${doc_jobs[@]}" | grep -qxF "$j"; then
+        printf '  FAIL  %s defines job "%s", which the README table does not list\n' "$ci_wf" "$j"
+        fails=$((fails + 1))
+        ci_table_diff=$((ci_table_diff + 1))
+      fi
+    done
+    for j in "${doc_jobs[@]}"; do
+      if ! printf '%s\n' "${ci_jobs[@]}" | grep -qxF "$j"; then
+        printf '  FAIL  the README table lists job "%s", which %s does not define\n' "$j" "$ci_wf"
+        fails=$((fails + 1))
+        ci_table_diff=$((ci_table_diff + 1))
+      fi
+    done
+    if [ "$ci_table_diff" -eq 0 ]; then
+      printf '  ok    the README table and %s agree on all %d job(s)\n' "$ci_wf" "$ci_n"
+    else
+      printf '        %s defines %d job(s); the README table lists %d\n' "$ci_wf" "$ci_n" "$doc_n"
+    fi
+  fi
 fi
 
 # --------------------------------------------------------------------------
