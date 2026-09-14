@@ -57,9 +57,8 @@
 //! of open axes in a module header is what went stale twice already. Each
 //! residual is documented where it is measured: GH #135's split-stream
 //! residual in `StreamRedactor`'s header, the tail-anchor cost at
-//! `TAIL_ANCHOR` in `tests/redaction_sweep.rs`, and the withholding side —
-//! a credential still arriving with an escape inside it — in
-//! `OutputProcessor::holdback_boundary` and GH #142.
+//! `TAIL_ANCHOR` in `tests/redaction_sweep.rs`, and the twelve rules GH
+//! #142's marker gate excludes, at `holdback_is_bounded` and GH #160.
 //!
 //! An earlier revision of this module claimed the unqualified form —
 //! *every byte stream a read can emit is matched before it is emitted* —
@@ -72,14 +71,24 @@
 //!
 //! * A view may add a **marker**. A marker is safe in every stream and
 //!   costs the caller nothing it was entitled to, so
-//!   [`OutputProcessor::all_spans`] reads every view.
+//!   [`OutputProcessor::all_spans`] reads every view — and so does the
+//!   GH #142 pass in `OutputProcessor::process`, which asks every view
+//!   whether a credential is still *arriving* and marks the answer. That
+//!   pass reads the **whole window** rather than the trailing
+//!   `partial_secret_scan_bytes`, which is safe for precisely the reason
+//!   it was illegal for a withhold (GH #14): a marker cannot stop the
+//!   cursor.
 //! * A view may **not** add a **withhold**. A withhold denies the caller
 //!   bytes, and [`PrefixIndex::earliest_partial`] — the predicate behind
 //!   every withhold — is load-bearing on exactly the control bytes a view
 //!   deletes. Asked about a stripped view it strands ordinary output
 //!   behind a `held_back` that never clears, so
 //!   `OutputProcessor::holdback_boundary` reads the raw region alone.
-//!   GH #142 carries the measurement and the residual that leaves open.
+//!   GH #142 carries the measurement, and settles that no sharper
+//!   predicate rescues the withhold: the buffer that must be held and
+//!   the buffer that must be released are the same object, so the fix is
+//!   the marker above and the residual is the twelve rules the gate
+//!   excludes (GH #160).
 //!
 //! The pipeline is `render` (strip or pass through) then [`encode`], and
 //! only two of its knobs drop bytes, so the set of derivable streams is

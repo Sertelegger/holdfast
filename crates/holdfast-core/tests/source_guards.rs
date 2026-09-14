@@ -1026,3 +1026,99 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
          the cleartext body as a plain Vec"
     );
 }
+
+/// **The view scan may only raise a marker, and this is where that stops
+/// being a convention (GH #142).**
+///
+/// `PrefixIndex::earliest_partial_in_view` asks a *view* whether a
+/// credential is still arriving, and the answer is sound as a marker and
+/// unsound as anything else: a view has deleted the control byte that
+/// would have revised the decision, so a **withhold** taken on it can
+/// never clear. Three call sites would turn it back into one —
+/// `holdback_boundary` (PR #162 measured the blocker: ordinary output
+/// ending in an escape strands for ever and `prompt.last_line` goes
+/// empty), `unresolved_from` (GH #14: a `Printable` view of a 117 KB
+/// colourised blob answers at its head, so the read returns zero bytes
+/// for ever), and `safe_last_line` (which truncates the reported prompt
+/// at the boundary).
+///
+/// **Here because no runtime test can see it.** Each of those three would
+/// still be *correct* on every fixture that does not carry a deleted
+/// terminator, so a behavioural row only catches the shape it was written
+/// for; PR #162's review found exactly that — its `unresolved_from`
+/// carve-out row was blind to a *gated* inlining, which is the only shape
+/// a post-#142 implementation would take.
+///
+/// **Code lines only**, because `normalise.rs`, `prefix_index.rs` and
+/// `output/mod.rs` all discuss this predicate at length in prose and a
+/// scanner that flagged those would be turned off within a day.
+#[test]
+fn the_view_in_flight_scan_reaches_only_the_marker_path() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let files = rust_files(&src);
+    assert!(
+        files.len() >= 10,
+        "the walk found only {} files under {}",
+        files.len(),
+        src.display()
+    );
+
+    let mut callers: Vec<String> = Vec::new();
+    let mut seen_definition = false;
+    for path in &files {
+        let text = read_src(path);
+        let rel = path
+            .strip_prefix(&src)
+            .expect("under src")
+            .to_string_lossy()
+            .replace('\\', "/");
+        for line in text.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") || code.starts_with("///") {
+                continue;
+            }
+            if !code.contains("earliest_partial_in_view") {
+                continue;
+            }
+            if code.contains("pub fn earliest_partial_in_view") {
+                seen_definition = true;
+                continue;
+            }
+            callers.push(rel.clone());
+        }
+    }
+    assert!(
+        seen_definition,
+        "the predicate itself was not found, so this guard scanned nothing"
+    );
+    callers.sort();
+    callers.dedup();
+    assert_eq!(
+        callers,
+        vec![
+            "output/mod.rs".to_string(),
+            "output/prefix_index.rs".to_string()
+        ],
+        "a new caller of the view in-flight scan: it may raise a marker and \
+         nothing else (GH #142)"
+    );
+
+    // …and inside `output/mod.rs`, not in the one method whose answer is
+    // a cursor stop. Taken as the text between this signature and the
+    // next `    /// ` at method indentation, which is how every method in
+    // that file ends.
+    let modrs = read_src(src.join("output/mod.rs"));
+    let open = modrs
+        .find("    pub fn holdback_boundary(")
+        .expect("`holdback_boundary` was renamed; this guard must move with it");
+    let body = &modrs[open..];
+    let close = body.find("\n    }\n").expect("the method must end");
+    let body = &body[..close];
+    for banned in ["earliest_partial_in_view", "emitted_views", "normalise::"] {
+        assert!(
+            !body.contains(banned),
+            "`holdback_boundary` reached `{banned}`: a view may add a marker, \
+             not a withhold (GH #142, GH #14)"
+        );
+    }
+}

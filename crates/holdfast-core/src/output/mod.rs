@@ -29,6 +29,7 @@ pub mod rules;
 use crate::audit::AuditLog;
 use ansi::{AnsiMode, AnsiStripper};
 use encoding::TextEncoding;
+use normalise::NormalView;
 use prefix_index::{PrefixIndex, DEFAULT_PREFIX_EXPANSION_LIMIT};
 use redact::Span;
 use rules::{RuleError, RuleSet};
@@ -277,15 +278,29 @@ impl OutputProcessor {
     /// nothing it was entitled to; a view may not add a **withhold**,
     /// because a withhold denies the caller bytes, and the predicate that
     /// decides withholds reads exactly the bytes a view removes.*
-    /// [`OutputProcessor::all_spans`] is the first half; this method is
-    /// the second.
+    /// [`OutputProcessor::all_spans`] is the first half and the GH #142
+    /// marker pass in [`OutputProcessor::process`] is the third; this
+    /// method is the second.
     ///
-    /// The cost of stopping here is stated rather than elided: a
-    /// credential that straddles a read boundary **with an escape inside
-    /// it** is still released half-emitted, exactly as before this fix.
-    /// That is GH #142, it is byte-identical to the behaviour at
-    /// `v0.0.7`, and closing it needs a sharper in-flight predicate
-    /// rather than a different set of views — see the issue.
+    /// **The cost of stopping here is now paid by a marker rather than
+    /// carried (GH #142).** A credential straddling a read boundary with
+    /// an escape inside it is invisible to this method and always will
+    /// be; `OutputProcessor::process` asks every view the same question
+    /// and covers the answer with one `[REDACTED:unresolved]`, over the
+    /// whole window rather than this tail region. That is legal there
+    /// and illegal here for one reason: a marker never moves `read_end`
+    /// backwards, so it terminates by construction, while the answer this
+    /// method returns *is* a cursor stop and a wrong one never clears.
+    ///
+    /// **No sharper predicate rescues a withhold, and that is settled
+    /// rather than deferred.** The two fixtures a withhold would have to
+    /// separate are the same object: in a stripped view
+    /// `use crate::re_exports` is `\bre_[A-Za-z0-9_]{24,}` — the `resend`
+    /// rule — with 7 of 24 value bytes arrived, and a GitHub token at 39
+    /// of 40 is the same shape one byte from completion. A decision that
+    /// is a function of the buffer must hold one and release the other
+    /// while the buffer is identical, so no such function exists. See GH
+    /// #142 for the candidate table and the two completions.
     ///
     /// [`PrefixIndex::earliest_partial`]: prefix_index::PrefixIndex::earliest_partial
     pub fn holdback_boundary(&self, w: &WindowSnapshot<'_>, opts: &ReadOptions) -> u64 {
@@ -316,8 +331,18 @@ impl OutputProcessor {
     /// union is the primitive now; a second hand-written one there would
     /// be exactly the drift that argument forbids.
     pub(crate) fn all_spans(&self, region: &[u8], region_start: u64) -> Vec<Span> {
+        let views = normalise::emitted_views(region, region_start);
+        self.spans_over(region, region_start, &views)
+    }
+
+    /// [`Self::all_spans`] with the view set handed in, so
+    /// [`Self::process`] can build it once and ask it two questions —
+    /// which bytes match a rule, and which bytes are a rule still
+    /// arriving (GH #142). Splitting it keeps `emitted_views` at one call
+    /// per region rather than two.
+    fn spans_over(&self, region: &[u8], region_start: u64, views: &[NormalView]) -> Vec<Span> {
         let mut spans = redact::find_spans(&self.rules, region, region_start);
-        for view in normalise::emitted_views(region, region_start) {
+        for view in views {
             spans.extend(
                 redact::find_spans(&self.rules, view.bytes(), 0)
                     .into_iter()
@@ -366,11 +391,99 @@ impl OutputProcessor {
             }
         }
 
-        let mut spans = if opts.redact {
-            self.all_spans(w.window, w.window_start)
+        let views = if opts.redact {
+            normalise::emitted_views(w.window, w.window_start)
         } else {
             Vec::new()
         };
+        let mut spans = if opts.redact {
+            self.spans_over(w.window, w.window_start, &views)
+        } else {
+            Vec::new()
+        };
+
+        // **GH #142: a credential still arriving with a control byte
+        // inside it is *marked*, because no condition could withhold it.**
+        //
+        // `holdback_boundary` reads the raw region, and a raw value run
+        // ends at the first control byte — so `ghp_` plus 39 of 40
+        // characters with a `\x1b[0m` planted in the middle is not in
+        // flight by that account, and the arrived half went out in the
+        // clear, `held_back: false`, `redactions: {}`. Every view of it
+        // splices the token back together, which is why the views can see
+        // what the raw region cannot.
+        //
+        // **The views may not answer the withhold question, and that is
+        // settled rather than cautious.** The two fixtures a withhold
+        // would have to separate are the *same object*: in a stripped
+        // view `use crate::re_exports` is `\bre_[A-Za-z0-9_]{24,}` — the
+        // `resend` rule — with 7 of its 24 value bytes arrived, and
+        // `line one\nghp_…` is the same rule shape one byte from
+        // completion. Liveness saying "alive" means a completion exists,
+        // and both completions can be exhibited; the decision must hold
+        // one and release the other while the buffer is identical. No
+        // function of the buffer does that. A view also has no byte left
+        // that can revise the decision, because the byte that would have
+        // is the one the view deleted, so the wrong answer is permanent.
+        //
+        // **A marker needs no separation.** It costs the caller the bytes
+        // it covers and nothing else: `read_end` never moves backwards,
+        // `held_back` does not change, `next_cursor` does not change, and
+        // the read that follows starts past it. `normalise`'s asymmetry
+        // rule licenses exactly this — *a view may add a marker; a view
+        // may not add a withhold* — and this is the second marker source
+        // that rule permits, after `all_spans`.
+        //
+        // **Scanned over the whole window rather than the trailing
+        // `partial_secret_scan_bytes`, and that is only safe because it
+        // is a marker.** GH #14 forbids a *withhold* the window-wide
+        // region, because `unresolved_from` over a 117 KB `jq -C -c` blob
+        // answers at its head and the read returns zero bytes for ever.
+        // A marker cannot stop the cursor, so the same region is free
+        // here — and it has to be, because the tail region is what let
+        // the token leak: 79 repetitions of `\x1b[s\x1b[u` after the
+        // painted `ghp_` push the candidate out of the 512-byte tail and
+        // `read_output` hands back all 39 characters. PR #162's review
+        // called `read_output` "protected by geometry"; the geometry was
+        // the leak.
+        //
+        // **The extent is bounded by `map_span`, not by the span written
+        // here.** The span runs to the end of the *view*, which for a
+        // stripped view of redraw traffic is a handful of surviving bytes
+        // scattered over a very large raw region — `map_span` reaches
+        // `raw_offset(end - 1) + 1`, the last **surviving** byte, so
+        // `\x1b[s\x1b[u` × 40,000 marks tens of bytes rather than the
+        // quarter-megabyte a to-end-of-region span would destroy.
+        //
+        // **The gate is what keeps that bound finite**, and under a
+        // marker that is its whole job: a rule whose holdback has no
+        // bound can stay alive to the end of any view, so one marker
+        // covers the entire read. See `holdback_is_bounded`. The twelve
+        // rules it excludes keep GH #142's leak in full — GH #160 is
+        // where that stops being silent.
+        //
+        // **The page pass below deliberately does not get this.** Its
+        // region ends at `read_end`, a cursor rather than the end of the
+        // evidence, so every page would mark its own tail. The window is
+        // the only region whose end is where the bytes stop.
+        if opts.redact {
+            let mut raised = false;
+            for view in &views {
+                let bytes = view.bytes();
+                let Some(at) = self.index.earliest_partial_in_view(&self.rules, bytes, 0) else {
+                    continue;
+                };
+                spans.push(view.map_span(Span {
+                    start: at,
+                    end: bytes.len() as u64,
+                    rule: redact::UNRESOLVED_RULE,
+                }));
+                raised = true;
+            }
+            if raised {
+                spans = redact::merge_spans(spans);
+            }
+        }
 
         // **The window is evidence, and a match can run off the end of it
         // (GH #14).**
@@ -581,9 +694,21 @@ impl OutputProcessor {
                         stripper.feed(o, w.window[(o - w.window_start) as usize]);
                     }
                     if span.end > w.req_start && span.start < read_end {
-                        let kind = &self.rules.rules[span.rule].kind;
+                        // **`redactions` counts this one too, and GH
+                        // #160's argument against the key is an argument
+                        // *for* it here.** That issue rules `unresolved`
+                        // out of the map because the map is "a strict
+                        // count of markers present in `output`" and the
+                        // warning it proposes puts no marker there. This
+                        // does: the caller is looking at
+                        // `[REDACTED:unresolved]`, and reporting
+                        // `redactions: {}` beside it would be the same
+                        // false assurance GH #142 is about.
+                        // `status.redaction_stats` counts substitutions
+                        // *delivered* (§5.2, REQ-O-012), which this is.
+                        let kind = redact::span_kind(&self.rules, span.rule);
                         out.extend_from_slice(redact::marker(kind).as_bytes());
-                        *redactions.entry(kind.clone()).or_insert(0) += 1;
+                        *redactions.entry(kind.to_string()).or_insert(0) += 1;
                     }
                     off = span.end;
                     continue;
@@ -2154,5 +2279,494 @@ mod tests {
         );
         assert!(!r.output.contains(GITHUB), "leaked: {}", r.output);
         assert_eq!(r.output, "\u{1b}]0;deploy [REDACTED:github]\u{7}$ ");
+    }
+
+    // ------------------------------------------------- GH #142, the marker
+
+    /// The six `ansi` × `text_encoding` combinations a caller can ask
+    /// for, so a row cannot pass by being asked about the one stream in
+    /// which a token does not reassemble.
+    const EVERY_OPTION_PAIR: &[(AnsiMode, TextEncoding)] = &[
+        (AnsiMode::Strip, TextEncoding::Utf8),
+        (AnsiMode::Strip, TextEncoding::Base64),
+        (AnsiMode::Strip, TextEncoding::LossyPrintable),
+        (AnsiMode::Raw, TextEncoding::Utf8),
+        (AnsiMode::Raw, TextEncoding::Base64),
+        (AnsiMode::Raw, TextEncoding::LossyPrintable),
+    ];
+
+    /// The longest contiguous run of `token` a reader can recover from
+    /// `output`, after undoing the transport encoding and applying the
+    /// filter a terminal applies to what is left.
+    ///
+    /// Deliberately **not** built on `normalise`: this is the oracle, and
+    /// an oracle sharing an implementation with the thing it judges
+    /// cannot see a bug in it.
+    fn recoverable_run(token: &str, output: &str, encoding: TextEncoding) -> usize {
+        let bytes: Vec<u8> = match encoding {
+            TextEncoding::Base64 => {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(output.as_bytes())
+                    .expect("base64 output must decode")
+            }
+            _ => output.as_bytes().to_vec(),
+        };
+        // What a terminal shows: the C0 controls and DEL are gone.
+        let shown: Vec<u8> = bytes
+            .iter()
+            .copied()
+            .filter(|b| *b >= 0x20 && *b != 0x7f)
+            .collect();
+        let text = String::from_utf8_lossy(&shown).into_owned();
+        let mut best = 0usize;
+        for i in 0..token.len() {
+            for j in (i + 1)..=token.len() {
+                if text.contains(&token[i..j]) {
+                    best = best.max(j - i);
+                }
+            }
+        }
+        best
+    }
+
+    /// **GH #142's reproduction, and the row asserts the property the
+    /// issue states rather than the mechanism that now delivers it.**
+    ///
+    /// `ghp_` plus 35 of a 36-character minimum with a `\x1b[0m` planted
+    /// inside came back **whole** on the default read path, with
+    /// `held_back: false` and `redactions: {}` — a positive assertion
+    /// that the read was clean, made about bytes heading into an agent's
+    /// transcript. The raw value run ends at the escape, so
+    /// `holdback_boundary` saw nothing in flight; every stream a reader
+    /// actually receives splices the token back together.
+    ///
+    /// **The property is "the caller cannot reconstruct it", not "the
+    /// read was held".** No withhold is possible here and that is
+    /// settled, not cautious: a stripped view of `use crate::re_exports`
+    /// *is* `\bre_[A-Za-z0-9_]{24,}` with 7 of 24 value bytes arrived, so
+    /// the buffer that must be held and the buffer that must be released
+    /// are the same object and no function of it separates them. The read
+    /// therefore hands over every byte it was asked for — `held_back` is
+    /// false and the cursor reaches head, asserted here so that a
+    /// regression *into* a withhold fails this row rather than passing it
+    /// — and covers the in-flight bytes with one marker.
+    #[test]
+    fn a_credential_arriving_with_a_control_byte_inside_it_does_not_reach_the_caller() {
+        let p = processor();
+        let partial = &GITHUB[..GITHUB.len() - 1];
+        let buf = format!("line one\n{}\x1b[0m{}", &partial[..20], &partial[20..]).into_bytes();
+
+        // The premise: this really is a token one byte from completion,
+        // and the raw bytes really do not match a rule.
+        assert!(
+            redact::find_spans(&p.rules, &buf, 0).is_empty(),
+            "the premise: nothing matches yet, so nothing is redacted the ordinary way"
+        );
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        assert_eq!(
+            p.holdback_boundary(&w, &ReadOptions::default()),
+            buf.len() as u64,
+            "the premise: the raw region sees nothing in flight, which is the leak"
+        );
+
+        for (ansi, text_encoding) in EVERY_OPTION_PAIR {
+            let opts = ReadOptions {
+                ansi: *ansi,
+                text_encoding: *text_encoding,
+                redact: true,
+            };
+            let r = p.process(&w, &opts);
+            assert_eq!(
+                recoverable_run(partial, &r.output, *text_encoding),
+                1,
+                "{ansi:?}/{} handed back a usable run of the token",
+                text_encoding.as_str()
+            );
+            assert!(
+                !r.held_back,
+                "{ansi:?}/{}: nothing is withheld — the fix is a marker",
+                text_encoding.as_str()
+            );
+            assert_eq!(
+                r.cursor,
+                buf.len() as u64,
+                "{ansi:?}/{}: the cursor still reaches head",
+                text_encoding.as_str()
+            );
+            assert_eq!(
+                r.redactions.get(redact::UNRESOLVED_KIND),
+                Some(&1),
+                "{ansi:?}/{}: and the caller is told, which is the other half \
+                 of what GH #142 reports",
+                text_encoding.as_str()
+            );
+        }
+    }
+
+    /// **The leak nobody had recorded, including PR #162's review, which
+    /// called `read_output` "protected by geometry" (GH #142).**
+    ///
+    /// The geometry is the leak. `holdback_boundary` reads the trailing
+    /// `partial_secret_scan_bytes`; traffic that adds raw bytes and
+    /// contributes none to any view — `\x1b[s\x1b[u` is a cursor
+    /// save/restore — slides a still-arriving credential out of that
+    /// window, after which even a *correct* raw predicate cannot see it.
+    /// 79 repetitions is 474 bytes, which is what it takes.
+    ///
+    /// This is why the marker pass reads the **whole window** rather than
+    /// the tail region, and why that is only legal for a marker: GH #14
+    /// forbids the same region to a withhold, because `unresolved_from`
+    /// over a 117 KB colourised blob answers at its head.
+    #[test]
+    fn a_credential_slid_out_of_the_scan_window_is_still_marked() {
+        let p = processor();
+        let partial = &GITHUB[..GITHUB.len() - 1];
+        let mut buf = format!("line one\n{}\x1b[0m{}", &partial[..20], &partial[20..]).into_bytes();
+        let candidate_at = 9u64;
+        for _ in 0..79 {
+            buf.extend_from_slice(b"\x1b[s\x1b[u");
+        }
+
+        // The premise, stated in the terms that make it a leak: the
+        // candidate is outside the region the holdback is allowed to see.
+        let scan_start = buf.len() as u64 - p.limits.partial_secret_scan_bytes as u64;
+        assert!(
+            scan_start > candidate_at,
+            "the fixture must push the candidate out of the scan window: \
+             scan starts at {scan_start}, candidate at {candidate_at}"
+        );
+        let w = snapshot(&p, &buf, 0, 256 * 1024, true, false);
+        assert_eq!(
+            p.holdback_boundary(&w, &ReadOptions::default()),
+            buf.len() as u64,
+            "the premise: the tail region is blind to it"
+        );
+
+        for (ansi, text_encoding) in EVERY_OPTION_PAIR {
+            let r = p.process(
+                &w,
+                &ReadOptions {
+                    ansi: *ansi,
+                    text_encoding: *text_encoding,
+                    redact: true,
+                },
+            );
+            assert_eq!(
+                recoverable_run(partial, &r.output, *text_encoding),
+                1,
+                "{ansi:?}/{} leaked the slid token",
+                text_encoding.as_str()
+            );
+        }
+    }
+
+    /// **`map_span` bounds the marker, and without it one marker eats the
+    /// buffer (GH #142).**
+    ///
+    /// The span raised from a view runs to the end of *that view*. For a
+    /// stripped view of redraw-only traffic the view's last byte is the
+    /// last byte the token contributed, hundreds of kilobytes earlier in
+    /// the raw buffer, and `NormalView::map_span` reaches
+    /// `raw_offset(end - 1) + 1` rather than the end of the region — so
+    /// the marker covers the credential and nothing else. A span written
+    /// straight to the region's end would destroy the whole read.
+    #[test]
+    fn the_marker_over_redraw_traffic_covers_the_credential_and_not_the_buffer() {
+        let p = processor();
+        let partial = &GITHUB[..GITHUB.len() - 1];
+        let mut buf = format!("line one\n{}\x1b[0m{}", &partial[..20], &partial[20..]).into_bytes();
+        for _ in 0..40_000 {
+            buf.extend_from_slice(b"\x1b[s\x1b[u");
+        }
+        assert!(buf.len() > 200_000, "the premise: a very large buffer");
+
+        let w = snapshot(&p, &buf, 0, 1024 * 1024, true, false);
+        let opts = ReadOptions::default();
+        let marked = p.process(&w, &opts);
+        let clear = p.process(
+            &w,
+            &ReadOptions {
+                redact: false,
+                ..opts
+            },
+        );
+        assert_eq!(marked.redactions.get(redact::UNRESOLVED_KIND), Some(&1));
+        // Every byte the caller lost, counted against the same read with
+        // redaction off: the marker's own text is added back so the
+        // difference is the bytes it replaced.
+        let destroyed = clear.output.len() + redact::marker(redact::UNRESOLVED_KIND).len()
+            - marked.output.len();
+        assert!(
+            destroyed < 64,
+            "the marker destroyed {destroyed} visible bytes of a {}-byte buffer",
+            buf.len()
+        );
+        assert_eq!(
+            marked.cursor,
+            buf.len() as u64,
+            "and the read still drains the whole buffer"
+        );
+    }
+
+    /// **Ordinary output that ends in an escape is released whole — and
+    /// the marker it now carries is the price, pinned so it cannot become
+    /// either a strand or a silence (GH #142).**
+    ///
+    /// These four shapes are PR #162's blocker: under a view-driven
+    /// *withhold* each returned a fraction of its bytes with
+    /// `held_back: true` and a cursor that never moved again, and the
+    /// first took `prompt.last_line` to `""`. Under the marker every one
+    /// of them hands over every byte, `holdback_boundary` is `head`, and
+    /// the trailing token is replaced.
+    ///
+    /// **The replacement is a real cost and it is stated rather than
+    /// elided**: a developer working in a directory called `re_exports`
+    /// sees `dev@box:~/src/[REDACTED:unresolved]` on every read, because
+    /// `re_` opens `resend-api-key` and seven of its twenty-four value
+    /// bytes have arrived. Against PR #162 it is a strict improvement —
+    /// a strand blocks everything after it too — and against `main` it is
+    /// what closing the leak costs.
+    #[test]
+    fn ordinary_output_ending_in_an_escape_is_released_whole_and_marked() {
+        let p = processor();
+        for (buf, expected) in [
+            (
+                &b"use crate::re_exports\x1b[0m"[..],
+                "use crate::[REDACTED:unresolved]",
+            ),
+            (
+                &b"\r\x1b[2K   Compiling re_export\x1b[0m"[..],
+                "\r   Compiling [REDACTED:unresolved]",
+            ),
+            (
+                &b"dev@box:~/src/re_exports\x1b[0m"[..],
+                "dev@box:~/src/[REDACTED:unresolved]",
+            ),
+            (
+                &b"added 210 packages\r\nnpm WARN deprecated \x1b[33m@acme/re_exports\x1b[0m\x1b[K"
+                    [..],
+                "added 210 packages\r\nnpm WARN deprecated @acme/[REDACTED:unresolved]",
+            ),
+        ] {
+            let w = snapshot(&p, buf, 0, 32 * 1024, true, false);
+            assert_eq!(
+                p.holdback_boundary(&w, &ReadOptions::default()),
+                buf.len() as u64,
+                "{expected:?}: the boundary must stay at head"
+            );
+            let r = p.process(&w, &ReadOptions::default());
+            assert!(!r.held_back, "{expected:?}: nothing may be withheld");
+            assert_eq!(
+                r.bytes_returned,
+                buf.len(),
+                "{expected:?}: every byte is consumed"
+            );
+            assert_eq!(r.next_cursor, None, "{expected:?}: and the read is done");
+            assert_eq!(r.output, expected);
+        }
+    }
+
+    /// **Every view that answers raises its own marker; there is no fold
+    /// and no winner (GH #142).**
+    ///
+    /// PR #162 took the *minimum* over the views because its answer was a
+    /// cursor stop and a read has only one, and its review found that the
+    /// fold was unpinned — `min` -> `max` survived all 1015 lib tests. A
+    /// marker has no such constraint: two views that answer at different
+    /// raw offsets must **both** be covered.
+    ///
+    /// They do disagree here. `Stripped` deletes the trailing `\x1b[K`
+    /// and keeps the 8-bit CSI introducer, which ends `re_`'s value run,
+    /// so its answer is the later `hf_`; the C1 views delete the
+    /// introducer, which splices `re_AAAAhf_BBBB` into one run and moves
+    /// the answer back to `re_`. A fold that kept the later answer leaves
+    /// `re_AAAA` in the clear.
+    #[test]
+    fn two_views_that_disagree_are_both_marked() {
+        let p = processor();
+        let buf = b"x re_AAAA\x9bhf_BBBB\x1b[K".to_vec();
+        let mut answers: Vec<u64> = normalise::emitted_views(&buf, 0)
+            .iter()
+            .filter_map(|v| {
+                p.index
+                    .earliest_partial_in_view(&p.rules, v.bytes(), 0)
+                    .map(|at| {
+                        v.map_span(Span {
+                            start: at,
+                            end: v.bytes().len() as u64,
+                            rule: redact::UNRESOLVED_RULE,
+                        })
+                        .start
+                    })
+            })
+            .collect();
+        answers.sort_unstable();
+        answers.dedup();
+        assert_eq!(
+            answers,
+            vec![2, 10],
+            "the premise: the views must answer at two different raw offsets, \
+             or this row is about one view"
+        );
+
+        let r = read(&buf, 0, 32 * 1024);
+        assert!(!r.held_back, "nothing is withheld");
+        assert_eq!(r.cursor, buf.len() as u64);
+        assert_eq!(r.output, "x [REDACTED:unresolved]");
+        assert_eq!(r.redactions.get(redact::UNRESOLVED_KIND), Some(&1));
+    }
+
+    /// **A view answer is an index into the view; the marker it becomes
+    /// is an absolute buffer offset (GH #142).**
+    ///
+    /// The two are the same number in every fixture whose window starts
+    /// at zero, so a mapping that skipped `map_span` entirely would pass
+    /// all of them. The padding is the whole row: it puts the painted
+    /// token past `lookbehind_bytes`, so the read opens a window several
+    /// hundred bytes into the buffer and a view offset is nothing like an
+    /// absolute one.
+    #[test]
+    fn a_view_marker_is_an_absolute_offset() {
+        let p = processor();
+        let partial = &GITHUB[..GITHUB.len() - 1];
+        let mut buf = "filler line\n".repeat(200).into_bytes();
+        let at = buf.len() as u64;
+        assert!(
+            at > p.limits.lookbehind_bytes as u64,
+            "the arrangement must really start its window past zero"
+        );
+        buf.extend_from_slice(format!("{}\x1b[0m{}", &partial[..20], &partial[20..]).as_bytes());
+
+        let r = read(&buf, at, 32 * 1024);
+        assert_eq!(r.output, "[REDACTED:unresolved]");
+        assert_eq!(r.cursor, buf.len() as u64);
+    }
+
+    /// **The gate is what keeps a terminated window title out of the
+    /// marker path (GH #142, GH #160).**
+    ///
+    /// `\x1b]0;SECRET_DONE\x07` is `screen.rs`'s own fixture and this
+    /// codebase has already adjudicated it a non-credential. It stays
+    /// ALIVE under liveness — `generic-secret-assignment`'s leading
+    /// `[a-z0-9_.-]{0,32}` lets its keyword arrive later, so
+    /// `SECRET_DONE_PASSWORD=…` is a genuine completion — and only the
+    /// gate releases it, because that rule's label-to-value run is
+    /// unbounded. Ungated, this row is the 0.85% marker rate the gate
+    /// buys out.
+    #[test]
+    fn a_terminated_window_title_raises_no_marker() {
+        let p = processor();
+        let buf = b"\x1b]0;SECRET_DONE\x07".to_vec();
+        let mut premise = false;
+        for view in normalise::emitted_views(&buf, 0) {
+            if view.bytes().windows(14).any(|w| w == b"]0;SECRET_DONE") {
+                premise |= p
+                    .index
+                    .earliest_partial(&p.rules, view.bytes(), 0)
+                    .is_some();
+            }
+            assert_eq!(
+                p.index.earliest_partial_in_view(&p.rules, view.bytes(), 0),
+                None,
+                "the gate must keep {:?} out of the marker path",
+                String::from_utf8_lossy(view.bytes())
+            );
+        }
+        assert!(
+            premise,
+            "the premise: ungated, a view of this title *is* a candidate — \
+             without it the row asserts nothing about the gate"
+        );
+        let r = read(&buf, 0, 32 * 1024);
+        assert!(!r.output.contains("[REDACTED"), "got {:?}", r.output);
+    }
+
+    /// **The GH #14 blob still drains, which is the constraint that
+    /// decided the marker's shape (GH #142).**
+    ///
+    /// The marker pass reads the whole window rather than a 512-byte
+    /// tail, and that region is exactly the one GH #14 forbids a
+    /// *withhold*: `unresolved_from` over a colourised `jq -C -c` blob
+    /// answers at its head, so a withhold there returns zero bytes for
+    /// ever. A marker cannot stop the cursor, so the same region is safe
+    /// — and this row is what says so about the real fixture rather than
+    /// about the argument.
+    #[test]
+    fn a_colourised_blob_with_no_delimiter_still_pages_to_exhaustion() {
+        let p = processor();
+        let mut buf = Vec::new();
+        while buf.len() < 117_000 {
+            buf.extend_from_slice(
+                b"\x1b[1;39m{\x1b[0m\x1b[34;1m\"k\"\x1b[0m\x1b[1;39m:\x1b[0m\x1b[0;32m\"v0123456789\"\x1b[0m\x1b[1;39m}\x1b[0m",
+            );
+        }
+        let head = buf.len() as u64;
+        let (mut cursor, mut pages) = (0u64, 0usize);
+        while cursor < head {
+            let w = snapshot(&p, &buf, cursor, 8 * 1024, true, false);
+            let r = p.process(&w, &ReadOptions::default());
+            assert!(
+                r.bytes_returned > 0,
+                "stalled at {cursor} of {head} after {pages} pages"
+            );
+            cursor = r.cursor;
+            pages += 1;
+            assert!(pages < 200, "paging did not terminate");
+        }
+        assert_eq!(cursor, head);
+    }
+
+    /// **The sentinel names no rule, and the ordering it gets is the one
+    /// REQ-O-009 already asks for (GH #142).**
+    ///
+    /// `render` resolves `Span::rule` against `rules.rules`, so a marker
+    /// nothing matched needs an index no rule can hold. `usize::MAX` is
+    /// out of range for every rule set that can exist — an
+    /// `extra_redaction_patterns` file makes the length an operator's
+    /// choice, so "one past the end" would be a real index in a larger
+    /// set — and it sorts last, so when a real rule's span and an
+    /// unresolved marker begin at the same offset `merge_spans` keeps the
+    /// informative kind.
+    #[test]
+    fn the_unresolved_sentinel_names_no_rule_and_loses_every_tie() {
+        let p = processor();
+        // Written as a lookup rather than as a comparison against
+        // `rules.len()`: clippy rejects the comparison as absurd — which
+        // is the point, `usize::MAX` cannot be a valid index for any rule
+        // set — and the lookup says the same thing without asserting a
+        // tautology about the type.
+        assert!(
+            p.rules.rules.get(redact::UNRESOLVED_RULE).is_none(),
+            "the sentinel must name no rule"
+        );
+        assert_eq!(
+            redact::span_kind(&p.rules, redact::UNRESOLVED_RULE),
+            redact::UNRESOLVED_KIND
+        );
+        let github = p
+            .rules
+            .rules
+            .iter()
+            .position(|r| r.kind == "github")
+            .expect("the built-in set has a github rule");
+        let merged = redact::merge_spans(vec![
+            Span {
+                start: 4,
+                end: 20,
+                rule: redact::UNRESOLVED_RULE,
+            },
+            Span {
+                start: 4,
+                end: 44,
+                rule: github,
+            },
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            redact::span_kind(&p.rules, merged[0].rule),
+            "github",
+            "a rule that matched must name the marker, not the pseudo-kind"
+        );
     }
 }

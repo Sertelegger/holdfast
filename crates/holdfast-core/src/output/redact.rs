@@ -37,6 +37,57 @@ pub fn marker(kind: &str) -> String {
 /// [`RuleSet::compile`]: super::rules::RuleSet
 pub const UNRESOLVED_KIND: &str = "unresolved";
 
+/// The [`Span::rule`] a marker carries when **no rule names it** — the
+/// index side of [`UNRESOLVED_KIND`], for the one span the pipeline
+/// raises without a rule having matched (GH #142).
+///
+/// **`usize::MAX` rather than `rules.rules.len()`, and the reasons are
+/// three.**
+///
+/// 1. *It cannot alias.* A `Span` carries a bare `usize` and outlives the
+///    call that built it, so a sentinel defined as "one past the end"
+///    would be a **valid index** in any larger rule set — and
+///    `extra_redaction_patterns` makes the set's length an operator's
+///    choice. `usize::MAX` is out of range for every rule set that can
+///    exist.
+/// 2. *It sorts last, which is the tie-break REQ-O-009 already wants.*
+///    [`merge_spans`] orders by `(start, rule)` and the earliest span
+///    names the merged marker — "ties go to the earlier rule, which is
+///    why rule order in the TOML is specific-first". An unresolved
+///    marker is maximally unspecific, so a real rule beginning at the
+///    same offset must win, and `usize::MAX` makes that fall out of the
+///    existing sort rather than needing a special case in it.
+/// 3. *It fails loudly where it is not handled.* Every other consumer of
+///    `Span::rule` indexes `rules.rules` directly — `redact_str`,
+///    `StreamRedactor::render`, `screen`, the sweep — and none of them
+///    can receive this sentinel today. If one later does, `rules.rules[usize::MAX]`
+///    panics at once instead of quietly printing the wrong kind. A
+///    length-based sentinel would be in range often enough to be
+///    plausible and wrong.
+///
+/// A synthetic rule appended to the [`RuleSet`] was the other candidate
+/// and is ruled out by REQ-O-011a: `unresolved` is the one kind
+/// [`RuleSet`] refuses a rule, precisely so that the marker cannot be
+/// read as "a rule matched".
+///
+/// [`RuleSet`]: super::rules::RuleSet
+/// [`merge_spans`]: crate::output::redact::merge_spans
+pub const UNRESOLVED_RULE: usize = usize::MAX;
+
+/// The kind a span's marker announces — [`UNRESOLVED_RULE`]'s kind, or
+/// the rule's own.
+///
+/// The one place `Span::rule` is resolved on a path that can carry the
+/// sentinel. Written as a function rather than inlined so the sentinel
+/// has exactly one reader.
+pub fn span_kind(rules: &RuleSet, rule: usize) -> &str {
+    if rule == UNRESOLVED_RULE {
+        UNRESOLVED_KIND
+    } else {
+        &rules.rules[rule].kind
+    }
+}
+
 /// Find every secret span in `window`, whose first byte is at absolute
 /// offset `window_start`. Spans come back sorted and non-overlapping.
 pub fn find_spans(rules: &RuleSet, window: &[u8], window_start: u64) -> Vec<Span> {
