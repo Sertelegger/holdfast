@@ -282,10 +282,13 @@ impl OutputProcessor {
     ///
     /// The cost of stopping here is stated rather than elided: a
     /// credential that straddles a read boundary **with an escape inside
-    /// it** is still released half-emitted, exactly as before this fix.
-    /// That is GH #142, it is byte-identical to the behaviour at
-    /// `v0.0.7`, and closing it needs a sharper in-flight predicate
-    /// rather than a different set of views — see the issue.
+    /// it** is still released half-emitted on *this* surface, exactly as
+    /// before that fix. That is GH #142. What closes it for a surface
+    /// that **masks** instead of shortening is
+    /// [`OutputProcessor::unvouched_boundary`]; `read_output` keeps this
+    /// boundary and keeps the residual, because a shortened read cannot
+    /// be revised — the byte that would revise it has been deleted from
+    /// the only stream consulted.
     ///
     /// [`PrefixIndex::earliest_partial`]: prefix_index::PrefixIndex::earliest_partial
     pub fn holdback_boundary(&self, w: &WindowSnapshot<'_>, opts: &ReadOptions) -> u64 {
@@ -295,6 +298,75 @@ impl OutputProcessor {
         self.index
             .earliest_partial(&self.rules, w.tail_region, w.tail_region_start)
             .unwrap_or(w.head)
+    }
+
+    /// The earliest offset in the trailing region the redactor cannot
+    /// **vouch for** — §4.1's boundary asked of every stream a consumer
+    /// can derive from these bytes, not only of the raw region (GH #142).
+    ///
+    /// **This is a second boundary, not a replacement, and exactly one
+    /// kind of surface may consume it.**
+    /// [`holdback_boundary`](Self::holdback_boundary) explains why a view
+    /// may not drive a *withhold*: `earliest_partial`'s continuation test
+    /// is load-bearing on the control bytes every view deletes, so a view
+    /// that says "still arriving" about ordinary output says it for ever.
+    /// That argument is about **shortening**. A read that has been
+    /// shortened cannot be revised, because the byte that would revise it
+    /// — the space, the newline, the `\x1b` — is the byte the view
+    /// removed, and `read_output` consults no other stream. The denial is
+    /// therefore permanent, and the two cases are provably
+    /// indistinguishable: `use crate::re_exports\x1b[0m` in a stripped
+    /// view genuinely *is* `\bre_[A-Za-z0-9_]{24,}` with seven of its
+    /// twenty-four value bytes arrived.
+    ///
+    /// **A mask is not a shortening and the argument does not carry over
+    /// to it.** §18.2 gives `held_back` two spellings and says which
+    /// surface gets which: *"On a cursor read the response is
+    /// **shortened**: the read end is capped at `holdback_boundary` and
+    /// `next_cursor` stops there. On `get_screen_state` the grid is
+    /// **masked**, not shortened — a screen has no tail to cut, so the
+    /// withheld cells carry `[REDACTED:unresolved]` and the geometry is
+    /// unchanged."* The stated reason is geometry, never principle. A
+    /// masked grid denies no range, moves no cursor, and is
+    /// **re-rendered from the live parser on every call** (REQ-O-011a:
+    /// the mask is the cells where the live render differs from the
+    /// render at the boundary), so the next call simply produces a
+    /// different answer. Nothing is destroyed, and the answer is revised
+    /// the moment the buffer says something different.
+    ///
+    /// **It is not free, and the cost is a rate rather than a strand.**
+    /// A mask that never clears still covers the cells the unvouched
+    /// bytes wrote, for as long as nothing else arrives, and the grid
+    /// carries a residual of its own — see
+    /// [`ScreenTracker::boundary_screen`] on an evicted replay front,
+    /// which this boundary reaches more often than the raw one does.
+    /// Measured rates and the eviction interaction are in the CHANGELOG
+    /// entry for this change and pinned by the tests named there.
+    ///
+    /// Never later than [`holdback_boundary`](Self::holdback_boundary):
+    /// a raw in-flight prefix is still in flight whatever a view thinks,
+    /// so the two compose by `min`. `!opts.redact` and a `tail_*` bypass
+    /// short-circuit for the reason §4.1 gives — the audited opt-out is
+    /// the agent's recourse *from* the holdback, and a mask that survived
+    /// it would be a hole in that recourse rather than a second layer.
+    ///
+    /// [`ScreenTracker::boundary_screen`]: crate::screen::ScreenTracker
+    pub fn unvouched_boundary(&self, w: &WindowSnapshot<'_>, opts: &ReadOptions) -> u64 {
+        let raw = self.holdback_boundary(w, opts);
+        if !opts.redact || w.bypass_holdback {
+            return raw;
+        }
+        let mut earliest = raw;
+        for view in normalise::emitted_views(w.tail_region, w.tail_region_start) {
+            // `region_start` is 0 because the offset wanted here is an
+            // index *into the view*, which `NormalView::raw_offset` then
+            // maps back to the raw stream. Handing the view the raw
+            // `tail_region_start` would produce a number that is neither.
+            if let Some(at) = self.index.earliest_partial(&self.rules, view.bytes(), 0) {
+                earliest = earliest.min(view.raw_offset(at as usize));
+            }
+        }
+        earliest
     }
 
     /// Every secret span in `region`, judged over **each byte stream a
@@ -664,6 +736,68 @@ mod tests {
         let p = processor();
         let w = snapshot(&p, buffer, req_start, max_bytes, true, false);
         p.process(&w, &ReadOptions::default())
+    }
+
+    /// **The two boundaries compose by `min`, and `read_output` keeps the
+    /// raw one (GH #142).** Three properties, each of which a plausible
+    /// implementation gets wrong on its own:
+    ///
+    /// 1. the unvouched boundary is never *later* than §4.1's — a raw
+    ///    in-flight prefix is still in flight whatever a view thinks;
+    /// 2. it is strictly earlier on the fixture this issue is about, so
+    ///    the row is not passing vacuously;
+    /// 3. `process` — the read path — is byte-identical either way,
+    ///    because it never asks this question. Handing it the unvouched
+    ///    boundary is the change PR #162 measured at 2,570 zero-byte
+    ///    second reads.
+    #[test]
+    fn the_unvouched_boundary_is_never_later_than_the_holdback_and_never_reaches_a_read() {
+        let p = processor();
+        let o = ReadOptions::default();
+        let spliced = b"line one\nghp_0123456789a\x1b[0mbcdefghijABCDEFGHIJ01234";
+        let arriving = format!("export TOKEN={}", &GITHUB[..20]).into_bytes();
+        let ordinary = b"   Compiling holdfast-core v0.0.1\n".to_vec();
+
+        for buf in [spliced.to_vec(), arriving, ordinary] {
+            let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+            assert!(
+                p.unvouched_boundary(&w, &o) <= p.holdback_boundary(&w, &o),
+                "the unvouched boundary released bytes §4.1 is withholding"
+            );
+        }
+
+        // Strictly earlier on the fixture, and §4.1 finds nothing at all.
+        let w = snapshot(&p, spliced, 0, 32 * 1024, true, false);
+        assert_eq!(p.holdback_boundary(&w, &o), w.head);
+        assert!(p.unvouched_boundary(&w, &o) < w.head);
+
+        // And the read is untouched: full payload, no flag, no cursor.
+        let r = read(spliced, 0, 32 * 1024);
+        assert!(!r.held_back);
+        assert_eq!(r.bytes_returned, spliced.len());
+        assert_eq!(r.next_cursor, None);
+    }
+
+    /// The audited opt-out and the `tail_*` bypass reach the new boundary
+    /// on exactly the terms §4.1 gives them: both answer `head`, so a mask
+    /// cannot survive a recourse that exists to get *past* the holdback.
+    #[test]
+    fn the_unvouched_boundary_honours_both_of_section_four_ones_bypasses() {
+        let p = processor();
+        let spliced = b"line one\nghp_0123456789a\x1b[0mbcdefghijABCDEFGHIJ01234";
+
+        let w = snapshot(&p, spliced, 0, 32 * 1024, true, false);
+        let no_redact = ReadOptions {
+            redact: false,
+            ..ReadOptions::default()
+        };
+        assert_eq!(p.unvouched_boundary(&w, &no_redact), w.head);
+
+        let bypass = snapshot(&p, spliced, 0, 32 * 1024, true, true);
+        assert_eq!(
+            p.unvouched_boundary(&bypass, &ReadOptions::default()),
+            bypass.head
+        );
     }
 
     #[test]

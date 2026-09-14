@@ -97,6 +97,65 @@ is cut, named and published is in
 
 ### Security
 
+- **`get_screen_state` no longer paints a credential that arrived with an
+  escape sequence inside it, and the grid is the only surface this covers.**
+  §4.1's holdback decides whether a secret is still arriving by scanning the
+  **raw** trailing region, and a control byte is what *ends* the value run
+  that test rests on — so `ghp_` with 39 of its 40 characters and a colour
+  reset spliced inside matched nothing, the boundary stayed at `buffer.head`,
+  and the grid, whose mask is a function of that boundary, rendered the token
+  contiguously, because an emulator writes no cell for an escape. On a
+  `readOnlyHint: true` tool, with `read_output` reporting `held_back: false`
+  and `redactions: {}` in the same moment. §9.2 Subject 2 names the class in
+  terms. The grid now masks on a **second** boundary, which asks §4.1's own
+  question of every byte stream a consumer can derive from those bytes rather
+  than of the raw bytes alone, and maps the answer back to raw offsets
+  ([#142]).
+- **What that does not cover, listed rather than implied.** Every other
+  consumer of the §4.1 boundary *shortens* — it caps a read end and moves a
+  cursor — and none of them takes the new one: `read_output`,
+  `resources/read`, `wait_for_pattern`, `holdfast logs` (whose `--tail` is
+  outside the holdback to begin with) and the `observer` attach stream behind
+  `holdfast watch` are byte-identical to before. That is deliberate and it is
+  measured: a shortened read cannot be revised, because the byte that would
+  revise it — the space, the newline, the `ESC` — is the byte the view
+  deleted, and the read consults no other stream. The same change made on
+  `read_output` stranded ordinary output permanently at 2,570 zero-byte second
+  reads against `main`'s 258, and the two cases are not separable, because
+  `use crate::re_exports` followed by a colour reset genuinely *is* the
+  `resend-api-key` rule with seven of its twenty-four value bytes arrived. A
+  mask is admissible where a shortening is not for one reason: it denies no
+  range, moves no cursor, and is recomputed from the live grid on every call,
+  so the next call revises it. §18.2 already gave the grid that spelling —
+  *"a screen has no tail to cut"* — and the reason it gives is geometry, never
+  principle ([#142]).
+- `prompt.last_line` needed nothing and got nothing. It has run the in-flight
+  test over the **rendered** line since 0.0.5, which is a view-driven denial
+  by another route, and REQ-O-013 mandates it; measured on `main`, this
+  issue's own fixture already returns `""` there. Worth stating because it
+  means a view-driven denial had already shipped on one surface while the
+  rule in `normalise.rs` still read as an unqualified ban ([#142]).
+- **The cost, measured on three corpora and not zero.** The new boundary is
+  open at moments §4.1's is not, and every such moment masks part of the
+  grid. At each 512-byte read boundary: **+0.0000 pp** on 95 KB of this
+  repository's prose, on 5.3 MB of its own Rust source, and on a real
+  `cargo build` log captured through a pty (0.0510 % either way); **+0.0548
+  pp** on a 2.4 MB `jq -C` blob, and **+0.2998 pp** on that source recoloured
+  mid-word. `held_back` stays rare, which is the 0.0.3 plan's requirement for
+  it. The one place this makes an existing defect *worse* rather than merely
+  more frequent is the grid's documented eviction residual: on a session that
+  has outlived its 1 MiB ring buffer, any open boundary masks the **whole**
+  visible screen, and this boundary reaches that state at the rates above.
+  Both arms are pinned by
+  `an_evicted_front_masks_the_whole_screen_and_the_new_boundary_reaches_it_oftener`,
+  whose other half is the leak being closed — on `main` that same moment
+  returns the credential in the clear ([#142]).
+- **Still open on `read_output`, and this entry is not the fix for it.** A
+  credential arriving with an escape inside it is still released
+  half-emitted there, bounded at *(rule minimum − 1)* characters, and [#166]
+  — an unbounded leak on the same two tools, reachable by `cat ~/.ssh/id_rsa`
+  and needing no escape at all — is untouched ([#142]).
+
 - **A credential is no longer written into a child whose terminal still
   echoes.** `request_secret_input` has no echo-state precondition — it raises
   and broadcasts `AwaitingSecret` the moment the agent calls it, without
@@ -154,7 +213,8 @@ is cut, named and published is in
   the in-flight predicate it rests on is load-bearing on the very control
   bytes those streams remove, so it still reads the raw region alone, and a
   credential straddling a read boundary with an escape inside it is still
-  released half-emitted ([#142]). `redact: false` and `--raw` are byte-identical
+  released half-emitted ([#142]). *That is still true of `read_output` and no
+  longer true of `get_screen_state`; see the Security entry above.* `redact: false` and `--raw` are byte-identical
   to before ([#125]).
   **This closed the matching side of #125 and not every class of the
   defect.** The range and grammar axes — [#138] (spans judged over the
@@ -162,9 +222,10 @@ is cut, named and published is in
   which the stripper does not open a sequence on and the screen emulator
   discards as an unhandled control — the discard being what splices the
   token) — are now closed too; see the two entries below. The *withholding*
-  side is still open: a credential still arriving with an escape inside it
-  is released half-emitted ([#142]), and a token split across reads with an
-  escape inside it is still partly released ([#135]). Redaction is not
+  side is still open **on every surface that shortens**: a credential still
+  arriving with an escape inside it is released half-emitted by `read_output`
+  ([#142] — the grid no longer does this), and a token split across reads
+  with an escape inside it is still partly released ([#135]). Redaction is not
   closed as a class.
 - **Redaction now judges the bytes that go out, not only the window they
   were drawn from ([#138]).** Spans were found over
@@ -725,3 +786,4 @@ residuals that are known and accepted.
 [#139]: https://github.com/Sertelegger/holdfast/issues/139
 [#142]: https://github.com/Sertelegger/holdfast/issues/142
 [#149]: https://github.com/Sertelegger/holdfast/issues/149
+[#166]: https://github.com/Sertelegger/holdfast/issues/166

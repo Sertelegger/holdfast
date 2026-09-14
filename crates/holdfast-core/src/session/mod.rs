@@ -1983,11 +1983,41 @@ impl Session {
         (boundary < head).then_some(boundary)
     }
 
+    /// The **unvouched** boundary as an open value (GH #142): `Some(b)`
+    /// only when some stream a consumer can derive from the trailing
+    /// region carries an in-flight secret prefix, `None` when none does.
+    ///
+    /// **Only a surface that masks may call this**, and today that is
+    /// `get_screen_state` alone. The reasoning is
+    /// [`OutputProcessor::unvouched_boundary`]'s and is not restated
+    /// here; what belongs here is the consequence for this type's API:
+    /// [`open_holdback`](Self::open_holdback) is the boundary a
+    /// *shortening* surface must use and this one is not a drop-in for
+    /// it. Handing this value to `read_processed` strands ordinary
+    /// output permanently, which is measured rather than feared.
+    pub fn open_unvouched_holdback(&self, processor: &OutputProcessor) -> Option<u64> {
+        let (boundary, head) =
+            self.boundary_snapshot(processor, OutputProcessor::unvouched_boundary);
+        (boundary < head).then_some(boundary)
+    }
+
     /// The §4.1 boundary **and** the head it was measured against, from
     /// one `buffer.lock()`. The pair is the unit of truth; see
     /// [`open_holdback`](Self::open_holdback) for why splitting it is a
     /// defect rather than a style choice.
     fn holdback_snapshot(&self, processor: &OutputProcessor) -> (u64, u64) {
+        self.boundary_snapshot(processor, OutputProcessor::holdback_boundary)
+    }
+
+    /// `holdback_snapshot` with the boundary rule as an argument, so the
+    /// raw boundary and the unvouched one are computed from *the same*
+    /// snapshot construction rather than from two copies of it that can
+    /// drift apart.
+    fn boundary_snapshot(
+        &self,
+        processor: &OutputProcessor,
+        rule: impl Fn(&OutputProcessor, &WindowSnapshot<'_>, &ReadOptions) -> u64,
+    ) -> (u64, u64) {
         let limits = processor.limits;
         let (tail_region, scan_start, head) = {
             let buffer = self.buffer.lock();
@@ -2011,10 +2041,7 @@ impl Session {
             front_clipped: false,
             truncated_at_tail: false,
         };
-        (
-            processor.holdback_boundary(&snapshot, &ReadOptions::default()),
-            head,
-        )
+        (rule(processor, &snapshot, &ReadOptions::default()), head)
     }
 
     /// A snapshot of the cumulative per-session redaction tally.
@@ -2332,7 +2359,16 @@ impl Session {
         // against a `T2` head: bytes that arrive in between make the
         // tracker mask cells for a secret nobody is withholding. The
         // pairing has to happen where both numbers were read.
-        let holdback = self.open_holdback(processor);
+        //
+        // **`open_unvouched_holdback`, not `open_holdback` (GH #142).**
+        // The grid *masks*; it does not shorten. The boundary a masking
+        // surface may use is the one asked of every stream a consumer can
+        // derive, which is what closes the case where a credential
+        // arrives with a colour reset spliced inside it — invisible to
+        // the raw scan, and rendered contiguous on the grid. No shortening
+        // surface may take this value; see
+        // [`Session::open_unvouched_holdback`].
+        let holdback = self.open_unvouched_holdback(processor);
         self.screen
             .lock()
             .capture(diff_from, redact, Instant::now(), &*self.buffer, holdback)
@@ -4545,6 +4581,69 @@ mod tests {
                  judged against a head sampled after it"
             );
         }
+    }
+
+    /// **The wiring, and it is the only place a mutation of it shows
+    /// (GH #142).** `ScreenTracker::capture` takes the boundary as an
+    /// argument, so every unit test of the mask can be satisfied by a
+    /// tracker that masks correctly while `screen_state` hands it the
+    /// wrong number. This row is asked of the session, so swapping
+    /// `open_unvouched_holdback` back to `open_holdback` here turns it
+    /// red and nothing else does.
+    ///
+    /// The fixture is GH #142's own: `ghp_` with 39 of its 40 characters
+    /// and a colour reset spliced inside. §4.1 sees no candidate in the
+    /// raw bytes — asserted, because without that this passes against the
+    /// implementation it exists to reject — and the grid renders the token
+    /// contiguously because the emulator writes no cell for an escape.
+    #[test]
+    fn the_grid_masks_a_credential_no_raw_scan_calls_in_flight() {
+        let (s, pty) = painted_session(ScreenTracking::On);
+        let processor = OutputProcessor::builtin().expect("builtin rules");
+        let before = s.buffer_head();
+        let fixture: &[u8] = b"\r\nline one\r\nghp_0123456789a\x1b[0mbcdefghijABCDEFGHIJ01234";
+        pty.queue_output(fixture);
+        wait_for_bytes(&s, before + fixture.len() as u64);
+
+        assert!(
+            s.open_holdback(&processor).is_none(),
+            "§4.1 found a candidate in the raw region; this fixture has \
+             stopped being GH #142's"
+        );
+        assert!(
+            s.open_unvouched_holdback(&processor).is_some(),
+            "no view called the token in flight"
+        );
+        let g = grid(s.screen_state(None, true, &processor));
+        assert!(g.held_back, "the grid reported nothing withheld");
+        let text = g.lines.join("\n");
+        assert!(
+            !text.contains("ghp_0123456789"),
+            "a readOnlyHint tool returned the in-flight credential: {text:?}"
+        );
+    }
+
+    /// The paired negative: `redact: false` is §4.1's audited recourse
+    /// *from* the holdback, so a mask that survived it would be a hole in
+    /// the recourse rather than a second layer of safety. Same fixture,
+    /// same moment, the argument flipped.
+    #[test]
+    fn the_unvouched_mask_honours_the_audited_opt_out() {
+        let (s, pty) = painted_session(ScreenTracking::On);
+        let processor = OutputProcessor::builtin().expect("builtin rules");
+        let before = s.buffer_head();
+        let fixture: &[u8] = b"\r\nline one\r\nghp_0123456789a\x1b[0mbcdefghijABCDEFGHIJ01234";
+        pty.queue_output(fixture);
+        wait_for_bytes(&s, before + fixture.len() as u64);
+
+        let g = grid(s.screen_state(None, false, &processor));
+        assert!(!g.held_back);
+        assert!(
+            g.lines
+                .join("\n")
+                .contains("ghp_0123456789abcdefghijABCDEFGHIJ01234"),
+            "the opt-out did not reach the grid"
+        );
     }
 
     /// The pairing, and it is not optional: without it the row above is

@@ -1026,3 +1026,144 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
          the cleartext body as a plain Vec"
     );
 }
+
+/// **A boundary a view may drive reaches masking surfaces and no others
+/// (GH #142).**
+///
+/// `OutputProcessor::unvouched_boundary` asks §4.1's in-flight question of
+/// every stream a consumer can derive from the trailing region, not only
+/// of the raw bytes. That is sound for a surface that **masks** — the
+/// answer is recomputed on every call and no range is denied — and
+/// measured-unsound for a surface that **shortens**, because a shortened
+/// read cannot be revised: the byte that would revise it is the byte the
+/// view deleted, and `read_output` consults no other stream. PR #162
+/// measured the consequence at 2,570 zero-byte second reads against
+/// `main`'s 258.
+///
+/// So the rule is a fact about *which files may name it*, and it is
+/// asserted here rather than left to review, because the call is one line
+/// and the two boundaries differ by one word. The listed modules are every
+/// shortening consumer in the tree — the read pipeline's callers, the
+/// resource reads, the `prompt.last_line` builder, the attach observer
+/// stream, and the CLI that wraps `read_output`.
+///
+/// Widening this list is not forbidden; doing it without moving the
+/// argument above is.
+#[test]
+fn no_shortening_surface_names_the_unvouched_boundary() {
+    let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let cli = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("holdfast")
+        .join("src");
+
+    // Every file that may name it, relative to `crates/`. The definition,
+    // the module header that states the asymmetry, the session accessor
+    // plus the one `screen_state` call, and the grid's own tests.
+    let allowed = [
+        "holdfast-core/src/output/mod.rs",
+        "holdfast-core/src/output/normalise.rs",
+        "holdfast-core/src/session/mod.rs",
+        "holdfast-core/src/screen/mod.rs",
+    ];
+
+    let mut named = Vec::new();
+    for dir in [core, cli] {
+        for file in rust_files(&dir) {
+            let text = read_src(&file);
+            if !text.contains("unvouched_boundary") && !text.contains("open_unvouched_holdback") {
+                continue;
+            }
+            let rel = file
+                .components()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            named.push(rel);
+        }
+    }
+
+    assert!(
+        !named.is_empty(),
+        "nothing in the tree names the unvouched boundary; it was removed \
+         and this guard is guarding an absence"
+    );
+    for rel in &named {
+        assert!(
+            allowed.iter().any(|a| rel.ends_with(a)),
+            "{rel} names the unvouched boundary. A shortening surface may \
+             not consume it — see this test's doc comment, and \
+             `OutputProcessor::holdback_boundary` for the boundary a \
+             shortening surface must use instead"
+        );
+    }
+
+    // And the shortening surfaces by name, so a future file that is not in
+    // `allowed` but also not one of these cannot pass by being new.
+    for (rel, dir) in [
+        ("mcp/tools.rs", "holdfast-core"),
+        ("mcp/resources.rs", "holdfast-core"),
+        ("mcp/detection.rs", "holdfast-core"),
+        ("attach/redact_stream.rs", "holdfast-core"),
+        ("commands.rs", "holdfast"),
+    ] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(dir)
+            .join("src")
+            .join(rel);
+        let text = read_src(&path);
+        let calls = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("unvouched_boundary(") || l.contains("open_unvouched_holdback("))
+            .count();
+        assert_eq!(
+            calls, 0,
+            "{dir}/src/{rel} calls the unvouched boundary; that surface \
+             shortens, and a view-driven shortening is the stranding PR \
+             #162 measured"
+        );
+    }
+
+    // The read pipeline itself lives beside the definition, so the file
+    // list above cannot speak for it. Outside its own `mod tests`, the
+    // only mention in `output/mod.rs` must be the `pub fn` that declares
+    // it — in particular `OutputProcessor::process` must not reach it.
+    let output = read_src(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("output")
+            .join("mod.rs"),
+    );
+    let shipped = &output[..output
+        .find("\n#[cfg(test)]\n")
+        .expect("output/mod.rs no longer has a unit-test module")];
+    let mentions: Vec<&str> = shipped
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("///") && !l.trim_start().starts_with("//"))
+        .filter(|l| l.contains("unvouched_boundary("))
+        .collect();
+    assert_eq!(
+        mentions.len(),
+        1,
+        "output/mod.rs mentions the unvouched boundary {} times outside its \
+         tests; exactly one — the definition — is permitted, because \
+         `process` is the shortening surface this rule exists for. Found: \
+         {mentions:?}",
+        mentions.len()
+    );
+    assert!(
+        mentions[0]
+            .trim_start()
+            .starts_with("pub fn unvouched_boundary("),
+        "the single mention in output/mod.rs is a call rather than the \
+         definition: {:?}",
+        mentions[0]
+    );
+}
