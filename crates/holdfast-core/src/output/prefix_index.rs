@@ -703,6 +703,131 @@ mod tests {
         );
     }
 
+    /// **Every shipped rule must yield at least one indexed prefix** (GH
+    /// #170).
+    ///
+    /// [`PrefixIndex::unresolved_from`] above and
+    /// `attach/redact_stream.rs` both *describe* this class — a rule
+    /// whose pattern derives no literal and which declares none gets no
+    /// entry in the index, so [`PrefixIndex::earliest_partial`] is
+    /// structurally blind to it and the targeted holdback can never cover
+    /// a partial value of it — and neither one **enumerates** it.
+    /// `telegram-bot-token` sat in that class from the day it was added:
+    /// `\b[0-9]{8,10}:AA…` breaks derivation at the leading class and the
+    /// rule declares nothing, so a partial token comes back with
+    /// `held_back: false` and the observer stream drops the bytes with no
+    /// marker. Whole-value reads redact it correctly, which is why the
+    /// rule's own positive/negative fixture passes and nothing noticed.
+    ///
+    /// **The ledger is not a waiver.** The assertion is set *equality*, so
+    /// it fails in both directions: when a **new** rule joins the blind
+    /// class — the next defect, which is the whole point of the check —
+    /// and when a listed rule is fixed but left here. That second half is
+    /// what separates a ledger from the hand-kept count GH #53 watched go
+    /// stale; this one cannot rot quietly, because rotting is a failure.
+    ///
+    /// The sweep runs the full configurable span the issue measured. A
+    /// rule that has an entry only at a generous
+    /// `prefilter_prefix_expansion_limit` is still unprotected on a site
+    /// that lowered it, so "indexed" has to mean indexed across the range,
+    /// not at the default alone.
+    ///
+    /// **What still slips past — this guard proves existence, not reach:**
+    ///
+    /// * *An entry that can never resolve.* A declared prefix sitting
+    ///   behind a non-optional atom indexes fine and counts here, but
+    ///   [`PrefixIndex::earliest_partial`]'s third condition anchors the
+    ///   rule's own regex **at the prefix**, so it never matches and the
+    ///   candidate never clears. Measured on the one-line fix GH #170
+    ///   proposes (`prefixes = [":AA"]`): a *complete* telegram token then
+    ///   holds back forever instead of leaking — this test goes green on
+    ///   it. That is why the ledger still has an entry.
+    /// * *An incomplete declared set.* Declared prefixes **replace** the
+    ///   derived ones rather than joining them, so a rule that declares
+    ///   some of its alternation's branches counts as covered here.
+    ///   `launchdarkly-key` alternates `(?:sdk|mob|api)-` and declares
+    ///   only the first two: measured, an in-flight `api-…` key is not
+    ///   held back while `sdk-…` and `mob-…` are. This guard is blind to
+    ///   that by construction — it asks for one entry, not the right set.
+    /// * *Prefix quality.* An entry at exactly [`MIN_PREFIX_LEN`] that
+    ///   collides with ordinary output counts the same as a good one;
+    ///   `the_known_transient_holdbacks_are_pinned` covers that direction.
+    /// * *Below the sweep floor.* At a limit of 4, `github-token` loses
+    ///   its entry too (measured) because five branches no longer fit.
+    ///   The floor of 8 is a judgement about plausible operator values,
+    ///   not a proof.
+    /// * *User rules.* Only [`RuleSet::builtin`] is swept;
+    ///   `extra_redaction_patterns` from an operator's config is not.
+    /// * *The other three exposure axes* — escape-splicing (GH #142), the
+    ///   context rules (GH #160), the scan window (GH #166) — are
+    ///   disjoint from this one and untouched by it.
+    ///
+    /// **A behavioural version of this guard was measured and rejected.**
+    /// Driving each rule's own `positive` fixture truncated by one byte
+    /// through [`PrefixIndex::earliest_partial`] and demanding a candidate
+    /// reads like the stronger check, and is not one: 25 of 51 rules fail
+    /// it correctly, because an open-ended quantifier (`{24,}`) means the
+    /// truncated example still satisfies the rule, so the redactor already
+    /// covers it and there is rightly nothing to withhold. A guard with 25
+    /// standing exceptions is a guard nobody reads.
+    #[test]
+    fn every_shipped_rule_yields_at_least_one_indexed_prefix() {
+        /// Rules known to have no index entry, each with the issue that
+        /// tracks it. Removing a fix from the tree without removing it
+        /// here fails this test, and so does the reverse.
+        const KNOWN_BLIND: &[(&str, &str)] = &[("telegram-bot-token", "GH #170")];
+
+        let rules = RuleSet::builtin().unwrap();
+        // Vacuity control, the house rule in this suite: a rule set that
+        // failed to load has nothing to check and would pass silently.
+        assert!(
+            rules.rules.len() >= 40,
+            "only {} rules loaded — the sweep below would be vacuous",
+            rules.rules.len()
+        );
+        let mut expected: Vec<&str> = KNOWN_BLIND.iter().map(|(n, _)| *n).collect();
+        expected.sort_unstable();
+
+        for (name, _) in KNOWN_BLIND {
+            assert!(
+                rules.rules.iter().any(|r| r.name == *name),
+                "the ledger names `{name}`, which is not a shipped rule any more: \
+                 drop the row rather than leaving it to match nothing"
+            );
+        }
+
+        // The span GH #170 measured. 8 is the floor: below it the cap
+        // itself starts dropping legitimate multi-branch classes, which
+        // is a tuning question and not this blind spot.
+        for limit in [8usize, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
+            let index = PrefixIndex::build(&rules, limit);
+            let mut blind: Vec<&str> = rules
+                .rules
+                .iter()
+                .filter(|r| index.prefixes_for(&rules, &r.name).is_empty())
+                .map(|r| r.name.as_str())
+                .collect();
+            blind.sort_unstable();
+            assert_eq!(
+                blind, expected,
+                "at prefilter_prefix_expansion_limit={limit}, the set of rules with no \
+                 indexed prefix is not the known-blind ledger. A name here and not in \
+                 KNOWN_BLIND is a new rule the partial-secret holdback cannot cover at \
+                 all: give it a `prefixes` entry whose literal starts the match, or \
+                 file the issue and add it to the ledger. A name in KNOWN_BLIND and \
+                 not here is fixed — delete its row."
+            );
+        }
+
+        // The shipped default is in the sweep, but pin it by name too:
+        // the sweep would still pass if the constant moved outside it.
+        assert!(
+            (8..=4096).contains(&DEFAULT_PREFIX_EXPANSION_LIMIT),
+            "DEFAULT_PREFIX_EXPANSION_LIMIT ({DEFAULT_PREFIX_EXPANSION_LIMIT}) left the \
+             swept range, so this test no longer covers the shipped configuration"
+        );
+    }
+
     /// The measured residual, pinned so it is visible rather than assumed
     /// absent. Each of these is a *legitimate* in-flight candidate — the
     /// rule really could still complete — and each releases the moment a
