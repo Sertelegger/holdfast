@@ -43,9 +43,21 @@ See spec §12.6 for the full ship-list and §14 for the post-v0.1.0 roadmap.
 
 ## Working on a Mac (or any non-Linux Unix)
 
-Every CI job is `ubuntu-24.04`, so nothing here is caught by CI and all of it
-has already cost someone a wrong diagnosis. Full detail and measurements:
+**CI now runs three platforms, and this section used to say it ran one.**
+`macos-native` (macos-14, arm64) and `windows-native` (windows-2022) are both
+required contexts alongside the `ubuntu-24.04` jobs, so a macOS-only break no
+longer reaches `main` unseen. `ci.yml`'s own comment on that job records the
+correction — and recorded it *there* rather than here, which is why this
+sentence stayed wrong.
+
+What CI still cannot reach: **FreeBSD at runtime** (`cargo check` cross-compiles
+it and nothing executes it) and the 55 shell-spawning `holdfast-core` lib tests
+on Windows ([#91]). Everything below has still cost someone a wrong diagnosis
+and is still worth knowing — it is now a guide to reading a red `macos-native`
+job rather than a substitute for one. Full detail and measurements:
 `docs/runbooks/2026-08-19-macos-verification.md` §8.
+
+[#91]: https://github.com/Sertelegger/holdfast/issues/91
 
 - **A session nobody reads from stalls its shell.** macOS gives a pty a far
   smaller output buffer than Linux; undrained it fills, and the shell blocks
