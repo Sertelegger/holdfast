@@ -68,18 +68,32 @@
 //! re-derive the class, which is how both of those were found.
 //!
 //! **Which view may decide what.** The two halves of the GH #125 fix are
-//! deliberately not symmetric:
+//! deliberately not symmetric, and the axis is *whether the decision can
+//! be revised*, not whether a view may be consulted:
 //!
 //! * A view may add a **marker**. A marker is safe in every stream and
 //!   costs the caller nothing it was entitled to, so
 //!   [`OutputProcessor::all_spans`] reads every view.
-//! * A view may **not** add a **withhold**. A withhold denies the caller
-//!   bytes, and [`PrefixIndex::earliest_partial`] — the predicate behind
-//!   every withhold — is load-bearing on exactly the control bytes a view
+//! * A view may **not** shorten a read. A shortened read denies the
+//!   caller bytes, and [`PrefixIndex::earliest_partial`] — the predicate
+//!   behind it — is load-bearing on exactly the control bytes a view
 //!   deletes. Asked about a stripped view it strands ordinary output
-//!   behind a `held_back` that never clears, so
-//!   `OutputProcessor::holdback_boundary` reads the raw region alone.
-//!   GH #142 carries the measurement and the residual that leaves open.
+//!   behind a `held_back` that never clears, because the byte that would
+//!   clear it is the byte the view removed and the read consults no other
+//!   stream. So `OutputProcessor::holdback_boundary` reads the raw region
+//!   alone, and GH #142 carries both the measurement and the residual
+//!   that leaves open.
+//! * A view **may** add a **mask**, on the same rule as a marker and for
+//!   the same reason: a mask denies no range, moves no cursor, and is
+//!   recomputed from the live state on every call, so the next call
+//!   revises it. `OutputProcessor::unvouched_boundary` is that half —
+//!   §4.1's question asked of every view — and `get_screen_state` is its
+//!   only consumer (§18.2 gives the grid a non-shortening spelling of
+//!   `held_back`; REQ-O-011a defines the masked extent as a render-time
+//!   difference). `prompt.last_line` reached the same answer earlier by a
+//!   different route: it runs the predicate over the *rendered* line, so
+//!   it has been view-driven since before this boundary existed
+//!   (REQ-O-013, §9.2 Subject 1).
 //!
 //! The pipeline is `render` (strip or pass through) then [`encode`], and
 //! only two of its knobs drop bytes, so the set of derivable streams is

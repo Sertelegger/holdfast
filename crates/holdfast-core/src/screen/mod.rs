@@ -376,9 +376,31 @@ impl ScreenTracker {
     /// shape, and this tool has no such argument (REQ-O-003). `None` means
     /// the caller is not a holdback-bearing surface at all; `Some(b)` with
     /// `b` at or past `consumed_head` is the ordinary case and masks
-    /// nothing. The value is computed by the *session*, from the same
-    /// `OutputProcessor::holdback_boundary` call `read_output` uses, so
-    /// this never becomes a second rule.
+    /// nothing.
+    ///
+    /// **The mask is over cells, so the window title is outside it
+    /// (GH #142).** An OSC title sequence paints no cell, and the mask is
+    /// a cell-by-cell difference — so `\x1b]0;ghp_<39 of 40>\x07` leaves
+    /// the boundary open and [`Self::rendered_title`] still returns the
+    /// partial, because `redact_str` replaces only complete matches.
+    /// Measured, not inferred. The remedy would be `prompt.last_line`'s
+    /// (clip or suppress the reconstruction), and it is not taken here
+    /// because a title is sticky where a last line is not: the field would
+    /// stay denied until the child set a new one, which is a decision
+    /// about that field rather than about this boundary.
+    ///
+    /// **The value the session passes is the *unvouched* boundary, which
+    /// is at or before §4.1's and not the same number (GH #142).** This
+    /// used to say it was "the same `OutputProcessor::holdback_boundary`
+    /// call `read_output` uses, so this never becomes a second rule", and
+    /// the second clause is the one that mattered: what must not diverge
+    /// is the *rule*, not the arithmetic. `OutputProcessor::
+    /// unvouched_boundary` is §4.1's own question — is a secret still
+    /// arriving in the trailing region — asked of every stream a consumer
+    /// can derive from those bytes rather than of the raw bytes alone,
+    /// which is what a surface that **masks** may do and a surface that
+    /// **shortens** may not. This method never learns the difference:
+    /// it masks whatever it is handed.
     pub fn capture(
         &mut self,
         diff_from: Option<u64>,
@@ -718,9 +740,23 @@ impl ScreenTracker {
     /// missing whatever those bytes painted; the affected cells then
     /// differ from the live ones and are *masked* rather than shown. For a
     /// session that has outlived its ring buffer that is **every**
-    /// pre-boundary row, for as long as a holdback stays open — the whole
+    /// pre-boundary row, for as long as a boundary stays open — the whole
     /// visible screen comes back `[REDACTED:unresolved]`, which is a
     /// safe answer and a nearly useless one.
+    ///
+    /// **GH #142 made it reachable oftener, and by how much is measured
+    /// rather than guessed.** The boundary handed down is now
+    /// `OutputProcessor::unvouched_boundary`, which is open at moments
+    /// §4.1's is not: at every 512-byte read boundary over this
+    /// repository's own corpora that is **+0.0000 pp** on prose, on 5.3 MB
+    /// of this crate's source and on a real `cargo build` log captured
+    /// through a pty, **+0.0548 pp** on a `jq -C` blob and **+0.2998 pp**
+    /// on source recoloured mid-word. Small, and not zero — and at each
+    /// such moment on an outlived ring the cost is the whole screen rather
+    /// than a few cells, which is the one place this change makes a
+    /// pre-existing defect worse rather than only more frequent. Pinned by
+    /// `an_evicted_front_masks_the_whole_screen_and_the_new_boundary_reaches_it_oftener`,
+    /// whose other arm is the leak this replaces.
     ///
     /// **It is not repaired by replaying twice and diffing the replays
     /// against each other, and that is worth stating because it is the
@@ -1361,6 +1397,440 @@ mod tests {
         p.process(&base.contents_formatted());
         p.process(diff.as_bytes());
         p
+    }
+
+    /// GH #142's fixture: `ghp_` plus **39 of the 40 characters** its rule
+    /// needs, with a colour reset spliced inside it. The escape breaks the
+    /// raw value run, so `holdback_boundary` sees nothing in flight; every
+    /// view that strips it sees a token one character short.
+    const SPLICED: &[u8] = b"line one\r\nghp_0123456789a\x1b[0mbcdefghijABCDEFGHIJ01234";
+
+    /// Ordinary output that is *also* an in-flight candidate in a stripped
+    /// view: `re_` is `resend-api-key`'s indexed prefix and
+    /// `\bre_[A-Za-z0-9_]{24,}` can still complete. It is here because the
+    /// two fixtures are not distinguishable by any function of the buffer,
+    /// and a reader who does not know that will read the mask on this one
+    /// as a bug.
+    const ORDINARY: &[u8] = b"use crate::re_exports\x1b[0m";
+
+    /// Both boundaries over a byte log's trailing region, paired with the
+    /// head they were measured against — `Session::holdback_snapshot`
+    /// without a session. Returned in the open form, so `None` is
+    /// "nothing withheld" and cannot be confused with a boundary that
+    /// happens to equal the head.
+    fn boundaries(log: &ByteLog) -> (Option<u64>, Option<u64>) {
+        // Built once: `PrefixIndex::build` is the expensive half and a
+        // row below calls this sixty times.
+        static PROC: std::sync::OnceLock<crate::output::OutputProcessor> =
+            std::sync::OnceLock::new();
+        let p =
+            PROC.get_or_init(|| crate::output::OutputProcessor::builtin().expect("builtin rules"));
+        let head = log.bytes.len() as u64;
+        let start = head.saturating_sub(p.limits.partial_secret_scan_bytes as u64);
+        let tail = &log.bytes[start as usize..head as usize];
+        let w = crate::output::WindowSnapshot {
+            window: &[],
+            window_start: head,
+            tail_region: tail,
+            tail_region_start: start,
+            req_start: head,
+            head,
+            cap_end: head,
+            child_alive: true,
+            bypass_holdback: false,
+            front_clipped: false,
+            truncated_at_tail: false,
+        };
+        let o = crate::output::ReadOptions::default();
+        let open = |b: u64| (b < head).then_some(b);
+        (
+            open(p.holdback_boundary(&w, &o)),
+            open(p.unvouched_boundary(&w, &o)),
+        )
+    }
+
+    fn joined(g: &ScreenGrid) -> String {
+        g.lines.join("\n")
+    }
+
+    /// **The leak, and then its repair, in one test so the premise cannot
+    /// rot away from the conclusion (GH #142).**
+    ///
+    /// `read_output` is unchanged by this and the first two assertions say
+    /// so: the raw region carries no in-flight candidate at all, so §4.1
+    /// withholds nothing and a grid driven by §4.1's boundary paints the
+    /// credential. That is `main`'s behaviour on a `readOnlyHint: true`
+    /// tool, and §9.2 Subject 2 names the class: *"an implementation
+    /// reading §4.1's tail-read bypass as covering the grid returns, on a
+    /// `readOnlyHint: true` tool, exactly the in-flight bytes
+    /// `read_output` is answering `held_back: true` about in the same
+    /// moment."* Here it is worse than that sentence allows for, because
+    /// `read_output` is not answering `held_back: true` either.
+    ///
+    /// The repair is the **unvouched** boundary, and it is a mask rather
+    /// than a shortening — which is the whole reason a view may drive it
+    /// (§18.2: *"a screen has no tail to cut"*).
+    #[test]
+    fn the_grid_masks_a_credential_arriving_with_an_escape_spliced_inside_it() {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
+        feed(&mut t, &mut log, t0, SPLICED);
+
+        let (raw, unvouched) = boundaries(&log);
+        assert!(
+            raw.is_none(),
+            "the premise is that §4.1 withholds nothing here; if it ever \
+             starts to, this test stops being about GH #142"
+        );
+
+        // `main`: the boundary §4.1 hands the grid is "nothing withheld".
+        let before = full(t.capture(None, true, t0, &log, raw));
+        assert!(!before.held_back);
+        assert!(
+            joined(&before).contains("ghp_0123456789abcdefghijABCDEFGHIJ01234"),
+            "the reproduction failed to reproduce: {:?}",
+            before.lines[0..2].to_vec()
+        );
+
+        // The unvouched boundary: same call, same grid, one argument.
+        let b = unvouched.expect("a view sees the token in flight");
+        let after = full(t.capture(None, true, t0, &log, Some(b)));
+        assert!(after.held_back, "the grid reported nothing withheld");
+        let text = joined(&after);
+        assert!(
+            !text.contains("ghp_0123456789"),
+            "the credential is still on the grid: {text:?}"
+        );
+        assert!(
+            text.contains(&marker(UNRESOLVED_KIND)),
+            "masked without a marker: {text:?}"
+        );
+        assert_eq!(
+            after.lines.len(),
+            before.lines.len(),
+            "a mask must not change the geometry (§18.2)"
+        );
+        assert!(
+            text.contains("line one"),
+            "the mask reached output the boundary is not withholding: {text:?}"
+        );
+    }
+
+    /// **The cost, measured and pinned rather than described.** The same
+    /// mechanism masks ordinary output whenever that output is, in a
+    /// stripped view, an in-flight candidate — and no function of the
+    /// buffer separates the two, because `use crate::re_exports` really
+    /// *is* `\bre_[A-Za-z0-9_]{24,}` with seven of twenty-four value bytes
+    /// arrived.
+    ///
+    /// What bounds it is that **the next byte revises the answer**, which
+    /// is the property a shortened read does not have. The second half of
+    /// this test is that termination: one more byte of ordinary output —
+    /// the newline every line of it ends with — kills the candidate and
+    /// the grid comes back whole, with the earlier text intact.
+    #[test]
+    fn ordinary_output_is_masked_only_while_it_is_the_tail() {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
+        feed(&mut t, &mut log, t0, ORDINARY);
+
+        let (raw, unvouched) = boundaries(&log);
+        assert!(raw.is_none(), "§4.1 releases this, as it should");
+        let b = unvouched.expect(
+            "the premise: a stripped view calls this ordinary line a token \
+             in flight, which is why no buffer-derived rule separates it \
+             from the credential above",
+        );
+        let masked = full(t.capture(None, true, t0, &log, Some(b)));
+        assert!(masked.held_back);
+        assert!(
+            !joined(&masked).contains("re_exports"),
+            "the fixture is not demonstrating the cost it exists to state"
+        );
+
+        // One more byte, and the answer is revised. Nothing was destroyed
+        // and no cursor moved, so there is nothing to recover.
+        feed(&mut t, &mut log, t0, b"\r\n");
+        let (_, after) = boundaries(&log);
+        assert!(
+            after.is_none(),
+            "the newline that ends every line of ordinary output did not \
+             clear the candidate"
+        );
+        let whole = full(t.capture(None, true, t0, &log, after));
+        assert!(!whole.held_back);
+        assert!(
+            joined(&whole).contains("use crate::re_exports"),
+            "ordinary output did not come back: {:?}",
+            whole.lines[0]
+        );
+    }
+
+    /// **The denial primitive, measured and bounded rather than assumed
+    /// away (GH #142, GH #139's byte).** A view that *consumes* rather
+    /// than merely deletes can join an indexed prefix to the end of the
+    /// region on its own: an unterminated 8-bit OSC introducer — one byte,
+    /// `\x9d` — makes `C1::Strip` swallow everything after it, so
+    /// `mailgun-api-key`'s `key-` sitting harmlessly in an npm warning
+    /// becomes a candidate whose value run reaches the view's end. On
+    /// `main` that moment masks nothing; here it masks every cell the
+    /// bytes from the prefix onward wrote.
+    ///
+    /// **The bound is `partial_secret_scan_bytes` and it is structural,
+    /// not measured**: `earliest_partial` is asked about a view of
+    /// `[head - partial_secret_scan_bytes, head)` and `NormalView::
+    /// raw_offset` maps into that same range, so no view can move the
+    /// boundary behind the scan window however much it deletes. Asserted
+    /// below, because "bounded by the window it was asked about" is the
+    /// difference between this and an unbounded span.
+    ///
+    /// Two things this is not. It is **not** a `read_output` regression —
+    /// §4.1's boundary is asserted absent on the same fixture. And it is
+    /// **not** permanent: the trailing `\r\n` of the next line ends the
+    /// value run in every view, which the last arm shows.
+    #[test]
+    fn a_consuming_view_can_mask_back_to_the_scan_window_and_no_further() {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        for i in 0..10 {
+            feed(
+                &mut t,
+                &mut log,
+                t0,
+                format!("earlier row {i:02}\r\n").as_bytes(),
+            );
+        }
+        // One `\x9d` and then ordinary text, with no terminator for it.
+        let mut payload = b"npm WARN @acme/key-manager\x9d".to_vec();
+        payload.extend_from_slice(&b"ordinary build output line\r\n".repeat(4));
+        payload.truncate(payload.len() - 2);
+        feed(&mut t, &mut log, t0, &payload);
+
+        let (raw, unvouched) = boundaries(&log);
+        assert!(
+            raw.is_none(),
+            "§4.1 held something; this fixture is then not about the view"
+        );
+        let b = unvouched.expect(
+            "the premise: a consuming view joins `key-` to the end of the \
+             region. If `C1::Strip` stops consuming, this row is measuring \
+             nothing and should be rewritten rather than deleted",
+        );
+
+        let head = log.bytes.len() as u64;
+        let scan = crate::output::ProcessingLimits::default().partial_secret_scan_bytes as u64;
+        assert!(
+            b >= head.saturating_sub(scan),
+            "the boundary reached behind the scan window: {b} < {head} - {scan}"
+        );
+
+        let masked = full(t.capture(None, true, t0, &log, Some(b)));
+        assert!(masked.held_back, "the fixture masked nothing");
+        let text = masked.lines.join("\n");
+        for i in 0..10 {
+            assert!(
+                text.contains(&format!("earlier row {i:02}")),
+                "a pre-boundary row was masked: {text:?}"
+            );
+        }
+
+        // **What ends it is the scan window, not a terminator, and that
+        // is the finding.** A newline does *not* clear this: the
+        // consuming view swallows the newline too, so the candidate is
+        // still the last thing in that view. What clears it is `key-`
+        // leaving `[head - partial_secret_scan_bytes, head)` — the same
+        // terminating rule `attach::redact_stream` documents for a stream
+        // carry, reached here for the same reason.
+        feed(&mut t, &mut log, t0, b"\r\n");
+        assert!(
+            boundaries(&log).1.is_some(),
+            "a newline cleared it, so this row is asserting the wrong \
+             terminating rule and the paragraph above is wrong with it"
+        );
+        feed(
+            &mut t,
+            &mut log,
+            t0,
+            &b"more ordinary output\r\n".repeat(32),
+        );
+        let (_, after) = boundaries(&log);
+        assert!(
+            after.is_none(),
+            "the candidate outlived the scan window it was found in"
+        );
+        assert!(!full(t.capture(None, true, t0, &log, after)).held_back);
+    }
+
+    /// **The rate row. `held_back` has to stay a rare event, not a routine
+    /// one** — the 0.0.3 output-processing plan's words, about
+    /// `read_output`; the grid inherits the requirement because §5.1 makes
+    /// `held_back` *one flag with one meaning* across both spellings.
+    ///
+    /// The fixture is a colourised build log in the shape that strands:
+    /// SGR runs mid-line, `\x1b[K` erase-to-end, and `\r` redraws with no
+    /// newline until the line is finished. Measured over the repository's
+    /// own corpora at every 512-byte read boundary, this boundary adds
+    /// **+0.0000 pp** on prose, on 5.3 MB of this crate's source, and on a
+    /// real `cargo build` log captured through a pty; it adds **+0.0548
+    /// pp** on a `jq -C` blob and **+0.2998 pp** on source recoloured
+    /// mid-word. So the requirement survives — and this row is what fails
+    /// if a future change makes the grid mask unconditionally, or widens
+    /// the view set in a way that does.
+    #[test]
+    fn ordinary_colourised_output_is_not_masked_line_by_line() {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
+        let lines: [&[u8]; 6] = [
+            b"\x1b[1m\x1b[92m   Compiling\x1b[0m holdfast-core v0.0.7 (/src)\r\n",
+            b"\x1b[1m\x1b[96m    Building\x1b[0m [=>    ] 16/205: proc-macro2\x1b[K\r",
+            b"\x1b[1m\x1b[96m    Building\x1b[0m [==>   ] 31/205: serde_derive\x1b[K\r\n",
+            b"\x1b[1m\x1b[33mwarning\x1b[0m: unused import: `crate::re_exports`\r\n",
+            b"added 210 packages\r\nnpm \x1b[33mWARN\x1b[0m @acme/key-manager@1.2.3\x1b[0m\x1b[K\r\n",
+            b"\x1b[1m\x1b[92m    Finished\x1b[0m `dev` profile in 13.72s\r\n",
+        ];
+        let mut masked = Vec::new();
+        for (round, line) in lines.iter().cycle().take(60).enumerate() {
+            feed(&mut t, &mut log, t0, line);
+            let (_, unvouched) = boundaries(&log);
+            let g = full(t.capture(None, true, t0, &log, unvouched));
+            if g.held_back {
+                masked.push(round);
+            }
+        }
+        assert!(
+            masked.is_empty(),
+            "the grid masked ordinary colourised output at {} of 60 line \
+             boundaries (rounds {masked:?}); `held_back` is meant to be rare",
+            masked.len()
+        );
+    }
+
+    /// **The cost this change does not pay for, stated because it is the
+    /// way this shape fails and it is reachable more often now.**
+    ///
+    /// [`ScreenTracker::boundary_screen`] documents a residual: once the
+    /// ring has evicted the front of `[seeded_from, boundary)` the replay
+    /// starts late, every pre-boundary row differs from the live grid, and
+    /// *the whole visible screen* comes back `[REDACTED:unresolved]` for
+    /// as long as a boundary stays open. That is unchanged by this
+    /// commit — but the **frequency** is not, because the unvouched
+    /// boundary is open at moments the raw one is not. The two arms below
+    /// are the same stream, the same eviction and the same call, differing
+    /// only in which boundary is handed down:
+    ///
+    /// * §4.1's boundary is `None` here, so the grid masks nothing —
+    ///   and paints the credential;
+    /// * the unvouched boundary is open, so the grid masks everything.
+    ///
+    /// Neither arm is a regression against the other's own behaviour: on
+    /// `main` this moment is a leak, and after this change it is a blank
+    /// screen. Both are bad and they are bad in opposite directions, which
+    /// is why this is pinned rather than described. The repair is the one
+    /// `boundary_screen` already names — pre-boundary state kept in the
+    /// live grid's coordinates at feed time — and it belongs to whoever
+    /// closes the eviction arm, not here.
+    #[test]
+    fn an_evicted_front_masks_the_whole_screen_and_the_new_boundary_reaches_it_oftener() {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        for i in 0..40 {
+            feed(&mut t, &mut log, t0, format!("line {i:02}\r\n").as_bytes());
+        }
+        feed(&mut t, &mut log, t0, SPLICED);
+        let (raw, unvouched) = boundaries(&log);
+        assert!(raw.is_none(), "§4.1 withholds nothing on this fixture");
+        let b = unvouched.expect("a view sees the token in flight");
+
+        // Everything still in the ring: the mask is confined to the cells
+        // the unvouched bytes wrote.
+        let whole = full(t.capture(None, true, t0, &log, Some(b)));
+        assert!(whole.held_back);
+        assert!(!joined(&whole).contains("ghp_0123456789"));
+        assert!(
+            joined(&whole).contains("line 38"),
+            "the mask spread past the withheld bytes with the whole ring in \
+             hand: {:?}",
+            whole.lines
+        );
+
+        // The front evicted. `main`'s boundary masks nothing at all and
+        // hands back the credential...
+        let ring = WrappedRing {
+            log: &log,
+            keep: 40,
+        };
+        let leaking = full(t.capture(None, true, t0, &ring, raw));
+        assert!(!leaking.held_back);
+        assert!(
+            joined(&leaking).contains("ghp_0123456789abcdefghijABCDEFGHIJ01234"),
+            "the reproduction failed to reproduce"
+        );
+
+        // ...and the unvouched boundary masks every pre-boundary row with
+        // it, which is the residual, not a new defect — and this is the
+        // moment it was previously out of reach at.
+        let blanked = full(t.capture(None, true, t0, &ring, Some(b)));
+        assert!(blanked.held_back);
+        assert!(!joined(&blanked).contains("ghp_0123456789"));
+        assert!(
+            !joined(&blanked).contains("line 38"),
+            "the eviction arm stopped over-masking; if that is deliberate \
+             this test is the one to rewrite, and `boundary_screen`'s \
+             residual paragraph with it"
+        );
+    }
+
+    /// **The termination argument, run against the case built to break
+    /// it.** A session whose last byte is an escape and which then goes
+    /// quiet holds the mask open for ever — that is true and it is not a
+    /// strand, because the masked extent is exactly the cells the
+    /// unvouched bytes wrote and every other cell is returned. The grid
+    /// keeps its geometry, its earlier rows, and its cursor.
+    ///
+    /// This is the half that *is* a denial, stated so nobody has to
+    /// discover it: a quiescent tail candidate is permanent until the
+    /// child writes again, exactly as `read_output`'s own §4.1 holdback is
+    /// (`redact_stream.rs`: *"may withhold forever"*). The difference that
+    /// licenses it here is that nothing is consumed — a later call sees
+    /// the same grid, not a shorter one.
+    #[test]
+    fn a_quiescent_tail_candidate_masks_its_own_cells_and_no_others() {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
+        for i in 0..5 {
+            feed(
+                &mut t,
+                &mut log,
+                t0,
+                format!("row {i} of ordinary output\r\n").as_bytes(),
+            );
+        }
+        feed(&mut t, &mut log, t0, SPLICED);
+
+        let (_, unvouched) = boundaries(&log);
+        let b = unvouched.expect("a view sees the token in flight");
+
+        // Idempotent under repetition: the grid is re-rendered per call,
+        // so a second look is not a shorter one.
+        let first = full(t.capture(None, true, t0, &log, Some(b)));
+        let second = full(t.capture(None, true, t0, &log, Some(b)));
+        assert_eq!(first.lines, second.lines);
+        assert!(first.held_back && second.held_back);
+        for i in 0..5 {
+            assert!(
+                joined(&first).contains(&format!("row {i} of ordinary output")),
+                "the mask reached a row the boundary is not withholding"
+            );
+        }
+        assert!(!joined(&first).contains("ghp_0123456789"));
     }
 
     #[test]
