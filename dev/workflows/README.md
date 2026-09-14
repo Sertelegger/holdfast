@@ -8,8 +8,9 @@ tree checked out is not part of the product.
 
 - [`verify.md`](./verify.md) — the full local gate: fmt, clippy across every
   installed target, the suite, the smoke script against the real JSON-RPC wire,
-  and the harness-falsification run. What CI does, plus the cross-platform part
-  CI structurally cannot do, since every workflow runs `ubuntu-24.04`.
+  and the harness-falsification run. What CI does, plus the part it cannot:
+  CI covers `ubuntu-24.04`, `windows-2022` and `macos-14`, so what is left is
+  FreeBSD, which nothing executes.
 - [`review.md`](./review.md) — the adversarial pre-PR review: parallel
   reviewers on disjoint failure modes, each in its own worktree.
 
