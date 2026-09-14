@@ -98,9 +98,9 @@ worse than none:**
   no window, no union. A defence one surface has is not a defence all of them
   have, and a secret that reaches the weaker ones is worth reporting.
 - **A secret still *arriving* is held back — unless a control byte has landed
-  inside it, and then it is not.** The in-flight test asks whether every byte
-  from an indexed prefix to the end of the region could still belong to a
-  value, and answers with `0x21..=0x7e` (`is_value_byte`,
+  inside it, or it began more than 512 bytes ago, and then it is not.** The
+  in-flight test asks whether every byte from an indexed prefix to the end of
+  the region could still belong to a value, and answers with `0x21..=0x7e` (`is_value_byte`,
   `output/prefix_index.rs`); `ESC` and `BEL` are outside that range, so an
   escape spliced into a token that has not finished arriving ends the run and
   disarms the holdback. Measured on `main` through `read_output` itself,
@@ -119,6 +119,19 @@ worse than none:**
   stream, where it caps at the same (rule minimum − 1) but is reached more
   often, the unit there being one PTY read rather than an 8 KiB lookahead
   (GH #135).
+- **The second exception is larger than the first, and unbounded.** The
+  in-flight scan is handed only the last `partial_secret_scan_bytes` of the
+  buffer — 512 by default — so a secret whose anchor has scrolled out of that
+  window is not found at all. `cat ~/.ssh/id_rsa` plus a poll: measured on
+  `main`, at 305 bytes arrived the holdback is armed and correct; **at 565 it
+  disarms and eight key-body lines go out clean**; at 3,295, all fifty, plus
+  eleven rendered on the grid, every one with `held_back: false` and
+  `redactions: {}`. Unlike the escape case this is **not** bounded by a rule's
+  minimum length — what escapes is however much of the secret has arrived.
+  `get_screen_state` leaks it too, because the grid's mask is a function of the
+  same boundary. That is **GH #166, open**. The paragraph above this one, and
+  the spec passage it was written from, both describe the behaviour this file
+  claimed rather than the behaviour that ships.
 - **Every string written to the audit log is redacted unconditionally** —
   including map keys, at any depth — and `[security] redaction_enabled =
   false` is a load error rather than a switch. It is not quite *the same*
