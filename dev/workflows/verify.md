@@ -83,9 +83,12 @@ a real defect in this repo's workflows is the one that quietly does not run.
 `ci.yml` is mostly `run:` blocks. Confirm `shellcheck --version` answers
 before believing a green from step 5.
 
-**Then the part CI structurally cannot do.** Every workflow runs
-`ubuntu-24.04`, so a break confined to another platform reaches `main`
-unnoticed. Add, for each of `x86_64-unknown-linux-gnu`,
+**Then the part CI structurally cannot do** — which is now smaller than this
+step used to claim. `macos-native` (macos-14, arm64) and `windows-native`
+(windows-2022) are required contexts, so `aarch64-apple-darwin` and Windows are
+executed by CI. **`x86_64-unknown-freebsd` is not executed anywhere** — it is
+cross-compiled only, which catches a `#[cfg]` split that deletes an arm and
+nothing else. Add, for each of `x86_64-unknown-linux-gnu`,
 `x86_64-unknown-freebsd` and `aarch64-apple-darwin` that is installed:
 
 ```
