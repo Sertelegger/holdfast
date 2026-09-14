@@ -63,9 +63,13 @@ security policy that implies shipped protection is worse than none:**
   are redacted by default: a match against the vendored rule set is replaced
   with a `[REDACTED:<kind>]` marker before the bytes leave the process, over
   an expanded window so a secret straddling a cursor boundary is caught from
-  both sides, and a secret still *arriving* holds the read at its first byte
-  rather than being returned in halves. Every string written to the audit log
-  goes through the same redactor unconditionally.
+  both sides. A secret still *arriving* holds the read at its first byte
+  rather than being returned in halves — **when the raw bytes show it
+  arriving**, which a control byte planted inside the value defeats; that
+  shape is covered instead, by a `[REDACTED:unresolved]` over the arrived
+  part, and for twelve of the fifty-one rules it is covered by neither
+  (GH #142, GH #160). Every string written to the audit log goes through the
+  same redactor unconditionally.
 - **`read_output(redact: false)` is a real escape hatch and returns raw
   bytes.** It exists because a withheld partial has to be reachable somehow.
   Each such read writes a `redaction_disabled` entry to the audit log naming

@@ -137,8 +137,94 @@ is cut, named and published is in
 
 ### Fixed
 
+- **A credential still arriving with a control byte inside it no longer
+  reaches the agent in the clear ([#142], closed for 39 of the 51 rules).**
+  `ghp_` plus 35 characters of a 36-character minimum, with a `\x1b[0m` planted
+  in the middle, came back **whole** on the default read path with
+  `held_back: false` and `redactions: {}` — a positive assertion that the read
+  was clean, made about bytes heading into an agent's transcript. The raw value
+  run ends at the escape, so the holdback saw nothing in flight; every stream a
+  reader actually receives splices the token back together.
+  `OutputProcessor::process` now asks each emitted view the same in-flight
+  question and covers its answer with one `[REDACTED:unresolved]`, mapped back
+  through `NormalView::map_span`.
+
+  **It marks rather than withholds, and that is a result rather than a
+  preference.** No condition on the buffer can separate a credential still
+  arriving from ordinary output, because they are the same object: in a
+  stripped view `use crate::re_exports` *is* `\bre_[A-Za-z0-9_]{24,}` — the
+  `resend` rule — with 7 of its 24 value bytes arrived, and a GitHub token at
+  39 of 40 is that shape one byte from completion. Both completions exist, so a
+  decision that is a function of the buffer must hold one and release the other
+  while the buffer is identical. A marker needs no such separation and
+  terminates by construction, because it never moves `read_end` backwards —
+  which is also why it may read the **whole window** where [#14] forbids a
+  withhold the same region.
+
+  **The leak this closes includes one nobody had recorded.** `read_output` was
+  called *protected by geometry* against the same shape; the geometry was the
+  leak. Traffic that adds raw bytes and contributes none to any view —
+  `\x1b[s\x1b[u` is a cursor save/restore — slides a still-arriving credential
+  out of the trailing `partial_secret_scan_bytes` the holdback reads. Measured:
+  the painted token plus 79 repetitions, 526 raw bytes, returned all 39
+  characters with `held_back: false` in every one of the six
+  `ansi` × `text_encoding` combinations. It now returns none of them, at 79
+  repetitions and at 40,000.
+
+  **The cost is bytes the agent cannot get back, and it is stated rather than
+  elided.** `dev@box:~/src/re_exports\x1b[0m` becomes
+  `dev@box:~/src/[REDACTED:unresolved]`, on every read, for any session whose
+  trailing token begins with one of the indexed prefixes a gated rule owns —
+  48 of the 100 the built-in set indexes, measured against that shape. Over
+  30,000 lines of this repository's own source in three colourisation schemes
+  the marker rate is **0.0000%**; for a developer working in a directory called
+  `re_exports` it is every prompt. Nothing is *withheld*: every shape that
+  earlier work stranded — `use crate::re_exports\x1b[0m`,
+  `\r\x1b[2K   Compiling re_export\x1b[0m`, a coloured prompt, an npm
+  deprecation line — hands over every byte with the boundary at `head`, and
+  `prompt.last_line` on `"$ cargo build\n   Compiling re_export\x1b[0m"` is
+  still `"   Compiling "`. Second reads that return zero bytes, over the
+  redaction sweep's own grid with the fixture at `head`: **284** on the parent
+  of this work's predicate change, **256** on its parent, **256** here.
+
+  **The marker is counted in `redactions`, and [#160]'s argument against the
+  key is what decides it.** That issue rules `unresolved` out of the map
+  because the map is a strict count of markers *present in `output`*, and the
+  warning it proposes puts none there. This puts one there, so the same
+  sentence requires the key; `redactions: {}` beside a visible
+  `[REDACTED:unresolved]` would be the false assurance [#142] is about.
+  `status.redaction_stats` counts substitutions delivered, which this is.
+
+  **Twelve rules are excluded by a computed gate and keep the leak in full**
+  ([#160]): the nine `has_value_group` context rules plus `jwt`,
+  `slack-webhook-url` and `private-key-block`, each with an unbounded
+  quantifier between its indexed prefix and something the match still needs.
+  Under the withhold this work supersedes, the gate proved *termination*; under
+  the marker it bounds the marker's **extent**, since a rule that can be kept
+  alive for ever can cover an entire read with one marker. Two holes in it are
+  closed rather than ported: the walk now covers every ASCII-case spelling
+  `PrefixIndex::scan` admits, because a rule bounded through `kqz-` and
+  unbounded through `KQZ-` was certified on the strength of an arm the scan
+  need never take; and a rule is gated only when its liveness language *equals*
+  its own, because the cycle search prunes at match states on the strength of a
+  condition that asks the rule's regex — the ASCII `\b` rewrite makes the
+  liveness language a superset, and `\bacmew_(?:é\bZ[a-z]*|OK[0-9]{6})` was
+  certified bounded while holding `x acmew_éZ` plus 5,000 bytes the rule can
+  never match. The second enforcement is a count of word boundaries and costs
+  **nothing**: five shipped rules carry a non-leading `\b` and all five are
+  ungated already.
+
+  **What this does not do.** An attached observer's stream is unchanged —
+  `StreamRedactor` keeps the raw predicate, so [#135]'s split-stream residual
+  and this one both stay open there. The page pass deliberately does not raise
+  markers: its region ends at a cursor rather than where the bytes stop, so
+  every page would mark its own tail. And `PrefixIndex::scan`'s pre-existing
+  quadratic ([#163]) now runs once per view as well as once on the raw region:
+  on the deliberately hostile 240 KB redraw fixture one `read_output` goes
+  **27 ms → 165 ms** in a debug build, against **0.0000%** marker rate and no
+  measurable change on ordinary output.
 - **The in-flight test the holdback rests on asks the rule, not a byte range
-  ([#142] — narrowed, and *not* closed).** `earliest_partial`'s continuation
+  ([#142]; the leak itself is closed by the entry above).** `earliest_partial`'s continuation
   test — *"every byte from the indexed prefix to the end of the region could
   still belong to the value"* — was decided by `is_value_byte`, a flat
   `0x21..=0x7e`. That is wrong in two directions at once: it holds runs no rule
@@ -176,18 +262,16 @@ is cut, named and published is in
   `prompt.last_line = "   Compiling "`, both byte-identical to the parent
   commit.
 
-  **[#142]'s leak is still open and this does not close it.** A credential
-  still arriving *with an escape inside it* is still released half-emitted,
-  because the raw stream is the only one the holdback reads. Closing it needs
-  the emitted views asked as well, and **that view-driven withhold is under
-  research rather than shipped**: measured, the form of it that was written
-  strands ordinary output permanently — a session whose last output is
-  `use crate::re_exports\x1b[0m` returns 11 of 25 bytes with `held_back: true`
-  for ever, and blanks `prompt.last_line`, which is how an agent learns a
-  password is being asked for. The open question is not *which* rules a view
-  may withhold on; it is that a view has already deleted the byte that would
+  **This predicate does not close [#142] on its own, and the view-driven
+  *withhold* that would have is not what shipped.** Measured, the form of it
+  that was written strands ordinary output permanently — a session whose last
+  output is `use crate::re_exports\x1b[0m` returns 11 of 25 bytes with
+  `held_back: true` for ever, and blanks `prompt.last_line`, which is how an
+  agent learns a password is being asked for. The question was never *which*
+  rules a view may withhold on: a view has already deleted the byte that would
   have ended the withhold, so the decision is unrevisable in a way the raw
-  stream's never is.
+  stream's never is. The marker in the entry above is what closes the leak,
+  and it keeps this method raw-only.
 
   **Two shipped rules get no automaton and keep the byte-class test**, by a
   check rather than by a list. `generic-secret-assignment` and
@@ -792,6 +876,7 @@ residuals that are known and accepted.
 [0.0.5]: https://github.com/Sertelegger/holdfast/releases/tag/v0.0.5
 
 [#7]: https://github.com/Sertelegger/holdfast/issues/7
+[#14]: https://github.com/Sertelegger/holdfast/issues/14
 [#19]: https://github.com/Sertelegger/holdfast/issues/19
 [#21]: https://github.com/Sertelegger/holdfast/issues/21
 [#39]: https://github.com/Sertelegger/holdfast/issues/39
@@ -825,3 +910,5 @@ residuals that are known and accepted.
 [#142]: https://github.com/Sertelegger/holdfast/issues/142
 [#149]: https://github.com/Sertelegger/holdfast/issues/149
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
+[#160]: https://github.com/Sertelegger/holdfast/issues/160
+[#163]: https://github.com/Sertelegger/holdfast/issues/163
