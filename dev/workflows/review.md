@@ -30,9 +30,26 @@ shared tree serialise against each other on the build lock, which is what the
 parallelism was for. Tell each one to run **targeted tests only** — a reviewer
 running `--workspace` starves the others.
 
-Tell them `docs/` is a git-ignored symlink that is **absent from a worktree**,
-so spec claims cannot be checked there. A reviewer that says so is doing it
-right; one that infers spec content has invented it.
+Tell them **to read the spec, and how.** `docs/` is a git-ignored symlink and
+the *link* is absent from a worktree — but it is an **absolute** symlink, so
+its target is reachable from anywhere:
+
+- `/home/dev/project-docs/holdfast/superpowers/specs/2026-05-01-holdfast-design.md`
+- `/home/dev/project-docs/holdfast/superpowers/plans/`
+
+Resolve it locally rather than hard-coding a path that is only right on one
+machine: `readlink -f docs` from the main checkout answers it.
+
+**This paragraph used to say spec claims could not be checked from a worktree,
+and that a reviewer who said so was doing it right.** That was wrong, and it
+was expensive: for months every agent reported "`docs/` does not propagate into
+a worktree, I read no spec text and guessed at none" — and then reasoned from
+`§N.N` references anyway. GH #142 was worked for weeks against a constraint
+(*"a view may add a marker; a view may not add a withhold"*) that appears
+nowhere in 5,614 spec lines, while the spec **mandated** the thing that rule
+forbade on a surface that already shipped. A reviewer who cannot quote the
+requirement has not finished; one who infers spec content has still invented
+it.
 
 ## What to demand of each reviewer
 
