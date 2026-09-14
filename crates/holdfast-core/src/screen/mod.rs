@@ -1557,6 +1557,103 @@ mod tests {
         );
     }
 
+    /// **The denial primitive, measured and bounded rather than assumed
+    /// away (GH #142, GH #139's byte).** A view that *consumes* rather
+    /// than merely deletes can join an indexed prefix to the end of the
+    /// region on its own: an unterminated 8-bit OSC introducer — one byte,
+    /// `\x9d` — makes `C1::Strip` swallow everything after it, so
+    /// `mailgun-api-key`'s `key-` sitting harmlessly in an npm warning
+    /// becomes a candidate whose value run reaches the view's end. On
+    /// `main` that moment masks nothing; here it masks every cell the
+    /// bytes from the prefix onward wrote.
+    ///
+    /// **The bound is `partial_secret_scan_bytes` and it is structural,
+    /// not measured**: `earliest_partial` is asked about a view of
+    /// `[head - partial_secret_scan_bytes, head)` and `NormalView::
+    /// raw_offset` maps into that same range, so no view can move the
+    /// boundary behind the scan window however much it deletes. Asserted
+    /// below, because "bounded by the window it was asked about" is the
+    /// difference between this and an unbounded span.
+    ///
+    /// Two things this is not. It is **not** a `read_output` regression —
+    /// §4.1's boundary is asserted absent on the same fixture. And it is
+    /// **not** permanent: the trailing `\r\n` of the next line ends the
+    /// value run in every view, which the last arm shows.
+    #[test]
+    fn a_consuming_view_can_mask_back_to_the_scan_window_and_no_further() {
+        let t0 = Instant::now();
+        let mut log = ByteLog::default();
+        let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
+        feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        for i in 0..10 {
+            feed(
+                &mut t,
+                &mut log,
+                t0,
+                format!("earlier row {i:02}\r\n").as_bytes(),
+            );
+        }
+        // One `\x9d` and then ordinary text, with no terminator for it.
+        let mut payload = b"npm WARN @acme/key-manager\x9d".to_vec();
+        payload.extend_from_slice(&b"ordinary build output line\r\n".repeat(4));
+        payload.truncate(payload.len() - 2);
+        feed(&mut t, &mut log, t0, &payload);
+
+        let (raw, unvouched) = boundaries(&log);
+        assert!(
+            raw.is_none(),
+            "§4.1 held something; this fixture is then not about the view"
+        );
+        let b = unvouched.expect(
+            "the premise: a consuming view joins `key-` to the end of the \
+             region. If `C1::Strip` stops consuming, this row is measuring \
+             nothing and should be rewritten rather than deleted",
+        );
+
+        let head = log.bytes.len() as u64;
+        let scan = crate::output::ProcessingLimits::default().partial_secret_scan_bytes as u64;
+        assert!(
+            b >= head.saturating_sub(scan),
+            "the boundary reached behind the scan window: {b} < {head} - {scan}"
+        );
+
+        let masked = full(t.capture(None, true, t0, &log, Some(b)));
+        assert!(masked.held_back, "the fixture masked nothing");
+        let text = masked.lines.join("\n");
+        for i in 0..10 {
+            assert!(
+                text.contains(&format!("earlier row {i:02}")),
+                "a pre-boundary row was masked: {text:?}"
+            );
+        }
+
+        // **What ends it is the scan window, not a terminator, and that
+        // is the finding.** A newline does *not* clear this: the
+        // consuming view swallows the newline too, so the candidate is
+        // still the last thing in that view. What clears it is `key-`
+        // leaving `[head - partial_secret_scan_bytes, head)` — the same
+        // terminating rule `attach::redact_stream` documents for a stream
+        // carry, reached here for the same reason.
+        feed(&mut t, &mut log, t0, b"\r\n");
+        assert!(
+            boundaries(&log).1.is_some(),
+            "a newline cleared it, so this row is asserting the wrong \
+             terminating rule and the paragraph above is wrong with it"
+        );
+        feed(
+            &mut t,
+            &mut log,
+            t0,
+            &b"more ordinary output\r\n".repeat(32),
+        );
+        let (_, after) = boundaries(&log);
+        assert!(
+            after.is_none(),
+            "the candidate outlived the scan window it was found in"
+        );
+        assert!(!full(t.capture(None, true, t0, &log, after)).held_back);
+    }
+
     /// **The rate row. `held_back` has to stay a rare event, not a routine
     /// one** — the 0.0.3 output-processing plan's words, about
     /// `read_output`; the grid inherits the requirement because §5.1 makes

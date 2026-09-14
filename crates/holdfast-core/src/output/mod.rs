@@ -334,6 +334,18 @@ impl OutputProcessor {
     /// different answer. Nothing is destroyed, and the answer is revised
     /// the moment the buffer says something different.
     ///
+    /// **The reach is bounded by the scan window, structurally.** Every
+    /// view is built from `[head - partial_secret_scan_bytes, head)` and
+    /// [`normalise::NormalView::raw_offset`] maps back into that same range, so no
+    /// amount of deletion moves this boundary behind it. That bound is
+    /// what keeps a *consuming* view — `C1::Strip` on an unterminated
+    /// `0x9d`, which swallows everything after it — from being an
+    /// unbounded denial primitive on the grid. It is still a denial: one
+    /// such byte masks the cells written since the nearest indexed prefix,
+    /// and what ends it is the prefix leaving the window rather than any
+    /// terminator, because the view swallows terminators too. Pinned by
+    /// `a_consuming_view_can_mask_back_to_the_scan_window_and_no_further`.
+    ///
     /// **It is not free, and the cost is a rate rather than a strand.**
     /// A mask that never clears still covers the cells the unvouched
     /// bytes wrote, for as long as nothing else arrives, and the grid

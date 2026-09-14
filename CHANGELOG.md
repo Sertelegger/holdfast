@@ -150,6 +150,19 @@ is cut, named and published is in
   `an_evicted_front_masks_the_whole_screen_and_the_new_boundary_reaches_it_oftener`,
   whose other half is the leak being closed — on `main` that same moment
   returns the credential in the clear ([#142]).
+- **One attacker-controlled byte can mask part of the grid, and the reach is
+  bounded by the scan window.** A view that *consumes* rather than deletes
+  joins an indexed prefix to the end of the region by itself: an unterminated
+  8-bit OSC introducer (`\x9d`, [#139]'s byte) makes that view swallow
+  everything after it, so a `key-` sitting harmlessly in an npm warning
+  becomes a candidate and the cells from it onward are masked. Measured at
+  124 bytes of reach-back and four markers on the fixture; **bounded at
+  `partial_secret_scan_bytes` (512) structurally**, because the view is built
+  from that window and offsets map back into it. A newline does not clear it —
+  the consuming view swallows the newline too — so what clears it is the
+  prefix scrolling out of that window, the same terminating rule an attached
+  observer's stream already uses. No byte is denied on any surface, and §4.1's
+  boundary is unmoved on the same fixture ([#142], [#139]).
 - **Still open on `read_output`, and this entry is not the fix for it.** A
   credential arriving with an escape inside it is still released
   half-emitted there, bounded at *(rule minimum − 1)* characters, and [#166]
