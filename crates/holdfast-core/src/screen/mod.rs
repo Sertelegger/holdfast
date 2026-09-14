@@ -378,6 +378,17 @@ impl ScreenTracker {
     /// `b` at or past `consumed_head` is the ordinary case and masks
     /// nothing.
     ///
+    /// **The mask is over cells, so the window title is outside it
+    /// (GH #142).** An OSC title sequence paints no cell, and the mask is
+    /// a cell-by-cell difference — so `\x1b]0;ghp_<39 of 40>\x07` leaves
+    /// the boundary open and [`Self::rendered_title`] still returns the
+    /// partial, because `redact_str` replaces only complete matches.
+    /// Measured, not inferred. The remedy would be `prompt.last_line`'s
+    /// (clip or suppress the reconstruction), and it is not taken here
+    /// because a title is sticky where a last line is not: the field would
+    /// stay denied until the child set a new one, which is a decision
+    /// about that field rather than about this boundary.
+    ///
     /// **The value the session passes is the *unvouched* boundary, which
     /// is at or before §4.1's and not the same number (GH #142).** This
     /// used to say it was "the same `OutputProcessor::holdback_boundary`

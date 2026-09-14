@@ -163,6 +163,19 @@ is cut, named and published is in
   prefix scrolling out of that window, the same terminating rule an attached
   observer's stream already uses. No byte is denied on any surface, and §4.1's
   boundary is unmoved on the same fixture ([#142], [#139]).
+- **`get_screen_state.title` is *not* covered, and it is this issue's other
+  named shape.** The mask is defined over *cells* (REQ-O-011a: the cells where
+  the live render differs from the render at the boundary), and a window title
+  is set by an OSC sequence that paints no cell — so `\x1b]0;ghp_<39 of
+  40>\x07` leaves the boundary open and still returns the partial credential
+  verbatim in `title`, with `held_back: false`, because `redact_str` replaces
+  only *complete* matches. Measured on this branch. Not closed here on
+  purpose: the title is a reconstruction with no byte-to-position mapping, so
+  the only available spellings are `prompt.last_line`'s — clip at the
+  candidate, or report nothing — and unlike a last line a title is **sticky**,
+  so either one denies the field until the child sets a new one. That is a
+  separate decision about a different field and it should be taken as one
+  rather than arrive inside this change ([#142]).
 - **Still open on `read_output`, and this entry is not the fix for it.** A
   credential arriving with an escape inside it is still released
   half-emitted there, bounded at *(rule minimum − 1)* characters, and [#166]
