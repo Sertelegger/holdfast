@@ -892,8 +892,23 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
     // handlers. `holdfast logs` is `read_output` with a human on the other
     // end, so it goes through `tool/read_output` rather than growing a
     // parallel method with its own bugs.
+    //
+    // **`apply_holdback` on the `--tail` arm, and it is not decoration
+    // (GH #169).** `tail_lines` alone is §4.1's per-call bypass, and this
+    // surface is named a non-member of it, twice: *"the exemption covers
+    // exactly those two arguments on the one tool that takes them, and
+    // nothing else"*, and then, by name, *"`--raw` is that surface's
+    // opt-in and it is audited; `--tail` is not an opt-in to anything."*
+    // The distinction has to be carried by what the CLI **sends**: the
+    // daemon may not recover it from `client_kind`, which is audit
+    // attribution and never a redaction input (REQ-SEC-018).
     let mut args = match tail_lines {
-        Some(n) => json!({ "session": session, "tail_lines": n, "max_bytes": 256 * 1024 }),
+        Some(n) => json!({
+            "session": session,
+            "tail_lines": n,
+            "apply_holdback": true,
+            "max_bytes": 256 * 1024,
+        }),
         None => json!({ "session": session, "since_cursor": 0, "max_bytes": 256 * 1024 }),
     };
     if raw {
@@ -931,6 +946,16 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
         }
     };
     print!("{}", data["output"].as_str().unwrap_or_default());
+    // §4.1's holdback can now shorten this read, so say so — on stderr,
+    // because stdout is the log and this surface's point is that it
+    // survives being piped somewhere. Silence here would read as "the
+    // output ended", which is the one thing it does not mean.
+    if data["held_back"] == json!(true) {
+        diag!(
+            "holdfast logs: output stops short: a secret may still be \
+             arriving (§4.1). Read again to pick up the rest."
+        );
+    }
     ExitCode::SUCCESS
 }
 

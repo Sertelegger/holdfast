@@ -44,6 +44,15 @@ is cut, named and published is in
   client that predates the field fails **closed**; nothing an agent sends
   selects it. `holdfast attach --allow-echo` is the CLI spelling ([#137]).
 
+- `read_output` gains `apply_holdback`, the way to ask for the last N lines
+  **inside** §4.1's holdback. A bare `tail_lines`/`tail_bytes` is the per-call
+  opt-in and still bypasses it, unchanged; `apply_holdback: true` declines that
+  opt-in while keeping the tail. The daemon could not express "the last N lines,
+  safely" before, which is why `holdfast logs --tail` reached for the bypass.
+  Only `true` is accepted — `false` has exactly one meaning anyone could want,
+  and putting a second, unaudited licence to bypass on the wire is the defect
+  this argument exists to close ([#169]).
+
 ### Changed
 
 - **`[security] redaction_enabled = false` is refused at load, and §9.4's
@@ -211,6 +220,24 @@ is cut, named and published is in
   `continue-on-error`, unpinned actions and `secrets.` references.
 
 ### Fixed
+
+- **`holdfast logs <session> --tail N` no longer releases a secret the same
+  session's `read_output` is withholding.** The CLI sent `tail_lines`, which is
+  §4.1's per-call bypass, so every tail-shaped read inherited an exemption the
+  spec grants to two arguments on one tool — and names this surface a
+  non-member of, twice. Measured on a live daemon in one instant:
+  `read_output(since_cursor: 0)` answered `held_back: true` and
+  `holdfast logs --tail 50` printed the credential in the clear. Unlike
+  `--raw`, nothing recorded it. `--tail` now asks for the tail inside the
+  holdback and stops at the boundary, saying so on stderr; with nothing in
+  flight it returns byte-for-byte what it always did. The bypass predicate has
+  moved off the read's *shape* and onto the request, where the licence
+  actually is, and `ReadRequest` has no `Default`, so the next read surface is
+  asked by the compiler rather than inheriting an answer. `--raw` is untouched:
+  it is this surface's opt-in, it still returns the bytes, and it is still
+  audited. No branch on `client_kind` — the CLI is held back for what it sends
+  (REQ-SEC-018). §11.4's third arm is finally written, and it is one
+  measurement rather than two tests that can drift ([#169]).
 
 - The secret **provider** path enforces the deadline and the size limit the
   caller declared. A helper process that inherits the provider's output pipe no
@@ -813,3 +840,4 @@ residuals that are known and accepted.
 [#142]: https://github.com/Sertelegger/holdfast/issues/142
 [#149]: https://github.com/Sertelegger/holdfast/issues/149
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
+[#169]: https://github.com/Sertelegger/holdfast/issues/169

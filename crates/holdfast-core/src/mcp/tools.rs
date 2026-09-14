@@ -11,7 +11,7 @@ use crate::output::ansi::AnsiMode;
 use crate::output::encoding::TextEncoding;
 use crate::output::redact::{redact_for_display, redact_str};
 use crate::output::rules::RuleSet;
-use crate::output::{ReadOptions, ReadRequest, ReadStart};
+use crate::output::{Holdback, ReadOptions, ReadRequest, ReadStart};
 use crate::pty::{clamp_geometry, InProcessPty, PtyBackend, PtySpawnConfig};
 use crate::request::RequestContext;
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
@@ -877,6 +877,22 @@ impl HoldfastServer {
                 None,
             ));
         }
+        // §4.1 gives the holdback bypass exactly one spelling: naming
+        // `tail_lines` or `tail_bytes`. `apply_holdback` is the way to
+        // decline that opt-in while still asking for the tail — the shape
+        // `holdfast logs --tail` needs and the daemon could not express
+        // before GH #169. It is deliberately one-way. `false` has only
+        // one meaning anyone could want, "bypass the holdback", and
+        // honouring it would put a second, unaudited licence on the wire
+        // — on a cursor read, one §4.1 grants to nothing at all. The
+        // audited way to obtain withheld bytes is `redact: false`.
+        if args.apply_holdback == Some(false) {
+            return Err(ErrorData::invalid_params(
+                "apply_holdback may only be true; omit it for the default, \
+                 and use redact: false for the audited unredacted read",
+                None,
+            ));
+        }
 
         // Unknown enum values are input-schema violations, which §5.1
         // routes to the protocol channel rather than `isError: true`.
@@ -922,6 +938,19 @@ impl HoldfastServer {
         } else {
             ReadStart::TailBytes(args.tail_bytes.unwrap().min(max_bytes))
         };
+        // §4.1's bypass, and its whole extent. The caller named a tail
+        // argument on the one tool that takes them, so it asked for the
+        // freshest bytes and accepted the trade-off — unless it also said
+        // `apply_holdback: true`, which is how a surface asks for the last
+        // N lines *inside* the holdback. The predicate reads the
+        // arguments, never the tail shape and never `client_kind`
+        // (REQ-SEC-018): `holdfast logs --tail` is held back because of
+        // what it sends, not because of who sent it.
+        let holdback = if start.is_tail() && args.apply_holdback != Some(true) {
+            Holdback::BypassedByCallerOptIn
+        } else {
+            Holdback::Applies
+        };
 
         // The §9.4 caller seam, derived server-side from the
         // authenticated connection: there is deliberately no path from a
@@ -934,6 +963,7 @@ impl HoldfastServer {
         let read = session.read_processed(
             &ReadRequest {
                 start,
+                holdback,
                 max_bytes,
                 options: ReadOptions {
                     ansi,
@@ -3802,6 +3832,7 @@ impl HoldfastServer {
         let context = session.read_processed(
             &ReadRequest {
                 start: ReadStart::Cursor(outcome.scan_start),
+                holdback: Holdback::Applies,
                 max_bytes: context_cap,
                 options: ReadOptions::default(),
                 tool: context_surface.tool,
@@ -3849,6 +3880,7 @@ impl HoldfastServer {
                         let text = session.read_processed(
                             &ReadRequest {
                                 start: ReadStart::Cursor(m.start),
+                                holdback: Holdback::Applies,
                                 max_bytes: (m.end - m.start) as usize,
                                 options: ReadOptions::default(),
                                 tool: match_surface.tool,
@@ -4001,6 +4033,12 @@ pub struct ReadOutputArgs {
     /// Read the last N bytes instead.
     #[serde(default)]
     pub tail_bytes: Option<usize>,
+    /// Apply §4.1's targeted secret holdback to a `tail_lines`/`tail_bytes`
+    /// read, which bypasses it by default. Only `true` is accepted:
+    /// the bypass has exactly one licensed spelling — naming one of those
+    /// two arguments — and `redact: false` is the audited escape hatch.
+    #[serde(default)]
+    pub apply_holdback: Option<bool>,
     /// Cap on RAW bytes read from the buffer. Defaults to 32768, hard
     /// limit 262144. Must be at least 1: a zero cap can never make
     /// forward progress. The encoded payload may be larger or smaller.
@@ -6609,6 +6647,93 @@ mod tests {
             json!(false),
             "held_back must separate the two arrangements, not be a constant"
         );
+
+        kill_everything(&server).await;
+    }
+
+    /// `apply_holdback` is the daemon's answer to "the last N lines,
+    /// **safely**" — the thing it could not express, which is why
+    /// `holdfast logs --tail` reached for the bypass instead (GH #169).
+    ///
+    /// Three arms, and the middle one is the whole test. §4.1 puts the
+    /// licence on the per-call opt-in, so a tail read must still bypass
+    /// when the caller says nothing, must stop at the boundary when the
+    /// caller declines, and must have no third spelling for "bypass":
+    /// `apply_holdback: false` would be a second, unaudited licence — and
+    /// on a cursor read it would be one §4.1 grants to nothing at all.
+    ///
+    /// Nothing here reads `client_kind`, and nothing may: REQ-SEC-018
+    /// makes it audit attribution and never an input to redaction. The
+    /// CLI is held back because of the argument it sends.
+    #[tokio::test]
+    async fn a_tail_read_can_decline_the_bypass_and_declining_has_one_spelling() {
+        let server = HoldfastServer::new();
+        let bytes = format!("one\r\ntwo\r\nsee {IN_FLIGHT}");
+        let (id, _pty) = mock_session(&server, "tail-optout", vec![], bytes.as_bytes());
+        let session = server.registry.get(&id).expect("the session");
+        settle(&session, "the partial to reach the tail", |s| {
+            s.detection().last_line.starts_with("see ")
+        })
+        .await;
+        assert!(
+            session.holdback_boundary(&server.processor) < session.buffer_head(),
+            "nothing is being withheld, so there is nothing to decline"
+        );
+
+        let tail = |apply: Option<bool>| {
+            server.read_output(Parameters(ReadOutputArgs {
+                session: id.clone(),
+                tail_lines: Some(3),
+                apply_holdback: apply,
+                ..Default::default()
+            }))
+        };
+
+        // Arm 1 — unchanged. The bare tail argument is the opt-in.
+        let bypassed = row("read_output", &tail(None).await.expect("read_output")).data;
+        assert!(
+            bypassed["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(IN_FLIGHT),
+            "the per-call opt-in must still bypass the holdback: {}",
+            bypassed["output"]
+        );
+        assert_eq!(bypassed["held_back"], json!(false));
+
+        // Arm 2 — the same three lines, inside the holdback. Shortened at
+        // the boundary, not replaced by the head and not emptied: `two`
+        // is still there, which is what `--tail` is for.
+        let held = row("read_output", &tail(Some(true)).await.expect("read_output")).data;
+        let text = held["output"].as_str().unwrap_or_default();
+        assert!(
+            !text.contains("ghp_"),
+            "a declined bypass still released the partial: {text:?}"
+        );
+        assert!(
+            text.contains("two") && text.ends_with("see "),
+            "a declined bypass must shorten the tail at the boundary, not \
+             return something else: {text:?}"
+        );
+        assert_eq!(held["held_back"], json!(true));
+        assert_eq!(
+            held["next_cursor"],
+            json!(session.holdback_boundary(&server.processor)),
+            "a shortened read must hand back the boundary to resume from"
+        );
+
+        // Arm 3 — `false` is not a spelling of anything.
+        for start in [json!({ "tail_lines": 3 }), json!({ "since_cursor": 0 })] {
+            let mut args = start.as_object().unwrap().clone();
+            args.insert("session".into(), json!(id));
+            args.insert("apply_holdback".into(), json!(false));
+            let parsed: ReadOutputArgs = serde_json::from_value(Value::Object(args)).expect("args");
+            assert!(
+                server.read_output(Parameters(parsed)).await.is_err(),
+                "apply_holdback: false must be an input-schema violation, \
+                 not a second licence to bypass ({start})"
+            );
+        }
 
         kill_everything(&server).await;
     }

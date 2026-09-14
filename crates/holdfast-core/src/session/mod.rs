@@ -15,7 +15,7 @@ use crate::detect::{
 };
 use crate::output::rules::RuleSet;
 use crate::output::{
-    OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
+    Holdback, OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
 };
 use crate::pty::{clamp_geometry, PtyBackend, Signal};
 use crate::screen::{
@@ -2158,7 +2158,13 @@ impl Session {
             // instead would return the oldest slice and hand back a cursor
             // far behind `head`, which re-delivers the same bytes on every
             // subsequent cursor read (0.0.1's documented contract, REQ-T-006).
-            let (req_start, front_clipped) = if req.start.bypasses_holdback() {
+            //
+            // **`is_tail()`, not the holdback.** This clip is a fact about
+            // where the read is anchored; the holdback is a fact about
+            // whether the caller opted in. They were one predicate until
+            // GH #169, which is how `holdfast logs --tail` acquired a
+            // bypass §4.1 names it as a non-member of.
+            let (req_start, front_clipped) = if req.start.is_tail() {
                 let clipped = head
                     .saturating_sub(req.max_bytes as u64)
                     .max(requested_start);
@@ -2199,7 +2205,7 @@ impl Session {
             head,
             cap_end,
             child_alive,
-            bypass_holdback: req.start.bypasses_holdback(),
+            bypass_holdback: req.holdback == Holdback::BypassedByCallerOptIn,
             front_clipped,
             truncated_at_tail,
         };
@@ -2997,6 +3003,7 @@ mod tests {
         let r = s.read_processed(
             &ReadRequest {
                 start: ReadStart::TailBytes(10),
+                holdback: Holdback::BypassedByCallerOptIn,
                 max_bytes: 32 * 1024,
                 options: ReadOptions::default(),
                 tool: "read_output",
@@ -3020,6 +3027,7 @@ mod tests {
         let r = s.read_processed(
             &ReadRequest {
                 start: ReadStart::Cursor(0),
+                holdback: Holdback::Applies,
                 max_bytes: 32 * 1024,
                 options: ReadOptions {
                     redact: false,
@@ -3106,6 +3114,7 @@ mod tests {
         let r = s.read_processed(
             &ReadRequest {
                 start: ReadStart::TailLines(100),
+                holdback: Holdback::BypassedByCallerOptIn,
                 max_bytes: 5,
                 options: ReadOptions::default(),
                 tool: "read_output",
@@ -3133,6 +3142,7 @@ mod tests {
         let r = s.read_processed(
             &ReadRequest {
                 start: ReadStart::TailLines(2),
+                holdback: Holdback::BypassedByCallerOptIn,
                 max_bytes: 32 * 1024,
                 options: ReadOptions::default(),
                 tool: "read_output",
@@ -3270,6 +3280,7 @@ mod tests {
         let _ = s.read_processed(
             &ReadRequest {
                 start: ReadStart::Cursor(0),
+                holdback: Holdback::Applies,
                 max_bytes: 32 * 1024,
                 options: ReadOptions {
                     redact: false,

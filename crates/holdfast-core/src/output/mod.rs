@@ -85,27 +85,74 @@ impl Default for ReadOptions {
 }
 
 /// Which bytes the caller wants.
+///
+/// **Shape only.** This says where a read starts and therefore which end
+/// `max_bytes` clips. It says nothing about §4.1's holdback: that is
+/// [`Holdback`], on the request, because the licence is the per-call
+/// opt-in and not the tail shape (GH #169).
 #[derive(Debug, Clone, Copy)]
 pub enum ReadStart {
     /// Forward from an absolute offset.
     Cursor(u64),
-    /// The last N bytes. Bypasses the holdback (§4.1).
+    /// The last N bytes.
     TailBytes(usize),
-    /// The last N lines. Bypasses the holdback (§4.1).
+    /// The last N lines.
     TailLines(usize),
 }
 
 impl ReadStart {
-    /// Explicit recency requests trade the holdback for freshness.
-    pub fn bypasses_holdback(&self) -> bool {
+    /// Whether the read is anchored at `buffer.head` rather than at an
+    /// absolute offset. An oversized tail read drops its **oldest** bytes,
+    /// so this is what decides which end `max_bytes` clips.
+    ///
+    /// It is deliberately *not* the holdback predicate. It used to be —
+    /// `bypasses_holdback()` — and `holdfast logs --tail N` inherited the
+    /// bypass by having the same shape, on a surface §4.1 names as a
+    /// non-member (GH #169).
+    pub fn is_tail(&self) -> bool {
         matches!(self, Self::TailBytes(_) | Self::TailLines(_))
     }
+}
+
+/// Whether §4.1's targeted secret holdback applies to a read.
+///
+/// **It is a field on [`ReadRequest`] and not a property of
+/// [`ReadStart`], and that is the whole of the fix for GH #169.** §4.1:
+///
+/// > **What licenses the bypass is the per-call opt-in, not the tail
+/// > shape** — so the exemption covers exactly those two arguments on the
+/// > one tool that takes them, and **nothing else**.
+///
+/// Encoding the bypass in the *shape* said the opposite, and every
+/// tail-shaped read inherited it. §4.1 names three tail-shaped
+/// non-members; two of them (`get_screen_state`, the `observer` stream)
+/// never reached this type, and the third — `holdfast logs <session>
+/// --tail N` — did, because it is served by `read_output`. §4.1 on that
+/// one: *"`--raw` is that surface's opt-in and it is audited; `--tail`
+/// is not an opt-in to anything."*
+///
+/// There is no `Default`, here or on [`ReadRequest`]. A new read surface
+/// has to name its answer, and the compiler asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holdback {
+    /// The read stops at `holdback_boundary`. Every surface, unless it
+    /// carried the opt-in below.
+    Applies,
+    /// The caller named `read_output`'s `tail_lines`/`tail_bytes`
+    /// argument, so it asked for the freshest bytes and accepted the
+    /// trade-off. Documented residual risk on those two arguments only
+    /// (§4.1, REQ-O-003).
+    BypassedByCallerOptIn,
 }
 
 /// A read request as the session sees it.
 #[derive(Debug, Clone, Copy)]
 pub struct ReadRequest {
     pub start: ReadStart,
+    /// Whether §4.1's holdback applies. See [`Holdback`]: it is here
+    /// rather than on `start` because the licence is the per-call opt-in,
+    /// not the tail shape.
+    pub holdback: Holdback,
     /// Raw-byte budget (§5.1): caps bytes read *from the ring buffer*,
     /// not the size of the encoded payload.
     ///
@@ -150,6 +197,7 @@ impl ReadRequest {
     pub fn since(cursor: u64, max_bytes: usize) -> Self {
         Self {
             start: ReadStart::Cursor(cursor),
+            holdback: Holdback::Applies,
             max_bytes,
             options: ReadOptions::default(),
             tool: "read_output",

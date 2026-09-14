@@ -3204,8 +3204,8 @@ async fn a_disabled_rule_still_redacts_the_audit_trail_and_the_row_names_it() {
 use holdfast_core::audit::AuditLog;
 use holdfast_core::output::rules::RuleSet;
 use holdfast_core::output::{
-    ansi::AnsiMode, encoding::TextEncoding, OutputProcessor, ProcessedRead, ProcessingLimits,
-    ReadOptions, ReadRequest, ReadStart,
+    ansi::AnsiMode, encoding::TextEncoding, Holdback, OutputProcessor, ProcessedRead,
+    ProcessingLimits, ReadOptions, ReadRequest, ReadStart,
 };
 
 /// A 40-character GitHub token, assembled at runtime. It is never typed
@@ -3332,6 +3332,7 @@ fn base64_without_redaction_returns_the_exact_pty_bytes() {
     let read = session.read_processed(
         &ReadRequest {
             start: ReadStart::Cursor(0),
+            holdback: Holdback::Applies,
             max_bytes: 64 * 1024,
             options: ReadOptions {
                 ansi: AnsiMode::Raw,
@@ -3385,6 +3386,7 @@ fn a_raw_read_of_a_real_session_is_recorded_in_the_audit_log() {
     let raw = session.read_processed(
         &ReadRequest {
             start: ReadStart::Cursor(0),
+            holdback: Holdback::Applies,
             max_bytes: 64 * 1024,
             options: ReadOptions {
                 redact: false,
@@ -3430,6 +3432,7 @@ fn read_args(session: &str) -> ReadOutputArgs {
         since_cursor: Some(0),
         tail_lines: None,
         tail_bytes: None,
+        apply_holdback: None,
         max_bytes: None,
         ansi: None,
         text_encoding: None,

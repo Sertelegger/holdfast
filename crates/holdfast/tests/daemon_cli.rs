@@ -1338,6 +1338,256 @@ fn holdfast_logs_raw_writes_a_redaction_disabled_audit_entry() {
     shim.kill();
 }
 
+/// §11.4's third arm — the one that was specified and never written.
+///
+/// The row is *"Holdback bypass for tail reads, and its three
+/// non-members"*, and it is explicit that the arms have to be one
+/// measurement: **"In the *same* moment assert §4.1's actual three
+/// non-members: `get_screen_state` answers `held_back: true` with those
+/// cells masked, `holdfast logs --tail` does not return them, and the
+/// `observer` attach stream withholds them"**. It closes by naming the
+/// cost of shipping without this arm:
+///
+/// > The bypass arm alone passes against an implementation that exempts
+/// > every tail-shaped read, **which is the reading that shipped**.
+///
+/// It had shipped. `holdfast logs --tail N` sent `tail_lines`, which was
+/// §4.1's per-call bypass, on the surface §4.1 names as a non-member by
+/// name: *"`--raw` is that surface's opt-in and it is audited; `--tail`
+/// is not an opt-in to anything."* Measured on a live daemon in one
+/// instant, `read_output(since_cursor: 0)` answered `held_back: true`
+/// and `holdfast logs --tail 50` printed the credential in the clear
+/// (GH #169).
+///
+/// **One session, one instant, and the premise asserted before the
+/// conclusion.** "`--tail` did not print the token" is satisfied by a
+/// session that never produced one, by a daemon that returned nothing,
+/// and by a `--tail` that returns the *head* — so the arrangement is
+/// established first (the licensed bypass hands the token over whole),
+/// the withholding is established second (`read_output` at the same
+/// instant), and the holdback is re-checked **after** the CLI ran, which
+/// is what makes "the same moment" a claim rather than a hope.
+///
+/// **The control is the first half of the test and it is not optional.**
+/// Everything here is also satisfied by a `--tail` that returns nothing,
+/// or the head, or silently less than asked. So the same session is
+/// measured first with nothing in flight, where `--tail` must still be
+/// byte-for-byte what the bypassing read returns.
+#[test]
+fn logs_tail_is_inside_the_holdback_in_the_same_moment_read_output_withholds() {
+    // 35 characters. `gh[pousr]_[0-9A-Za-z]{36,}` wants 36, so this is a
+    // token that is still arriving: the redactor cannot judge it, §4.1's
+    // holdback is the only thing withholding it, and anything that
+    // returns it returns it in the clear.
+    const IN_FLIGHT_TAIL: &str = "0123456789abcdefghijABCDEFGHIJ01234";
+
+    let env = TestEnv::new("tailholdback");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "tailhb" }),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "ok",
+        "{started}"
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    // ---- the control: what `--tail` is for, with nothing in flight ----
+    shim.call_tool(
+        "send_input",
+        json!({ "session": session_id, "data": "for i in $(seq 1 40); do echo LINE''_$i; done" }),
+    );
+    let seen = shim.read_until(&session_id, "LINE_40");
+    assert!(
+        seen.contains("LINE_40"),
+        "the loop never ran; got: {seen:?}"
+    );
+
+    let (code, ordinary, err) = env.run(&["logs", "tailhb", "--tail", "10"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        ordinary.contains("LINE_40"),
+        "`--tail 10` did not reach the newest line: {ordinary:?}"
+    );
+    assert!(
+        !ordinary.contains("LINE_1\r"),
+        "`--tail 10` returned the HEAD of the buffer, not the tail: {ordinary:?}"
+    );
+    // The sharp form of "unchanged": with nothing withheld, the held-back
+    // tail read and the bypassing one are the same bytes. A fix that
+    // trades this defect for a shorter `--tail` fails here.
+    let bypassing = shim.call_tool(
+        "read_output",
+        json!({ "session": session_id, "tail_lines": 10, "max_bytes": 262144 }),
+    );
+    assert_eq!(
+        ordinary,
+        bypassing["result"]["structuredContent"]["data"]["output"]
+            .as_str()
+            .unwrap_or_default(),
+        "with nothing in flight, `--tail` must return exactly what the \
+         bypassing tail read returns"
+    );
+    assert!(
+        err.is_empty(),
+        "the ordinary case reported a holdback: {err}"
+    );
+
+    // ---- the arrangement: a secret that is still arriving -------------
+    // `ghp_` and the value are separate `printf` arguments, so the shell's
+    // echo of the command line carries them with a space between and is
+    // not itself a candidate — the only contiguous token in the buffer is
+    // the one `printf` writes. `read -r _` then parks the shell with no
+    // prompt and no newline after it, which is what keeps the partial at
+    // `buffer.head`: `earliest_partial` requires every byte from the
+    // prefix to the end of the scan region to still be a value byte.
+    shim.call_tool(
+        "send_input",
+        json!({
+            "session": session_id,
+            "data": format!("printf 'see %s%s' ghp_ {IN_FLIGHT_TAIL}; read -r _"),
+        }),
+    );
+
+    let in_flight = format!("ghp_{IN_FLIGHT_TAIL}");
+    let arranged = format!("see {in_flight}");
+    // Wait for the arrangement itself — the token whole, at the head of
+    // the buffer — **with no deadline**. A deadline here would let this
+    // row go green against a build where nothing was ever in flight,
+    // which is the vacuous pass §11.4 spends its closing sentence on.
+    // `.config/nextest.toml`'s `terminate-after` is the bound, and unlike
+    // a deadline it fails the test and names it. Each turn of the loop is
+    // a socket round trip, so it paces itself; no sleep.
+    let bypass = loop {
+        let r = shim.call_tool(
+            "read_output",
+            json!({ "session": session_id, "tail_bytes": 256 }),
+        );
+        let data = r["result"]["structuredContent"]["data"].clone();
+        if data["output"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(&arranged)
+        {
+            break data;
+        }
+    };
+
+    // Premise one, and §11.4's bypass arm: the per-call opt-in is still
+    // exempt and hands the partial over whole (§4.1, REQ-O-003). Without
+    // it, every "did not return the token" below is also true of a buffer
+    // that never held one.
+    assert!(
+        bypass["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&arranged),
+        "the per-call tail opt-in must still return the partial: {}",
+        bypass["output"]
+    );
+    assert_eq!(
+        bypass["held_back"],
+        json!(false),
+        "a read that bypasses the holdback is not withholding anything"
+    );
+
+    // Premise two: in this same moment the ordinary cursor read really is
+    // withholding. This is the half that makes the row a *pairing*.
+    let held = shim.call_tool(
+        "read_output",
+        json!({ "session": session_id, "since_cursor": 0, "max_bytes": 262144 }),
+    );
+    let held = &held["result"]["structuredContent"]["data"];
+    assert_eq!(
+        held["held_back"],
+        json!(true),
+        "nothing is being withheld, so there is no non-membership to describe: {held}"
+    );
+    assert!(
+        !held["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&in_flight),
+        "the cursor read must be withholding it: {}",
+        held["output"]
+    );
+
+    // ---- the conclusion: §4.1:477's named non-member ------------------
+    let (code, tail, err) = env.run(&["logs", "tailhb", "--tail", "10"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        !tail.contains(&in_flight),
+        "`holdfast logs --tail` released the in-flight token that \
+         `read_output` is withholding in the same moment (§4.1:477, \
+         REQ-O-003, GH #169): {tail:?}"
+    );
+    assert!(
+        !tail.contains("see ghp_"),
+        "`holdfast logs --tail` returned part of the withheld region: {tail:?}"
+    );
+    // Withheld, not emptied and not reversed: it is still the tail, cut
+    // at `holdback_boundary`, which is §4.1's shortened-read shape.
+    assert!(
+        tail.contains("LINE_40"),
+        "`--tail` stopped returning the tail; withholding is a shorter \
+         read, not a different one: {tail:?}"
+    );
+    assert!(
+        tail.ends_with("see "),
+        "`--tail` did not stop exactly at the holdback boundary: {tail:?}"
+    );
+    assert!(
+        err.contains("stops short"),
+        "a shortened read that says nothing reads as 'the output ended': {err:?}"
+    );
+
+    // The bracket. Arms measured either side of a process spawn are only
+    // "the same moment" if the holdback was still open at the end of it.
+    let after = shim.call_tool(
+        "read_output",
+        json!({ "session": session_id, "since_cursor": 0, "max_bytes": 262144 }),
+    );
+    assert_eq!(
+        after["result"]["structuredContent"]["data"]["held_back"],
+        json!(true),
+        "the holdback closed while the CLI was running, so the two arms \
+         are not one measurement"
+    );
+
+    // ---- `--raw` IS the opt-in, and it IS audited ---------------------
+    // §4.1:477 licenses the bypass on this surface *because* the record
+    // exists. An opt-in that is licensed by an audit and then is not
+    // audited is the same defect in a different hat.
+    assert!(
+        env.redaction_disabled_entries().is_empty(),
+        "a redacted read was audited as a raw one: {:?}",
+        env.redaction_disabled_entries()
+    );
+    let (code, raw, err) = env.run(&["logs", "tailhb", "--tail", "10", "--raw"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        raw.contains(&arranged),
+        "`--raw` is this surface's opt-in and must still return the \
+         in-flight bytes: {raw:?}"
+    );
+    let entries = env.redaction_disabled_entries();
+    assert_eq!(
+        entries.len(),
+        1,
+        "`--raw` was honoured without being audited: {entries:?}"
+    );
+    assert_eq!(entries[0]["tool"], "read_output", "{:?}", entries[0]);
+    assert_eq!(entries[0]["client_kind"], "cli", "{:?}", entries[0]);
+    assert_eq!(entries[0]["session_id"], session_id, "{:?}", entries[0]);
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
 #[test]
 fn no_daemon_mode_runs_in_process_and_starts_no_daemon() {
     // §3.4's escape hatch, and the shape the Windows build reuses in
