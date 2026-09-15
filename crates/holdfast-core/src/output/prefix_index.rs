@@ -726,11 +726,15 @@ mod tests {
     /// what separates a ledger from the hand-kept count GH #53 watched go
     /// stale; this one cannot rot quietly, because rotting is a failure.
     ///
-    /// The sweep runs the full configurable span the issue measured. A
-    /// rule that has an entry only at a generous
-    /// `prefilter_prefix_expansion_limit` is still unprotected on a site
-    /// that lowered it, so "indexed" has to mean indexed across the range,
-    /// not at the default alone.
+    /// The sweep runs a range rather than the default alone, and the
+    /// range is cover for a seam that is not wired yet rather than for a
+    /// site that lowered anything. `prefilter_prefix_expansion_limit`
+    /// does not reach [`PrefixIndex::build`]: `output/mod.rs` passes the
+    /// hardcoded `DEFAULT_PREFIX_EXPANSION_LIMIT`, and
+    /// `tests/config_surface.rs` both classifies the key
+    /// `Inert::NamedElsewhere` and asserts it stays off
+    /// `processing_limits()`. No operator can lower it today. When one
+    /// can, "indexed" will already mean indexed across the range.
     ///
     /// **What still slips past — this guard proves existence, not reach:**
     ///
@@ -752,10 +756,14 @@ mod tests {
     /// * *Prefix quality.* An entry at exactly [`MIN_PREFIX_LEN`] that
     ///   collides with ordinary output counts the same as a good one;
     ///   `the_known_transient_holdbacks_are_pinned` covers that direction.
-    /// * *Below the sweep floor.* At a limit of 4, `github-token` loses
-    ///   its entry too (measured) because five branches no longer fit.
-    ///   The floor of 8 is a judgement about plausible operator values,
-    ///   not a proof.
+    /// * *Below the sweep floor.* 8 is headroom, not a boundary:
+    ///   measured, the blind set is byte-identical from 5 upward, and 5
+    ///   is where `gh[pousr]`'s five branches stop fitting. At 4 and 3
+    ///   and 2 `github-token` loses its entry as well; at 1
+    ///   `posthog-key` goes too. `Config::validate` demands only
+    ///   non-zero, so 1..8 is reachable in principle and unswept — which
+    ///   costs nothing while the knob reaches nothing, and is the second
+    ///   thing to fix on the day it does.
     /// * *User rules.* Only [`RuleSet::builtin`] is swept;
     ///   `extra_redaction_patterns` from an operator's config is not.
     /// * *The other three exposure axes* — escape-splicing (GH #142), the
@@ -796,9 +804,10 @@ mod tests {
             );
         }
 
-        // The span GH #170 measured. 8 is the floor: below it the cap
-        // itself starts dropping legitimate multi-branch classes, which
-        // is a tuning question and not this blind spot.
+        // The span GH #170 measured. 8 is headroom rather than a
+        // boundary: the cap only starts dropping multi-branch classes
+        // below 5, where `gh[pousr]`'s five branches stop fitting —
+        // a tuning question and not this blind spot.
         for limit in [8usize, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
             let index = PrefixIndex::build(&rules, limit);
             let mut blind: Vec<&str> = rules
