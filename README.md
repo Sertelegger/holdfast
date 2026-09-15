@@ -148,7 +148,8 @@ out to be the start of a secret, the cells those bytes would have
 written read `[REDACTED:unresolved]` and the response carries
 `held_back: true`. The exemption that lets a tail read see those bytes
 is licensed by `read_output`'s own `tail_lines` / `tail_bytes` argument
-— a per-call opt-in `get_screen_state` does not have.
+— a per-call opt-in `get_screen_state` does not have, and neither does
+`holdfast logs --tail`, which asks for the tail inside the holdback.
 
 ## Build and try it
 

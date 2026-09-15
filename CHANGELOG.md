@@ -44,6 +44,15 @@ is cut, named and published is in
   client that predates the field fails **closed**; nothing an agent sends
   selects it. `holdfast attach --allow-echo` is the CLI spelling ([#137]).
 
+- `read_output` gains `apply_holdback`, the way to ask for the last N lines
+  **inside** §4.1's holdback. A bare `tail_lines`/`tail_bytes` is the per-call
+  opt-in and still bypasses it, unchanged; `apply_holdback: true` declines that
+  opt-in while keeping the tail. The daemon could not express "the last N lines,
+  safely" before, which is why `holdfast logs --tail` reached for the bypass.
+  Only `true` is accepted — `false` has exactly one meaning anyone could want,
+  and putting a second, unaudited licence to bypass on the wire is the defect
+  this argument exists to close ([#169]).
+
 ### Changed
 
 - **`[security] redaction_enabled = false` is refused at load, and §9.4's
@@ -114,21 +123,24 @@ is cut, named and published is in
 - **What that does not cover, listed rather than implied.** Every other
   consumer of the §4.1 boundary *shortens* — it caps a read end and moves a
   cursor — and none of them takes the new one: `read_output`,
-  `resources/read`, `wait_for_pattern`, `holdfast logs` (whose `--tail` is
-  outside the holdback to begin with) and the `observer` attach stream behind
-  `holdfast watch` are byte-identical to before. That is deliberate and it is
-  measured: a shortened read cannot be revised, because the byte that would
-  revise it — the space, the newline, the `ESC` — is the byte the view
-  deleted, and the read consults no other stream. The same change made on
-  `read_output` stranded ordinary output permanently at 2,570 zero-byte second
-  reads against `main`'s 258, and the two cases are not separable, because
-  `use crate::re_exports` followed by a colour reset genuinely *is* the
-  `resend-api-key` rule with seven of its twenty-four value bytes arrived. A
-  mask is admissible where a shortening is not for one reason: it denies no
-  range, moves no cursor, and is recomputed from the live grid on every call,
-  so the next call revises it. §18.2 already gave the grid that spelling —
-  *"a screen has no tail to cut"* — and the reason it gives is geometry, never
-  principle ([#142]).
+  `resources/read`, `wait_for_pattern`, `holdfast logs` and the `observer`
+  attach stream behind `holdfast watch` are byte-identical to before. (This
+  sentence read *"`holdfast logs` (whose `--tail` is outside the holdback to
+  begin with)"* until [#169] put `--tail` **inside** §4.1's holdback; see that
+  entry. What is byte-identical is this entry's own subject — the **new grid**
+  boundary, which no read surface takes — and that is unchanged.) That is
+  deliberate and it is measured: a shortened read cannot be revised, because
+  the byte that would revise it — the space, the newline, the `ESC` — is the
+  byte the view deleted, and the read consults no other stream. The same
+  change made on `read_output` stranded ordinary output permanently at 2,570
+  zero-byte second reads against `main`'s 258, and the two cases are not
+  separable, because `use crate::re_exports` followed by a colour reset
+  genuinely *is* the `resend-api-key` rule with seven of its twenty-four value
+  bytes arrived. A mask is admissible where a shortening is not for one
+  reason: it denies no range, moves no cursor, and is recomputed from the live
+  grid on every call, so the next call revises it. §18.2 already gave the grid
+  that spelling — *"a screen has no tail to cut"* — and the reason it gives is
+  geometry, never principle ([#142]).
 - `prompt.last_line` needed nothing and got nothing. It has run the in-flight
   test over the **rendered** line since 0.0.5, which is a view-driven denial
   by another route, and REQ-O-013 mandates it; measured on `main`, this
@@ -209,6 +221,60 @@ is cut, named and published is in
   that merely mentions the marker inside a comment — it must *be* a comment
   line — so a file can no longer exempt itself from the bans on
   `continue-on-error`, unpinned actions and `secrets.` references.
+- **`holdfast logs <session> --tail N` no longer releases a secret the same
+  session's `read_output` is withholding.** The CLI sent `tail_lines`, which is
+  §4.1's per-call bypass, so every tail-shaped read inherited an exemption the
+  spec grants to two arguments on one tool — and names this surface a
+  non-member of, twice. Measured on a live daemon in one instant:
+  `read_output(since_cursor: 0)` answered `held_back: true` and
+  `holdfast logs --tail 50` printed the credential in the clear. Unlike
+  `--raw`, nothing recorded it. `--tail` now asks for the tail inside the
+  holdback and stops at the boundary, saying so on stderr; with nothing in
+  flight it returns byte-for-byte what it always did. The bypass predicate has
+  moved off the read's *shape* and onto the request, where the licence
+  actually is, and `ReadRequest` has no `Default`, so the next read surface is
+  asked by the compiler rather than inheriting an answer. `--raw` is untouched:
+  it is this surface's opt-in, it still returns the bytes, and it is still
+  audited. No branch on `client_kind` — the CLI is held back for what it sends
+  (REQ-SEC-018). §11.4's third arm is finally written, and it is one
+  measurement rather than two tests that can drift ([#169]). Filed under
+  `### Security` rather than `### Fixed` to sit with [#142] and [#137], the
+  milestone's other two credential-release fixes; it was under `### Fixed`
+  until review.
+- **Two behaviour changes `holdfast logs` carries as a consequence, stated
+  rather than left to be discovered.** (a) **A session that has exited can
+  now withhold the tail of its own log, permanently.** §4.1 is explicit that
+  this is correct — *"If a process stops mid-token, the partial stays
+  withheld"* — and REQ-O-005 makes it normative, but before [#169] `--tail`
+  bypassed the holdback and returned the bytes, so on `main` a completed
+  session's last line comes back whole and here it may not. The withhold is
+  kept and **is deliberately still reachable through `--raw`**, which is the
+  recourse §4.1 names in the same sentence (*"may take the audited `redact:
+  false` path"*) and §4.1:476 names as this surface's spelling of it; making
+  it unreachable would invent a rule the spec does not have and strand the
+  bytes entirely. (b) **The stderr note now says which of three things
+  shortened the read.** `held_back` is `safety_end < cap_end`, and §4.1's
+  holdback, REQ-O-008's unfinished trailing escape and [#14]'s
+  `unresolved_from` bound all set it; one sentence described the first as if
+  it were all three. It claimed a secret was in flight on `--raw`, where
+  `redact: false` disarms that mechanism *before* the field is computed and
+  the audit log says so, and it advised a retry that a dead child can never
+  satisfy. The note is now chosen from `--raw` and the response's `state`.
+  It is also flushed against stdout, so `holdfast logs X 2>&1 | tail` no
+  longer splices it into the log text ([#169]).
+- **Residual, not closed: under shim/daemon version skew an agent can ask for
+  the safe tail read and silently get the bypassing one.** `mcp::shim`
+  answers `list_tools` **locally** — its own module doc names this class and
+  defers it — and `ReadOutputArgs` carries no `deny_unknown_fields`, so a
+  newer shim in front of an older daemon advertises `apply_holdback`, forwards
+  it, and the daemon drops it: the caller gets `held_back: false` and no
+  error. A false affordance `main` does not have, since on `main` the argument
+  does not exist. Closing it properly needs a manifest method on the control
+  protocol (§7.4.1 defines none), which is the same protocol addition
+  `shim.rs` already defers; **the protocol version is deliberately not bumped
+  for it** — `PROTOCOL_MINOR` "cannot start refusing anybody"
+  (`attach/handshake.rs`), so a bump would not make an older daemon apply a
+  holdback it has no code for ([#169]).
 
 ### Fixed
 
@@ -780,6 +846,7 @@ residuals that are known and accepted.
 [0.0.5]: https://github.com/Sertelegger/holdfast/releases/tag/v0.0.5
 
 [#7]: https://github.com/Sertelegger/holdfast/issues/7
+[#14]: https://github.com/Sertelegger/holdfast/issues/14
 [#19]: https://github.com/Sertelegger/holdfast/issues/19
 [#21]: https://github.com/Sertelegger/holdfast/issues/21
 [#39]: https://github.com/Sertelegger/holdfast/issues/39
@@ -813,3 +880,4 @@ residuals that are known and accepted.
 [#142]: https://github.com/Sertelegger/holdfast/issues/142
 [#149]: https://github.com/Sertelegger/holdfast/issues/149
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
+[#169]: https://github.com/Sertelegger/holdfast/issues/169
