@@ -892,8 +892,23 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
     // handlers. `holdfast logs` is `read_output` with a human on the other
     // end, so it goes through `tool/read_output` rather than growing a
     // parallel method with its own bugs.
+    //
+    // **`apply_holdback` on the `--tail` arm, and it is not decoration
+    // (GH #169).** `tail_lines` alone is §4.1's per-call bypass, and this
+    // surface is named a non-member of it, twice: *"the exemption covers
+    // exactly those two arguments on the one tool that takes them, and
+    // nothing else"*, and then, by name, *"`--raw` is that surface's
+    // opt-in and it is audited; `--tail` is not an opt-in to anything."*
+    // The distinction has to be carried by what the CLI **sends**: the
+    // daemon may not recover it from `client_kind`, which is audit
+    // attribution and never a redaction input (REQ-SEC-018).
     let mut args = match tail_lines {
-        Some(n) => json!({ "session": session, "tail_lines": n, "max_bytes": 256 * 1024 }),
+        Some(n) => json!({
+            "session": session,
+            "tail_lines": n,
+            "apply_holdback": true,
+            "max_bytes": 256 * 1024,
+        }),
         None => json!({ "session": session, "since_cursor": 0, "max_bytes": 256 * 1024 }),
     };
     if raw {
@@ -931,7 +946,82 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
         }
     };
     print!("{}", data["output"].as_str().unwrap_or_default());
+    // §4.1's holdback can now shorten this read, so say so — on stderr,
+    // because stdout is the log and this surface's point is that it
+    // survives being piped somewhere. Silence here would read as "the
+    // output ended", which is the one thing it does not mean.
+    //
+    // **Flush first.** `print!` goes through Rust's `LineWriter` and
+    // `diag!` writes an unbuffered, locked stderr, so `holdfast logs X
+    // 2>&1 | tail` spliced the note into the middle of the log text.
+    // Ordering two streams is the writer's job, not the reader's.
+    if data["held_back"] == json!(true) {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        diag!("holdfast logs: {}", held_back_note(raw, &data));
+    }
     ExitCode::SUCCESS
+}
+
+/// What `holdfast logs` says on stderr when the read came back
+/// `held_back: true`.
+///
+/// **`held_back` is a disjunction, and one sentence described one of its
+/// terms as if it were all three.** `output/mod.rs` computes it as
+/// `safety_end < w.cap_end`, and three independent rules lower
+/// `safety_end`: §4.1's partial-secret holdback, REQ-O-008's unfinished
+/// trailing escape, and GH #14's `unresolved_from` bound. The note read
+/// *"a secret may still be arriving (§4.1). Read again to pick up the
+/// rest."* for every one of them — a security claim on two cases where
+/// it is false, and advice that on a third can never succeed.
+///
+/// Two readings are decisively wrong and both are fixed here:
+///
+/// * **`--raw`.** `redact: false` makes `holdback_boundary` return
+///   `w.head` *before* this field is computed, so §4.1's mechanism is
+///   provably switched off — and the same read writes a
+///   `redaction_disabled` row saying so. The only rule left that can
+///   fire is REQ-O-008's, which is gated on `ansi == Strip` and not on
+///   `redact`, and which requires a **live** child. Naming §4.1 there
+///   asserts a protection that is not running.
+/// * **A child that has exited.** §4.1: *"If a process stops mid-token,
+///   the partial stays withheld — correct"*, and REQ-O-005 states the
+///   consequence — quiescence does **not** release the holdback. So
+///   nothing is "still arriving" and "read again" can never succeed.
+///   §4.1 names the recourse in the same breath: the agent *"may take
+///   the audited `redact: false` path if it genuinely needs the bytes"*,
+///   which on this surface is `--raw` (§4.1:476, and it is audited).
+///
+/// **What it is told apart *by*, and what it is not.**
+/// `dropped_incomplete_escape` is unusable for this twice over: it is a
+/// `ProcessedRead` field `mcp/tools.rs` never serialises, so it does not
+/// reach this process at all, and it flags the escape being *dropped* —
+/// the arm that does **not** set `held_back`. `redactions` counts
+/// redactions inside the returned bytes; a partial secret matches no
+/// rule by definition, so it is `{}` in exactly the case of interest.
+/// What does reach here is `state` (`tools.rs` sends it beside
+/// `held_back`) and this process's own `--raw`, and between them they
+/// separate all three readings.
+#[cfg(unix)]
+fn held_back_note(raw: bool, data: &Value) -> &'static str {
+    if raw {
+        return "output stops short at an unfinished escape sequence \
+                (REQ-O-008). Redaction is off on this read, so §4.1's \
+                holdback is not what stopped it. Read again to pick up \
+                the rest.";
+    }
+    // `Exited` and `Dead` are the two terminal states (`SessionState`);
+    // an unknown spelling from a newer daemon falls through to the live
+    // wording, which is the reading that advises a harmless retry.
+    if matches!(data["state"].as_str(), Some("Exited") | Some("Dead")) {
+        return "output stops short, and stays that way: the session has \
+                ended with a partial secret in its tail, which §4.1 keeps \
+                withheld (REQ-O-005 — quiescence does not release it). \
+                Reading again returns the same bytes; `--raw` is this \
+                surface's audited opt-in.";
+    }
+    "output stops short: the tail is not vouched for yet — a secret may \
+     still be arriving, or an escape sequence is unfinished (§4.1, \
+     REQ-O-008). Read again to pick up the rest."
 }
 
 /// The §7.5 handshake `holdfast attach` sends, **in full**.

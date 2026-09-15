@@ -15,7 +15,7 @@ use crate::detect::{
 };
 use crate::output::rules::RuleSet;
 use crate::output::{
-    OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
+    Holdback, OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
 };
 use crate::pty::{clamp_geometry, PtyBackend, Signal};
 use crate::screen::{
@@ -2158,7 +2158,13 @@ impl Session {
             // instead would return the oldest slice and hand back a cursor
             // far behind `head`, which re-delivers the same bytes on every
             // subsequent cursor read (0.0.1's documented contract, REQ-T-006).
-            let (req_start, front_clipped) = if req.start.bypasses_holdback() {
+            //
+            // **`is_tail()`, not the holdback.** This clip is a fact about
+            // where the read is anchored; the holdback is a fact about
+            // whether the caller opted in. They were one predicate until
+            // GH #169, which is how `holdfast logs --tail` acquired a
+            // bypass §4.1 names it as a non-member of.
+            let (req_start, front_clipped) = if req.start.is_tail() {
                 let clipped = head
                     .saturating_sub(req.max_bytes as u64)
                     .max(requested_start);
@@ -2199,7 +2205,7 @@ impl Session {
             head,
             cap_end,
             child_alive,
-            bypass_holdback: req.start.bypasses_holdback(),
+            bypass_holdback: req.holdback == Holdback::BypassedByCallerOptIn,
             front_clipped,
             truncated_at_tail,
         };
@@ -2997,6 +3003,7 @@ mod tests {
         let r = s.read_processed(
             &ReadRequest {
                 start: ReadStart::TailBytes(10),
+                holdback: Holdback::BypassedByCallerOptIn,
                 max_bytes: 32 * 1024,
                 options: ReadOptions::default(),
                 tool: "read_output",
@@ -3020,6 +3027,7 @@ mod tests {
         let r = s.read_processed(
             &ReadRequest {
                 start: ReadStart::Cursor(0),
+                holdback: Holdback::Applies,
                 max_bytes: 32 * 1024,
                 options: ReadOptions {
                     redact: false,
@@ -3106,6 +3114,7 @@ mod tests {
         let r = s.read_processed(
             &ReadRequest {
                 start: ReadStart::TailLines(100),
+                holdback: Holdback::BypassedByCallerOptIn,
                 max_bytes: 5,
                 options: ReadOptions::default(),
                 tool: "read_output",
@@ -3117,6 +3126,56 @@ mod tests {
         assert_eq!(r.cursor, 19, "the cursor still points past the newest byte");
         assert!(r.truncated_for_size, "bytes were lost to the size budget");
         assert!(!r.held_back);
+    }
+
+    /// **The same clip, with the holdback *applying*.** The row above is
+    /// the only pin on the clip direction and it names
+    /// `BypassedByCallerOptIn`, so both halves of `req.start.is_tail()`
+    /// and `req.holdback == Holdback::BypassedByCallerOptIn` are true in
+    /// it and it cannot tell the two predicates apart. Splitting them was
+    /// the whole of GH #169's fix — §4.1: *"**What licenses the bypass is
+    /// the per-call opt-in, not the tail shape**"* — and a fix that
+    /// separates two predicates needs a fixture per direction, not one.
+    ///
+    /// This is the direction `holdfast logs --tail N` now sends, and it
+    /// is the only sender of it: a tail whose holdback *applies*. Written
+    /// against the clip predicate reading the holdback instead of the
+    /// shape, which returns the OLDEST `max_bytes` with a cursor far
+    /// behind `head` — REQ-T-006's re-delivery loop, on the surface the
+    /// comment three lines above the predicate exists to protect.
+    #[test]
+    fn an_oversized_tail_read_inside_the_holdback_still_drops_the_oldest_bytes() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        pty.queue_output(b"one\ntwo\nthree\nfour\n");
+        wait_for_bytes(&s, 19);
+
+        let r = s.read_processed(
+            &ReadRequest {
+                start: ReadStart::TailLines(100),
+                holdback: Holdback::Applies,
+                max_bytes: 5,
+                options: ReadOptions::default(),
+                tool: "read_output",
+                client_kind: "in_process",
+            },
+            &p,
+        );
+        assert_eq!(
+            r.output, "four\n",
+            "the clip is a fact about where the read is anchored, not about \
+             whether the caller opted out of the holdback"
+        );
+        assert_eq!(
+            r.cursor, 19,
+            "a cursor behind `head` re-delivers these bytes on every \
+             follow-up read (REQ-T-006)"
+        );
+        assert!(r.truncated_for_size, "bytes were lost to the size budget");
+        assert!(
+            !r.held_back,
+            "nothing is in flight, so an applying holdback withholds nothing"
+        );
     }
 
     /// The negative half: a `tail_*` read that *fits* was not clipped, so
@@ -3133,6 +3192,7 @@ mod tests {
         let r = s.read_processed(
             &ReadRequest {
                 start: ReadStart::TailLines(2),
+                holdback: Holdback::BypassedByCallerOptIn,
                 max_bytes: 32 * 1024,
                 options: ReadOptions::default(),
                 tool: "read_output",
@@ -3270,6 +3330,7 @@ mod tests {
         let _ = s.read_processed(
             &ReadRequest {
                 start: ReadStart::Cursor(0),
+                holdback: Holdback::Applies,
                 max_bytes: 32 * 1024,
                 options: ReadOptions {
                     redact: false,

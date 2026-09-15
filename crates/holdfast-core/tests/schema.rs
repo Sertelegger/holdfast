@@ -4442,6 +4442,75 @@ fn the_pattern_argument_advertises_that_it_may_be_omitted() {
     );
 }
 
+/// **`apply_holdback` reaches the advertised schema, and so does the one
+/// value it accepts.**
+///
+/// GH #169 added this argument and pinned nothing about it here — not
+/// in this file, not in `tests/wire_shape.rs`, not in
+/// `scripts/mcp-smoke.sh`. Two mutations survived the suite as it stood:
+///
+/// * `#[schemars(skip)]` on the field. Serde still accepts it, so every
+///   behavioural row in `mcp::tools` stays green — while the argument
+///   vanishes from `inputSchema` and **no agent can discover the safe
+///   tail read at all**. `tools/list` is the only place a client learns
+///   this argument exists.
+/// * deleting the *"Only `true` is accepted…"* sentence. The refusal
+///   stays in the code and becomes undocumented, so a caller meets it as
+///   an unexplained `invalid_params`.
+///
+/// `the_pattern_argument_advertises_that_it_may_be_omitted` above sets
+/// the rule this follows: *a constraint that lives in argument prose gets
+/// pinned by name, because prose is the only place a client can read it.*
+/// It is doubly the only place here — `read_output`'s own tool
+/// description does not mention `apply_holdback`, and the `required`
+/// array cannot express "may only be true".
+///
+/// `scripts/mcp-smoke.sh` carries the other half: this pins what
+/// `tools/list` says, and that pins what a real call does with it.
+#[test]
+fn read_output_advertises_apply_holdback_and_the_only_value_it_accepts() {
+    let tool = advertised("read_output");
+    let schema = serde_json::to_value(&*tool.input_schema).expect("input schema");
+    let props = schema["properties"]
+        .as_object()
+        .expect("read_output advertises `properties`");
+
+    assert!(
+        props.contains_key("apply_holdback"),
+        "`read_output` no longer advertises `apply_holdback`. It is the \
+         only way to ask for the last N lines *inside* §4.1's holdback, \
+         and `tools/list` is the only surface on which a client can find \
+         out it exists: {schema}"
+    );
+    assert_eq!(
+        props["apply_holdback"].get("type"),
+        Some(&json!(["boolean", "null"])),
+        "`apply_holdback` is advertised, but not as an optional boolean: {}",
+        props["apply_holdback"]
+    );
+
+    // The doc comment reaches the wire with its source line breaks
+    // intact, so collapse whitespace and assert the sentence rather than
+    // where rustfmt happened to wrap it.
+    let raw = props["apply_holdback"]
+        .get("description")
+        .and_then(Value::as_str)
+        .expect("`apply_holdback` advertises no description");
+    let description = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in [
+        "Only `true` is accepted",
+        "`redact: false` is the audited escape hatch",
+    ] {
+        assert!(
+            description.contains(phrase),
+            "`apply_holdback`'s description no longer says {phrase:?}. \
+             `false` is refused as invalid_params and this prose is the \
+             only thing on the wire that says so, or names what to reach \
+             for instead: {description:?}"
+        );
+    }
+}
+
 /// **The idle path honours the deadline it was given, and says when it was
 /// rewritten.**
 ///

@@ -33,7 +33,7 @@ use serde_json::json;
 
 use crate::output::ansi::AnsiMode;
 use crate::output::encoding::TextEncoding;
-use crate::output::{ReadOptions, ReadRequest, ReadStart};
+use crate::output::{Holdback, ReadOptions, ReadRequest, ReadStart};
 use crate::session::{Session, SessionRegistry};
 
 use super::caller;
@@ -485,6 +485,9 @@ pub fn read_resource(
     let read = session.read_processed(
         &ReadRequest {
             start: ReadStart::Cursor(since_cursor),
+            // A resource read has no tail argument to opt in with, so it
+            // is inside the holdback like every other cursor read (§4.1).
+            holdback: Holdback::Applies,
             max_bytes: effective_max,
             options: ReadOptions {
                 ansi: uri.query.ansi,
