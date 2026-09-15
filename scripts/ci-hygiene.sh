@@ -992,7 +992,10 @@ echo "--- invoked scripts are executable ---"
 #
 # Comment-blanked copies are used deliberately: a script named only in a
 # header comment is documentation, not an invocation.
-mapfile -t invoked < <(grep -hoE '(\./)?scripts/[A-Za-z0-9_.-]+\.sh' "${stripped[@]}" 2>/dev/null \
+# `\.(sh|py)` and not `\.sh`: `spec-enum-check.py` is invoked by the hygiene
+# job and was outside this rule entirely, so renaming it left HYGIENE OK --
+# the extension in the pattern was doing work nobody had decided it should.
+mapfile -t invoked < <(grep -hoE '(\./)?scripts/[A-Za-z0-9_.-]+\.(sh|py)' "${stripped[@]}" 2>/dev/null \
                        | sed 's|^\./||' | sort -u)
 # Same vacuous-pass guard as above, one layer down: if the derivation ever
 # matches nothing -- a renamed directory, an invocation spelled some other
