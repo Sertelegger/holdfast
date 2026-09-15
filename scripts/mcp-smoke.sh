@@ -265,6 +265,20 @@ OUT="$(
     req '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"smoke","tail_bytes":512}}}'
     sleep 1
     req '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"smoke","tail_bytes":512}}}'
+    # GH #169's new argument, on the only surface that drives real
+    # JSON-RPC. The two calls above are the BYPASS arm -- a bare
+    # `tail_bytes`, which is §4.1's per-call opt-in -- and until these
+    # two the DECLINING arm was driven by nothing outside the crate.
+    # `read_output_advertises_apply_holdback_and_the_only_value_it_accepts`
+    # in `tests/schema.rs` is the other half; it pins what `tools/list`
+    # says, and these pin what a real call actually does.
+    #
+    # The refusal is the pairing and not a bonus row: `apply_holdback:
+    # true` being accepted is also true of a server that ignores the
+    # argument entirely, and "only `true` is accepted" is the whole of
+    # what the advertised prose promises.
+    req '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"smoke","tail_bytes":512,"apply_holdback":true}}}'
+    req '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"smoke","tail_bytes":512,"apply_holdback":false}}}'
     req '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"send_input","arguments":{"session":"smoke","data":"hunter2"}}}'
     sleep 2
     # The milestone's headline behaviour, on the only surface that drives
@@ -603,9 +617,11 @@ check "read_output shows shell-evaluated output" 'SMOKE_42'
 # The §5.4 block on every prompt-bearing response, and the session
 # observed at an OSC 133 prompt.
 #
-# The count is the strict half: eight tool calls in this transcript are
-# prompt-bearing (four `send_input`, three `read_output`, one `status`),
-# and dropping `with_detection` from any one of them changes it.
+# The count is the strict half: dropping `with_detection` from any one
+# prompt-bearing handler changes it. It moved from 10 to 11 with GH
+# #169's `apply_holdback` row, which is a fourth `read_output` in this
+# transcript; the refused `apply_holdback: false` call beside it is a
+# JSON-RPC error with no `data`, so it does not count and must not.
 # `list_sessions` is deliberately not among them -- it carries the block
 # on each *entry*, not on `data` -- so this also pins that shape.
 #
@@ -628,7 +644,7 @@ jcheck "responses carry interaction_mode" \
         | select(.interaction_mode? != null)
         | [.interaction_mode, .detection_tier]] as $seen
    | [($seen | any(. == ["AtPrompt","semantic"])), ($seen | length)]' \
-  '[true,10]'
+  '[true,11]'
 
 # `semantic` is only reachable if the injected OSC 133 snippet was typed
 # into a real shell and that shell ran it -- it cannot be faked by the
@@ -709,6 +725,26 @@ jcheck "read_output redacts the terminal's echo of the token" \
 jcheck "get_command_history redacts the command line" \
   'data(7).entries[3] | [.command, .exit_code]' \
   '["export GH_TOKEN=[REDACTED:github]",0]'
+
+# GH #169. `apply_holdback` is how a caller asks for the last N lines
+# *inside* §4.1's holdback -- the shape `holdfast logs --tail` needs, and
+# the one the daemon could not express before. Three rows, because the
+# argument can fail in three independent places: it can vanish from the
+# advertised schema (and then no agent can find it), its one constraint
+# can stop being documented, and the refusal can stop refusing.
+jcheck "read_output advertises apply_holdback and the one value it takes" \
+  'tool("read_output").inputSchema.properties.apply_holdback as $a
+   | [$a.type,
+      ($a.description | gsub("\\s+";" ") | contains("Only `true` is accepted"))]' \
+  '[["boolean","null"],true]'
+jcheck "a real tail read may decline the bypass and still get the tail" \
+  '[resp(17).error, (data(17).output | type), data(17).held_back]' \
+  '[null,"string",false]'
+jcheck "apply_holdback: false is refused by name, and names the hatch instead" \
+  '[resp(18).error.code,
+    (resp(18).error.message | contains("apply_holdback may only be true")),
+    (resp(18).error.message | contains("redact: false"))]' \
+  '[-32602,true,true]'
 
 # `index` is emitted only by get_command_history, and the exit code
 # beside it came from an OSC 133 `D;<code>` marker. Entry 0's `0` is the
