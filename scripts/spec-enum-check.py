@@ -69,7 +69,7 @@
 #     document CI does not check out, cannot.
 #
 # ==========================================================================
-# THE TWO JUDGEMENTS, STATED RATHER THAN IMPLIED
+# THE JUDGEMENTS, STATED RATHER THAN IMPLIED
 # ==========================================================================
 #
 # 1. A LEDGER, NOT A WAIVER — and the difference is that it fails both ways.
@@ -88,17 +88,34 @@
 #    That is the same shape `prefix_index.rs`'s blind-rule ledger uses and
 #    the opposite of the hand-kept count GH #53 watched go stale.
 #
-#    WHAT MAY GO IN THE LEDGER, AND WHAT MAY NOT. Only a kind whose FEATURE
-#    is unbuilt. A kind belonging to a feature that SHIPS and is simply not
-#    writing its entry is a defect, not a deferral, and ledgering it would
-#    be the P5 failure this file exists to oppose — a guard holding a stale
-#    sentence in place. Such a kind stays a finding and this check stays
-#    red until someone writes the call site or files the issue and records
-#    it here with the real reason. That is affordable precisely because the
-#    real run is not a CI gate (see WHERE THIS RUNS); only `--self-test`
-#    is, and it is green.
+#    WHAT MAY GO IN `KNOWN_UNWRITTEN`, AND WHAT MAY NOT. Only a kind whose
+#    FEATURE is unbuilt. A kind belonging to a feature that SHIPS and is
+#    simply not writing its entry is a defect, not a deferral, and waiving
+#    it would be the P5 failure this file exists to oppose — a guard
+#    holding a stale sentence in place. Such a kind stays a finding and
+#    this check stays red until someone writes the call site.
 #
-# 2. PARENTHETICALS ARE NOT MEMBERS. §12.6 annotates entries inline —
+#    THE SECOND LEDGER IS NOT A SECOND WAIVER. `KNOWN_UNAUDITED` lists the
+#    shipped-but-unaudited kinds and every one of them is STILL A FINDING;
+#    nothing is suppressed. It exists because a finding alone does not pin
+#    the spec row it is about. With both ledgers plus the set of kinds the
+#    tree actually writes, EVERY row of §9.4's table is claimed by name, so
+#    deleting any row from the document fires a membership check. Without
+#    it the only anti-vacuity here was a numeric floor, and a floor is weak:
+#    two realistic editorial reformats took the table from 21 rows to 19
+#    with byte-identical findings and the same exit code.
+#
+# 2. A WRITER IS A `.record(` FIRST ARGUMENT. Not a substring of the tree.
+#    The two are not close: `send_input`'s only surviving production
+#    occurrence is an MCP tool-dispatch arm on the tool's NAME, so a
+#    substring rule cleared the kind that records the bytes an agent types
+#    into a shell, on a tree with no `.record("send_input"` in it. And a
+#    kind can LOSE its only writer invisibly when its literal is also a
+#    JSON field name, which `truncated_at_tail` is five times over. The
+#    ledger section above claims both cases; only this definition of
+#    "written" delivers them. See the note at the forward check.
+#
+# 3. PARENTHETICALS ARE NOT MEMBERS. §12.6 annotates entries inline —
 #    `read_output` (with `ansi`/`text_encoding`/`redact`/`max_bytes`) — so a
 #    naive backtick scan returns 20 spans for a list of 16. Parenthetical
 #    groups are stripped BEFORE ids are extracted, and the count is then
@@ -111,22 +128,43 @@
 # WHAT CAN STILL SLIP PAST — the false-negative surface, stated on purpose
 # ==========================================================================
 #
-# * §9.4: "written" means the kind's string literal appears in production
-#   Rust. It does NOT mean the call site is reachable, correct, on the right
-#   path, or that its `Extra fields` match the spec's second column. A
-#   writer behind an `if false` counts. The second column is not read at all.
-# * §9.4: test code is stripped by a HEURISTIC — a column-zero `#[cfg(test)]`
-#   or `#[cfg(all(test, ...))]` through the next line that is exactly `}`.
-#   That is this codebase's universal shape (measured: 72 and 7 occurrences,
-#   no third form), but a test gate on an INDENTED item, or a test module
-#   whose closing brace is indented, would leave test literals in the
-#   production set and mark an unbuilt kind as written. The two
-#   `.record("before" | "after", …)` warnings this emits are exactly that
-#   case and are why the reverse direction does not gate.
-# * §9.4 reverse direction (a kind written but absent from the table) is a
-#   WARNING, not a failure. Extracting the first argument of `.record(`
-#   is heuristic — `mcp/mod.rs` has an unrelated `record(site)` on a
-#   different type — so it is reported for a human rather than gating.
+# * §9.4: "written" means the kind is the first argument of a `.record(`
+#   call in production Rust. It does NOT mean the call site is reachable,
+#   correct, on the right path, or that its `Extra fields` match the spec's
+#   second column. A writer behind an `if false` counts. The second column
+#   is not read at all.
+# * §9.4: a writer whose kind is NOT a string literal — a `const`, a
+#   variable, a value threaded in from a caller — reads as no writer at all.
+#   No such call site exists today (`AuditLog::record` is the one write
+#   primitive and its five wrappers all pass literals), and the failure is
+#   in the red direction, which is the direction a guard may be wrong in.
+# * §9.4: test code is stripped by a HEURISTIC — a column-zero
+#   `#[cfg(test)]` or `#[cfg(all(test, ...))]` through the end of the item
+#   it gates, found by counting brackets over a string- and comment-masked
+#   copy of the file. A test gate on an INDENTED item would still leave test
+#   literals in the production set and mark an unbuilt kind as written; this
+#   workspace has none (measured: 79 column-zero gates, no indented one).
+#   The SHAPES it must handle were measured rather than assumed, because the
+#   previous terminator — "the next line that is exactly `}`" — assumed one:
+#   67 of the 79 gate a braced `mod tests`, 10 a column-zero `struct`/`enum`/
+#   `impl` whose brace happens to land in the same place, and 2 a BRACELESS
+#   item, where the old rule ran on for 99 lines of live production Rust.
+# * §9.4: the masker is a Rust lexer only to the depth bracket counting
+#   needs — line and nested block comments, ordinary/raw/byte strings, char
+#   literals distinguished from lifetimes. It does not know about macros
+#   that emit unbalanced token trees, and Rust does not permit those, which
+#   is the reason counting is exact here rather than lucky. (Naive counting
+#   is NOT: `config.rs:2264` is `&["{host"],`, one unbalanced brace inside a
+#   string, and a counter that cannot see it walks off the end of the file.)
+# * §9.4 reverse direction (a kind written but absent from the table) GATES.
+#   It did not, on the stated ground that `.record(` has other meanings in
+#   this tree — but the one unrelated `record` (`mcp/mod.rs:167`,
+#   `fn record(&mut self, site: ArmSite)`) takes no string literal, so this
+#   regex has never matched it, and on this tree it yields ten names that
+#   are all `AuditLog` writes. The `.record("before" | "after", …)` calls
+#   that argument named are six sites in `daemon/server.rs` and
+#   `daemon/paths.rs`, all inside test modules the blanking correctly
+#   strips: this script emits ZERO such warnings and always has.
 # * §12.6: this asserts the shipped tools are a SUBSET of the ship-list and
 #   that the list is self-consistent. It cannot tell you the ship-list is
 #   the right list, nor that a tool named there will behave as §5 says.
@@ -146,6 +184,40 @@
 # document. `--self-test` runs against fixtures, needs no spec, and IS
 # wired into the `hygiene` job — because a guard whose own guard never runs
 # is a guard on trust.
+#
+# THE REAL ARM RUNS FROM `dev/workflows/verify.md`, AND THAT IS NOT A
+# CONSOLATION PRIZE — IT IS THE ONLY OPTION AND THE REPOSITORY HAS THE
+# RECEIPT. Gating `hygiene` on the real check is not a decision anyone gets
+# to make: CI's checkout has no `docs/`, so the real run exits 3 there on
+# every push forever. What the question really asks is where else it runs,
+# and the answer this project has already lived through is `af0e06a` —
+# "actionlint was named in the gate for months and never run". `verify.md`
+# listed actionlint under *"CI's own gate, which must pass"*, CI did not run
+# it, and the tool was not installed on the machine of anyone who tried to
+# follow the file. The fix was to EXECUTE it, not to delete it, and it is a
+# required context today. Nothing in this repository has ever been deleted
+# for being unrun: three of nine scripts are wired to no automation and all
+# three survive — but each of the other two has `--install-hook`, and
+# `preflight.sh` is a quoted command in CONTRIBUTING's getting-started
+# block. Every orphan has SOMETHING that puts it in front of a human. This
+# script's document arm had nothing, and `verify.md` — which `CLAUDE.md`
+# calls "the full local gate" — is where that goes.
+#
+# It is listed there under "also worth running" rather than in the numbered
+# list, because that list is titled "CI's own gate, which must pass" and
+# this is a check CI cannot run. Putting it in the numbered list would make
+# that heading false, which is the exact defect `af0e06a` was fixing.
+#
+# WHY IT SHIPS RED, AND WHY THAT IS NOT DECORATION. Four kinds are findings
+# and GH #173 tracks all four; `KNOWN_UNAUDITED` names them so the red says
+# what to do about it and so their spec rows cannot vanish unnoticed. The
+# repo's stated theory of check-death is FALSE reds — "a check that is red
+# for correct reasons is a check that gets deleted" is about a check red on
+# a CORRECT tree. This one is red on an INCORRECT tree, which is a check
+# doing its job. There is no expiry date on those rows on purpose:
+# `mutants.yml` retired its `CALIBRATION-EXEMPT-UNTIL` marker early with the
+# reason "a dated fuse is a dated surprise", and a fuse here would do
+# nothing on any day but one.
 #
 # Absence of the spec exits 3 with a message saying nothing was checked. It
 # never exits 0 on a tree it could not read: a silent pass is how a check
@@ -172,6 +244,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -198,6 +271,36 @@ KNOWN_UNWRITTEN = [
     ("bridge_revoke", "the `holdfast ui` TCP bridge is unbuilt (§7.6.1)"),
     ("file_transfer", "send_file / fetch_file are unbuilt (§5.7)"),
     ("recording_started", "session recording is unbuilt (§5.8.1)"),
+]
+
+# --------------------------------------------------------------------------
+# §9.4 — the kinds whose FEATURE SHIPS and which are audited by nobody.
+#
+# THIS IS NOT A WAIVER, and the distinction from `KNOWN_UNWRITTEN` above is
+# the whole point: every row here is STILL A FINDING and this check stays
+# red while any of them stands. What the row buys is two things a bare
+# finding does not.
+#
+#   1. It names the tracker, so the red says what to do about it.
+#   2. It PINS THE SPEC ROW. Between this list, `KNOWN_UNWRITTEN` and the
+#      set of kinds the tree actually writes, every row of §9.4's table is
+#      accounted for by NAME. Delete any row from the document and one of
+#      the three membership checks fires. That is the anti-vacuity this
+#      half was missing: the floor below is a coarse format-moved tripwire,
+#      and a floor alone let two realistic editorial reformats take the
+#      table from 21 rows to 19 with byte-identical output.
+#
+# NO EXPIRY DATE, deliberately, and the repository has the worked example:
+# `mutants.yml` carried a `CALIBRATION-EXEMPT-UNTIL` marker and retired it
+# early with the reason "a dated fuse is a dated surprise". A date here
+# would do nothing on any day but one, and on that day it would turn a
+# check that is already red a different colour. The finding is the pressure.
+KNOWN_UNAUDITED = [
+    ("daemon_start", "GH #173 — the daemon ships and does not audit its own start"),
+    ("daemon_stop", "GH #173 — the daemon ships and does not audit its own stop"),
+    ("send_input", "GH #173 — REQ-SEC-011 is conjunctive (warning AND audit-logged); "
+                   "REQ-T-003 is a Tier-2 verification over this row"),
+    ("panic", "GH #173 — `diag.rs`'s hook writes the diagnostic log, not audit.log"),
 ]
 
 H3_RE = re.compile(r"^### (\d+\.\d+)\b")
@@ -268,34 +371,175 @@ def parse_shiplist_tools(lines):
     return None, None
 
 
-# Column-zero test gates. Measured across `crates/*/src/`: 72 `#[cfg(test)]`
-# and 7 `#[cfg(all(test, unix))]`, and nothing else. Anchored to the two
-# literal forms rather than a `\btest\b` search inside the cfg, because that
-# would also match a `#[cfg(feature = "test-util")]` the day someone adds one
-# and silently blank a production module.
+# Column-zero test gates. Anchored to the two literal cfg forms rather than a
+# `\btest\b` search inside the cfg, because that would also match a
+# `#[cfg(feature = "test-util")]` the day someone adds one and silently blank
+# a production module.
+#
+# The SHAPE of the gated item is a separate question from the spelling of the
+# cfg, and conflating the two is what the previous revision of this file got
+# wrong: it terminated the blank at "the next line that is exactly `}`", which
+# is right for `mod tests { ... }` and wrong for every braceless item. This
+# tree has both — `secret/provider.rs:72` is `#[cfg(test)] use
+# std::path::PathBuf;` — and there the old rule ran on to the close of `pub
+# enum ResolveError` a hundred lines below, blanking live production Rust in
+# between. That direction of error is silent: a kind whose only writer sits in
+# the blanked span reads as unwritten, and a kind whose literal survives in
+# test code reads as written.
 CFG_TEST_RE = re.compile(r"^#\[cfg\((?:test\)|all\(test[,)])")
+
+# A raw string opener (`r"`, `r#"`, `br##"` …) and a char literal, including
+# the `'\u{7d}'` form. The char-literal pattern deliberately does NOT match a
+# lifetime: `'a` has no closing quote in the next two characters, so `&'a str`
+# is left alone while `'}'` is masked — which matters, because an unmasked
+# `'}'` moves the depth counter below.
+RAW_STR_RE = re.compile(r"b?r(#*)\"")
+CHAR_LIT_RE = re.compile(r"'(?:\\u\{[0-9a-fA-F_]+\}|\\.|[^'\\\n])'")
+
+
+def _mask_line(line, state):
+    """Replace string, char-literal and comment content with spaces.
+
+    `state` carries a nested-block-comment depth, an open ordinary string and
+    an open raw string's hash count ACROSS lines, because all three can span
+    them in this tree. Masking is what makes the bracket counting in
+    `_item_end` exact rather than another heuristic: `crates/` is full of
+    `"{}"` format strings, `'}'` char literals and doc comments containing
+    braces, and every one of them would move a naive counter.
+    """
+    out = []
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if state["block"] > 0:
+            if line.startswith("/*", i):
+                state["block"] += 1
+                out.append("  ")
+                i += 2
+                continue
+            if line.startswith("*/", i):
+                state["block"] -= 1
+                out.append("  ")
+                i += 2
+                continue
+            out.append(" ")
+            i += 1
+            continue
+        if state["raw"] is not None:
+            close = '"' + "#" * state["raw"]
+            if line.startswith(close, i):
+                state["raw"] = None
+                out.append(" " * len(close))
+                i += len(close)
+                continue
+            out.append(" ")
+            i += 1
+            continue
+        if state["str"]:
+            if ch == "\\":
+                out.append("  ")
+                i += 2
+                continue
+            if ch == '"':
+                state["str"] = False
+                out.append(" ")
+                i += 1
+                continue
+            out.append(" ")
+            i += 1
+            continue
+        # Ordinary code.
+        if line.startswith("//", i):
+            out.append(" " * (n - i))
+            break
+        if line.startswith("/*", i):
+            state["block"] = 1
+            out.append("  ")
+            i += 2
+            continue
+        prev_is_ident = i > 0 and (line[i - 1].isalnum() or line[i - 1] == "_")
+        m = RAW_STR_RE.match(line, i) if not prev_is_ident else None
+        if m:
+            state["raw"] = len(m.group(1))
+            out.append(" " * (m.end() - i))
+            i = m.end()
+            continue
+        if ch == '"':
+            state["str"] = True
+            out.append(" ")
+            i += 1
+            continue
+        if ch == "'":
+            m = CHAR_LIT_RE.match(line, i)
+            if m:
+                out.append(" " * (m.end() - i))
+                i = m.end()
+                continue
+            out.append("'")  # a lifetime, not a literal
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _item_end(masked, start):
+    """Index of the LAST line of the item introduced at `masked[start]`.
+
+    Two shapes, both exact once strings and comments are masked:
+
+      * a BRACED item (`mod tests { … }`, `impl … { … }`) ends on the line
+        where the depth opened by its first `{` returns to zero;
+      * a BRACELESS one (`use …;`, `const … = …;`, `mod tests;`) ends at the
+        first `;` seen at depth zero before any `{`.
+
+    Depth counts `(`, `[` and `{` alike, and only `{` arms the braced case.
+    That is not decoration: `static X: [&str; 2] = [ … ];` carries a `;`
+    inside brackets, and terminating there would leave the rest of a test
+    fixture in the production set — the false-GREEN direction, which is the
+    one this whole script exists to refuse.
+
+    An item that never closes blanks to EOF. That is the safe direction:
+    over-blanking loses a writer and turns the check red, under-blanking
+    keeps test literals and turns it green.
+    """
+    depth = 0
+    seen_brace = False
+    for j in range(start, len(masked)):
+        for ch in masked[j]:
+            if ch in "([{":
+                depth += 1
+                if ch == "{":
+                    seen_brace = True
+            elif ch in ")]}":
+                depth -= 1
+                if ch == "}" and seen_brace and depth <= 0:
+                    return j
+            elif ch == ";" and depth == 0 and not seen_brace:
+                return j
+    return len(masked) - 1
 
 
 def strip_test_modules(src):
     """Blank out test-gated items anchored at column zero.
 
-    Heuristic, and the limits are in the header: from a column-zero test
-    `cfg` through the next line that is exactly `}`. Every test module in
-    this workspace has that shape. Lines are blanked rather than deleted so
-    any line number we report still matches the file.
+    Lines are blanked rather than deleted so any line number we report still
+    matches the file.
     """
-    out, skipping = [], False
-    for line in src.split("\n"):
-        if not skipping and CFG_TEST_RE.match(line):
-            skipping = True
-            out.append("")
+    lines = src.split("\n")
+    state = {"block": 0, "raw": None, "str": False}
+    masked = [_mask_line(line, state) for line in lines]
+
+    out = list(lines)
+    i = 0
+    while i < len(lines):
+        if CFG_TEST_RE.match(masked[i]):
+            end = _item_end(masked, i)
+            for j in range(i, end + 1):
+                out[j] = ""
+            i = end + 1
             continue
-        if skipping:
-            out.append("")
-            if line == "}":
-                skipping = False
-            continue
-        out.append(line)
+        i += 1
     return "\n".join(out)
 
 
@@ -331,6 +575,11 @@ def build_report(spec_path, root):
         "spec": str(spec_path),
         "root": str(root),
         "findings": [],
+        # Empty today, and kept as a channel rather than deleted: the
+        # reverse §9.4 direction used to live here and now gates, so a
+        # self-test case asserts it is NOT reported as a warning. A rule
+        # that wants to report without gating has somewhere to go; nothing
+        # currently does.
         "warnings": [],
     }
 
@@ -343,52 +592,147 @@ def build_report(spec_path, root):
     kinds = parse_audit_kinds(lines)
     if kinds is None:
         return None, "§9.4 not found in the spec"
-    if len(kinds) < 10:
+    # Coarse format-moved tripwire only. The REAL anti-vacuity for this half
+    # is the by-name accounting below: every row is claimed by the emitted
+    # set, by `KNOWN_UNWRITTEN` or by `KNOWN_UNAUDITED`, so deleting any one
+    # of them fires a membership finding. A floor alone did not do that job —
+    # two realistic editorial reformats took the table from 21 rows to 19
+    # with byte-identical findings and the same exit code, and `< 10` never
+    # came close. 18 is the sibling guard's ratio (`rules.len() >= 40`
+    # against 51, 78%) applied to 21, rounded up, and it is a backstop for
+    # the case where the by-name accounting cannot run because the parse
+    # collapsed.
+    if len(kinds) < 18:
         return None, "§9.4's table parsed to only {} kinds — the format moved".format(len(kinds))
     report["audit_kinds"] = kinds
 
-    written, unwritten = [], []
-    for kind in kinds:
-        if '"{}"'.format(kind) in blob:
-            written.append(kind)
-        else:
-            unwritten.append(kind)
+    # A KIND IS "WRITTEN" WHEN IT IS THE FIRST ARGUMENT OF A `.record(` CALL,
+    # and not merely when its string appears somewhere in production Rust.
+    #
+    # The difference is not academic; it was the defect. `send_input`'s only
+    # surviving production occurrence is `mcp/passthrough.rs`'s MCP
+    # tool-dispatch arm — `"send_input" => run!(send_input, SendInputArgs)` —
+    # which is the tool's NAME, not an audit write. Under the old substring
+    # rule the one kind recording the bytes an agent types into a shell read
+    # as audited, on a tree where `git grep` finds no `.record("send_input"`
+    # at all, while GH #173 lists it in bold among the four kinds nothing
+    # writes. The check reported a false green on the exact failure class it
+    # exists to catch, and it under-reported its own tracking issue by 25%.
+    #
+    # The same root has a worse direction that was latent: DELETING an audit
+    # write was invisible. `truncated_at_tail` is written once, at
+    # `audit.rs:273`, and the same literal appears five more times as a JSON
+    # RESPONSE-FIELD name in `mcp/resources.rs` and `mcp/tools.rs` — so
+    # removing the only writer left this script's output byte-identical.
+    # That is precisely the case the LEDGER section above claims to catch
+    # ("a kind LOSES its writer … the case a 'has a writer' check in either
+    # direction would miss"), and the forward half was not delivering it.
+    #
+    # `AuditLog::record` (audit.rs:187) is the single write primitive: the
+    # five convenience wrappers beside it all call `self.record("literal",
+    # …)`, so this extraction is a complete accounting of the writes rather
+    # than a sample of them. A future call site that passes a `const` or a
+    # variable instead of a literal reads as unwritten — red, not green,
+    # which is the direction a guard is allowed to be wrong in.
+    emitted = set()
+    for text in prod.values():
+        emitted.update(RECORD_CALL_RE.findall(text))
+    report["audit_emitted"] = sorted(emitted)
+
+    written = [k for k in kinds if k in emitted]
+    unwritten = [k for k in kinds if k not in emitted]
     report["audit_written"] = written
     report["audit_unwritten"] = unwritten
 
-    ledger = sorted(k for k, _ in KNOWN_UNWRITTEN)
+    # Kinds whose literal IS in production Rust but never as a `.record(`
+    # first argument. Reported on the finding itself, because "no writer"
+    # and "no writer, and here is the non-audit use that looked like one"
+    # are very different things to hand a reader.
+    literal_only = [k for k in unwritten if '"{}"'.format(k) in blob]
+    report["audit_literal_but_not_recorded"] = literal_only
+
+    deferred = sorted(k for k, _ in KNOWN_UNWRITTEN)
+    defects = sorted(k for k, _ in KNOWN_UNAUDITED)
     why = dict(KNOWN_UNWRITTEN)
-    for kind in ledger:
+    why.update(dict(KNOWN_UNAUDITED))
+    report["audit_deferred"] = deferred
+    report["audit_shipped_unaudited"] = defects
+
+    both = sorted(set(deferred) & set(defects))
+    for kind in both:
+        report["findings"].append(
+            "§9.4 `{}` is in BOTH ledgers. A kind is either waiting on an unbuilt "
+            "feature or is a shipped feature that does not audit; it cannot be "
+            "both, and the two rows would hide each other.".format(kind)
+        )
+
+    for kind in deferred + defects:
         if kind not in kinds:
             report["findings"].append(
                 "§9.4 ledger names `{}`, which is not a row in the table any more: "
                 "drop the row rather than leaving it to match nothing".format(kind)
             )
-    for kind in sorted(set(unwritten) - set(ledger)):
+
+    unaccounted = sorted(set(unwritten) - set(deferred) - set(defects))
+    report["audit_unaccounted"] = unaccounted
+    for kind in unaccounted:
+        extra = ""
+        if kind in literal_only:
+            extra = (" The literal `\"{}\"` DOES appear in production Rust, but never "
+                     "as the first argument of `.record(` — so whatever that "
+                     "occurrence is, it is not an audit write.".format(kind))
         report["findings"].append(
-            "§9.4 `{}` has NO production writer and is not in the ledger. Either an "
+            "§9.4 `{}` has NO production writer and is in neither ledger. Either an "
             "event stopped being audited, or a kind was specified and never "
             "implemented. Add a writer, or add it to KNOWN_UNWRITTEN with the "
-            "feature it waits on.".format(kind)
-        )
-    for kind in sorted(set(ledger) - set(unwritten)):
-        report["findings"].append(
-            "§9.4 `{}` now HAS a production writer but is still in the ledger "
-            "({}). Delete its row.".format(kind, why[kind])
+            "feature it waits on, or to KNOWN_UNAUDITED with its issue.{}".format(kind, extra)
         )
 
-    # Reverse direction: a kind the code writes that §9.4 never named. A
-    # warning, not a finding — see the false-negative surface.
-    emitted = set()
-    for text in prod.values():
-        emitted.update(RECORD_CALL_RE.findall(text))
+    # `& set(kinds)` on both: a ledger row the TABLE dropped is already
+    # reported above, and without the intersection it is not in `unwritten`
+    # either — so it would be reported a second time as "now has a writer",
+    # which is false and sends the reader to the wrong file. The previous
+    # revision had this and the self-test did not see it, because the case
+    # asserted the first finding was present and nothing about the rest.
+    for kind in sorted((set(deferred) & set(kinds)) - set(unwritten)):
+        report["findings"].append(
+            "§9.4 `{}` now HAS a production writer but is still in the unbuilt-feature "
+            "ledger ({}). Delete its row.".format(kind, why[kind])
+        )
+    for kind in sorted((set(defects) & set(kinds)) - set(unwritten)):
+        report["findings"].append(
+            "§9.4 `{}` now HAS a production writer but is still in the "
+            "shipped-but-unaudited ledger ({}). Delete its row — and that issue "
+            "has one fewer item.".format(kind, why[kind])
+        )
+    for kind in sorted(set(defects) & set(unwritten)):
+        report["findings"].append(
+            "§9.4 `{}` is specified, its feature SHIPS, and no production code "
+            "writes it: {}. Ledgered so the row cannot vanish from the "
+            "document unnoticed — NOT waived. This check is red until the call "
+            "site exists.".format(kind, why[kind])
+        )
+
+    # Reverse direction: a kind the code writes that §9.4 never named. This
+    # GATES, and the header used to say it did not.
+    #
+    # The stated reason it did not — that `.record(` has other meanings in
+    # this tree — does not survive measurement. The one unrelated `record`
+    # (`mcp/mod.rs:167`, `fn record(&mut self, site: ArmSite)`) takes no
+    # string literal, so `RECORD_CALL_RE` has never matched it; on this tree
+    # the regex yields ten names and all ten are `AuditLog` writes. And the
+    # argument is now self-defeating: the FORWARD direction gates on exactly
+    # this extraction, so calling it too heuristic to gate in reverse would
+    # be holding one direction to a standard the other is already trusted
+    # with. A `.record("x", …)` whose `x` §9.4 does not list is an audit
+    # record with no specified shape, which is the drift, not a curiosity.
     stray = sorted(k for k in emitted if k not in kinds)
     report["audit_emitted_not_in_spec"] = stray
     for kind in stray:
-        report["warnings"].append(
-            "`.record(\"{}\", …)` is called in production Rust but `{}` is not a "
-            "row in §9.4's table (heuristic: `.record(` has other meanings in "
-            "this tree, so check before acting)".format(kind, kind)
+        report["findings"].append(
+            "`.record(\"{}\", …)` is called in production Rust and `{}` is not a "
+            "row in §9.4's table. Either the table lost a row or the tree "
+            "writes an audit record the document does not specify.".format(kind, kind)
         )
 
     # --------------------------------------------------------------- §12.6
@@ -441,7 +785,11 @@ def render(report):
     out.append("")
     out.append("  §9.4 audit kinds in the table ..... {}".format(len(report["audit_kinds"])))
     out.append("      with a production writer ...... {}".format(len(report["audit_written"])))
-    out.append("      unwritten (ledgered) .......... {}".format(len(report["audit_unwritten"])))
+    out.append("      unwritten, feature unbuilt .... {}".format(
+        len(set(report["audit_unwritten"]) & set(report["audit_deferred"]))))
+    out.append("      unwritten, feature SHIPS ...... {}".format(
+        len(set(report["audit_unwritten"]) & set(report["audit_shipped_unaudited"]))))
+    out.append("      unwritten, in neither ledger .. {}".format(len(report["audit_unaccounted"])))
     out.append("  §12.6 ship-list tools ............. {}  (numeral says {})".format(
         len(report["shiplist_tools"]), report["shiplist_numeral"]))
     out.append("      shipped today ................. {}".format(len(report["shipped_tools"])))
@@ -453,12 +801,19 @@ def render(report):
         for t in report["shiplist_not_shipped"]:
             out.append("  {}".format(t))
         out.append("")
-    if report["audit_unwritten"]:
-        out.append("§9.4 kinds with no production writer (ledgered; not a finding)")
+    # Only the unbuilt-feature ledger prints here. The previous revision
+    # iterated ALL of `audit_unwritten` under this heading, so the three
+    # kinds that were findings printed once with a BLANK reason column and
+    # again six lines below under FINDINGS, while the summary counted all
+    # ten as "ledgered" when seven were. A report that contradicts itself
+    # teaches the reader to skim the part that was right.
+    deferred_here = [k for k in report["audit_unwritten"] if k in set(report["audit_deferred"])]
+    if deferred_here:
+        out.append("§9.4 kinds whose feature is unbuilt (ledgered; not a finding)")
         out.append("-" * 66)
         why = dict(KNOWN_UNWRITTEN)
-        for k in report["audit_unwritten"]:
-            out.append("  {:<24} {}".format(k, why.get(k, "")))
+        for k in deferred_here:
+            out.append("  {:<24} {}".format(k, why[k]))
         out.append("")
     for w in report["warnings"]:
         out.append("WARNING: {}".format(w))
@@ -472,7 +827,13 @@ def render(report):
         out.append("")
         out.append("SPEC-ENUM FAILED: {} finding(s)".format(len(report["findings"])))
     else:
-        out.append("SPEC-ENUM OK — §9.4's 21 kinds and §12.6's ship-list agree with the tree")
+        # The count is READ, not remembered. A hand-kept numeral in the banner
+        # of the file whose stated purpose is ending hand-kept numerals is the
+        # joke writing itself; §12.6's half already cross-checks the document's
+        # own numeral against the document's own list, and this line was the
+        # §9.4 half doing neither.
+        out.append("SPEC-ENUM OK — §9.4's {} kinds and §12.6's ship-list agree with the tree".format(
+            len(report["audit_kinds"])))
     return "\n".join(out)
 
 
@@ -521,13 +882,47 @@ def find_spec(root, explicit):
 # --------------------------------------------------------------------------
 # Self-test.
 #
-# Every case runs `build_report` — the production path — against a fixture
-# tree, so a case cannot pass by testing a copy of the logic. Each rule gets
-# a positive AND a negative: "no findings" and "this rule cannot produce a
-# finding" print the same word, which is the whole reason the negatives are
-# here. The mutation cases edit a fixture and assert the ANSWER CHANGES; a
-# check that reports the same thing either way is not reading the document.
-# --------------------------------------------------------------------------
+# Every case runs `build_report` or `find_spec` — the production paths —
+# against a fixture tree, so a case cannot pass by testing a copy of the
+# logic. Each rule gets a positive AND a negative: "no findings" and "this
+# rule cannot produce a finding" print the same word, which is the whole
+# reason the negatives are here. The mutation cases edit a fixture and assert
+# the ANSWER CHANGES; a check that reports the same thing either way is not
+# reading the document.
+#
+# THE CASES ARE CHOSEN BY WHAT SURVIVES MUTATION OF *THIS FILE*, not by what
+# is easy to fixture. An earlier revision of this self-test was the only arm
+# wired into CI and it constrained almost none of the heuristics that decide
+# the real answer: four separate mutations of this script passed it with exit
+# 0 while breaking the real check —
+#
+#   * deleting `find_spec`'s `git rev-parse --git-common-dir` fallback, which
+#     is this script's headline capability and the reason a reviewer can run
+#     it from a worktree at all. All three `find_spec` cases called
+#     `find_spec(Path(tmp), None)` on a directory that was not a git worktree,
+#     so none of them entered the branch — while the coverage summary printed
+#     that they did;
+#   * narrowing the source glob from `*/src/**/*.rs` to `*/src/*.rs`. Every
+#     fixture writer lived in `src/lib.rs`, so the `**` was never load-bearing;
+#   * breaking the test-module blanking terminator. `SELF_TEST_SRC` contained
+#     exactly one `#[cfg(test)]`, on a textbook `mod tests { … }` — the one
+#     shape the heuristic already handled, and not the shape it got wrong in
+#     the real tree;
+#   * deleting the `--spec` and `$HOLDFAST_SPEC` branches of `find_spec`, for
+#     which there was no case at all.
+#
+# Each of those now has a case that dies on the mutation, and the fixtures
+# below are shaped accordingly: writers live in a NESTED directory, the
+# blanking fixture carries every item shape this workspace actually has, and
+# `find_spec` is driven through a real `git worktree`.
+#
+# AND IT IS HERMETIC. `find_spec` reads `$HOLDFAST_SPEC` from the process
+# environment, so a developer who had exported it — the documented way to
+# point the real check at a spec — got three red `find_spec` cases that said
+# nothing about what they had changed. CI never saw it, because the variable
+# is unset there, which makes it a human-only false red: the direction that
+# gets a check dismissed rather than fixed. `self_test` scrubs the variable
+# for its own duration and the one case that wants it sets it explicitly.
 
 SELF_TEST_SPEC = """# Design
 
@@ -546,8 +941,18 @@ SELF_TEST_SPEC = """# Design
 | `attach_connect` | `peer_uid` |
 | `attach_disconnect` | `reason, duration_secs` |
 | `panic` | `module, message` |
+| `truncated_at_tail` | `tool, since_cursor` |
+| `secret_input_request` | `request_id` |
+| `secret_input_resolved` | `request_id, outcome` |
+| `binding_resolved` | `binding_name` |
+| `binding_approval` | `approval_id` |
 | `preflight_match` | `rule_kind` |
+| `confirmation_redeem` | `confirmation_id` |
+| `confirmation_abandoned` | `confirmation_id` |
 | `bridge_register` | `port` |
+| `bridge_revoke` | `reason` |
+| `file_transfer` | `direction, bytes` |
+| `recording_started` | `path` |
 
 Prose below the table naming `session_start` and `panic` again.
 
@@ -576,17 +981,63 @@ const TOOLS: [&str; 6] = [
 ];
 """
 
+# `crates/holdfast-core/src/lib.rs`.
+#
+# Shaped after the real tree rather than after what is convenient, because
+# the blanking heuristic is decided by SHAPES and the previous fixture had
+# exactly one — `mod tests { … }`, the shape that already worked:
+#
+#   * a braceless `#[cfg(test)] use …;`, which is `secret/provider.rs:72` and
+#     where the old "blank to the next line that is exactly `}`" terminator
+#     ate 99 lines of live production Rust, including the writers below it;
+#   * a `{` inside a STRING literal (`config.rs:2264` is `&["{host"],`), which
+#     is what makes naive brace counting walk off the end of the file;
+#   * a `'}'` CHAR literal beside a `'a` lifetime, which a masker that cannot
+#     tell them apart gets wrong in one direction or the other;
+#   * a raw string containing a lone brace and an embedded quote;
+#   * a column-zero `#[cfg(all(test, unix))]` on a tuple struct and a
+#     `#[cfg(test)]` on an `impl`, which is 10 of this workspace's 12
+#     non-`mod` gates;
+#   * `"send_input"` as an MCP DISPATCH ARM — the literal in production Rust
+#     that is not an audit write, which is the false green this file shipped.
 SELF_TEST_SRC = """
+pub const BRACE_IN_A_STRING: &[&str] = &["{host"];
+pub const BRACE_CHAR: char = '}';
+pub const RAW: &str = r#"a raw string with a lone } and an embedded "quote""#;
+
+pub fn borrow<'a>(s: &'a str) -> &'a str {
+    s // `'a` is a lifetime, not a char literal
+}
+
+#[cfg(test)]
+use std::path::PathBuf;
+
 pub fn go(log: &AuditLog) {
     log.record("daemon_start", None, json!({}));
     log.record("daemon_stop", None, json!({}));
     log.record("session_start", None, json!({}));
-    log.record("session_terminate", None, json!({}));
     log.record("send_input", None, json!({}));
-    log.record("redaction_disabled", None, json!({}));
     log.record("attach_connect", None, json!({}));
-    log.record("attach_disconnect", None, json!({}));
     log.record("panic", None, json!({}));
+    log.record("truncated_at_tail", None, json!({}));
+}
+
+pub fn dispatch(name: &str) -> bool {
+    matches!(name, "send_input" | "start_session")
+}
+
+pub fn respond() -> Value {
+    json!({ "truncated_at_tail": true })
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct Forced(u32);
+
+#[cfg(test)]
+impl Forced {
+    fn t(&self, log: &AuditLog) {
+        log.record("confirmation_redeem", None, json!({}));
+    }
 }
 
 #[cfg(test)]
@@ -595,16 +1046,43 @@ mod tests {
     fn t() {
         log.record("preflight_match", None, json!({}));
         log.record("bridge_register", None, json!({}));
+        log.record("bridge_revoke", None, json!({}));
+        log.record("confirmation_abandoned", None, json!({}));
+        log.record("file_transfer", None, json!({}));
+        log.record("recording_started", None, json!({}));
     }
 }
 """
 
+# `crates/holdfast-core/src/mcp/tools.rs` — a NESTED directory, and the only
+# home of these five writers. Narrow the glob's `**` to a single `*` and they
+# vanish, which is the mutation that used to survive.
+SELF_TEST_NESTED = """
+pub fn more(log: &AuditLog) {
+    log.record("session_terminate", None, json!({}));
+    log.record("redaction_disabled", None, json!({}));
+    log.record("attach_disconnect", None, json!({}));
+    log.record("secret_input_request", None, json!({}));
+    log.record("secret_input_resolved", None, json!({}));
+    log.record("binding_resolved", None, json!({}));
+    log.record("binding_approval", None, json!({}));
+}
+"""
 
-def _fixture(tmp, spec=SELF_TEST_SPEC, schema=SELF_TEST_SCHEMA, src=SELF_TEST_SRC):
+NESTED_ONLY = [
+    "session_terminate", "redaction_disabled", "attach_disconnect",
+    "secret_input_request", "secret_input_resolved", "binding_resolved",
+    "binding_approval",
+]
+
+
+def _fixture(tmp, spec=SELF_TEST_SPEC, schema=SELF_TEST_SCHEMA, src=SELF_TEST_SRC,
+             nested=SELF_TEST_NESTED):
     root = Path(tmp)
-    (root / "crates" / "holdfast-core" / "src").mkdir(parents=True, exist_ok=True)
+    (root / "crates" / "holdfast-core" / "src" / "mcp").mkdir(parents=True, exist_ok=True)
     (root / "crates" / "holdfast-core" / "tests").mkdir(parents=True, exist_ok=True)
     (root / "crates" / "holdfast-core" / "src" / "lib.rs").write_text(src)
+    (root / "crates" / "holdfast-core" / "src" / "mcp" / "tools.rs").write_text(nested)
     (root / "crates" / "holdfast-core" / "tests" / "schema.rs").write_text(schema)
     spec_path = root / "spec.md"
     spec_path.write_text(spec)
@@ -612,153 +1090,334 @@ def _fixture(tmp, spec=SELF_TEST_SPEC, schema=SELF_TEST_SCHEMA, src=SELF_TEST_SR
 
 
 def self_test():
-    failures = 0
-    ledger = ["preflight_match", "bridge_register"]
+    # Hermeticity: see the header above. `$HOLDFAST_SPEC` is scrubbed for the
+    # whole run, and the one case that wants it sets it itself.
+    saved_env = os.environ.pop("HOLDFAST_SPEC", None)
+    try:
+        return _self_test_body()
+    finally:
+        if saved_env is not None:
+            os.environ["HOLDFAST_SPEC"] = saved_env
 
-    def check(name, got, want):
-        nonlocal failures
+
+def _self_test_body():
+    state = {"failures": 0}
+    deferred = ["preflight_match", "confirmation_redeem", "confirmation_abandoned",
+                "bridge_register", "bridge_revoke", "file_transfer", "recording_started"]
+
+    def chk(name, got, want):
         if got == want:
             print("  PASS  {} -> {!r}".format(name, got))
         else:
             print("  FAIL  {}\n          got  {!r}\n          want {!r}".format(name, got, want))
-            failures += 1
+            state["failures"] += 1
 
-    def run(**kw):
+    def run(defects=(), **kw):
         with tempfile.TemporaryDirectory() as tmp:
             spec_path, root = _fixture(tmp, **kw)
-            saved = list(KNOWN_UNWRITTEN)
-            KNOWN_UNWRITTEN[:] = [(k, "fixture") for k in ledger]
+            saved_u, saved_a = list(KNOWN_UNWRITTEN), list(KNOWN_UNAUDITED)
+            KNOWN_UNWRITTEN[:] = [(k, "fixture") for k in deferred]
+            KNOWN_UNAUDITED[:] = [(k, "fixture issue") for k in defects]
             try:
                 return build_report(spec_path, root)
             finally:
-                KNOWN_UNWRITTEN[:] = saved
+                KNOWN_UNWRITTEN[:] = saved_u
+                KNOWN_UNAUDITED[:] = saved_a
 
     print("spec-enum-check self-test")
     print("-" * 66)
 
     print("\n§9.4 — table parsing")
     rep, err = run()
-    check("the baseline fixture reports no findings", (rep and rep["findings"], err), ([], None))
-    check("column 1 of the table is parsed, and only the table",
-          rep["audit_kinds"],
-          ["daemon_start", "daemon_stop", "session_start", "session_terminate",
-           "send_input", "redaction_disabled", "attach_connect", "attach_disconnect",
-           "panic", "preflight_match", "bridge_register"])
-    check("an escaped pipe in column 2 does not break the row",
-          "daemon_stop" in rep["audit_kinds"], True)
-    check("a later section's table is NOT collected", "not_an_audit_kind" in rep["audit_kinds"], False)
-    check("test-module writers do not count as production writers",
-          sorted(rep["audit_unwritten"]), ["bridge_register", "preflight_match"])
+    chk("the baseline fixture reports no findings", (rep and rep["findings"], err), ([], None))
+    chk("column 1 of the table is parsed, and only the table", len(rep["audit_kinds"]), 21)
+    chk("an escaped pipe in column 2 does not break the row",
+        "daemon_stop" in rep["audit_kinds"], True)
+    chk("a later section's table is NOT collected",
+        "not_an_audit_kind" in rep["audit_kinds"], False)
+    chk("test-module writers do not count as production writers",
+        sorted(rep["audit_unwritten"]), sorted(["preflight_match", "confirmation_redeem",
+                                                "confirmation_abandoned", "bridge_register",
+                                                "bridge_revoke", "file_transfer",
+                                                "recording_started"]))
+    chk("every row of the table is accounted for by name", rep["audit_unaccounted"], [])
+
+    print("\n§9.4 — a writer is a `.record(` FIRST ARGUMENT, not a substring")
+    chk("writers in a NESTED src/ directory are seen (the glob's `**` is load-bearing)",
+        [k for k in NESTED_ONLY if k not in rep["audit_written"]], [])
+    chk("a dispatch arm naming the kind is not itself a writer",
+        (rep["audit_literal_but_not_recorded"], "send_input" in rep["audit_written"]),
+        ([], True))
+    rep_disp, _ = run(src=SELF_TEST_SRC.replace(
+        '    log.record("send_input", None, json!({}));\n', ""))
+    chk("MUTATION: delete the audit write, leave the MCP dispatch arm -> a finding",
+        (any("`send_input` has NO production writer" in f for f in rep_disp["findings"]),
+         rep_disp["audit_literal_but_not_recorded"]),
+        (True, ["send_input"]))
+    chk("...and the finding SAYS the surviving literal is not an audit write",
+        any("not an audit write" in f and "send_input" in f for f in rep_disp["findings"]), True)
+    chk("...and `send_input` is no longer reported as written",
+        "send_input" in rep_disp["audit_written"], False)
+    rep_json, _ = run(src=SELF_TEST_SRC.replace(
+        '    log.record("truncated_at_tail", None, json!({}));\n', ""))
+    chk("MUTATION: delete the only audit write whose literal is also a JSON field name",
+        (any("`truncated_at_tail` has NO production writer" in f for f in rep_json["findings"]),
+         rep_json["audit_literal_but_not_recorded"]),
+        (True, ["truncated_at_tail"]))
+    chk("...and the answer CHANGED (the substring rule left it byte-identical)",
+        rep_json["findings"] != rep["findings"], True)
+
+    print("\n§9.4 — test-module blanking, by ITEM SHAPE")
+    stripped = strip_test_modules(SELF_TEST_SRC)
+    # Production items, every one of which the OLD terminator destroyed or
+    # would destroy on the next edit: `pub fn go` sits between a braceless
+    # `#[cfg(test)] use …;` and the next column-zero `}`.
+    survives = ["BRACE_IN_A_STRING", "BRACE_CHAR", "RAW", "pub fn borrow",
+                "pub fn go", "pub fn dispatch", "pub fn respond"]
+    blanked = ["std::path::PathBuf", "pub(crate) struct Forced", "impl Forced",
+               "mod tests", "confirmation_redeem", "preflight_match"]
+    chk("every production item survives blanking", [x for x in survives if x not in stripped], [])
+    chk("every test-gated item is blanked", [x for x in blanked if x in stripped], [])
+    chk("a braceless `#[cfg(test)] use …;` does not take the writers below it",
+        [k for k in ("daemon_start", "session_start", "panic") if k not in rep["audit_written"]],
+        [])
+    chk("a `{` in a string, a `'}'` char literal and a raw brace do not move the depth counter",
+        [x for x in ("BRACE_IN_A_STRING", "BRACE_CHAR", "RAW") if x not in stripped], [])
+    chk("`'a` is a lifetime and not a char literal", "pub fn borrow" in stripped, True)
+    chk("blanking preserves line numbering",
+        len(stripped.split("\n")), len(SELF_TEST_SRC.split("\n")))
 
     print("\n§9.4 — MUTATION: a writer disappears (an event stops being audited)")
-    rep2, _ = run(src=SELF_TEST_SRC.replace('log.record("attach_connect", None, json!({}));', ""))
-    check("the lost writer is a finding",
-          any("`attach_connect` has NO production writer" in f for f in rep2["findings"]), True)
-    check("...and the answer CHANGED from the baseline", rep2["findings"] != rep["findings"], True)
+    rep2, _ = run(src=SELF_TEST_SRC.replace(
+        '    log.record("attach_connect", None, json!({}));\n', ""))
+    chk("the lost writer is a finding",
+        any("`attach_connect` has NO production writer" in f for f in rep2["findings"]), True)
+    chk("...and the answer CHANGED from the baseline", rep2["findings"] != rep["findings"], True)
 
     print("\n§9.4 — MUTATION: a ledgered kind gains a writer")
     rep3, _ = run(src=SELF_TEST_SRC.replace(
-        'log.record("send_input", None, json!({}));',
-        'log.record("send_input", None, json!({}));\n    log.record("preflight_match", None, json!({}));'))
-    check("a stale ledger row is a finding",
-          any("`preflight_match` now HAS a production writer" in f for f in rep3["findings"]), True)
+        '    log.record("send_input", None, json!({}));',
+        '    log.record("send_input", None, json!({}));\n'
+        '    log.record("preflight_match", None, json!({}));'))
+    chk("a stale ledger row is a finding",
+        any("`preflight_match` now HAS a production writer" in f for f in rep3["findings"]), True)
 
     print("\n§9.4 — MUTATION: the ledger names a kind the table dropped")
     rep4, _ = run(spec=SELF_TEST_SPEC.replace("| `bridge_register` | `port` |\n", ""))
-    check("a ledger row matching no table row is a finding",
-          any("not a row in the table any more" in f for f in rep4["findings"]), True)
+    chk("a ledger row matching no table row is a finding",
+        any("not a row in the table any more" in f for f in rep4["findings"]), True)
 
-    print("\n§9.4 — reverse direction is a WARNING, not a finding")
+    print("\n§9.4 — the reverse direction GATES")
     rep5, _ = run(spec=SELF_TEST_SPEC.replace("| `attach_connect` | `peer_uid` |\n", ""))
-    check("a kind written but unspecified warns",
-          any("attach_connect" in w for w in rep5["warnings"]), True)
-    check("...and does not gate",
-          any("attach_connect" in f for f in rep5["findings"]), False)
+    chk("a kind written but unspecified is a finding, not a warning",
+        (any("`attach_connect` is not a row" in f for f in rep5["findings"]),
+         rep5["warnings"]), (True, []))
+
+    print("\n§9.4 — every row is pinned by NAME, so an editorial reformat cannot shrink it")
+    for row, label in (("| `session_start` | `command, args` |\n", "a WRITTEN row"),
+                       ("| `file_transfer` | `direction, bytes` |\n", "a DEFERRED row")):
+        repx, errx = run(spec=SELF_TEST_SPEC.replace(row, ""))
+        chk("dropping {} from the table is caught (20 rows, above the floor)".format(label),
+            (errx, len(repx["audit_kinds"]), repx["findings"] != []), (None, 20, True))
+
+    print("\n§9.4 — the shipped-but-unaudited ledger PINS a row without waiving it")
+    rep6, _ = run(defects=["daemon_start"],
+                  src=SELF_TEST_SRC.replace(
+                      '    log.record("daemon_start", None, json!({}));\n', ""))
+    chk("a ledgered shipped-but-unaudited kind is STILL a finding",
+        any("its feature SHIPS, and no production code writes it" in f
+            and "daemon_start" in f for f in rep6["findings"]), True)
+    chk("...and the row is pinned, so it is not 'unaccounted for' either",
+        (rep6["audit_unaccounted"], rep6["audit_shipped_unaudited"]), ([], ["daemon_start"]))
+    rep7, _ = run(defects=["daemon_start"])
+    chk("a defect-ledger row whose writer arrived is a finding (the ledger cannot rot)",
+        any("still in the shipped-but-unaudited ledger" in f for f in rep7["findings"]), True)
+    rep8, _ = run(defects=["preflight_match"])
+    chk("a kind in BOTH ledgers is a finding",
+        any("is in BOTH ledgers" in f for f in rep8["findings"]), True)
+    rep8b, _ = run(defects=["daemon_start"],
+                   spec=SELF_TEST_SPEC.replace("| `daemon_start` | `pid, version` |\n", ""))
+    chk("a defect-ledger row the table dropped is a finding (this is the F9 pin)",
+        any("not a row in the table any more" in f and "daemon_start" in f
+            for f in rep8b["findings"]), True)
+    chk("...and it is NOT also reported as having gained a writer",
+        any("now HAS a production writer" in f for f in rep8b["findings"]), False)
+    rep8c, _ = run(spec=SELF_TEST_SPEC.replace("| `file_transfer` | `direction, bytes` |\n", ""))
+    chk("the same holds for the unbuilt-feature ledger",
+        (any("not a row in the table any more" in f and "file_transfer" in f
+             for f in rep8c["findings"]),
+         any("now HAS a production writer" in f for f in rep8c["findings"])),
+        (True, False))
 
     print("\n§12.6 — parenthetical filter and the numeral cross-check")
-    check("parentheticals are stripped before ids are taken",
-          rep["shiplist_tools"],
-          ["start_session", "read_output", "send_input", "terminate", "status",
-           "list_sessions", "precheck_command"])
-    check("`ansi` and `redact` are NOT collected as tools",
-          [t for t in rep["shiplist_tools"] if t in ("ansi", "redact")], [])
-    check("the shipped set is reported", rep["shipped_tools"],
-          ["start_session", "read_output", "send_input", "terminate", "status",
-           "list_sessions"])
-    check("planned-but-unbuilt is a census, not a finding",
-          (rep["shiplist_not_shipped"], [f for f in rep["findings"] if "precheck_command" in f]),
-          (["precheck_command"], []))
+    chk("parentheticals are stripped before ids are taken",
+        rep["shiplist_tools"],
+        ["start_session", "read_output", "send_input", "terminate", "status",
+         "list_sessions", "precheck_command"])
+    chk("`ansi` and `redact` are NOT collected as tools",
+        [t for t in rep["shiplist_tools"] if t in ("ansi", "redact")], [])
+    chk("the shipped set is reported", rep["shipped_tools"],
+        ["start_session", "read_output", "send_input", "terminate", "status",
+         "list_sessions"])
+    chk("planned-but-unbuilt is a census, not a finding",
+        (rep["shiplist_not_shipped"], [f for f in rep["findings"] if "precheck_command" in f]),
+        (["precheck_command"], []))
 
     print("\n§12.6 — MUTATION: the numeral disagrees with its own list")
-    rep6, _ = run(spec=SELF_TEST_SPEC.replace("All 7 MCP tools", "All 8 MCP tools"))
-    check("numeral vs list is a finding",
-          any("says `All 8 MCP tools` and then lists 7" in f for f in rep6["findings"]), True)
+    rep9, _ = run(spec=SELF_TEST_SPEC.replace("All 7 MCP tools", "All 8 MCP tools"))
+    chk("numeral vs list is a finding",
+        any("says `All 8 MCP tools` and then lists 7" in f for f in rep9["findings"]), True)
 
     print("\n§12.6 — MUTATION: a shipped tool is missing from the ship-list")
-    rep7, _ = run(spec=SELF_TEST_SPEC.replace("`send_input`, `terminate`", "`terminate`")
-                  .replace("All 7 MCP tools", "All 6 MCP tools"))
-    check("a shipped tool absent from §12.6 is a finding",
-          any("`send_input` is an MCP tool the tree ships" in f for f in rep7["findings"]), True)
+    rep10, _ = run(spec=SELF_TEST_SPEC.replace("`send_input`, `terminate`", "`terminate`")
+                   .replace("All 7 MCP tools", "All 6 MCP tools"))
+    chk("a shipped tool absent from §12.6 is a finding",
+        any("`send_input` is an MCP tool the tree ships" in f for f in rep10["findings"]), True)
 
     print("\nanti-vacuity — a tree or document it cannot read is never a pass")
     with tempfile.TemporaryDirectory() as tmp:
         spec_path, root = _fixture(tmp)
-        for p in (root / "crates" / "holdfast-core" / "src" / "lib.rs",):
-            p.unlink()
-        rep8, err8 = build_report(spec_path, root)
-    check("no production Rust -> error, not 'every kind unwritten'",
-          (rep8 is None, "refusing to report every kind as unwritten" in (err8 or "")), (True, True))
-    rep_small, err_small = run(spec=SELF_TEST_SPEC.replace(
-        "| `session_terminate` | `reason, exit_code` |\n", "")
-        .replace("| `redaction_disabled` | `tool, client_kind` |\n", "")
-        .replace("| `attach_disconnect` | `reason, duration_secs` |\n", ""))
-    check("a table that parsed to too few rows -> error, not a short green run",
-          (rep_small is None, "the format moved" in (err_small or "")), (True, True))
-    rep9, err9 = run(spec="# Design\n\n### 12.6 ship-list\n\n- nothing\n")
-    check("§9.4 absent -> error, not a green run", (rep9 is None, err9), (True, "§9.4 not found in the spec"))
-    rep10, err10 = run(spec=SELF_TEST_SPEC.replace("### 12.6 v0.1.0 ship-list", "### 12.7 elsewhere"))
-    check("§12.6 absent -> error, not a green run",
-          (rep10 is None, "§12.6" in (err10 or "")), (True, True))
-    rep11, err11 = run(schema="const TOOLS: [&str; 0] = [];\nlet x = 1;\n")
-    check("an EMPTY schema.rs pin -> error, not a vacuously satisfied subset rule",
-          (rep11 is None, "vacuously satisfied" in (err11 or "")), (True, True))
-    rep12, err12 = run(schema="const NOT_TOOLS: [&str; 2] = [\"a\", \"b\"];\n")
-    check("the schema.rs pin being RENAMED -> error, not a silent skip",
-          (rep12 is None, "the pin moved" in (err12 or "")), (True, True))
+        (root / "crates" / "holdfast-core" / "src" / "lib.rs").unlink()
+        (root / "crates" / "holdfast-core" / "src" / "mcp" / "tools.rs").unlink()
+        rep11, err11 = build_report(spec_path, root)
+    chk("no production Rust -> error, not 'every kind unwritten'",
+        (rep11 is None, "refusing to report every kind as unwritten" in (err11 or "")), (True, True))
+    shrunk = SELF_TEST_SPEC
+    for row in ("| `file_transfer` | `direction, bytes` |\n",
+                "| `recording_started` | `path` |\n",
+                "| `bridge_revoke` | `reason` |\n",
+                "| `binding_approval` | `approval_id` |\n"):
+        shrunk = shrunk.replace(row, "")
+    rep_small, err_small = run(spec=shrunk)
+    chk("a table that parsed to 17 rows -> error, not a short green run",
+        (rep_small is None, "the format moved" in (err_small or "")), (True, True))
+    rep12, err12 = run(spec="# Design\n\n### 12.6 ship-list\n\n- nothing\n")
+    chk("§9.4 absent -> error, not a green run", (rep12 is None, err12),
+        (True, "§9.4 not found in the spec"))
+    rep13, err13 = run(spec=SELF_TEST_SPEC.replace("### 12.6 v0.1.0 ship-list", "### 12.7 elsewhere"))
+    chk("§12.6 absent -> error, not a green run",
+        (rep13 is None, "§12.6" in (err13 or "")), (True, True))
+    rep14, err14 = run(schema="const TOOLS: [&str; 0] = [];\nlet x = 1;\n")
+    chk("an EMPTY schema.rs pin -> error, not a vacuously satisfied subset rule",
+        (rep14 is None, "vacuously satisfied" in (err14 or "")), (True, True))
+    rep15, err15 = run(schema="const NOT_TOOLS: [&str; 2] = [\"a\", \"b\"];\n")
+    chk("the schema.rs pin being RENAMED -> error, not a silent skip",
+        (rep15 is None, "the pin moved" in (err15 or "")), (True, True))
 
-    print("\nfind_spec — the worktree fallback")
+    print("\nfind_spec — every branch of the chain, including the worktree fallback")
+    chk("the environment is scrubbed for this section",
+        os.environ.get("HOLDFAST_SPEC"), None)
+    with tempfile.TemporaryDirectory() as tmp:
+        explicit = Path(tmp) / "given.md"
+        explicit.write_text("x")
+        got, ferr = find_spec(Path(tmp), str(explicit))
+        chk("--spec names a file -> that file, and no search happens", (got, ferr),
+            (explicit, None))
+        got, ferr = find_spec(Path(tmp), str(Path(tmp) / "absent.md"))
+        chk("--spec names a non-file -> error, not a fallback to the search",
+            (got, "--spec" in (ferr or "")), (None, True))
+        os.environ["HOLDFAST_SPEC"] = str(explicit)
+        try:
+            got, ferr = find_spec(Path(tmp), None)
+            chk("$HOLDFAST_SPEC is consulted when --spec is absent", (got, ferr), (explicit, None))
+            os.environ["HOLDFAST_SPEC"] = str(Path(tmp) / "absent.md")
+            got, ferr = find_spec(Path(tmp), None)
+            chk("$HOLDFAST_SPEC naming a non-file -> error, not a silent fallback",
+                (got, "$HOLDFAST_SPEC" in (ferr or "")), (None, True))
+        finally:
+            os.environ.pop("HOLDFAST_SPEC", None)
     with tempfile.TemporaryDirectory() as tmp:
         got, ferr = find_spec(Path(tmp), None)
-        check("a tree with no docs/ and no git -> cannot run, with the paths tried",
-              (got, "no spec at any of" in (ferr or "")), (None, True))
+        chk("a tree with no docs/ and no git -> cannot run, with the paths tried",
+            (got, "no spec at any of" in (ferr or "")), (None, True))
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp) / "docs" / "superpowers" / "specs"
         d.mkdir(parents=True)
         (d / "0000-00-00-holdfast-design.md").write_text("x")
         got, ferr = find_spec(Path(tmp), None)
-        check("docs/ present -> the spec is found", (got.name, ferr),
-              ("0000-00-00-holdfast-design.md", None))
+        chk("docs/ present -> the spec is found", (got.name, ferr),
+            ("0000-00-00-holdfast-design.md", None))
         (d / "0001-01-01-holdfast-design.md").write_text("x")
         got, ferr = find_spec(Path(tmp), None)
-        check("two candidate specs -> error, not an arbitrary pick",
-              (got, "expected exactly one" in (ferr or "")), (None, True))
+        chk("two candidate specs -> error, not an arbitrary pick",
+            (got, "expected exactly one" in (ferr or "")), (None, True))
+    _worktree_case(chk)
 
     print("\n" + "-" * 66)
     # What was covered, rather than how many cases ran: the count is the
     # thing that goes stale, which is the defect this whole file is about.
     print("covered: §9.4's table parsed and bounded away from its own prose")
-    print("and from a later section's table; the ledger red in both")
-    print("directions and when it names a dropped row; a writer disappearing;")
-    print("the reverse direction warning without gating; §12.6's parenthetical")
-    print("filter, its numeral-vs-list cross-check and the shipped-subset")
-    print("rule; refusal on an unreadable tree, a shrunken table, a missing")
-    print("§9.4 or §12.6, and an empty or renamed schema.rs pin; and")
-    print("find_spec's --spec / $HOLDFAST_SPEC / docs / worktree chain.")
-    if failures:
-        print("SELF-TEST FAILED: {} case(s)".format(failures))
+    print("and from a later section's table; a writer defined as a `.record(`")
+    print("first argument, with a dispatch arm and a JSON field name proved")
+    print("NOT to be one; the blanking heuristic driven through every item")
+    print("shape this workspace has, with a brace in a string, a `'}'` char")
+    print("literal and a raw string; writers in a nested src/ directory; the")
+    print("ledger red in both directions and when it names a dropped row; the")
+    print("shipped-but-unaudited ledger pinning a row without waiving it; the")
+    print("reverse direction gating; every table row pinned by name against")
+    print("an editorial deletion; §12.6's parenthetical filter, its")
+    print("numeral-vs-list cross-check and the shipped-subset rule; refusal")
+    print("on an unreadable tree, a shrunken table, a missing §9.4 or §12.6,")
+    print("and an empty or renamed schema.rs pin; and find_spec's --spec /")
+    print("$HOLDFAST_SPEC / docs / real-git-worktree chain.")
+    if state["failures"]:
+        print("SELF-TEST FAILED: {} case(s)".format(state["failures"]))
         return EXIT_FINDINGS
     print("SELF-TEST OK")
     return EXIT_OK
+
+
+def _worktree_case(chk):
+    """`find_spec` from a REAL `git worktree`, which is the headline capability.
+
+    Driven through `git` rather than simulated, because the branch under test
+    is `git rev-parse --path-format=absolute --git-common-dir` and a fake of
+    it would be a second implementation of the thing being checked. `docs/` is
+    created AFTER the commit and never added, so the worktree genuinely does
+    not have it — which is the real condition, not a staged one.
+    """
+    git = shutil.which("git")
+    if git is None:
+        chk("git is on PATH for the worktree case", False, True)
+        return
+    env = dict(os.environ)
+    env.update({
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_AUTHOR_NAME": "spec-enum-check",
+        "GIT_AUTHOR_EMAIL": "spec-enum-check@example.invalid",
+        "GIT_COMMITTER_NAME": "spec-enum-check",
+        "GIT_COMMITTER_EMAIL": "spec-enum-check@example.invalid",
+    })
+    with tempfile.TemporaryDirectory() as tmp:
+        main = Path(tmp) / "main"
+        main.mkdir()
+
+        def g(*args):
+            return subprocess.run([git, "-C", str(main)] + list(args), env=env,
+                                  capture_output=True, text=True, timeout=30)
+
+        if g("init", "-q").returncode != 0:
+            chk("git init succeeds for the worktree case", False, True)
+            return
+        (main / "README").write_text("x")
+        g("add", "-A")
+        if g("commit", "-qm", "init").returncode != 0:
+            chk("git commit succeeds for the worktree case", False, True)
+            return
+        specs = main / "docs" / "superpowers" / "specs"
+        specs.mkdir(parents=True)
+        (specs / "0000-00-00-holdfast-design.md").write_text("x")
+        wt = Path(tmp) / "wt"
+        if g("worktree", "add", "--detach", "-q", str(wt), "HEAD").returncode != 0:
+            chk("git worktree add succeeds for the worktree case", False, True)
+            return
+        chk("the worktree genuinely has no docs/ (the case is not staged)",
+            (wt / "docs").exists(), False)
+        got, ferr = find_spec(wt, None)
+        chk("a git WORKTREE with no docs/ finds the spec in the main checkout",
+            (got.name if got else None, ferr), ("0000-00-00-holdfast-design.md", None))
+        g("worktree", "remove", "--force", str(wt))
 
 
 def main():
