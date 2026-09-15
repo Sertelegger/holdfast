@@ -226,11 +226,17 @@ Grep the value, not the key. `"outputSchema"` being present says nothing.
   design specification, which is deliberately git-ignored and local to the
   author's machine. If you are working in a clone without `docs/`, say so
   rather than guessing at what a section required.
-- `scripts/orphan-req-check.py` and `scripts/artifact-deletion-check.py` are
-  author-local tools, not a CI gate: both read the `docs/` spec and plans,
-  both exit 3 with a message rather than 0 when `docs/` is absent, and
-  neither is invoked from anywhere in this repository. Run them by hand if
-  you have `docs/`; on a clone without it they cannot run at all.
+- `scripts/orphan-req-check.py`, `scripts/artifact-deletion-check.py` and
+  `scripts/spec-enum-check.py` read the `docs/` spec and plans, and all three
+  exit 3 with a message rather than 0 when `docs/` is absent. Run them by
+  hand if you have `docs/`; on a clone without it they cannot run at all. The
+  first two are invoked from nowhere in this repository. `spec-enum-check.py`
+  is the exception in one direction only: its **`--self-test` runs in the
+  `hygiene` job**, because that arm is fixture-driven and needs no document,
+  and a parser whose own tests never run is a parser on trust. Its real
+  invocation is still author-local, and it finds the spec from a git
+  worktree — where `docs/` is not materialised — by falling back to the main
+  checkout, so a reviewer can run it where reviewers actually work.
 
 ## Commits and pull requests
 

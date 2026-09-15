@@ -131,6 +131,13 @@ jobs:
       # guard whose guard is unrun is a guard on trust.
       - run: ./scripts/ci-hygiene.sh --self-test
       - run: ./scripts/ci-hygiene.sh
+      # Only the self-test, and that is the whole of what CI can run: the
+      # real invocation reads the design spec, `docs/` is git-ignored and
+      # lives in a separate repository, so the checkout above does not have
+      # it and every real run here would exit 3 saying so. The self-test
+      # runs against its own fixtures, needs no document, and is what keeps
+      # the parser honest -- the same reason the two lines above it exist.
+      - run: python3 ./scripts/spec-enum-check.py --self-test
 
   # `dev/workflows/verify.md` has listed `actionlint` under *"CI's own gate,
   # which must pass"* since the file was written, and CI did not run it —

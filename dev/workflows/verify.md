@@ -107,6 +107,26 @@ pass count means nothing if the harness cannot fail:
 ./scripts/mcp-smoke.sh /usr/bin/true      # every check must FAIL
 ```
 
+**Also worth running when the spec moved, or when you touched an audit kind
+or the MCP tool surface** — and **only** if you have `docs/`, which a clone
+does not:
+
+```
+./scripts/spec-enum-check.py
+```
+
+It asserts §9.4's audit-kind table and §12.6's ship-list against the tree.
+It is **red today**, exit 1, with four findings — `daemon_start`,
+`daemon_stop`, `send_input` and `panic` are specified and no production code
+writes them, all four tracked by GH #173. Read the finding list, not the
+exit code: four findings naming exactly those kinds is the expected state,
+and a fifth, or a different name, is the thing this check exists to tell
+you. Its `--self-test` arm is the half CI can run and is a required check;
+this arm is the half that needs the document, and it works from a worktree
+(`docs/` is not materialised there, so it falls back to the main checkout).
+Absent `docs/` it exits 3 saying so — which is neither a pass nor a failure,
+per the last paragraph of this file.
+
 Report as: one line per check with the numbers **that run emitted** — quote
 nextest's own `Summary [ … ] N tests run: N passed, N skipped` line, the
 census's `SKIP CENSUS OK: …`, and the smoke script's own `SMOKE OK (N checks)`
