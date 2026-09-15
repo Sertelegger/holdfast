@@ -1572,11 +1572,27 @@ mod tests {
     /// away (GH #142, GH #139's byte).** A view that *consumes* rather
     /// than merely deletes can join an indexed prefix to the end of the
     /// region on its own: an unterminated 8-bit OSC introducer — one byte,
-    /// `\x9d` — makes `C1::Strip` swallow everything after it, so
-    /// `mailgun-api-key`'s `key-` sitting harmlessly in an npm warning
-    /// becomes a candidate whose value run reaches the view's end. On
-    /// `main` that moment masks nothing; here it masks every cell the
-    /// bytes from the prefix onward wrote.
+    /// `\x9d` — makes `C1::Strip` swallow everything after it, so the
+    /// same `use crate::re_exports` the `ORDINARY` const carries becomes
+    /// a candidate whose value run reaches the view's end — and it does
+    /// so with a hundred and ten bytes of ordinary build output still
+    /// standing behind it in the raw stream, which is the difference
+    /// between this row and the deleting view above, where the escape
+    /// had to be the last thing that arrived. On `main` that moment
+    /// masks nothing; here it masks every cell the bytes from the prefix
+    /// onward wrote.
+    ///
+    /// **Why `re_`, and not the `key-` of an npm warning this fixture
+    /// used to carry.** `earliest_partial` asks the rule now rather than
+    /// a byte class (GH #142), so the premise needs a candidate the rule
+    /// could still *complete*. `mailgun-api-key` is `\bkey-[a-f0-9]{32}`
+    /// and dies on the `m` of `manager` in every view — correct of the
+    /// predicate, and useless as a premise. `resend-api-key` is
+    /// `\bre_[A-Za-z0-9_]{24,}`, whose value class is the bytes ordinary
+    /// identifiers are made of, so seven of its twenty-four have arrived
+    /// here without anyone planting them. The row therefore still says
+    /// the thing it exists to say: it is *ordinary* output the consuming
+    /// view turns into a mask, not a credential smuggled into a fixture.
     ///
     /// **The bound is `partial_secret_scan_bytes` and it is structural,
     /// not measured**: `earliest_partial` is asked about a view of
@@ -1584,48 +1600,89 @@ mod tests {
     /// raw_offset` maps into that same range, so no view can move the
     /// boundary behind the scan window however much it deletes. Asserted
     /// below, because "bounded by the window it was asked about" is the
-    /// difference between this and an unbounded span.
+    /// difference between this and an unbounded span — and the rows
+    /// ahead of the fixture are padded past that window on purpose,
+    /// because on a stream shorter than the window the subtraction
+    /// saturates and the assertion reads `b >= 0`, which holds of every
+    /// `u64`.
     ///
     /// Two things this is not. It is **not** a `read_output` regression —
     /// §4.1's boundary is asserted absent on the same fixture. And it is
-    /// **not** permanent: the trailing `\r\n` of the next line ends the
-    /// value run in every view, which the last arm shows.
+    /// **not** permanent — but what ends it is the prefix leaving the
+    /// scan window and *not* a newline, which the last two arms show in
+    /// that order.
     #[test]
     fn a_consuming_view_can_mask_back_to_the_scan_window_and_no_further() {
         let t0 = Instant::now();
         let mut log = ByteLog::default();
         let mut t = ScreenTracker::new(cfg(ScreenTracking::On), rules(), t0);
         feed(&mut t, &mut log, t0, b"\x1b[H\x1b[2J");
+        // The padding is load-bearing rather than decorative: it is what
+        // carries the head past `partial_secret_scan_bytes`, so that the
+        // window really starts inside this stream and the bound below
+        // has something to compare against. Ten rows still fit a
+        // 24×80 grid with the four masked ones after them.
         for i in 0..10 {
             feed(
                 &mut t,
                 &mut log,
                 t0,
-                format!("earlier row {i:02}\r\n").as_bytes(),
+                format!("earlier row {i:02} of ordinary build output, padded to width\r\n")
+                    .as_bytes(),
             );
         }
         // One `\x9d` and then ordinary text, with no terminator for it.
-        let mut payload = b"npm WARN @acme/key-manager\x9d".to_vec();
+        let mut payload = b"use crate::re_exports\x9d".to_vec();
         payload.extend_from_slice(&b"ordinary build output line\r\n".repeat(4));
         payload.truncate(payload.len() - 2);
         feed(&mut t, &mut log, t0, &payload);
+
+        let head = log.bytes.len() as u64;
+        let scan = crate::output::ProcessingLimits::default().partial_secret_scan_bytes as u64;
+        let window_start = head.saturating_sub(scan);
+        assert!(
+            window_start > 0,
+            "the scan window covers this whole stream, so the bound below \
+             reads `b >= 0` and holds of every `u64`. Two different \
+             things spell this, and only one of them is a test-side fix: \
+             `partial_secret_scan_bytes` grew until it stopped bounding \
+             the reach-back at all, or the fixture wants lengthening past \
+             it. Which number moved says which"
+        );
 
         let (raw, unvouched) = boundaries(&log);
         assert!(
             raw.is_none(),
             "§4.1 held something; this fixture is then not about the view"
         );
+
+        // **The premise has two halves and they break for unrelated
+        // reasons, so they are asserted apart** — whoever changes one of
+        // them is owed a message naming the one they changed.
+        let tail = &log.bytes[window_start as usize..];
+        assert!(
+            crate::output::normalise::emitted_views(tail, window_start)
+                .iter()
+                .any(|v| v.bytes().ends_with(b"re_exports")),
+            "the premise, first half: some emitted view has to *consume* \
+             to the end of the region, joining `re_` to it across the \
+             ordinary output that follows. If `C1::Strip` stopped \
+             swallowing an unterminated `\\x9d`, rewrite this row around \
+             whatever view still consumes — do not delete it, because \
+             the bound below has no other guard"
+        );
         let b = unvouched.expect(
-            "the premise: a consuming view joins `key-` to the end of the \
-             region. If `C1::Strip` stops consuming, this row is measuring \
-             nothing and should be rewritten rather than deleted",
+            "the premise, second half: `re_` has to be *alive* in that \
+             view — `\\bre_[A-Za-z0-9_]{24,}` with `exports` behind it \
+             and the region ending there. If the in-flight predicate \
+             stopped calling that alive, rewrite the fixture around a \
+             prefix the new predicate does keep alive across ordinary \
+             bytes, rather than deleting the row",
         );
 
-        let head = log.bytes.len() as u64;
-        let scan = crate::output::ProcessingLimits::default().partial_secret_scan_bytes as u64;
         assert!(
-            b >= head.saturating_sub(scan),
-            "the boundary reached behind the scan window: {b} < {head} - {scan}"
+            b >= window_start,
+            "the boundary reached behind the scan window: {b} < {window_start}"
         );
 
         let masked = full(t.capture(None, true, t0, &log, Some(b)));
@@ -1641,7 +1698,7 @@ mod tests {
         // **What ends it is the scan window, not a terminator, and that
         // is the finding.** A newline does *not* clear this: the
         // consuming view swallows the newline too, so the candidate is
-        // still the last thing in that view. What clears it is `key-`
+        // still the last thing in that view. What clears it is `re_`
         // leaving `[head - partial_secret_scan_bytes, head)` — the same
         // terminating rule `attach::redact_stream` documents for a stream
         // carry, reached here for the same reason.

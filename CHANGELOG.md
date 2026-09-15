@@ -176,11 +176,14 @@ is cut, named and published is in
   bounded by the scan window.** A view that *consumes* rather than deletes
   joins an indexed prefix to the end of the region by itself: an unterminated
   8-bit OSC introducer (`\x9d`, [#139]'s byte) makes that view swallow
-  everything after it, so a `key-` sitting harmlessly in an npm warning
-  becomes a candidate and the cells from it onward are masked. Measured at
-  124 bytes of reach-back and four markers on the fixture; **bounded at
-  `partial_secret_scan_bytes` (512) structurally**, because the view is built
-  from that window and offsets map back into it. A newline does not clear it —
+  everything after it, so the `re_` of an ordinary `use crate::re_exports`
+  becomes a candidate and the cells from it onward are masked. The fixture is
+  that line and no longer the `key-` of an npm warning, because the predicate
+  below has to call the candidate *alive* for the primitive to exist at all,
+  and `\bre_[A-Za-z0-9_]{24,}` is alive across ordinary identifier bytes where
+  `\bkey-[a-f0-9]{32}` is not. Measured at 121 bytes of reach-back and four
+  markers; **bounded at `partial_secret_scan_bytes` (512) structurally**,
+  because the view is built from that window and offsets map back into it. A newline does not clear it —
   the consuming view swallows the newline too — so what clears it is the
   prefix scrolling out of that window, the same terminating rule an attached
   observer's stream already uses. No byte is denied on any surface, and §4.1's
