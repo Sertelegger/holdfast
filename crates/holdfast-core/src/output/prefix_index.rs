@@ -2,9 +2,10 @@
 //! **targeted holdback** (spec §4.1) is built on.
 //!
 //! The holdback boundary is not a byte count. It is the start of a secret
-//! that is *still arriving*: bytes that match a known secret prefix, run
-//! all the way to `buffer.head`, and do not yet satisfy the rule that
-//! produced the prefix. When no such candidate exists — the overwhelming
+//! that is *still arriving*: bytes that match a known secret prefix, keep
+//! the rule that produced that prefix able to match all the way to
+//! `buffer.head`, and do not yet satisfy it. When no such candidate
+//! exists — the overwhelming
 //! majority of reads — the boundary is `buffer.head` and the holdback has
 //! no observable effect at all.
 //!
@@ -17,6 +18,11 @@
 //! which is the half no window size reaches.
 
 use super::rules::RuleSet;
+use regex_automata::{
+    dfa::{dense, Automaton, StartKind},
+    util::{primitives::StateID, syntax},
+    Anchored, Input,
+};
 use std::collections::HashMap;
 
 /// Cap on prefixes generated per rule by character-class expansion
@@ -30,8 +36,250 @@ pub const MIN_PREFIX_LEN: usize = 3;
 /// Bytes a still-arriving value may contain by default: printable ASCII,
 /// no space and no control characters. A rule marked `binary` (a PEM
 /// block) opts out.
+///
+/// **Superseded for most rules by [`PrefixIndex::still_alive`] (GH #142)**
+/// and kept for the three places that outlive it: the nine
+/// `has_value_group` context rules on the raw stream (GH #152),
+/// [`trailing_value_run_start`], and the fallback when a rule's liveness
+/// automaton could not be built.
 fn is_value_byte(b: u8) -> bool {
     (0x21..=0x7e).contains(&b)
+}
+
+/// `[A-Za-z0-9_]` — what both spellings of `\b` agree is a word character.
+fn is_ascii_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// The pattern a rule's **liveness** automaton is built from: the rule's
+/// own source with every `\b` rewritten to its ASCII-only spelling, or
+/// `None` for a pattern this rewrite cannot be trusted on.
+///
+/// The rewrite is the difference between a usable predicate and one that
+/// is *worse* than the byte-class test it replaces. A Unicode word
+/// boundary cannot be compiled into a DFA at all without the quit set —
+/// every byte ≥ 0x80 becomes a quit byte, a quit must be read as ALIVE
+/// for soundness, and the result holds back any output carrying a glyph.
+/// With the ASCII spelling there is no quit set, and the predicate is
+/// exact on everything the rules can actually match.
+///
+/// **Why the substitution cannot release a secret early — and exactly
+/// what "cannot" is quantified over, because the two boundaries are not
+/// proved to the same standard.** `\b` is *"exactly one side is a word
+/// character"*, and the two spellings differ only where one of those
+/// sides is a non-ASCII byte, which `(?-u:\b)` reads as a non-word byte
+/// and `\b` may read as a word character.
+///
+/// * **At the candidate's own leading boundary the argument is
+///   absolute.** The other side of that boundary is the indexed prefix's
+///   first byte, which [`PrefixIndex::build`] guarantees is an ASCII word
+///   byte by refusing an automaton to any rule where it is not. `\b` then
+///   reduces to *"the byte behind is not a word character"*, and "not an
+///   **ASCII** word byte" is a superset of "not a **Unicode** word
+///   character" — so `(?-u:\b)` holds wherever `\b` does, and liveness
+///   over-approximates the rule. That half rests on `build`'s refusal
+///   and on nothing else.
+/// * **At every later boundary the argument is *relative*, and its
+///   baseline is [`is_value_byte`].** Divergence there needs a non-ASCII
+///   byte at or after the first value byte, and where it happens the
+///   rewrite can *under*-approximate: the automaton may call DEAD a
+///   candidate the rule could still complete, which is the direction that
+///   releases. What makes that safe is not the rewrite, it is the floor —
+///   `is_value_byte`, the predicate shipped at `11df4d0`, releases the
+///   candidate on *any* byte ≥ 0x80 outright. So the claim proved here is
+///   **"liveness releases nothing the byte-class test held"**, and not the
+///   stronger "liveness never releases an in-flight secret". The two read
+///   the same only because the byte-class test is the baseline.
+///
+/// **The relative half does not travel, and whoever moves this predicate
+/// must re-derive it.** Anything that drives this automaton where
+/// `is_value_byte` is not the thing it replaces — a view-driven withhold
+/// (GH #142's reverted step, where a view carries no `is_value_byte`
+/// baseline at all and the deleted byte cannot revise the decision), or
+/// GH #152 moving the `has_value_group` rules across — loses the floor
+/// and with it the argument. Such a caller needs the absolute property at
+/// the trailing boundary too, which nothing here supplies: it would have
+/// to enforce a refusal at that boundary the way [`PrefixIndex::build`]
+/// enforces one at the leading boundary.
+///
+/// **`\B` gets no such argument, so a pattern carrying one gets no
+/// automaton.** `\B` is the negation, so the ASCII spelling
+/// *under*-approximates by the same reasoning, and at a *leading* `\B`
+/// the divergent byte sits behind the candidate where `is_value_byte`
+/// never looked. No shipped rule uses one; a user rule that does keeps
+/// the byte-class test, which is what it has today.
+///
+/// The walk tracks escapes rather than calling `str::replace`, so a
+/// pattern containing `\\b` — an escaped backslash followed by a literal
+/// `b` — keeps its meaning instead of acquiring a word boundary it never
+/// had.
+fn liveness_pattern(pattern: &str) -> Option<String> {
+    let mut out = String::with_capacity(pattern.len() + 16);
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('b') => out.push_str("(?-u:\\b)"),
+            Some('B') => return None,
+            Some(escaped) => {
+                out.push('\\');
+                out.push(escaped);
+            }
+            None => out.push('\\'),
+        }
+    }
+    Some(out)
+}
+
+/// Whether the rule's match can begin **one byte before** an occurrence
+/// of `prefix` — the shape that makes [`PrefixIndex::still_alive`] answer
+/// the wrong question about it.
+///
+/// `still_alive` anchors the whole pattern at the candidate, so what it
+/// actually answers is *"can this rule match **starting here**"*. For a
+/// prefix the rule's own match reaches only after consuming earlier
+/// bytes that is the wrong question, and it is wrong in the direction
+/// that **releases**. Measured, against the shipped
+/// `generic-secret-assignment`
+/// (`(?i)\b[a-z0-9_.-]{0,32}(?:password|…)\b["'\s]*[:=]…`):
+///
+/// ```text
+/// rule.regex.is_match("MY_APP_PASSWORD=hunter2hunter2")            == true
+/// still_alive(rule, "MY_APP_PASSWORD=hunter2hunter2", at = 7)      == false
+/// ```
+///
+/// The leading `\b` cannot hold between the `_` at 6 and the `P` at 7,
+/// so anchoring there is DEAD on arrival — while the rule matches the
+/// whole region from offset 0. A rule this answers `false` for gets no
+/// automaton, exactly as the punctuation-prefix case above does, and
+/// keeps [`is_value_byte`], which holds strictly more.
+///
+/// **Latent today, and that is why it is computed rather than noted.**
+/// The nine `has_value_group` context rules are exactly the ones whose
+/// declared prefixes sit inside their own match, and
+/// [`PrefixIndex::earliest_partial`] keeps them on [`is_value_byte`] for
+/// an unrelated reason (GH #152). Closing #152 by moving them across
+/// would land that false DEAD on a shipped rule against an ordinary
+/// env-var line, and a refusal computed here cannot be forgotten there.
+///
+/// **What this proves, and what it does not — stated because the
+/// difference is the whole of it.** It proves the match cannot begin
+/// exactly one byte before the prefix. That reaches every lead-in whose
+/// minimum length is one or less, which is the family the hazard lives
+/// in: `{0,n}`, `*`, `?` and `+` all admit a gap of exactly one byte. It
+/// does **not** reach a lead-in whose minimum is two or more. Three
+/// shapes have one, and all three need the rule to **declare** its
+/// prefixes, because a derived prefix is by construction a literal every
+/// match begins with: a fixed literal lead-in, a `{2,n}` run, and an
+/// alternation branch with a declared prefix starting two bytes into it.
+/// `(?:\bacme|\bfoo)[a-z]{2,6}tok_[A-Za-z0-9]{20,}` with
+/// `prefixes = ["tok_"]` is the second, and it keeps an automaton that
+/// calls `acmexytok_ABCDEFGHIJ` dead at offset 6.
+///
+/// **That residual is measured empty on the rule set, and searching one
+/// byte deeper would not find it anyway.** Sweeping the same walk at
+/// depths one through six over the shipped fifty-one plus the adversarial
+/// user rules: depths one and two refuse the *same* two rules, and depth
+/// **three** — which is [`MIN_PREFIX_LEN`], the first depth at which a
+/// rule's own value run can be entered and spell its own prefix — jumps
+/// to seven and starts refusing `openai-api-key`, `jwt` and
+/// `aws-access-key-id`. There is no depth between "reaches more real
+/// lead-ins" and "starts refusing rules that are fine".
+///
+/// **Chasing the deep occurrences was tried and is not worth having.**
+/// The unbounded reachability walk refuses an automaton to **23 of the 51
+/// shipped rules** — `\bsk-ant-[A-Za-z0-9_-]{24,}` reaches its own
+/// `sk-ant-` from inside its own value run, because that run's character
+/// class can spell it. Every one of those interior occurrences is
+/// preceded, in the same region, by that rule's *own* earlier candidate,
+/// and [`PrefixIndex::earliest_partial`] scans left to right and answers
+/// with the earliest — so the deep walk buys nothing and costs the
+/// change.
+fn rule_may_start_one_byte_before(dfa: &dense::DFA<Vec<u32>>, prefix: &[u8]) -> bool {
+    fn consumes(dfa: &dense::DFA<Vec<u32>>, mut sid: StateID, prefix: &[u8]) -> bool {
+        for byte in prefix {
+            sid = dfa.next_state(sid, *byte);
+            if dfa.is_dead_state(sid) {
+                return false;
+            }
+            if dfa.is_quit_state(sid) {
+                return true;
+            }
+        }
+        // **A dense DFA reports a match one byte late**, so landing in a
+        // match state here means the match ended *before* this prefix was
+        // covered and the byte that put us here is outside it. A match
+        // state that can still be extended is a different thing, which is
+        // why this asks rather than assuming.
+        !dfa.is_match_state(sid) || (0u8..=0xff).any(|b| !dfa.is_dead_state(dfa.next_state(sid, b)))
+    }
+
+    // **One seed per start configuration `regex-automata` distinguishes**,
+    // read off `util::start::Start` rather than reasoned about: `Text`
+    // (the empty seed), `WordByte`, `NonWordByte`, `LineLF` and `LineCR`.
+    // `\r` is its own class and `\n` does not stand in for it — the
+    // determinizer gives `LineCR` a half-CRLF look-behind where `LineLF`
+    // gets `StartCRLF` — and on a pty `\r` is the *common* byte before a
+    // line. Missing a start state means missing a lead-in, which is the
+    // direction that releases. `CustomLineTerminator` needs a
+    // `LookMatcher` this crate never sets, so it is unreachable here.
+    for lead in [None, Some(b'a'), Some(b'-'), Some(b'\n'), Some(b'\r')] {
+        let hay: Vec<u8> = lead.into_iter().collect();
+        let input = Input::new(&hay).range(hay.len()..).anchored(Anchored::Yes);
+        let Ok(sid) = dfa.start_state_forward(&input) else {
+            // A quit byte in the look-behind: nothing was analysed, so
+            // nothing is proved, so the rule gets no automaton.
+            return true;
+        };
+        // The alphabet is every byte, for the reason the rest of this
+        // file takes the conservative reading: a narrower one finds fewer
+        // lead-ins, and missing one is what releases a secret.
+        for byte in 0u8..=0xff {
+            let to = dfa.next_state(sid, byte);
+            if dfa.is_dead_state(to) {
+                continue;
+            }
+            if dfa.is_quit_state(to) || consumes(dfa, to, prefix) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A rule's liveness automaton, or `None` when it could not be built.
+///
+/// **Dense rather than lazy, and that choice is what keeps this type
+/// behind its `Arc`.** A `dfa::dense::DFA` owns no mutable search state,
+/// so it is `Send + Sync` and [`PrefixIndex::still_alive`] stays `&self`;
+/// the lazy `hybrid` DFA needs `&mut Cache` on every transition, which
+/// would put a cache pool between `OutputProcessor` — one per daemon,
+/// shared by every read path — and its callers.
+///
+/// A failure is not an error: the caller falls back to [`is_value_byte`],
+/// which is the shipped predicate and holds *more* than liveness does.
+fn build_liveness(pattern: &str) -> Option<dense::DFA<Vec<u32>>> {
+    dense::Builder::new()
+        .configure(
+            dense::DFA::config()
+                // The search always starts at a known candidate offset,
+                // so the unanchored start state is dead weight — and
+                // building it is what made an earlier probe report this
+                // engine as unusable at 9.9 GB of resident memory.
+                .start_kind(StartKind::Anchored)
+                // Explicit, though it is also the default: a Unicode word
+                // boundary must fail to build here rather than silently
+                // install a quit set. `liveness_pattern` has removed the
+                // last one, and this is what keeps a future rule from
+                // reintroducing it unnoticed.
+                .unicode_word_boundary(false),
+        )
+        .syntax(syntax::Config::new().utf8(false))
+        .build(&liveness_pattern(pattern)?)
+        .ok()
 }
 
 /// Whether `pattern` opens with `\b` (after an optional inline-flag
@@ -177,12 +425,16 @@ struct Candidate {
 pub struct PrefixIndex {
     by_first_byte: HashMap<u8, Vec<Candidate>>,
     total: usize,
+    /// One liveness automaton per rule, parallel to `rules.rules`. See
+    /// [`build_liveness`]; `None` means the rule keeps [`is_value_byte`].
+    liveness: Vec<Option<dense::DFA<Vec<u32>>>>,
 }
 
 impl PrefixIndex {
     pub fn build(rules: &RuleSet, expansion_limit: usize) -> Self {
         let mut by_first_byte: HashMap<u8, Vec<Candidate>> = HashMap::new();
         let mut total = 0usize;
+        let mut liveness: Vec<Option<dense::DFA<Vec<u32>>>> = Vec::with_capacity(rules.rules.len());
         for (idx, rule) in rules.rules.iter().enumerate() {
             let derived = derive_prefixes(&rule.pattern, expansion_limit);
             // A derivable leading literal means the prefix is where the
@@ -192,24 +444,63 @@ impl PrefixIndex {
             // boundary belongs somewhere else and must not be demanded.
             let requires_word_boundary =
                 !derived.is_empty() && starts_with_word_boundary(&rule.pattern);
-            let prefixes = match &rule.declared_prefixes {
+            let prefixes: Vec<Vec<u8>> = match &rule.declared_prefixes {
                 Some(declared) => declared.clone(),
                 None => derived,
-            };
-            for prefix in prefixes {
-                if prefix.len() < MIN_PREFIX_LEN {
-                    continue;
-                }
+            }
+            .into_iter()
+            .filter(|p| p.len() >= MIN_PREFIX_LEN)
+            .collect();
+
+            // **The ASCII word-boundary lemma, enforced here rather than
+            // asserted about a test fixture.** [`liveness_pattern`]'s
+            // rewrite over-approximates `\b` only because the byte on the
+            // *pattern* side of the candidate's leading boundary is an
+            // ASCII word byte — which, for an indexed candidate, is the
+            // prefix's first byte. No shipped rule breaks that, but
+            // `extra_redaction_patterns` accepts arbitrary rules, and one
+            // whose pattern carries a `\b` and whose prefix opens on
+            // punctuation breaks it in the direction that **releases** an
+            // in-flight secret: measured, `\b(?:-zq-|-zr-)[A-Za-z0-9]{10,}`
+            // against `"\u{e9}-zq-ABCD"` is alive to the rule's own regex,
+            // dead to the ASCII rewrite, and was held by the byte-class
+            // test this replaces.
+            //
+            // Such a rule gets no automaton at all: it keeps
+            // [`is_value_byte`] on the raw stream, which is what it has
+            // today, and that is the safe direction — the byte-class test
+            // holds strictly more than liveness does.
+            let lemma_holds =
+                !rule.pattern.contains("\\b") || prefixes.iter().all(|p| is_ascii_word_byte(p[0]));
+            // **And the automaton is only asked about prefixes the rule's
+            // match begins at.** `still_alive` anchors at the candidate,
+            // so a prefix the match can only reach after earlier bytes is
+            // DEAD on arrival — see `rule_may_start_one_byte_before`,
+            // which
+            // measures it on `generic-secret-assignment`. Same refusal,
+            // same fallback, and for the same reason: an automaton that
+            // answers the wrong question is worse than no automaton.
+            let dfa = lemma_holds
+                .then(|| build_liveness(&rule.pattern))
+                .flatten()
+                .filter(|d| {
+                    !prefixes
+                        .iter()
+                        .any(|p| rule_may_start_one_byte_before(d, p))
+                });
+
+            for prefix in &prefixes {
                 total += 1;
                 by_first_byte
                     .entry(prefix[0].to_ascii_lowercase())
                     .or_default()
                     .push(Candidate {
-                        prefix,
+                        prefix: prefix.clone(),
                         rule: idx,
                         requires_word_boundary,
                     });
             }
+            liveness.push(dfa);
         }
         // Longest prefix first, so the most specific rule claims a
         // position when several share a first byte.
@@ -219,7 +510,63 @@ impl PrefixIndex {
         Self {
             by_first_byte,
             total,
+            liveness,
         }
+    }
+
+    /// Whether rule `rule` could still match if `region` grew — asked at
+    /// absolute position `at` within it (GH #142).
+    ///
+    /// This is the sharp form of *"every byte from the indexed prefix to
+    /// the end of the region could still belong to the value"*. The
+    /// byte-class test it replaces answers with a single range, which is
+    /// wrong in both directions at once: it holds runs no rule could ever
+    /// complete, and it releases the moment a control byte lands inside a
+    /// value that is genuinely still arriving.
+    ///
+    /// **Four things this gets right, each of which is a way to get it
+    /// wrong.**
+    ///
+    /// 1. **`next_eoi_state` is never called.** *"The haystack may
+    ///    grow"* is exactly *"do not walk end-of-input"*. Walking it asks
+    ///    whether the rule matches the bytes that have arrived, which for
+    ///    `ghp_` plus 39 of 40 characters answers DEAD — and releases the
+    ///    secret this function exists to hold.
+    /// 2. **The look-behind arrives by range, not by re-slicing.**
+    ///    `Input::range(at..)` lets the automaton read `region[at - 1]`
+    ///    when it decides the leading `\b`; handing it `&region[at..]`
+    ///    instead makes every candidate look like the start of the
+    ///    haystack, so `xghp_0123` reads as live when its `\b` forbids it.
+    /// 3. **A match is not the same question.** Liveness is stale the
+    ///    instant the rule matches, which is why the caller keeps its
+    ///    separate anchored-match test rather than folding it in here.
+    /// 4. **A quit state is ALIVE.** With the ASCII word boundary
+    ///    [`liveness_pattern`] installs there is no quit set and the arm
+    ///    is unreachable, but reading a quit as DEAD would release an
+    ///    in-flight secret the moment a glyph appeared near it, so the arm
+    ///    is written rather than assumed away.
+    fn still_alive(&self, rule: usize, region: &[u8], at: usize) -> bool {
+        let Some(dfa) = self.liveness.get(rule).and_then(Option::as_ref) else {
+            return region[at..].iter().all(|b| is_value_byte(*b));
+        };
+        let input = Input::new(region).range(at..).anchored(Anchored::Yes);
+        // `start_state_forward` fails on a quit byte in the look-behind
+        // (rule 4 above) or on an anchored-mode mismatch, which cannot
+        // happen here — [`build_liveness`] sets `StartKind::Anchored` and
+        // the input above asks for `Anchored::Yes`. Both go the same way.
+        let Ok(mut sid) = dfa.start_state_forward(&input) else {
+            return true;
+        };
+        for byte in &region[at..] {
+            sid = dfa.next_state(sid, *byte);
+            if dfa.is_dead_state(sid) {
+                return false;
+            }
+            if dfa.is_quit_state(sid) {
+                return true;
+            }
+        }
+        true
     }
 
     pub fn len(&self) -> usize {
@@ -255,13 +602,41 @@ impl PrefixIndex {
     /// 1. an indexed prefix matches there and **at least one** value byte
     ///    has arrived after it — a bare `ghp_` carries no secret material
     ///    and is not withheld;
-    /// 2. every byte from the prefix to the end of the region could still
-    ///    belong to the value, so `ghp_abc def` (a space arrived) is not a
-    ///    token in flight and releases immediately;
+    /// 2. the rule could still match if more bytes arrived
+    ///    ([`Self::still_alive`]), so `ghp_abc def` is not a token in
+    ///    flight and neither is `parsing key-value` — `v` is not a hex
+    ///    digit and `\bkey-[a-f0-9]{32}` can never reach it (GH #142);
     /// 3. the rule's own anchored regex does **not** match yet. Once the
     ///    whole token has landed the redactor covers it, so there is
     ///    nothing left to withhold. Using the rule's own regex is what
     ///    keeps this test from drifting away from the rule.
+    ///
+    /// **Two rule classes keep the old byte-class test on this — the
+    /// raw — stream, and the second of them is why GH #152 stays open.**
+    /// A `binary` rule opts out of condition 2 entirely, as before: a PEM
+    /// body's newlines defeat any value-run test at every line. And the
+    /// nine `has_value_group` context rules keep [`is_value_byte`],
+    /// because their patterns legitimately admit whitespace between the
+    /// label and the value — so liveness reports `Password: ` alive, and
+    /// a candidate that can still grow never dies at the end of a region
+    /// that has stopped growing. Measured against the automaton
+    /// [`PrefixIndex::build`] would install: driven from the `P` of
+    /// `"$ ssh dev@box\r\nPassword: "` it is ALIVE, `earliest_partial`
+    /// goes `None` -> `Some(15)`, `read_output` returns only the first
+    /// line with `held_back: true`, `prompt.last_line` becomes `""`, and
+    /// three shipped pty fixtures hang. A shell sitting at a password
+    /// prompt is the most common state this tool exists to handle.
+    ///
+    /// **Removing the carve-out is no longer sufficient to reintroduce
+    /// that, and #152 should not read it as sufficient to *fix* the
+    /// issue either.** `build` refuses `generic-secret-assignment` and
+    /// `secret-key-assignment` an automaton on separate grounds — their
+    /// declared prefixes sit inside their own match, see
+    /// [`rule_may_start_one_byte_before`] — so those two fall back to
+    /// [`is_value_byte`] however this branch is spelled. Measured on this
+    /// tree, `still_alive(generic-secret-assignment, …, 15)` is `false`.
+    /// #152 asks for a narrower widening of the *byte class*; the
+    /// coupling is recorded there rather than guessed at here.
     pub fn earliest_partial(
         &self,
         rules: &RuleSet,
@@ -292,7 +667,14 @@ impl PrefixIndex {
                     continue;
                 }
                 let rule = &rules.rules[candidate.rule];
-                if !rule.binary && !region[value_start..].iter().all(|b| is_value_byte(*b)) {
+                let in_flight = if rule.binary {
+                    true
+                } else if rule.has_value_group {
+                    region[value_start..].iter().all(|b| is_value_byte(*b))
+                } else {
+                    self.still_alive(candidate.rule, region, i)
+                };
+                if !in_flight {
                     continue;
                 }
                 if rule.anchored.is_match(&region[i..]) {
@@ -360,10 +742,17 @@ impl PrefixIndex {
 /// be *interior* to a non-`binary` rule's value, or `None` when `region`
 /// ends on a byte no such value may contain.
 ///
-/// The delimiter test is [`is_value_byte`] — the same one
-/// [`PrefixIndex::earliest_partial`] uses to decide that a candidate is
-/// still in flight — so one notion of "what a value may contain" serves
-/// both, and narrowing it later narrows both together.
+/// The delimiter test is [`is_value_byte`], which
+/// [`PrefixIndex::earliest_partial`] shared until GH #142 and now keeps
+/// for the `has_value_group` context rules and for any rule `build`
+/// refused an automaton. **The two notions have
+/// parted, deliberately**: this function takes a region and no rule, so
+/// there is no automaton to drive and nothing sharper to ask. Narrowing
+/// the in-flight predicate therefore did *not* narrow this one, and the
+/// GH #14 half of [`PrefixIndex::unresolved_from`] is untouched by it —
+/// widening `is_value_byte` here is also what GH #152 must not do, since
+/// it takes `trailing_value_run_start(b"   Compiling holdfast-core\n")`
+/// from `None` to `Some(0)`.
 pub fn trailing_value_run_start(region: &[u8]) -> Option<usize> {
     let mut i = region.len();
     while i > 0 && is_value_byte(region[i - 1]) {
@@ -491,27 +880,40 @@ mod tests {
         // The first candidate is followed by a space, so only the second
         // is genuinely in flight.
         assert_eq!(index.earliest_partial(&rules, region, 100), Some(108));
-        // With no space, the earlier one qualifies and wins.
+        // **Re-pinned deliberately for GH #142**, from `Some(100)`.
+        // `earliest_partial`'s continuation test used to be *printable
+        // and not a space*, which `sk-ant-xy` satisfies, so `ghp_` read
+        // as a GitHub token still arriving. It never was one:
+        // `\bghp_[0-9A-Za-z]{36,}` cannot reach a `-`, and the rule's own
+        // automaton says so. `sk-ant-` sits mid-word behind a `c` and its
+        // `\b` forbids it. **The new expectation is that nothing here is
+        // in flight at all** — not that a different candidate wins.
         let region = b"ghp_abcsk-ant-xy";
-        assert_eq!(index.earliest_partial(&rules, region, 100), Some(100));
+        assert_eq!(index.earliest_partial(&rules, region, 100), None);
 
         // …and now the ordering itself, which neither case above pins.
         // Measured: reversing the candidate loop (`.enumerate().rev()`)
         // leaves the **whole workspace** green against the two fixtures
-        // above, because each of them has exactly one candidate that
+        // above, because each of them has at most one candidate that
         // qualifies — in the first the space kills `ghp_`, and in the
-        // second `sk-ant-` sits mid-word behind a `c` and its rule's `\b`
-        // forbids it. A scan that walks backwards answers both
-        // identically, so "earliest" was a claim in the name only.
+        // second nothing qualifies at all. A scan that walks backwards
+        // answers both identically, so "earliest" was a claim in the name
+        // only.
         //
-        // This fixture separates the two directions: `/` is a word
-        // boundary *and* a legal value byte, so `ghp_` and `sk-ant-` both
-        // qualify at the same time and only a left-to-right scan reports
-        // the first one.
-        let region = b"ghp_abc/sk-ant-xy";
+        // This fixture separates the two directions, and its shape is
+        // GH #142's doing as well: the `/` the original used is a legal
+        // value byte but not a legal *continuation* of a GitHub token, so
+        // under liveness only one candidate survived it and the row
+        // stopped separating anything. `password` is alphanumeric, so
+        // `\bghp_[0-9A-Za-z]{36,}` is genuinely still able to match
+        // across it, while `password` is `generic-secret-assignment`'s
+        // own declared prefix and qualifies on its own account. Both are
+        // in flight at the same instant and only a left-to-right scan
+        // reports the first.
+        let region = b"ghp_passwordX";
         assert_eq!(
-            index.earliest_partial(&rules, &region[7..], 107),
-            Some(108),
+            index.earliest_partial(&rules, &region[4..], 104),
+            Some(104),
             "the later candidate must qualify on its own, or the assertion \
              below separates earliest-from-nothing rather than earliest-from-latest"
         );
@@ -840,19 +1242,26 @@ mod tests {
     /// The measured residual, pinned so it is visible rather than assumed
     /// absent. Each of these is a *legitimate* in-flight candidate — the
     /// rule really could still complete — and each releases the moment a
-    /// byte arrives that the value cannot contain. Narrowing them needs
-    /// the scanner to test continuation against the rule's own value class
-    /// (`\bkey-[a-f0-9]` rejects `key-v`) rather than the generic
-    /// printable-byte test; that is a follow-up, not a 0.0.3 change.
+    /// byte arrives that the value cannot contain.
     ///
-    /// This test exists so that follow-up has to update it deliberately.
+    /// **The follow-up this test was written to force has landed, and one
+    /// row has moved (GH #142).** The 0.0.3 note said narrowing these
+    /// needed "the scanner to test continuation against the rule's own
+    /// value class (`\bkey-[a-f0-9]` rejects `key-v`) rather than the
+    /// generic printable-byte test"; that is now exactly what
+    /// [`PrefixIndex::still_alive`] does, and `parsing key-value` has
+    /// moved from the residual to
+    /// `the_holdbacks_that_liveness_retired`. The two rows left are the
+    /// two the change does **not** reach: `re_exports` really is a live
+    /// `\bre_[A-Za-z0-9_]{24,}` prefix, and `$POWERSYNC_` belongs to a
+    /// `has_value_group` context rule, which keeps the byte-class test on
+    /// the raw stream (GH #152).
     #[test]
     fn the_known_transient_holdbacks_are_pinned() {
         let rules = RuleSet::builtin().unwrap();
         let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
         for text in [
             "use crate::re_exports", // resend `\bre_`
-            "parsing key-value",     // mailgun `\bkey-`
             "$ echo $POWERSYNC_",    // powersync context rule
         ] {
             assert!(
@@ -867,5 +1276,498 @@ mod tests {
                 "the candidate must die as soon as a space arrives: {released:?}"
             );
         }
+    }
+
+    /// The other half of the row above: what GH #142's predicate
+    /// **stopped** withholding, pinned so it cannot silently come back.
+    ///
+    /// Each of these was held by the byte-class test and released by
+    /// nothing until a delimiter arrived, and none was ever a credential:
+    /// `\bkey-[a-f0-9]{32}` cannot reach the `v` of `value` or the `m` of
+    /// `manager`, and `launchdarkly-key`'s `sdk-` wants a hex UUID and
+    /// cannot reach the `g` of `gateway`. The npm shapes are the ones
+    /// that matter in practice — a progress line ending in an escape with
+    /// no newline after it — and
+    /// `ordinary_output_ending_in_an_escape_sequence_is_not_held_back`
+    /// covers that end to end.
+    ///
+    /// **Each row is checked for being a candidate at all before it is
+    /// checked for being released.** A row whose text forms no candidate
+    /// answers `None` whatever the predicate does — it was green before
+    /// this work and it would be green against a revert — and this test's
+    /// first draft shipped one (`api-gateway`, whose `api-` alternative
+    /// `launchdarkly-key` does not index).
+    #[test]
+    fn the_holdbacks_that_liveness_retired() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        for (text, live) in [
+            // mailgun `\bkey-`, and `v` is not a hex digit
+            ("parsing key-value", "parsing key-0123"),
+            // the same rule, the real shape
+            ("npm WARN @acme/key-manager", "npm WARN @acme/key-0123abcd"),
+            // launchdarkly `\bsdk-`, which wants a hex UUID
+            ("npm WARN @acme/sdk-gateway", "npm WARN @acme/sdk-0123abcd"),
+        ] {
+            assert!(
+                index.earliest_partial(&rules, live.as_bytes(), 0).is_some(),
+                "{live:?} must form a candidate, or {text:?} tests nothing"
+            );
+            assert_eq!(
+                index.earliest_partial(&rules, text.as_bytes(), 0),
+                None,
+                "no rule can still match {text:?}, so nothing is in flight"
+            );
+        }
+    }
+
+    /// **A shell sitting at a password prompt must hand over the prompt
+    /// (GH #142, GH #152).**
+    ///
+    /// This is the row the `has_value_group` carve-out exists for, and
+    /// the suite has never had it. `generic-secret-assignment`'s
+    /// `["'\s]*[:=]\s*` legitimately admits the trailing space, so an
+    /// automaton for it is alive here while the region has stopped
+    /// growing: `earliest_partial` would go `None` -> `Some(15)`,
+    /// `read_output` would return `"$ ssh dev@box\r\n"` with
+    /// `held_back: true`, `safe_last_line` would return `""` through its
+    /// case-2 gate, and `echo_off_prompts_with_and_without_canonical_mode`,
+    /// `matrix_row_getpass_is_awaiting_secret_with_no_bracketed_paste_history`
+    /// and `matrix_row_bash_read_s_is_awaiting_secret_and_flags_a_write`
+    /// would all fail on their 20-second deadlines.
+    ///
+    /// **Two things now stand between this row and that, not one.** The
+    /// carve-out is the first; the second is that `PrefixIndex::build`
+    /// refuses this rule an automaton at all, because its declared
+    /// prefixes sit inside its own match
+    /// ([`rule_may_start_one_byte_before`]). Removing the carve-out alone
+    /// leaves the row green, which is the safe direction and also a trap
+    /// for GH #152: the fix it needs is a sharper byte class, not a
+    /// re-routing.
+    ///
+    /// The second row is the same defect **still open on `main`**, kept
+    /// visible rather than assumed absent: with no trailing space the `:`
+    /// is inside `0x21..=0x7e`, so the byte-class test holds nine bytes
+    /// permanently. The three pty fixtures miss it only because all three
+    /// of their prompts happen to end in a space. GH #152 owns it.
+    #[test]
+    fn a_password_prompt_at_head_is_not_withheld() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let at_prompt = b"$ ssh dev@box\r\nPassword: ";
+        assert!(
+            index
+                .prefixes_for(&rules, "generic-secret-assignment")
+                .contains(&b"password".to_vec()),
+            "the premise: `password` is an indexed prefix, so the line really \
+             does offer the scanner a candidate"
+        );
+        assert_eq!(
+            index.earliest_partial(&rules, at_prompt, 0),
+            None,
+            "a password prompt is not a credential in flight"
+        );
+        // The pre-existing defect, pinned rather than fixed here.
+        assert_eq!(
+            index.earliest_partial(&rules, b"$ ssh dev@box\r\nEnter password:", 0),
+            Some(21),
+            "GH #152: with no trailing space the `:` keeps the byte-class \
+             run alive, so the last nine bytes are withheld permanently"
+        );
+    }
+
+    /// User rules shaped to break the GH #142 liveness engine rather than
+    /// to exercise it: an **interior** word boundary (the shipped set has
+    /// one only on the context rules), a `\B` (the shipped set has none
+    /// at all), an escaped backslash immediately before a `b` (which a
+    /// `str::replace` rewrite corrupts), and a case-folded pattern.
+    ///
+    /// REQ-O-006 puts `extra_redaction_patterns` through every mechanism
+    /// this work adds — the automaton and the two refusals that guard it
+    /// — and the shipped fifty-one cannot supply that coverage, so these
+    /// do.
+    const ADVERSARIAL_USER_RULES: &str = r#"
+        [[rule]]
+        name = "acme-interior-boundary"
+        kind = "acme-internal"
+        pattern = '''\bACMEIB-[A-Z]{4}\b-[0-9]{8}'''
+        positive = ["ACMEIB-ABCD-01234567"]
+        negative = ["ACMEIB-ABCD"]
+
+        [[rule]]
+        name = "acme-negated-boundary"
+        kind = "acme-internal"
+        pattern = '''\bACMENB-[A-Z0-9]{6}\B[0-9]{6}'''
+        positive = ["ACMENB-ABCDEF123456"]
+        negative = ["ACMENB-ABCDEF"]
+
+        [[rule]]
+        name = "acme-escaped-backslash"
+        kind = "acme-internal"
+        pattern = '''\bACMEESC-\\bkey[0-9]{8}'''
+        positive = ['''ACMEESC-\bkey12345678''']
+        negative = ["ACMEESC-bkey12345678"]
+
+        [[rule]]
+        name = "acme-non-word-prefix"
+        kind = "acme-internal"
+        pattern = '''\b(?:-zq-|-zr-)[A-Za-z0-9]{10,}'''
+        prefixes = ["-zq-", "-zr-"]
+        positive = ["-zq-ABCDEFGHIJ"]
+        negative = ["-zq-ABC"]
+
+        [[rule]]
+        name = "acme-folded"
+        kind = "acme-internal"
+        pattern = '''(?i)\bacmefold_[a-z0-9]{20,}'''
+        positive = ["ACMEFOLD_abcdefghij0123456789"]
+        negative = ["acmefold_short"]
+    "#;
+
+    /// The span of `positive` that `rule` actually matches — the haystack
+    /// a liveness drive is entitled to be asked about. A rule's example
+    /// carries its context (`export DB_PASSWORD=hunter2hunter2`), and
+    /// driving from the `e` of `export` would ask a different question.
+    fn matched_span<'a>(rule: &super::super::rules::CompiledRule, positive: &'a str) -> &'a str {
+        let m = rule
+            .regex
+            .find(positive.as_bytes())
+            .unwrap_or_else(|| panic!("{}: its own positive example must match", rule.name));
+        &positive[m.start()..m.end()]
+    }
+
+    /// GH #142's engine: which rules get a liveness automaton and which
+    /// are refused one, and the two structural facts that make the ASCII
+    /// word boundary sound.
+    ///
+    /// **Why `(?-u:\b)` and not `\b`.** With the Unicode spelling the DFA
+    /// carries a quit set over every byte ≥ 0x80, a quit must be read as
+    /// ALIVE, and the predicate then holds back any output with a glyph
+    /// in it — measurably worse than the byte-class test it replaces, and
+    /// it fails `redaction_sweep`'s reached-rows floor. The rewrite
+    /// deletes the quit set outright.
+    ///
+    /// The soundness of that rewrite rests on *one side of every leading
+    /// boundary being an ASCII word byte*, which is a property of the
+    /// rules rather than of the engine — so it is asserted here, over
+    /// user rules as well, rather than assumed.
+    #[test]
+    fn the_liveness_automata_and_the_refusals_are_both_pinned() {
+        let rules = RuleSet::builtin_with_extra(ADVERSARIAL_USER_RULES).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        assert_eq!(index.liveness.len(), rules.rules.len());
+        assert!(rules.rules.len() >= 51, "{} rules", rules.rules.len());
+
+        // 1. Every rule builds except those `build` refuses on purpose,
+        //    each of which keeps `is_value_byte`: the `\B` (no
+        //    over-approximation argument), the punctuation-opening prefix
+        //    (the leading-boundary lemma), and the two context rules
+        //    whose match can begin before their own prefix.
+        let unbuilt: Vec<&str> = rules
+            .rules
+            .iter()
+            .zip(&index.liveness)
+            .filter(|(_, dfa)| dfa.is_none())
+            .map(|(r, _)| r.name.as_str())
+            .collect();
+        assert_eq!(
+            unbuilt,
+            vec![
+                "secret-key-assignment",
+                "generic-secret-assignment",
+                "acme-negated-boundary",
+                "acme-non-word-prefix"
+            ],
+            "a rule with no automaton silently falls back to the byte-class \
+             test, so the set of them is pinned rather than counted"
+        );
+
+        // **The refusal above is a leak that would otherwise be shipped,
+        // so it is asserted on behaviour and not only on the list.**
+        // `\b` holds between `é` (a Unicode word character) and `-`; the
+        // ASCII rewrite sees `0xa9` and `-` as both non-word and says it
+        // does not, so an automaton for this rule would report a value
+        // half-arrived as DEAD and release it — where the byte-class test
+        // this work replaces held it. The offset is the `-` of `-zq-`,
+        // which is 2 — immediately past a two-byte `é`.
+        let idx = rules
+            .rules
+            .iter()
+            .position(|r| r.name == "acme-non-word-prefix")
+            .expect("the fixture rule is in the set");
+        assert!(
+            rules.rules[idx]
+                .regex
+                .is_match("é-zq-ABCDEFGHIJ".as_bytes()),
+            "the premise: this rule really can still match from that prefix"
+        );
+        assert_eq!(
+            index.earliest_partial(&rules, "é-zq-ABCD".as_bytes(), 0),
+            Some(2),
+            "a value still arriving behind a non-ASCII byte must not be \
+             released just because the ASCII word boundary cannot see it"
+        );
+
+        // 2. **The soundness lemma, as a property of the index rather
+        //    than of the shipped rule file.** Every indexed prefix a
+        //    liveness automaton will be driven from starts with an ASCII
+        //    word byte, so `(?-u:\b)` over-approximates `\b` at the only
+        //    boundary whose other side the input supplies.
+        //    `PrefixIndex::build` makes that true by refusing an automaton
+        //    to a rule that breaks it, so this is a check on the refusal
+        //    rather than a hope about the rules. `private-key-block` is
+        //    the sole *shipped* prefix that opens on punctuation, and its
+        //    pattern has no `\b` at all.
+        let mut pairs = 0usize;
+        for bucket in index.by_first_byte.values() {
+            for candidate in bucket {
+                pairs += 1;
+                let rule = &rules.rules[candidate.rule];
+                if index.liveness[candidate.rule].is_none() || !rule.pattern.contains(r"\b") {
+                    continue;
+                }
+                let first = candidate.prefix[0];
+                assert!(
+                    is_ascii_word_byte(first),
+                    "{}: prefix {:?} starts on a non-word byte, so the ASCII \
+                     word boundary is no longer an over-approximation of the \
+                     rule's own `\\b`",
+                    rule.name,
+                    String::from_utf8_lossy(&candidate.prefix)
+                );
+                // 3. …and the pair is not structurally dead: some byte
+                //    keeps it alive, or its holdback could never engage.
+                let alive = (0u8..=0xff).any(|b| {
+                    let mut region = candidate.prefix.clone();
+                    region.push(b);
+                    index.still_alive(candidate.rule, &region, 0)
+                });
+                assert!(
+                    alive,
+                    "{}: no continuation byte keeps prefix {:?} alive",
+                    rule.name,
+                    String::from_utf8_lossy(&candidate.prefix)
+                );
+            }
+        }
+        assert!(pairs >= 100, "only {pairs} (rule, prefix) pairs judged");
+    }
+
+    /// **A prefix the rule's match can only reach after earlier bytes
+    /// gets no automaton (GH #142).**
+    ///
+    /// [`PrefixIndex::still_alive`] anchors the pattern at the candidate,
+    /// so it answers *"can this rule match starting here"*. For a
+    /// declared prefix that sits *inside* its own match that is the wrong
+    /// question and it answers in the releasing direction. The first two
+    /// assertions are the reproduction, driven against the automaton
+    /// `PrefixIndex::build` would have installed; the third is the
+    /// refusal that makes it unreachable.
+    ///
+    /// **Latent today and pinned anyway.** `generic-secret-assignment`
+    /// has a `value` capture group, so `earliest_partial` keeps it on
+    /// [`is_value_byte`] for an unrelated reason (GH #152) and never asks
+    /// the automaton. #152's fix is exactly the change that would start
+    /// asking, which is why the refusal lives in `build` and not in a
+    /// comment on `earliest_partial`.
+    #[test]
+    fn a_prefix_the_rule_reaches_only_after_earlier_bytes_gets_no_automaton() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let idx = rules
+            .rules
+            .iter()
+            .position(|r| r.name == "generic-secret-assignment")
+            .expect("the rule is shipped");
+        let region = b"MY_APP_PASSWORD=hunter2hunter2";
+        // `password` is one of its declared prefixes and sits at 7.
+        assert!(
+            index
+                .prefixes_for(&rules, "generic-secret-assignment")
+                .iter()
+                .any(|p| p == b"password"),
+            "the premise: `password` is indexed, at offset 7 of the fixture"
+        );
+
+        // 1. The premise: the rule really does match the whole region —
+        //    from offset 0, because `[a-z0-9_.-]{0,32}` takes `MY_APP_`.
+        assert!(
+            rules.rules[idx].regex.is_match(region),
+            "the premise: an ordinary env-var line this rule matches"
+        );
+
+        // 2. The reproduction, against the automaton that would have been
+        //    installed. Anchored at 7 the leading `\b` sits between the
+        //    `_` at 6 and the `P` at 7 — two word bytes, so it cannot
+        //    hold, and the rule is DEAD on arrival at its own prefix.
+        let dfa = build_liveness(&rules.rules[idx].pattern)
+            .expect("the pattern itself compiles; it is the anchoring that is wrong");
+        let input = Input::new(region).range(7..).anchored(Anchored::Yes);
+        let mut sid = dfa
+            .start_state_forward(&input)
+            .expect("no quit set, so the look-behind is readable");
+        let mut died = false;
+        for byte in &region[7..] {
+            sid = dfa.next_state(sid, *byte);
+            if dfa.is_dead_state(sid) {
+                died = true;
+                break;
+            }
+        }
+        assert!(
+            died,
+            "the reproduction is stale: this automaton no longer calls a \
+             matching region dead when anchored at its interior prefix"
+        );
+
+        // 3. The fix: `build` refuses it the automaton, so `still_alive`
+        //    falls back to `is_value_byte` — which holds the region, the
+        //    safe direction and what `11df4d0` does.
+        assert!(
+            index.liveness[idx].is_none(),
+            "a rule whose match can begin before its own indexed prefix \
+             must get no automaton"
+        );
+        assert!(
+            index.still_alive(idx, region, 7),
+            "with no automaton the byte-class fallback must hold, not release"
+        );
+
+        // 4. …and the refusal separates the two families rather than
+        //    catching everything. `launchdarkly-key` also declares its
+        //    prefixes and also derives none, and its match *does* begin
+        //    at them.
+        let ld = rules
+            .rules
+            .iter()
+            .position(|r| r.name == "launchdarkly-key")
+            .expect("the rule is shipped");
+        assert!(
+            index.liveness[ld].is_some(),
+            "a declared prefix the match begins at must keep its automaton, \
+             or the check is a ban on declared prefixes"
+        );
+    }
+
+    /// The rewrite reads the pattern rather than scanning it for a
+    /// substring, and refuses what it cannot argue about.
+    ///
+    /// Row two is the one that matters: `str::replace("\\b", …)` — which
+    /// is the obvious spelling — turns an escaped backslash followed by a
+    /// literal `b` into a word boundary, and the liveness automaton then
+    /// answers about a pattern the matcher never had.
+    #[test]
+    fn the_liveness_rewrite_is_escape_aware() {
+        assert_eq!(
+            liveness_pattern(r"\bghp_[0-9A-Za-z]{36,}").as_deref(),
+            Some(r"(?-u:\b)ghp_[0-9A-Za-z]{36,}")
+        );
+        assert_eq!(
+            liveness_pattern(r"\bACMEESC-\\bkey[0-9]{8}").as_deref(),
+            Some(r"(?-u:\b)ACMEESC-\\bkey[0-9]{8}"),
+            "the escaped backslash's `b` is a literal, not a boundary"
+        );
+        assert_eq!(
+            liveness_pattern(r"(?i)\bcloudflare[a-z]{0,4}(?:token|key)\b[:=]").as_deref(),
+            Some(r"(?i)(?-u:\b)cloudflare[a-z]{0,4}(?:token|key)(?-u:\b)[:=]"),
+            "an interior boundary is rewritten too"
+        );
+        assert_eq!(
+            liveness_pattern(r"\bacme[0-9]{4}\B[a-z]{4}"),
+            None,
+            "`\\B` inverts the comparison, so no automaton is built for it"
+        );
+    }
+
+    /// **The mutation this file exists to catch.** A rule that is
+    /// genuinely still able to match must never be reported dead, and the
+    /// way to get that wrong is to walk end-of-input: `next_eoi_state`
+    /// asks *"does this match the bytes that arrived"*, which for a token
+    /// one character short of its minimum answers no — and releases it.
+    ///
+    /// Driven constructively rather than by fixture. Every truncation of
+    /// every rule's **own** positive example is alive by construction:
+    /// the rest of that example is a continuation that completes it. The
+    /// look-behind is `…` (U+2026, three non-ASCII bytes and not a word
+    /// character either way), which is the shape a Unicode `\b` would
+    /// answer `MatchError(Quit)` for.
+    ///
+    /// **It does not pin the quit arms, and saying so is the point.**
+    /// `build_liveness` sets `unicode_word_boundary(false)` and
+    /// `liveness_pattern` removes the last Unicode `\b`, so no automaton
+    /// here has a quit set and inverting both arms of `still_alive`
+    /// leaves every row in this file green — measured. The arms are
+    /// written for a future rule that reintroduces one, and they are
+    /// unguarded until it does.
+    #[test]
+    fn a_truncated_match_is_alive_behind_a_non_ascii_look_behind() {
+        let rules = RuleSet::builtin_with_extra(ADVERSARIAL_USER_RULES).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let lead = "…".as_bytes();
+        let mut checked = 0usize;
+        for (idx, rule) in rules.rules.iter().enumerate() {
+            if index.liveness[idx].is_none() {
+                continue;
+            }
+            for positive in &rule.positive {
+                let span = matched_span(rule, positive);
+                for take in 1..=span.len() {
+                    if !span.is_char_boundary(take) {
+                        continue;
+                    }
+                    let mut region = lead.to_vec();
+                    region.extend_from_slice(&span.as_bytes()[..take]);
+                    assert!(
+                        index.still_alive(idx, &region, lead.len()),
+                        "{}: {:?} can still become {span:?} and was called dead",
+                        rule.name,
+                        &span[..take]
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 2_000, "only {checked} truncations judged");
+    }
+
+    /// The other direction, and the mutation it catches: the look-behind
+    /// byte must reach the automaton by **range**, not by re-slicing the
+    /// region. `Input::new(&region[at..])` makes every candidate look like
+    /// the start of the haystack, where a `\b` always holds — so a rule
+    /// whose pattern forbids a mid-word match would be held open on text
+    /// it can never match.
+    #[test]
+    fn a_candidate_sitting_mid_word_is_dead_for_a_word_boundary_rule() {
+        let rules = RuleSet::builtin_with_extra(ADVERSARIAL_USER_RULES).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let mut checked = 0usize;
+        for (idx, rule) in rules.rules.iter().enumerate() {
+            if index.liveness[idx].is_none() || !starts_with_word_boundary(&rule.pattern) {
+                continue;
+            }
+            for positive in &rule.positive {
+                let span = matched_span(rule, positive);
+                let mut region = b"x".to_vec();
+                region.extend_from_slice(span.as_bytes());
+                assert!(
+                    !index.still_alive(idx, &region, 1),
+                    "{}: {span:?} behind a word byte can never satisfy its own \
+                     `\\b`, so the look-behind did not reach the automaton",
+                    rule.name
+                );
+                // The same bytes at a real boundary stay alive, so the row
+                // separates "the look-behind was read" from "everything is
+                // dead".
+                let mut ok = b" ".to_vec();
+                ok.extend_from_slice(span.as_bytes());
+                assert!(
+                    index.still_alive(idx, &ok, 1),
+                    "{}: {span:?} at a boundary must be alive",
+                    rule.name
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 40, "only {checked} rules judged");
     }
 }

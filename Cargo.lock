@@ -496,6 +496,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "regex",
+ "regex-automata",
  "rmcp",
  "schemars",
  "serde",
