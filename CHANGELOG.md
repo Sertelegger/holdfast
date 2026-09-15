@@ -301,6 +301,86 @@ is cut, named and published is in
 
 ### Fixed
 
+- **The `binary` arm of the in-flight test asks the rule as well, so a
+  certificate no longer pins the holdback for the rest of the session
+  ([#166]'s precondition — on its own it closes no leak).**
+  `earliest_partial`'s `binary` arm was an unconditional `true`.
+  `private-key-block` is the whole of that class, a PEM body's newlines defeat
+  `is_value_byte` at every line, and until [#142] there was nothing sharper to
+  ask — but an unconditional `true` is not the conservative reading of *is this
+  secret still arriving*, it is the absence of the question. Condition 3 then
+  asks only *has this rule matched*, never *can it still match*, so
+  `-----BEGIN CERTIFICATE-----` — which matches the rule's indexed prefix and
+  is that rule's own shipped `negative` example — held `holdback_boundary` at
+  its anchor for as long as those bytes stayed in the scan window, past
+  `-----END CERTIFICATE-----` and past every ordinary line printed after it.
+  The arm now asks the automaton, through a `binary`-specific predicate rather
+  than `still_alive`, and keeps the unconditional hold where
+  `PrefixIndex::build` refused the rule one: `is_value_byte` is not a usable
+  fallback for a `binary` rule the way it is for every other one, because it
+  calls a key dead on its second line.
+
+  **A dead state is believed only when it was reached on bytes every emitted
+  view reproduces verbatim, and that guard is not decoration.** Without it this
+  change *releases key material*, measured: `-----BEGIN RSA PRIVATE KEY-----`,
+  forty lines of body, **one `0x9b`** in the middle of it and no `-----END`
+  yet — `earliest_partial` goes `Some(0)` to `None` and the body already
+  arrived goes out in the clear. `[\s\S]` is a *codepoint* class, so a lone C1
+  byte puts the automaton in a dead state; the same class keeps `rule.regex`
+  from matching the raw bytes, so `find_spans` covers nothing either and there
+  is no marker and no audit entry. What does cover those bytes is `all_spans`
+  over the normalised views ([#135], [#139]) — and only once `-----END` lands.
+  `holdback_boundary` reads the raw region and nothing else by design, which
+  was harmless while this arm was a constant no raw byte could change and stops
+  being harmless the moment a raw byte can release. An ANSI escape in the
+  label, a tab the rendered grid expands into the spaces `[ A-Z]` accepts, and
+  a `\r` that puts the rendered row in a different order are the same failure
+  by three further routes. So the walk stops at the first byte outside
+  printable ASCII and `\n` and answers *in flight*. A certificate is unaffected:
+  it dies on the `-` after a plain-ASCII label, 27 bytes in, before any of that.
+
+  **The narrowing is per anchor, not per region, which is what makes it safe.**
+  A dead state is the statement *no arriving byte can produce a match from
+  here*, about one rule at one offset. A combined PEM — the certificate
+  followed by its key, which is what an haproxy bundle is — carries two
+  anchors, and `earliest_partial` walks left to right and returns the first
+  *qualifying* one: the certificate's bytes go out, and the boundary lands on
+  the key's own `-----BEGIN`.
+
+  **Measured, as the share of 512-byte read boundaries at which a candidate
+  judged over the whole buffer holds, before → after:** a synthetic
+  three-certificate bundle `100.0 % → 0.0 %`; a 3.3 KB RSA key still streaming
+  `100.0 % → 100.0 %`, which is the half that must not move;
+  this file plus `README.md` **as they stood before this entry was written**
+  `0.7 % → 0.7 %` and an 853 KiB `cargo build -vv` log `0.0 % → 0.0 %`,
+  neither containing a `-----BEGIN` at all, so neither reaches this arm;
+  `holdfast-core/src/**/*.rs` `94.2 % → 52.0 %`. The qualification on the
+  prose row is not pedantry — this entry put four `-----BEGIN` anchors into
+  the file, and the corpus that results is held at **88.5 %** of its
+  boundaries by the old arm and **87.3 %** by the new one, the difference
+  being that the old one stops at the certificate and the new one stops 842
+  bytes later at the private key.
+
+  **A real certificate does not reach this today, and that is the point of
+  landing it first.** At `partial_secret_scan_bytes`' 512 bytes the
+  `-----BEGIN` anchor falls out of the scanned region long before
+  `-----END CERTIFICATE-----` arrives, so the permanent hold is prevented by
+  accident; [#166] is about widening that region for `binary` rules, which
+  removes the accident. The rows added here are therefore asserted over
+  regions far wider than 512, per §9.2: *"If the fixture fits inside one unit,
+  it is not testing this rule."*
+
+  **One release is a behaviour change rather than a narrowing, and it is
+  stated rather than left to be found.** A PEM header this rule cannot match
+  at all — `-----begin rsa private key-----`, which RFC 7468 does not permit
+  and which `find_spans` would never have redacted, because the pattern is
+  case-sensitive while the prefix index is not — was held for ever and is now
+  released. Nothing the redactor could ever have covered changes hands: that
+  hold was a strand and not a protection, and it would have ended at
+  `read_output(redact: false)` in any case. A permanent hold on a key the rule
+  *can* match is unchanged and deliberate — REQ-O-005: *"Quiescence does not
+  release the holdback."*
+
 - **The in-flight test the holdback rests on asks the rule, not a byte range
   ([#142] — narrowed, and *not* closed).** `earliest_partial`'s continuation
   test — *"every byte from the indexed prefix to the end of the region could
@@ -312,9 +392,10 @@ is cut, named and published is in
   match if more bytes arrived*. **Not every rule, and the exceptions are
   checked rather than listed**: 49 of the 51 build one and keep it, two are
   refused for the reason in the paragraph below, and of the 49 keepers the
-  seven remaining `has_value_group` context rules and the single `binary` rule
-  are never asked it — so the predicate decides 41 of the 51. A rule that is
-  refused, or never asked, keeps the behaviour it has today.
+  seven remaining `has_value_group` context rules are never asked it — so the
+  predicate decides 42 of the 51, the one `binary` rule among them by way of
+  the [#166] entry below. A rule that is refused, or never asked, keeps the
+  behaviour it has today.
 
   **What it buys is the false holds, and the honest summary is that it is a
   small number.** `parsing key-value`, `npm WARN @acme/key-manager` and
@@ -995,3 +1076,4 @@ residuals that are known and accepted.
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
+[#166]: https://github.com/Sertelegger/holdfast/issues/166
