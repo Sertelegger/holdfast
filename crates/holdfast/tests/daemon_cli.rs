@@ -12,11 +12,26 @@
 //! rather than defensive habit. These tests drive processes that can
 //! stop answering without dying — a shim whose daemon accepted the
 //! connection and never replied, a `holdfast logs` parked in `call_raw`,
-//! which has no timeout of its own. The workspace has no `nextest.toml`
-//! and no per-test harness timeout, so a mutation that turns a reply
-//! into silence would hang CI rather than redden it, and a hung job
+//! which has no timeout of its own. A mutation that turns a reply into
+//! silence should redden the build rather than hang it, and a hung job
 //! looks like an infrastructure problem for as long as it takes someone
 //! to read the logs.
+//!
+//! **The reason this used to give — "the workspace has no
+//! `nextest.toml` and no per-test harness timeout" — is no longer
+//! true, and it is corrected rather than left**, because a stale reason
+//! is how a discipline gets dropped by the next person who checks it.
+//! `.config/nextest.toml` landed in #93 with `slow-timeout = { period =
+//! "60s", terminate-after = 5 }`. `tests/worker_protocol.rs` has
+//! already settled what that changes: *"a hang is now named at 300 s
+//! instead of taking the job down anonymously. That changes what a hang
+//! costs, not whether one is acceptable."* Two things it does not
+//! change at all. It reads only under `cargo nextest run`, and
+//! `scripts/ci-flake-hunt.sh` deliberately runs `cargo test` — *"Do not
+//! 'modernise' this line"* — a hundred times per `nightly.yml` run, so
+//! an unbounded wait there is bounded by nothing short of the job's
+//! `timeout-minutes: 180`, which yields no verdict and no artifact. And
+//! a harness kill names the test but never the wait.
 //!
 //! So a wait that expires **panics**. It is never absorbed into an
 //! `Ok(_) | Err(_)` that would let a timeout count as a pass.
@@ -1456,12 +1471,27 @@ fn logs_tail_is_inside_the_holdback_in_the_same_moment_read_output_withholds() {
     let in_flight = format!("ghp_{IN_FLIGHT_TAIL}");
     let arranged = format!("see {in_flight}");
     // Wait for the arrangement itself — the token whole, at the head of
-    // the buffer — **with no deadline**. A deadline here would let this
-    // row go green against a build where nothing was ever in flight,
-    // which is the vacuous pass §11.4 spends its closing sentence on.
-    // `.config/nextest.toml`'s `terminate-after` is the bound, and unlike
-    // a deadline it fails the test and names it. Each turn of the loop is
-    // a socket round trip, so it paces itself; no sleep.
+    // the buffer. **The deadline is a hang detector, not part of the
+    // assertion**, which is this file's rule and not an exception to it:
+    // it panics, so it can never be absorbed into a pass, and the
+    // premise asserted immediately after the loop is still the only
+    // thing that can make this row green. The vacuous pass §11.4 spends
+    // its closing sentence on is prevented by that premise, not by
+    // spinning forever — a spin adds no assertion, it only removes the
+    // message that says which wait it was.
+    //
+    // This comment used to say `.config/nextest.toml`'s
+    // `terminate-after` was the bound. On the job that runs this row
+    // most, it is not: `scripts/ci-flake-hunt.sh` runs `cargo test`
+    // (*"Do not 'modernise' this line"*), which reads no nextest
+    // profile, and `nightly.yml` invokes it 100 times. Measured still
+    // running at 400 s under plain libtest.
+    //
+    // `ends_with` and not `contains`: the partial has to be **at**
+    // `buffer.head` for §4.1 to be withholding it at all, so relaxing
+    // this would weaken the arrangement rather than the wait. Each turn
+    // is a socket round trip, so it paces itself; no sleep.
+    let arranged_by = Instant::now() + Duration::from_secs(60);
     let bypass = loop {
         let r = shim.call_tool(
             "read_output",
@@ -1475,6 +1505,14 @@ fn logs_tail_is_inside_the_holdback_in_the_same_moment_read_output_withholds() {
         {
             break data;
         }
+        assert!(
+            Instant::now() < arranged_by,
+            "no partial secret ever reached `buffer.head`, so the \
+             arrangement this row measures was never made. Every \
+             assertion below would have been vacuous. Wanted a tail read \
+             ending in {arranged:?}; last one was {}",
+            data["output"]
+        );
     };
 
     // Premise one, and §11.4's bypass arm: the per-call opt-in is still
@@ -1544,6 +1582,19 @@ fn logs_tail_is_inside_the_holdback_in_the_same_moment_read_output_withholds() {
         err.contains("stops short"),
         "a shortened read that says nothing reads as 'the output ended': {err:?}"
     );
+    // The live-child wording, pinned by name so the three readings below
+    // cannot collapse back into one. This child is parked in `read -r _`,
+    // so a byte really may still arrive and "read again" really is the
+    // advice — which is exactly what makes it the wrong thing to say on
+    // a `--raw` read or a session that has ended.
+    assert!(
+        err.contains("may still be arriving"),
+        "the live-child note no longer says what is being waited for: {err:?}"
+    );
+    assert!(
+        !err.contains("stays that way"),
+        "a session still producing output was told its tail is final: {err:?}"
+    );
 
     // The bracket. Arms measured either side of a process spawn are only
     // "the same moment" if the holdback was still open at the end of it.
@@ -1585,6 +1636,239 @@ fn logs_tail_is_inside_the_holdback_in_the_same_moment_read_output_withholds() {
     assert_eq!(entries[0]["session_id"], session_id, "{:?}", entries[0]);
 
     shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// **The note asserted a security claim that `--raw` switches off.**
+///
+/// `held_back` is `safety_end < w.cap_end` (`output/mod.rs`), and three
+/// rules lower `safety_end`. `redact: false` makes `holdback_boundary`
+/// return `w.head` *before* the field is computed, so §4.1's holdback
+/// cannot be one of them on this read — and the same read writes the
+/// `redaction_disabled` row that says redaction was off. The one rule
+/// left is REQ-O-008's unfinished trailing escape, which is gated on
+/// `ansi == Strip` and not on `redact`.
+///
+/// So the old unconditional *"a secret may still be arriving (§4.1)"*
+/// named a mechanism that was provably not running, on the one read of
+/// this surface that is audited as unredacted. `dropped_incomplete_escape`
+/// cannot be used to tell them apart: `mcp/tools.rs` does not serialise
+/// it, and it flags the escape being *dropped*, which is the arm that
+/// does not set `held_back` at all.
+#[test]
+fn raw_does_not_blame_the_secret_holdback_for_an_unfinished_escape() {
+    let env = TestEnv::new("logsrawescape");
+    let mut shim = Shim::start(&env);
+    // `shell_integration: false` so nothing is typed into the pty behind
+    // the test: the OSC 133 snippet is echoed back, and its own escapes
+    // are complete, so it would move `buffer.head` past the one that is
+    // not.
+    let started = shim.call_tool(
+        "start_session",
+        json!({
+            "command": "bash",
+            "args": ["--norc", "--noprofile"],
+            "name": "rawesc",
+            "shell_integration": false,
+        }),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "ok",
+        "{started}"
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    // `ESC [` and nothing after it: a CSI introducer the child has not
+    // finished, two bytes, well under `ansi_incomplete_max_bytes`.
+    // `read -r _` parks the shell so it stays unfinished and the child
+    // stays alive, which is what REQ-O-008 withholds on.
+    shim.call_tool(
+        "send_input",
+        json!({ "session": session_id, "data": r"printf 'ESCMARK\033['; read -r _" }),
+    );
+
+    // The arrangement, measured the way `--raw` measures it: redaction
+    // off, so only REQ-O-008's rule can answer `true`. Bounded, and the
+    // expiry panics rather than falling through to a vacuous pass.
+    let arranged_by = Instant::now() + Duration::from_secs(60);
+    loop {
+        let r = shim.call_tool(
+            "read_output",
+            json!({ "session": session_id, "since_cursor": 0, "redact": false, "max_bytes": 262144 }),
+        );
+        let data = &r["result"]["structuredContent"]["data"];
+        if data["held_back"] == json!(true) {
+            break;
+        }
+        assert!(
+            Instant::now() < arranged_by,
+            "no unfinished escape ever reached `buffer.head` with \
+             redaction off, so this row would assert nothing: {data}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (code, out, err) = env.run(&["logs", "rawesc", "--tail", "5", "--raw"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("ESCMARK"),
+        "`--raw` did not return the bytes before the escape: {out:?}"
+    );
+    assert!(
+        !err.is_empty(),
+        "the read was shortened and said nothing: {out:?}"
+    );
+    assert!(
+        !err.contains("may still be arriving"),
+        "`--raw` blamed §4.1's secret holdback for a read on which \
+         `holdback_boundary` returned `buffer.head` before `held_back` \
+         was computed — and which is in the audit log as unredacted: \
+         {err:?}"
+    );
+    assert!(
+        err.contains("unfinished escape sequence"),
+        "the note does not name the one rule that can still fire with \
+         redaction off (REQ-O-008): {err:?}"
+    );
+
+    // The other half of the claim above: the daemon really did record
+    // this read as one with redaction switched off.
+    let entries = env.redaction_disabled_entries();
+    assert!(
+        entries.iter().any(|e| e["client_kind"] == "cli"),
+        "`--raw` was honoured without being audited, so the note's claim \
+         that the named mechanism is off is unrecorded: {entries:?}"
+    );
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// **A session that has ended, and the two sentences that were false
+/// about it.**
+///
+/// The *withhold* here is spec-correct and stays: §4.1 — *"If a process
+/// stops mid-token, the partial stays withheld — correct"* — and
+/// REQ-O-005 makes it normative, *"Quiescence does not release the
+/// holdback."* What was wrong is everything said about it. Nothing is
+/// "still arriving" from a child that has exited, and "read again to
+/// pick up the rest" can never succeed: the bytes that would advance the
+/// boundary do not exist and never will, so the last bytes of a
+/// completed session's log were unreachable from the primary
+/// human-facing command with no hint that another one would do.
+///
+/// §4.1 names the recourse in the same sentence as the rule — the agent
+/// *"may take the audited `redact: false` path if it genuinely needs the
+/// bytes"* — and §4.1:476 names `--raw` as this surface's spelling of
+/// it. **So the withheld tail stays reachable through `--raw`, and the
+/// note now says so.** Both halves are asserted here: taking that away
+/// would be inventing a rule the spec does not have, on the only route
+/// the spec does name.
+///
+/// This is a behaviour change against `main`, where `--tail` bypassed
+/// the holdback and returned the token; `CHANGELOG.md` records it.
+#[test]
+fn a_completed_sessions_withheld_tail_is_named_as_final_and_reachable_through_raw() {
+    // 35 characters: `gh[pousr]_[0-9A-Za-z]{36,}` wants 36, so the
+    // redactor cannot judge it and §4.1's holdback is the only thing
+    // withholding it.
+    const IN_FLIGHT_TAIL: &str = "0123456789abcdefghijABCDEFGHIJ01234";
+
+    let env = TestEnv::new("logsexited");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({
+            "command": "bash",
+            "args": [
+                "--norc",
+                "--noprofile",
+                "-c",
+                format!("printf 'see %s%s' ghp_ {IN_FLIGHT_TAIL}"),
+            ],
+            "name": "deadtail",
+            "shell_integration": false,
+        }),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "ok",
+        "{started}"
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let in_flight = format!("ghp_{IN_FLIGHT_TAIL}");
+    let exited_by = Instant::now() + Duration::from_secs(60);
+    loop {
+        let st = shim.call_tool("status", json!({ "session": session_id }));
+        let data = &st["result"]["structuredContent"]["data"];
+        if data["state"] == json!("Exited") {
+            assert_eq!(data["exit_code"], json!(0), "{data}");
+            break;
+        }
+        assert!(
+            Instant::now() < exited_by,
+            "the child never exited, so this row is about a live session \
+             and asserts nothing it claims to: {data}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Both tail sizes, because the withhold is a property of the tail
+    // and not of how much of it was asked for — and twice, because "read
+    // again" was the advice and it has to be shown not to work.
+    //
+    // **By id, not by name.** A session that has exited has released its
+    // claim on `deadtail`, which is the whole reason this case matters:
+    // the log outlives the child, and the id is what still reaches it.
+    for tail in ["5", "50", "5"] {
+        let (code, out, err) = env.run(&["logs", &session_id, "--tail", tail]);
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(
+            !out.contains(&in_flight),
+            "a completed session released the partial its own \
+             `read_output` withholds (§4.1, REQ-O-005): {out:?}"
+        );
+        assert!(
+            out.ends_with("see "),
+            "the read did not stop at the holdback boundary: {out:?}"
+        );
+        assert!(
+            !err.contains("may still be arriving"),
+            "the session has exited with code 0; nothing is arriving, \
+             and this is the sentence that says otherwise: {err:?}"
+        );
+        assert!(
+            err.contains("stays that way"),
+            "the note does not say the tail is final: {err:?}"
+        );
+        assert!(
+            err.contains("--raw"),
+            "the only route §4.1 names to these bytes is unmentioned on \
+             the one surface that can no longer reach them: {err:?}"
+        );
+    }
+
+    // And that route works. Without this the row above is satisfied by a
+    // build that made the bytes unreachable altogether.
+    let (code, raw, err) = env.run(&["logs", &session_id, "--tail", "5", "--raw"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        raw.contains(&in_flight),
+        "§4.1's own escape hatch does not reach the withheld tail of a \
+         completed session: {raw:?}"
+    );
+    let entries = env.redaction_disabled_entries();
+    assert!(
+        entries.iter().any(|e| e["client_kind"] == "cli"),
+        "`--raw` was honoured without being audited: {entries:?}"
+    );
+
     shim.kill();
 }
 
