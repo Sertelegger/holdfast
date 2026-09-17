@@ -1,0 +1,21 @@
+{
+  "name": "holdfast",
+  "version": "0.0.7",
+  "description": "A persistent, PTY-backed shell environment for AI agents, over MCP. Sessions outlive the tool call: real terminals, real stdin, prompt detection, secret input, and a human who can attach.",
+  "author": {
+    "name": "Sascha Sertel",
+    "email": "Sertelegger@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/Sertelegger/holdfast#readme",
+  "repository": "https://github.com/Sertelegger/holdfast",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "pty",
+    "terminal",
+    "shell",
+    "session",
+    "tmux",
+    "rust"
+  ]
+}
