@@ -151,12 +151,25 @@ jobs:
   # not an available context in `jobs.<id>.if` *or* in a step's `if:`, and
   # actionlint says so for both positions rather than this being a belief:
   # `context "secrets" is not allowed here. available contexts are "github",
-  # "inputs", "needs", "vars"`. Written that way the expression is empty, and
-  # a job gated on an empty string runs unconditionally. So the first step
-  # reads the token into `env` — where the context *is* available — decides
-  # there, and every later step keys off its output. With no `CARGO_REGISTRY_TOKEN` configured this job is one shell
-  # command that prints a line and exits, which is the intended state until
-  # the maintainer decides the version question.
+  # "inputs", "needs", "vars"`. GitHub does not degrade gracefully either --
+  # it refuses the whole run with `Unrecognized named-value: 'secrets'`. So
+  # the obvious spelling does not misbehave quietly, it stops the release,
+  # and the gate step exists to read the token into `env` -- where the
+  # context *is* available -- decide there, and let every later step key off
+  # its output.
+  #
+  # With no `CARGO_REGISTRY_TOKEN` configured this job is one `if`/`else`
+  # that writes `publish=false` to `$GITHUB_OUTPUT`, prints two lines and
+  # exits 0; every step after it is skipped. That is the intended state
+  # until the maintainer decides the version question.
+  #
+  # **Adding the secret is the decision, and it leaves no diff.** §12.3 makes
+  # *first external distribution* the event that binds change discipline, and
+  # several escapes in this tree -- the wire-shape record's in-place
+  # corrections most of all -- are written on the premise that it has not
+  # happened. `cargo install holdfast` is that event as much as a release
+  # asset is. It is armed from the repository settings UI with no PR and no
+  # review, which is exactly why it is named here.
   crates-io:
     needs: publish
     runs-on: ubuntu-24.04
@@ -239,6 +252,13 @@ jobs:
       # tarball compiles from itself, which is the failure mode a path
       # dependency or a missing `include`d file produces and nothing else
       # catches.
+      # **There is no resume path, and that is not fixable in this file.**
+      # `cargo publish` is not atomic across members: if `holdfast-core`
+      # uploads and `holdfast` does not, re-running this job dies on `crate
+      # version already uploaded` before it reaches `holdfast`. Recovery is
+      # manual -- `cargo publish --locked -p holdfast` from the tagged
+      # commit -- and it is written down here because the alternative is
+      # working it out while a half-published version is live.
       - name: Publish holdfast-core then holdfast
         if: steps.gate.outputs.publish == 'true'
         env:

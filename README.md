@@ -189,7 +189,7 @@ request runs:
 
 | Job | What it runs |
 |---|---|
-| `hygiene` | `scripts/ci-hygiene.sh` — asserts the workflows have not grown a publish step, a `continue-on-error`, a retry action, a `secrets.` reference, an unpinned action, a missing job timeout, or a checkout that leaves a pushable credential behind |
+| `hygiene` | `scripts/ci-hygiene.sh` — asserts the workflows have not grown a `continue-on-error`, a retry action, an unpinned action, a missing job timeout, or a checkout that leaves a pushable credential behind. The publishing rules — a `secrets.` reference, `cargo publish`, `gh`, a write permission — are **scoped rather than absolute**, and `release.yml` is the one file they do not apply to: it declares itself a release workflow and the script verifies that claim by requiring its `on:` block to name `tags:` and to name none of `branches:`, `pull_request` or `schedule` before granting the exemption |
 | `actionlint` | `actionlint` 1.7.12, installed against its published checksums, over `.github/workflows/*.yml`. It runs `shellcheck --version` first and fails if that is absent: actionlint shells out to shellcheck to lint the shell inside every `run:` block, and with it missing skips that silently and still exits 0 — so the check most likely to find a real defect would be the one that quietly did not run. `dev/workflows/verify.md` listed this under *"CI's own gate, which must pass"* from the day it was written, and CI did not run it |
 | `fmt` | `cargo fmt --all --check` |
 | `clippy` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
