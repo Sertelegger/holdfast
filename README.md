@@ -5,7 +5,7 @@ An MCP server that gives AI agents persistent, PTY-backed shell sessions.
 The **Human-Observable** in that name is a shipped property from 0.0.6:
 `holdfast attach` and `holdfast watch` let a human look at — and take
 over — a live session from any terminal. The web UI is still to come; see
-[ROADMAP.md](./ROADMAP.md).
+[ROADMAP.md](https://github.com/Sertelegger/holdfast/blob/main/ROADMAP.md).
 
 > **Status: `v0.0.7` is the newest tag — early development.** Twelve
 > tools, hybrid mode on Linux/macOS/WSL. Sessions live in a background
@@ -13,7 +13,7 @@ over — a live session from any terminal. The web UI is still to come; see
 > takes them with it. On Windows there is no daemon: `holdfast mcp`
 > serves stdio in-process and sessions end with it — see the
 > platform-support table below for what is verified there. Output is ANSI-stripped and secret-redacted by
-> default. Not yet suitable for real use; see [ROADMAP.md](./ROADMAP.md)
+> default. Not yet suitable for real use; see [ROADMAP.md](https://github.com/Sertelegger/holdfast/blob/main/ROADMAP.md)
 > for what is and is not there.
 
 ## What works today (`v0.0.7`)
@@ -158,6 +158,16 @@ cargo build --workspace
 ./scripts/mcp-smoke.sh                  # raw JSON-RPC smoke test (needs jq)
 claude mcp add --scope user holdfast -- "$(pwd)/target/debug/holdfast" mcp
 ```
+
+**Those commands assume a git checkout, and that is the only way in
+today.** `cargo install holdfast` resolves the `0.0.0` name reservation on
+crates.io and errors with "there is nothing to install"; the shipped
+GitHub Releases carry no binary assets. Publishing either is this
+project's *first external distribution* — a decision it has not taken, and
+one that changes what several in-tree escapes are allowed to do (see
+[CONTRIBUTING.md](https://github.com/Sertelegger/holdfast/blob/main/CONTRIBUTING.md#no-binary-assets)).
+When it is taken, releases are the channel and crates.io the source-build
+fallback beside it.
 
 ## Development
 
@@ -334,13 +344,13 @@ more, the assertion simply runs and the census says so.
 
 ## Documentation
 
-- [CHANGELOG.md](./CHANGELOG.md) — what has landed, and the known limitations
+- [CHANGELOG.md](https://github.com/Sertelegger/holdfast/blob/main/CHANGELOG.md) — what has landed, and the known limitations
   that are easy to mistake for bugs
-- [ROADMAP.md](./ROADMAP.md) — where this is going, as ordered scope groupings
+- [ROADMAP.md](https://github.com/Sertelegger/holdfast/blob/main/ROADMAP.md) — where this is going, as ordered scope groupings
   rather than a schedule
-- [CONTRIBUTING.md](./CONTRIBUTING.md) — the checks, and the two testing
+- [CONTRIBUTING.md](https://github.com/Sertelegger/holdfast/blob/main/CONTRIBUTING.md) — the checks, and the two testing
   standards this project actually enforces
-- [SECURITY.md](./SECURITY.md) — what is in scope. Holdfast runs commands on your
+- [SECURITY.md](https://github.com/Sertelegger/holdfast/blob/main/SECURITY.md) — what is in scope. Holdfast runs commands on your
   machine by design, so the interesting surface is the machinery around that:
   detection, signals, and the redactor that now runs at every output boundary.
 
@@ -351,4 +361,4 @@ explaining what it does and why, and the tests name the behaviour they pin.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](https://github.com/Sertelegger/holdfast/blob/main/LICENSE).
