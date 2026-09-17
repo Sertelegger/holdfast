@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords.workspace = true
+homepage.workspace = true
 # **`readme` names a path above the package root and that is deliberate.**
 # `cargo package` copies the file in and rewrites the field to `README.md`
 # (verified: the generated manifest in the tarball reads `readme =
@@ -18,29 +19,36 @@ The library behind the holdfast binary: PTY-backed session management, \
 prompt detection, secret redaction, and the MCP tool and daemon wire \
 protocols. The API tracks that binary's needs and is not yet stable.\
 """
-# **The integration tests are workspace gates, not crate tests, and a
-# tarball cannot satisfy them.** `tests/source_guards.rs` asserts properties
-# of `crates/holdfast/src` -- the *sibling* package -- by reading it through
-# `CARGO_MANIFEST_DIR/../holdfast/src`, a path that does not exist in a
-# single-crate tarball. Shipping them ships a `cargo test` that fails for
-# reasons a consumer cannot act on. `tests/wire-shape/` goes with them:
-# `tests/wire_shape.rs` is its only reader.
+# **One file, because exactly one file cannot work from a tarball.**
+# `tests/source_guards.rs` asserts properties of `crates/holdfast/src` -- the
+# *sibling* package -- through `CARGO_MANIFEST_DIR/../holdfast/src`, a path
+# that does not exist in a single-crate tarball. Everything else under
+# `tests/` builds and runs from one.
 #
-# `tests/fixtures/` stays, and is the reason this is a file pattern rather
-# than `"/tests"`: `src/config.rs` has `include_str!(
-# "../tests/fixtures/example_config.toml")` inside its own `#[cfg(test)]`
-# module. Measured on the packaged tarball with that one file removed,
-# `cargo test --lib --no-run`:
+# **This started as `["/tests/*.rs", "/tests/wire-shape"]` and that was
+# wrong**, which is the whole reason the rule is now one named file. Three
+# `#[cfg(test)]` blocks in `src/` read files under `tests/` as data, and a
+# pattern that drops test *sources* silently takes two of them with it:
 #
-#   error: couldn't read `src/../tests/fixtures/example_config.toml`:
-#     No such file or directory (os error 2)
-#    --> src/config.rs:1797:27
+#   src/config.rs:1797 ............. include_str! tests/fixtures/example_config.toml
+#   src/secret/provider.rs:1658 .... reads tests/secrets.rs
+#   src/secret/binding.rs:3667 ..... reads tests/secrets.rs
 #
-# **Nothing in the publish path would have reported it.** `cargo package`'s
-# verification build compiles the lib without `--cfg test`, so the whole-
-# directory exclude packages, verifies and publishes green, and the breakage
-# only appears for whoever vendors the crate and runs its tests.
-exclude = ["/tests/*.rs", "/tests/wire-shape"]
+# Only the first is an `include_str!` and so only the first fails at compile
+# time; the other two are `env!("CARGO_MANIFEST_DIR")` joins that panic at
+# *run* time. Measured on the tarball built with the pattern above:
+#
+#   panicked at src/secret/provider.rs:1689:33: read
+#     .../holdfast-core-0.0.7/tests/secrets.rs: No such file or directory
+#   test result: FAILED. 0 passed; 2 failed
+#
+# **Nothing in the publish path reports either one.** `cargo package`'s
+# verification build compiles the lib without `--cfg test`, so a broken
+# exclude packages, verifies and publishes green; the breakage belongs
+# entirely to whoever vendors the crate and runs its tests. A deny-list
+# keyed on a glob has to re-derive that set every time a test moves. A
+# deny-list of one named file does not.
+exclude = ["/tests/source_guards.rs"]
 
 [dependencies]
 anyhow.workspace = true

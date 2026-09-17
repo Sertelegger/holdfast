@@ -6,23 +6,27 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords.workspace = true
+homepage.workspace = true
 # See `holdfast-core`'s manifest for why this path points above the package
 # root: cargo copies the file in and normalises the field to `README.md`.
 readme = "../../README.md"
 categories = ["command-line-utilities", "development-tools"]
 description = """\
 MCP server and CLI giving AI agents persistent, PTY-backed shell sessions. \
-A background daemon keeps sessions alive across client restarts, and \
-attach/watch put a human at the same terminal. Early development.\
+On Unix a background daemon keeps them alive across client restarts and \
+attach/watch put a human at the same terminal; on Windows there is no \
+daemon and sessions end with the client. Early development.\
 """
-# **`tests/daemon_cli.rs` cannot compile from a tarball.** It carries
-# `include_str!("../../holdfast-core/tests/fixtures/example_config.toml")`,
-# which reaches into the sibling package -- a path `cargo package` cannot
-# follow, because it copies nothing from above the package root. The file
-# would ship naming a file that is not there, and the failure is a compile
-# error rather than a red test. `cargo package`'s verification build does
-# not compile tests, so nothing in the publish path would have reported it.
-exclude = ["/tests"]
+# **`tests/daemon_cli.rs` cannot compile from a tarball**, and it is the only
+# file here that cannot. It carries `include_str!(
+# "../../holdfast-core/tests/fixtures/example_config.toml")`, which reaches
+# into the sibling package -- a path `cargo package` cannot follow, because it
+# copies nothing from above the package root. Shipping it ships a file naming
+# a file that is not there, and the failure is a compile error rather than a
+# red test. `cargo package`'s verification build does not compile tests, so
+# nothing in the publish path would report it. `attach_cli.rs` and
+# `worker_process.rs` stay: they reach nowhere outside this package.
+exclude = ["/tests/daemon_cli.rs"]
 
 [[bin]]
 name = "holdfast"
