@@ -598,9 +598,19 @@ impl PrefixIndex {
     ///    is unreachable, but reading a quit as DEAD would release an
     ///    in-flight secret the moment a glyph appeared near it, so the arm
     ///    is written rather than assumed away.
-    fn still_alive(&self, rule: usize, region: &[u8], at: usize) -> bool {
+    ///
+    /// **`value_tail` is [`value_tail_start`] for the whole `region`,
+    /// computed once by the caller (GH #163).** The no-automaton arm
+    /// below used to walk `region[at..]` itself, once per candidate at
+    /// every anchor, which is the second of the two full-suffix walks
+    /// the issue reports. `region[at..].iter().all(is_value_byte)` holds
+    /// exactly when `at >= value_tail`: the predicate is upward-closed
+    /// in `at`, and `value_tail` is by construction its least witness.
+    /// The rewrite is **exact**, not conservative in either direction,
+    /// and the differential oracle below is what says so.
+    fn still_alive(&self, rule: usize, region: &[u8], at: usize, value_tail: usize) -> bool {
         let Some(dfa) = self.liveness.get(rule).and_then(Option::as_ref) else {
-            return region[at..].iter().all(|b| is_value_byte(*b));
+            return at >= value_tail;
         };
         let input = Input::new(region).range(at..).anchored(Anchored::Yes);
         // `start_state_forward` fails on a quit byte in the look-behind
@@ -788,6 +798,13 @@ impl PrefixIndex {
         region: &[u8],
         region_start: u64,
     ) -> Option<u64> {
+        // **One backward pass per call, not one per candidate per
+        // anchor** (GH #163). Both arms below asked *"is every byte from
+        // here to the end of the region a value byte"*, each with its own
+        // full-suffix walk; the predicate is upward-closed in the index
+        // and this is its least witness, so an index comparison answers
+        // it exactly.
+        let value_tail = value_tail_start(region);
         for (i, byte) in region.iter().enumerate() {
             let bucket = self.bucket(*byte);
             if bucket.is_empty() {
@@ -819,9 +836,15 @@ impl PrefixIndex {
                     // each of them releases key material (GH #166).
                     self.binary_in_flight(candidate.rule, region, i)
                 } else if rule.has_value_group {
-                    region[value_start..].iter().all(|b| is_value_byte(*b))
+                    // The suffix fact, exactly (GH #163): `region[k..]`
+                    // is all value bytes iff `k >= value_tail`. Note the
+                    // slice — this arm asks about `value_start`, where
+                    // the fallback in `still_alive` asks about the
+                    // *anchor*, and spelling both the same way holds
+                    // where the shipped scan released.
+                    value_start >= value_tail
                 } else {
-                    self.still_alive(candidate.rule, region, i)
+                    self.still_alive(candidate.rule, region, i, value_tail)
                 };
                 if !in_flight {
                     continue;
@@ -887,6 +910,102 @@ impl PrefixIndex {
     }
 }
 
+/// **The pre-GH #163 scan, kept as a differential oracle.**
+///
+/// [`PrefixIndex::earliest_partial`] is a security predicate: a faster
+/// version that releases one byte it used to hold is a leak, and one
+/// that holds where it used to release is a strand. Each of the three
+/// changes GH #163 landed is argued exact at its own site; this is what
+/// checks the argument against the code it replaced, over the shipped
+/// rule set, the adversarial user rules, and **randomly generated rule
+/// sets** — the last being the only arm that reaches the no-automaton
+/// fallback at all, since every rule the shipped file refuses an
+/// automaton is a `has_value_group` context rule that never gets there.
+///
+/// It is deliberately **not** an independent reimplementation. It
+/// differs from the shipped scan in exactly the three places the issue
+/// touched — the bucket lookup, the `has_value_group` arm and the
+/// no-automaton fallback — and shares everything else, the liveness
+/// walk included, so a mismatch localises to a change rather than to a
+/// copy that drifted.
+#[cfg(test)]
+impl PrefixIndex {
+    /// The `HashMap<u8, Vec<Candidate>>` the 256-slot array replaced,
+    /// rebuilt with the key function [`Self::build`] filled it with.
+    fn reference_map(&self) -> std::collections::HashMap<u8, &Vec<Candidate>> {
+        self.by_first_byte
+            .iter()
+            .enumerate()
+            .filter(|(_, bucket)| !bucket.is_empty())
+            .map(|(byte, bucket)| (byte as u8, bucket))
+            .collect()
+    }
+
+    pub(crate) fn earliest_partial_reference(
+        &self,
+        rules: &RuleSet,
+        region: &[u8],
+        region_start: u64,
+    ) -> Option<u64> {
+        let by_first_byte = self.reference_map();
+        for (i, byte) in region.iter().enumerate() {
+            let Some(bucket) = by_first_byte.get(&byte.to_ascii_lowercase()) else {
+                continue;
+            };
+            for candidate in bucket.iter() {
+                if candidate.requires_word_boundary
+                    && i > 0
+                    && (region[i - 1].is_ascii_alphanumeric() || region[i - 1] == b'_')
+                {
+                    continue;
+                }
+                let value_start = i + candidate.prefix.len();
+                if value_start >= region.len() {
+                    continue;
+                }
+                if !region[i..value_start].eq_ignore_ascii_case(&candidate.prefix) {
+                    continue;
+                }
+                let rule = &rules.rules[candidate.rule];
+                let in_flight = if rule.binary {
+                    self.binary_in_flight(candidate.rule, region, i)
+                } else if rule.has_value_group {
+                    region[value_start..].iter().all(|b| is_value_byte(*b))
+                } else if self.liveness[candidate.rule].is_none() {
+                    // `still_alive`'s no-automaton arm, as it was walked.
+                    region[i..].iter().all(|b| is_value_byte(*b))
+                } else {
+                    // The automaton arm is untouched by GH #163, so the
+                    // oracle shares it; `value_tail` is unreachable here.
+                    self.still_alive(candidate.rule, region, i, usize::MAX)
+                };
+                if !in_flight {
+                    continue;
+                }
+                if rule.anchored.is_match(&region[i..]) {
+                    continue;
+                }
+                return Some(region_start + i as u64);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn unresolved_from_reference(
+        &self,
+        rules: &RuleSet,
+        region: &[u8],
+        region_start: u64,
+    ) -> Option<u64> {
+        let anchored = self.earliest_partial_reference(rules, region, region_start);
+        let run = trailing_value_run_start(region).map(|i| region_start + i as u64);
+        match (anchored, run) {
+            (Some(a), Some(r)) => Some(a.min(r)),
+            (a, r) => a.or(r),
+        }
+    }
+}
+
 /// Index of the first byte of the maximal trailing run of bytes that could
 /// be *interior* to a non-`binary` rule's value, or `None` when `region`
 /// ends on a byte no such value may contain.
@@ -903,11 +1022,26 @@ impl PrefixIndex {
 /// it takes `trailing_value_run_start(b"   Compiling holdfast-core\n")`
 /// from `None` to `Some(0)`.
 pub fn trailing_value_run_start(region: &[u8]) -> Option<usize> {
+    let start = value_tail_start(region);
+    (start < region.len()).then_some(start)
+}
+
+/// The least index `t` for which `region[t..]` is entirely
+/// [`is_value_byte`] — the suffix fact GH #163 asks of the region once
+/// instead of letting every candidate at every anchor ask its own copy.
+///
+/// [`trailing_value_run_start`] is this with the empty run spelled
+/// `None`, which is what its callers want and what the scan does not:
+/// a region ending on a non-value byte has `t == region.len()`, and
+/// `k >= region.len()` is the correct — and correctly vacuous — answer
+/// to *"is `region[k..]` all value bytes"* for the only `k` that can
+/// reach it.
+fn value_tail_start(region: &[u8]) -> usize {
     let mut i = region.len();
     while i > 0 && is_value_byte(region[i - 1]) {
         i -= 1;
     }
-    (i < region.len()).then_some(i)
+    i
 }
 
 #[cfg(test)]
@@ -1690,7 +1824,7 @@ mod tests {
                 let alive = (0u8..=0xff).any(|b| {
                     let mut region = candidate.prefix.clone();
                     region.push(b);
-                    index.still_alive(candidate.rule, &region, 0)
+                    index.still_alive(candidate.rule, &region, 0, value_tail_start(&region))
                 });
                 assert!(
                     alive,
@@ -1779,7 +1913,7 @@ mod tests {
              must get no automaton"
         );
         assert!(
-            index.still_alive(idx, region, 7),
+            index.still_alive(idx, region, 7, value_tail_start(region)),
             "with no automaton the byte-class fallback must hold, not release"
         );
 
@@ -1868,7 +2002,7 @@ mod tests {
                     let mut region = lead.to_vec();
                     region.extend_from_slice(&span.as_bytes()[..take]);
                     assert!(
-                        index.still_alive(idx, &region, lead.len()),
+                        index.still_alive(idx, &region, lead.len(), value_tail_start(&region)),
                         "{}: {:?} can still become {span:?} and was called dead",
                         rule.name,
                         &span[..take]
@@ -1900,7 +2034,7 @@ mod tests {
                 let mut region = b"x".to_vec();
                 region.extend_from_slice(span.as_bytes());
                 assert!(
-                    !index.still_alive(idx, &region, 1),
+                    !index.still_alive(idx, &region, 1, value_tail_start(&region)),
                     "{}: {span:?} behind a word byte can never satisfy its own \
                      `\\b`, so the look-behind did not reach the automaton",
                     rule.name
@@ -1911,7 +2045,7 @@ mod tests {
                 let mut ok = b" ".to_vec();
                 ok.extend_from_slice(span.as_bytes());
                 assert!(
-                    index.still_alive(idx, &ok, 1),
+                    index.still_alive(idx, &ok, 1, value_tail_start(&ok)),
                     "{}: {span:?} at a boundary must be alive",
                     rule.name
                 );
@@ -2349,5 +2483,344 @@ mod tests {
                 "{label}: `S` must reach the `s` bucket, which must not be empty"
             );
         }
+    }
+
+    /// The suffix fact is the predicate it replaces, at every index —
+    /// asserted directly, because both rewrites below rest on it.
+    #[test]
+    fn the_suffix_fact_is_exactly_the_walk_it_replaces() {
+        let regions: &[&[u8]] = &[
+            b"",
+            b" ",
+            b"a",
+            b"abc",
+            b"abc ",
+            b" abc",
+            b"ab cd",
+            b"ghp_abcdef\n",
+            b"\n\n\n",
+            b"\x00\x7f\x80\xffabc",
+        ];
+        for region in regions {
+            let t = value_tail_start(region);
+            for k in 0..=region.len() {
+                assert_eq!(
+                    k >= t,
+                    region[k..].iter().all(|b| is_value_byte(*b)),
+                    "region {region:?}, k = {k}, value_tail = {t}"
+                );
+            }
+            // The `Option` spelling, pinned against the **pre-GH #163
+            // walk** rather than against its own new body — otherwise
+            // this row restates the implementation and proves nothing
+            // about the rewrite.
+            let mut i = region.len();
+            while i > 0 && is_value_byte(region[i - 1]) {
+                i -= 1;
+            }
+            assert_eq!(
+                trailing_value_run_start(region),
+                (i < region.len()).then_some(i),
+                "region {region:?}: the `Option` spelling moved"
+            );
+        }
+    }
+
+    /// User rules whose declared prefixes contain a byte no value may
+    /// contain — the only shape that separates GH #163's suffix fact
+    /// from the two ways of spelling it wrong.
+    ///
+    /// **Neither mutation is reachable from the shipped fifty-one**, and
+    /// that is a fact about the rule file rather than about the rewrite:
+    /// every shipped prefix is printable and space-free, so `value_tail`
+    /// can never land strictly inside one, and the anchor and the value
+    /// start are never on opposite sides of it. An operator's rule may
+    /// put a space in a label, and `extra_redaction_patterns` takes one.
+    const SUFFIX_FACT_USER_RULES: &str = r#"
+        [[rule]]
+        name = "acme-spaced-label"
+        kind = "acme-internal"
+        pattern = '''(?i)acmepw [:=]?\s*(?P<value>[A-Za-z0-9]{8,})'''
+        prefixes = ["acmepw "]
+        positive = ["acmepw ABCDEFGH"]
+        negative = ["acmepw ABC"]
+
+        [[rule]]
+        name = "acme-spaced-punct-prefix"
+        kind = "acme-internal"
+        pattern = '''\b-zb- [A-Za-z0-9]{10,}'''
+        prefixes = ["-zb- "]
+        positive = ["x-zb- ABCDEFGHIJ"]
+        negative = ["x-zb- ABC"]
+    "#;
+
+    /// Step 1, and the two mutations that prove which slice each arm
+    /// asks about.
+    ///
+    /// * `has_value_group` asks about **`value_start`**: at
+    ///   `value_start == value_tail` the arm holds, and a `>` releases.
+    /// * the no-automaton fallback asks about **the anchor**: with the
+    ///   non-value byte inside the prefix, `at < value_tail <= value_start`,
+    ///   and spelling the fallback `value_start >= value_tail` withholds
+    ///   bytes the shipped scan released.
+    #[test]
+    fn each_arm_asks_the_suffix_fact_about_its_own_slice() {
+        let rules = RuleSet::builtin_with_extra(SUFFIX_FACT_USER_RULES).unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+
+        let spaced = rules
+            .rules
+            .iter()
+            .position(|r| r.name == "acme-spaced-label")
+            .unwrap();
+        let punct = rules
+            .rules
+            .iter()
+            .position(|r| r.name == "acme-spaced-punct-prefix")
+            .unwrap();
+        assert!(
+            rules.rules[spaced].has_value_group,
+            "the premise of the first half: this rule reaches the \
+             `has_value_group` arm"
+        );
+        assert!(
+            index.liveness[punct].is_none(),
+            "the premise of the second half: a `\\b` pattern whose prefix \
+             opens on punctuation is refused an automaton, so it reaches \
+             the fallback — the arm the shipped fifty-one cannot"
+        );
+
+        // -- the `has_value_group` arm, at `value_start == value_tail` --
+        let region: &[u8] = b"acmepw ABCDEFG";
+        assert_eq!(
+            value_tail_start(region),
+            7,
+            "the space is the last non-value byte"
+        );
+        assert_eq!(
+            index.earliest_partial(&rules, region, 0),
+            Some(0),
+            "seven of the eight value characters have arrived, so the label \
+             is a credential in flight. `value_start > value_tail` releases \
+             it, and the trailing run starts exactly at the value"
+        );
+
+        // -- the fallback, with the anchor and the value start straddling
+        //    `value_tail` --
+        let region: &[u8] = b"-zb- ABCDEF";
+        assert_eq!(value_tail_start(region), 5);
+        assert_eq!(
+            index.earliest_partial(&rules, region, 0),
+            None,
+            "the space inside the prefix is a byte no value may contain, so \
+             the rule cannot match from the anchor — asking the suffix fact \
+             about `value_start` instead of the anchor withholds this"
+        );
+    }
+
+    /// One non-value byte at the very end of the region kills the
+    /// `has_value_group` arm at **every** earlier anchor, however many
+    /// labels the region carries.
+    #[test]
+    fn one_non_value_byte_at_the_end_kills_the_arm_at_every_anchor() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+
+        let open = b"password=aaaa secret=bbbb password=cccc api_key=dddd";
+        assert!(
+            index.earliest_partial(&rules, open, 0).is_some(),
+            "the premise: these labels are candidates while the run is open"
+        );
+
+        let mut closed = open.to_vec();
+        closed.push(b'\n');
+        assert_eq!(
+            value_tail_start(&closed),
+            closed.len(),
+            "the trailing run is empty, so no index can be at or above it"
+        );
+        assert_eq!(
+            index.earliest_partial(&rules, &closed, 0),
+            None,
+            "a single `\\n` at the end ends every candidate in the region at \
+             once — the arm is a fact about the region's suffix, not about \
+             the distance from any one anchor"
+        );
+    }
+
+    /// A deterministic xorshift64*, so the differential corpus below is
+    /// reproducible and needs no dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    /// A random rule set, spelled as `extra_redaction_patterns` TOML.
+    ///
+    /// **The generator's job is the fallback arm.** A word-leading prefix
+    /// gets an automaton and never reaches it; the shapes that do are a
+    /// `\B` anywhere in the pattern and a punctuation-opening prefix
+    /// under a `\b`. A prefix carrying a space is what puts `value_tail`
+    /// somewhere other than the two places a shipped rule can put it.
+    fn random_rule_toml(rng: &mut Rng, n: usize) -> String {
+        const HEAD: &[&str] = &["acme", "zq", "tok", "kx", "b7"];
+        const BODY: &[&str] = &["-", "_", " ", "", "."];
+        const CLASS: &[&str] = &["[A-Za-z0-9]", "[A-Za-z0-9_-]", "[a-f0-9]"];
+        let mut out = String::new();
+        for i in 0..n {
+            let head = HEAD[rng.below(HEAD.len())];
+            let body = BODY[rng.below(BODY.len())];
+            let lead = if rng.below(3) == 0 { "-" } else { "" };
+            let prefix = format!("{lead}{head}{body}k{i}{body}");
+            let class = CLASS[rng.below(CLASS.len())];
+            let fold = if rng.below(2) == 0 { "(?i)" } else { "" };
+            let (pattern, declared) = match rng.below(4) {
+                0 => (format!("{fold}\\b{prefix}(?P<value>{class}{{6,}})"), true),
+                1 => (format!("{fold}\\b{prefix}{class}{{8,}}\\B[0-9]{{2}}"), true),
+                2 => (format!("{fold}\\b{prefix}{class}{{10,}}"), true),
+                _ => (format!("{fold}{prefix}{class}{{4,}}"), rng.below(2) == 0),
+            };
+            out.push_str(&format!(
+                "[[rule]]\nname = \"g163-{i}\"\nkind = \"g163\"\npattern = '''{pattern}'''\n"
+            ));
+            if declared {
+                out.push_str(&format!("prefixes = [\"{prefix}\"]\n"));
+            }
+            if rng.below(8) == 0 {
+                out.push_str("binary = true\n");
+            }
+            out.push_str(&format!(
+                "positive = [\"x{prefix}ABCDEFabcdef0123456789\"]\nnegative = [\"x{prefix}\"]\n\n"
+            ));
+        }
+        out
+    }
+
+    fn random_region(rng: &mut Rng, prefixes: &[Vec<u8>]) -> Vec<u8> {
+        const DELIMS: &[u8] = b" \t\r\n:=\"',;()[]{}\x00\x1b\x7f\x80\xc3\xff";
+        const VALUES: &[u8] = b"abcdefABCDEF0123456789-_.";
+        let mut out = Vec::new();
+        for _ in 0..1 + rng.below(8) {
+            match rng.below(6) {
+                0 | 1 if !prefixes.is_empty() => {
+                    let p = prefixes[rng.below(prefixes.len())].clone();
+                    for b in &p {
+                        out.push(if rng.below(4) == 0 {
+                            b.to_ascii_uppercase()
+                        } else {
+                            *b
+                        });
+                    }
+                }
+                2 => {
+                    for _ in 0..rng.below(24) {
+                        out.push(VALUES[rng.below(VALUES.len())]);
+                    }
+                }
+                3 => out.push(DELIMS[rng.below(DELIMS.len())]),
+                4 => {
+                    for _ in 0..rng.below(8) {
+                        out.push(rng.next_u64() as u8);
+                    }
+                }
+                _ => out.extend_from_slice(b"-sk-"),
+            }
+        }
+        out
+    }
+
+    fn index_prefixes(index: &PrefixIndex) -> Vec<Vec<u8>> {
+        index
+            .by_first_byte
+            .iter()
+            .flatten()
+            .map(|c| c.prefix.clone())
+            .collect()
+    }
+
+    /// **The answer-preservation proof for all three steps**, against the
+    /// implementation they replaced, over the shipped rule set, the
+    /// adversarial user rules, the suffix-fact rules and randomly
+    /// generated rule sets.
+    ///
+    /// Random rule sets are not decoration. Every rule the shipped file
+    /// refuses an automaton is a `has_value_group` context rule, which
+    /// never reaches [`PrefixIndex::still_alive`] at all — so the arm the
+    /// `at` / `value_start` mutation lives in is dead code against the
+    /// built-in fifty-one, and a hand corpus over them cannot kill it.
+    #[test]
+    fn the_cheap_steps_answer_what_the_pre_163_scan_did() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut checks = 0usize;
+
+        fn check(index: &PrefixIndex, rules: &RuleSet, region: &[u8], label: &str) {
+            for start in [0u64, 1_000_000] {
+                assert_eq!(
+                    index.earliest_partial(rules, region, start),
+                    index.earliest_partial_reference(rules, region, start),
+                    "{label}: earliest_partial diverged on {region:?} at {start}"
+                );
+                assert_eq!(
+                    index.unresolved_from(rules, region, start),
+                    index.unresolved_from_reference(rules, region, start),
+                    "{label}: unresolved_from diverged on {region:?} at {start}"
+                );
+            }
+        }
+
+        for (label, rules) in [
+            ("built-in", RuleSet::builtin().unwrap()),
+            (
+                "adversarial",
+                RuleSet::builtin_with_extra(ADVERSARIAL_USER_RULES).unwrap(),
+            ),
+            (
+                "suffix-fact",
+                RuleSet::builtin_with_extra(SUFFIX_FACT_USER_RULES).unwrap(),
+            ),
+        ] {
+            let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+            let prefixes = index_prefixes(&index);
+            for _ in 0..3_000 {
+                let region = random_region(&mut rng, &prefixes);
+                check(&index, &rules, &region, label);
+                checks += 1;
+            }
+        }
+
+        let mut random_sets = 0usize;
+        for round in 0..400 {
+            let n = 1 + rng.below(5);
+            let toml = random_rule_toml(&mut rng, n);
+            let Ok(rules) = RuleSet::from_toml(&toml) else {
+                continue;
+            };
+            random_sets += 1;
+            let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+            let prefixes = index_prefixes(&index);
+            for _ in 0..40 {
+                let region = random_region(&mut rng, &prefixes);
+                check(&index, &rules, &region, &format!("random rule set {round}"));
+                checks += 1;
+            }
+        }
+
+        assert!(
+            random_sets > 300,
+            "only {random_sets} random rule sets compiled"
+        );
+        assert!(checks > 20_000, "only {checks} regions checked");
     }
 }
