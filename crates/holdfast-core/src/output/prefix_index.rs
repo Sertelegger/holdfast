@@ -23,7 +23,6 @@ use regex_automata::{
     util::{primitives::StateID, syntax},
     Anchored, Input,
 };
-use std::collections::HashMap;
 
 /// Cap on prefixes generated per rule by character-class expansion
 /// (`prefilter_prefix_expansion_limit`, spec §4.2).
@@ -446,7 +445,24 @@ struct Candidate {
 /// never cause a secret to be released early.
 #[derive(Debug)]
 pub struct PrefixIndex {
-    by_first_byte: HashMap<u8, Vec<Candidate>>,
+    /// One bucket per byte value, indexed rather than hashed (GH #163).
+    ///
+    /// **The bucket lookup runs once per input byte of every read, and
+    /// a `HashMap<u8, _>` charged a SipHash of one byte for each.**
+    /// Measured on this tree, that hash was about half the cost of an
+    /// `earliest_partial` over the default 41,472-byte read window that
+    /// finds nothing — which is what ordinary output does on every
+    /// read. The key is one byte, so the table that removes the hash
+    /// entirely is 256 slots; most are empty and an empty `Vec` is
+    /// three words, so the whole array is 6 KiB behind one `Box`, built
+    /// once per rule set.
+    ///
+    /// **Keyed by the ASCII-lowercased first byte, and read the same
+    /// way** — the case-insensitivity above is the array's index
+    /// function, not a property of the map it replaced.
+    /// [`Self::bucket`] is the single lookup, so the two spellings
+    /// cannot drift apart.
+    by_first_byte: Box<[Vec<Candidate>; 256]>,
     total: usize,
     /// One liveness automaton per rule, parallel to `rules.rules`. See
     /// [`build_liveness`]; `None` means the rule keeps [`is_value_byte`].
@@ -455,7 +471,8 @@ pub struct PrefixIndex {
 
 impl PrefixIndex {
     pub fn build(rules: &RuleSet, expansion_limit: usize) -> Self {
-        let mut by_first_byte: HashMap<u8, Vec<Candidate>> = HashMap::new();
+        let mut by_first_byte: Box<[Vec<Candidate>; 256]> =
+            Box::new(std::array::from_fn(|_| Vec::new()));
         let mut total = 0usize;
         let mut liveness: Vec<Option<dense::DFA<Vec<u32>>>> = Vec::with_capacity(rules.rules.len());
         for (idx, rule) in rules.rules.iter().enumerate() {
@@ -514,20 +531,17 @@ impl PrefixIndex {
 
             for prefix in &prefixes {
                 total += 1;
-                by_first_byte
-                    .entry(prefix[0].to_ascii_lowercase())
-                    .or_default()
-                    .push(Candidate {
-                        prefix: prefix.clone(),
-                        rule: idx,
-                        requires_word_boundary,
-                    });
+                by_first_byte[prefix[0].to_ascii_lowercase() as usize].push(Candidate {
+                    prefix: prefix.clone(),
+                    rule: idx,
+                    requires_word_boundary,
+                });
             }
             liveness.push(dfa);
         }
         // Longest prefix first, so the most specific rule claims a
         // position when several share a first byte.
-        for bucket in by_first_byte.values_mut() {
+        for bucket in by_first_byte.iter_mut() {
             bucket.sort_by_key(|c| std::cmp::Reverse(c.prefix.len()));
         }
         Self {
@@ -535,6 +549,22 @@ impl PrefixIndex {
             total,
             liveness,
         }
+    }
+
+    /// The candidates a region byte routes to — **the** lookup the scan
+    /// performs, factored out so nothing else can spell it differently.
+    ///
+    /// `to_ascii_lowercase` here is not an optimisation and dropping it
+    /// is not a fold-insensitive scan with a slightly different cost: it
+    /// is the index function [`Self::build`] keyed the table with, so a
+    /// raw `byte as usize` reads the wrong slot for every uppercase byte
+    /// and silently stops indexing the `(?i)` rules — every context rule
+    /// carries one. `every_first_byte_routes_to_the_bucket_the_map_held`
+    /// asserts the routing for all 256 values against a map built the
+    /// way the replaced `HashMap` was.
+    #[inline]
+    fn bucket(&self, byte: u8) -> &[Candidate] {
+        &self.by_first_byte[byte.to_ascii_lowercase() as usize]
     }
 
     /// Whether rule `rule` could still match if `region` grew — asked at
@@ -678,7 +708,7 @@ impl PrefixIndex {
         };
         let mut out: Vec<Vec<u8>> = self
             .by_first_byte
-            .values()
+            .iter()
             .flatten()
             .filter(|c| c.rule == idx)
             .map(|c| c.prefix.clone())
@@ -759,9 +789,10 @@ impl PrefixIndex {
         region_start: u64,
     ) -> Option<u64> {
         for (i, byte) in region.iter().enumerate() {
-            let Some(bucket) = self.by_first_byte.get(&byte.to_ascii_lowercase()) else {
+            let bucket = self.bucket(*byte);
+            if bucket.is_empty() {
                 continue;
-            };
+            }
             for candidate in bucket {
                 // `\b` in the rule means the match cannot start mid-word.
                 // Position 0 is treated as a boundary: the region is a
@@ -883,6 +914,7 @@ pub fn trailing_value_run_start(region: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::output::rules::RuleSet;
+    use std::collections::HashMap;
 
     fn s(v: &[Vec<u8>]) -> Vec<String> {
         v.iter()
@@ -1637,7 +1669,7 @@ mod tests {
         //    the sole *shipped* prefix that opens on punctuation, and its
         //    pattern has no `\b` at all.
         let mut pairs = 0usize;
-        for bucket in index.by_first_byte.values() {
+        for bucket in index.by_first_byte.iter() {
             for candidate in bucket {
                 pairs += 1;
                 let rule = &rules.rules[candidate.rule];
@@ -2250,5 +2282,72 @@ mod tests {
             "the session is not withholding anything; there is nothing left \
              that could arrive to make this rule match"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // GH #163 — the three cheap steps, and the proof they change no
+    // answer.
+    // ---------------------------------------------------------------
+
+    /// Step 0: the 256-slot array routes every byte value to the bucket
+    /// the `HashMap<u8, _>` it replaced held under the same key.
+    ///
+    /// **All 256 values, not the ones a fixture happens to contain.** The
+    /// mutation this exists for is indexing by `byte` where the map was
+    /// keyed by `byte.to_ascii_lowercase()`: it is invisible on any
+    /// lowercase input and silently un-indexes every `(?i)` rule — which
+    /// is all nine context rules — against uppercase output.
+    #[test]
+    fn every_first_byte_routes_to_the_bucket_the_map_held() {
+        for (label, rules) in [
+            ("built-in", RuleSet::builtin().unwrap()),
+            (
+                "built-in + adversarial user rules",
+                RuleSet::builtin_with_extra(ADVERSARIAL_USER_RULES).unwrap(),
+            ),
+        ] {
+            let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+
+            // The map `build` used to fill, keyed the way it keyed it.
+            let mut map: HashMap<u8, Vec<(Vec<u8>, usize)>> = HashMap::new();
+            for bucket in index.by_first_byte.iter() {
+                for c in bucket {
+                    map.entry(c.prefix[0].to_ascii_lowercase())
+                        .or_default()
+                        .push((c.prefix.clone(), c.rule));
+                }
+            }
+
+            for byte in 0u8..=0xff {
+                let got: Vec<(Vec<u8>, usize)> = index
+                    .bucket(byte)
+                    .iter()
+                    .map(|c| (c.prefix.clone(), c.rule))
+                    .collect();
+                let want = map
+                    .get(&byte.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(
+                    got, want,
+                    "{label}: byte {byte:#04x} ({:?}) does not route to the \
+                     bucket the map held for it",
+                    byte as char
+                );
+            }
+
+            // The array is the whole index and nothing fell out of it.
+            let slotted: usize = index.by_first_byte.iter().map(|b| b.len()).sum();
+            assert_eq!(slotted, index.len(), "{label}: prefixes lost in the array");
+
+            // And the fold is load-bearing rather than incidental: an
+            // uppercase byte must reach a non-empty lowercase bucket, or
+            // the assertion above is satisfied by two empty lists.
+            assert!(
+                !index.bucket(b'S').is_empty()
+                    && index.bucket(b'S').len() == index.bucket(b's').len(),
+                "{label}: `S` must reach the `s` bucket, which must not be empty"
+            );
+        }
     }
 }
