@@ -449,13 +449,13 @@ pub struct PrefixIndex {
     ///
     /// **The bucket lookup runs once per input byte of every read, and
     /// a `HashMap<u8, _>` charged a SipHash of one byte for each.**
-    /// Measured on this tree, that hash was about half the cost of an
-    /// `earliest_partial` over the default 41,472-byte read window that
-    /// finds nothing — which is what ordinary output does on every
-    /// read. The key is one byte, so the table that removes the hash
-    /// entirely is 256 slots; most are empty and an empty `Vec` is
-    /// three words, so the whole array is 6 KiB behind one `Box`, built
-    /// once per rule set.
+    /// Measured on this tree, that hash was 0.378 ms of a 0.751 ms
+    /// `earliest_partial` over the default 41,472-byte read window —
+    /// about half the cost of a scan that finds nothing, which is what
+    /// ordinary output does on every read. The key is one byte, so the
+    /// table that removes the hash entirely is 256 slots; most are
+    /// empty and an empty `Vec` is three words, so the whole array is
+    /// 6 KiB behind one `Box`, built once per rule set.
     ///
     /// **Keyed by the ASCII-lowercased first byte, and read the same
     /// way** — the case-insensitivity above is the array's index
@@ -798,14 +798,46 @@ impl PrefixIndex {
         region: &[u8],
         region_start: u64,
     ) -> Option<u64> {
-        // **One backward pass per call, not one per candidate per
-        // anchor** (GH #163). Both arms below asked *"is every byte from
-        // here to the end of the region a value byte"*, each with its own
-        // full-suffix walk; the predicate is upward-closed in the index
-        // and this is its least witness, so an index comparison answers
-        // it exactly.
         let value_tail = value_tail_start(region);
-        for (i, byte) in region.iter().enumerate() {
+        self.earliest_partial_bounded(rules, region, region_start, value_tail, region.len())
+    }
+
+    /// [`Self::earliest_partial`] with the suffix fact hoisted out of the
+    /// loop and an optional ceiling on the anchors it visits (GH #163).
+    ///
+    /// **`value_tail` is a fact about `region`, and `scan_ceiling` is a
+    /// promise from the caller.** The first is [`value_tail_start`] and
+    /// changes no answer — see [`Self::still_alive`]. The second
+    /// **does**: with a ceiling below `region.len()` this function
+    /// returns `None` where [`Self::earliest_partial`] returns
+    /// `Some(region_start + i)` for some `i >= scan_ceiling`. It is
+    /// therefore **not** a cheaper spelling of the public predicate and
+    /// must never be reached from one.
+    ///
+    /// Exactly one caller may pass a real ceiling:
+    /// [`Self::unresolved_from`], whose answer is the `min` of this scan
+    /// and [`trailing_value_run_start`]. When the trailing run starts at
+    /// `t`, every anchor at or after `t` loses that `min` outright, so
+    /// declining to look for one cannot move the composed answer. The
+    /// `min` is the whole of the argument; a surface without it would
+    /// release bytes it used to withhold, and there are **five** of them
+    /// rather than the four a reader lists from memory —
+    /// `OutputProcessor::holdback_boundary`, the view-driven boundary
+    /// beside it, `mcp/detection.rs`'s `prompt.last_line`, and *both* of
+    /// `attach/redact_stream.rs`'s calls (`feed` and
+    /// `feed_while_withholding`).
+    /// `the_scan_ceiling_is_confined_to_unresolved_from` and the source
+    /// guard of the same name are what hold that line.
+    fn earliest_partial_bounded(
+        &self,
+        rules: &RuleSet,
+        region: &[u8],
+        region_start: u64,
+        value_tail: usize,
+        scan_ceiling: usize,
+    ) -> Option<u64> {
+        let ceiling = scan_ceiling.min(region.len());
+        for (i, byte) in region[..ceiling].iter().enumerate() {
             let bucket = self.bucket(*byte);
             if bucket.is_empty() {
                 continue;
@@ -872,8 +904,11 @@ impl PrefixIndex {
     ///
     /// **Two detectors, and each reaches a case the other cannot.**
     ///
-    /// * *Prefix-anchored* — [`Self::earliest_partial`], reused verbatim so
-    ///   the two surfaces cannot drift. It is the only one that reaches a
+    /// * *Prefix-anchored* — [`Self::earliest_partial`]'s scan. **Not
+    ///   `earliest_partial` itself, since GH #163**: this is the one
+    ///   caller entitled to a ceiling on it, and the paragraph below the
+    ///   list is why. The scan's *body* is still shared, which is what
+    ///   "cannot drift" was ever about. It is the only one that reaches a
     ///   rule marked `binary`, whose value may contain whitespace:
     ///   `private-key-block` is the whole of that set, and a PEM body's
     ///   newlines defeat the value-run test below at every line. It is also
@@ -901,8 +936,28 @@ impl PrefixIndex {
         region: &[u8],
         region_start: u64,
     ) -> Option<u64> {
-        let anchored = self.earliest_partial(rules, region, region_start);
-        let run = trailing_value_run_start(region).map(|i| region_start + i as u64);
+        // **The trailing run is computed first and then spent twice**
+        // (GH #163): once as this function's own second detector, and
+        // once as a ceiling on the prefix-anchored scan. The composed
+        // answer is a `min`, so an anchor at or after `t` could only
+        // ever lose it — and the fixture that makes that worth doing is
+        // 270,336 bytes of `-sk-` with no trailing delimiter, where the
+        // anchored scan spends 22.3 s arriving at `Some(t + 1)` and the
+        // run answers `Some(t)` in 0.157 ms (measured on this tree).
+        //
+        // `unwrap_or(region.len())` is [`value_tail_start`], which is
+        // what the scan wants: where the region ends on a non-value byte
+        // there is no run, `t` is `region.len()`, and the ceiling is the
+        // no-op it has to be. Spelled through
+        // [`trailing_value_run_start`] rather than through the unwrapped
+        // form so that the detector this paragraph names is the function
+        // this line calls — the two agree only because both bottom out
+        // in [`is_value_byte`], and GH #152 is a live proposal to widen
+        // one of them.
+        let run = trailing_value_run_start(region);
+        let tail = run.unwrap_or(region.len());
+        let anchored = self.earliest_partial_bounded(rules, region, region_start, tail, tail);
+        let run = run.map(|i| region_start + i as u64);
         match (anchored, run) {
             (Some(a), Some(r)) => Some(a.min(r)),
             (a, r) => a.or(r),
@@ -2645,6 +2700,44 @@ mod tests {
             "a single `\\n` at the end ends every candidate in the region at \
              once — the arm is a fact about the region's suffix, not about \
              the distance from any one anchor"
+        );
+    }
+
+    /// Step 2': the scan ceiling is `unresolved_from`'s and reaches no
+    /// other surface.
+    ///
+    /// The ceiling is sound **only** under the `min` that
+    /// `unresolved_from` composes. Applied to the public predicate it
+    /// answers `None` where the scan answers `Some`, which is
+    /// `holdback_boundary` releasing a token still arriving.
+    #[test]
+    fn the_scan_ceiling_is_confined_to_unresolved_from() {
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+
+        // A region whose only candidate sits *inside* the trailing run,
+        // so the ceiling would suppress it.
+        let region: &[u8] = b"$ echo ghp_abcdef";
+        let tail = value_tail_start(region);
+        assert_eq!(tail, 7, "the space before the token starts the run");
+
+        assert_eq!(
+            index.earliest_partial(&rules, region, 1000),
+            Some(1007),
+            "the public predicate must not take the ceiling: this is the \
+             GitHub token `holdback_boundary` is withholding"
+        );
+        assert_eq!(
+            index.earliest_partial_bounded(&rules, region, 1000, tail, tail),
+            None,
+            "the premise — the ceiling really does change this scan's own \
+             answer, which is why it may not be applied to the one above"
+        );
+        assert_eq!(
+            index.unresolved_from(&rules, region, 1000),
+            Some(1007),
+            "and the composed answer is unchanged, because the trailing run \
+             starts at the same place"
         );
     }
 

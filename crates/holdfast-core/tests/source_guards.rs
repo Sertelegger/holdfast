@@ -1167,3 +1167,107 @@ fn no_shortening_surface_names_the_unvouched_boundary() {
         mentions[0]
     );
 }
+
+/// **The GH #163 scan ceiling is `unresolved_from`'s alone.**
+///
+/// `PrefixIndex::earliest_partial_bounded` takes a `scan_ceiling` that
+/// changes its own answer: below `region.len()` it returns `None` where
+/// the public `earliest_partial` returns `Some(i)` for an `i` at or above
+/// it. That is sound for exactly one caller —
+/// `PrefixIndex::unresolved_from`, whose answer is the `min` of this scan
+/// and `trailing_value_run_start`, so an anchor at or after the run's
+/// start could only ever lose the `min`. Every other consumer of the
+/// predicate composes no such `min` and takes the answer as the
+/// boundary, so a ceiling applied there releases an in-flight secret
+/// outright. There are **five** of them and the count is the point:
+/// `OutputProcessor::holdback_boundary`,
+/// `OutputProcessor::unvouched_boundary`, `mcp/detection.rs`'s
+/// `prompt.last_line`, and `attach/redact_stream.rs`'s `feed` **and**
+/// `feed_while_withholding` — the second of which is the one a reader
+/// enumerating from memory leaves out.
+///
+/// A unit test pins the behaviour at one fixture; this pins the *shape*,
+/// because the hazard is a second call site rather than a wrong answer at
+/// the first. `earliest_partial_bounded` is private, so this only has to
+/// watch one file — and it asserts that the two calls are the two
+/// intended ones rather than merely counting them, since a third call
+/// added inside `prefix_index.rs` is exactly the mistake.
+#[test]
+fn only_unresolved_from_may_ceiling_the_prefix_scan() {
+    let prefix_index = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("output")
+        .join("prefix_index.rs");
+    let text = read_src(&prefix_index);
+    // **The first `#[cfg(test)]`, not the `mod tests` one.** The
+    // differential oracle is a `#[cfg(test)] impl PrefixIndex` block that
+    // sits above the module, and splitting at `mod tests` would put it on
+    // the shipped side — so an oracle that one day exercised the ceiling
+    // would fail this guard with a message about production call sites.
+    let shipped = &text[..text
+        .find("\n#[cfg(test)]\n")
+        .expect("prefix_index.rs no longer has any test-only code")];
+
+    let mentions: Vec<&str> = shipped
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("///") && !l.starts_with("//"))
+        .filter(|l| l.contains("earliest_partial_bounded"))
+        .collect();
+
+    assert_eq!(
+        mentions.len(),
+        3,
+        "prefix_index.rs names `earliest_partial_bounded` {} times outside \
+         its tests; exactly three — the definition and its two callers — \
+         are permitted. Found: {mentions:?}",
+        mentions.len()
+    );
+    // Asserted as a set rather than positionally: which of the two
+    // functions is written first in the file is not the property.
+    for (expected, why) in [
+        (
+            "fn earliest_partial_bounded(",
+            "the definition",
+        ),
+        (
+            "self.earliest_partial_bounded(rules, region, region_start, value_tail, region.len())",
+            "`earliest_partial` must pass the whole region as its ceiling — a \
+             real ceiling here is `holdback_boundary` releasing a token that \
+             is still arriving",
+        ),
+        (
+            "let anchored = self.earliest_partial_bounded(rules, region, region_start, tail, tail);",
+            "`unresolved_from` is the one caller whose composed `min` licenses \
+             a ceiling, and the ceiling it passes must be the trailing run it \
+             then takes the `min` against",
+        ),
+    ] {
+        assert_eq!(
+            mentions.iter().filter(|m| **m == expected).count(),
+            1,
+            "{why}: expected exactly one line `{expected}`, found {mentions:?}"
+        );
+    }
+
+    // And nothing outside that file may name it at all. It is private, so
+    // this cannot fail by compiling — it fails by someone widening the
+    // visibility, which is the first step of the mistake above.
+    for dir in ["holdfast-core", "holdfast"] {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(dir)
+            .join("src");
+        for file in rust_files(&src) {
+            if file.ends_with("output/prefix_index.rs") {
+                continue;
+            }
+            assert!(
+                !read_src(&file).contains("earliest_partial_bounded"),
+                "{} names `earliest_partial_bounded`; the ceiling may not \
+                 leave `prefix_index.rs`",
+                file.display()
+            );
+        }
+    }
+}
