@@ -1,0 +1,20 @@
+# **`rust-lld` for the aarch64 musl cross-link, and nothing else.** A stock
+# `ubuntu-24.04` (the release and rehearsal runners, and an ordinary Linux
+# developer box) has an x86_64 `cc` and no aarch64 cross-binutils, so the
+# default link of `aarch64-unknown-linux-musl` dies in the system linker on
+# the first object it is handed:
+#
+#     /usr/bin/ld: .../self-contained/crt1.o: Relocations in generic ELF (EM: 183)
+#
+# `rust-lld` ships inside the Rust toolchain, cross-links by construction, and
+# needs no apt package — which is what makes `linux-aarch64` a release asset
+# that a Linux runner can produce rather than one that needs a second image.
+# Measured: with this override the link succeeds and the output is a genuine
+# AArch64 ELF (`e_machine` 183); without it, it does not link at all.
+#
+# It is HERE rather than in the workflow on purpose: an environment variable
+# set only in CI makes `scripts/package-release.sh linux-aarch64` fail for a
+# developer running the same command locally, and the packaging script is
+# meant to be the one description of how a release asset is built.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

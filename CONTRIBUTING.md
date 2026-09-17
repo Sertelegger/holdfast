@@ -364,12 +364,31 @@ and inventing one would break the only rule the list has. It is twenty
 releases away; decide it then, and record what was decided here rather than
 leaving the next person to rediscover the problem.
 
-### No binary assets
+### Binary assets, and the draft that keeps them a decision
 
-Releases carry none, and none of the three shipped ones has any. The event that
-binds this project's compatibility promises is **first external
-distribution**, and several deliberate escapes — the wire-shape record's
-in-place corrections most of all — are conditioned on it not having happened. A
-downloadable binary *is* that event, and it is not one to trigger as a side
-effect of writing release notes. When it is time, it is a decision, and it
-changes what those escapes are allowed to do.
+**Releases now carry the five §12.1 assets and `SHA256SUMS.txt`, and they are
+created as drafts.** The three shipped releases carry none, which is why
+Holdfast could not be installed by anybody: measured, the only install path was
+building from source, and nothing in the repository said so.
+
+This section used to say *"no binary assets"*, and the argument it made is
+still the right one — it just decides the `--draft`, not the upload. The event
+that binds this project's compatibility promises is **first external
+distribution**, and several deliberate escapes are conditioned on it not having
+happened: `crates/holdfast-core/tests/wire_shape.rs` rewrites its `1.0.golden`
+record in place on the ground that there is no peer in the world speaking 1.0,
+and `crates/holdfast-core/src/protocol/method.rs` says in as many words that
+*"the latitude ends at the first published binary."* A draft's assets are not
+served from `releases/download/<tag>/<asset>`, so building and attaching them
+is automation and **promoting the draft is the decision** — one act, taken by
+a person, that ends both escapes.
+
+So, cutting a release, after the tag: the `Release` workflow builds all five
+targets, assembles `SHA256SUMS.txt` over exactly those five, verifies each
+archive against it under §13.3's safe-archive rules, and creates the draft.
+Then, by hand:
+
+1. `curl -I` an asset URL **unauthenticated** — it must 404 while the release
+   is a draft. That is the measurement that the event has not happened yet.
+2. Re-read the two escapes above. Promoting ends them.
+3. `gh release edit vX.Y.Z --draft=false`.

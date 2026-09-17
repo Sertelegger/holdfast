@@ -8,28 +8,92 @@
 #
 # Constraints this file is held to (enforced by scripts/ci-hygiene.sh):
 #   * the `RELEASE-WORKFLOW:` marker above is **verified, not believed**: the
-#     `on:` block must name `tags:` and must name none of `branches:`,
-#     `pull_request`, `pull_request_target` or `schedule`. That is what makes
-#     the publishing capability safe to grant — nothing but somebody tagging
-#     a commit on purpose can start this.
+#     `on:` block must name `tags:` and may name **nothing but `push:` and
+#     `tags:`**. That is what makes the publishing capability safe to grant —
+#     nothing but somebody tagging a commit on purpose can start this. It was
+#     a denylist of four triggers until the commit that added binary assets,
+#     and `workflow_dispatch:` walked straight through it; that sentence was
+#     therefore true of four spellings and false of at least three others.
 #   * no `continue-on-error`, no retry action — a release that half-happened
 #     and reported success is worse than one that failed
 #   * every `uses:` pinned to a 40-hex commit SHA
 #   * `persist-credentials: false`; the token this job needs is passed
 #     explicitly to the one step that needs it
-#   * `runs-on: ubuntu-24.04`, never ubuntu-latest
+#   * never a `-latest` runner image. **This line used to read "`runs-on:
+#     ubuntu-24.04`, never ubuntu-latest", and that stopped being true when
+#     the build matrix landed** — three of the five §12.1 assets need a
+#     macOS or Windows runner, so the images are now `ubuntu-24.04`,
+#     `macos-15`, `macos-15-intel` and `windows-2022`. All pinned; the
+#     hygiene rule was only ever about the mutable alias, and the narrower
+#     sentence was this file describing itself rather than the rule.
+#     (`macos-14`, which `ci.yml`'s `macos-native` still pins, is deprecated
+#     upstream and there is no `macos-13` label at all any more.)
 #   * explicit timeout-minutes
 #
 # **`gh` rather than a release action**, deliberately: it is preinstalled on
 # the runner, so this adds no third-party dependency to pin, review and watch
 # for compromise on the one workflow that holds a write token.
 #
-# **No binary assets.** §12.3's binding event is *first external
-# distribution*, and several deliberate escapes — the wire-shape record's
+# **Binary assets, published as a DRAFT.** This file used to say "no binary
+# assets", on the argument that §12.3's binding event is *first external
+# distribution* and that several deliberate escapes — the wire-shape record's
 # in-place corrections most of all — are conditioned on it not having
-# happened. Attaching a binary here is that event, and it is not one to
-# trigger as a side effect of writing release notes. When it is time, it is a
-# decision, and it changes what the escapes above are allowed to do.
+# happened. That argument is still correct and is why the `--draft` below is
+# not a convenience. It is the mechanism that keeps the two things apart:
+#
+#   * **Building and attaching the assets is automation.** It happens on every
+#     tag, and it is what makes the project installable at all — measured
+#     before this change, all three shipped releases had zero assets, crates.io
+#     held a 0.0.0 name reservation whose own lib.rs says it "contains no
+#     usable code", and the §13 plugin layer did not exist. The only install
+#     path was building from source and nothing said so.
+#   * **Promoting the draft is the decision.** A draft's assets are not served
+#     from `releases/download/<tag>/<asset>`, so nothing has reached anyone
+#     and §12.3's event has not occurred. The escapes named above survive
+#     until a human runs `gh release edit <tag> --draft=false`, and THAT is
+#     the moment they stop being allowed — `crates/holdfast-core/tests/
+#     wire_shape.rs`'s in-place golden rewrite and `protocol/method.rs`'s
+#     "the latitude ends at the first published binary" both have to be
+#     revisited in the same act, not after it.
+#
+# So the capability lands here and the event stays a decision, which is what
+# `CONTRIBUTING.md` said the shape of this should be.
+#
+# **A-4 is the trust root and `SHA256SUMS.txt` is half of it.** The spec:
+# *"The bootstrap launcher fetches binaries from GitHub Releases over TLS;
+# the SHA256SUMS file fetched alongside establishes integrity but not
+# independent authenticity (sigstore/cosign is post-v0.1.0)."* §13.3 step 5
+# has the launcher fetch exactly `releases/download/vX.Y.Z/SHA256SUMS.txt`
+# and verify the archive against it before extracting, so that file is not a
+# courtesy: it is the artifact the install path is built on, and it must
+# cover every archive the release carries.
+#
+# **HOW THIS FILE IS TESTED, AND WHAT IS LEFT OVER.** A release workflow
+# cannot be tested by releasing, and the trigger rule above forbids the
+# pull-request hatch, so the build/pack/checksum/verify path lives in
+# `scripts/package-release.sh` and `scripts/verify-release-archive.sh` and
+# `.github/workflows/release-rehearsal.yml` runs those same scripts on all
+# five targets on every pull request. Every step in the `build` job below and
+# every step in `publish` up to and including the verification loop is a line
+# that file also runs.
+#
+# **The residual is exactly one command: `gh release create`.** Nothing in
+# this repository can exercise it — `scripts/ci-hygiene.sh` refuses `gh`, a
+# `secrets.` reference and a `contents: write` on any workflow without the
+# tag-only marker, by design, so no pull-request-triggered job will ever
+# reach the upload path. Unproven until the first tag, therefore: that the
+# upload succeeds at all, that the asset names on the release object are the
+# names `holdfast-<target>.<tar.gz|zip>` that §13.3 composes, and that
+# `releases/download/<tag>/<asset>` resolves. The first two surface as a red
+# release job. The third is why the draft exists — on the first tag, check
+# the asset URLs with an unauthenticated `curl -I` BEFORE promoting, which
+# both proves the URL and measures whether §12.3's event has already
+# happened.
+#
+# A second residual, smaller and named rather than papered over: the
+# `linux-aarch64` asset is cross-built and no runner here can execute it, so
+# it is shape-verified and never run. The other four are executed by the
+# rehearsal.
 name: Release
 
 on:
@@ -41,9 +105,67 @@ permissions:
   contents: read
 
 jobs:
+  # **§12.1's five assets, one job each.** The names are the spec's platform
+  # names and not Rust triples, because §13.3 step 5 has the bootstrap
+  # construct `holdfast-<target>.<tar.gz|zip>` from exactly this list — an
+  # asset named `holdfast-x86_64-unknown-linux-musl.tar.gz` is an asset the
+  # launcher cannot find. Which triple each name maps to, which libc, and how
+  # the archive is laid out all live in `scripts/package-release.sh`, so the
+  # rehearsal workflow exercises the real answers rather than a copy.
+  build:
+    # A release that half-happened is worse than one that failed, so `publish`
+    # `needs:` this whole matrix. `fail-fast: false` on top of that: when a
+    # tag does fail here, the useful output is which of the five targets broke,
+    # not the first one to.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: linux-x86_64
+            os: ubuntu-24.04
+          - asset: linux-aarch64
+            os: ubuntu-24.04
+          - asset: macos-aarch64
+            os: macos-15
+          - asset: macos-x86_64
+            os: macos-15-intel
+          - asset: windows-x86_64
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain rust-toolchain.toml pins
+        shell: bash
+        run: rustup show active-toolchain && rustc --version
+      # **No build cache here, deliberately**, where the rehearsal has one.
+      # §12.4 wants the release built from the tag with `--locked`; a restored
+      # cache is a second input to that build which is not in the tag, and the
+      # minutes it saves are not worth owning that question on the one
+      # workflow whose output people install.
+      - name: Build and pack ${{ matrix.asset }}
+        shell: bash
+        env:
+          # Or every shipped binary says `build unknown` in its handshake:
+          # `protocol/handshake.rs` reads `option_env!("HOLDFAST_BUILD_SHA")`
+          # and its doc comment names the release pipeline as what wires it.
+          HOLDFAST_BUILD_SHA: ${{ github.sha }}
+        run: ./scripts/package-release.sh "${{ matrix.asset }}" dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: asset-${{ matrix.asset }}
+          path: dist/
+          retention-days: 7
+          # `warn` is the default and would give a green job that built
+          # nothing, then a release missing an asset nobody noticed.
+          if-no-files-found: error
+
   publish:
+    needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       # The whole grant, and only here: creating a release writes to the
       # repository. `ci.yml` cannot ask for this — ci-hygiene refuses a write
@@ -53,6 +175,39 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: asset-*
+          path: dist
+          merge-multiple: true
+
+      # **`SHA256SUMS.txt` is assembled from §12.1's list, not from whatever
+      # is in the directory.** A build job that was deleted, renamed or
+      # skipped would otherwise produce a four-asset release whose checksum
+      # file is internally consistent and silently short — and internally
+      # consistent is all the bootstrap can check. The same line runs in the
+      # rehearsal.
+      - name: Assemble SHA256SUMS.txt over exactly the five §12.1 assets
+        run: ./scripts/package-release.sh --sums dist
+
+      # **The consuming half, before publishing rather than after.** §13.3
+      # step 5 is the contract this is checked against: the launcher verifies
+      # the archive against the fetched `SHA256SUMS.txt` and extracts under
+      # safe-archive rules — no absolute paths, no `..`, no symlinks,
+      # hardlinks or device files, and exactly the expected `holdfast`
+      # executable. An asset that fails any of those is an asset the
+      # bootstrap will refuse after download, which is the worst place to
+      # find out.
+      - name: Every asset verifies and safely extracts
+        run: |
+          set -euo pipefail
+          for a in $(./scripts/package-release.sh --assets); do
+            archive="dist/$(./scripts/package-release.sh --archive "$a")"
+            echo "=== $archive"
+            ./scripts/verify-release-archive.sh dist/SHA256SUMS.txt "$archive"
+          done
+          ls -l dist
+          cat dist/SHA256SUMS.txt
 
       # **Three things must agree before anything is published**: the tag, the
       # workspace version, and a changelog section that exists. Any pair
@@ -127,10 +282,30 @@ jobs:
             title="holdfast $version"
           fi
           echo "release title: $title"
+          # `--draft` is the §12.3 boundary, not a safety net — see the header.
+          # The assets are attached and the release object exists; nothing is
+          # reachable at `releases/download/` until a human promotes it, so
+          # first external distribution stays an act somebody takes.
+          # **The upload list is derived from §12.1, not globbed.** A glob
+          # uploads whatever is in the directory, which is the same class of
+          # defect as assembling SHA256SUMS.txt from the directory: it cannot
+          # tell a missing asset from a directory that never had one.
+          upload=(dist/SHA256SUMS.txt)
+          for a in $(./scripts/package-release.sh --assets); do
+            upload+=("dist/$(./scripts/package-release.sh --archive "$a")")
+          done
           gh release create "${GITHUB_REF_NAME}" \
+            --draft \
             --verify-tag \
             --title "$title" \
-            --notes-file release-notes.md
+            --notes-file release-notes.md \
+            "${upload[@]}"
+          echo
+          echo "DRAFT created. Before promoting:"
+          echo "  1. curl -I the asset URLs unauthenticated — they must 404 while it is a draft."
+          echo "  2. Re-read the §12.3 escapes: crates/holdfast-core/tests/wire_shape.rs"
+          echo "     and crates/holdfast-core/src/protocol/method.rs. Promoting ends them."
+          echo "  3. gh release edit ${GITHUB_REF_NAME} --draft=false"
 
   # **crates.io, and it is inert until a token exists.** §12.1 of the design
   # spec lists `cargo install holdfast` as a distribution channel — "published
