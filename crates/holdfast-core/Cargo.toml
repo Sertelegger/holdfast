@@ -4,6 +4,43 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+# **`readme` names a path above the package root and that is deliberate.**
+# `cargo package` copies the file in and rewrites the field to `README.md`
+# (verified: the generated manifest in the tarball reads `readme =
+# "README.md"`), so the one README ships with both crates and there is no
+# per-crate stub to keep in sync with it.
+readme = "../../README.md"
+categories = ["development-tools", "os::unix-apis"]
+description = """\
+The library behind the holdfast binary: PTY-backed session management, \
+prompt detection, secret redaction, and the MCP tool and daemon wire \
+protocols. The API tracks that binary's needs and is not yet stable.\
+"""
+# **The integration tests are workspace gates, not crate tests, and a
+# tarball cannot satisfy them.** `tests/source_guards.rs` asserts properties
+# of `crates/holdfast/src` -- the *sibling* package -- by reading it through
+# `CARGO_MANIFEST_DIR/../holdfast/src`, a path that does not exist in a
+# single-crate tarball. Shipping them ships a `cargo test` that fails for
+# reasons a consumer cannot act on. `tests/wire-shape/` goes with them:
+# `tests/wire_shape.rs` is its only reader.
+#
+# `tests/fixtures/` stays, and is the reason this is a file pattern rather
+# than `"/tests"`: `src/config.rs` has `include_str!(
+# "../tests/fixtures/example_config.toml")` inside its own `#[cfg(test)]`
+# module. Measured on the packaged tarball with that one file removed,
+# `cargo test --lib --no-run`:
+#
+#   error: couldn't read `src/../tests/fixtures/example_config.toml`:
+#     No such file or directory (os error 2)
+#    --> src/config.rs:1797:27
+#
+# **Nothing in the publish path would have reported it.** `cargo package`'s
+# verification build compiles the lib without `--cfg test`, so the whole-
+# directory exclude packages, verifies and publishes green, and the breakage
+# only appears for whoever vendors the crate and runs its tests.
+exclude = ["/tests/*.rs", "/tests/wire-shape"]
 
 [dependencies]
 anyhow.workspace = true

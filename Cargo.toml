@@ -8,8 +8,26 @@ edition = "2021"
 rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/Sertelegger/holdfast"
+# **`readme` is deliberately absent here and set per crate.** An inherited
+# `readme` resolves against the workspace root, and `README.md` sits outside
+# both package directories -- `cargo package` copies nothing from above the
+# package root, so the inherited path would name a file the tarball cannot
+# contain. Each crate points at its own.
+keywords = ["mcp", "pty", "terminal", "shell", "agent"]
 
 [workspace.dependencies]
+# **The intra-workspace dependency, and the one version string that is not
+# the one above.** crates.io rejects a path-only dependency, so `holdfast`'s
+# edge to `holdfast-core` has to carry a literal version; there is no
+# `version.workspace` inside a dependency spec to inherit `0.0.7` from
+# `[workspace.package]`. It is declared here, six lines under the version it
+# must equal, so the bump in CONTRIBUTING.md step 4 sees both at once --
+# and `release.yml` refuses to publish when they disagree, because a stale
+# literal here does not fail any build: it silently resolves `holdfast` against
+# an **older `holdfast-core` already on crates.io**, which is a wrong
+# published artifact rather than a red check.
+holdfast-core = { path = "crates/holdfast-core", version = "0.0.7" }
+
 anyhow = "1.0.104"
 base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
