@@ -788,9 +788,185 @@ jobs:
             exit 1
           fi
           echo "ok    GH #96 still fails on macOS; the exclusion is still needed"
+      # **The bsdtar cell of the plugin bootstrap's archive corpus**, and it
+      # is here because macOS `/usr/bin/tar` IS libarchive's bsdtar -- the
+      # third tar implementation the bootstrap has to survive, free, with
+      # nothing installed. The other two cells live in the `plugin` job.
+      #
+      # It matters that this is a separate cell rather than a repeat: the
+      # three implementations disagree about the archives in the corpus.
+      # bsdtar extracts `./holdfast` where GNU tar and busybox report it not
+      # found -- so an unpinned release-archive shape is a macOS-passes /
+      # Linux-fails split, and this is the cell that would notice.
+      #
+      # **And macOS `/bin/sh` is bash, which is the other half of what this
+      # cell covers and the half that actually caught something.** The corpus
+      # runs under the script's own `#!/bin/sh`; on this runner that is bash
+      # 3.2, whose `ulimit -f` counts 1024-byte blocks where dash counts 512.
+      # A bomb cap written in blocks was therefore twice as generous here as
+      # on every Linux cell, and this job is where that was first seen. The
+      # `plugin` job now runs the same corpus under bash on Linux so the next
+      # one is seen in twenty seconds rather than on another platform — but
+      # this cell stays, because a Linux bash is not macOS's bash 3.2 and the
+      # header line the corpus prints (`shell=`, `tar=`) is the evidence.
+      #
+      # `--mutations` is NOT run here. The mutation table in that script is
+      # keyed by cell and only two cells have been measured; adding a third
+      # key nobody has measured would be a guess wearing an assertion's
+      # clothes.
+      - name: The archive corpus against bsdtar and bash, which is what macOS ships
+        run: |
+          tar --version
+          ./scripts/plugin-archive-tests.sh --tar
       # Doctests are not run here. They are platform-independent prose checks
       # and the `test` job already runs them; repeating them buys nothing a
       # BSD kernel can tell you.
+
+  # --- the plugin and marketplace layer ------------------------------------
+  #
+  # Deliberately NOT gated on `probe`: nothing here spawns a shell or
+  # allocates a pty, and the bootstrap is the one thing in this repository a
+  # user runs before any of the rest of it exists.
+  plugin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # **The self-test first**, for the reason the `hygiene` job gives: this
+      # script's twelve breakage fixtures are the only thing holding its
+      # twenty-five assertions honest, and a guard whose guard is unrun is a
+      # guard on trust.
+      - run: ./scripts/plugin-manifest-check.py --self-test
+      - run: ./scripts/plugin-manifest-check.py
+
+      # `claude plugin validate --strict` is the OFFICIAL check and it is
+      # deliberately not run here: it needs the Claude Code CLI, which is not
+      # a pinned input this pipeline has. Run it by hand before a release
+      # (`dev/workflows/verify.md`).
+      #
+      # **Be clear about what it would and would not buy**, because a green
+      # official tick is easy to mistake for layout verification: measured, it
+      # prints "Validation passed" for a plugin whose commands sit in a
+      # subdirectory and are therefore silently never loaded. The flat-layout
+      # rule above is the one that catches that, and only that rule does.
+
+      - name: shellcheck must exist, or the shell gate below is a no-op
+        run: shellcheck --version
+
+      - name: Lint and syntax-check every shell file the plugin ships
+        run: |
+          set -eux
+          shellcheck -s sh -x plugin/bootstrap plugin/lib-safe-extract.sh
+          shellcheck -s sh -x scripts/plugin-archive-tests.sh scripts/plugin-bootstrap-tests.sh
+          # Both interpreters the plugin promises to run under. `sh` is dash
+          # on Ubuntu, so the second is not a duplicate of the first on any
+          # box where /bin/sh is bash.
+          for f in plugin/bootstrap plugin/lib-safe-extract.sh \
+                   scripts/plugin-archive-tests.sh scripts/plugin-bootstrap-tests.sh; do
+            dash -n "$f"
+            sh -n "$f"
+          done
+
+      # --- cell 1 of 4: dash + GNU tar, unprivileged ------------------------
+      - name: Hostile archives, dash and GNU tar as a normal user
+        run: |
+          set -eux
+          dash ./scripts/plugin-archive-tests.sh --tar
+          dash ./scripts/plugin-archive-tests.sh --mutations gnu-nonroot
+
+      # --- cell 2 of 4: BASH, which is what macOS `/bin/sh` is --------------
+      #
+      # **This cell exists because its absence shipped a broken guard.** Every
+      # Linux cell here ran the corpus under `dash` or `busybox sh`, and the
+      # bootstrap's decompression-bomb cap is `ulimit -f`, whose argument is in
+      # blocks — 512 bytes under dash, 1024 under bash. So the cap was 128 MiB
+      # where CI looked and 256 MiB under macOS `/bin/sh`, which IS bash, and
+      # the 200 MiB corpus bomb was installed there. `macos-native` caught it;
+      # this step is the ~20-second Linux cell that should have caught it
+      # first, and it reproduces the failure exactly on the unfixed library.
+      #
+      # bsdtar as a second run because macOS `tar` is bsdtar too, so this pair
+      # covers the macOS combination end to end. Measured, the tar
+      # implementation was NOT the variable — GNU tar 1.35 and bsdtar 3.7.2
+      # agree on all nineteen cases in both shells — but that is a measurement,
+      # and a measurement stops being true the moment nothing re-takes it.
+      - name: Install bsdtar, which is the tar macOS and Windows both ship
+        run: |
+          # Same Chrome-source removal as the other apt steps in this file,
+          # and for the same measured reason: `apt-get update` exits non-zero
+          # on any source it cannot verify, and that source has served a
+          # mismatched index while this repo's `main` was green.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/google-chrome.sources
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libarchive-tools
+          bsdtar --version
+      - name: Hostile archives under bash, with GNU tar and then with bsdtar
+        run: |
+          set -eux
+          bash ./scripts/plugin-archive-tests.sh --tar
+          HOLDFAST_TAR=bsdtar bash ./scripts/plugin-archive-tests.sh --tar
+          # `--mutations gnu-nonroot` is not repeated here. Measured under
+          # bash it produces the same table as under dash, byte for byte —
+          # the mutation table is keyed by the tar/uid cell and the shell is
+          # not one of its axes — so running it again buys a second copy of
+          # an answer at the cost of six more corpus passes.
+
+      # --- cell 3 of 4: busybox ash + busybox tar, as root ------------------
+      #
+      # **This cell is not redundant and the measurement says so.** Deleting
+      # the post-extraction check breaks NOTHING in cell 1 and breaks the
+      # hardlink case here. Deleting the mode check breaks a different set in
+      # each -- the setuid archive in cell 1, the symlink, device and setuid
+      # archives here, where without it `landed` catches them and the corpus
+      # would have called that a pass until rejections started being matched
+      # against the reason the case was written for. A one-cell matrix makes
+      # a check look like dead code, and dead code is what the next reader
+      # deletes.
+      #
+      # The corpus is generated on the host and piped in: Alpine has no
+      # python3, and `apk add` would make this cell depend on a mutable
+      # package index. The image is pinned by digest for the same reason every
+      # action here is pinned by SHA.
+      - name: Hostile archives, busybox ash and busybox tar as root
+        run: |
+          set -eux
+          python3 ./scripts/plugin-archive-corpus.py "$RUNNER_TEMP/corpus"
+          tar -cf - scripts plugin -C "$RUNNER_TEMP" corpus \
+            | docker run --rm -i \
+                alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
+                sh -c 'mkdir -p /w && tar -xf - -C /w && cd /w
+                       [ "$(id -u)" = 0 ] || { echo "cell must run as root" >&2; exit 1; }
+                       export HOLDFAST_ARCHIVE_CORPUS=/w/corpus
+                       busybox sh scripts/plugin-archive-tests.sh --tar
+                       busybox sh scripts/plugin-archive-tests.sh --mutations busybox-root'
+
+      # --- cell 4 of 4: the Windows extractor, on the only host that can run it
+      #
+      # `pwsh` is preinstalled on the Ubuntu runner image. Asserted rather
+      # than assumed: a missing interpreter here would skip the entire
+      # Windows extraction surface and still exit 0, which is the failure
+      # mode the `shellcheck --version` step above exists for.
+      - name: pwsh must exist, or the zip corpus does not run
+        run: pwsh --version
+      - name: Hostile zip archives against the PowerShell extractor
+        run: ./scripts/plugin-archive-tests.sh --zip
+
+      # --- the download path, against a fabricated release ------------------
+      #
+      # There is no real release to point this at, by construction rather
+      # than by timing. `release.yml` does now build and attach the five
+      # §12.1 assets and a `SHA256SUMS.txt`, but to a DRAFT release, and a
+      # draft's assets are not served from `releases/download/vX.Y.Z/` --
+      # promoting one is the spec's first-external-distribution decision and
+      # is deliberately a human step. So this harness is the permanent answer
+      # even after a tag exists. It must never be replaced by a test that
+      # skips when no release is found -- that is a test that has never run.
+      - name: The bootstrap download path, over loopback HTTP
+        run: ./scripts/plugin-bootstrap-tests.sh
 
   # --- the capability gate -------------------------------------------------
 

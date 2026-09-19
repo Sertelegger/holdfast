@@ -265,16 +265,26 @@ Cutting one is therefore:
    definition** — a missing one is why `[0.0.5]` and `[0.0.6]` rendered with
    visible brackets for two releases while `[0.0.7]` did not.
 3. Open a fresh empty `## [Unreleased]`.
-4. Bump **both** version literals in the root `Cargo.toml` to match, and
-   commit. `[workspace.package] version` is the obvious one;
+4. Bump the version to match in **three files and four literals**, and
+   commit. Two of the four are in the root `Cargo.toml`:
+   `[workspace.package] version` is the obvious one, and
    `holdfast-core = { path = "crates/holdfast-core", version = "X.Y.Z" }`
-   under `[workspace.dependencies]` is the second. It exists because
+   under `[workspace.dependencies]` is the second. That one exists because
    crates.io rejects a path-only dependency and there is no
    `version.workspace` to inherit inside a dependency spec. **A stale second
    literal fails no build and no test** — the workspace still resolves it by
    path — and surfaces only as a *published* `holdfast` bound to an older
    `holdfast-core`, which is a wrong permanent artifact rather than a red
    check. The two are declared six lines apart so that one edit sees both.
+
+   The other two are `plugin/version.txt` and
+   `plugin/.claude-plugin/plugin.json`. The design spec names only
+   `Cargo.toml` and `version.txt`, and the third file is the one that matters
+   most to an installed user — the plugin install cache is keyed
+   `cache/<marketplace>/<plugin>/<version>/` from `plugin.json`, so a release
+   that bumps the other two ships a plugin that never updates itself.
+   `scripts/plugin-manifest-check.py` fails if the three files disagree, and
+   the `plugin` CI job runs it.
 5. Tag `vX.Y.Z` and push the tag. That triggers
    `.github/workflows/release.yml`, which checks that the tag, the crate
    version and a non-empty changelog section all agree, then publishes the

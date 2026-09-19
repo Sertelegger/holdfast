@@ -1,0 +1,22 @@
+{
+  "name": "holdfast",
+  "owner": {
+    "name": "Sascha Sertel",
+    "email": "Sertelegger@users.noreply.github.com"
+  },
+  "metadata": {
+    "description": "Single-plugin marketplace for Holdfast — this repository is both the source and the marketplace, so a release ships binaries, plugin manifest and listing together."
+  },
+  "plugins": [
+    {
+      "name": "holdfast",
+      "source": "./plugin",
+      "description": "A persistent, PTY-backed shell environment for AI agents, over MCP. Sessions outlive the tool call: real terminals, real stdin, prompt detection, secret input, and a human who can attach.",
+      "homepage": "https://github.com/Sertelegger/holdfast#readme",
+      "repository": "https://github.com/Sertelegger/holdfast",
+      "license": "MIT",
+      "category": "development",
+      "keywords": ["mcp", "pty", "terminal", "shell", "session", "tmux", "rust"]
+    }
+  ]
+}
