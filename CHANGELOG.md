@@ -214,6 +214,14 @@ is cut, named and published is in
   inferring one. It inferred from `state` and its own `--raw`, which separates
   two of the three rules and not the third, so a live session wedged on
   [#14]'s bound was told *"read again to pick up the rest"* ([#195]).
+- **`[limits] resource_read_max_bytes` is refused below the session output
+  ring**, naming the key and the floor. It is the ceiling on the only general
+  recourse above, and `nonzero` was its only floor — so `= 1` loaded, and a
+  `resources/read` paging loop then wedged exactly as `read_output` does. The
+  floor is `registry::DEFAULT_BUFFER_BYTES` and **not** `[limits]
+  output_buffer_bytes`, which is inert ([#128]): relating a live key to a dead
+  one would pass a configuration whose operator believed the invariant held
+  while the real ring stayed at 1 MiB ([#203]).
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of
@@ -1423,6 +1431,7 @@ residuals that are known and accepted.
 [#149]: https://github.com/Sertelegger/holdfast/issues/149
 [#160]: https://github.com/Sertelegger/holdfast/issues/160
 [#195]: https://github.com/Sertelegger/holdfast/issues/195
+[#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
