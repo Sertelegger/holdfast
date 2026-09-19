@@ -2,7 +2,7 @@
 //! status, list_sessions, get_command_history.
 
 use super::envelope::{self, Status};
-use super::{caller, detection, schema, HoldfastServer};
+use super::{caller, detection, offload, schema, HoldfastServer};
 use crate::detect::{
     detect_shell, DetectionConfig, InteractionMode, PatternSet, PromptPattern,
     DEFAULT_SETTLE_THRESHOLD_MS,
@@ -960,21 +960,43 @@ impl HoldfastServer {
         // handshake the daemon scoped this call to, and is `in_process`
         // when there is no control-protocol connection at all.
         let surface = caller::audit_surface("read_output");
-        let read = session.read_processed(
-            &ReadRequest {
-                start,
-                holdback,
-                max_bytes,
-                options: ReadOptions {
-                    ansi,
-                    text_encoding,
-                    redact: args.redact.unwrap_or(true),
-                },
-                tool: surface.tool,
-                client_kind: surface.client_kind,
+        let request = ReadRequest {
+            start,
+            holdback,
+            max_bytes,
+            options: ReadOptions {
+                ansi,
+                text_encoding,
+                redact: args.redact.unwrap_or(true),
             },
-            &self.processor,
-        );
+            tool: surface.tool,
+            client_kind: surface.client_kind,
+        };
+        // **Off the runtime, not merely off the buffer lock** (GH #201).
+        // `read_processed` already runs every regex outside that lock, and
+        // that was the whole of §4.3's requirement — but it runs them on
+        // whichever worker thread is polling this connection, and GH #194
+        // made an ordinary 256 KiB read of real-world UTF-8 cost 0.4–3.9 s.
+        // Measured on the shipped wire, one such read left a single thread
+        // running in the whole daemon, stalled an unrelated session's
+        // `status`, and failed a third client's `holdfast list` outright on
+        // the control protocol's handshake bound. **The numbers live in
+        // `crate::mcp::offload` and deliberately not here** — a second copy
+        // of a measurement is a second thing to update, and this one had
+        // already gone stale against that file once.
+        //
+        // The §9.4 surface is read **above** this line and travels on the
+        // `ReadRequest`, because `caller::current()` is a task-local and
+        // `spawn_blocking` does not inherit one — the rule
+        // `crate::mcp::caller` states, and the one whose violation would
+        // silently rewrite every `redaction_disabled` row this read can
+        // emit to `in_process`.
+        let scan_session = Arc::clone(&session);
+        let scan_processor = Arc::clone(&self.processor);
+        let read = offload::off_runtime("read_output's scan", move || {
+            scan_session.read_processed(&request, &scan_processor)
+        })
+        .await?;
         let state = session.state();
 
         Ok(envelope::ok(
@@ -1050,7 +1072,31 @@ impl HoldfastServer {
         // succeeds either way, so this is never an error path — which is
         // also why §5.3 classifies the tool `readOnlyHint: true` despite
         // it: the change is to Holdfast's bookkeeping, not to the session.
-        let capture = session.screen_state(args.diff_from, redact, &self.processor);
+        //
+        // **Off the runtime for the same reason `read_output` is, and
+        // with more of it to pay** (GH #201). That re-seed is a full
+        // `vt100::Parser` replay of `rows * cols * SEED_BYTES_PER_CELL`,
+        // which §4.2a measured at ~86 MB/s — the one figure that spike
+        // called "not free" — and `find_spans` then runs over the whole
+        // rendered grid. At `pty::MAX_COLS` by `pty::MAX_ROWS` — 1000 by
+        // 1000, which `clamp_geometry` admits — that seed is 4 MiB, and
+        // the capture parses it twice. Nothing inside reads a task-local:
+        // the §9.4 obligation for `redact: false` is discharged above,
+        // where the caller is still in scope.
+        //
+        // **This one holds `Session::screen`'s lock for the whole
+        // capture**, unlike `read_output`, which is outside every lock by
+        // the time it reaches the pool. `crate::mcp::offload` sizes what
+        // that costs a concurrent `status` or `list_sessions`; it is not
+        // a regression — the holder used to be a worker — but the claim
+        // "a queued call holds nothing" is false here and is not made.
+        let capture_session = Arc::clone(&session);
+        let capture_processor = Arc::clone(&self.processor);
+        let diff_from = args.diff_from;
+        let capture = offload::off_runtime("get_screen_state's capture", move || {
+            capture_session.screen_state(diff_from, redact, &capture_processor)
+        })
+        .await?;
         let tracking = session.screen_tracking();
 
         let (mut data, details) = match capture {
@@ -1144,22 +1190,65 @@ impl HoldfastServer {
         // Recording it fixes the durable half: `desired_size` is the floor
         // the session returns to when the last writer detaches, so the
         // request outlives the clients rather than the other way round.
-        session.set_desired_size(args.cols, args.rows);
-        // `Some` unconditionally here: this call *is* the request, so the
-        // fold always has a desired size to work with.
-        let (want_cols, want_rows) = self
-            .attach_hub()
-            .effective_size(&session.id, Some((args.cols, args.rows)))
-            .unwrap_or((args.cols, args.rows));
-
         // A failing `ioctl` is Holdfast failing to do its job, not a session
         // outcome, so it takes the protocol channel (§5.1) — and it
         // matters that it does: the alternative is an `ok` reporting
         // dimensions the terminal never reached.
-        if let Err(e) = session.resize(want_cols, want_rows) {
-            return envelope::from_error(&e);
-        }
-        let (cols, rows) = session.size();
+        //
+        // Off the runtime (GH #201): a width *shrink* cannot reflow, so
+        // `Screen::resize` re-seeds — the same multi-megabyte
+        // `vt100::Parser` replay `get_screen_state` pays, reached from a
+        // tool whose name suggests an `ioctl` and nothing more. That
+        // suggestion is exactly why it was the easiest of the four to
+        // miss.
+        //
+        // **Record, fold, apply and read back under `with_resize_decision`,
+        // which this tool never took and the attach path always did.**
+        // `attach::conn`'s own comment states the hazard: *"the fold is
+        // order-independent; the sequence was not. Two writers on a
+        // multi-thread runtime could each fold and then apply in the
+        // opposite order, leaving the session at a departed or stale
+        // writer's geometry with no further event to correct it."* The
+        // omission predates GH #201 — the statements used to be adjacent
+        // and synchronous, so the window was a scheduler's width — but
+        // putting a `spawn_blocking` hop *and* a multi-megabyte re-seed
+        // between the fold and the apply is not a window to leave open. A
+        // human attaching an 80×24 terminal mid-hop would have had their
+        // geometry overwritten by a fold taken before they arrived, and
+        // the tool would have reported the size it wanted as the size
+        // achieved.
+        //
+        // The guard is a `parking_lot::Mutex` and the closure is
+        // synchronous, so it cannot span an `await` — which is why the
+        // whole sequence goes *inside* the offloaded closure rather than
+        // around it. Holding it across the re-seed is what `attach::conn`
+        // already does, so this adds no new hold, only a second holder.
+        let resize_session = Arc::clone(&session);
+        let hub = Arc::clone(self.attach_hub());
+        let (asked_cols, asked_rows) = (args.cols, args.rows);
+        let resized = offload::off_runtime("resize's re-seed", move || {
+            hub.with_resize_decision(|| {
+                // `desired_size` is the floor the session returns to when
+                // the last writer detaches, so the request outlives the
+                // clients rather than the other way round — and it is set
+                // inside the guard so the fold below cannot read a value
+                // an attach client's fold has already acted on.
+                resize_session.set_desired_size(asked_cols, asked_rows);
+                // `Some` unconditionally here: this call *is* the request,
+                // so the fold always has a desired size to work with.
+                let (want_cols, want_rows) = hub
+                    .effective_size(&resize_session.id, Some((asked_cols, asked_rows)))
+                    .unwrap_or((asked_cols, asked_rows));
+                resize_session
+                    .resize(want_cols, want_rows)
+                    .map(|()| resize_session.size())
+            })
+        })
+        .await?;
+        let (cols, rows) = match resized {
+            Ok(size) => size,
+            Err(e) => return envelope::from_error(&e),
+        };
         // Tell the attached clients, because this changed their view and
         // none of them asked for it. The tool emitted no frame at all
         // before, so a human's terminal learned about an agent's resize
@@ -3829,17 +3918,52 @@ impl HoldfastServer {
             _ => max_bytes,
         };
         let context_surface = caller::audit_surface("wait_for_pattern");
-        let context = session.read_processed(
-            &ReadRequest {
-                start: ReadStart::Cursor(outcome.scan_start),
-                holdback: Holdback::Applies,
-                max_bytes: context_cap,
-                options: ReadOptions::default(),
-                tool: context_surface.tool,
-                client_kind: context_surface.client_kind,
-            },
-            &self.processor,
-        );
+        let context_request = ReadRequest {
+            start: ReadStart::Cursor(outcome.scan_start),
+            holdback: Holdback::Applies,
+            max_bytes: context_cap,
+            options: ReadOptions::default(),
+            tool: context_surface.tool,
+            client_kind: context_surface.client_kind,
+        };
+        // Off the runtime (GH #201). This is `read_output`'s pipeline
+        // over `read_output`'s window — GH #194 measured a backlog wait
+        // at 557 ms against 6.6 ms for the same bytes in ASCII — and the
+        // fact that a *waiting* tool pays it is the reason it reads as
+        // "the wait was slow" rather than as the server going quiet.
+        let context_session = Arc::clone(session);
+        let context_processor = Arc::clone(&self.processor);
+        let context = offload::off_runtime_or_unwind(move || {
+            context_session.read_processed(&context_request, &context_processor)
+        })
+        .await;
+
+        // Hoisted above the response map because it cannot be awaited
+        // inside one. The window is the match span, so it is bounded by
+        // `wait::SCAN_WINDOW_BYTES` rather than by anything smaller —
+        // same pipeline, same reason to run it off the executor.
+        let match_text = match outcome.found {
+            Some(m) if !withheld => {
+                let match_surface = caller::audit_surface("wait_for_pattern");
+                let match_request = ReadRequest {
+                    start: ReadStart::Cursor(m.start),
+                    holdback: Holdback::Applies,
+                    max_bytes: (m.end - m.start) as usize,
+                    options: ReadOptions::default(),
+                    tool: match_surface.tool,
+                    client_kind: match_surface.client_kind,
+                };
+                let match_session = Arc::clone(session);
+                let match_processor = Arc::clone(&self.processor);
+                Some(
+                    offload::off_runtime_or_unwind(move || {
+                        match_session.read_processed(&match_request, &match_processor)
+                    })
+                    .await,
+                )
+            }
+            _ => None,
+        };
 
         let mut fields = serde_json::Map::new();
         fields.insert("matched".into(), json!(outcome.found.is_some()));
@@ -3853,41 +3977,32 @@ impl HoldfastServer {
                     // nulled — when the match is withheld.
                     let mut obj = serde_json::Map::new();
                     obj.insert("offset".into(), json!(m.start));
-                    if !withheld {
-                        // **Through `read_processed`, over the expanded
-                        // window** — §5.2's "`match.text` is routed
-                        // through the OutputProcessor", which
-                        // `redact_str` over the match slice alone was
-                        // not. A *context* rule keys on a label lying
-                        // outside the caller's match (`DD_API_KEY=`
-                        // before a 32-hex value), so redacting a
-                        // zero-context window can never fire it: 8 of the
-                        // 51 built-in rules returned their value
-                        // verbatim, beside an `output_since_start` that
-                        // showed `[REDACTED:datadog]` for the same bytes
-                        // in the same response. The read below is the
-                        // same pass `output_since_start` runs — 512 bytes
-                        // of lookbehind, trimmed back to the match — so
-                        // the two agree by construction rather than by
-                        // coincidence.
-                        //
-                        // It is a second `read_processed` and therefore a
-                        // second contribution to `redaction_stats`, which
-                        // is correct: that tally counts substitutions
-                        // *delivered*, and this response delivers the
-                        // marker twice (§5.2, REQ-O-012).
-                        let match_surface = caller::audit_surface("wait_for_pattern");
-                        let text = session.read_processed(
-                            &ReadRequest {
-                                start: ReadStart::Cursor(m.start),
-                                holdback: Holdback::Applies,
-                                max_bytes: (m.end - m.start) as usize,
-                                options: ReadOptions::default(),
-                                tool: match_surface.tool,
-                                client_kind: match_surface.client_kind,
-                            },
-                            &self.processor,
-                        );
+                    // **Through `read_processed`, over the expanded
+                    // window** — §5.2's "`match.text` is routed through
+                    // the OutputProcessor", which `redact_str` over the
+                    // match slice alone was not. A *context* rule keys on
+                    // a label lying outside the caller's match
+                    // (`DD_API_KEY=` before a 32-hex value), so redacting
+                    // a zero-context window can never fire it: 8 of the
+                    // 51 built-in rules returned their value verbatim,
+                    // beside an `output_since_start` that showed
+                    // `[REDACTED:datadog]` for the same bytes in the same
+                    // response. The read is the same pass
+                    // `output_since_start` runs — 512 bytes of
+                    // lookbehind, trimmed back to the match — so the two
+                    // agree by construction rather than by coincidence.
+                    //
+                    // It is a second `read_processed` and therefore a
+                    // second contribution to `redaction_stats`, which is
+                    // correct: that tally counts substitutions
+                    // *delivered*, and this response delivers the marker
+                    // twice (§5.2, REQ-O-012).
+                    //
+                    // `match_text` is `Some` on exactly the arm that
+                    // spelled `if !withheld` here before GH #201 hoisted
+                    // the read out of this expression: the predicate
+                    // moved, it did not change.
+                    if let Some(text) = &match_text {
                         obj.insert("text".into(), json!(text.output));
                     }
                     serde_json::Value::Object(obj)

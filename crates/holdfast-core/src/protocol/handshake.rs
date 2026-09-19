@@ -76,6 +76,25 @@ pub const PROTOCOL_MINOR: u32 = 4;
 /// is the same user, so this is not a defence against an attacker. It is
 /// a defence against a wedged process, which is a state the `--force`
 /// path in `holdfast daemon stop` already exists to resolve.
+///
+/// **GH #201 asked whether this is the right bound and the answer was
+/// yes, so the number is unchanged and the question is recorded here
+/// rather than left to be asked again.** That issue is `holdfast list`
+/// exiting `rc=2` on this deadline because some *other* session was
+/// being read, and it is genuinely two claims: that the daemon should
+/// have answered, and that five seconds is too short. Only the first is
+/// true. The daemon had not begun the handshake at all — its last worker
+/// was inside a synchronous read (see `crate::mcp::offload`) — so no
+/// deadline distinguishes "busy" from "wedged" here, and every second
+/// added buys a longer wait before an operator learns the same thing.
+/// Raising it would also have made the fix unfalsifiable: the
+/// `control_protocol` rows that pin GH #201 fail *by* this timeout, so a
+/// larger value is a slower red row and not a greener one.
+///
+/// The reading to keep: a client giving up while the daemon is merely
+/// busy would be a defect, and the fix for it is a daemon that is never
+/// too busy to answer one frame — not a client that waits longer to find
+/// out.
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Build identifier reported in the handshake. Wired to a real git SHA

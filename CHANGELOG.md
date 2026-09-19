@@ -609,6 +609,102 @@ is cut, named and published is in
   as a known defect with its measurements, because a number that looks
   arbitrary and is arbitrary is the kind that gets raised again without
   them.
+- **`resize` now folds the requested geometry, applies it and reads it back
+  under the attach hub's resize lock**, which the tool had never taken and the
+  attach path always did. `attach::conn`'s own comment states the hazard —
+  *"the fold is order-independent; the sequence was not"* — and the omission
+  was harmless while the two statements were adjacent and synchronous. Putting
+  a `spawn_blocking` hop and a `vt100` re-seed between them is not a window to
+  leave open: a human attaching an 80×24 terminal mid-hop would have had their
+  geometry overwritten by a fold taken before they arrived, and the tool would
+  have reported the size it asked for as the size achieved, with no further
+  event to correct either. Found while moving the re-seed off the executor,
+  and fixed there because that is what widened it ([#201]).
+
+- **One slow read no longer stalls every other client: the MCP read paths run
+  off the executor's worker threads.** `read_output`, `resources/read`,
+  `get_screen_state`, `resize` and `wait_for_pattern`'s two result reads —
+  which `send_input(wait_for=)` shares — all ran §4.1's ANSI strip, redaction
+  and `vt100` re-seed **inline in the async handler**. §4.3 only ever required
+  that work to be outside the *buffer lock*, which it was, and §4.2a's
+  0.095 ms default read was why nobody asked what thread it was on — but
+  [#194] moved that number by 410× for any window carrying one byte above
+  `0x7f`, which is every real terminal buffer.
+
+  **Not every blocking thing the daemon does moved, and the two that did not
+  are named rather than implied.** An attached observer's per-chunk redaction
+  (`attach::redact_stream`) is stateful across chunks and wants an owner, not a
+  hop per chunk; the §9.4 audit log's `write_all` is blocking *file I/O* rather
+  than CPU and wants a writer task. Both still run on a worker.
+
+  **The symptom was not a slow read.** Measured on the wire, two independent
+  `holdfast mcp` processes against one daemon with twelve worker threads: with
+  a single 256 KiB read in flight, exactly **one** of the daemon's sixteen
+  runtime-named threads was running and fifteen were asleep — twelve of those
+  sixteen are executor workers, the other four are the `std::thread`s two
+  sessions spawn, which Linux gives the creating thread's name — a `status` on
+  an *unrelated* session was answered **17 times in 2.1 s with a worst of
+  2,061 ms** against a 1.28–5.10 ms baseline, and a third client's `holdfast
+  list` exited **rc=2 after 5,031 ms** on the control protocol's handshake
+  bound (`HANDSHAKE_TIMEOUT`, this codebase's own constant; §7.4 states no
+  handshake deadline). At most one worker busy and eleven free rules out both
+  obvious diagnoses: it was neither CPU saturation nor lock contention, but a runtime
+  with no worker left in its I/O driver — so one synchronous call in one
+  handler took the daemon's whole socket surface down, accept loop included.
+  The operator saw a daemon that looked broken, caused by a read of a session
+  they were not looking at.
+
+  After, on the same corpus and the same wire: the same `status` answered
+  **1,453 times** across a 2.4 s read, median 1.52 ms and worst 8.48 ms, and
+  `holdfast list` **rc=0 in 21.7 ms** during a 7.2 s `resources/read`. Nothing
+  about redaction, the holdback or §9.4 changes —
+  `resources::read_resource` now takes its audit surface as an argument
+  precisely so it cannot, since `spawn_blocking` does not inherit the
+  task-local the caller identity lives in and a forgotten hoist would have
+  rewritten every `redaction_disabled` row to `in_process`.
+
+  **`spawn_blocking`'s 512 threads bound how many tasks *run*, not how many
+  are accepted, and the trade is stated rather than assumed.** Tokio's
+  blocking queue is an uncapped `VecDeque` pushed to *before* the thread cap
+  is consulted, and `SpawnError` has no "pool full" variant — so a saturated
+  pool queues without limit and never parks the runtime. For `read_output` and
+  `resources/read` its worst outcome is a read that waits while `status`,
+  `list` and the accept loop keep answering — those two hold no lock once they
+  reach the pool. **`get_screen_state` and `resize` do**: both hold the
+  session's screen lock across the re-seed, and `status` and `list_sessions`
+  read that lock through §5.4's detection block, so a queued capture can delay
+  them. Sized rather than alarming: §4.2a's ~86 MB/s puts the largest seed
+  `clamp_geometry` admits at ~46 ms in release, the lock is per session and
+  sessions are capped at `max_concurrent_sessions` (default 8), and it is not
+  a regression — the holder used to be an executor worker, which is worse.
+  What is new is how many threads can hold such a lock at once.
+  Measured at 64 concurrent 256 KiB reads: 81 daemon threads, `status` worst
+  92.76 ms; at 256: 273 threads, `status` worst 210.23 ms, `holdfast list`
+  rc=0 throughout while the reads themselves degraded to 59–144 s. That
+  degradation is twelve cores doing real work, and it lands on the reads
+  rather than on the control plane, which is the whole trade.
+
+  **What shares that pool, stated exactly, because a draft of this entry got
+  it half wrong.** The per-session PTY reader and writer are raw
+  `std::thread`s, so a session costs the pool nothing for its lifetime; the
+  secret providers return their thread through an internal poll loop and a
+  `kill_group`, which is stronger than a deadline. But `send_input`'s write is
+  only *answered* within `SEND_INPUT_TIMEOUT` — that timeout wraps the
+  `JoinHandle`, not the work, so the pool thread stays parked on the fd, as
+  `tools.rs` has said at that arm since 0.0.6. `WRITE_LOCK_TIMEOUT` keeps it
+  from multiplying (the next write to the same wedged session fails in 2 s
+  rather than queueing), but those threads outlive their session. **That leak
+  is pre-existing and is not repaired here.** What this release changes is the
+  shared fate: exhausting the pool used to degrade `send_input` and the secret
+  paths, and now takes the read surface with it. **Work on that pool is not
+  cancellable** — the same
+  sentence `send_input` has carried since 0.0.6 — but that is not a
+  regression: a synchronous call mid-`async fn` has no await point to be
+  dropped at either, so these reads were already uncancellable and only the
+  thread changed. The handshake's 5 s bound is untouched and is not the
+  defect: it is right that one frame between two local processes should never
+  take longer, and the frame was never late — the daemon was never asked
+  ([#201], [#194]).
 
 - **The `binary` arm of the in-flight test asks the rule as well, so a
   certificate no longer pins the holdback for the rest of the session
@@ -1408,5 +1504,7 @@ residuals that are known and accepted.
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
 [#200]: https://github.com/Sertelegger/holdfast/issues/200
+[#194]: https://github.com/Sertelegger/holdfast/issues/194
+[#201]: https://github.com/Sertelegger/holdfast/issues/201
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
