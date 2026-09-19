@@ -127,6 +127,34 @@ is cut, named and published is in
   `--test redaction_sweep` 50 s against a run still going at 11 minutes when it
   was stopped. Nothing about the shipped binary changes; `--release` already
   optimized both.
+- **§4.1's in-flight scan answers the same question about half as much work on
+  ordinary output, and three orders of magnitude less on a hostile one.** Three
+  changes to `PrefixIndex`, each exactly answer-preserving — nothing is
+  withheld that was released, and nothing released that was withheld. The
+  prefix index buckets into a 256-slot array rather than a `HashMap<u8, _>`,
+  which removes one SipHash of one byte **per input byte of every read**. The
+  two full-suffix walks — the `has_value_group` arm and `still_alive`'s
+  no-automaton fallback — become one backward pass per call and an index
+  comparison against it, which is exact rather than conservative because the
+  predicate is upward-closed and that pass finds its least witness. And
+  `unresolved_from`, whose answer is the `min` of that scan and the trailing
+  value run, computes the run **first** and passes it in as a ceiling: an
+  anchor at or after the run's start could only ever lose the `min`, so
+  declining to look for one cannot move the answer. That ceiling is the one
+  thing here that is not safe everywhere — it changes the scan's *own* answer —
+  so it is a private parameter with one permitted caller and a source guard
+  holding the line. Measured on this tree, before → after: a 41,472-byte read
+  window of ordinary build output 1.58 → 0.65 ms; the same window of
+  `-secret_key=` 326 → 0.97 ms; 270,336 bytes of it 24.2 s → 7.1 ms; and
+  `unresolved_from` over 270,336 bytes of `-sk-` with no trailing delimiter
+  22.3 s → 0.157 ms. **The half of that family that ends in a space is
+  unchanged and that is deliberate** — its cost is in the liveness automaton,
+  which none of this touches, and the merged multi-start sweep that would reach
+  it is a much larger change held back for a separate decision. A
+  `#[cfg(test)]` oracle keeps the pre-change scan and a differential test runs
+  the two against each other over the shipped rule set, the adversarial user
+  rules and 400 randomly generated ones — random sets because the arm the
+  fallback lives in is dead code against the built-in fifty-one ([#163]).
 
 ### Security
 
@@ -1089,5 +1117,6 @@ residuals that are known and accepted.
 [#149]: https://github.com/Sertelegger/holdfast/issues/149
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
+[#163]: https://github.com/Sertelegger/holdfast/issues/163
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
