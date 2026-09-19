@@ -1,0 +1,177 @@
+# **A release workflow cannot be tested by releasing, so this is where it gets
+# tested.** `release.yml` is tag-triggered and holds `contents: write`; cutting
+# a tag to find out whether its YAML parses is not a test, it is a release with
+# a hopeful comment on it. This file runs the identical build, pack, checksum
+# and verify path on every pull request, on all five §12.1 targets, holding no
+# token and able to publish nothing.
+#
+# **How it stays a rehearsal rather than a lookalike.** Every step below that
+# has a counterpart in `release.yml` is the SAME LINE calling the SAME SCRIPT —
+# `scripts/package-release.sh <asset>`, `scripts/package-release.sh --sums`,
+# `scripts/verify-release-archive.sh`. Nothing about how an asset is built,
+# named, archived or summed lives in either workflow's YAML, precisely so that
+# the two cannot drift into agreeing only in appearance. What `release.yml`
+# adds that this file does not exercise is one command, `gh release create`,
+# and that is stated there as the residual rather than here as a footnote.
+#
+# **Why this is not a `workflow_dispatch` on `release.yml` instead.** That is
+# the textbook dry-run hatch and `scripts/ci-hygiene.sh`'s release gate —
+# a denylist of four triggers — lets it through. It should not: it moves the
+# safety from "only a tag can start this" to an `if:` inside a job that holds
+# `contents: write`, which inverts the argument the gate is built on. The same
+# change that added this file turned that denylist into an allowlist, so the
+# hatch is now closed and this file is the answer in its place.
+name: Release rehearsal
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-rehearsal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- one job per §12.1 asset ---------------------------------------------
+  pack:
+    # `fail-fast: false` because the question this job answers is "which
+    # targets build", and a matrix that cancels its siblings on the first red
+    # answers it for one target and guesses at four.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both Linux assets cross-build on one x86_64 runner, and that is
+          # measured rather than hoped: `x86_64-unknown-linux-musl` links on a
+          # stock `ubuntu-24.04` with no apt package at all, and
+          # `aarch64-unknown-linux-musl` links with the `rust-lld` override in
+          # `.cargo/config.toml`, producing a genuine AArch64 ELF. See that
+          # file for why musl rather than gnu — §13.3's Alpine promise decides
+          # it.
+          - asset: linux-x86_64
+            os: ubuntu-24.04
+            runnable: true
+          - asset: linux-aarch64
+            os: ubuntu-24.04
+            runnable: false
+          # Apple and MSVC are built natively. They COMPILE from Linux — every
+          # crate including the binary — and fail only at the final link, on a
+          # missing macOS SDK and a missing `link.exe`. Those are native-runner
+          # problems and a native build is the more trustworthy answer anyway.
+          # `macos-14` is deprecated upstream and there is no `macos-13` label
+          # at all any more, which is why x64 macOS is `macos-15-intel`.
+          - asset: macos-aarch64
+            os: macos-15
+            runnable: true
+          - asset: macos-x86_64
+            os: macos-15-intel
+            runnable: true
+          - asset: windows-x86_64
+            os: windows-2022
+            runnable: true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the toolchain rust-toolchain.toml pins
+        shell: bash
+        run: rustup show active-toolchain && rustc --version
+      # Cached HERE and not in `release.yml`: a release builds clean from the
+      # tag (§12.4), and a rehearsal runs on every pull request, where the
+      # cache is the difference between a gate people keep and one they turn
+      # off. The cache changes how fast the build is, not what it produces.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: rehearse-${{ matrix.asset }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build and pack ${{ matrix.asset }}
+        shell: bash
+        env:
+          HOLDFAST_BUILD_SHA: ${{ github.sha }}
+        run: ./scripts/package-release.sh "${{ matrix.asset }}" dist
+      # The consuming half, on the leg that produced the archive: §13.3 step
+      # 5's safe-archive rules against the real artifact. The per-asset
+      # `.sha256` is already in `SHA256SUMS.txt`'s exact line format, so this
+      # is the same parse the assembled file gets below.
+      - name: Verify and safely extract the archive it just made
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="dist/$(./scripts/package-release.sh --archive "${{ matrix.asset }}")"
+          ./scripts/verify-release-archive.sh --extract-to extracted \
+            "${archive}.sha256" "$archive"
+      # **The only thing that proves the asset is a program.** Four of the
+      # five legs build natively and can run what they built; `linux-aarch64`
+      # is cross-built and is skipped here by `matrix.runnable`, which is a
+      # named residual rather than a silent one.
+      - name: Run the extracted binary
+        if: matrix.runnable
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="extracted/holdfast"
+          [ -f "$bin" ] || bin="extracted/holdfast.exe"
+          out="$("$bin" version)"
+          echo "$out"
+          want="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          case "$out" in
+            "holdfast $want "*) ;;
+            *) echo "extracted binary says '$out'; Cargo.toml says $want" >&2; exit 1 ;;
+          esac
+          case "$out" in
+            *"build unknown"*)
+              echo "the asset reports 'build unknown' — HOLDFAST_BUILD_SHA did not reach the build" >&2
+              exit 1 ;;
+          esac
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rehearsal-${{ matrix.asset }}
+          path: dist/
+          retention-days: 7
+          # `warn` is the default and produces a GREEN job with a warning
+          # nobody reads when nothing was built. That is a job that cannot
+          # fail.
+          if-no-files-found: error
+
+  # --- the shape the release publishes -------------------------------------
+  assemble:
+    needs: pack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: rehearsal-*
+          path: dist
+          merge-multiple: true
+      # Same line as the publish job. It fails if §12.1's five assets are not
+      # all present, so a matrix leg that was deleted or skipped cannot
+      # produce a four-asset set whose checksum file is internally consistent.
+      - name: Assemble SHA256SUMS.txt
+        run: ./scripts/package-release.sh --sums dist
+      - name: Every asset verifies against the assembled SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          for a in $(./scripts/package-release.sh --assets); do
+            archive="dist/$(./scripts/package-release.sh --archive "$a")"
+            echo "=== $archive"
+            ./scripts/verify-release-archive.sh dist/SHA256SUMS.txt "$archive"
+          done
+      - name: What the release would carry
+        run: ls -l dist && cat dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rehearsal-release-set
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error

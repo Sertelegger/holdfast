@@ -201,6 +201,17 @@ request runs:
 | `fish-req-ts-008` | `ubuntu-24.04` with fish 4.x from `ppa:fish-shell/release-4`, running REQ-TS-008's three-arm row and nothing else — the measurement §4.5.1's decision to write unsolicited bytes into a child's stdin rests on, which had executed nowhere in this pipeline until 0.0.4. It gets its own job because installing fish in `test` takes `tests/detection.rs`'s fish row red for a defect that is not the pipeline's; the `detection` binary is never invoked here, so that row's agreed skip is untouched. Not gated on `probe` — fish is deliberately not among the shells the probe asserts |
 | `package` | `cargo build --release --locked`, the MCP smoke script against the *release* binary, and a downloadable artifact + SHA-256. It `needs:` a green `test`, so the build that gets installed is the build that was tested |
 
+Not in the table above, because the table enumerates `ci.yml`: **`release
+rehearsal`** (`release-rehearsal.yml`) builds, packs, checksums, verifies and
+safely extracts all five §12.1 release assets on every pull request, on
+`ubuntu-24.04`, `macos-15`, `macos-15-intel` and `windows-2022`. It exists
+because `release.yml` is tag-triggered and holds a write token, so the only
+other way to find out whether it works is to cut a tag and hope. It publishes
+nothing and holds no token; the one command it cannot exercise —
+`gh release create` — is named as the residual in `release.yml`'s own header.
+**It is not a required status check**, which is a gap: add it alongside the
+eleven, or it is a gate that can go red unnoticed.
+
 Scheduled: a **weekly** flake hunt (Sundays — the suite 100× at 4×
 oversubscribed parallelism) and a **monthly** `cargo mutants` sweep (the 1st).
 Both were cut back from nightly/weekly while this repository was private, when
