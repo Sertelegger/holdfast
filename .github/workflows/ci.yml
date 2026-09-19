@@ -799,11 +799,22 @@ jobs:
       # found -- so an unpinned release-archive shape is a macOS-passes /
       # Linux-fails split, and this is the cell that would notice.
       #
+      # **And macOS `/bin/sh` is bash, which is the other half of what this
+      # cell covers and the half that actually caught something.** The corpus
+      # runs under the script's own `#!/bin/sh`; on this runner that is bash
+      # 3.2, whose `ulimit -f` counts 1024-byte blocks where dash counts 512.
+      # A bomb cap written in blocks was therefore twice as generous here as
+      # on every Linux cell, and this job is where that was first seen. The
+      # `plugin` job now runs the same corpus under bash on Linux so the next
+      # one is seen in twenty seconds rather than on another platform — but
+      # this cell stays, because a Linux bash is not macOS's bash 3.2 and the
+      # header line the corpus prints (`shell=`, `tar=`) is the evidence.
+      #
       # `--mutations` is NOT run here. The mutation table in that script is
       # keyed by cell and only two cells have been measured; adding a third
       # key nobody has measured would be a guess wearing an assertion's
       # clothes.
-      - name: The archive corpus against bsdtar, which is what macOS ships as tar
+      - name: The archive corpus against bsdtar and bash, which is what macOS ships
         run: |
           tar --version
           ./scripts/plugin-archive-tests.sh --tar
@@ -859,21 +870,62 @@ jobs:
             sh -n "$f"
           done
 
-      # --- cell 1 of 3: dash + GNU tar, unprivileged ------------------------
+      # --- cell 1 of 4: dash + GNU tar, unprivileged ------------------------
       - name: Hostile archives, dash and GNU tar as a normal user
         run: |
           set -eux
           dash ./scripts/plugin-archive-tests.sh --tar
           dash ./scripts/plugin-archive-tests.sh --mutations gnu-nonroot
 
-      # --- cell 2 of 3: busybox ash + busybox tar, as root ------------------
+      # --- cell 2 of 4: BASH, which is what macOS `/bin/sh` is --------------
+      #
+      # **This cell exists because its absence shipped a broken guard.** Every
+      # Linux cell here ran the corpus under `dash` or `busybox sh`, and the
+      # bootstrap's decompression-bomb cap is `ulimit -f`, whose argument is in
+      # blocks — 512 bytes under dash, 1024 under bash. So the cap was 128 MiB
+      # where CI looked and 256 MiB under macOS `/bin/sh`, which IS bash, and
+      # the 200 MiB corpus bomb was installed there. `macos-native` caught it;
+      # this step is the ~20-second Linux cell that should have caught it
+      # first, and it reproduces the failure exactly on the unfixed library.
+      #
+      # bsdtar as a second run because macOS `tar` is bsdtar too, so this pair
+      # covers the macOS combination end to end. Measured, the tar
+      # implementation was NOT the variable — GNU tar 1.35 and bsdtar 3.7.2
+      # agree on all nineteen cases in both shells — but that is a measurement,
+      # and a measurement stops being true the moment nothing re-takes it.
+      - name: Install bsdtar, which is the tar macOS and Windows both ship
+        run: |
+          # Same Chrome-source removal as the other apt steps in this file,
+          # and for the same measured reason: `apt-get update` exits non-zero
+          # on any source it cannot verify, and that source has served a
+          # mismatched index while this repo's `main` was green.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/google-chrome.sources
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libarchive-tools
+          bsdtar --version
+      - name: Hostile archives under bash, with GNU tar and then with bsdtar
+        run: |
+          set -eux
+          bash ./scripts/plugin-archive-tests.sh --tar
+          HOLDFAST_TAR=bsdtar bash ./scripts/plugin-archive-tests.sh --tar
+          # `--mutations gnu-nonroot` is not repeated here. Measured under
+          # bash it produces the same table as under dash, byte for byte —
+          # the mutation table is keyed by the tar/uid cell and the shell is
+          # not one of its axes — so running it again buys a second copy of
+          # an answer at the cost of six more corpus passes.
+
+      # --- cell 3 of 4: busybox ash + busybox tar, as root ------------------
       #
       # **This cell is not redundant and the measurement says so.** Deleting
       # the post-extraction check breaks NOTHING in cell 1 and breaks the
-      # hardlink case here; deleting the type check is the other way round.
-      # Two of the four checks are invisible in any single cell, so a one-cell
-      # matrix would make half of them look like dead code -- and dead code is
-      # what gets deleted by the next reader.
+      # hardlink case here. Deleting the mode check breaks a different set in
+      # each -- the setuid archive in cell 1, the symlink, device and setuid
+      # archives here, where without it `landed` catches them and the corpus
+      # would have called that a pass until rejections started being matched
+      # against the reason the case was written for. A one-cell matrix makes
+      # a check look like dead code, and dead code is what the next reader
+      # deletes.
       #
       # The corpus is generated on the host and piped in: Alpine has no
       # python3, and `apk add` would make this cell depend on a mutable
@@ -892,7 +944,7 @@ jobs:
                        busybox sh scripts/plugin-archive-tests.sh --tar
                        busybox sh scripts/plugin-archive-tests.sh --mutations busybox-root'
 
-      # --- the Windows extractor, on the only host that can run it ----------
+      # --- cell 4 of 4: the Windows extractor, on the only host that can run it
       #
       # `pwsh` is preinstalled on the Ubuntu runner image. Asserted rather
       # than assumed: a missing interpreter here would skip the entire

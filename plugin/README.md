@@ -105,23 +105,38 @@ listing for `..` never fires — on the one implementation the rule was written
 for. The archive still extracts a file the maintainer never shipped.
 
 `lib-safe-extract.sh` enforces the clause the same sentence ends with instead:
-the archive must contain *exactly the expected `holdfast` executable*. Four
-checks, each of which is the only thing that catches something:
+the archive must contain *exactly the expected `holdfast` executable*. Five
+checks:
 
 1. the listing is exactly the one expected name — nothing before, nothing after;
 2. the `-tv` mode string is a regular file with no setuid/setgid bit;
 3. extraction of that one member only, under `ulimit -f`;
 4. **what actually landed on disk** is re-validated — one entry, regular file,
-   not a symlink or directory or device, non-empty, link count 1, no setuid.
+   not a symlink or directory or device, non-empty, link count 1, no setuid;
+5. **and it is measured** — `wc -c` against the byte bound, which is where the
+   decompression-bomb verdict now lives.
 
 Check 4 is not defence in depth. busybox tar reports a hardlink entry as a
 regular file and then happily materialises a second link to `/etc/passwd`
 named `holdfast`; nothing in the listing says so.
 
-`scripts/plugin-archive-tests.sh` runs 19 hostile tar archives and 11 hostile
-zips, and deletes each check in turn to prove the corpus goes red. Two of the
-four are invisible outside the busybox-as-root cell, which is why CI runs that
-cell separately.
+**Check 5 is the one that is, and it is deliberate.** `ulimit -f` takes
+*blocks*, and the block size is 512 under dash and 1024 under bash — so one
+fixed block count is a 128 MiB cap under `/bin/sh` on Linux and a 256 MiB cap
+under `/bin/sh` on macOS, where `/bin/sh` is bash. A 200 MiB bomb fits under
+the second. The bound is now a byte constant; check 3 divides it by the larger
+block size so the cap can only come out at or below it, and check 5 compares
+the size of the file that actually arrived to the same constant, asking no
+shell to have meant the right unit and no `tar` to have reported anything.
+
+`scripts/plugin-archive-tests.sh` runs 19 hostile tar archives and 12 hostile
+zips, deletes each check in turn to prove the corpus goes red, and matches
+each rejection against the message of the check that case was written to
+provoke — "it exited non-zero" is not the same claim. Check 4 is invisible outside
+the busybox-as-root cell, and checks 3 and 5 mask each other, so they are
+asserted as a pair. It also asks the kernel, in bytes,
+what cap the running shell actually derived — the assertion the block-size
+bug needed and did not have.
 
 `lib-safe-extract.ps1` is the Windows half. It does **not** use
 `Expand-Archive`: Windows PowerShell 5.1 ships

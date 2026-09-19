@@ -133,22 +133,40 @@ is cut, named and published is in
   archive still extracts a file nobody shipped. What ships is the whitelist
   the same sentence ends with: the listing must be exactly the expected
   member, the mode string must be a regular file with no setuid bit,
-  extraction is of that one member under `ulimit -f`, and **what landed on
-  disk is re-validated** — one entry, regular file, not a symlink or device,
-  link count 1. The fourth check is not defence in depth: busybox reports a
-  hardlink entry as a regular file and then materialises a second link to
-  `/etc/passwd` named `holdfast`, and nothing in the listing says so.
-- A `plugin` CI job. 19 hostile tar archives and 11 hostile zips, generated at
+  extraction is of that one member under `ulimit -f`, **what landed on disk is
+  re-validated** — one entry, regular file, not a symlink or device, link
+  count 1 — and **what landed is measured against the size bound directly**.
+  The fourth check is not defence in depth: busybox reports a hardlink entry
+  as a regular file and then materialises a second link to `/etc/passwd` named
+  `holdfast`, and nothing in the listing says so.
+- **The bomb bound is stated in bytes and enforced twice, because stating it
+  in `ulimit -f` blocks made it depend on which shell `/bin/sh` is.** That
+  argument is 512-byte blocks under dash and 1024-byte blocks under bash, so
+  one fixed block count meant a 128 MiB cap on every cell CI ran and a 256 MiB
+  cap under macOS `/bin/sh` — which is bash — and the 200 MiB corpus bomb was
+  installed there. It is now a byte constant divided by the largest block size
+  any shell uses, so the cap can only come out at or below the bound; and the
+  verdict no longer rests on it, because the size of the file that actually
+  arrived is compared to the same constant with `wc -c`. The tar
+  implementation was never the variable: GNU tar 1.35 and bsdtar 3.7.2 agree
+  on all nineteen tar cases in both shells.
+- A `plugin` CI job. 19 hostile tar archives and 12 hostile zips, generated at
   test time from `scripts/plugin-archive-corpus.py` rather than committed as
-  blobs, across **three tar cells** — dash + GNU tar unprivileged, busybox ash
-  + busybox tar as root in a digest-pinned Alpine container, and bsdtar on
-  `macos-native`, which is what macOS ships as `tar`. Each check is deleted
-  from a copy of the library in turn and the corpus must go red: **two of the
-  four are invisible outside the busybox-as-root cell**, so a one-cell matrix
-  would make half of them read as dead code. Plus the download path itself,
-  against a fabricated release over loopback HTTP, including four hostile
-  archives re-hashed so the checksum *matches* — the compromised-release case
-  the extraction rules exist for.
+  blobs, across **four cells** — dash + GNU tar unprivileged; bash with GNU tar
+  and again with bsdtar, which is the pair macOS `/bin/sh` and macOS `tar`
+  make; busybox ash + busybox tar as root in a digest-pinned Alpine container;
+  and the PowerShell extractor under `pwsh`. `macos-native` runs the tar
+  corpus a fifth time on the real thing. Each check is deleted from a copy of
+  the library in turn and the corpus must go red: **the post-extraction check is
+  invisible outside the busybox-as-root cell**, so a one-cell matrix would
+  make it read as dead code, and the two halves of the size bound are
+  asserted as a pair because each alone is masked by the other. **Every
+  rejection is matched against the message of the check the case was written
+  to provoke**, not merely against a non-zero status — a case that starts
+  tripping an earlier check has silently stopped testing what its name says.
+  Plus the download path itself, against a fabricated release over loopback
+  HTTP, including four hostile archives re-hashed so the checksum *matches* —
+  the compromised-release case the extraction rules exist for.
 - `scripts/plugin-manifest-check.py`, with twelve breakage fixtures. It pins
   what `claude plugin validate --strict` does not: measured, the official
   validator prints "Validation passed" for a plugin whose commands sit in a
