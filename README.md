@@ -5,7 +5,7 @@ An MCP server that gives AI agents persistent, PTY-backed shell sessions.
 The **Human-Observable** in that name is a shipped property from 0.0.6:
 `holdfast attach` and `holdfast watch` let a human look at — and take
 over — a live session from any terminal. The web UI is still to come; see
-[ROADMAP.md](./ROADMAP.md).
+[ROADMAP.md](https://github.com/Sertelegger/holdfast/blob/main/ROADMAP.md).
 
 > **Status: `v0.0.7` is the newest tag — early development.** Twelve
 > tools, hybrid mode on Linux/macOS/WSL. Sessions live in a background
@@ -13,7 +13,7 @@ over — a live session from any terminal. The web UI is still to come; see
 > takes them with it. On Windows there is no daemon: `holdfast mcp`
 > serves stdio in-process and sessions end with it — see the
 > platform-support table below for what is verified there. Output is ANSI-stripped and secret-redacted by
-> default. Not yet suitable for real use; see [ROADMAP.md](./ROADMAP.md)
+> default. Not yet suitable for real use; see [ROADMAP.md](https://github.com/Sertelegger/holdfast/blob/main/ROADMAP.md)
 > for what is and is not there.
 
 ## What works today (`v0.0.7`)
@@ -159,6 +159,16 @@ cargo build --workspace
 claude mcp add --scope user holdfast -- "$(pwd)/target/debug/holdfast" mcp
 ```
 
+**Those commands assume a git checkout, and that is the only way in
+today.** `cargo install holdfast` resolves the `0.0.0` name reservation on
+crates.io and errors with "there is nothing to install"; the shipped
+GitHub Releases carry no binary assets. Publishing either is this
+project's *first external distribution* — a decision it has not taken, and
+one that changes what several in-tree escapes are allowed to do (see
+[CONTRIBUTING.md](https://github.com/Sertelegger/holdfast/blob/main/CONTRIBUTING.md#no-binary-assets)).
+When it is taken, releases are the channel and crates.io the source-build
+fallback beside it.
+
 ## Development
 
 ```bash
@@ -179,7 +189,7 @@ request runs:
 
 | Job | What it runs |
 |---|---|
-| `hygiene` | `scripts/ci-hygiene.sh` — asserts the workflows have not grown a publish step, a `continue-on-error`, a retry action, a `secrets.` reference, an unpinned action, a missing job timeout, or a checkout that leaves a pushable credential behind |
+| `hygiene` | `scripts/ci-hygiene.sh` — asserts the workflows have not grown a `continue-on-error`, a retry action, an unpinned action, a missing job timeout, or a checkout that leaves a pushable credential behind. The publishing rules — a `secrets.` reference, `cargo publish`, `gh`, a write permission — are **scoped rather than absolute**, and `release.yml` is the one file they do not apply to: it declares itself a release workflow and the script verifies that claim by requiring its `on:` block to name `tags:` and to name none of `branches:`, `pull_request` or `schedule` before granting the exemption |
 | `actionlint` | `actionlint` 1.7.12, installed against its published checksums, over `.github/workflows/*.yml`. It runs `shellcheck --version` first and fails if that is absent: actionlint shells out to shellcheck to lint the shell inside every `run:` block, and with it missing skips that silently and still exits 0 — so the check most likely to find a real defect would be the one that quietly did not run. `dev/workflows/verify.md` listed this under *"CI's own gate, which must pass"* from the day it was written, and CI did not run it |
 | `fmt` | `cargo fmt --all --check` |
 | `clippy` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
@@ -190,6 +200,17 @@ request runs:
 | `test` | `scripts/ci-skip-census.sh --self-test` (the census's own gates, deleted one at a time against fixtures), then `cargo nextest run --workspace --locked --no-fail-fast -j 4 --success-output immediate --no-output-indent`, then `cargo test --workspace --locked --doc` because nextest runs no doctests, then `scripts/ci-skip-census.sh` over the captured log — which fails on any skipped row the pipeline has not agreed to, on any *assertion* gated off inside a row that ran without an agreed entry, **and on an agreed one of either kind that stopped happening** |
 | `fish-req-ts-008` | `ubuntu-24.04` with fish 4.x from `ppa:fish-shell/release-4`, running REQ-TS-008's three-arm row and nothing else — the measurement §4.5.1's decision to write unsolicited bytes into a child's stdin rests on, which had executed nowhere in this pipeline until 0.0.4. It gets its own job because installing fish in `test` takes `tests/detection.rs`'s fish row red for a defect that is not the pipeline's; the `detection` binary is never invoked here, so that row's agreed skip is untouched. Not gated on `probe` — fish is deliberately not among the shells the probe asserts |
 | `package` | `cargo build --release --locked`, the MCP smoke script against the *release* binary, and a downloadable artifact + SHA-256. It `needs:` a green `test`, so the build that gets installed is the build that was tested |
+
+Not in the table above, because the table enumerates `ci.yml`: **`release
+rehearsal`** (`release-rehearsal.yml`) builds, packs, checksums, verifies and
+safely extracts all five §12.1 release assets on every pull request, on
+`ubuntu-24.04`, `macos-15`, `macos-15-intel` and `windows-2022`. It exists
+because `release.yml` is tag-triggered and holds a write token, so the only
+other way to find out whether it works is to cut a tag and hope. It publishes
+nothing and holds no token; the one command it cannot exercise —
+`gh release create` — is named as the residual in `release.yml`'s own header.
+**It is not a required status check**, which is a gap: add it alongside the
+eleven, or it is a gate that can go red unnoticed.
 
 Scheduled: a **weekly** flake hunt (Sundays — the suite 100× at 4×
 oversubscribed parallelism) and a **monthly** `cargo mutants` sweep (the 1st).
@@ -334,13 +355,13 @@ more, the assertion simply runs and the census says so.
 
 ## Documentation
 
-- [CHANGELOG.md](./CHANGELOG.md) — what has landed, and the known limitations
+- [CHANGELOG.md](https://github.com/Sertelegger/holdfast/blob/main/CHANGELOG.md) — what has landed, and the known limitations
   that are easy to mistake for bugs
-- [ROADMAP.md](./ROADMAP.md) — where this is going, as ordered scope groupings
+- [ROADMAP.md](https://github.com/Sertelegger/holdfast/blob/main/ROADMAP.md) — where this is going, as ordered scope groupings
   rather than a schedule
-- [CONTRIBUTING.md](./CONTRIBUTING.md) — the checks, and the two testing
+- [CONTRIBUTING.md](https://github.com/Sertelegger/holdfast/blob/main/CONTRIBUTING.md) — the checks, and the two testing
   standards this project actually enforces
-- [SECURITY.md](./SECURITY.md) — what is in scope. Holdfast runs commands on your
+- [SECURITY.md](https://github.com/Sertelegger/holdfast/blob/main/SECURITY.md) — what is in scope. Holdfast runs commands on your
   machine by design, so the interesting surface is the machinery around that:
   detection, signals, and the redactor that now runs at every output boundary.
 
@@ -351,4 +372,4 @@ explaining what it does and why, and the tests name the behaviour they pin.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](https://github.com/Sertelegger/holdfast/blob/main/LICENSE).

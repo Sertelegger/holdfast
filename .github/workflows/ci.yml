@@ -138,6 +138,13 @@ jobs:
       # runs against its own fixtures, needs no document, and is what keeps
       # the parser honest -- the same reason the two lines above it exist.
       - run: python3 ./scripts/spec-enum-check.py --self-test
+      # **The §13.3 safe-archive rules, against archives built to break
+      # them.** `release-rehearsal.yml` runs the same script over the real
+      # assets, but that job is not among the required checks and this one is;
+      # the fixtures need no build, no runner matrix and about a second. Same
+      # argument as the two self-tests above it: a guard whose guard is unrun
+      # is a guard on trust.
+      - run: ./scripts/verify-release-archive.sh --self-test
 
   # `dev/workflows/verify.md` has listed `actionlint` under *"CI's own gate,
   # which must pass"* since the file was written, and CI did not run it —

@@ -265,13 +265,61 @@ Cutting one is therefore:
    definition** — a missing one is why `[0.0.5]` and `[0.0.6]` rendered with
    visible brackets for two releases while `[0.0.7]` did not.
 3. Open a fresh empty `## [Unreleased]`.
-4. Bump the workspace version in `Cargo.toml` to match, and commit.
+4. Bump **both** version literals in the root `Cargo.toml` to match, and
+   commit. `[workspace.package] version` is the obvious one;
+   `holdfast-core = { path = "crates/holdfast-core", version = "X.Y.Z" }`
+   under `[workspace.dependencies]` is the second. It exists because
+   crates.io rejects a path-only dependency and there is no
+   `version.workspace` to inherit inside a dependency spec. **A stale second
+   literal fails no build and no test** — the workspace still resolves it by
+   path — and surfaces only as a *published* `holdfast` bound to an older
+   `holdfast-core`, which is a wrong permanent artifact rather than a red
+   check. The two are declared six lines apart so that one edit sees both.
 5. Tag `vX.Y.Z` and push the tag. That triggers
    `.github/workflows/release.yml`, which checks that the tag, the crate
    version and a non-empty changelog section all agree, then publishes the
    release with that section as the body and the name derived from its
    heading. **The codename must be on the heading before the tag is
    pushed**, or the release ships without it.
+
+### crates.io
+
+`release.yml` carries a second job, `crates-io`. It `needs:` the GitHub
+Release above — crates.io goes last because a version, once uploaded, can be
+yanked but never reused or replaced, while a GitHub Release can be deleted
+and recreated — and then runs `cargo publish --workspace --locked`.
+
+**Today that job does nothing, and cutting a release is unchanged by it.**
+It is gated on a `CARGO_REGISTRY_TOKEN` repository secret that does not
+exist. With the secret absent its first step records `publish=false`, every
+later step is `if:`-ed off, and the job is one shell command that prints why
+it stopped and exits green. Nothing is uploaded. The gate is written that
+way, rather than as an `if:` on `secrets.*`, because `secrets` is not an
+available context in either a job-level or a step-level `if:` — there the
+expression is empty, and a job gated on an empty string runs
+unconditionally.
+
+Two things about it are worth knowing before it is switched on:
+
+- **It publishes `holdfast-core` first, and must.** `holdfast` cannot
+  resolve until core is on the index, and `--workspace` is what orders the
+  members and waits for each upload to appear there. If a run half-succeeds
+  — core uploaded, the binary crate not — a re-run does not recover it: core
+  is already uploaded and cargo refuses. Recovery is a manual
+  `cargo publish -p holdfast`.
+- **Its version check is behind the same gate.** The step that compares the
+  tag against both `Cargo.toml` literals only runs when the token is
+  present, so with no token nothing in this repository catches a stale
+  dependency literal. Step 4 above is the entire defence until then.
+
+**Adding that secret is a decision, not a configuration step.** It is done
+in the GitHub UI: no diff, no PR, no review, and no record here — the
+repository records that the job *reads* the secret, never whether it is set.
+What it changes is that the next tag uploads a permanent, unreplaceable
+artifact, and that is **first external distribution**: the event the note
+below says binds this project's compatibility promises, and that several
+deliberate in-tree escapes are conditioned on not having happened. Decide it
+deliberately, and record here when it was decided.
 
 ### Naming
 
@@ -316,12 +364,31 @@ and inventing one would break the only rule the list has. It is twenty
 releases away; decide it then, and record what was decided here rather than
 leaving the next person to rediscover the problem.
 
-### No binary assets
+### Binary assets, and the draft that keeps them a decision
 
-Releases carry none, and none of the three shipped ones has any. The event that
-binds this project's compatibility promises is **first external
-distribution**, and several deliberate escapes — the wire-shape record's
-in-place corrections most of all — are conditioned on it not having happened. A
-downloadable binary *is* that event, and it is not one to trigger as a side
-effect of writing release notes. When it is time, it is a decision, and it
-changes what those escapes are allowed to do.
+**Releases now carry the five §12.1 assets and `SHA256SUMS.txt`, and they are
+created as drafts.** The three shipped releases carry none, which is why
+Holdfast could not be installed by anybody: measured, the only install path was
+building from source, and nothing in the repository said so.
+
+This section used to say *"no binary assets"*, and the argument it made is
+still the right one — it just decides the `--draft`, not the upload. The event
+that binds this project's compatibility promises is **first external
+distribution**, and several deliberate escapes are conditioned on it not having
+happened: `crates/holdfast-core/tests/wire_shape.rs` rewrites its `1.0.golden`
+record in place on the ground that there is no peer in the world speaking 1.0,
+and `crates/holdfast-core/src/protocol/method.rs` says in as many words that
+*"the latitude ends at the first published binary."* A draft's assets are not
+served from `releases/download/<tag>/<asset>`, so building and attaching them
+is automation and **promoting the draft is the decision** — one act, taken by
+a person, that ends both escapes.
+
+So, cutting a release, after the tag: the `Release` workflow builds all five
+targets, assembles `SHA256SUMS.txt` over exactly those five, verifies each
+archive against it under §13.3's safe-archive rules, and creates the draft.
+Then, by hand:
+
+1. `curl -I` an asset URL **unauthenticated** — it must 404 while the release
+   is a draft. That is the measurement that the event has not happened yet.
+2. Re-read the two escapes above. Promoting ends them.
+3. `gh release edit vX.Y.Z --draft=false`.
