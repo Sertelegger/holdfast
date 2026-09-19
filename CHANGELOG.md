@@ -61,6 +61,16 @@ is cut, named and published is in
   produced the boundary, so reporting it infers nothing and has no false-fire
   rate to measure. [#160] stays open for the warning.
 
+  Naming the three found a **second wedge of the same shape through a
+  different rule**, pre-existing and now pinned by a test:
+  `incomplete_escape` is transient only while `max_bytes >
+  ansi_incomplete_max_bytes` (64). At or below it, `cap_end` stops tracking
+  `buffer.head`, the pending sequence is the same length on every retry, and
+  the read returns zero bytes with the cursor frozen — measured at 1, 8, 32
+  and 64 after a further 300 KB of output, and clearing at 65. Neither shipped
+  surface can reach it (`read_output` defaults to 32 KiB, `holdfast logs`
+  sends 256 KiB), but `max_bytes` is a caller argument with a minimum of 1.
+
 - `read_output` gains `apply_holdback`, the way to ask for the last N lines
   **inside** §4.1's holdback. A bare `tail_lines`/`tail_bytes` is the per-call
   opt-in and still bypasses it, unchanged; `apply_holdback: true` declines that

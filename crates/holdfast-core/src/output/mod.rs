@@ -273,10 +273,18 @@ pub enum HeldBackCause {
     /// escape sequence and the child is still alive, so the tail is held
     /// until the sequence completes.
     ///
-    /// **The bound is a function of the window**, and the withheld tail
-    /// is bounded by `ansi_incomplete_max_bytes` (default 64): the next
-    /// read starts at the introducer, scans far past that cap, and drops
-    /// the sequence instead. Transient by construction.
+    /// **Transient at any ordinary `max_bytes`, and a permanent wedge
+    /// below `ansi_incomplete_max_bytes` (default 64).** The next read
+    /// starts at the introducer and scans `max_bytes` past it; once that
+    /// exceeds the cap the sequence is dropped rather than withheld and
+    /// the read proceeds. At or below the cap it never can be, because
+    /// `cap_end` is `req_start + max_bytes` and stops tracking
+    /// `buffer.head` — measured at 1, 8, 32 and 64 bytes, zero returned
+    /// and the cursor frozen after a further 300 KB of output, and
+    /// clearing at 65. `read_output`'s 32 KiB default and `holdfast
+    /// logs`'s 256 KiB both clear it by three orders of magnitude;
+    /// `an_escape_under_the_incomplete_cap_wedges_like_the_window_bound`
+    /// pins the corner.
     IncompleteEscape,
     /// GH #14: a candidate begins inside the read window and continues
     /// past its end, so *this window* cannot say whether it is a secret,
@@ -308,19 +316,42 @@ impl HeldBackCause {
         }
     }
 
-    /// Whether the boundary can move on its own.
+    /// Parse the wire spelling. The inverse of [`Self::as_str`], so a
+    /// process on the other side of the daemon socket — `holdfast
+    /// logs` — branches on the enum rather than on string literals it
+    /// would keep in step by hand.
     ///
-    /// `true` means the bound tracks `buffer.head`, so the documented
-    /// retry-at-`next_cursor` loop is the right response. `false` means
-    /// it is pinned to the request, and retrying the identical read is
-    /// futile for ever.
+    /// `None` for anything else, which is what a **newer** daemon's
+    /// fourth cause looks like to an older CLI. That falls back to the
+    /// wording that advises a harmless retry, exactly as a daemon too
+    /// old to send the field at all does.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "in_flight_secret" => Some(HeldBackCause::InFlightSecret),
+            "incomplete_escape" => Some(HeldBackCause::IncompleteEscape),
+            "unvouched_window" => Some(HeldBackCause::UnvouchedWindow),
+            _ => None,
+        }
+    }
+
+    /// Whether retrying at `next_cursor`, unchanged, can **ever**
+    /// advance.
+    ///
+    /// **`false` means never** — at any `max_bytes`, after any amount of
+    /// new output. `true` means it can, under the condition stated on
+    /// the variant, and it is **not** an unconditional promise: both
+    /// conditions hold for every read at the shipped defaults, and
+    /// neither holds universally. `in_flight_secret` needs new output
+    /// and REQ-O-005 says a quiesced session will not produce any;
+    /// `incomplete_escape` needs `max_bytes > ansi_incomplete_max_bytes`
+    /// and wedges permanently at or below it.
     ///
     /// **Not serialised, deliberately.** It is derivable from the cause
     /// by a `match`, and a second wire field that can only ever agree
     /// with the first is a second thing to keep in step. It exists so
-    /// the CLI's note and the tests can state the property rather than
-    /// re-deriving the mapping at each site.
-    pub fn advances_with_output(self) -> bool {
+    /// the tests can state the property once rather than re-deriving
+    /// the mapping at each site.
+    pub fn retry_may_advance(self) -> bool {
         match self {
             HeldBackCause::InFlightSecret | HeldBackCause::IncompleteEscape => true,
             HeldBackCause::UnvouchedWindow => false,
@@ -1840,10 +1871,7 @@ mod tests {
         let mut live = b"line one\nghp_abcdef".to_vec();
         let before = read(&live, 0, 32 * 1024);
         assert_eq!(before.held_back_cause, Some(HeldBackCause::InFlightSecret));
-        assert!(before
-            .held_back_cause
-            .expect("cause")
-            .advances_with_output());
+        assert!(before.held_back_cause.expect("cause").retry_may_advance());
         live.extend_from_slice(b"ghijABCDEFGHIJ0123450123456789abcd\n$ echo ok\n");
         let after = read(&live, before.cursor, 32 * 1024);
         assert!(
@@ -1857,7 +1885,7 @@ mod tests {
         let first = read(&wedged, 0, 32 * 1024);
         assert_eq!(first.held_back_cause, Some(HeldBackCause::UnvouchedWindow));
         assert!(
-            !first.held_back_cause.expect("cause").advances_with_output(),
+            !first.held_back_cause.expect("cause").retry_may_advance(),
             "this bound is a function of the request, not of buffer.head"
         );
         let second = read(&wedged, first.cursor, 32 * 1024);
@@ -1936,6 +1964,72 @@ mod tests {
             "the window reached head, so nothing is unvouched"
         );
         assert_eq!(r.held_back_cause, None);
+    }
+
+    /// **A second wedge of GH #195's shape, through a different rule,
+    /// and this row is how it stops being invisible.**
+    ///
+    /// REQ-O-008's withhold is transient because the *next* read starts
+    /// at the introducer and scans `max_bytes` past it, so the sequence
+    /// exceeds `ansi_incomplete_max_bytes` and is dropped instead. That
+    /// argument needs `max_bytes > ansi_incomplete_max_bytes`, and below
+    /// it the argument inverts: `cap_end` is `req_start + max_bytes`, it
+    /// stops tracking `buffer.head`, and the pending sequence is the
+    /// same length on every retry for ever.
+    ///
+    /// Measured here rather than asserted, and **paired**: at 64 the read
+    /// returns zero bytes with the cursor frozen and 300 KB of later
+    /// output does not move it; at 65 the same buffer drops the escape
+    /// and returns the lot. One arm alone passes against an
+    /// implementation that always wedges or never does.
+    ///
+    /// Not reachable from either shipped surface — `read_output`
+    /// defaults to 32 KiB and `holdfast logs` sends 256 KiB — but
+    /// `max_bytes` is a caller argument with a minimum of 1, so it is
+    /// reachable by an agent. It is **pre-existing** behaviour, named
+    /// here because `held_back_cause` would otherwise report
+    /// `incomplete_escape` and the caller would read that as "retry".
+    #[test]
+    fn an_escape_under_the_incomplete_cap_wedges_like_the_window_bound() {
+        let p = processor();
+        let cap = p.limits.ansi_incomplete_max_bytes;
+        // `done` then an unterminated CSI introducer at offset 4, then
+        // plenty of bytes the read would otherwise return.
+        let mut buf = b"done\x1b[".to_vec();
+        buf.extend(std::iter::repeat_n(b'0', 4000));
+        // A caller that followed `next_cursor` lands exactly on the ESC.
+        const ESC_AT: u64 = 4;
+
+        let wedged = read(&buf, ESC_AT, cap);
+        assert_eq!(wedged.bytes_returned, 0, "at the cap: zero bytes");
+        assert_eq!(wedged.next_cursor, Some(ESC_AT), "…and a frozen cursor");
+        assert_eq!(
+            wedged.held_back_cause,
+            Some(HeldBackCause::IncompleteEscape)
+        );
+
+        // 300 KB of later output does not move it, which is what makes
+        // it a wedge rather than a delay.
+        let mut later = buf.clone();
+        later.extend(std::iter::repeat_n(b'y', 300 * 1024));
+        let after = read(&later, ESC_AT, cap);
+        assert_eq!(after.bytes_returned, 0);
+        assert_eq!(after.next_cursor, Some(ESC_AT));
+
+        // The paired arm: one byte over the cap and the sequence is
+        // dropped instead, exactly as `an_over_long_incomplete_escape_
+        // is_dropped_rather_than_stalling_reads` describes.
+        let clear = read(&buf, ESC_AT, cap + 1);
+        assert!(!clear.held_back, "one byte over the cap must not wedge");
+        assert_eq!(clear.held_back_cause, None);
+        assert!(clear.dropped_incomplete_escape);
+        assert_eq!(clear.bytes_returned, cap + 1);
+
+        // …and the shipped default is three orders of magnitude clear of
+        // the corner, so neither surface can reach it.
+        let default_read = read(&buf, ESC_AT, 32 * 1024);
+        assert!(!default_read.held_back);
+        assert_eq!(default_read.cursor, buf.len() as u64);
     }
 
     // ------------------------------------------------- ANSI boundary rule
