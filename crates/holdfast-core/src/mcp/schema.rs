@@ -155,6 +155,14 @@ pub enum ScreenTracking {
 /// A size cap is deliberately **not** a value here. It is not a
 /// holdback, the two can be true at once, and `truncated_for_size`
 /// already answers it — see `output::ProcessedRead::held_back_cause`.
+///
+/// Carried by `read_output`, `wait_for_pattern`, `send_input`'s
+/// `wait_for` fields and `resources/read`'s `_meta.holdfast` — every
+/// surface §4.1 calls identical. **`get_screen_state` is the one
+/// exclusion**, and it is not an omission: its `held_back` reports that
+/// the grid was *masked*, not that a read end was pulled back
+/// (REQ-O-011a), so none of these three values is an answer to it and
+/// there is no `next_cursor` for a caller to retry on.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HeldBackCause {
@@ -343,6 +351,18 @@ pub struct WaitForPattern {
     pub truncated_at_tail: Option<bool>,
     pub truncated_for_size: Option<bool>,
     pub held_back: Option<bool>,
+    /// Which rule held this wait's read back. **Non-null exactly when
+    /// `held_back` is true; present and `null` otherwise.**
+    ///
+    /// The vocabulary is `read_output`'s, because the read is —
+    /// `output_since_start` runs through the same pipeline. This tool's
+    /// `held_back` is wider by one term, a match whose range intersects
+    /// the withheld region, and that term is §4.1's holdback by
+    /// construction, so it reports `in_flight_secret`. Where a match is
+    /// withheld *and* the context read hit `unvouched_window`, the
+    /// static cause is the one reported: the match may yet be released
+    /// by an advancing boundary, and the context read never will be.
+    pub held_back_cause: Option<HeldBackCause>,
     pub next_cursor: Option<u64>,
     /// Set **only** when the daemon clamped the requested deadline
     /// (REQ-T-008). A field that is always present carries no information.
@@ -397,6 +417,7 @@ pub struct SendInput {
     pub truncated_at_tail: Option<bool>,
     pub truncated_for_size: Option<bool>,
     pub held_back: Option<bool>,
+    pub held_back_cause: Option<HeldBackCause>,
     pub next_cursor: Option<u64>,
     pub clamped_timeout_secs: Option<u64>,
     pub interaction_mode: Option<InteractionMode>,

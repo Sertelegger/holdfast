@@ -2430,6 +2430,9 @@ async fn wait_for_pattern_response_matches_its_schema() {
             "truncated_at_tail",
             "truncated_for_size",
             "held_back",
+            // GH #195: this tool's `held_back` is `read_output`'s three
+            // rules plus a withheld *match*, and it named none of them.
+            "held_back_cause",
             "next_cursor",
             "interaction_mode",
             "detection_tier",

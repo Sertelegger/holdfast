@@ -4029,6 +4029,32 @@ impl HoldfastServer {
             json!(context.truncated_for_size),
         );
         fields.insert("held_back".into(), json!(withheld || context.held_back));
+        // **This surface's `held_back` is a *wider* disjunction than
+        // `read_output`'s, and the cause has to say so rather than be
+        // dropped.** `withheld` is a fact about the *match* — its range
+        // intersects `[holdback_boundary, buffer.head)` — and `context`
+        // carries `read_output`'s own three-rule answer about the
+        // `output_since_start` read end. Left out entirely, an agent
+        // waiting on this tool got exactly GH #195's wedge with nothing
+        // to read it by: `output_since_start` stops at a bound its own
+        // `context_cap` window produced, `next_cursor` comes back frozen,
+        // and §5.2 tells it *"as more bytes arrive the boundary advances
+        // and a retry returns the text"*.
+        //
+        // `withheld` is `in_flight_secret` by construction, not by
+        // choice: `boundary` above is `holdback_boundary`, which is §4.1
+        // and nothing else. Where both arms fire, the **static** cause
+        // wins, because it is the only value that changes what the
+        // caller does next — a match released by an advancing boundary
+        // is no use if the context read can never get past its own.
+        let cause = match (withheld, context.held_back_cause) {
+            (_, Some(crate::output::HeldBackCause::UnvouchedWindow)) => {
+                Some(crate::output::HeldBackCause::UnvouchedWindow)
+            }
+            (true, _) => Some(crate::output::HeldBackCause::InFlightSecret),
+            (false, c) => c,
+        };
+        fields.insert("held_back_cause".into(), json!(cause.map(|c| c.as_str())));
         fields.insert(
             "next_cursor".into(),
             match (withheld, context.next_cursor) {
@@ -6859,6 +6885,119 @@ mod tests {
                  not a second licence to bypass ({start})"
             );
         }
+
+        kill_everything(&server).await;
+    }
+
+    /// **The same wedge on `wait_for_pattern`, which is the tool an
+    /// agent is most likely to be holding when it happens.**
+    ///
+    /// `output_since_start` is a `read_processed` bounded by this tool's
+    /// own `max_bytes`, so GH #14's bound arises on it identically —
+    /// `held_back: true`, a frozen `next_cursor`, and §5.2 telling the
+    /// caller *"as more bytes arrive the boundary advances and a retry
+    /// returns the text"*. Three reviewers found this independently and
+    /// the cause was being dropped on the floor at the `json!`.
+    ///
+    /// The control is the second arm: this tool's `held_back` is
+    /// `read_output`'s three rules **plus** a withheld match, so a row
+    /// that only drove the wedge would pass against an implementation
+    /// that hard-wired `unvouched_window`. A match sitting inside §4.1's
+    /// holdback must answer `in_flight_secret`.
+    #[tokio::test]
+    async fn a_wedged_wait_names_its_cause_and_a_withheld_match_names_the_other() {
+        let server = HoldfastServer::new();
+        let mut bytes = b"$ cat chain.pem\r\n-----BEGIN RSA PRIVATE KEY-----\r\n".to_vec();
+        for i in 0..600 {
+            bytes.extend_from_slice(
+                format!("KEYBODY{i:06}MIIEowIBAAKCAQEAy8Dbv8prpJ\r\n").as_bytes(),
+            );
+        }
+        let (id, _pty) = mock_session(&server, "waitwedge", vec![], &bytes);
+        let session = server.registry.get(&id).expect("the session");
+        let planted = bytes.len() as u64;
+        settle(&session, "the whole key to reach the buffer", |s| {
+            s.buffer_head() >= planted
+        })
+        .await;
+
+        // A pattern that matches early, so the wait returns at once and
+        // the only thing short of `head` is the context read.
+        const MAX: usize = 4096;
+        assert!(
+            (MAX + server.processor.limits.lookahead_bytes) as u64 * 2 < session.buffer_head(),
+            "the fixture must leave the context window short of head"
+        );
+        let wedged = row(
+            "wait_for_pattern",
+            &server
+                .wait_for_pattern(Parameters(WaitForPatternArgs {
+                    session: id.clone(),
+                    pattern: Some("cat chain".into()),
+                    since_cursor: Some(0),
+                    timeout_secs: Some(5),
+                    max_bytes: Some(MAX),
+                }))
+                .await
+                .expect("wait_for_pattern"),
+        )
+        .data;
+        assert_eq!(wedged["matched"], json!(true), "{wedged}");
+        assert_eq!(wedged["held_back"], json!(true), "{wedged}");
+        assert_eq!(
+            wedged["held_back_cause"],
+            json!("unvouched_window"),
+            "the wait wedges exactly as read_output does and must say so: {wedged}"
+        );
+
+        // The control: an in-flight token at the tail, matched inside
+        // §4.1's holdback. Different rule, different answer, same field.
+        let live = format!("$ cat note\r\nsee {IN_FLIGHT}");
+        let (live_id, _live_pty) = mock_session(&server, "waitarriving", vec![], live.as_bytes());
+        let live_session = server.registry.get(&live_id).expect("the session");
+        settle(&live_session, "the partial to reach the tail", |s| {
+            s.detection().last_line.starts_with("see ")
+        })
+        .await;
+        let arriving = row(
+            "wait_for_pattern",
+            &server
+                .wait_for_pattern(Parameters(WaitForPatternArgs {
+                    session: live_id.clone(),
+                    pattern: Some("ghp_".into()),
+                    since_cursor: Some(0),
+                    timeout_secs: Some(1),
+                    ..Default::default()
+                }))
+                .await
+                .expect("wait_for_pattern"),
+        )
+        .data;
+        assert_eq!(arriving["held_back"], json!(true), "{arriving}");
+        assert_eq!(
+            arriving["held_back_cause"],
+            json!("in_flight_secret"),
+            "a match withheld by §4.1's boundary is §4.1's cause: {arriving}"
+        );
+
+        // …and a wait that withheld nothing carries the key with `null`,
+        // so the key set is the same on every response.
+        let clean = row(
+            "wait_for_pattern",
+            &server
+                .wait_for_pattern(Parameters(WaitForPatternArgs {
+                    session: live_id.clone(),
+                    pattern: Some("cat note".into()),
+                    since_cursor: Some(0),
+                    timeout_secs: Some(1),
+                    max_bytes: Some(8),
+                }))
+                .await
+                .expect("wait_for_pattern"),
+        )
+        .data;
+        assert_eq!(clean["held_back"], json!(false), "{clean}");
+        assert_eq!(clean["held_back_cause"], Value::Null, "{clean}");
 
         kill_everything(&server).await;
     }

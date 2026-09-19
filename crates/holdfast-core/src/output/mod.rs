@@ -832,9 +832,11 @@ impl OutputProcessor {
         // construction; the `.then_some` supplies the reverse, since a
         // claim made at `u == safety_end == cap_end` lowers nothing.
         let held_back_cause = held_back.then_some(cause).flatten();
-        debug_assert!(
-            !held_back || held_back_cause.is_some(),
-            "a held-back read must name the rule that held it back"
+        debug_assert_eq!(
+            held_back,
+            held_back_cause.is_some(),
+            "held_back and its cause answer the same question and must \
+             never disagree"
         );
 
         // **The continuation cursor must never land inside a secret.**

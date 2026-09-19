@@ -53,8 +53,14 @@ is cut, named and published is in
   depend on `buffer.head`, so the documented loop never advances against it.
   Measured on this repository's own `CHANGELOG.md`: eight consecutive
   zero-byte reads with the cursor frozen, on ordinary prose containing no
-  credential ([#195]). Mirrored into `_meta.holdfast` on `resources/read`,
-  where there is no `next_cursor` to retry on at all.
+  credential ([#195]). Carried by `wait_for_pattern` and `send_input`'s
+  `wait_for` fields too — `output_since_start` is the same `read_processed`,
+  so it wedges identically, and that surface's `held_back` is a *wider*
+  disjunction whose extra term (a match intersecting the withheld region) is
+  §4.1's boundary by construction. Mirrored into `_meta.holdfast` on
+  `resources/read`, where there is no `next_cursor` to retry on at all.
+  `get_screen_state` is the one exclusion and not an omission: its
+  `held_back` reports masking rather than a shortened read (REQ-O-011a).
 
   **It is an exact statement, not a heuristic**, which is what separates it
   from [#160]'s excluded-rule *warning*: `process` already computed which term
