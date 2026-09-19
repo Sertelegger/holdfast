@@ -113,6 +113,71 @@ is cut, named and published is in
   download. Second residual: `linux-aarch64` is cross-built, so it is
   shape-verified and never executed; the other four are run by the rehearsal.
 
+- **The Claude Code plugin and marketplace layer** (§13): `plugin/` with its
+  manifest, a `.mcp.json` registering one stdio server, `version.txt`, a
+  README and two commands, plus `.claude-plugin/marketplace.json` at the root
+  so `/plugin marketplace add Sertelegger/holdfast` then `/plugin install
+  holdfast@holdfast` works. **It installs and it does not yet run**, and the
+  gap is named rather than implied: the bootstrap downloads the binary for
+  `version.txt` from the matching GitHub Release, and no release *serves*
+  one. `release.yml` builds and attaches the five §12.1 assets, but to a
+  draft, and a draft's assets are not reachable at
+  `releases/download/vX.Y.Z/` — promoting one is the §12.3
+  first-external-distribution decision and stays a human step. Until someone
+  takes it, the MCP server fails to start with a message naming the manual
+  install.
+- **`plugin/bootstrap` — the launcher, in POSIX sh, with the safe-extraction
+  rules asserted rather than commented.** §13.3 words those rules as a
+  blacklist ("reject absolute paths, `..` path components, symlinks,
+  hardlinks, device files") and **that cannot be implemented over a tar
+  listing**: busybox tar sanitises names *before* it prints them, so
+  `../../../tmp/PWNED` lists as `tmp/PWNED` and a check grepping for `..`
+  never fires — on the one implementation the rule was written for. The
+  archive still extracts a file nobody shipped. What ships is the whitelist
+  the same sentence ends with: the listing must be exactly the expected
+  member, the mode string must be a regular file with no setuid bit,
+  extraction is of that one member under `ulimit -f`, **what landed on disk is
+  re-validated** — one entry, regular file, not a symlink or device, link
+  count 1 — and **what landed is measured against the size bound directly**.
+  The fourth check is not defence in depth: busybox reports a hardlink entry
+  as a regular file and then materialises a second link to `/etc/passwd` named
+  `holdfast`, and nothing in the listing says so.
+- **The bomb bound is stated in bytes and enforced twice, because stating it
+  in `ulimit -f` blocks made it depend on which shell `/bin/sh` is.** That
+  argument is 512-byte blocks under dash and 1024-byte blocks under bash, so
+  one fixed block count meant a 128 MiB cap on every cell CI ran and a 256 MiB
+  cap under macOS `/bin/sh` — which is bash — and the 200 MiB corpus bomb was
+  installed there. It is now a byte constant divided by the largest block size
+  any shell uses, so the cap can only come out at or below the bound; and the
+  verdict no longer rests on it, because the size of the file that actually
+  arrived is compared to the same constant with `wc -c`. The tar
+  implementation was never the variable: GNU tar 1.35 and bsdtar 3.7.2 agree
+  on all nineteen tar cases in both shells.
+- A `plugin` CI job. 19 hostile tar archives and 12 hostile zips, generated at
+  test time from `scripts/plugin-archive-corpus.py` rather than committed as
+  blobs, across **four cells** — dash + GNU tar unprivileged; bash with GNU tar
+  and again with bsdtar, which is the pair macOS `/bin/sh` and macOS `tar`
+  make; busybox ash + busybox tar as root in a digest-pinned Alpine container;
+  and the PowerShell extractor under `pwsh`. `macos-native` runs the tar
+  corpus a fifth time on the real thing. Each check is deleted from a copy of
+  the library in turn and the corpus must go red: **the post-extraction check is
+  invisible outside the busybox-as-root cell**, so a one-cell matrix would
+  make it read as dead code, and the two halves of the size bound are
+  asserted as a pair because each alone is masked by the other. **Every
+  rejection is matched against the message of the check the case was written
+  to provoke**, not merely against a non-zero status — a case that starts
+  tripping an earlier check has silently stopped testing what its name says.
+  Plus the download path itself, against a fabricated release over loopback
+  HTTP, including four hostile archives re-hashed so the checksum *matches* —
+  the compromised-release case the extraction rules exist for.
+- `scripts/plugin-manifest-check.py`, with twelve breakage fixtures. It pins
+  what `claude plugin validate --strict` does not: measured, the official
+  validator prints "Validation passed" for a plugin whose commands sit in a
+  subdirectory and are therefore **silently never loaded**, because
+  auto-discovery is flat-only. It also pins the braced `${CLAUDE_PLUGIN_ROOT}`
+  form (the unbraced one is passed through literally and the server fails with
+  ENOENT), the committed exec bit, and the version lockstep below.
+
 ### Changed
 
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
@@ -128,6 +193,13 @@ is cut, named and published is in
   write token. The `on:` block may now name `push:` and `tags:` and nothing
   else, and the three spellings are self-test fixtures.
 
+- **A release now bumps three files, not two.** §12.5 and `CONTRIBUTING.md`
+  named `Cargo.toml` and `plugin/version.txt`;
+  `plugin/.claude-plugin/plugin.json` carries its own `version` and **that is
+  the one `/plugin update` and the install cache key on** — installPath is
+  `cache/<marketplace>/<plugin>/<version>/`, and `claude plugin list` reports
+  the version from `plugin.json`, not from `version.txt`. A release PR that
+  moved the other two would ship a plugin that never updates itself.
 - **`[security] redaction_enabled = false` is refused at load, and §9.4's
   `session_start` row no longer carries `redaction_enabled`.** The key disabled
   redaction nowhere: its only consumer was that row, so `false` bought an
@@ -217,6 +289,28 @@ is cut, named and published is in
 
 ### Security
 
+- **The plugin bootstrap does not exec whatever `holdfast` is on `$PATH`, and
+  §13.3 step 2 says it should.** Self-reported version output is not
+  authentication: measured, a five-line shell script that echoes
+  `holdfast 0.1.0` for `version` is enough to win, and the process the
+  bootstrap execs inherits the agent's MCP stdio — every command the agent
+  runs and every secret routed through `request_secret_input`. The behaviour
+  survives only behind `HOLDFAST_BOOTSTRAP_ALLOW_PATH`, where setting the
+  variable *is* the authorisation, and the harness asserts both arms.
+- The bootstrap's extraction temp directory is inside the cache directory,
+  not `$TMPDIR`. §13.3 says "extract into a fresh temp directory … atomically
+  rename into the cache path" and omits that the two must share a filesystem:
+  `$TMPDIR` is a different device from `$HOME` on most Linux installs, where
+  `mv` degrades to copy-then-unlink and a concurrent bootstrap can exec a
+  half-written binary. Reasoned from `rename(2)` EXDEV; not demonstrable on a
+  host where the two are one device.
+- **`Expand-Archive` is not used on the Windows path.** Windows PowerShell
+  5.1 — the version §13.3 targets — ships `Microsoft.PowerShell.Archive`
+  1.0.1.0, which predates even the traversal check PowerShell 7's 1.2.5 has;
+  and 1.2.5, measured, still accepts a two-entry archive, accepts a
+  nested-directory archive, and writes a Unix symlink entry out as a regular
+  file whose *content* is the link target. `plugin/lib-safe-extract.ps1`
+  enumerates entries and never joins an archive-supplied string onto a path.
 - **`get_screen_state` no longer paints a credential that arrived with an
   escape sequence inside it, and the grid is the only surface this covers.**
   §4.1's holdback decides whether a secret is still arriving by scanning the
@@ -715,6 +809,28 @@ is cut, named and published is in
   their next line needed, and each now carries the delay that produced its
   figure. `buffer_until_count` was added alongside, and caught a
   `write_secret_if_unread` mutation that had passed all 54 rows in the module.
+
+### Known limitations
+
+- **The plugin's Windows entrypoint is unverified, and it is unverified in a
+  way no amount of care on this side settles.** `.mcp.json` holds exactly one
+  `command` string and the schema has no platform conditional, so §13.3's
+  "registers `bootstrap.sh` on Unix and `bootstrap.cmd` on Windows" cannot be
+  expressed at all. What ships is the only shape in which one string can be
+  both: an extensionless `${CLAUDE_PLUGIN_ROOT}/bootstrap`, which is the POSIX
+  sh script on Unix and which Windows PATHEXT resolution would find as
+  `bootstrap.cmd` — **if** the spawn path does PATHEXT resolution, which was
+  not testable without a Windows host. Two further Windows unknowns ride on
+  it: whether `bootstrap.cmd` is reached, and whether a native child's stdout
+  survives PowerShell's pipeline byte-for-byte, which matters because MCP is
+  JSON-RPC over stdio and a re-encoded stream would connect and then talk
+  nonsense. `plugin/README.md` names the fallback (two server entries, the
+  wrong-platform one failing closed) so it is not re-derived later.
+- The `plugin` CI job's bsdtar cell runs on GitHub's `macos-14` libarchive,
+  not on the older one Apple ships in a stock install, and the mutation
+  controls are not run in that cell at all — the mutation table is keyed by
+  cell and only two cells have been measured, so a third key would be a guess
+  wearing an assertion's clothes.
 
 ## [0.0.7] — 2026-09-01 (Carabiner)
 

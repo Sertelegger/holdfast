@@ -202,6 +202,18 @@ a port rather than a `#[cfg]`:
 Releases, `cargo install`, and a Claude Code plugin marketplace with a bootstrap
 launcher that fetches the right binary on demand.
 
+**The plugin half of that now exists and the binary half does not**, which is
+the whole of what is left here. `/plugin marketplace add Sertelegger/holdfast`
+then `/plugin install holdfast@holdfast` installs — measured — and the
+bootstrap it installs then fails with a message naming the manual install,
+because no release carries binaries or a `SHA256SUMS.txt`. `release.yml`
+attaches none on purpose: doing so is the first-external-distribution event,
+not a side effect of writing release notes. So the remaining work is one
+decision and the assets that follow it, not more plugin code. Windows is the
+one part of the plugin that is genuinely unfinished rather than waiting —
+`.mcp.json` has a single `command` string and no platform conditional, so the
+entrypoint shape shipped there is a hypothesis nobody has been able to run.
+
 ## Beyond the first release
 
 - **Process-isolated PTYs.** The `PtyBackend` trait exists so the isolation

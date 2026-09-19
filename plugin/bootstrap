@@ -1,0 +1,252 @@
+#!/bin/sh
+# Holdfast plugin bootstrap -- the Unix launcher spec §13.3 describes.
+#
+# **This file has no extension on purpose, and the reason is a measurement.**
+# `.mcp.json` holds exactly ONE `command` string and has no platform
+# conditional -- there is no key in the 2.1.273 MCP server schema that lets a
+# plugin name `bootstrap.sh` on Unix and `bootstrap.cmd` on Windows, and the
+# command is spawned directly with no shell to branch in. So §13.3's opening
+# sentence ("registers `${CLAUDE_PLUGIN_ROOT}/bootstrap.sh` on Unix and
+# `${CLAUDE_PLUGIN_ROOT}/bootstrap.cmd` on Windows") cannot be implemented as
+# written. An EXTENSIONLESS command is the only shape in which one string can
+# be both: Unix spawns this file by its shebang, and Windows PATHEXT
+# resolution -- IF the spawn path does it -- finds `bootstrap.cmd` beside it.
+#
+# Whether Windows actually resolves it is UNVERIFIED (no Windows host was
+# available when this landed). It costs nothing on Unix, and the fallback if
+# it does not work is two MCP server entries with the wrong-platform one
+# failing closed. `plugin/README.md` records both.
+#
+# POSIX sh only -- verified with `dash -n`, `busybox sh -n` and `shellcheck
+# -s sh`, and exercised under dash and busybox ash by
+# scripts/plugin-archive-tests.sh.
+set -u
+
+HF_URL_MANUAL="https://github.com/Sertelegger/holdfast/releases"
+HF_URL_SOURCE="https://github.com/Sertelegger/holdfast#build-and-try-it"
+
+# The script's own directory: version.txt and lib-safe-extract.sh ship beside
+# it, and only the `plugin/` subtree is copied into the plugin cache, so
+# "next to me" is well defined. `$0` FIRST and ${CLAUDE_PLUGIN_ROOT} second:
+# $0 is what makes the file runnable by hand and by the test harness, and it
+# was measured to be an absolute path when the loader spawns it. The cwd is
+# the USER's cwd, never the plugin root, so nothing here may be relative.
+HF_ROOT=$(unset CDPATH; cd -- "$(dirname -- "$0")" 2> /dev/null && pwd) || HF_ROOT=''
+if [ -z "$HF_ROOT" ] || [ ! -r "$HF_ROOT/lib-safe-extract.sh" ]; then
+    HF_ROOT=${CLAUDE_PLUGIN_ROOT:-}
+fi
+if [ -z "$HF_ROOT" ] || [ ! -r "$HF_ROOT/lib-safe-extract.sh" ]; then
+    echo "holdfast bootstrap: cannot locate my own directory (tried \$0 and \$CLAUDE_PLUGIN_ROOT); reinstall the plugin" >&2
+    exit 1
+fi
+
+# hf_die is defined by the library, which is sourced before anything can fail.
+hf_die() { echo "holdfast bootstrap: $*" >&2; exit 1; }
+hf_log() { [ -n "${HOLDFAST_BOOTSTRAP_DEBUG:-}" ] && echo "holdfast bootstrap: $*" >&2; return 0; }
+
+# shellcheck source=plugin/lib-safe-extract.sh
+. "$HF_ROOT/lib-safe-extract.sh"
+
+# --- the version this plugin build is pinned to ----------------------------
+[ -r "$HF_ROOT/version.txt" ] || hf_die "version.txt is missing from $HF_ROOT; reinstall the plugin"
+HF_VERSION=$(tr -d ' \t\r\n' < "$HF_ROOT/version.txt")
+case "$HF_VERSION" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) hf_die "version.txt does not hold a version: '$HF_VERSION'" ;;
+esac
+
+# --- target ---------------------------------------------------------------
+hf_os=$(uname -s 2>/dev/null || echo unknown)
+hf_arch=$(uname -m 2>/dev/null || echo unknown)
+case "$hf_os" in
+    Linux)                 HF_OS=linux ;;
+    Darwin)                HF_OS=macos ;;
+    MINGW* | MSYS* | CYGWIN*) HF_OS=windows ;;
+    *) hf_die "no prebuilt binary for '$hf_os' -- build from source: $HF_URL_SOURCE" ;;
+esac
+case "$hf_arch" in
+    x86_64 | amd64)  HF_ARCH=x86_64 ;;
+    aarch64 | arm64) HF_ARCH=aarch64 ;;
+    *) hf_die "no prebuilt binary for '$hf_arch' -- build from source: $HF_URL_SOURCE" ;;
+esac
+HF_TARGET="$HF_OS-$HF_ARCH"
+HF_EXE=holdfast
+HF_EXT=tar.gz
+if [ "$HF_OS" = windows ]; then
+    HF_EXE=holdfast.exe
+    HF_EXT=zip
+fi
+HF_ARCHIVE="holdfast-$HF_TARGET.$HF_EXT"
+
+# --- where the binary is cached -------------------------------------------
+# ${CLAUDE_PLUGIN_DATA} is a per-plugin writable directory the loader exports
+# (measured: `.../plugins/data/<plugin>-<marketplace>`). It is preferred over
+# §13.3's `~/.cache/holdfast/bin/` for two reasons: it is removed when the
+# plugin is uninstalled rather than orphaned, and it is not a well-known path
+# that a hostile local process can pre-create and pre-populate before the
+# first run. The XDG path stays as the fallback for a bootstrap run by hand.
+if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+    HF_CACHE_ROOT=$CLAUDE_PLUGIN_DATA
+else
+    HF_CACHE_HOME=
+    if [ -n "${XDG_CACHE_HOME:-}" ]; then
+        # XDG basedir spec: a RELATIVE value is invalid and must be ignored.
+        case "$XDG_CACHE_HOME" in /*) HF_CACHE_HOME=$XDG_CACHE_HOME ;; esac
+    fi
+    if [ -z "$HF_CACHE_HOME" ]; then
+        [ -n "${HOME:-}" ] || hf_die "neither CLAUDE_PLUGIN_DATA, XDG_CACHE_HOME nor HOME is set, so there is nowhere to cache the binary -- set one, or install holdfast manually from $HF_URL_MANUAL"
+        HF_CACHE_HOME="$HOME/.cache"
+    fi
+    HF_CACHE_ROOT="$HF_CACHE_HOME/holdfast"
+fi
+HF_CACHE_DIR="$HF_CACHE_ROOT/bin"
+HF_CACHED="$HF_CACHE_DIR/holdfast-v$HF_VERSION-$HF_TARGET"
+HF_SUMS_CACHED="$HF_CACHE_DIR/SHA256SUMS-v$HF_VERSION.txt"
+
+HF_BASE_URL=${HOLDFAST_BOOTSTRAP_BASE_URL:-https://github.com/Sertelegger/holdfast/releases/download}
+
+# --- helpers --------------------------------------------------------------
+hf_sha256() {
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum > /dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v openssl > /dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | sed 's/.*= *//'
+    elif command -v cksum > /dev/null 2>&1 && cksum -a sha256 /dev/null > /dev/null 2>&1; then
+        cksum -a sha256 "$1" | sed 's/.*= *//'   # FreeBSD, illumos
+    else
+        hf_die "no SHA-256 tool found (need sha256sum, shasum, openssl or a cksum with -a); install one, or install holdfast manually from $HF_URL_MANUAL"
+    fi
+}
+
+# The expected hash for EXACTLY ONE filename. Not `grep "$name"`: substring
+# matching picks a neighbouring line the day the release adds
+# `holdfast-linux-x86_64-musl.tar.gz`, and it would pick it silently. Whole
+# -field equality, exactly one match required, and the hash shape checked.
+hf_expected_hash() {
+    _want=$1
+    _found=
+    _n=0
+    while read -r _h _f; do
+        _f=${_f#\*}
+        _f=${_f#./}
+        [ "$_f" = "$_want" ] || continue
+        _n=$((_n + 1))
+        _found=$_h
+    done < "$HF_SUMS"
+    [ "$_n" -eq 1 ] || return 1
+    [ ${#_found} -eq 64 ] || return 1
+    case "$_found" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    printf '%s\n' "$_found"
+}
+
+hf_fetch() {   # hf_fetch <url> <dest>
+    case "$1" in
+        https://*) ;;
+        http://* | file://*)
+            # The test harness serves a fabricated release over loopback HTTP.
+            # The opt-in exists so the injectable base URL is not also a
+            # downgrade path: without it, a plain-http base URL is refused.
+            [ -n "${HOLDFAST_BOOTSTRAP_INSECURE:-}" ] \
+                || hf_die "refusing a non-TLS URL ($1) -- TLS to GitHub is the whole of the v0.1.0 trust root (spec A-4)" ;;
+        *) hf_die "unsupported URL scheme: $1" ;;
+    esac
+    if command -v curl > /dev/null 2>&1; then
+        curl --fail --silent --show-error --location --max-time 120 --output "$2" "$1"
+    elif command -v wget > /dev/null 2>&1; then
+        wget --quiet --timeout=120 --output-document="$2" "$1"
+    else
+        hf_die "neither curl nor wget is available, so the binary cannot be fetched -- download it from $HF_URL_MANUAL and place it at $HF_CACHED"
+    fi
+}
+
+# --- 0. an explicitly opted-in $PATH holdfast ------------------------------
+# §13.3 step 2 says to exec whatever `holdfast` is on $PATH whenever
+# `holdfast version` agrees with version.txt. That is NOT shippable as the
+# default: self-reported version output is not authentication, so any
+# writable $PATH entry ahead of the real one wins, and the process this
+# bootstrap execs inherits the agent's MCP stdio -- every command the agent
+# runs and every secret routed through `request_secret_input`. Measured: a
+# five-line shell script that echoes `holdfast 0.1.0` is enough.
+#
+# It survives as an explicit opt-in for the `cargo install` / Homebrew user
+# who wants it, where the env var IS the authorisation.
+if [ -n "${HOLDFAST_BOOTSTRAP_ALLOW_PATH:-}" ]; then
+    hf_path_bin=$(command -v holdfast 2>/dev/null) || hf_path_bin=
+    if [ -n "$hf_path_bin" ] && [ -x "$hf_path_bin" ]; then
+        if "$hf_path_bin" version 2>/dev/null | grep -q "$HF_VERSION"; then
+            hf_log "HOLDFAST_BOOTSTRAP_ALLOW_PATH is set; exec $hf_path_bin"
+            exec "$hf_path_bin" "$@"
+        fi
+    fi
+fi
+
+# --- 1. cache hit ----------------------------------------------------------
+# The cached binary's name carries the version and the target, and it was
+# only ever written after its archive matched the release manifest. Re-
+# hashing 13 MB on every MCP call to re-derive a fact already encoded in the
+# path would put ~40 ms on the hot path for nothing.
+if [ -x "$HF_CACHED" ] && [ -r "$HF_SUMS_CACHED" ]; then
+    hf_log "cache hit: $HF_CACHED"
+    exec "$HF_CACHED" "$@"
+fi
+
+# --- 2. download -----------------------------------------------------------
+mkdir -p "$HF_CACHE_DIR" 2> /dev/null \
+    || hf_die "cannot create $HF_CACHE_DIR (read-only or full filesystem?) -- install holdfast manually from $HF_URL_MANUAL"
+[ -w "$HF_CACHE_DIR" ] \
+    || hf_die "$HF_CACHE_DIR is not writable -- install holdfast manually from $HF_URL_MANUAL"
+
+# The temp directory must be INSIDE the cache directory. §13.3 says "extract
+# into a fresh temp directory ... atomically rename into the cache path", and
+# a bare `mktemp -d` lands in $TMPDIR, which is a different filesystem from
+# $HOME on most Linux installs -- where `mv` degrades to copy-then-unlink and
+# a concurrent bootstrap can exec a half-written binary.
+HF_TMP=$(mktemp -d "$HF_CACHE_DIR/.dl.XXXXXX") || hf_die "cannot create a temp directory in $HF_CACHE_DIR"
+chmod 700 "$HF_TMP"
+trap 'rm -rf "$HF_TMP"' EXIT HUP INT TERM
+
+hf_fetch "$HF_BASE_URL/v$HF_VERSION/SHA256SUMS.txt" "$HF_TMP/SHA256SUMS.txt" \
+    || hf_die "cannot reach $HF_BASE_URL/v$HF_VERSION/SHA256SUMS.txt -- is the release published, and is this host online? On an air-gapped or firewalled host, download holdfast-$HF_TARGET.$HF_EXT and SHA256SUMS.txt from $HF_URL_MANUAL on a connected machine, verify the checksum yourself, and place the extracted binary at $HF_CACHED (see plugin/README.md)"
+HF_SUMS="$HF_TMP/SHA256SUMS.txt"
+
+HF_WANT=$(hf_expected_hash "$HF_ARCHIVE") \
+    || hf_die "the v$HF_VERSION release manifest has no single well-formed entry for $HF_ARCHIVE -- this platform may not be built for that release"
+
+hf_fetch "$HF_BASE_URL/v$HF_VERSION/$HF_ARCHIVE" "$HF_TMP/$HF_ARCHIVE" \
+    || hf_die "cannot download $HF_ARCHIVE from $HF_BASE_URL/v$HF_VERSION/ -- see $HF_URL_MANUAL for a manual install"
+
+HF_GOT=$(hf_sha256 "$HF_TMP/$HF_ARCHIVE")
+[ "$HF_GOT" = "$HF_WANT" ] \
+    || hf_die "checksum mismatch for $HF_ARCHIVE (manifest says $HF_WANT, download hashed $HF_GOT) -- nothing was installed"
+
+mkdir "$HF_TMP/x" || hf_die "cannot create an extraction directory"
+chmod 700 "$HF_TMP/x"
+hf_safe_extract_tar "$HF_TMP/$HF_ARCHIVE" "$HF_TMP/x" "$HF_EXE"
+chmod 755 "$HF_TMP/x/$HF_EXE" || hf_die "cannot chmod the extracted binary"
+
+# The manifest is moved into place FIRST and the binary second, so the pair
+# a later run reads is never binary-without-manifest.
+mv -f "$HF_TMP/SHA256SUMS.txt" "$HF_SUMS_CACHED" || hf_die "cannot install the checksum manifest into $HF_CACHE_DIR"
+mv -f "$HF_TMP/x/$HF_EXE" "$HF_CACHED" || hf_die "cannot install the binary into $HF_CACHE_DIR"
+rm -rf "$HF_TMP"
+trap - EXIT
+hf_log "installed $HF_CACHED"
+
+# One probe, on the install path only, never on the cache-hit path. A cache
+# directory on a NOEXEC mount (docker --tmpfs defaults to noexec, and so do
+# many hardened /tmp and /home mounts) downloads, verifies, extracts and
+# installs perfectly and then dies with a bare "Permission denied" on a file
+# that is mode 755 and owned by the caller. Measured: exit 126, no cause
+# named anywhere. This turns that into a sentence.
+if ! "$HF_CACHED" version > /dev/null 2>&1; then
+    if [ -x "$HF_CACHED" ]; then
+        hf_die "installed $HF_CACHED but cannot run it -- is $HF_CACHE_ROOT on a noexec mount? Point CLAUDE_PLUGIN_DATA or XDG_CACHE_HOME at an exec-permitted filesystem, or install holdfast manually from $HF_URL_MANUAL"
+    fi
+    hf_die "installed $HF_CACHED but it is not executable"
+fi
+
+exec "$HF_CACHED" "$@"
