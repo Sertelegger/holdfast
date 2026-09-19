@@ -575,10 +575,31 @@ check "outputSchema reaches the wire as schemars JSON" '"outputSchema":{"$defs"'
 jcheck "the §18.2a vocabularies reach the wire" \
   '[tool("read_output").outputSchema["$defs"]
     | .Status.enum, .InteractionMode.enum, .DetectionTier.enum,
-      .ScreenTracking.enum, .SessionState.enum]
+      .ScreenTracking.enum, .SessionState.enum, .HeldBackCause.enum]
    + [tool("status").outputSchema["$defs"].ShellIntegration.enum,
       tool("status").outputSchema["$defs"].Osc133Source.enum]' \
-  '[["ok","timeout","session_died","secret_provided","secret_cancelled","session_not_found","name_taken","limit_reached","spawn_failed","not_supported_on_platform","unavailable"],["AtPrompt","Executing","AwaitingSecret","Fullscreen","Exited"],["semantic","terminal_mode","heuristic"],["off","on"],["Starting","Running","Exited","Dead"],["bash","zsh","fish"],["holdfast","external","mixed"]]'
+  '[["ok","timeout","session_died","secret_provided","secret_cancelled","session_not_found","name_taken","limit_reached","spawn_failed","not_supported_on_platform","unavailable"],["AtPrompt","Executing","AwaitingSecret","Fullscreen","Exited"],["semantic","terminal_mode","heuristic"],["off","on"],["Starting","Running","Exited","Dead"],["in_flight_secret","incomplete_escape","unvouched_window"],["bash","zsh","fish"],["holdfast","external","mixed"]]'
+
+# GH #195: `held_back` is three rules and the response named which for
+# none of them, so an agent following §4.1's retry-at-`next_cursor`
+# against GH #14's static bound paged for ever at zero bytes. The cause
+# has to reach the *wire* as a declared value and not merely exist on
+# `ProcessedRead` -- a `json!` key that never got added, or a variant
+# serialised outside its declared vocabulary, is exactly what every Rust
+# test in this repo is blind to.
+#
+# The description is checked rather than only the type, because what
+# makes this field worth anything is that it names the recourse: an
+# agent that reads `unvouched_window` and is not told to fetch
+# `resource_uri` is in the same position it was in before the field
+# existed.
+jcheck "read_output declares held_back_cause and names the recourse" \
+  'tool("read_output").outputSchema["$defs"].ReadOutput.properties.held_back_cause as $c
+   | [($c.anyOf | map(.["$ref"] // .type)),
+      ($c.description | gsub("\\s+";" ") | contains("resource_uri")),
+      (tool("read_output").outputSchema["$defs"].HeldBackCause.description
+       | gsub("\\s+";" ") | contains("Retry at `next_cursor`"))]' \
+  '[["#/$defs/HeldBackCause","null"],true,true]'
 
 # The caveats have to be in the text the AGENT reads, and scoped to the
 # tool that carries them rather than to the transcript. `80 columns` and
@@ -740,6 +761,14 @@ jcheck "read_output advertises apply_holdback and the one value it takes" \
 jcheck "a real tail read may decline the bypass and still get the tail" \
   '[resp(17).error, (data(17).output | type), data(17).held_back]' \
   '[null,"string",false]'
+# The negative half of the field above, on a real response. `null` and
+# `absent` are different answers and only one of them is declared: a
+# `json!` that omitted the key when nothing was withheld would leave an
+# agent unable to branch without first testing for the key's existence,
+# and `has("held_back_cause")` is what separates the two.
+jcheck "a read that withheld nothing carries the key and names no cause" \
+  '[data(5).held_back, (data(5) | has("held_back_cause")), data(5).held_back_cause]' \
+  '[false,true,null]'
 jcheck "apply_holdback: false is refused by name, and names the hatch instead" \
   '[resp(18).error.code,
     (resp(18).error.message | contains("apply_holdback may only be true")),

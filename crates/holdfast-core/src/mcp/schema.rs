@@ -113,6 +113,41 @@ pub enum ScreenTracking {
     On,
 }
 
+/// Which of the three rules behind `held_back` stopped this read
+/// (§4.1, REQ-O-008, GH #14).
+///
+/// Mirrors `output::HeldBackCause::as_str`, and the two are asserted
+/// equal in `tests/schema.rs` — same construction as `SessionState`
+/// below and for the same reason.
+///
+/// **What a caller does with it.** `held_back` alone says only *"some of
+/// what you asked for is being withheld"*, and §4.1's answer to that —
+/// retry at `next_cursor` — is right for two of these three and wrong
+/// for ever for the third:
+///
+/// * `in_flight_secret` and `incomplete_escape` are bounded by
+///   `buffer.head`, so new output moves the boundary. **Retry at
+///   `next_cursor`.** If the session is quiescent or exited (`state`,
+///   `interaction_mode`, both in this same response) the boundary will
+///   not move on its own — REQ-O-005 — and `redact: false` is the
+///   audited hatch.
+/// * `unvouched_window` is bounded by the *request*, not by `head`.
+///   Retrying the identical read returns the identical boundary for
+///   ever, however much output arrives. **Fetch `resource_uri` instead**
+///   (GH #195): `resources/read` reads to `buffer.head`, so the window
+///   is never truncated and this bound cannot arise there.
+///
+/// A size cap is deliberately **not** a value here. It is not a
+/// holdback, the two can be true at once, and `truncated_for_size`
+/// already answers it — see `output::ProcessedRead::held_back_cause`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldBackCause {
+    InFlightSecret,
+    IncompleteEscape,
+    UnvouchedWindow,
+}
+
 /// Lifecycle state of a session (§5.2).
 ///
 /// Mirrors `session::SessionState::as_str`, which is a closed vocabulary of
@@ -220,8 +255,17 @@ pub struct ReadOutput {
     pub truncated_at_tail: Option<bool>,
     pub truncated_for_size: Option<bool>,
     /// The read stopped short of `buffer.head` at the holdback boundary
-    /// (§4.1), or an unfinished escape was pulled back (REQ-O-008).
+    /// (§4.1), or an unfinished escape was pulled back (REQ-O-008), or
+    /// the window could not vouch for a candidate inside it (GH #14).
+    /// `held_back_cause` says which, and the three take different
+    /// recourses.
     pub held_back: Option<bool>,
+    /// Which rule held this read back, present exactly when `held_back`
+    /// is true. `in_flight_secret` and `incomplete_escape` clear as
+    /// output arrives — retry at `next_cursor`. `unvouched_window` never
+    /// clears for the same read at any `max_bytes` — fetch
+    /// `resource_uri` instead (GH #195).
+    pub held_back_cause: Option<HeldBackCause>,
     /// `rule kind -> count` for the redactions inside the returned range.
     /// Empty on an unredacted read; absent only on an error envelope.
     pub redactions: Option<std::collections::BTreeMap<String, u64>>,

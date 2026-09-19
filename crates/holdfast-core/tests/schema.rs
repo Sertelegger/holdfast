@@ -1068,6 +1068,31 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
     let emitted_sources: BTreeSet<String> =
         sources.iter().map(|s| s.as_str().to_string()).collect();
 
+    // GH #195's `held_back_cause`, walked the same way. This one earns
+    // the walk twice over: the agent's branch on it decides between
+    // retrying `next_cursor` and fetching `resource_uri`, and a fourth
+    // cause reaching `mcp/tools.rs` without reaching `schema.rs` would
+    // be a response that fails its own closed `outputSchema` on the
+    // first read that hit the new rule.
+    use holdfast_core::output::HeldBackCause as Hb;
+    fn next_cause(c: Hb) -> Option<Hb> {
+        match c {
+            Hb::InFlightSecret => Some(Hb::IncompleteEscape),
+            Hb::IncompleteEscape => Some(Hb::UnvouchedWindow),
+            Hb::UnvouchedWindow => None,
+        }
+    }
+    let mut causes = vec![Hb::InFlightSecret];
+    while let Some(next) = next_cause(*causes.last().expect("non-empty")) {
+        assert!(
+            !causes.contains(&next),
+            "the HeldBackCause walk revisits {:?}",
+            next.as_str()
+        );
+        causes.push(next);
+    }
+    let emitted_causes: BTreeSet<String> = causes.iter().map(|c| c.as_str().to_string()).collect();
+
     // Both directions. A value emitted but not declared is a response that
     // fails its own schema; a value declared but not emitted is vocabulary
     // the agent is told to branch on and never sees.
@@ -1091,9 +1116,15 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
         emitted_sources,
         "schema::Osc133Source and detect::Osc133Source::as_str disagree"
     );
+    assert_eq!(
+        declared("read_output", "HeldBackCause"),
+        emitted_causes,
+        "schema::HeldBackCause and output::HeldBackCause::as_str disagree"
+    );
     assert_eq!(emitted_states.len(), 4);
     assert_eq!(emitted_shells.len(), 3);
     assert_eq!(emitted_sources.len(), 3);
+    assert_eq!(emitted_causes.len(), 3);
 }
 
 // --------------------------------------------------- real tool responses
@@ -1280,6 +1311,14 @@ async fn read_output_emits_every_field_5_4_promises() {
             // with `Additional properties are not allowed`, and a
             // declared unemitted one fails only here.
             "held_back",
+            // `held_back` is a three-way disjunction and said so
+            // nowhere on the wire, so an agent following §4.1's "retry
+            // at `next_cursor`" against GH #14's static bound paged for
+            // ever at zero bytes (GH #195). The cause is present on
+            // every response — `null` when nothing was withheld — so
+            // that a caller branches on a value rather than on a key's
+            // existence.
+            "held_back_cause",
             "redactions",
             "next_cursor",
             // 0.0.5's resource layer closes §5.2's `resource_uri`, which

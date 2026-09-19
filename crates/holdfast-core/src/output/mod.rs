@@ -235,6 +235,99 @@ pub struct WindowSnapshot<'a> {
     pub truncated_at_tail: bool,
 }
 
+/// Which of the three rules behind `held_back` stopped *this* read.
+///
+/// **`held_back` is a disjunction and the caller was told it was one
+/// thing.** `process` computes it as `safety_end < w.cap_end`, and three
+/// independent rules lower `safety_end`. Two of them move with
+/// `buffer.head`, so the documented "retry at `next_cursor`" loop makes
+/// progress as output arrives. The third does not move at all, and a
+/// caller following that loop against it never advances — GH #195,
+/// measured on this repository's own `CHANGELOG.md`.
+///
+/// **This is an exact statement about the read that just happened, not
+/// a guess.** `process` already knows which term produced the final
+/// `safety_end`, because it computed it; reporting it costs a `match`
+/// and introduces no inference, so there is no false-fire rate to
+/// measure. That is the whole difference between this and GH #160's
+/// *heuristic* excluded-rule warning, which is a prediction about
+/// whether a credential might be present and is held behind its own
+/// measured false-fire problem.
+///
+/// The value is a fact about the boundary, never an instruction: it does
+/// not touch `next_cursor`, `held_back` or the bytes returned, so an
+/// agent that ignores it sees exactly the response it saw before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldBackCause {
+    /// §4.1's targeted holdback: a known secret *prefix* is still
+    /// arriving inside the trailing `partial_secret_scan_bytes` region.
+    ///
+    /// **The bound is a function of `buffer.head`**, so new output moves
+    /// it and the same read makes progress. The exception is stated in
+    /// the same breath by REQ-O-005: quiescence does not release it, so
+    /// a session that stopped mid-token stays withheld — `state` and
+    /// `interaction_mode` in the same response are how a caller tells
+    /// the two apart, and `redact: false` is the audited hatch.
+    InFlightSecret,
+    /// REQ-O-008: the read would have ended inside an unfinished ANSI
+    /// escape sequence and the child is still alive, so the tail is held
+    /// until the sequence completes.
+    ///
+    /// **The bound is a function of the window**, and the withheld tail
+    /// is bounded by `ansi_incomplete_max_bytes` (default 64): the next
+    /// read starts at the introducer, scans far past that cap, and drops
+    /// the sequence instead. Transient by construction.
+    IncompleteEscape,
+    /// GH #14: a candidate begins inside the read window and continues
+    /// past its end, so *this window* cannot say whether it is a secret,
+    /// and the read stops where the evidence ran out.
+    ///
+    /// **The bound is a fixed absolute offset that does not depend on
+    /// `buffer.head` at all** — it is a function of `since_cursor`,
+    /// `max_bytes` and the bytes already in the buffer. Retrying the
+    /// identical read returns the identical boundary for ever, however
+    /// much new output arrives, and *that* is GH #195: eight consecutive
+    /// zero-byte reads with the cursor frozen, measured on this
+    /// repository's own documentation.
+    ///
+    /// The recourse is **`resource_uri`** — see [`ProcessedRead`]'s
+    /// `held_back_cause` for why, and for why "a larger `max_bytes`" is
+    /// not the general answer.
+    UnvouchedWindow,
+}
+
+impl HeldBackCause {
+    /// The wire spelling. Mirrored by `mcp::schema::HeldBackCause`, which
+    /// is what the agent is handed as a closed vocabulary; the two are
+    /// asserted equal in `tests/schema.rs`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeldBackCause::InFlightSecret => "in_flight_secret",
+            HeldBackCause::IncompleteEscape => "incomplete_escape",
+            HeldBackCause::UnvouchedWindow => "unvouched_window",
+        }
+    }
+
+    /// Whether the boundary can move on its own.
+    ///
+    /// `true` means the bound tracks `buffer.head`, so the documented
+    /// retry-at-`next_cursor` loop is the right response. `false` means
+    /// it is pinned to the request, and retrying the identical read is
+    /// futile for ever.
+    ///
+    /// **Not serialised, deliberately.** It is derivable from the cause
+    /// by a `match`, and a second wire field that can only ever agree
+    /// with the first is a second thing to keep in step. It exists so
+    /// the CLI's note and the tests can state the property rather than
+    /// re-deriving the mapping at each site.
+    pub fn advances_with_output(self) -> bool {
+        match self {
+            HeldBackCause::InFlightSecret | HeldBackCause::IncompleteEscape => true,
+            HeldBackCause::UnvouchedWindow => false,
+        }
+    }
+}
+
 /// The result of one processed read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessedRead {
@@ -250,6 +343,25 @@ pub struct ProcessedRead {
     pub truncated_at_tail: bool,
     pub truncated_for_size: bool,
     pub held_back: bool,
+    /// Which rule produced the boundary — `Some` exactly when
+    /// `held_back`, and `None` otherwise.
+    ///
+    /// **Why it is not spelled as a `truncated_for_size` variant.** A
+    /// size cap is not a holdback: `mcp/resources.rs` calls collapsing
+    /// the two into one flag "the fault to avoid", and
+    /// `a_size_cap_is_not_a_holdback` pins it. So a size-capped read
+    /// reports `held_back: false`, `held_back_cause: None`,
+    /// `truncated_for_size: true`, and a caller separates the third case
+    /// by the flag that already exists. The two flags can also both be
+    /// true at once (`front_clipped`), which one merged field could not
+    /// express.
+    ///
+    /// **Why it is not a key in `redactions`.** That map is a strict
+    /// count of markers present in `output`, keyed by rule `kind`;
+    /// `rules.rs` rejects a non-rule kind, and it folds unfiltered into
+    /// `status.redaction_stats`, where a count reads as "secrets this
+    /// session caught" (GH #160).
+    pub held_back_cause: Option<HeldBackCause>,
     pub next_cursor: Option<u64>,
     /// `kind -> count` for the redactions inside the returned range.
     pub redactions: BTreeMap<String, usize>,
@@ -475,6 +587,14 @@ impl OutputProcessor {
         // read would end inside an unfinished escape sequence.
         let mut dropped_incomplete_escape = false;
         let mut safety_end = bound;
+        // Which term is currently *binding*. Each rule below that lowers
+        // `safety_end` claims it, so the last claimant is the one that
+        // produced the final boundary. `holdback` claims it here because
+        // it is folded into `bound` above rather than applied as its own
+        // step; `holdback < cap_end` can only happen when
+        // `holdback_boundary` found a partial prefix, since it otherwise
+        // returns `w.head` and `cap_end <= w.head` always.
+        let mut cause = (holdback < w.cap_end).then_some(HeldBackCause::InFlightSecret);
         if opts.ansi == AnsiMode::Strip {
             let scan_end = bound.clamp(w.window_start, window_end);
             let mut probe = AnsiStripper::new();
@@ -488,7 +608,10 @@ impl OutputProcessor {
                 let seq_len = scan_end.saturating_sub(seq_start);
                 if w.child_alive && seq_len <= self.limits.ansi_incomplete_max_bytes as u64 {
                     // The child may still finish it: withhold the tail.
+                    // `seq_start < scan_end <= bound`, so this only ever
+                    // lowers `safety_end` and the claim is unconditional.
                     safety_end = seq_start;
+                    cause = Some(HeldBackCause::IncompleteEscape);
                 } else {
                     // A dead child never will, and neither will one that
                     // has already exceeded the cap. Drop it; the stripper
@@ -558,6 +681,16 @@ impl OutputProcessor {
                 .unresolved_from(&self.rules, w.window, w.window_start)
                 .filter(|u| !spans.iter().any(|s| s.start <= *u && s.end >= window_end));
             if let Some(u) = unresolved {
+                // `<=` rather than `<` so that a tie hands the cause to
+                // the term that cannot move. Reporting a transient cause
+                // for a bound that is also static is the one direction
+                // that produces advice which never succeeds; the reverse
+                // costs a caller one unnecessary `resources/read`. The
+                // value of `safety_end` is `min` either way, so this is
+                // not a behaviour change.
+                if u <= safety_end {
+                    cause = Some(HeldBackCause::UnvouchedWindow);
+                }
                 safety_end = safety_end.min(u);
             }
         }
@@ -565,6 +698,16 @@ impl OutputProcessor {
         let mut read_end = safety_end.max(w.req_start).min(w.cap_end);
         let held_back = safety_end < w.cap_end;
         let truncated_for_size = w.front_clipped || (w.cap_end < w.head && w.cap_end <= safety_end);
+        // `held_back` and its cause answer the same question and must
+        // never disagree. Every rule that claims `cause` also lowers
+        // `safety_end` below `cap_end`, so the forward direction holds by
+        // construction; the `.then_some` supplies the reverse, since a
+        // claim made at `u == safety_end == cap_end` lowers nothing.
+        let held_back_cause = held_back.then_some(cause).flatten();
+        debug_assert!(
+            !held_back || held_back_cause.is_some(),
+            "a held-back read must name the rule that held it back"
+        );
 
         // **The continuation cursor must never land inside a secret.**
         //
@@ -676,6 +819,7 @@ impl OutputProcessor {
             truncated_at_tail: w.truncated_at_tail,
             truncated_for_size,
             held_back,
+            held_back_cause,
             next_cursor: (held_back || truncated_for_size).then_some(read_end),
             redactions,
             dropped_incomplete_escape,
@@ -1561,6 +1705,127 @@ mod tests {
         );
         assert_eq!(r.cursor, buf.len() as u64);
         assert!(r.output.ends_with("   Compil"), "the tail must survive");
+    }
+
+    // -------------------------------- which rule held it back (GH #195)
+
+    /// **`held_back` is a three-way disjunction and the response named
+    /// which of them for none of them** (GH #160's analysis, GH #195's
+    /// consequence). One arm per rule, driven through the same `read`
+    /// helper every other row here uses.
+    ///
+    /// The two negatives are not padding. Without the ordinary-output
+    /// arm, `Some(InFlightSecret)` unconditionally passes; without the
+    /// size-cap arm, "`Some` whenever anything stopped the read short"
+    /// passes — and that is precisely the collapse `resources.rs` calls
+    /// the fault to avoid, since a size cap is not a holdback.
+    #[test]
+    fn each_rule_behind_held_back_names_itself_and_a_size_cap_names_nothing() {
+        // §4.1's trailing-region holdback: a token still arriving.
+        let arriving = read(b"line one\nghp_abcdef", 0, 32 * 1024);
+        assert!(arriving.held_back);
+        assert_eq!(
+            arriving.held_back_cause,
+            Some(HeldBackCause::InFlightSecret)
+        );
+
+        // REQ-O-008: an unfinished escape with the child still alive.
+        let escape = read(b"done\x1b[3", 0, 4096);
+        assert!(escape.held_back);
+        assert_eq!(
+            escape.held_back_cause,
+            Some(HeldBackCause::IncompleteEscape)
+        );
+
+        // GH #14: a candidate that runs past the end of the window.
+        let (pem, _) = pem_longer_than(64 * 1024);
+        let unvouched = read(format!("$ cat k.pem\n{pem}\n").as_bytes(), 0, 32 * 1024);
+        assert!(unvouched.held_back);
+        assert_eq!(
+            unvouched.held_back_cause,
+            Some(HeldBackCause::UnvouchedWindow)
+        );
+
+        // Negative 1: ordinary output is held back by nothing.
+        let clean = read(b"   Compiling holdfast-core v0.0.1\n", 0, 32 * 1024);
+        assert!(!clean.held_back);
+        assert_eq!(clean.held_back_cause, None);
+
+        // Negative 2: a size cap is reported as a size cap and names no
+        // cause, because nothing was withheld — the rest is simply not
+        // in this response.
+        let capped = read(b"aaaaaaaaaaaaaaaaaaaaaaaa", 0, 8);
+        assert!(capped.truncated_for_size, "the cap is what bit");
+        assert!(!capped.held_back, "a size cap is not a holdback");
+        assert_eq!(capped.held_back_cause, None);
+
+        // The three spellings the wire carries, asserted here so a
+        // rename cannot pass by changing only the enum.
+        assert_eq!(HeldBackCause::InFlightSecret.as_str(), "in_flight_secret");
+        assert_eq!(
+            HeldBackCause::IncompleteEscape.as_str(),
+            "incomplete_escape"
+        );
+        assert_eq!(HeldBackCause::UnvouchedWindow.as_str(), "unvouched_window");
+    }
+
+    /// **GH #195, as behaviour rather than as a label.**
+    ///
+    /// The cause is only worth a wire field if the three values predict
+    /// different futures, so this row drives the future: more output
+    /// arrives, and the same read is issued again.
+    ///
+    /// * `in_flight_secret` — the boundary tracked `buffer.head`, the
+    ///   token completed, and the read progressed.
+    /// * `unvouched_window` — the boundary is pinned to the *request*.
+    ///   225 KB of new output later it is **the same offset**, the read
+    ///   returns **the same zero bytes**, and it would do so for ever.
+    ///   That is the wedge: eight zero-byte reads with a frozen cursor.
+    ///
+    /// The paired arms are what make it a distinction. An implementation
+    /// that reported one cause for both passes neither half alone, and a
+    /// row that only checked the wedge would be green against a
+    /// `read_output` that never advanced at all.
+    #[test]
+    fn only_the_unvouched_bound_survives_more_output_arriving() {
+        // The boundary that moves.
+        let mut live = b"line one\nghp_abcdef".to_vec();
+        let before = read(&live, 0, 32 * 1024);
+        assert_eq!(before.held_back_cause, Some(HeldBackCause::InFlightSecret));
+        assert!(before
+            .held_back_cause
+            .expect("cause")
+            .advances_with_output());
+        live.extend_from_slice(b"ghijABCDEFGHIJ0123450123456789abcd\n$ echo ok\n");
+        let after = read(&live, before.cursor, 32 * 1024);
+        assert!(
+            after.cursor > before.cursor,
+            "the in-flight boundary must move once the token completes"
+        );
+
+        // The boundary that does not.
+        let (pem, _) = pem_longer_than(64 * 1024);
+        let mut wedged = format!("$ cat k.pem\n{pem}\n").into_bytes();
+        let first = read(&wedged, 0, 32 * 1024);
+        assert_eq!(first.held_back_cause, Some(HeldBackCause::UnvouchedWindow));
+        assert!(
+            !first.held_back_cause.expect("cause").advances_with_output(),
+            "this bound is a function of the request, not of buffer.head"
+        );
+        let second = read(&wedged, first.cursor, 32 * 1024);
+        assert_eq!(second.bytes_returned, 0, "the wedge: zero bytes");
+        assert_eq!(
+            second.next_cursor,
+            Some(first.cursor),
+            "…and a frozen cursor"
+        );
+
+        // 225 KB of unrelated output arrives. Nothing changes.
+        wedged.extend(std::iter::repeat_n(b'z', 225 * 1024));
+        let later = read(&wedged, first.cursor, 32 * 1024);
+        assert_eq!(later.bytes_returned, 0);
+        assert_eq!(later.cursor, second.cursor);
+        assert_eq!(later.held_back_cause, Some(HeldBackCause::UnvouchedWindow));
     }
 
     // ------------------------------------------------- ANSI boundary rule

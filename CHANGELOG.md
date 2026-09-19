@@ -44,6 +44,23 @@ is cut, named and published is in
   client that predates the field fails **closed**; nothing an agent sends
   selects it. `holdfast attach --allow-echo` is the CLI spelling ([#137]).
 
+- `read_output` gains **`held_back_cause`**, present exactly when `held_back`
+  is true and `null` otherwise. `held_back` is a disjunction of three rules —
+  §4.1's trailing-region holdback, REQ-O-008's unfinished escape, and [#14]'s
+  window bound — and the response named which of them for none of them. Two
+  of the three clear as output arrives and §4.1's "retry at `next_cursor`" is
+  right for them; the third is a **fixed absolute offset** that does not
+  depend on `buffer.head`, so the documented loop never advances against it.
+  Measured on this repository's own `CHANGELOG.md`: eight consecutive
+  zero-byte reads with the cursor frozen, on ordinary prose containing no
+  credential ([#195]). Mirrored into `_meta.holdfast` on `resources/read`,
+  where there is no `next_cursor` to retry on at all.
+
+  **It is an exact statement, not a heuristic**, which is what separates it
+  from [#160]'s excluded-rule *warning*: `process` already computed which term
+  produced the boundary, so reporting it infers nothing and has no false-fire
+  rate to measure. [#160] stays open for the warning.
+
 - `read_output` gains `apply_holdback`, the way to ask for the last N lines
   **inside** §4.1's holdback. A bare `tail_lines`/`tail_bytes` is the per-call
   opt-in and still bypasses it, unchanged; `apply_holdback: true` declines that
@@ -1387,6 +1404,8 @@ residuals that are known and accepted.
 [#139]: https://github.com/Sertelegger/holdfast/issues/139
 [#142]: https://github.com/Sertelegger/holdfast/issues/142
 [#149]: https://github.com/Sertelegger/holdfast/issues/149
+[#160]: https://github.com/Sertelegger/holdfast/issues/160
+[#195]: https://github.com/Sertelegger/holdfast/issues/195
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#163]: https://github.com/Sertelegger/holdfast/issues/163

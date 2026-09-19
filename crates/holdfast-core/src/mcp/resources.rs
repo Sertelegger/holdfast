@@ -548,10 +548,12 @@ pub fn read_prepared(
     );
 
     // §5.5.3's extension fields, exactly: `truncated_for_size`,
-    // `held_back`, `truncated_at_tail`, `next_uri`. **`held_back` and
-    // `truncated_for_size` are distinct** — one means Holdfast is
-    // deliberately withholding bytes, the other that more exist beyond a
-    // cap — and collapsing them into one flag is the fault to avoid.
+    // `held_back`, `truncated_at_tail`, `next_uri` — plus
+    // `held_back_cause`, which qualifies `held_back` rather than adding
+    // a fifth independent fact. **`held_back` and `truncated_for_size`
+    // are distinct** — one means Holdfast is deliberately withholding
+    // bytes, the other that more exist beyond a cap — and collapsing
+    // them into one flag is the fault to avoid.
     let mut meta = MetaObject::new();
     let mut holdfast = serde_json::Map::new();
     if read.truncated_for_size {
@@ -559,6 +561,20 @@ pub fn read_prepared(
     }
     if read.held_back {
         holdfast.insert("held_back".into(), json!(true));
+        // Mirrored beside the flag rather than left to `read_output`,
+        // because this surface has no `next_cursor` to retry on and its
+        // continuation is a URI: a caller that gets `held_back` here
+        // needs to know whether re-fetching `next_uri` can ever advance.
+        //
+        // **`_meta` omits a field rather than writing a false one** —
+        // `control_protocol.rs` pins `held_back` being absent on a
+        // size-capped read — so this is inside the `if` and is present
+        // exactly when `held_back` is. Every value is a `&'static str`
+        // from `HeldBackCause::as_str`, the same vocabulary the tool
+        // emits, so the two surfaces cannot drift apart.
+        if let Some(cause) = read.held_back_cause {
+            holdfast.insert("held_back_cause".into(), json!(cause.as_str()));
+        }
     }
     if read.truncated_at_tail {
         holdfast.insert("truncated_at_tail".into(), json!(true));

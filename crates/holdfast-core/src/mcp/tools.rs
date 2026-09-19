@@ -1008,6 +1008,16 @@ impl HoldfastServer {
                     "truncated_at_tail": read.truncated_at_tail,
                     "truncated_for_size": read.truncated_for_size,
                     "held_back": read.held_back,
+                    // Which of `held_back`'s three rules fired, so the
+                    // caller can tell a boundary that moves with
+                    // `buffer.head` from one pinned to its own request
+                    // (GH #195). Emitted as `null` rather than omitted
+                    // when nothing was withheld: §5.4's `outputSchema` is
+                    // closed and `read_output_emits_every_field_5_4_
+                    // promises` asserts an exact key set, so a key that
+                    // comes and goes is one the agent must test for
+                    // before it can branch.
+                    "held_back_cause": read.held_back_cause.map(|c| c.as_str()),
                     "next_cursor": read.next_cursor,
                     // §5.2 declares this without a `?` and nothing had
                     // ever emitted it. The bulk counterpart to this
@@ -6849,6 +6859,162 @@ mod tests {
                  not a second licence to bypass ({start})"
             );
         }
+
+        kill_everything(&server).await;
+    }
+
+    /// **GH #195 on the tool surface, with the recourse in the same
+    /// moment.**
+    ///
+    /// The unit rows in `output/mod.rs` prove the boundary is pinned;
+    /// this one proves an agent holding only a `read_output` response
+    /// can *tell*, and that the thing the response points it at works.
+    /// Four arms, and each is load-bearing:
+    ///
+    /// 1. the wedge itself — a second read at `next_cursor` returns zero
+    ///    bytes and the same cursor, which is the bug as reported;
+    /// 2. `held_back_cause: "unvouched_window"` on both reads, which is
+    ///    the only thing in the response that distinguishes this from a
+    ///    holdback that will clear on its own;
+    /// 3. `resources/read` on the `resource_uri` the same response
+    ///    carries returns the bytes — so the cause names a recourse that
+    ///    exists rather than a diagnosis with no action attached;
+    /// 4. **the control**: an in-flight token in the tail of an
+    ///    otherwise identical session reports `in_flight_secret`. Without
+    ///    it, a field hard-wired to `"unvouched_window"` passes 1–3.
+    #[tokio::test]
+    async fn a_wedged_read_names_the_static_bound_and_the_resource_read_clears_it() {
+        let server = HoldfastServer::new();
+        // An unterminated PEM: `private-key-block`'s header matches, the
+        // `[\s\S]*?` between header and footer means the DFA can never
+        // reach a dead state, and there is no footer — so the candidate
+        // is genuinely in flight for as long as the window is short of
+        // `buffer.head`. Ordinary documentation does this by accident;
+        // this repository's own `CHANGELOG.md` is the reported case.
+        let mut bytes = b"$ cat chain.pem\r\n-----BEGIN RSA PRIVATE KEY-----\r\n".to_vec();
+        for i in 0..600 {
+            bytes.extend_from_slice(
+                format!("KEYBODY{i:06}MIIEowIBAAKCAQEAy8Dbv8prpJ\r\n").as_bytes(),
+            );
+        }
+        let (id, _pty) = mock_session(&server, "wedge", vec![], &bytes);
+        let session = server.registry.get(&id).expect("the session");
+        let planted = bytes.len() as u64;
+        settle(&session, "the whole key to reach the buffer", |s| {
+            s.buffer_head() >= planted
+        })
+        .await;
+
+        // `max_bytes` well short of the buffer, which is what makes the
+        // window truncated — the condition the bound is about. Asserted
+        // rather than assumed, or the row is about something else.
+        const MAX: usize = 4096;
+        assert!(
+            (MAX + server.processor.limits.lookahead_bytes) as u64 * 2 < session.buffer_head(),
+            "the fixture must leave the window short of head"
+        );
+        let page = |cursor: u64| {
+            server.read_output(Parameters(ReadOutputArgs {
+                session: id.clone(),
+                since_cursor: Some(cursor),
+                max_bytes: Some(MAX),
+                ..Default::default()
+            }))
+        };
+
+        let first = row("read_output", &page(0).await.expect("read_output")).data;
+        assert_eq!(first["held_back"], json!(true));
+        assert_eq!(first["held_back_cause"], json!("unvouched_window"));
+        let stalled = first["next_cursor"]
+            .as_u64()
+            .expect("a cursor to resume from");
+
+        // Arm 1: the wedge. Following the documented loop makes no
+        // progress, and would not on any later round either.
+        let second = row("read_output", &page(stalled).await.expect("read_output")).data;
+        assert_eq!(second["bytes_returned"], json!(0), "the wedge: zero bytes");
+        assert_eq!(
+            second["next_cursor"],
+            json!(stalled),
+            "…and a frozen cursor"
+        );
+        assert_eq!(second["held_back"], json!(true));
+        assert_eq!(second["held_back_cause"], json!("unvouched_window"));
+
+        // Arm 3: the recourse the response names. `resources/read` is
+        // bounded by `resource_read_max_bytes`, which `config.rs` refuses
+        // below the hardcoded session ring (GH #203 — against the ring,
+        // not against the inert `output_buffer_bytes` key), so its window
+        // reaches `head` and this bound cannot arise there.
+        let uri = first["resource_uri"].as_str().expect("a resource uri");
+        let read = crate::mcp::resources::read_resource(
+            &server.registry,
+            &server.processor,
+            uri,
+            crate::config::LimitsConfig::default().resource_read_max_bytes,
+        )
+        .expect("the resource read");
+        let text = read
+            .contents
+            .iter()
+            .filter_map(|c| match c {
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            text.len() as u64 > stalled,
+            "the recourse must get past the boundary the tool stalled at: \
+             {} bytes vs a cursor frozen at {stalled}",
+            text.len()
+        );
+
+        // Arm 4: the control. Same tool, same shape, a cause that will
+        // clear on its own.
+        let live = format!("$ cat note\r\nsee {IN_FLIGHT}");
+        let (live_id, _live_pty) = mock_session(&server, "arriving", vec![], live.as_bytes());
+        let live_session = server.registry.get(&live_id).expect("the session");
+        settle(&live_session, "the partial to reach the tail", |s| {
+            s.detection().last_line.starts_with("see ")
+        })
+        .await;
+        let arriving = row(
+            "read_output",
+            &server
+                .read_output(Parameters(ReadOutputArgs {
+                    session: live_id.clone(),
+                    since_cursor: Some(0),
+                    ..Default::default()
+                }))
+                .await
+                .expect("read_output"),
+        )
+        .data;
+        assert_eq!(arriving["held_back"], json!(true));
+        assert_eq!(
+            arriving["held_back_cause"],
+            json!("in_flight_secret"),
+            "the two causes must separate, or the field carries nothing"
+        );
+
+        // …and a read that withheld nothing names nothing, so `null` is
+        // not merely what an unreached branch happens to produce.
+        let clean = row(
+            "read_output",
+            &server
+                .read_output(Parameters(ReadOutputArgs {
+                    session: live_id.clone(),
+                    tail_lines: Some(3),
+                    ..Default::default()
+                }))
+                .await
+                .expect("read_output"),
+        )
+        .data;
+        assert_eq!(clean["held_back"], json!(false));
+        assert_eq!(clean["held_back_cause"], Value::Null);
 
         kill_everything(&server).await;
     }
