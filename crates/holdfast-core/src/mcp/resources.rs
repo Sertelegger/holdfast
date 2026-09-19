@@ -740,6 +740,19 @@ mod tests {
         name: Option<&str>,
         bytes: &[u8],
     ) -> (SessionRegistry, Arc<Session>) {
+        registry_with_capacity(name, 4096, bytes)
+    }
+
+    /// The same again with the ring size named, for the one row that
+    /// needs `buffer.head` to out-run `max_bytes + lookahead_bytes` —
+    /// below that the read window reaches `head`, GH #14's declination
+    /// structurally cannot fire, and the arrangement would be measuring
+    /// a size cap instead.
+    fn registry_with_capacity(
+        name: Option<&str>,
+        capacity: usize,
+        bytes: &[u8],
+    ) -> (SessionRegistry, Arc<Session>) {
         let pty = Arc::new(MockPty::new());
         let session = Session::new(
             new_session_id(),
@@ -747,7 +760,7 @@ mod tests {
             "bash".into(),
             vec![],
             Arc::clone(&pty) as Arc<dyn crate::pty::PtyBackend>,
-            SessionConfig::with_buffer_capacity(4096),
+            SessionConfig::with_buffer_capacity(capacity),
         );
         pty.queue_output(bytes);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -916,6 +929,83 @@ mod tests {
             ResourceTarget::SessionId(session.id.clone()),
             "the published continuation must key on the resolved session: {next}"
         );
+    }
+
+    /// **The `_meta` half of GH #195's cause field, which nothing else
+    /// reaches.**
+    ///
+    /// `read_output`'s copy is pinned by `tests/schema.rs`'s exact key
+    /// set and by `mcp-smoke.sh`; this one is pinned by nothing —
+    /// deleting the three lines that write it left the whole suite and
+    /// the smoke script green. It matters more here than there, because
+    /// this surface has no `next_cursor` to retry on: its continuation
+    /// is `next_uri`, and whether re-fetching that URI can ever advance
+    /// is exactly what the cause answers.
+    ///
+    /// Three arms, and the third is the one that stops the row passing
+    /// against an unconditional insert. A caller-supplied `max_bytes`
+    /// is clamped **down** only, so a small one re-creates the short
+    /// window on this surface too — which is how the positive arm is
+    /// arranged without a megabyte of fixture.
+    #[test]
+    fn a_held_back_resource_read_names_its_cause_in_meta() {
+        // An unterminated PEM: `private-key-block`'s header matches, the
+        // footer never arrives, and a window short of `buffer.head`
+        // cannot say whether it ever will.
+        let mut bytes = b"$ cat k.pem\n-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
+        for i in 0..500 {
+            bytes
+                .extend_from_slice(format!("KEYBODY{i:06}MIIEowIBAAKCAQEAy8Dbv8prpJ\n").as_bytes());
+        }
+        let (registry, session) = registry_with_capacity(None, 64 * 1024, &bytes);
+        let processor = crate::output::OutputProcessor::builtin().expect("built-in rules compile");
+        // The arrangement, asserted rather than assumed: the window must
+        // really stop short of `head`, or arm 1 is about a size cap.
+        const CAP: usize = 4096;
+        assert!(
+            bytes.len() > CAP + processor.limits.lookahead_bytes,
+            "the fixture must out-run max_bytes + lookahead, or the window \
+             reaches head and the bound cannot fire"
+        );
+        let meta_of = |uri: &str, ceiling: usize| -> serde_json::Value {
+            let result =
+                read_resource(&registry, &processor, uri, ceiling).expect("a live session");
+            let ResourceContents::TextResourceContents { meta, .. } = &result.contents[0] else {
+                panic!("utf8 travels in `text`")
+            };
+            match meta {
+                Some(m) => m.0["holdfast"].clone(),
+                None => json!({}),
+            }
+        };
+        let base = format!("holdfast://session/{}/buffer?since_cursor=0", session.id);
+
+        // Arm 1: a window short of `head` declines, and says why.
+        let held = meta_of(&format!("{base}&max_bytes={CAP}"), 4 * 1024 * 1024);
+        assert_eq!(held["held_back"], json!(true), "{held}");
+        assert_eq!(held["held_back_cause"], json!("unvouched_window"), "{held}");
+
+        // Arm 2: the same buffer read to `head` withholds nothing, and
+        // `_meta` omits the key rather than writing a null — this
+        // surface's convention, pinned for `held_back` itself by
+        // `control_protocol.rs`.
+        let whole = meta_of(&base, 4 * 1024 * 1024);
+        assert!(whole.get("held_back").is_none(), "{whole}");
+        assert!(whole.get("held_back_cause").is_none(), "{whole}");
+
+        // Arm 3: a size cap is not a holdback, so it names no cause —
+        // without this, an insert outside the `if read.held_back` block
+        // passes arms 1 and 2.
+        let capped = meta_of(
+            &format!(
+                "holdfast://session/{}/buffer?since_cursor=0&redact=false&max_bytes=4",
+                session.id
+            ),
+            4 * 1024 * 1024,
+        );
+        assert_eq!(capped["truncated_for_size"], json!(true), "{capped}");
+        assert!(capped.get("held_back").is_none(), "{capped}");
+        assert!(capped.get("held_back_cause").is_none(), "{capped}");
     }
 
     #[test]

@@ -582,11 +582,17 @@ jcheck "the §18.2a vocabularies reach the wire" \
 
 # GH #195: `held_back` is three rules and the response named which for
 # none of them, so an agent following §4.1's retry-at-`next_cursor`
-# against GH #14's static bound paged for ever at zero bytes. The cause
-# has to reach the *wire* as a declared value and not merely exist on
-# `ProcessedRead` -- a `json!` key that never got added, or a variant
-# serialised outside its declared vocabulary, is exactly what every Rust
-# test in this repo is blind to.
+# against GH #14's static bound paged for ever at zero bytes.
+#
+# **What is checked here is the advertised schema, and that is the half
+# the Rust suite genuinely cannot see.** The emitted key and the variant
+# spellings on a real response ARE covered in Rust --
+# `tests/schema.rs`'s `a_held_back_read_carries_a_declared_cause_and_
+# still_matches_its_schema` validates a non-null cause against the
+# compiled `outputSchema` and pairs it with a rejection -- so this is not
+# a lone guard and the comment that said so was wrong. What that row
+# cannot reach is whether the schema survives serialisation to the wire
+# at all, which is this script's standing job.
 #
 # The description is checked rather than only the type, because what
 # makes this field worth anything is that it names the recourse: an

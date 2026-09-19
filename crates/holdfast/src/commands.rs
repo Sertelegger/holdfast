@@ -1044,9 +1044,24 @@ fn held_back_note(raw: bool, data: &Value) -> &'static str {
              many times you ask: this read's window could not vouch for a \
              candidate that runs past the end of it (GH #14), and that \
              boundary is fixed by the request rather than by how much \
-             output arrives (GH #195). A larger `--tail` does not move it. \
-             `--raw` is this surface's audited opt-in; an agent's recourse \
-             is the `resource_uri` on its own read_output response."
+             output arrives (GH #195). A read that reaches the end of the \
+             buffer is not subject to it — `--tail`, or `--raw`, or an \
+             agent's `resource_uri` — but each of those gets past the \
+             boundary by not applying the check, so what it hands back may \
+             include the bytes this read declined. Only `--raw` is audited."
+        }
+        // The `raw` half is kept as a *guard on this arm* rather than
+        // as a branch of its own below, because a current daemon always
+        // sends a cause when `held_back` is true — so an arm reachable
+        // only through the no-cause path would never print this, and the
+        // sentence it carries is the accurate one: `redact: false` makes
+        // `holdback_boundary` return `w.head` before `held_back` is
+        // computed, so §4.1 is provably not what stopped the read.
+        Some(HeldBackCause::IncompleteEscape) if raw => {
+            "output stops short at an unfinished escape sequence \
+             (REQ-O-008). Redaction is off on this read, so §4.1's \
+             holdback is not what stopped it. The child is still alive \
+             and may yet finish it. Read again to pick up the rest."
         }
         Some(HeldBackCause::IncompleteEscape) => {
             "output stops short at an unfinished escape sequence \

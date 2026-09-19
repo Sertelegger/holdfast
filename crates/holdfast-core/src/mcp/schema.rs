@@ -134,8 +134,23 @@ pub enum ScreenTracking {
 /// * `unvouched_window` is bounded by the *request*, not by `head`.
 ///   Retrying the identical read returns the identical boundary for
 ///   ever, however much output arrives. **Fetch `resource_uri` instead**
-///   (GH #195): `resources/read` reads to `buffer.head`, so the window
-///   is never truncated and this bound cannot arise there.
+///   (GH #195): a resource read's window reaches `buffer.head`, so it is
+///   never truncated and this bound cannot arise on it. Fetch the URI as
+///   given — adding a small `?max_bytes=` re-creates the same short
+///   window and the same bound.
+///
+///   **What that costs, stated because the flag does not state it.** The
+///   bound clears because a window that reaches `buffer.head` does not
+///   run the declination, not because the candidate was resolved. Such a
+///   read still runs the full rule set and §4.1's trailing holdback, but
+///   a candidate that is *still unterminated* at `buffer.head` matches
+///   no rule, so if its anchor is further back than
+///   `partial_secret_scan_bytes` it is returned unredacted. That is a
+///   documented residual of the design and not a property of this field;
+///   it applies equally to a `tail_lines`/`tail_bytes` read and to any
+///   `max_bytes` large enough to reach `buffer.head`. If you need the
+///   declination kept, there is no read that also makes progress —
+///   that is the trade this field exists to make visible.
 ///
 /// A size cap is deliberately **not** a value here. It is not a
 /// holdback, the two can be true at once, and `truncated_for_size`
@@ -260,11 +275,15 @@ pub struct ReadOutput {
     /// `held_back_cause` says which, and the three take different
     /// recourses.
     pub held_back: Option<bool>,
-    /// Which rule held this read back, present exactly when `held_back`
-    /// is true. `in_flight_secret` and `incomplete_escape` clear as
-    /// output arrives — retry at `next_cursor`. `unvouched_window` never
-    /// clears for the same read at any `max_bytes` — fetch
-    /// `resource_uri` instead (GH #195).
+    /// Which rule held this read back. **Non-null exactly when
+    /// `held_back` is true; present and `null` otherwise**, so branch on
+    /// the value and never on the key's existence.
+    ///
+    /// `in_flight_secret` and `incomplete_escape` can clear as output
+    /// arrives — retry at `next_cursor`. `unvouched_window` never clears
+    /// for the same read at any `max_bytes`; fetch `resource_uri`
+    /// instead, and read that value's own documentation for what the
+    /// wider read does and does not still withhold (GH #195).
     pub held_back_cause: Option<HeldBackCause>,
     /// `rule kind -> count` for the redactions inside the returned range.
     /// Empty on an unredacted read; absent only on an error envelope.

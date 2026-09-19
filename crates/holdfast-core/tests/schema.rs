@@ -1284,6 +1284,92 @@ async fn read_output_response_matches_its_schema() {
     kill(&server, &id).await;
 }
 
+/// **Every response this file validates carries `held_back_cause: null`,
+/// and `null` satisfies `anyOf: [$ref, null]` whatever the `$ref` says.**
+///
+/// So the closed `outputSchema` was never exercised against a *value*
+/// from that vocabulary: an `as_str` spelling outside the declared enum
+/// would reach an agent as a response failing its own advertised schema,
+/// and nothing here would have seen it. The vocabulary walk in
+/// `the_closed_vocabularies_declare_exactly_what_the_session_emits` is a
+/// good proxy — it compares the two Rust sides — but a proxy is what it
+/// is. This row drives a **real** held-back read through the real tool
+/// and validates the real response.
+///
+/// The arrangement is the GH #195 wedge, because it is the one cause a
+/// session can be driven into deterministically from a shell: an
+/// unterminated `-----BEGIN RSA PRIVATE KEY-----` printed to the pty,
+/// read with a `max_bytes` small enough that the window stops short of
+/// `buffer.head`.
+#[tokio::test]
+async fn a_held_back_read_carries_a_declared_cause_and_still_matches_its_schema() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    // A header with no footer, then enough output that a 4 KiB read
+    // cannot reach `buffer.head` past the 8 KiB lookahead.
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "printf -- '-----BEGIN RSA PRIVATE KEY-----\\n';                    for i in $(seq 1 400); do printf 'KEYBODY%06d%s\\n' \"$i\"                    MIIEowIBAAKCAQEAy8Dbv8prpJ; done; echo SCHEMA_DONE"
+                .into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("send_input must not be a protocol error");
+    wait_for(&server, &id, "SCHEMA_DONE").await;
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let payload = loop {
+        let r = server
+            .read_output(Parameters(ReadOutputArgs {
+                session: id.clone(),
+                since_cursor: Some(0),
+                max_bytes: Some(4096),
+                ..Default::default()
+            }))
+            .await
+            .expect("read_output must not be a protocol error");
+        let p = assert_matches_schema("read_output", &r);
+        if p["data"]["held_back_cause"] == json!("unvouched_window") {
+            break p;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never reached a state this row is about, so it \
+             would have asserted nothing: {p}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // The value really was non-null and really was validated — without
+    // this the loop above could break on a response the schema happened
+    // to accept for an unrelated reason.
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["held_back"], json!(true));
+    assert!(payload["data"]["held_back_cause"].is_string());
+
+    // The paired negative, in the same run: the declared vocabulary is
+    // closed, so a spelling outside it is rejected. Without this arm the
+    // row above passes against `held_back_cause: { "type": "string" }`.
+    let mut bad = payload.clone();
+    bad["data"]["held_back_cause"] = json!("a_cause_from_the_future");
+    assert_rejected_because(
+        "read_output",
+        &bad,
+        "held_back_cause is a closed vocabulary",
+        |k| {
+            matches!(
+                k,
+                ValidationErrorKind::Enum { .. } | ValidationErrorKind::AnyOf { .. }
+            )
+        },
+    );
+
+    kill(&server, &id).await;
+}
+
 #[tokio::test]
 async fn read_output_emits_every_field_5_4_promises() {
     // The separator that stops the schema tests from being vacuous. Every

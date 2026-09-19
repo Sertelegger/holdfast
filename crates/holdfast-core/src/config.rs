@@ -1821,7 +1821,11 @@ fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<(), ConfigError> {
 fn at_least(key: &str, value: usize, floor: usize) -> Result<(), ConfigError> {
     if value < floor {
         return Err(ConfigError::invalid(format!(
-            "{key} = {value}, which is smaller than the {floor}-byte session output              ring; a resource read is the documented recourse when a cursor read is              held back at a bound its own window produced, and it can only be one              while it reaches the whole ring, so {key} must stay at or above {floor}"
+            "{key} = {value}, which is smaller than the {floor}-byte session \
+             output ring; a resource read is the documented recourse when a \
+             cursor read is held back at a bound its own window produced, and \
+             it can only be one while it reaches the whole ring, so {key} must \
+             stay at or above {floor}"
         )));
     }
     Ok(())
@@ -2968,6 +2972,15 @@ reference = \"db/prod\"
             assert!(
                 msg.contains(&DEFAULT_BUFFER_BYTES.to_string()),
                 "…and the floor, or there is nothing to act on: {msg}"
+            );
+            // An operator reads this in `daemon.log` and on a terminal.
+            // A `\`-continuation whose next line's indentation becomes
+            // content renders as a run of spaces mid-sentence, and
+            // `cargo fmt` does not touch string bodies, so nothing else
+            // in the gate would see it.
+            assert!(
+                !msg.contains("  "),
+                "the message wraps into the operator's face: {msg:?}"
             );
         }
 

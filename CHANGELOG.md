@@ -220,6 +220,23 @@ is cut, named and published is in
   buffer in the same moment returned 336,359 bytes. On a 113 KB buffer the
   larger read does clear it, at 131,072, which is the case the claim was true
   of and was stated of all of them ([#195]).
+
+  **What the recourse costs is now stated everywhere it is named, because
+  the first draft of this change got it wrong.** `unvouched_window` clears on
+  a read whose window reaches `buffer.head` — and it clears because such a
+  read *does not apply* [#14]'s declination, not because the candidate was
+  resolved. `resource_uri`, a `tail_*` read and a large enough `max_bytes`
+  are one mechanism with three names. Such a read still runs the full rule
+  set and §4.1's trailing holdback, but a candidate still unterminated at
+  `buffer.head` matches no rule, so if its anchor sits further back than
+  `partial_secret_scan_bytes` it comes back unredacted. Measured: a
+  24,650-byte buffer holding a `-----BEGIN RSA PRIVATE KEY-----` with no
+  footer is returned in full by a resource read in the same moment
+  `read_output` answers `held_back: true` with 17 bytes; append the footer
+  and the same read returns `[REDACTED:private-key]`. That residual is
+  [#14]'s, is unchanged here, and is now asserted in both directions. **There
+  is no read that both makes progress and keeps the declination** — the point
+  of the cause field is that the caller chooses knowing which it holds.
 - `holdfast logs`'s held-back note reads the daemon's cause instead of
   inferring one. It inferred from `state` and its own `--raw`, which separates
   two of the three rules and not the third, so a live session wedged on

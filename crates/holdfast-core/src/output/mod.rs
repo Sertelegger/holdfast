@@ -282,7 +282,10 @@ pub enum HeldBackCause {
     /// `buffer.head` — measured at 1, 8, 32 and 64 bytes, zero returned
     /// and the cursor frozen after a further 300 KB of output, and
     /// clearing at 65. `read_output`'s 32 KiB default and `holdfast
-    /// logs`'s 256 KiB both clear it by three orders of magnitude;
+    /// logs`'s 256 KiB both clear it by three orders of magnitude at the
+    /// shipped `ansi_incomplete_max_bytes` — but that key is live and
+    /// takes only `nonzero`, so raised above a read's `max_bytes` it
+    /// reaches the default and the 256 KiB ceiling alike.
     /// `an_escape_under_the_incomplete_cap_wedges_like_the_window_bound`
     /// pins the corner.
     IncompleteEscape,
@@ -742,10 +745,37 @@ impl OutputProcessor {
         // ceiling, which is live and whose only floor was `nonzero`;
         // `config.rs` now refuses a value under the ring (GH #203) rather
         // than leaving the escape to two defaults happening to line up.
-        // A `tail_*` read and the audited `redact: false` remain the other
-        // two, unchanged.
         //
-        // The residual is unchanged and is what REQ-O-005 already
+        // **State plainly what that costs, because "the bound cannot
+        // arise there" is a fact about the flag and says nothing about
+        // the bytes.** A window that reaches `head` clears this bound by
+        // *not running condition 2*, not by resolving the candidate — and
+        // the three recourses (`resource_uri`, a `tail_*` read, and a
+        // `max_bytes` large enough to reach `head`) are one mechanism
+        // wearing three names. What such a read returns is whatever the
+        // rule set matches over the whole buffer, plus §4.1's
+        // trailing-`partial_secret_scan_bytes` holdback. **A candidate
+        // still unterminated at `head` matches no rule**, so if its
+        // anchor sits further back than that trailing region it goes out
+        // raw with `redactions: {}`. Measured on the fixture in
+        // `mcp/tools.rs`'s `a_wedged_read_names_the_static_bound_and_the_
+        // resource_read_clears_it`: `read_output` returns 17 bytes with
+        // `unvouched_window` while `resources/read` of the same buffer in
+        // the same moment returns 24,650 including the whole key body,
+        // and that row asserts both halves.
+        //
+        // That is GH #14's **documented residual for full-window reads**,
+        // and it is not new: condition 2 has always been the difference
+        // between a window that saw every byte and one that did not, and
+        // removing it would make `held_back` routine (see 2 above) and
+        // leave no recourse at all. What is new is that the response says
+        // which of the two a caller is holding, so the choice between
+        // making progress and keeping the declination is theirs to make
+        // with the facts rather than by guessing. `redact: false` is the
+        // audited hatch and is the only thing that switches redaction
+        // itself off.
+        //
+        // The other residual is unchanged and is what REQ-O-005 already
         // licenses: a secret still arriving in the trailing region stays
         // withheld from cursor reads, which is the safe direction.
         if opts.redact && window_end < w.head {
@@ -754,14 +784,39 @@ impl OutputProcessor {
                 .unresolved_from(&self.rules, w.window, w.window_start)
                 .filter(|u| !spans.iter().any(|s| s.start <= *u && s.end >= window_end));
             if let Some(u) = unresolved {
-                // `<=` rather than `<` so that a tie hands the cause to
-                // the term that cannot move. Reporting a transient cause
-                // for a bound that is also static is the one direction
-                // that produces advice which never succeeds; the reverse
-                // costs a caller one unnecessary `resources/read`. The
-                // value of `safety_end` is `min` either way, so this is
-                // not a behaviour change.
-                if u <= safety_end {
+                // **`<` and not `<=`, and the tie it declines to break
+                // is unreachable — which is why it is `<`.**
+                //
+                // This read as `<=` (hand the tie to the term that
+                // cannot move) and a mutation to `<` survived the whole
+                // suite, so the choice was a judgement call nothing
+                // tested. Working out *why* nothing could test it
+                // settles it:
+                //
+                // * A tie with `holdback` cannot happen. `safety_end`
+                //   starts below `cap_end` only when `holdback <
+                //   cap_end`, and `holdback >= head - partial_secret_
+                //   scan_bytes`, so `cap_end > head - 512` and therefore
+                //   `window_end == min(cap_end + lookahead, head) ==
+                //   head` — at which point condition 2 above is false
+                //   and this block does not run at all.
+                // * A tie with `seq_start` would need an indexed secret
+                //   prefix beginning with `ESC`. No rule in the shipped
+                //   set does, and `earliest_partial` and
+                //   `unresolved_from` read the same index.
+                //
+                // So the two are mutually exclusive by construction and
+                // `min` is the whole behaviour either way. `<` is then
+                // the form that keeps `cause` aligned with the term that
+                // actually lowered `safety_end`, and it is also the
+                // safer default if that structure ever changes: the
+                // static label routes a caller to a read that reaches
+                // `buffer.head`, and such a read does **not** apply this
+                // declination (see the block comment above), so guessing
+                // "static" on a boundary that would have cleared on its
+                // own trades a round trip for a wider read. The earlier
+                // reasoning had that backwards.
+                if u < safety_end {
                     cause = Some(HeldBackCause::UnvouchedWindow);
                 }
                 safety_end = safety_end.min(u);
@@ -2026,10 +2081,169 @@ mod tests {
         assert_eq!(clear.bytes_returned, cap + 1);
 
         // …and the shipped default is three orders of magnitude clear of
-        // the corner, so neither surface can reach it.
+        // the corner, so neither surface reaches it at the shipped
+        // `ansi_incomplete_max_bytes`. That key is live and takes only
+        // `nonzero`, so an operator who raises it above a read's
+        // `max_bytes` moves the corner onto the default path — which is
+        // why the row above is written against `p.limits` rather than
+        // against the literal 64.
         let default_read = read(&buf, ESC_AT, 32 * 1024);
         assert!(!default_read.held_back);
         assert_eq!(default_read.cursor, buf.len() as u64);
+    }
+
+    /// **`held_back` and its cause answer the same question, and the
+    /// row that proves they never disagree is a sweep, not a fixture.**
+    ///
+    /// Mutation-found: replacing `held_back.then_some(cause).flatten()`
+    /// with a bare `cause` **survived** every other row in this module.
+    /// The case it lets through is narrow — a candidate whose offset is
+    /// exactly `cap_end`, so the `u <= safety_end` tie claims the cause
+    /// without lowering anything — and narrow is precisely why no
+    /// hand-built fixture found it. A caller branching on
+    /// `held_back_cause` would see a cause on a read that withheld
+    /// nothing and fetch `resource_uri` for a page it already has.
+    ///
+    /// So this asserts the biconditional over a matrix rather than the
+    /// value over a case: every shape that can reach each of the three
+    /// rules, every `max_bytes` around the interesting bounds, both
+    /// liveness states, both `ansi` modes, both `redact` settings, and
+    /// request starts at `0`, mid-buffer and at `head`.
+    #[test]
+    fn held_back_and_its_cause_never_disagree_on_any_shape() {
+        let p = processor();
+        let (pem, _) = pem_longer_than(64 * 1024);
+        let mut token_then_more = format!("$ export T={}", &GITHUB[..20]).into_bytes();
+        let shapes: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "clean",
+                b"   Compiling holdfast-core v0.0.1
+"
+                .to_vec(),
+            ),
+            (
+                "in-flight token",
+                b"line one
+ghp_abcdef"
+                    .to_vec(),
+            ),
+            ("unfinished CSI", b"done[3".to_vec()),
+            (
+                "unfinished OSC",
+                b"done]0;a title with no terminator".to_vec(),
+            ),
+            (
+                "unterminated pem",
+                format!(
+                    "$ cat k.pem
+{pem}
+"
+                )
+                .into_bytes(),
+            ),
+            ("pem then a token tail", {
+                let mut v = format!(
+                    "$ cat k.pem
+{pem}
+"
+                )
+                .into_bytes();
+                v.extend_from_slice(b"$ export T=ghp_abcdef");
+                v
+            }),
+            ("token then bulk", {
+                token_then_more.extend(std::iter::repeat_n(b'z', 40 * 1024));
+                token_then_more.clone()
+            }),
+        ];
+        // Around `ansi_incomplete_max_bytes` (64), the 512 lookbehind,
+        // the 8192 lookahead, and the default read size.
+        let caps = [
+            1usize,
+            2,
+            63,
+            64,
+            65,
+            512,
+            8192,
+            8193,
+            32 * 1024,
+            256 * 1024,
+        ];
+        let mut checked = 0usize;
+        let mut causes: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for (label, buf) in &shapes {
+            let head = buf.len() as u64;
+            for max_bytes in caps {
+                for req_start in [0, head / 2, head.saturating_sub(1), head] {
+                    for child_alive in [true, false] {
+                        for ansi in [AnsiMode::Strip, AnsiMode::Raw] {
+                            for redact in [true, false] {
+                                let w = snapshot(&p, buf, req_start, max_bytes, child_alive, false);
+                                let opts = ReadOptions {
+                                    ansi,
+                                    redact,
+                                    ..ReadOptions::default()
+                                };
+                                let r = p.process(&w, &opts);
+                                assert_eq!(
+                                    r.held_back,
+                                    r.held_back_cause.is_some(),
+                                    "{label}: held_back={} cause={:?} at req_start={req_start}                                      max_bytes={max_bytes} alive={child_alive} ansi={ansi:?}                                      redact={redact}",
+                                    r.held_back,
+                                    r.held_back_cause
+                                );
+                                if let Some(c) = r.held_back_cause {
+                                    *causes.entry(c.as_str()).or_default() += 1;
+                                }
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // **The sweep has to reach all three rules, or it is a statement
+        // about whichever one it happened to hit.** Without this the row
+        // is green against an implementation that never sets a cause at
+        // all — which is the same mutation, inverted.
+        assert!(checked > 1000, "only {checked} combinations reached");
+
+        // **The one arrangement the sweep above cannot stumble into,
+        // built by hand because it is the mutation's whole reachable
+        // set.** A candidate whose offset is *exactly* `cap_end` makes
+        // `u <= safety_end` true while `safety_end.min(u)` lowers
+        // nothing, so the cause is claimed on a read that withheld
+        // nothing. `held_back.then_some(cause).flatten()` is what stops
+        // it reaching the wire; without that line this row is the only
+        // thing in the workspace that goes red.
+        const EDGE_CAP: usize = 4096;
+        let mut edge = vec![b'a'; EDGE_CAP];
+        let (edge_pem, _) = pem_longer_than(32 * 1024);
+        edge.extend_from_slice(edge_pem.as_bytes());
+        assert!(
+            edge.len() as u64 > (EDGE_CAP + p.limits.lookahead_bytes) as u64,
+            "the window must stop short of head, or the bound cannot fire"
+        );
+        let w = snapshot(&p, &edge, 0, EDGE_CAP, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(
+            r.cursor, EDGE_CAP as u64,
+            "the arrangement is a candidate sitting exactly on cap_end; if \
+             the read stopped anywhere else this row is about something else"
+        );
+        assert!(!r.held_back, "nothing was withheld: the cap is what bit");
+        assert!(r.truncated_for_size);
+        assert_eq!(
+            r.held_back_cause, None,
+            "a read that withheld nothing must name no cause"
+        );
+        for rule in ["in_flight_secret", "incomplete_escape", "unvouched_window"] {
+            assert!(
+                causes.get(rule).is_some_and(|n| *n > 0),
+                "the sweep never reached {rule}, so it says nothing about it: {causes:?}"
+            );
+        }
     }
 
     // ------------------------------------------------- ANSI boundary rule

@@ -6970,6 +6970,65 @@ mod tests {
              {} bytes vs a cursor frozen at {stalled}",
             text.len()
         );
+        // **And what the recourse costs, asserted rather than left to
+        // the reader.** The bound clears because a window that reaches
+        // `buffer.head` does not run GH #14's declination — not because
+        // the candidate was resolved. So the body `read_output` was
+        // withholding comes back, raw, with nothing substituted. That is
+        // the design's residual for full-window reads and it predates
+        // this change; it is pinned here because the same change is what
+        // names this read as the recourse, and a residual nobody asserts
+        // is one the next edit can widen unnoticed.
+        assert!(
+            text.contains("KEYBODY000123"),
+            "the residual moved: a window reaching buffer.head used to \
+             return the unterminated candidate raw"
+        );
+        assert!(
+            !text.contains("[REDACTED"),
+            "an unterminated block matches no rule, so nothing is \
+             substituted and `redactions` stays empty"
+        );
+
+        // The control that makes the residual a *statement* rather than
+        // an accusation: terminate the same block and the same read
+        // redacts it. The gap is exactly "no terminator yet".
+        let mut closed = bytes.clone();
+        closed.extend_from_slice(b"-----END RSA PRIVATE KEY-----\r\n");
+        let (closed_id, _closed_pty) = mock_session(&server, "closed", vec![], &closed);
+        let closed_session = server.registry.get(&closed_id).expect("the session");
+        let planted_closed = closed.len() as u64;
+        settle(&closed_session, "the whole key to reach the buffer", |s| {
+            s.buffer_head() >= planted_closed
+        })
+        .await;
+        let closed_uri = crate::mcp::resources::ResourceUri::buffer_uri(&closed_id);
+        let closed_read = crate::mcp::resources::read_resource(
+            &server.registry,
+            &server.processor,
+            &closed_uri,
+            crate::config::LimitsConfig::default().resource_read_max_bytes,
+        )
+        .expect("the resource read");
+        let closed_text = closed_read
+            .contents
+            .iter()
+            .filter_map(|c| match c {
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            closed_text.contains("[REDACTED:private-key]"),
+            "a terminated block is redacted by the same read: {}",
+            &closed_text[..200.min(closed_text.len())]
+        );
+        assert!(
+            !closed_text.contains("KEYBODY000123"),
+            "…and its body does not survive"
+        );
 
         // Arm 4: the control. Same tool, same shape, a cause that will
         // clear on its own.
