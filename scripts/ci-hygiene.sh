@@ -261,7 +261,7 @@ names no image at all" \
     runs-on: \${{ matrix.os }}"
 
   echo
-  echo "ci-hygiene self-test — the release gate, all three directions"
+  echo "ci-hygiene self-test — the release gate: what it allows, and the four spellings it does not"
   echo
 
   # Publishing is allowed only where the trigger cannot fire by accident.
@@ -308,6 +308,35 @@ jobs:
           persist-credentials: false
       - run: ./scripts/fixture-probe.sh
       - run: echo publish"
+
+  # **The three that a denylist of four triggers waved through.** Each was
+  # measured passing before the gate became an allowlist, on a file carrying
+  # `contents: write` and `gh`. `workflow_dispatch` is the one that matters:
+  # it is what anybody asked to "test the release workflow without releasing"
+  # reaches for first, and it moves the safety from the trigger to an `if:`
+  # inside a job that already holds the write token.
+  for trig in workflow_dispatch workflow_call repository_dispatch; do
+    want_file_denied "a release marker with a $trig: trigger is rejected" \
+      'the marker is checked, not believed' \
+"# RELEASE-WORKFLOW: tag-triggered publishing
+name: DispatchableRelease
+on:
+  push:
+    tags: ['v*']
+  $trig:
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: ./scripts/fixture-probe.sh
+      - run: echo publish"
+  done
 
   # And an ordinary workflow still cannot authenticate. This is the rule the
   # widening must not have deleted.
@@ -828,13 +857,26 @@ deny() { # deny <extended-regex> <why>
 #
 # A file may opt in with a `RELEASE-WORKFLOW:` marker, and the marker is
 # **verified rather than trusted** — same shape as the calibration exemption
-# above. `release_gate_ok` requires the `on:` block to name `tags:` and to
-# name none of `branches:`, `pull_request`, `pull_request_target` or
-# `schedule`. So a release workflow cannot fire from a branch push, a pull
-# request, or a timer; the only thing that starts it is somebody tagging a
-# commit on purpose. A marker on a file that does not meet that is a
-# failure, not a pass — otherwise the marker would be the whole security
-# model.
+# above. The `on:` block must name `tags:`, and it may name **nothing except
+# `push:` and `tags:`**. So a release workflow cannot fire from a branch push,
+# a pull request, a timer, a button, another workflow or an API call; the only
+# thing that starts it is somebody tagging a commit on purpose. A marker on a
+# file that does not meet that is a failure, not a pass — otherwise the marker
+# would be the whole security model.
+#
+# **THIS IS AN ALLOWLIST, AND IT USED TO BE A DENYLIST OF FOUR TRIGGERS**
+# (`branches`, `schedule`, `pull_request`, `pull_request_target`). Measured:
+# under that rule `workflow_dispatch:`, `workflow_call:` and
+# `repository_dispatch:` each passed silently on a file holding
+# `contents: write`, `secrets.GITHUB_TOKEN` and `gh` — and `workflow_dispatch`
+# is the textbook dry-run hatch, so the rule was open in exactly the place
+# somebody reaching for a rehearsal mechanism would push. The header sentence
+# it is supposed to enforce — *"nothing but somebody tagging a commit on
+# purpose can start this"* — was true of four spellings and false of at least
+# three others. A denylist over a namespace GitHub extends is a rule that
+# decays every time they add a trigger; naming what is permitted does not.
+# The rehearsal that hatch would have bought lives in
+# `.github/workflows/release-rehearsal.yml` instead, holding no token.
 release_ok=()
 for i in "${!files[@]}"; do
   release_ok[$i]=0
@@ -853,14 +895,21 @@ for i in "${!files[@]}"; do
   grep -qE '^#[[:space:]]*RELEASE-WORKFLOW:' "${files[$i]}" || continue
   # The `on:` block: from a line starting `on:` to the next top-level key.
   on_block="$(awk '/^on:/{f=1;next} f&&/^[a-zA-Z_]+:/{exit} f{print}' "${stripped[$i]}")"
-  if printf '%s' "$on_block" | grep -qE '^[[:space:]]+tags:' \
-     && ! printf '%s' "$on_block" | grep -qE '^[[:space:]]+(branches|schedule):' \
-     && ! printf '%s' "$on_block" | grep -qE '^[[:space:]]*pull_request(_target)?:'; then
+  # Every KEY the block names, at any depth. A sequence item (`- "v*"`) is
+  # not a key and is not collected, which is what lets the tag filter itself
+  # be written either way.
+  extra="$(printf '%s\n' "$on_block" \
+           | sed -nE 's/^[[:space:]]+([A-Za-z_][A-Za-z0-9_-]*):.*/\1/p' \
+           | grep -vxE 'push|tags' || true)"
+  if printf '%s' "$on_block" | grep -qE '^[[:space:]]+tags:' && [ -z "$extra" ]; then
     release_ok[$i]=1
     printf 'note  %s is a release workflow: tag-triggered, publishing allowed\n' "${files[$i]}"
   else
     printf '  %s: RELEASE-WORKFLOW marker on a workflow that is not tag-only\n' "${files[$i]}"
-    printf '  FORBIDDEN: %s\n' 'a release marker whose `on:` block is not tags-only — the marker is checked, not believed'
+    if [ -n "$extra" ]; then
+      printf '%s\n' "$extra" | sed "s|^|  ${files[$i]}: on: also names |"
+    fi
+    printf '  FORBIDDEN: %s\n' 'a release marker whose `on:` block names anything but push:/tags: — the marker is checked, not believed'
     fails=$((fails + 1))
   fi
 done

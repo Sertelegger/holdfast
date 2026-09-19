@@ -8,8 +8,37 @@ edition = "2021"
 rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/Sertelegger/holdfast"
+# Same URL as `repository`, and kept because **both 0.0.0 name
+# reservations already set it** -- dropping a field the published crate
+# has today would read as a deliberate removal.
+homepage = "https://github.com/Sertelegger/holdfast"
+# **`readme` is deliberately absent here and set per crate.** An inherited
+# `readme` resolves against the workspace root, and `README.md` sits outside
+# both package directories -- `cargo package` copies nothing from above the
+# package root, so the inherited path would name a file the tarball cannot
+# contain. Each crate points at its own.
+keywords = ["mcp", "pty", "terminal", "shell", "agent"]
 
 [workspace.dependencies]
+# **The intra-workspace dependency, and the one version string that is not
+# the one above.** crates.io rejects a path-only dependency, so `holdfast`'s
+# edge to `holdfast-core` has to carry a literal version; there is no
+# `version.workspace` inside a dependency spec to inherit `0.0.7` from
+# `[workspace.package]`. **CONTRIBUTING.md's release step 4 names both**,
+# because proximity is not a mechanism: the two literals are twenty-odd lines
+# apart with this comment between them, and an earlier draft of this note
+# claimed six.
+#
+# A stale literal here fails no build and no test -- the workspace still
+# resolves the dependency by path, so everything local stays green, and only
+# the *published* `holdfast` binds to an older `holdfast-core` already on
+# crates.io. `release.yml`'s `crates-io` job refuses to publish when the tag,
+# this literal and the version above disagree -- **but that check sits behind
+# the same missing-token gate as the publish it guards.** Until a
+# `CARGO_REGISTRY_TOKEN` exists nothing in this repository catches a stale
+# literal, and CONTRIBUTING.md's release step 4 is the whole defence.
+holdfast-core = { path = "crates/holdfast-core", version = "0.0.7" }
+
 anyhow = "1.0.104"
 base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }

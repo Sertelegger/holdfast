@@ -52,6 +52,66 @@ is cut, named and published is in
   Only `true` is accepted — `false` has exactly one meaning anyone could want,
   and putting a second, unaudited licence to bypass on the wire is the defect
   this argument exists to close ([#169]).
+- The two crates carry the metadata crates.io requires, so the workspace can
+  be published: a `description` each, `keywords`, per-crate `categories`, and
+  `repository`/`homepage`/`readme` inherited or pointed at the one root
+  `README.md`, which cargo copies into both tarballs. `holdfast`'s dependency
+  on `holdfast-core` now carries a **version** as well as a path, because
+  crates.io rejects a path-only dependency — a second version literal that
+  must be bumped with the first, which release step 4 now names.
+- `.github/workflows/release.yml` gains a `crates-io` job that runs after the
+  GitHub Release and publishes both crates with `cargo publish --workspace
+  --locked` — `holdfast-core` first, since `holdfast` cannot resolve until it
+  is on the index. **It is inert**: it is gated on a `CARGO_REGISTRY_TOKEN`
+  secret that does not exist, so today it prints why it is skipping and exits.
+  Adding that secret is §12.3's *first external distribution*, which is a
+  decision rather than a configuration step; see CONTRIBUTING.md.
+
+- **Release binaries and `SHA256SUMS.txt`, which no release has ever carried.**
+  `release.yml` builds §12.1's five assets — `holdfast-linux-x86_64.tar.gz`,
+  `holdfast-linux-aarch64.tar.gz`, `holdfast-macos-x86_64.tar.gz`,
+  `holdfast-macos-aarch64.tar.gz`, `holdfast-windows-x86_64.zip` — assembles
+  `SHA256SUMS.txt` over exactly those five, verifies each archive against it
+  under §13.3 step 5's safe-archive rules, and attaches all six to the release.
+  Until now the only install path was building from source and nothing said so:
+  all three shipped releases have zero assets and crates.io holds a `0.0.0`
+  name reservation whose own `lib.rs` says it "contains no usable code".
+
+  **The release is created as a DRAFT**, and that is §12.3 rather than
+  timidity. First external distribution is the event that ends the wire-shape
+  record's in-place corrections and `protocol/method.rs`'s "the latitude ends
+  at the first published binary"; a draft's assets are not served from
+  `releases/download/`, so building them is automation and promoting the draft
+  is the decision. `CONTRIBUTING.md` carries the three-step promotion.
+
+  The assets are **static musl** on Linux, not glibc. §12.1 names the platform
+  without a libc, so it does not settle the question; §13.3 does, by promising
+  the bootstrap runs "under `dash`/`busybox sh` on minimal Alpine-style
+  installs" — an environment a glibc binary cannot exec in at all. Measured
+  free: `scripts/mcp-smoke.sh` passes all 60 checks against the extracted musl
+  binary, and both Linux assets cross-build on one `ubuntu-24.04` with no apt
+  package, the AArch64 one via a `rust-lld` override in `.cargo/config.toml`.
+  Every shipped binary now reports a real `HOLDFAST_BUILD_SHA` in its
+  handshake instead of `build unknown`.
+
+- **`release-rehearsal.yml`, because a release workflow cannot be tested by
+  releasing.** `release.yml` is tag-triggered and holds `contents: write`, and
+  hygiene forbids any pull-request-triggered workflow from reaching a publish
+  step — so the build, pack, checksum, verify and safe-extract path lives in
+  `scripts/package-release.sh` and `scripts/verify-release-archive.sh`, and
+  this workflow runs those same scripts over all five targets on every pull
+  request, holding no token. `scripts/verify-release-archive.sh --self-test`
+  drives 21 adversarial fixtures — a `..` member, an absolute path, a symlink,
+  a hardlink, a device node, a directory, two members, a wrong digest, a
+  malformed sums line — through the same parser, and runs in the `hygiene` job.
+
+  **The residual is one command, `gh release create`, and it is documented in
+  `release.yml` itself** rather than only here: nothing in this repository can
+  exercise it, so the upload succeeding, the asset names matching what §13.3's
+  bootstrap composes, and `releases/download/` resolving are unproven until the
+  first tag. The draft is what makes the third checkable before anyone can
+  download. Second residual: `linux-aarch64` is cross-built, so it is
+  shape-verified and never executed; the other four are run by the rehearsal.
 
 ### Fixed
 
@@ -109,6 +169,19 @@ is cut, named and published is in
   `RuleSet` per daemon, not one per session.
 
 ### Changed
+
+- **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
+  denylist of four triggers — `branches`, `schedule`, `pull_request`,
+  `pull_request_target` — and `release.yml`'s header claimed on the strength of
+  it that "nothing but somebody tagging a commit on purpose can start this".
+  Measured, that was true of four spellings and false of at least three others:
+  `workflow_dispatch:`, `workflow_call:` and `repository_dispatch:` each passed
+  silently on a file carrying `contents: write`, `secrets.GITHUB_TOKEN` and
+  `gh`. `workflow_dispatch` is the one that matters, because it is what anyone
+  asked to rehearse a release without releasing reaches for first, and it moves
+  the safety from the trigger to an `if:` inside a job that already holds the
+  write token. The `on:` block may now name `push:` and `tags:` and nothing
+  else, and the three spellings are self-test fixtures.
 
 - **`[security] redaction_enabled = false` is refused at load, and §9.4's
   `session_start` row no longer carries `redaction_enabled`.** The key disabled
