@@ -55,6 +55,38 @@ is cut, named and published is in
 
 ### Fixed
 
+- **One byte >= 0x80 anywhere in a read window no longer costs the redaction
+  prefilter its automaton ([#194]).** Forty-five of the fifty-one shipped rules
+  carry a Unicode `\b`, the prefilter was built from the rule source verbatim,
+  and a Unicode word boundary installs a quit set over every byte >= 0x80 — so
+  a single `é`, em dash or emoji dropped the whole `RegexSet` onto the slow
+  engine for the length of the window. Measured on this tree, release, on
+  REQ-O-007's 41,472 B default read window (512 lookbehind + 32,768 + 8,192
+  lookahead): **0.082 ms pure ASCII against 37.4 ms with one em dash at the
+  midpoint, 456x**, and 0.09 ms after. A default `read_output` of this
+  repository's own `CHANGELOG`+`README`+`ROADMAP` — 871 non-ASCII bytes out of
+  108,501 — goes from 112 ms of span-finding to 11 ms.
+
+  The prefilter's patterns now carry `(?-u:\b)` where the boundary's meaning
+  provably survives the respelling, and carry no boundary at all where it does
+  not. It is the rewrite [#142] made for the liveness DFA, with the premise
+  read off the pattern text rather than off an indexed prefix, and with
+  deletion instead of refusal as the fallback — a `RegexSet` is one automaton,
+  so one surviving Unicode `\b` re-arms the quit set for the whole set.
+
+  **A prefilter may over-report freely and may never under-report, because
+  `find_spans` runs only the rules it names.** Both branches are
+  superset-preserving and the argument is per-boundary: deleting an assertion
+  can only enlarge a language, and `\b` -> `(?-u:\b)` holds wherever `\b`
+  does when the pattern's own side of the boundary can only be an ASCII word
+  byte. The two generic assignment rules can begin a match on `.` or `-` and
+  get the deletion; so does any boundary next to `k`, `K`, `s` or `S`, the
+  four ASCII letters whose `(?i)` expansion reaches U+212A and U+017F. A
+  differential over the shipped rules, their positive examples with seven
+  non-ASCII probes planted at the first byte, the midpoint and the last, and
+  randomly generated rule sets finds **zero** divergences for what ships and
+  **2,623** for an unconditional respelling.
+
 - **The redaction prefilter is built with a 64 MiB lazy-DFA cache ceiling
   instead of the `regex` crate's 2 MiB default, so a large *pure-ASCII* read
   no longer falls off the automaton ([#194]).** This is the second of that
