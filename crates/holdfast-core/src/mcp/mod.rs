@@ -3,6 +3,7 @@
 pub mod caller;
 pub mod detection;
 pub mod envelope;
+pub(crate) mod offload;
 pub mod passthrough;
 pub mod resources;
 pub mod schema;
@@ -798,12 +799,23 @@ impl ServerHandler for HoldfastServer {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        let result = resources::read_resource(
-            &self.registry,
-            &self.processor,
-            &request.uri,
-            self.config.limits.resource_read_max_bytes,
-        )?;
+        // Off the runtime (GH #201), and this is the **largest** of the
+        // read paths: `resource_read_max_bytes` defaults to 4 MiB against
+        // `read_output`'s 256 KiB cap, so one fetch can run the whole
+        // multi-view pipeline over sixteen times the bytes that already
+        // measured 3.9 s. `--no-daemon` has one runtime for the shim and
+        // the tools both, which makes the stall it produces here the same
+        // stall with fewer places to hide.
+        let registry = Arc::clone(&self.registry);
+        let processor = Arc::clone(&self.processor);
+        let uri = request.uri.clone();
+        let ceiling = self.config.limits.resource_read_max_bytes;
+        let surface = caller::audit_surface(resources::RESOURCE_READ_TOOL);
+        let result = offload::off_runtime("resources/read's scan", move || {
+            resources::read_resource(&registry, &processor, &uri, ceiling, surface)
+        })
+        .await
+        .unwrap_or_else(Err)?;
         Ok(result.into())
     }
 }

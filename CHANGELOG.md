@@ -329,6 +329,49 @@ is cut, named and published is in
 
 ### Fixed
 
+- **One slow read no longer stalls every other client: the output pipeline
+  runs off the executor's worker threads.** `read_output`, `resources/read`,
+  `get_screen_state` and `resize` all ran §4.1's ANSI strip, redaction and
+  `vt100` re-seed **inline in the async handler**. §4.3 only ever required
+  that work to be outside the *buffer lock*, which it was, and §4.2a's
+  0.095 ms default read was why nobody asked what thread it was on — but
+  [#194] moved that number by 410× for any window carrying one byte above
+  `0x7f`, which is every real terminal buffer.
+
+  **The symptom was not a slow read.** Measured on the wire, two independent
+  `holdfast mcp` processes against one daemon with twelve worker threads: with
+  a single 256 KiB read in flight, **one** worker was running and fifteen were
+  asleep, a `status` on an *unrelated* session took **3,336 ms** against a
+  0.35–2.82 ms baseline, and a third client's `holdfast list` exited **rc=2
+  after 5,014 ms** on §7.4's handshake bound. One running thread and fifteen
+  idle rules out both obvious diagnoses: it was neither CPU saturation nor
+  lock contention, but a runtime with no worker left in its I/O driver — so
+  one synchronous call in one handler took the daemon's whole socket surface
+  down, accept loop included. The operator saw a daemon that looked broken,
+  caused by a read of a session they were not looking at.
+
+  After, on the same corpus and the same wire: `status` **1.5 ms** while a
+  3.2 s read is in flight, and `holdfast list` **rc=0 in 12 ms** during a
+  `resources/read`. Nothing about redaction, the holdback or §9.4 changes —
+  `resources::read_resource` now takes its audit surface as an argument
+  precisely so it cannot, since `spawn_blocking` does not inherit the
+  task-local the caller identity lives in and a forgotten hoist would have
+  rewritten every `redaction_disabled` row to `in_process`.
+
+  **`spawn_blocking` is a bounded pool and the trade is stated rather than
+  assumed.** 512 threads by default, shared with `send_input` and the secret
+  providers; a saturated pool *queues* instead of parking the runtime, so its
+  worst outcome is a read that waits while `status`, `list` and the accept
+  loop keep answering. Measured at 64 concurrent 256 KiB reads the control
+  plane held at 1–3 ms. **Work on that pool is not cancellable** — the same
+  sentence `send_input` has carried since 0.0.6 — but that is not a
+  regression: a synchronous call mid-`async fn` has no await point to be
+  dropped at either, so these reads were already uncancellable and only the
+  thread changed. The §7.4 handshake's 5 s bound is untouched and is not the
+  defect: it is right that one frame between two local processes should never
+  take longer, and the frame was never late — the daemon was never asked
+  ([#201], [#194]).
+
 - **The `binary` arm of the in-flight test asks the rule as well, so a
   certificate no longer pins the holdback for the rest of the session
   ([#166]'s precondition — on its own it closes no leak).**
@@ -1104,5 +1147,7 @@ residuals that are known and accepted.
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
+[#194]: https://github.com/Sertelegger/holdfast/issues/194
+[#201]: https://github.com/Sertelegger/holdfast/issues/201
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
 [#166]: https://github.com/Sertelegger/holdfast/issues/166

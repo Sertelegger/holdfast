@@ -2224,12 +2224,26 @@ async fn dispatch_resource(
                     Ok(p) => p,
                     Err(e) => return Response::error(req.id, ErrorCode::BadParams, e.to_string()),
                 };
-                match resources::read_resource(
-                    &server.registry,
-                    &server.processor,
-                    &params.uri,
-                    server.config.limits.resource_read_max_bytes,
-                ) {
+                // Off the runtime (GH #201). `resource_read_max_bytes` is
+                // 4 MiB by default against `read_output`'s 256 KiB cap,
+                // so this is the longest single CPU block the daemon can
+                // be asked for — and it is the one that was measured
+                // failing a bystander's `holdfast list` on §7.4's
+                // handshake bound. The §9.4 surface is sampled **here**,
+                // inside `with_caller`'s scope, because the blocking pool
+                // does not inherit it; `read_resource` takes it as an
+                // argument so that cannot be forgotten.
+                let registry = Arc::clone(&server.registry);
+                let processor = Arc::clone(&server.processor);
+                let uri = params.uri.clone();
+                let ceiling = server.config.limits.resource_read_max_bytes;
+                let surface = caller::audit_surface(resources::RESOURCE_READ_TOOL);
+                let read = crate::mcp::offload::off_runtime("resources/read's scan", move || {
+                    resources::read_resource(&registry, &processor, &uri, ceiling, surface)
+                })
+                .await
+                .unwrap_or_else(Err);
+                match read {
                     // §18.3's nearest catalogued code is `bad_params`, so
                     // a peer that knows only §18.3 still reads a
                     // well-formed error. The structured `data.code`

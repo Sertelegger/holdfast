@@ -2323,3 +2323,494 @@ async fn list_changed_fires_on_create_and_on_exit() {
         )
         .expect("the sender went away");
 }
+
+// ---------------------------------------------------------------------
+// GH #201: one slow read must not stall unrelated control calls.
+// ---------------------------------------------------------------------
+
+/// A `MockPty` whose liveness check can be **held**, so a row can put a
+/// `read_output` handler inside `Session::read_processed` and keep it
+/// there.
+///
+/// **Why `is_alive` and not a big payload.** The defect is CPU-bound
+/// work running on an executor thread, and the honest way to reproduce
+/// it would be a window large enough to take a measurable while. That is
+/// a duration, and a duration is the shape GH #140 spent a milestone
+/// retiring: the row would assert against a window whose width depends
+/// on the box, the build profile, and how much of the payload happens to
+/// be non-ASCII (GH #194's 410× cliff). `Session::read_processed` opens
+/// with `self.backend.is_alive()`, so parking there is the same claim
+/// with no width — *a handler is inside the synchronous read and has not
+/// come out*. Whether the thread is burning cycles or waiting on a
+/// condvar is exactly the distinction the executor cannot make, which is
+/// why substituting one for the other tests the same property.
+///
+/// Held only while **armed**, so every call before the row asks for one
+/// — `start_session`'s liveness probe, the registry insert, the reader
+/// thread — behaves like an ordinary mock.
+/// Which backend call a [`HeldPty`] parks in.
+///
+/// **Two, because one gate point cannot reach all four tools.**
+/// `Session::read_processed` and `screen_state`'s boundary both open
+/// with `backend.is_alive()`, so `Liveness` puts a row inside either.
+/// `Session::resize` never asks — it goes straight to `backend.resize`
+/// — and an armed `Liveness` gate would instead catch
+/// `detection::with_detection`'s liveness probe *after* the offloaded
+/// work, wedging the runtime on a call this change deliberately leaves
+/// where it is and reporting the fixed build as broken. Measured: that
+/// is exactly what the first draft of the `resize` row did.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldAt {
+    Liveness,
+    Resize,
+}
+
+struct HeldPty {
+    hold_at: HoldAt,
+    inner: Arc<holdfast_core::pty::MockPty>,
+    armed: std::sync::atomic::AtomicBool,
+    entries: std::sync::atomic::AtomicUsize,
+    entered: std::sync::mpsc::SyncSender<()>,
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// The session's own reader thread, identified by the fact that it
+    /// is the only thread in the process that calls [`HeldPty::read`].
+    ///
+    /// **It has to be excluded, and the row is worthless without the
+    /// exclusion.** The reader loop asks `is_alive` between reads, so an
+    /// armed gate catches it too — and it catches it on a thread that is
+    /// neither a worker nor the pool, which would satisfy the rendezvous
+    /// *before any read was in flight*. The row would then dial the
+    /// bystander against a perfectly idle daemon and pass against the
+    /// defect it exists to catch.
+    reader_thread: std::sync::OnceLock<std::thread::ThreadId>,
+}
+
+/// The row's half of [`HeldPty`]: it opens the gate and nothing else.
+struct HeldGate {
+    pty: Arc<HeldPty>,
+    entered: std::sync::mpsc::Receiver<()>,
+}
+
+impl HeldGate {
+    fn arm(&self) {
+        self.pty
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Block until a read has reached the held call. A **fact reported by
+    /// the daemon**, not an interval hoped to cover it.
+    ///
+    /// Blocking the test thread is safe and deliberate: this row runs on
+    /// `worker_threads = 1`, and `Runtime::block_on` drives its future on
+    /// the calling thread rather than on that worker. The thread this
+    /// parks is the one thread in the process that the wedge under test
+    /// cannot reach — which is the whole reason the verdict below is
+    /// trustworthy.
+    fn await_entered(&self) {
+        self.entered
+            .recv_timeout(WEDGE_DETECTOR)
+            .expect("no read ever reached the held call; this row is waiting on nothing");
+    }
+
+    fn release(&self) {
+        let (lock, cv) = &*self.pty.gate;
+        *lock.lock().expect("the gate mutex is never poisoned") = true;
+        cv.notify_all();
+    }
+
+    fn entries(&self) -> usize {
+        self.pty.entries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl HeldPty {
+    /// Park here if this is the armed gate point, and say so once.
+    fn hold(&self, site: HoldAt) {
+        if self.hold_at != site || !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if self.reader_thread.get() == Some(&std::thread::current().id()) {
+            return;
+        }
+        self.entries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // `try_send`, because the row only needs to learn of the first
+        // arrival and a second must not park the daemon on a full
+        // channel.
+        let _ = self.entered.try_send(());
+        let (lock, cv) = &*self.gate;
+        let mut open = lock.lock().expect("the gate mutex is never poisoned");
+        while !*open {
+            open = cv.wait(open).expect("the gate mutex is never poisoned");
+        }
+    }
+}
+
+impl holdfast_core::pty::PtyBackend for HeldPty {
+    fn write(&self, data: &[u8]) -> holdfast_core::Result<()> {
+        self.inner.write(data)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> holdfast_core::Result<usize> {
+        let _ = self.reader_thread.set(std::thread::current().id());
+        self.inner.read(buf)
+    }
+
+    fn signal(&self, sig: holdfast_core::pty::Signal) -> holdfast_core::Result<()> {
+        self.inner.signal(sig)
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> holdfast_core::Result<()> {
+        self.hold(HoldAt::Resize);
+        self.inner.resize(cols, rows)
+    }
+
+    fn is_alive(&self) -> bool {
+        self.hold(HoldAt::Liveness);
+        self.inner.is_alive()
+    }
+
+    fn exit_code(&self) -> Option<i32> {
+        self.inner.exit_code()
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+}
+
+/// Seven times the longest wedge this row can legitimately produce (the
+/// §7.4 handshake bound is 5 s), and inside `.config/nextest.toml`'s
+/// `terminate-after`, so a genuine hang names itself here rather than
+/// being killed anonymously by the harness. **A hang detector, not a
+/// window**: every real outcome this row waits for is either immediate
+/// or an error the daemon itself produced.
+const WEDGE_DETECTOR: Duration = Duration::from_secs(35);
+
+/// A fixture with a documented shape, not a credential — the same choice
+/// `scripts/mcp-smoke.sh` makes. It is in the payload so the row can
+/// prove the read that came back off the blocking pool is the *whole*
+/// pipeline and not a shortcut around it.
+const AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+
+fn insert_held_session(
+    d: &TestDaemon,
+    name: &str,
+    payload: &[u8],
+    hold_at: HoldAt,
+) -> (String, HeldGate) {
+    let inner = Arc::new(holdfast_core::pty::MockPty::new());
+    inner.queue_output(payload);
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let pty = Arc::new(HeldPty {
+        hold_at,
+        inner,
+        armed: std::sync::atomic::AtomicBool::new(false),
+        entries: std::sync::atomic::AtomicUsize::new(0),
+        entered: entered_tx,
+        gate: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        reader_thread: std::sync::OnceLock::new(),
+    });
+    let session = holdfast_core::session::Session::new(
+        holdfast_core::session::new_session_id(),
+        Some(name.to_string()),
+        "bash".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn holdfast_core::pty::PtyBackend>,
+        holdfast_core::session::SessionConfig::with_buffer_capacity(1024 * 1024),
+    );
+    let id = session.id.clone();
+    d.daemon
+        .server
+        .registry
+        .insert(session)
+        .expect("registry insert");
+    (
+        id,
+        HeldGate {
+            pty,
+            entered: entered_rx,
+        },
+    )
+}
+
+fn insert_mock_session(d: &TestDaemon, name: &str) -> String {
+    let pty = Arc::new(holdfast_core::pty::MockPty::new());
+    let session = holdfast_core::session::Session::new(
+        holdfast_core::session::new_session_id(),
+        Some(name.to_string()),
+        "bash".into(),
+        vec![],
+        pty as Arc<dyn holdfast_core::pty::PtyBackend>,
+        holdfast_core::session::SessionConfig::with_buffer_capacity(64 * 1024),
+    );
+    let id = session.id.clone();
+    d.daemon
+        .server
+        .registry
+        .insert(session)
+        .expect("registry insert");
+    id
+}
+
+/// What one GH #201 row observes: the slow call's eventual answer.
+///
+/// The bystander's own answer is asserted inside the driver rather than
+/// handed back, because every row makes the same claim about it — it is
+/// the fixed half of the arrangement, and the varying half is what the
+/// slow call returns once released.
+struct Bystander {
+    slow: Response,
+}
+
+/// GH #201, driven once per tool that runs the output pipeline: while
+/// `method` is inside that pipeline on one session, a second,
+/// independent client must still be able to connect, handshake and be
+/// answered about an **unrelated** session.
+///
+/// ## How these rows cannot pass by accident
+///
+/// Three properties, and none of them is a measurement:
+///
+/// 1. **`worker_threads = 1`, and the slow call holds that thread.**
+///    Before the fix the pipeline runs on the task's own executor
+///    thread, so a call that has not returned is a runtime with nothing
+///    left to poll — the accept loop included. It is a deadlock, not a
+///    slow path: no box is fast enough to make it go green.
+/// 2. **The gate is opened after the verdict is in.** The row does not
+///    wait for the slow call and then look; it holds it open across the
+///    whole of the bystander's attempt. There is no window in which the
+///    bystander could have been served by a daemon that had already
+///    finished.
+/// 3. **The bystander runs on its own runtime, on its own thread.** It
+///    is `holdfast list`'s shape exactly: a separate event loop, a fresh
+///    connection, its own handshake. A wedged daemon cannot starve the
+///    bystander's timer, so what it reports is the daemon's answer and
+///    not the row running out of patience.
+///
+/// On `main` every one of these fails in the issue's own words —
+/// `ControlClient::connect` returns the §7.4 handshake timeout, because
+/// the daemon accepted the connection into the kernel backlog and never
+/// got a thread to answer it on. That is `holdfast list`'s `rc=2`, one
+/// layer down.
+///
+/// Each caller adds its own anti-vacuity assertion on [`Bystander::slow`],
+/// because "the bystander was served" is also true of a tool that did no
+/// work at all.
+async fn a_bystander_served_during(
+    tag: &str,
+    method: &'static str,
+    hold_at: HoldAt,
+    params: impl FnOnce(&str, &[u8]) -> Value,
+) -> Bystander {
+    let d = TestDaemon::start(tag).await;
+
+    // Enough bytes that the slow call is real work rather than a
+    // formality, and a planted fixture so the answer has to prove it ran.
+    let mut payload = Vec::new();
+    while payload.len() < 64 * 1024 {
+        payload.extend_from_slice(
+            format!("   Compiling widget — line {}\n", payload.len()).as_bytes(),
+        );
+    }
+    payload.extend_from_slice(format!("aws_access_key_id = {AWS_KEY}\n").as_bytes());
+    let (held_id, gate) = insert_held_session(&d, "held", &payload, hold_at);
+    let idle_id = insert_mock_session(&d, "idle");
+
+    // The payload has to be *in the buffer* before the call is made, or
+    // the row measures an empty scan. A fact about the session, polled —
+    // the house idiom — and not a sleep sized to cover it.
+    let held = d
+        .daemon
+        .server
+        .registry
+        .get(&held_id)
+        .expect("the held session is registered");
+    let deadline = std::time::Instant::now() + WEDGE_DETECTOR;
+    while held.buffer_head() < payload.len() as u64 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the held session's reader never delivered the payload: {} of {}",
+            held.buffer_head(),
+            payload.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let caller = d.client().await.expect("the slow client connects");
+    let slow_params = method::to_cbor(&params(&held_id, &payload)).unwrap();
+    gate.arm();
+    let slow = tokio::spawn(async move { caller.call_raw(method, slow_params).await });
+
+    // The rendezvous. From here to `release()` the daemon is inside the
+    // pipeline on the held session, and this row knows it because the
+    // daemon said so.
+    gate.await_entered();
+
+    // The bystander: `holdfast list`'s shape, in-process. Its own
+    // runtime on its own thread, a connection it dials itself, and a
+    // question about a session the slow call has never touched.
+    let sock = d.paths.control_sock();
+    let idle_for_bystander = idle_id.clone();
+    let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+    let bystander = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the bystander's runtime builds");
+        let outcome = rt.block_on(async move {
+            let client = ControlClient::connect(&sock, ClientKind::Cli).await?;
+            let params = method::to_cbor(&json!({ "session": idle_for_bystander })).unwrap();
+            client.call_raw("tool/status", params).await
+        });
+        let _ = verdict_tx.send(outcome);
+    });
+
+    let verdict = verdict_rx.recv_timeout(WEDGE_DETECTOR);
+    // Sampled while the gate is still shut, so they describe the moment
+    // the bystander was served rather than the cleanup after it.
+    let parked = gate.entries();
+    let still_working = !slow.is_finished();
+    // Opened **before** any assertion, so a red row tears down cleanly
+    // instead of leaving the daemon's one worker parked forever and the
+    // harness killing the process on `terminate-after`.
+    gate.release();
+
+    let answered = verdict
+        .expect(
+            "the bystander never came back at all — the daemon's worker never returned \
+             to the executor",
+        )
+        .expect(
+            "a second client could not be answered while one call was in flight (GH #201); \
+             a handshake timeout here is the daemon never reaching its own accept loop",
+        );
+    assert_eq!(
+        answered.status, "ok",
+        "the bystander's status on an unrelated session: {}",
+        answered.details
+    );
+    let seen: Value = method::from_cbor(&answered.data).unwrap();
+    assert_eq!(
+        seen["name"].as_str(),
+        Some("idle"),
+        "the bystander was answered about the wrong session: {seen}"
+    );
+
+    // Anti-vacuity for the *timing*: without this the row would also
+    // pass against a call that had quietly finished before the bystander
+    // ever dialled.
+    assert!(
+        still_working,
+        "{method} had already returned, so nothing was in flight and this row proved nothing"
+    );
+    assert_eq!(
+        parked, 1,
+        "exactly one call should have been parked inside the held session while the \
+         bystander was served"
+    );
+
+    let slow = slow
+        .await
+        .expect("the slow task")
+        .expect("the slow call itself completes once the gate opens");
+    bystander.join().expect("the bystander thread");
+    Bystander { slow }
+}
+
+/// `read_output` — the call the issue measured at 3,540 ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_read_output_in_flight_does_not_stall_an_unrelated_control_call() {
+    let b = a_bystander_served_during(
+        "inflight-read",
+        "tool/read_output",
+        HoldAt::Liveness,
+        |id, _| json!({ "session": id, "since_cursor": 0, "max_bytes": 262_144 }),
+    )
+    .await;
+
+    assert_eq!(b.slow.status, "ok", "{}", b.slow.details);
+    let data: Value = method::from_cbor(&b.slow.data).unwrap();
+    let output = data["output"].as_str().expect("§5.2's output field");
+    assert!(
+        output.contains("[REDACTED:aws]") && !output.contains(AWS_KEY),
+        "the read that came back off the blocking pool skipped the redaction pipeline"
+    );
+    assert!(
+        data["bytes_returned"].as_u64().unwrap_or(0) > 32 * 1024,
+        "the read returned {} bytes; it was not the large read this row arranged",
+        data["bytes_returned"]
+    );
+}
+
+/// `resource/read` — §5.5.3's bulk fetch, and the **largest** of the
+/// four: `resource_read_max_bytes` defaults to 4 MiB against
+/// `read_output`'s 256 KiB cap. The issue's `holdfast list` failure was
+/// measured against this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_resource_read_in_flight_does_not_stall_an_unrelated_control_call() {
+    let b = a_bystander_served_during(
+        "inflight-resource",
+        method::METHOD_RESOURCE_READ,
+        HoldAt::Liveness,
+        |id, _| json!({ "uri": format!("holdfast://session/{id}/buffer?since_cursor=0") }),
+    )
+    .await;
+
+    assert_eq!(b.slow.status, "ok", "{}", b.slow.details);
+    let data: Value = method::from_cbor(&b.slow.data).unwrap();
+    let text = serde_json::to_string(&data).unwrap();
+    assert!(
+        text.contains("[REDACTED:aws]") && !text.contains(AWS_KEY),
+        "the resource read skipped the redaction pipeline: {text:.400}"
+    );
+}
+
+/// `get_screen_state` — §4.5's Tier-B re-seed, which §4.2a measured at
+/// ~86 MB/s and called the one thing in the read path that is *not*
+/// free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_screen_capture_in_flight_does_not_stall_an_unrelated_control_call() {
+    let b = a_bystander_served_during(
+        "inflight-screen",
+        "tool/get_screen_state",
+        HoldAt::Liveness,
+        |id, _| json!({ "session": id }),
+    )
+    .await;
+
+    assert_eq!(b.slow.status, "ok", "{}", b.slow.details);
+    let data: Value = method::from_cbor(&b.slow.data).unwrap();
+    let grid = serde_json::to_string(&data["lines"]).unwrap();
+    assert!(
+        data["lines"].is_array() && grid.contains("Compiling widget"),
+        "the capture came back without a grid: {data}"
+    );
+    assert!(
+        grid.contains("[REDACTED:aws]") && !grid.contains(AWS_KEY),
+        "the grid that came back off the blocking pool skipped the redaction pipeline"
+    );
+}
+
+/// `resize` — the easiest of the four to miss, because the tool's name
+/// says `ioctl` and says nothing about the full `vt100::Parser` re-seed
+/// a width shrink cannot avoid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_resize_in_flight_does_not_stall_an_unrelated_control_call() {
+    let b = a_bystander_served_during(
+        "inflight-resize",
+        "tool/resize",
+        HoldAt::Resize,
+        |id, _| json!({ "session": id, "cols": 40, "rows": 12 }),
+    )
+    .await;
+
+    assert_eq!(b.slow.status, "ok", "{}", b.slow.details);
+    let data: Value = method::from_cbor(&b.slow.data).unwrap();
+    assert_eq!(
+        (data["cols"].as_u64(), data["rows"].as_u64()),
+        (Some(40), Some(12)),
+        "the resize reported dimensions the session never reached: {data}"
+    );
+}

@@ -458,11 +458,21 @@ pub fn resolve(
 ///
 /// `ceiling` is the daemon's `resource_read_max_bytes`. A caller's
 /// `?max_bytes=N` is clamped **down** against it and never up.
+///
+/// **`surface` is a parameter and not a `caller::audit_surface` call in
+/// the body** (GH #201). Both transports now run this on the blocking
+/// pool, which does not inherit the task-local the caller identity lives
+/// in — so read inside, every §9.4 row this emits would say `in_process`
+/// on the one transport where a control-protocol connection certainly
+/// existed. Taking it as an argument makes that impossible to get wrong
+/// rather than depending on each call site remembering: a caller that
+/// forgets has nothing to pass.
 pub fn read_resource(
     registry: &SessionRegistry,
     processor: &crate::output::OutputProcessor,
     uri_str: &str,
     ceiling: usize,
+    surface: caller::AuditSurface,
 ) -> Result<ReadResourceResult, ErrorData> {
     // Validation before resolution, before any buffer access: §5.5.2
     // requires a malformed parameter to be a JSON-RPC error rather than
@@ -478,10 +488,10 @@ pub fn read_resource(
         .unwrap_or_else(|| session.buffer_tail());
 
     // The §9.4 caller seam, derived server-side from the authenticated
-    // connection exactly as `read_output`'s is. Routing through
-    // `read_processed` is what makes `?redact=false` audited without a
-    // second `record_redaction_disabled` call site.
-    let surface = caller::audit_surface(RESOURCE_READ_TOOL);
+    // connection exactly as `read_output`'s is — sampled by the caller,
+    // above the blocking hop, for the reason on this function's doc.
+    // Routing through `read_processed` is what makes `?redact=false`
+    // audited without a second `record_redaction_disabled` call site.
     let read = session.read_processed(
         &ReadRequest {
             start: ReadStart::Cursor(since_cursor),
@@ -712,8 +722,14 @@ mod tests {
                 "holdfast://session/{}/buffer?since_cursor=0&redact=false{query}",
                 session.id
             );
-            let result =
-                read_resource(&registry, &processor, &uri, ceiling).expect("a live session reads");
+            let result = read_resource(
+                &registry,
+                &processor,
+                &uri,
+                ceiling,
+                caller::audit_surface(RESOURCE_READ_TOOL),
+            )
+            .expect("a live session reads");
             text_of(&result).to_string()
         };
 
@@ -809,6 +825,7 @@ mod tests {
             &processor,
             "holdfast://session-name/build/buffer?since_cursor=0&redact=false&max_bytes=4",
             4096,
+            caller::audit_surface(RESOURCE_READ_TOOL),
         )
         .expect("a live named session resolves");
 
