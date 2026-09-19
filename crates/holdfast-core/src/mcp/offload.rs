@@ -14,15 +14,22 @@
 //! measurement moved, the licence went with it.
 //!
 //! **What that costs is not latency on the slow call.** Measured on the
-//! shipped wire — one daemon, twelve worker threads, one in-flight
-//! `read_output`, everything else idle:
+//! shipped wire — a release build, one daemon, twelve worker threads,
+//! two independent `holdfast mcp` processes, one in-flight `read_output`
+//! and everything else idle. The thread census is from the same
+//! arrangement in a debug build, where the read is long enough to sample
+//! comfortably:
 //!
-//! | sampled during one large read | observed |
-//! |---|---|
-//! | daemon worker threads in `R` | **1** of 12 |
-//! | daemon worker threads in `S` | 15 (incl. the blocking pool's) |
-//! | `status` on an *unrelated* session, second client | **3,546 ms** (baseline 5–27 ms) |
-//! | `holdfast list`, a third client | **rc=2 at 5,014 ms** |
+//! | during one large read | before | after |
+//! |---|---|---|
+//! | daemon worker threads in `R` | **1** of 12 | — |
+//! | `status`, unrelated session, second client | answered **17** times, worst **2,061 ms** | **1,453** times, median 1.52 ms, worst **8.48 ms** |
+//! | `holdfast list`, a third client | **rc=2 at 5,031 ms** | **rc=0 at 21.7 ms** |
+//!
+//! Baseline with nothing in flight: `status` 1.28–5.10 ms, `list` rc=0 in
+//! 19.6 ms. The answer *count* is the clearest of those numbers —
+//! seventeen replies across a 2.1 s window is a client that was stopped,
+//! not one that was slow.
 //!
 //! One running thread and fifteen asleep rules out both the diagnoses
 //! that look obvious. It is not CPU saturation — eleven workers were
@@ -43,14 +50,33 @@
 //! ## What it costs
 //!
 //! [`tokio::task::spawn_blocking`] is a **bounded** pool — 512 threads by
-//! default, which nothing in this workspace overrides — and it is shared
-//! with `send_input`'s write, both secret providers, and the PTY worker's
-//! reader and writer. A saturated pool **queues**; it does not park the
-//! runtime. So the worst this trade can produce is a read that waits for
-//! a pool thread, while `status`, `list` and the accept loop keep
-//! answering — which is the failure the whole exchange is for. Measured
-//! at 64 concurrent 256 KiB reads the pool never came close: see the
-//! `control_protocol` row that pins it.
+//! default, which nothing in this workspace overrides. A saturated pool
+//! **queues**; it does not park the runtime. So the worst this trade can
+//! produce is a read that waits for a pool thread, while `status`, `list`
+//! and the accept loop keep answering — which is the failure the whole
+//! exchange is for.
+//!
+//! **The daemon's other blocking work is transient or is not on this pool
+//! at all, which is why the headroom is real rather than nominal.**
+//! `send_input`'s write is bounded by `SEND_INPUT_TIMEOUT` and the secret
+//! providers by `keychain_provider_timeout_secs`; the per-session PTY
+//! reader and writer are raw `std::thread`s (`session::Session::new`),
+//! deliberately, so a session costs this pool nothing for its lifetime.
+//!
+//! Measured, release build, all reads at the 256 KiB cap on one 1 MiB
+//! buffer:
+//!
+//! | concurrent reads | daemon threads | `status` worst | `holdfast list` |
+//! |---|---|---|---|
+//! | 0 (baseline) | 18 | 5.14 ms | rc=0, 25.3 ms |
+//! | 64 | 81 | 92.76 ms | rc=0 throughout, worst 533.7 ms |
+//! | 256 | 273 | 210.23 ms | rc=0 throughout, worst 3,777 ms |
+//!
+//! Reaching 512 needs 512 simultaneous in-flight tool calls, and §7.4
+//! gives each one its own connection. What the 256 row shows is the trade
+//! working as intended and not disappearing: the reads themselves
+//! degraded to 59–144 s — twelve cores cannot do more — while the control
+//! plane stayed answered. Before this change a **single** read failed it.
 //!
 //! ## What it deliberately does not fix
 //!

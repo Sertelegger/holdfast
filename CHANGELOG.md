@@ -341,18 +341,20 @@ is cut, named and published is in
   **The symptom was not a slow read.** Measured on the wire, two independent
   `holdfast mcp` processes against one daemon with twelve worker threads: with
   a single 256 KiB read in flight, **one** worker was running and fifteen were
-  asleep, a `status` on an *unrelated* session took **3,336 ms** against a
-  0.35–2.82 ms baseline, and a third client's `holdfast list` exited **rc=2
-  after 5,014 ms** on §7.4's handshake bound. One running thread and fifteen
-  idle rules out both obvious diagnoses: it was neither CPU saturation nor
-  lock contention, but a runtime with no worker left in its I/O driver — so
-  one synchronous call in one handler took the daemon's whole socket surface
-  down, accept loop included. The operator saw a daemon that looked broken,
-  caused by a read of a session they were not looking at.
+  asleep, a `status` on an *unrelated* session was answered **17 times in
+  2.1 s with a worst of 2,061 ms** against a 1.28–5.10 ms baseline, and a
+  third client's `holdfast list` exited **rc=2 after 5,031 ms** on §7.4's
+  handshake bound. One running thread and fifteen idle rules out both obvious
+  diagnoses: it was neither CPU saturation nor lock contention, but a runtime
+  with no worker left in its I/O driver — so one synchronous call in one
+  handler took the daemon's whole socket surface down, accept loop included.
+  The operator saw a daemon that looked broken, caused by a read of a session
+  they were not looking at.
 
-  After, on the same corpus and the same wire: `status` **1.5 ms** while a
-  3.2 s read is in flight, and `holdfast list` **rc=0 in 12 ms** during a
-  `resources/read`. Nothing about redaction, the holdback or §9.4 changes —
+  After, on the same corpus and the same wire: the same `status` answered
+  **1,453 times** across a 2.4 s read, median 1.52 ms and worst 8.48 ms, and
+  `holdfast list` **rc=0 in 21.7 ms** during a 7.2 s `resources/read`. Nothing
+  about redaction, the holdback or §9.4 changes —
   `resources::read_resource` now takes its audit surface as an argument
   precisely so it cannot, since `spawn_blocking` does not inherit the
   task-local the caller identity lives in and a forgotten hoist would have
@@ -360,10 +362,16 @@ is cut, named and published is in
 
   **`spawn_blocking` is a bounded pool and the trade is stated rather than
   assumed.** 512 threads by default, shared with `send_input` and the secret
-  providers; a saturated pool *queues* instead of parking the runtime, so its
+  providers — and, notably, *not* with the per-session PTY reader and writer,
+  which are raw `std::thread`s, so a session costs it nothing for its
+  lifetime. A saturated pool *queues* instead of parking the runtime, so its
   worst outcome is a read that waits while `status`, `list` and the accept
-  loop keep answering. Measured at 64 concurrent 256 KiB reads the control
-  plane held at 1–3 ms. **Work on that pool is not cancellable** — the same
+  loop keep answering. Measured at 64 concurrent 256 KiB reads: 81 daemon
+  threads, `status` worst 92.76 ms; at 256: 273 threads, `status` worst
+  210.23 ms, `holdfast list` rc=0 throughout while the reads themselves
+  degraded to 59–144 s. That degradation is twelve cores doing real work, and
+  it lands on the reads rather than on the control plane, which is the whole
+  trade. **Work on that pool is not cancellable** — the same
   sentence `send_input` has carried since 0.0.6 — but that is not a
   regression: a synchronous call mid-`async fn` has no await point to be
   dropped at either, so these reads were already uncancellable and only the
