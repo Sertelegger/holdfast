@@ -28,7 +28,92 @@ use crate::protocol::handshake::ClientKind;
 
 /// §4.3's per-connection outbound bound. **Not configurable in
 /// v0.1.0.** Overflow detaches this client and never blocks the reader.
+///
+/// **64 *frames*, and the unit is a known defect this change deliberately
+/// did not repair** (GH #200). A frame is one PTY `read`, so this is half
+/// a megabyte of 8 KiB chunks and about six kilobytes of the line-sized
+/// ones a `cat` through a PTY actually produces — a threshold that varies
+/// by four orders of magnitude with how chatty the child is, and that at
+/// the small end declares a client slow after a few kilobytes. Measured:
+/// `holdfast watch` on a 380 KB burst delivered 2.6%–23% of it, from a
+/// client that delivered 100% of the same burst the moment this stopped
+/// being the binding constraint.
+///
+/// **It was raised, measured, and put back.** §4.3's two bounds are in
+/// series and only this one detaches: a forwarder that is not scheduled
+/// lags on the 256-frame broadcast instead, and frames lost *there* never
+/// reach this queue to fill it. At 64 the queue wins that race
+/// essentially always; with a megabyte of headroom it stops winning, and
+/// a client that drains nothing is then never detached at all — it
+/// collects gaps forever while holding a socket and two tasks §4.3 says
+/// to reclaim. `a_slow_consumer_is_detached_and_the_reader_keeps_running`
+/// went red in 3 runs of 5 on a loaded machine, and stayed intermittent
+/// after the obvious repairs. Moving this bound safely means moving
+/// §4.2's `output_broadcast_capacity` with it, and that key is inert —
+/// `tests/config_surface.rs` records it as `Inert::NeverNamed` against
+/// the hardcoded `OUTPUT_BROADCAST_FRAMES` — so the two cannot currently
+/// be moved together at all. That is its own change with its own
+/// evidence, and GH #200's fix does not depend on it: what it needed was
+/// for the loss to stop being silent.
 pub const ATTACH_QUEUE_FRAMES: usize = 64;
+
+/// How many slots of the per-connection queue the **stream** may never
+/// take, so that the attachment's ending always has somewhere to go.
+///
+/// **Three, and each one is owed by a frame the ending sequence can
+/// still need.** §7.5's exit sequence is `SessionExited` then
+/// `Detached`, which is two; the third is `conn::send_exit`'s
+/// `OutputGap` for a redactor carry that did not fit, because a tail
+/// dropped in silence is the defect this whole change is about and it
+/// must not be reintroduced at the one moment the queue is fullest. The
+/// `slow_consumer` path needs only the `Detached`, so one would do
+/// there — reserving for the worst sequence removes the case analysis,
+/// and costs three frames of a **64**-frame queue.
+///
+/// **Three, not two, was measured rather than reasoned.** At two the
+/// exit path consumed the reserve exactly, so a single interloper — the
+/// four `AwaitingSecret`/`SecretRequestClosed`/`BindingApprovalRequired`
+/// hub fan-outs, or `conn::broadcast_size`'s `Resize` — cost the client its
+/// `Detached`. Those now go through [`queue_ancillary`], which honours
+/// the reserve, so they cannot; the margin is belt and braces for a
+/// sixth sender nobody has written yet.
+///
+/// **This is what makes §7.5's teardown guarantee true rather than
+/// aspirational** (GH #200). `Detached { reason: "slow_consumer" }` was
+/// written with a `try_send` onto the very queue whose overflow had just
+/// caused the ending, so it failed by construction in exactly the case
+/// it names, and a `holdfast watch` that had lost nine tenths of a burst
+/// reported the tidy `the daemon closed the connection` of an EOF. The
+/// frame is not raced against the close either: `run` drops every
+/// `Sender`, and `write_loop` drains what is queued *before* the socket
+/// goes away.
+pub(super) const ENDING_SLOTS: usize = 3;
+
+/// Put a frame that is neither the stream nor the ending on the queue,
+/// **without spending [`ENDING_SLOTS`]**.
+///
+/// `Resize`, `AwaitingSecret`, `SecretRequestClosed` and
+/// `BindingApprovalRequired` are session events this connection is owed
+/// and none of them is worth detaching over, so a refusal here is a
+/// silent drop exactly as the bare `let _ = try_send` it replaces was on
+/// a full queue. What changes is *where* the refusal starts: a frame
+/// that would eat the ending's room is refused, so the reserve is a
+/// reserve rather than a convention the stream alone observes.
+///
+/// **Measured, not hypothesised** (GH #200). With the reserve honoured
+/// only by `conn::queue_stream`, two `Resize` frames from one window drag
+/// landed on a queue at the reserve and cost the client both its
+/// `SessionExited` and its `Detached` — and `conn::broadcast_size`'s own
+/// dedup comment records that a drag flood is already *"enough of one to
+/// have a client dropped as a slow consumer by its own window drag"*, so
+/// the flood and the teardown are documented in this file as
+/// co-occurring rather than merely conceivable.
+pub(super) fn queue_ancillary(tx: &mpsc::Sender<ServerFrame>, frame: ServerFrame) {
+    if tx.capacity() <= ENDING_SLOTS {
+        return;
+    }
+    let _ = tx.try_send(frame);
+}
 
 /// One attached client, as the hub and the audit trail see it.
 pub struct AttachConn {
@@ -58,8 +143,11 @@ pub struct AttachConn {
     /// owner **before a byte of this connection was parsed**.
     pub peer_uid: u32,
     /// Bounded per-connection queue (§4.3: *"their own bounded mpsc,
-    /// default 64 frames"*). Overflow detaches this client and never
-    /// blocks the reader task.
+    /// default 64 frames"* — see [`ATTACH_QUEUE_FRAMES`] for why the
+    /// *number* is now derived and the quote is kept as a quote).
+    /// Overflow detaches this client and never blocks the reader task,
+    /// and the ending still fits: `conn::ENDING_SLOTS` keeps room for
+    /// it (GH #200).
     pub tx: mpsc::Sender<ServerFrame>,
     pub connected_at: Instant,
     /// The geometry this client was last *sent*, so it is not sent again.
@@ -420,16 +508,19 @@ impl AttachHub {
     /// Tell every client attached to this session that a request is
     /// outstanding (§7.5).
     ///
-    /// `try_send` rather than `send`: §4.3's per-connection queue is
+    /// Non-blocking rather than `send`: §4.3's per-connection queue is
     /// bounded and overflow detaches that client. A fan-out that blocked
     /// on one slow client would hold up the tool call, the write path, or
     /// whatever else happened to be doing the raising.
     pub fn broadcast_awaiting_secret(&self, session_id: &str, request_id: &str, prompt_text: &str) {
         for c in self.clients_of(session_id) {
-            let _ = c.tx.try_send(ServerFrame::AwaitingSecret {
-                request_id: request_id.to_string(),
-                prompt_text: prompt_text.to_string(),
-            });
+            queue_ancillary(
+                &c.tx,
+                ServerFrame::AwaitingSecret {
+                    request_id: request_id.to_string(),
+                    prompt_text: prompt_text.to_string(),
+                },
+            );
         }
     }
 
@@ -437,10 +528,13 @@ impl AttachHub {
     /// over, and how (§7.5: `fulfilled` | `cancelled` | `timeout`).
     pub fn broadcast_secret_closed(&self, session_id: &str, request_id: &str, outcome: &str) {
         for c in self.clients_of(session_id) {
-            let _ = c.tx.try_send(ServerFrame::SecretRequestClosed {
-                request_id: request_id.to_string(),
-                outcome: outcome.to_string(),
-            });
+            queue_ancillary(
+                &c.tx,
+                ServerFrame::SecretRequestClosed {
+                    request_id: request_id.to_string(),
+                    outcome: outcome.to_string(),
+                },
+            );
         }
     }
 
@@ -462,20 +556,25 @@ impl AttachHub {
     /// a `&SecretBinding` would be one `serde_json::to_value` away from
     /// putting the reference on the wire.
     ///
-    /// `try_send`, like the other two fan-outs: §4.3's per-connection
+    /// Non-blocking, like the other two fan-outs: §4.3's per-connection
     /// queue is bounded, and a slow client must not hold up a tool call.
+    /// Through `conn::queue_ancillary`, so a fan-out cannot spend the
+    /// room §7.5's ending is holding (GH #200).
     ///
     /// [`Approval`]: crate::secret::Approval
     pub fn broadcast_binding_approval(&self, approval: &crate::secret::Approval) {
         for c in self.clients_of(&approval.session_id) {
-            let _ = c.tx.try_send(ServerFrame::BindingApprovalRequired {
-                approval_id: approval.approval_id.clone(),
-                binding_name: approval.binding_name.clone(),
-                command_line: approval.command_line.clone(),
-                provider: approval.provider.clone(),
-                session: approval.session_id.clone(),
-                prompt_text: approval.prompt_text.clone(),
-            });
+            queue_ancillary(
+                &c.tx,
+                ServerFrame::BindingApprovalRequired {
+                    approval_id: approval.approval_id.clone(),
+                    binding_name: approval.binding_name.clone(),
+                    command_line: approval.command_line.clone(),
+                    provider: approval.provider.clone(),
+                    session: approval.session_id.clone(),
+                    prompt_text: approval.prompt_text.clone(),
+                },
+            );
         }
     }
 }

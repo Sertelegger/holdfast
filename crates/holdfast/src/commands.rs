@@ -41,7 +41,8 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Duration;
 
-/// §18.8 shim exit codes, in §18.8's row order — `0`, `1`, `2`, `64`.
+/// §18.8 shim exit codes, in §18.8's row order — `0`, `1`, `2`, `3`,
+/// `64`.
 /// `0` is `ExitCode::SUCCESS` and needs no constant of its own.
 ///
 /// These are `const`s rather than an enum, so §18's preamble does not
@@ -54,6 +55,24 @@ use std::time::Duration;
 /// §18.8 mirror and the rule starts binding it.
 pub const EXIT_FAILED: u8 = 1;
 pub const EXIT_UNREACHABLE: u8 = 2;
+/// **The view ended, and it was not all of the session** (GH #200).
+///
+/// A code of its own rather than `EXIT_FAILED`, and the argument is a
+/// collision rather than a preference. `1` is already what `watch` and
+/// `attach` return for every §18.4b refusal — `holdfast watch
+/// no-such-session` exits 1 — so `holdfast watch build > log` returning
+/// 1 would mean *either* "you named the wrong session and captured
+/// nothing" *or* "you captured all but twelve bytes". Those have
+/// opposite remedies and a script cannot tell them apart, which is the
+/// same class of defect as the exit 0 this issue is about, one step
+/// along: a status that cannot be branched on is a status that is not
+/// being read.
+///
+/// `2` was the other candidate and is wrong on its own terms — it means
+/// *"there should be a daemon and I could not reach it"*, and here the
+/// daemon was present throughout and said so. §18.8 leaves 3–63
+/// unassigned; this takes the first.
+pub const EXIT_TRUNCATED: u8 = 3;
 pub const EXIT_USAGE: u8 = 64;
 /// `128 + signo`, the status a shell reports for a signalled child.
 ///
@@ -1273,6 +1292,122 @@ fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
     rx
 }
 
+/// What a viewing client knows about how much of the session it was
+/// actually shown (GH #200).
+///
+/// **Two states and not a `bool`, because the two are told differently.**
+/// A gap has a size and the stream continued past it; a `slow_consumer`
+/// ending has no size at all — everything from that instant on was
+/// never queued, and the daemon has no count of what the child went on
+/// to print. Collapsing them would mean either inventing a number for
+/// the second or throwing away the one the first has.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Truncation {
+    /// Nothing was reported missing. **Not a claim that nothing was:**
+    /// it is the absence of a report, which is exactly what this issue
+    /// was about, and it is only as strong as the daemon's reporting.
+    None,
+    /// **At least** `n` bytes are missing from what was rendered, summed
+    /// over every gap.
+    ///
+    /// A lower bound and not a total, for `observer` connections. The
+    /// daemon counts the hole in the **raw** session stream (§4.3's
+    /// broadcast drop, measured from the `OutputFrame` offsets), and an
+    /// observer renders the *redacted* stream — `StreamRedactor` can
+    /// withhold on its own account, and its withholding window is not
+    /// this number — and the redactor announces its own drops in band,
+    /// with `[REDACTED:unresolved]` where the value was. Two mechanisms,
+    /// two notices, neither one the other's total. For `interactive`
+    /// there is no redactor and the two coincide. The CLI says *"at
+    /// least"* for that reason; a hard total would be the same kind of
+    /// over-claim this issue is about.
+    Gap(u64),
+}
+
+#[cfg(unix)]
+impl Truncation {
+    fn saw_gap(&mut self, bytes: u64) {
+        *self = match *self {
+            Self::None => Self::Gap(bytes),
+            Self::Gap(n) => Self::Gap(n.saturating_add(bytes)),
+        };
+    }
+}
+
+/// Tell the operator the stream skipped bytes, at the point it skipped
+/// them.
+///
+/// Through `diag!` and therefore stderr, **not** through [`render`]:
+/// stdout is the session's own byte stream and a client that wrote its
+/// own prose into it would corrupt every `holdfast watch > file`. It is
+/// also why this is not rendered inline at the column the gap occurred
+/// in, which would read better and would be the same mistake.
+#[cfg(unix)]
+fn report_gap(what: &str, bytes: u64) {
+    diag!(
+        "holdfast {what}: at least {bytes} bytes of output were dropped here and are not \
+         shown — `holdfast logs` still has them"
+    );
+}
+
+/// §7.5's `Detached`, rendered, and the exit status that goes with it.
+///
+/// **`slow_consumer` is not a success and this is the one place that is
+/// decided.** Both clients returned `ExitCode::SUCCESS` for every value
+/// of `reason`, so a view that had lost nine tenths of a build log
+/// exited 0 and a script could not tell it from a clean detach. The
+/// **The other two reasons are not a verdict on their own, and that is
+/// the whole of the ordering here.** `session_exit` and
+/// `daemon_shutdown` say the *session* ended or the daemon went away,
+/// and neither is a statement about how much this client saw — so they
+/// fall through to `left_cleanly`, which answers that question from the
+/// gaps. An earlier revision of this comment stopped at *"still exit
+/// 0"*, which is false the moment a gap has been reported, and a gap
+/// does not end a stream: `Truncation` is sticky by design, so a
+/// 12-byte hole early in a session that then exits cleanly is exit
+/// `EXIT_TRUNCATED`. That is the intended answer — the operator's
+/// capture really is missing twelve bytes — and it is written here
+/// because the sentence it replaces read as a promise of 0.
+#[cfg(unix)]
+fn finish(what: &str, reason: &str, truncated: Truncation) -> ExitCode {
+    if reason == "slow_consumer" {
+        // No byte count: see `Truncation`. What is knowable is where to
+        // get the rest, and the ring buffer still has it (REQ-O-005).
+        diag!(
+            "holdfast {what}: detached ({reason}) — this view is incomplete from here on; \
+             `holdfast logs` has what the session printed"
+        );
+        return ExitCode::from(EXIT_TRUNCATED);
+    }
+    diag!("holdfast {what}: detached ({reason})");
+    left_cleanly(what, truncated)
+}
+
+/// The exit status for an ending that was nobody's failure — the client
+/// detached, stdin closed, the session ended — **once a gap has already
+/// been reported**.
+///
+/// [`EXIT_TRUNCATED`] carries the argument for the code itself. What is
+/// worth saying here is the shape: this is the **only** place a gap can
+/// reach the exit status, because `finish` answers `slow_consumer`
+/// before it looks — so a row that pairs a gap with a `slow_consumer`
+/// ending exercises none of this.
+///
+/// The paths that reach this with `Truncation::None` are unchanged and
+/// still exit 0, which is what `mcp-smoke.sh` asserts of `Ctrl-B d` and
+/// of `watch` under `SIGINT`.
+#[cfg(unix)]
+fn left_cleanly(what: &str, truncated: Truncation) -> ExitCode {
+    match truncated {
+        Truncation::None => ExitCode::SUCCESS,
+        Truncation::Gap(n) => {
+            diag!("holdfast {what}: at least {n} bytes of this session were never shown");
+            ExitCode::from(EXIT_TRUNCATED)
+        }
+    }
+}
+
 /// Write bytes to the local terminal, unmodified.
 ///
 /// `write_all` and not `print!`: the payload is a PTY's raw byte stream,
@@ -1534,6 +1669,17 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
     // credential, which is the defect the decline exists to prevent.
     let mut submitted: Option<String> = None;
 
+    // **Whether this view is a complete record of the session** (GH
+    // #200). Set by an `OutputGap` and by nothing else: a
+    // `slow_consumer` ending is the same fact stated as a termination,
+    // but `finish` answers that one directly and returns before it ever
+    // reads this. An earlier version of this comment claimed both, and
+    // claiming both is what hid the fact that the `Gap` arm of
+    // `left_cleanly` was reached by no test at all — every row paired a
+    // gap with a `slow_consumer` ending, so the early return answered
+    // them and the arm could have been deleted green.
+    let mut truncated = Truncation::None;
+
     loop {
         tokio::select! {
             body = frames.recv() => {
@@ -1560,12 +1706,15 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                             diag!("{b}");
                         }
                     }
+                    ServerFrame::OutputGap { bytes, .. } => {
+                        truncated.saw_gap(bytes);
+                        report_gap("attach", bytes);
+                    }
                     ServerFrame::SessionExited { code } => {
                         diag!("holdfast attach: the session exited ({code})");
                     }
                     ServerFrame::Detached { reason } => {
-                        diag!("holdfast attach: detached ({reason})");
-                        return ExitCode::SUCCESS;
+                        return finish("attach", &reason, truncated);
                     }
                     ServerFrame::AwaitingSecret { request_id, prompt_text } => {
                         // On its own line, so it cannot be mistaken for
@@ -1690,7 +1839,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                     // Local stdin closed. Leave without killing the
                     // session, exactly as the detach key does.
                     let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
-                    return ExitCode::SUCCESS;
+                    return left_cleanly("attach", truncated);
                 };
                 // **§6.1's grammar runs first, and it runs during a
                 // secret prompt too.** The order is the whole point: a
@@ -1774,7 +1923,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                 if detached {
                     let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
                     render(b"\r\n");
-                    return ExitCode::SUCCESS;
+                    return left_cleanly("attach", truncated);
                 }
             }
             // Returning, not re-raising: the `return` is what runs
@@ -1886,6 +2035,12 @@ pub async fn watch(session: &str) -> ExitCode {
     let resize_settle = tokio::time::sleep(RESIZE_SETTLE);
     tokio::pin!(resize_settle);
 
+    // See `attach`'s copy: whether this view is a complete record (GH
+    // #200). `watch` is the surface the issue was measured on and the
+    // one a human is most likely to be reading as a record of what
+    // happened.
+    let mut truncated = Truncation::None;
+
     loop {
         tokio::select! {
             body = frames.recv() => {
@@ -1902,12 +2057,15 @@ pub async fn watch(session: &str) -> ExitCode {
                 };
                 match f {
                     ServerFrame::Output { bytes, .. } => render(&bytes),
+                    ServerFrame::OutputGap { bytes, .. } => {
+                        truncated.saw_gap(bytes);
+                        report_gap("watch", bytes);
+                    }
                     ServerFrame::SessionExited { code } => {
                         diag!("holdfast watch: the session exited ({code})");
                     }
                     ServerFrame::Detached { reason } => {
-                        diag!("holdfast watch: detached ({reason})");
-                        return ExitCode::SUCCESS;
+                        return finish("watch", &reason, truncated);
                     }
                     // A watcher is told a secret is being asked for and
                     // **cannot answer it**: `SecretInput` is a write
@@ -1968,7 +2126,7 @@ pub async fn watch(session: &str) -> ExitCode {
                 // and it is a write frame: §7.5 would refuse it
                 // `read_only_attach` and the client would sit there.
                 let _ = frame::write_frame(&mut wr, &WatchOut::Detach.frame()).await;
-                return ExitCode::SUCCESS;
+                return left_cleanly("watch", truncated);
             }
         }
     }

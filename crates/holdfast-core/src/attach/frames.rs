@@ -319,6 +319,54 @@ pub enum ServerFrame {
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
+    /// **The stream skipped `bytes` bytes here** — §4.3's bounded output
+    /// broadcast dropped frames this connection had not read yet, and
+    /// they are gone (GH #200).
+    ///
+    /// The count is **exact and in bytes**, not the frame count
+    /// `RecvError::Lagged(n)` reports. The internal `OutputFrame` carries
+    /// `start`/`end`, so the hole between the last frame this connection
+    /// forwarded and the first one after the lag is arithmetic the daemon
+    /// already has; `n` frames is a number about the channel's plumbing
+    /// and answers nothing a person watching a build log is asking.
+    ///
+    /// **Out of band, and that is the whole reason it is a frame.** The
+    /// redactor's `[REDACTED:unresolved]` is written *into* the payload
+    /// because a substitution has to sit where the value was. A gap has no
+    /// such position to occupy, and `role: interactive` is REQ-SEC-008's
+    /// raw-fidelity surface — bytes this daemon invented inside `Output`
+    /// would corrupt every byte-exact capture taken through it. So the
+    /// notice travels beside the stream and the renderer decides what to
+    /// draw.
+    ///
+    /// **A frame and not a fourth `Detached.reason`**: §18.4c closes that
+    /// set at three and REQ-D-009 carries the guarantee. This is not an
+    /// ending. The attachment is healthy, the stream continues, and the
+    /// only thing that happened is that part of it is missing.
+    ///
+    /// **It counts the *raw* stream, which for an `observer` is not the
+    /// stream that client renders — so it is a floor, not a total.** The
+    /// number is exactly §4.3's broadcast hole and nothing else; an
+    /// observer's `StreamRedactor` withholds on its own account, and
+    /// those bytes are announced separately and in band, by
+    /// `[REDACTED:unresolved]` where the value was (REQ-O-011a). Two
+    /// mechanisms, two notices, and neither is the other's total.
+    /// Measured on one composed feed: a 5,000-byte lag around a 20 KB
+    /// unterminated PEM reports 5,000 while 25,459 bytes go unrendered,
+    /// the balance being the redactor's — marked, not silent. The CLI
+    /// says *"at least"* for this reason. `interactive` has no redactor
+    /// and the two coincide.
+    ///
+    /// **Residual, stated and not closed**: a lag landing *while* the
+    /// redactor is withholding loses post-gap bytes with no marker and
+    /// no second frame, because the marker fires once per withholding
+    /// episode. That is `redact_stream`'s documented residual (up to
+    /// `2 × STREAM_CARRY_BYTES`) rather than this frame's, and it is
+    /// named here because this is where a reader will look for it.
+    OutputGap {
+        session: String,
+        bytes: u64,
+    },
     SessionExited {
         code: i32,
     },
@@ -673,6 +721,7 @@ impl ServerFrame {
             Self::Attached { .. } => Some("Attached"),
             Self::AttachReject { .. } => Some("AttachReject"),
             Self::Output { .. } => Some("Output"),
+            Self::OutputGap { .. } => Some("OutputGap"),
             Self::SessionExited { .. } => Some("SessionExited"),
             Self::Resize { .. } => Some("Resize"),
             Self::AwaitingSecret { .. } => Some("AwaitingSecret"),
@@ -690,7 +739,17 @@ impl ServerFrame {
 /// one.
 ///
 /// The order is §7.5's — the two handshake frames, then the bulleted
-/// server list — restricted to the variants 0.0.7 implements.
+/// server list — restricted to the variants 0.0.7 implements, plus the
+/// one that is not a §7.5 row at all.
+///
+/// **`OutputGap` sits directly after `Output`, which is where §7.5 now
+/// carries it** (GH #200). It was placed here first, by the rule the
+/// rest of this order follows rather than by transcription — it is a
+/// statement about the output stream and belongs with the frame it
+/// qualifies, the way a gap belongs where the bytes were — and the
+/// document was then edited to match, so the two can still be diffed by
+/// eye. An append would have put it after `Detached`, which is the one
+/// place it means nothing.
 /// `BindingApprovalRequired` **inserted** between `SecretRequestClosed`
 /// and `TransferProgress` when 0.0.7 landed it, exactly where 0.0.6's
 /// version of this comment reserved the slot; `TransferProgress` goes
@@ -702,6 +761,7 @@ pub const KNOWN_SERVER_TYPES: &[&str] = &[
     "Attached",
     "AttachReject",
     "Output",
+    "OutputGap",
     "SessionExited",
     "Resize",
     "AwaitingSecret",
@@ -1191,6 +1251,10 @@ mod tests {
                 session: "s".into(),
                 bytes: vec![],
             },
+            ServerFrame::OutputGap {
+                session: "s".into(),
+                bytes: 0,
+            },
             ServerFrame::SessionExited { code: 0 },
             ServerFrame::Resize { cols: 80, rows: 24 },
             ServerFrame::AwaitingSecret {
@@ -1225,8 +1289,9 @@ mod tests {
         assert_eq!(tags.as_slice(), KNOWN_SERVER_TYPES);
         assert_eq!(
             KNOWN_SERVER_TYPES.len(),
-            10,
-            "ten of §7.5's eleven; only TransferProgress (0.0.9) is deferred"
+            11,
+            "eleven of §7.5's twelve; only TransferProgress (0.0.9) is deferred. \
+             OutputGap is the twelfth row, added to §7.5 by GH #200"
         );
         // The negative: Unknown is decode-only and must not be in the
         // list, or decode_server_frame would refuse to produce it.
