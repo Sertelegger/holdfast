@@ -592,6 +592,69 @@ is cut, named and published is in
   defect: it is right that one frame between two local processes should never
   take longer, and the frame was never late — the daemon was never asked
   ([#201], [#194]).
+- **`generic-secret-assignment` and `secret-key-assignment` no longer fire on a
+  namespace path, which is the largest class of the prose-mangling [#202]
+  measured and is not all of it.** Both rules now refuse a value whose first
+  byte is another `:`.
+  The separator is already consumed by `[:=]` at that point, so a value opening
+  on a second colon means the text read `label::…` — a scope-resolution
+  operator, not an assignment. Measured over nine corpora that contain no
+  credential (third-party Rust, crates.io READMEs, this repository's own
+  `git log`, rendered man pages, colourised `grep -rn`, the Python 3.12 standard
+  library, Debian licence texts, and this project's own docs and source), it
+  removes 63% of the pair's matches on commit prose, 63% on this repository's
+  own Rust, 53% on READMEs and 26% on the design docs, and takes the share of
+  default-sized read windows the redaction prefilter can skip outright from 33%
+  to 58% on this repository's source. **It removes none of either rule's own
+  positives and none of a 32-row corpus of constructed real-shaped credentials**
+  — `tests/redaction_prose.rs` asserts both directions, with every absence arm
+  paired against the pre-fix pattern reinstated by name, so a rule set that
+  matched nothing would fail rather than pass ([#202]).
+
+  **This changes the rate, not the rule.** The pair still matches on the
+  *label* and does not inspect the value, so `password = not-set-yet` is still
+  `[REDACTED:generic]` exactly as [#125] recorded; whether that stays is an
+  operator's call through `disabled_redaction_rules` ([#128]) and not this
+  release's. `powersync-token` keeps the broad value class deliberately: its
+  label is anchored to one vendor's name, so none of the nine corpora measured
+  reaches it — a fact about those corpora rather than a property of that rule,
+  whose own `[a-z0-9_.-]{0,24}` would let `powersync_token::Name` reach it
+  inside a PowerSync codebase.
+
+  **What it does not close, and the reason it stops here.** [#202]'s own
+  headline row — ``reassembled the token: `get_screen_state` `` — is a plain
+  `label: value` with no second colon, and is still redacted; so is
+  `export TOKEN={GITHUB}`. Closing those means constraining what the value
+  *contains*, and every such constraint measured drops a real credential with
+  it — a value character class costs a bcrypt hash and a password carrying `!`
+  or `@`, a required digit costs every digit-free passphrase. That is a
+  security trade rather than a bug fix, so it is written up on [#202] for a
+  decision instead of taken here, and `tests/redaction_prose.rs` asserts the
+  headline row is still redacted so the open half is a number rather than a
+  silence.
+
+  **What it gives up, recorded rather than hidden — two things, not one.**
+  First, a credential whose own first byte is `:` — **however it is quoted or
+  spaced**, since `["']?` consumes an opening quote and `\s*` a whitespace run
+  including a newline, so `password=:hunter2`, `{"password":":hunter2"}` and the
+  YAML spelling are one class and not three — is no longer redacted. No provider
+  mints one and no fixture contains one, but the class is real and ships as an
+  explicit documented-limitation assertion (REQ-TST-006).
+
+  Second, and found by a review lane rather than by the author: **at the buffer
+  tail the change trades a marker for a shortened read.** Both rules carry a
+  `value` capture group, so §4.1's partial-secret scan disqualifies a candidate
+  only where the rule can already see a whole match; a stricter value class
+  matches less often, disqualifies less, and moves `holdback_boundary`
+  **earlier** — never later, which is the direction that would be a leak, and a
+  4,293-prefix monotonicity sweep found 28 boundaries moved earlier and zero
+  later. The user-visible effect is that an un-terminated line the child has
+  echoed (`$ cargo test secret::binding`, no newline yet) now returns truncated
+  with `held_back: true` where it returned mangled, and `status`'s
+  `prompt.last_line` is `""` for as long as that holds. It is a rate and not a
+  strand — one byte outside the value class releases the whole line — and
+  `at_the_buffer_tail_the_fix_withholds_where_it_used_to_mangle` measures both
+  halves rather than asserting the cost away.
 
 - **The `binary` arm of the in-flight test asks the rule as well, so a
   certificate no longer pins the holdback for the rest of the session
@@ -1394,3 +1457,4 @@ residuals that are known and accepted.
 [#201]: https://github.com/Sertelegger/holdfast/issues/201
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
+[#202]: https://github.com/Sertelegger/holdfast/issues/202
