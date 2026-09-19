@@ -131,3 +131,136 @@ jobs:
             --verify-tag \
             --title "$title" \
             --notes-file release-notes.md
+
+  # **crates.io, and it is inert until a token exists.** §12.1 of the design
+  # spec lists `cargo install holdfast` as a distribution channel — "published
+  # to crates.io as a source-build fallback" — beside the GitHub Release. The
+  # names are reserved (`holdfast 0.0.0`, `holdfast-core 0.0.0`, both
+  # placeholder crates with no usable code), so the first real upload replaces
+  # a stub rather than claiming a name.
+  #
+  # **A separate job, deliberately.** Publishing to crates.io is irreversible:
+  # a version number, once uploaded, can be yanked but never reused or
+  # replaced. The GitHub Release above is not — it can be deleted and
+  # recreated. So crates.io goes last and behind `needs:`, and a failed
+  # release above never leaves a permanent artifact behind it. It also keeps
+  # `publish`'s 10-minute budget intact; two verification builds do not fit in
+  # it.
+  #
+  # **The gate is the absence of a secret, not an `if:` on one.** `secrets` is
+  # not an available context in `jobs.<id>.if` *or* in a step's `if:`, and
+  # actionlint says so for both positions rather than this being a belief:
+  # `context "secrets" is not allowed here. available contexts are "github",
+  # "inputs", "needs", "vars"`. GitHub does not degrade gracefully either --
+  # it refuses the whole run with `Unrecognized named-value: 'secrets'`. So
+  # the obvious spelling does not misbehave quietly, it stops the release,
+  # and the gate step exists to read the token into `env` -- where the
+  # context *is* available -- decide there, and let every later step key off
+  # its output.
+  #
+  # With no `CARGO_REGISTRY_TOKEN` configured this job is one `if`/`else`
+  # that writes `publish=false` to `$GITHUB_OUTPUT`, prints two lines and
+  # exits 0; every step after it is skipped. That is the intended state
+  # until the maintainer decides the version question.
+  #
+  # **Adding the secret is the decision, and it leaves no diff.** §12.3 makes
+  # *first external distribution* the event that binds change discipline, and
+  # several escapes in this tree -- the wire-shape record's in-place
+  # corrections most of all -- are written on the premise that it has not
+  # happened. `cargo install holdfast` is that event as much as a release
+  # asset is. It is armed from the repository settings UI with no PR and no
+  # review, which is exactly why it is named here.
+  crates-io:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: A registry token, or nothing happens
+        id: gate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "No CARGO_REGISTRY_TOKEN secret is configured." >&2
+            echo "The GitHub Release is published; crates.io is skipped." >&2
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.publish == 'true'
+        with:
+          persist-credentials: false
+
+      # ci.yml's phrasing, and for its reason: `rust-toolchain.toml` is the
+      # only pin, so this installs it and prints what it resolved to rather
+      # than naming a version here that could disagree with it.
+      - name: Install the toolchain rust-toolchain.toml pins
+        if: steps.gate.outputs.publish == 'true'
+        run: rustup show active-toolchain && rustc --version
+
+      # **The second version string.** `holdfast`'s dependency on
+      # `holdfast-core` must carry a literal version — crates.io rejects a
+      # path-only dependency — and no `version.workspace` exists inside a
+      # dependency spec to inherit it from. A stale literal here fails no
+      # build and no test: the workspace still resolves it by path, and only
+      # the *published* `holdfast` binds to an older `holdfast-core` already
+      # on the index. That is a wrong permanent artifact, so it is checked
+      # against the tag here, before anything is uploaded.
+      - name: The tag, the workspace version and the dependency literal must agree
+        if: steps.gate.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          ws="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          dep="$(sed -n 's/^holdfast-core = .*version = "\([^"]*\)".*$/\1/p' Cargo.toml | head -1)"
+          if [ -z "$dep" ]; then
+            echo "no version literal found on the holdfast-core workspace dependency" >&2
+            exit 1
+          fi
+          if [ "$version" != "$ws" ] || [ "$version" != "$dep" ]; then
+            echo "tag $version, workspace $ws, holdfast-core dependency $dep" >&2
+            exit 1
+          fi
+          echo "all three agree on $version"
+
+      # **`--workspace` is what orders this correctly**, and the ordering is
+      # not optional: `holdfast` cannot resolve until `holdfast-core` is on
+      # the index. Measured on cargo 1.97.1 against the real index, which
+      # today holds only the 0.0.0 name reservations:
+      #
+      #   cargo publish --dry-run -p holdfast-core ... ok
+      #   cargo publish --dry-run -p holdfast ....... error: failed to select
+      #     a version for the requirement `holdfast-core = "^0.0.7"`;
+      #     candidate versions found which didn't match: 0.0.0
+      #   cargo publish --dry-run --workspace ....... ok, core uploaded first
+      #
+      # `--workspace` publishes members in dependency order and, since 1.66,
+      # cargo blocks on a just-published version appearing on the index
+      # before continuing. **That wait is the one part a dry run cannot
+      # exercise** — the dry run aborts before any upload — so it is taken
+      # from cargo's documented behaviour rather than measured here. It is
+      # still better than the alternative: a hand-rolled two-command script
+      # would have to guess at a `sleep`.
+      #
+      # `--locked` per §12.4: releases build from the committed `Cargo.lock`.
+      # No `--no-verify` — the verification build is the check that each
+      # tarball compiles from itself, which is the failure mode a path
+      # dependency or a missing `include`d file produces and nothing else
+      # catches.
+      # **There is no resume path, and that is not fixable in this file.**
+      # `cargo publish` is not atomic across members: if `holdfast-core`
+      # uploads and `holdfast` does not, re-running this job dies on `crate
+      # version already uploaded` before it reaches `holdfast`. Recovery is
+      # manual -- `cargo publish --locked -p holdfast` from the tagged
+      # commit -- and it is written down here because the alternative is
+      # working it out while a half-published version is live.
+      - name: Publish holdfast-core then holdfast
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --workspace --locked

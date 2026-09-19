@@ -265,13 +265,61 @@ Cutting one is therefore:
    definition** — a missing one is why `[0.0.5]` and `[0.0.6]` rendered with
    visible brackets for two releases while `[0.0.7]` did not.
 3. Open a fresh empty `## [Unreleased]`.
-4. Bump the workspace version in `Cargo.toml` to match, and commit.
+4. Bump **both** version literals in the root `Cargo.toml` to match, and
+   commit. `[workspace.package] version` is the obvious one;
+   `holdfast-core = { path = "crates/holdfast-core", version = "X.Y.Z" }`
+   under `[workspace.dependencies]` is the second. It exists because
+   crates.io rejects a path-only dependency and there is no
+   `version.workspace` to inherit inside a dependency spec. **A stale second
+   literal fails no build and no test** — the workspace still resolves it by
+   path — and surfaces only as a *published* `holdfast` bound to an older
+   `holdfast-core`, which is a wrong permanent artifact rather than a red
+   check. The two are declared six lines apart so that one edit sees both.
 5. Tag `vX.Y.Z` and push the tag. That triggers
    `.github/workflows/release.yml`, which checks that the tag, the crate
    version and a non-empty changelog section all agree, then publishes the
    release with that section as the body and the name derived from its
    heading. **The codename must be on the heading before the tag is
    pushed**, or the release ships without it.
+
+### crates.io
+
+`release.yml` carries a second job, `crates-io`. It `needs:` the GitHub
+Release above — crates.io goes last because a version, once uploaded, can be
+yanked but never reused or replaced, while a GitHub Release can be deleted
+and recreated — and then runs `cargo publish --workspace --locked`.
+
+**Today that job does nothing, and cutting a release is unchanged by it.**
+It is gated on a `CARGO_REGISTRY_TOKEN` repository secret that does not
+exist. With the secret absent its first step records `publish=false`, every
+later step is `if:`-ed off, and the job is one shell command that prints why
+it stopped and exits green. Nothing is uploaded. The gate is written that
+way, rather than as an `if:` on `secrets.*`, because `secrets` is not an
+available context in either a job-level or a step-level `if:` — there the
+expression is empty, and a job gated on an empty string runs
+unconditionally.
+
+Two things about it are worth knowing before it is switched on:
+
+- **It publishes `holdfast-core` first, and must.** `holdfast` cannot
+  resolve until core is on the index, and `--workspace` is what orders the
+  members and waits for each upload to appear there. If a run half-succeeds
+  — core uploaded, the binary crate not — a re-run does not recover it: core
+  is already uploaded and cargo refuses. Recovery is a manual
+  `cargo publish -p holdfast`.
+- **Its version check is behind the same gate.** The step that compares the
+  tag against both `Cargo.toml` literals only runs when the token is
+  present, so with no token nothing in this repository catches a stale
+  dependency literal. Step 4 above is the entire defence until then.
+
+**Adding that secret is a decision, not a configuration step.** It is done
+in the GitHub UI: no diff, no PR, no review, and no record here — the
+repository records that the job *reads* the secret, never whether it is set.
+What it changes is that the next tag uploads a permanent, unreplaceable
+artifact, and that is **first external distribution**: the event the note
+below says binds this project's compatibility promises, and that several
+deliberate in-tree escapes are conditioned on not having happened. Decide it
+deliberately, and record here when it was decided.
 
 ### Naming
 

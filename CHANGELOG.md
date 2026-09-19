@@ -52,6 +52,20 @@ is cut, named and published is in
   Only `true` is accepted — `false` has exactly one meaning anyone could want,
   and putting a second, unaudited licence to bypass on the wire is the defect
   this argument exists to close ([#169]).
+- The two crates carry the metadata crates.io requires, so the workspace can
+  be published: a `description` each, `keywords`, per-crate `categories`, and
+  `repository`/`homepage`/`readme` inherited or pointed at the one root
+  `README.md`, which cargo copies into both tarballs. `holdfast`'s dependency
+  on `holdfast-core` now carries a **version** as well as a path, because
+  crates.io rejects a path-only dependency — a second version literal that
+  must be bumped with the first, which release step 4 now names.
+- `.github/workflows/release.yml` gains a `crates-io` job that runs after the
+  GitHub Release and publishes both crates with `cargo publish --workspace
+  --locked` — `holdfast-core` first, since `holdfast` cannot resolve until it
+  is on the index. **It is inert**: it is gated on a `CARGO_REGISTRY_TOKEN`
+  secret that does not exist, so today it prints why it is skipping and exits.
+  Adding that secret is §12.3's *first external distribution*, which is a
+  decision rather than a configuration step; see CONTRIBUTING.md.
 
 ### Changed
 
