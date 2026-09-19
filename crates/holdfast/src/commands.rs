@@ -41,7 +41,8 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Duration;
 
-/// §18.8 shim exit codes, in §18.8's row order — `0`, `1`, `2`, `64`.
+/// §18.8 shim exit codes, in §18.8's row order — `0`, `1`, `2`, `3`,
+/// `64`.
 /// `0` is `ExitCode::SUCCESS` and needs no constant of its own.
 ///
 /// These are `const`s rather than an enum, so §18's preamble does not
@@ -54,6 +55,24 @@ use std::time::Duration;
 /// §18.8 mirror and the rule starts binding it.
 pub const EXIT_FAILED: u8 = 1;
 pub const EXIT_UNREACHABLE: u8 = 2;
+/// **The view ended, and it was not all of the session** (GH #200).
+///
+/// A code of its own rather than `EXIT_FAILED`, and the argument is a
+/// collision rather than a preference. `1` is already what `watch` and
+/// `attach` return for every §18.4b refusal — `holdfast watch
+/// no-such-session` exits 1 — so `holdfast watch build > log` returning
+/// 1 would mean *either* "you named the wrong session and captured
+/// nothing" *or* "you captured all but twelve bytes". Those have
+/// opposite remedies and a script cannot tell them apart, which is the
+/// same class of defect as the exit 0 this issue is about, one step
+/// along: a status that cannot be branched on is a status that is not
+/// being read.
+///
+/// `2` was the other candidate and is wrong on its own terms — it means
+/// *"there should be a daemon and I could not reach it"*, and here the
+/// daemon was present throughout and said so. §18.8 leaves 3–63
+/// unassigned; this takes the first.
+pub const EXIT_TRUNCATED: u8 = 3;
 pub const EXIT_USAGE: u8 = 64;
 /// `128 + signo`, the status a shell reports for a signalled child.
 ///
@@ -1289,8 +1308,20 @@ enum Truncation {
     /// it is the absence of a report, which is exactly what this issue
     /// was about, and it is only as strong as the daemon's reporting.
     None,
-    /// `n` bytes are known to be missing from what was rendered, summed
+    /// **At least** `n` bytes are missing from what was rendered, summed
     /// over every gap.
+    ///
+    /// A lower bound and not a total, for `observer` connections. The
+    /// daemon counts the hole in the **raw** session stream (§4.3's
+    /// broadcast drop, measured from the `OutputFrame` offsets), and an
+    /// observer renders the *redacted* stream — `StreamRedactor` can
+    /// withhold on its own account, and its withholding window is not
+    /// this number — and the redactor announces its own drops in band,
+    /// with `[REDACTED:unresolved]` where the value was. Two mechanisms,
+    /// two notices, neither one the other's total. For `interactive`
+    /// there is no redactor and the two coincide. The CLI says *"at
+    /// least"* for that reason; a hard total would be the same kind of
+    /// over-claim this issue is about.
     Gap(u64),
 }
 
@@ -1315,8 +1346,8 @@ impl Truncation {
 #[cfg(unix)]
 fn report_gap(what: &str, bytes: u64) {
     diag!(
-        "holdfast {what}: {bytes} bytes of output were dropped here and are not shown — \
-         `holdfast logs` still has them"
+        "holdfast {what}: at least {bytes} bytes of output were dropped here and are not \
+         shown — `holdfast logs` still has them"
     );
 }
 
@@ -1326,14 +1357,18 @@ fn report_gap(what: &str, bytes: u64) {
 /// decided.** Both clients returned `ExitCode::SUCCESS` for every value
 /// of `reason`, so a view that had lost nine tenths of a build log
 /// exited 0 and a script could not tell it from a clean detach. The
-/// other two reasons are unchanged and still exit 0: `session_exit` and
-/// `daemon_shutdown` are the session ending and the daemon going away,
-/// both of which are things that happened to the *session*, and neither
-/// says the operator was shown less than there was.
-///
-/// A gap seen earlier carries the same verdict, because it is the same
-/// fact: the stream this client rendered is not the stream the child
-/// wrote.
+/// **The other two reasons are not a verdict on their own, and that is
+/// the whole of the ordering here.** `session_exit` and
+/// `daemon_shutdown` say the *session* ended or the daemon went away,
+/// and neither is a statement about how much this client saw — so they
+/// fall through to `left_cleanly`, which answers that question from the
+/// gaps. An earlier revision of this comment stopped at *"still exit
+/// 0"*, which is false the moment a gap has been reported, and a gap
+/// does not end a stream: `Truncation` is sticky by design, so a
+/// 12-byte hole early in a session that then exits cleanly is exit
+/// `EXIT_TRUNCATED`. That is the intended answer — the operator's
+/// capture really is missing twelve bytes — and it is written here
+/// because the sentence it replaces read as a promise of 0.
 #[cfg(unix)]
 fn finish(what: &str, reason: &str, truncated: Truncation) -> ExitCode {
     if reason == "slow_consumer" {
@@ -1343,7 +1378,7 @@ fn finish(what: &str, reason: &str, truncated: Truncation) -> ExitCode {
             "holdfast {what}: detached ({reason}) — this view is incomplete from here on; \
              `holdfast logs` has what the session printed"
         );
-        return ExitCode::from(EXIT_FAILED);
+        return ExitCode::from(EXIT_TRUNCATED);
     }
     diag!("holdfast {what}: detached ({reason})");
     left_cleanly(what, truncated)
@@ -1353,10 +1388,11 @@ fn finish(what: &str, reason: &str, truncated: Truncation) -> ExitCode {
 /// detached, stdin closed, the session ended — **once a gap has already
 /// been reported**.
 ///
-/// §18.8's `1` and not a new code: *"the thing you asked for did not
-/// happen"* covers a view that is missing part of the session, and a
-/// truncated stream is not `2`'s *"there should be a daemon and I could
-/// not reach it"* — the daemon was there throughout and said so.
+/// [`EXIT_TRUNCATED`] carries the argument for the code itself. What is
+/// worth saying here is the shape: this is the **only** place a gap can
+/// reach the exit status, because `finish` answers `slow_consumer`
+/// before it looks — so a row that pairs a gap with a `slow_consumer`
+/// ending exercises none of this.
 ///
 /// The paths that reach this with `Truncation::None` are unchanged and
 /// still exit 0, which is what `mcp-smoke.sh` asserts of `Ctrl-B d` and
@@ -1366,8 +1402,8 @@ fn left_cleanly(what: &str, truncated: Truncation) -> ExitCode {
     match truncated {
         Truncation::None => ExitCode::SUCCESS,
         Truncation::Gap(n) => {
-            diag!("holdfast {what}: {n} bytes of this session were never shown");
-            ExitCode::from(EXIT_FAILED)
+            diag!("holdfast {what}: at least {n} bytes of this session were never shown");
+            ExitCode::from(EXIT_TRUNCATED)
         }
     }
 }
@@ -1634,10 +1670,14 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
     let mut submitted: Option<String> = None;
 
     // **Whether this view is a complete record of the session** (GH
-    // #200). Set by an `OutputGap`, and by a `slow_consumer` ending,
-    // which is the same fact stated as a termination. It is the only
-    // input to the exit status that is not an error the client itself
-    // hit — see [`incomplete_exit`].
+    // #200). Set by an `OutputGap` and by nothing else: a
+    // `slow_consumer` ending is the same fact stated as a termination,
+    // but `finish` answers that one directly and returns before it ever
+    // reads this. An earlier version of this comment claimed both, and
+    // claiming both is what hid the fact that the `Gap` arm of
+    // `left_cleanly` was reached by no test at all — every row paired a
+    // gap with a `slow_consumer` ending, so the early return answered
+    // them and the arm could have been deleted green.
     let mut truncated = Truncation::None;
 
     loop {

@@ -2313,6 +2313,88 @@ async fn a_client_on_a_terminal_declares_it_and_two_terminals_differ() {
 ///
 /// `run_plain` rather than a pty, because `watch` is the subcommand that
 /// deliberately works from a pipe.
+/// **A gap alone decides the exit status, with no `slow_consumer`
+/// anywhere near it** (GH #200).
+///
+/// **This is the row the other two could not be.** Both of them pair a
+/// gap with a `Detached { reason: "slow_consumer" }`, and `finish`
+/// answers that reason *before* it reads `truncated` — so `left_cleanly`'s
+/// `Gap` arm, which is the entire reason `Truncation` exists, was
+/// reached by nothing. Mutation-proved twice, by two reviewers and two
+/// different edits: `Gap(n) => EXIT_TRUNCATED` replaced by
+/// `ExitCode::SUCCESS`, and `left_cleanly`'s whole match body replaced
+/// by `ExitCode::SUCCESS`, both **64/64 green**. `Truncation`,
+/// `saw_gap` and the byte-count line could all have been deleted.
+///
+/// So the ending here is `session_exit` — the session finished on its
+/// own, nothing went wrong with the connection, and the view is *still*
+/// short by twelve bytes. That combination is also the common one in
+/// practice: a gap does not end a stream, and `Truncation` is sticky, so
+/// almost every truncated `watch` ends this way rather than on a
+/// `slow_consumer`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gap_alone_decides_the_exit_status() {
+    let replies = vec![
+        enc(&ServerFrame::Attached {
+            session_id: "sess_w200c".into(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            state: "Running".into(),
+            exit_code: None,
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: 0,
+        }),
+        enc(&ServerFrame::Output {
+            session: "sess_w200c".into(),
+            bytes: b"BEFORE-THE-GAP\n".to_vec(),
+        }),
+        enc(&ServerFrame::OutputGap {
+            session: "sess_w200c".into(),
+            bytes: 12,
+        }),
+        enc(&ServerFrame::Output {
+            session: "sess_w200c".into(),
+            bytes: b"AFTER-THE-GAP\n".to_vec(),
+        }),
+        // The session ends **cleanly**. Nothing here is a slow consumer.
+        enc(&ServerFrame::SessionExited { code: 0 }),
+        enc(&ServerFrame::Detached {
+            reason: "session_exit".into(),
+        }),
+    ];
+    let stub = StubDaemon::start("watchgaponly", replies, Duration::from_millis(900)).await;
+    let out = tokio::task::spawn_blocking({
+        let dir = stub.paths.dir().to_path_buf();
+        move || run_plain(&dir, &["watch", "sess_w200c"])
+    })
+    .await
+    .expect("join");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a clean ending on a view that lost 12 bytes exited {:?}; the gap is the \
+         only thing wrong and it must still decide the status. all stderr:\n{err}",
+        out.status.code()
+    );
+    assert!(
+        err.contains("at least 12 bytes of this session were never shown"),
+        "the summary at the end must name the total, and name it as a lower \
+         bound:\n{err}"
+    );
+    assert!(
+        err.contains("detached (session_exit)"),
+        "the ending is still reported as what it was:\n{err}"
+    );
+    assert!(
+        !err.contains("slow_consumer") && !err.contains("incomplete"),
+        "nothing here was a slow consumer; saying so would be a second wrong \
+         diagnosis:\n{err}"
+    );
+}
+
 /// **`attach` carries the same defect and the same fix** (GH #200).
 ///
 /// It is a different `AttachRole` on one protocol, so the daemon half is
@@ -2359,13 +2441,13 @@ async fn a_truncated_attach_names_the_loss_and_does_not_exit_zero() {
     let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_a200"], 80, 24);
     assert_eq!(
         term.wait_exit(15),
-        1,
+        3,
         "a raw-fidelity view missing 349,525 bytes exited 0, which is what a \
          clean Ctrl-B d exits"
     );
     let seen = term.snapshot();
     assert!(
-        contains(&seen, b"349525 bytes of output were dropped"),
+        contains(&seen, b"at least 349525 bytes of output were dropped"),
         "attach must name the gap with its size, as watch does:\n{}",
         String::from_utf8_lossy(&seen)
     );
@@ -2455,12 +2537,12 @@ async fn a_truncated_watch_names_the_loss_and_does_not_exit_zero() {
 
     assert_eq!(
         out.status.code(),
-        Some(1),
+        Some(3),
         "a view missing 349,525 bytes of its session exited {:?}; all stderr:\n{err}",
         out.status.code()
     );
     assert!(
-        err.contains("349525 bytes of output were dropped"),
+        err.contains("at least 349525 bytes of output were dropped"),
         "the gap must be named with its size, not merely hinted at:\n{err}"
     );
     assert!(

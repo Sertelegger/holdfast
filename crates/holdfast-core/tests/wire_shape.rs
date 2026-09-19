@@ -277,6 +277,9 @@ const RECORDED_VERSIONS: &[(u32, u32)] = &[
     // through the wire, `holdfast watch` delivered as little as 2.6% of a
     // 380 KB burst and ended on `the daemon closed the connection`.
     //
+    // §7.5 carries the frame as its twelfth server row; the spec edit
+    // and this one are the same change.
+    //
     // **A new server frame is additive and a new client frame would not
     // be**, which is the distinction the failure message below draws and
     // the reason this is a minor. `decode_server_frame` maps an
@@ -668,9 +671,12 @@ fn server_frames() -> Vec<ServerFrame> {
             bytes: vec![0x1b],
         },
         // Maximal like every other sample, and `bytes` is the one field
-        // here that could be mistaken for `Output`'s: it is an `int`
-        // there and a byte string here, which is the difference the
-        // `wire:` line records.
+        // here that could be mistaken for `Output`'s: it is a byte
+        // string there and an `int` here, which is the difference the
+        // `wire:` line records (`1.4.golden` — `Output` reads
+        // `{bytes: bytes, …}`, `OutputGap` reads `{bytes: int, …}`).
+        // An earlier revision of this comment had the two the wrong way
+        // round.
         ServerFrame::OutputGap {
             session: STR.into(),
             bytes: 1,

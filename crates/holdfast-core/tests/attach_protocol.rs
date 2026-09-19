@@ -3628,7 +3628,9 @@ fn the_attach_protocol_carries_no_confirmation_frame() {
     // And the catalogue really is the one this build serialises — without
     // this the loop above passes against an empty array. 6 → 7 and 9 → 10
     // are 0.0.7's two additive variants (§23.3, Global Constraint 13);
-    // 10 → 11 is `OutputGap`, which is GH #200's and is not a §7.5 row.
+    // 10 → 11 is `OutputGap`, GH #200's, and §7.5 now carries it as its
+    // twelfth row — eleven of twelve ship, TransferProgress (0.0.9) does
+    // not.
     assert_eq!(ClientFrameKind::ALL.len(), 7);
     assert_eq!(KNOWN_SERVER_TYPES.len(), 11);
 }

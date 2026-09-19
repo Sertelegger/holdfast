@@ -343,6 +343,26 @@ pub enum ServerFrame {
     /// set at three and REQ-D-009 carries the guarantee. This is not an
     /// ending. The attachment is healthy, the stream continues, and the
     /// only thing that happened is that part of it is missing.
+    ///
+    /// **It counts the *raw* stream, which for an `observer` is not the
+    /// stream that client renders — so it is a floor, not a total.** The
+    /// number is exactly §4.3's broadcast hole and nothing else; an
+    /// observer's `StreamRedactor` withholds on its own account, and
+    /// those bytes are announced separately and in band, by
+    /// `[REDACTED:unresolved]` where the value was (REQ-O-011a). Two
+    /// mechanisms, two notices, and neither is the other's total.
+    /// Measured on one composed feed: a 5,000-byte lag around a 20 KB
+    /// unterminated PEM reports 5,000 while 25,459 bytes go unrendered,
+    /// the balance being the redactor's — marked, not silent. The CLI
+    /// says *"at least"* for this reason. `interactive` has no redactor
+    /// and the two coincide.
+    ///
+    /// **Residual, stated and not closed**: a lag landing *while* the
+    /// redactor is withholding loses post-gap bytes with no marker and
+    /// no second frame, because the marker fires once per withholding
+    /// episode. That is `redact_stream`'s documented residual (up to
+    /// `2 × STREAM_CARRY_BYTES`) rather than this frame's, and it is
+    /// named here because this is where a reader will look for it.
     OutputGap {
         session: String,
         bytes: u64,
@@ -722,16 +742,14 @@ impl ServerFrame {
 /// server list — restricted to the variants 0.0.7 implements, plus the
 /// one that is not a §7.5 row at all.
 ///
-/// **`OutputGap` sits directly after `Output` and the document has no
-/// bullet to put it beside** (GH #200). It is placed by the rule the
-/// rest of this order follows rather than by transcription: it is a
+/// **`OutputGap` sits directly after `Output`, which is where §7.5 now
+/// carries it** (GH #200). It was placed here first, by the rule the
+/// rest of this order follows rather than by transcription — it is a
 /// statement about the output stream and belongs with the frame it
-/// qualifies, the way a gap belongs where the bytes were. It is
-/// recorded here as an insertion rather than an append for the same
-/// reason `BindingApprovalRequired` was — a list a reader can diff
-/// against §7.5 by eye is worth the arithmetic, and an append would
-/// have put it after `Detached`, which is the one place it means
-/// nothing.
+/// qualifies, the way a gap belongs where the bytes were — and the
+/// document was then edited to match, so the two can still be diffed by
+/// eye. An append would have put it after `Detached`, which is the one
+/// place it means nothing.
 /// `BindingApprovalRequired` **inserted** between `SecretRequestClosed`
 /// and `TransferProgress` when 0.0.7 landed it, exactly where 0.0.6's
 /// version of this comment reserved the slot; `TransferProgress` goes
@@ -1272,8 +1290,8 @@ mod tests {
         assert_eq!(
             KNOWN_SERVER_TYPES.len(),
             11,
-            "ten of §7.5's eleven — only TransferProgress (0.0.9) is deferred — \
-             plus OutputGap, which is not a §7.5 row at all (GH #200)"
+            "eleven of §7.5's twelve; only TransferProgress (0.0.9) is deferred. \
+             OutputGap is the twelfth row, added to §7.5 by GH #200"
         );
         // The negative: Unknown is decode-only and must not be in the
         // list, or decode_server_frame would refuse to produce it.

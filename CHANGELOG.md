@@ -17,6 +17,9 @@ is cut, named and published is in
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
   still not run, because 55 of its tests spawn a real shell ([#91]).
+- **Exit code 3 on `holdfast watch` and `holdfast attach`: the view ended
+  and it was not all of the session** ([#200]). §18.8's first previously
+  unassigned code; the `Fixed` entry below argues why it is not `1`.
 - Attach protocol **1.4**: `ServerFrame::OutputGap { session, bytes }`, sent
   when §4.3's bounded output broadcast dropped frames a connection had not
   read. The count is **exact and in bytes** — the internal `OutputFrame`
@@ -537,15 +540,43 @@ is cut, named and published is in
   **A broadcast lag said nothing.** The `Lagged(n)` arm wrote `n` to the
   daemon's own stderr and handed the client the next chunk as though it
   followed the last, so a hole in a build log was indistinguishable from a
-  build that printed less. It is now `OutputGap`, above.
+  build that printed less. It is now `OutputGap`, above — **a floor and
+  not a total for an `observer`**, which is why the client says *"at
+  least"*: the count is exactly §4.3's broadcast hole in the **raw**
+  stream, and an observer renders the redacted one, whose own withheld
+  bytes are announced separately and in band by `[REDACTED:unresolved]`.
+  Measured on one composed feed, a 5,000-byte lag around a 20 KB
+  unterminated PEM reports 5,000 while 25,459 bytes go unrendered — the
+  balance marked, not silent. `interactive` has no redactor and the two
+  coincide.
 
   **And the exit status said the view was fine.** Both clients returned 0
   for every `Detached.reason`, so a `watch` that had lost nine tenths of a
   log was indistinguishable to a script from a clean `Ctrl+C`. A truncated
-  view — a gap, or a `slow_consumer` ending — is §18.8's exit **1**, not 2:
-  the daemon was there throughout and said so. `session_exit` and
-  `daemon_shutdown` still exit 0, because neither says the operator was
-  shown less than there was.
+  view — a gap, or a `slow_consumer` ending — is now §18.8's new exit
+  **3**.
+
+  **A code of its own rather than `1`, because `1` is already taken on
+  these two commands.** `holdfast watch no-such-session` exits 1, as does
+  every other §18.4b refusal, so `holdfast watch build > log` returning 1
+  would mean *either* "you named the wrong session and captured nothing"
+  *or* "you captured all but twelve bytes" — opposite remedies, and a
+  script cannot tell them apart. That is the same defect as the exit 0
+  this entry is about, one step along: a status nobody can branch on is a
+  status nobody is reading. `2` was the other candidate and is wrong on
+  its own terms — it means *"there should be a daemon and I could not
+  reach it"*, and the daemon was present throughout and said so. §18.8
+  had 3–63 unassigned.
+
+  **The ending's own reason does not decide this, and the earlier wording
+  here said it did.** A gap does not end a stream and the client's record
+  of it is sticky, so a twelve-byte hole early in a session that then
+  exits cleanly still exits 3 — `session_exit` and `daemon_shutdown` fall
+  through to the gap count rather than overriding it, and exit 0 only
+  when nothing was reported missing. The sentence this replaces stopped
+  at *"`session_exit` and `daemon_shutdown` still exit 0"*, which is
+  false in the common case and was the operator-facing half of a contract
+  the code had already got right.
 
   **What is *not* claimed: this does not make the drop impossible**, and
   §4.2's choice not to back-pressure an observer is untouched — a session's
