@@ -19,6 +19,11 @@ use holdfast_core::daemon::{server, spawn};
 use holdfast_core::diag;
 #[cfg(unix)]
 use holdfast_core::mcp::shim::ShimServer;
+// The daemon's own vocabulary for `held_back_cause`, so `held_back_note`
+// branches on the enum rather than on string literals kept in step by
+// hand — see its doc comment.
+#[cfg(unix)]
+use holdfast_core::output::HeldBackCause;
 #[cfg(unix)]
 use holdfast_core::protocol::client::{ClientError, ControlClient};
 #[cfg(unix)]
@@ -991,37 +996,118 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
 ///   the audited `redact: false` path if it genuinely needs the bytes"*,
 ///   which on this surface is `--raw` (§4.1:476, and it is audited).
 ///
-/// **What it is told apart *by*, and what it is not.**
-/// `dropped_incomplete_escape` is unusable for this twice over: it is a
-/// `ProcessedRead` field `mcp/tools.rs` never serialises, so it does not
-/// reach this process at all, and it flags the escape being *dropped* —
-/// the arm that does **not** set `held_back`. `redactions` counts
-/// redactions inside the returned bytes; a partial secret matches no
-/// rule by definition, so it is `{}` in exactly the case of interest.
-/// What does reach here is `state` (`tools.rs` sends it beside
-/// `held_back`) and this process's own `--raw`, and between them they
-/// separate all three readings.
+/// **What it is told apart *by*, and what it used to be told apart by.**
+/// This function inferred the cause from `state` and its own `--raw`,
+/// because the daemon did not say. It could separate two of the three
+/// and **not** the third: a live session whose read stopped on GH #14's
+/// bound fell through to the last branch and was told *"read again to
+/// pick up the rest"*, which on that bound can never succeed at any
+/// `max_bytes` — GH #195. The daemon now answers exactly, in
+/// `held_back_cause` beside `held_back`, so the inference is gone and
+/// only the two spellings that are this *surface's* own — `--raw`, and
+/// `holdfast logs` having no cursor to resume from — are decided here.
+///
+/// The `state` branch survives on its own merits and is not a guess: it
+/// qualifies `in_flight_secret`, which is REQ-O-005's case and the one
+/// place where a transient cause is transient in name only.
+///
+/// The older reasoning, still true, about what will *not* serve:
+/// `dropped_incomplete_escape` is unusable twice over — it is a
+/// `ProcessedRead` field `mcp/tools.rs` never serialises, and it flags
+/// the escape being *dropped*, the arm that does **not** set
+/// `held_back`. `redactions` counts redactions inside the returned
+/// bytes; a partial secret matches no rule by definition, so it is `{}`
+/// in exactly the case of interest.
 #[cfg(unix)]
 fn held_back_note(raw: bool, data: &Value) -> &'static str {
-    if raw {
-        return "output stops short at an unfinished escape sequence \
-                (REQ-O-008). Redaction is off on this read, so §4.1's \
-                holdback is not what stopped it. Read again to pick up \
-                the rest.";
+    // **Through `HeldBackCause::from_wire`, and not a `match` on three
+    // string literals.** The daemon's vocabulary lives in
+    // `output::HeldBackCause::as_str`; literals here would keep step
+    // with it by hand, and a rename would leave every arm falling into
+    // the catch-all — which prints *"read again"* for the static bound
+    // and is GH #195 re-entering through the back door, with nothing
+    // red. Parsing into the enum makes the arms below exhaustive, so a
+    // fourth cause is a compile error in this file rather than a silent
+    // fallback.
+    //
+    // An older daemon sends no cause, and a newer one may send a word
+    // this build has never heard of. Both arrive as `None` and fall
+    // through to the wording that advises a harmless retry, which is
+    // what this function did for every case before the field existed.
+    let cause = data["held_back_cause"]
+        .as_str()
+        .and_then(HeldBackCause::from_wire);
+    let ended = matches!(data["state"].as_str(), Some("Exited") | Some("Dead"));
+    match cause {
+        Some(HeldBackCause::UnvouchedWindow) => {
+            "output stops short, and will stop in the same place however \
+             many times you ask: this read's window could not vouch for a \
+             candidate that runs past the end of it (GH #14), and that \
+             boundary is fixed by the request rather than by how much \
+             output arrives (GH #195). A read that reaches the end of the \
+             buffer is not subject to it — `--tail`, or `--raw`, or an \
+             agent's `resource_uri` — but each of those gets past the \
+             boundary by not applying the check, so what it hands back may \
+             include the bytes this read declined. Only `--raw` is audited."
+        }
+        // The `raw` half is kept as a *guard on this arm* rather than
+        // as a branch of its own below, because a current daemon always
+        // sends a cause when `held_back` is true — so an arm reachable
+        // only through the no-cause path would never print this, and the
+        // sentence it carries is the accurate one: `redact: false` makes
+        // `holdback_boundary` return `w.head` before `held_back` is
+        // computed, so §4.1 is provably not what stopped the read.
+        Some(HeldBackCause::IncompleteEscape) if raw => {
+            "output stops short at an unfinished escape sequence \
+             (REQ-O-008). Redaction is off on this read, so §4.1's \
+             holdback is not what stopped it. The child is still alive \
+             and may yet finish it. Read again to pick up the rest."
+        }
+        Some(HeldBackCause::IncompleteEscape) => {
+            "output stops short at an unfinished escape sequence \
+             (REQ-O-008). The child is still alive and may yet finish it. \
+             Read again to pick up the rest."
+        }
+        // `Exited` and `Dead` are the two terminal states
+        // (`SessionState`); an unknown spelling from a newer daemon
+        // falls through to the live wording.
+        Some(HeldBackCause::InFlightSecret) if ended => {
+            "output stops short, and stays that way: the session has \
+             ended with a partial secret in its tail, which §4.1 keeps \
+             withheld (REQ-O-005 — quiescence does not release it). \
+             Reading again returns the same bytes; `--raw` is this \
+             surface's audited opt-in."
+        }
+        Some(HeldBackCause::InFlightSecret) => {
+            "output stops short: a secret may still be arriving in the \
+             tail, so §4.1 is withholding from where it starts. Read \
+             again to pick up the rest."
+        }
+        None if raw => {
+            // `redact: false` makes `holdback_boundary` return `w.head`
+            // before `held_back` is computed, so §4.1's mechanism is
+            // provably switched off and the same read writes a
+            // `redaction_disabled` row saying so. Kept as a branch
+            // because it is still the right thing to print against a
+            // daemon too old to send a cause.
+            "output stops short at an unfinished escape sequence \
+             (REQ-O-008). Redaction is off on this read, so §4.1's \
+             holdback is not what stopped it. Read again to pick up \
+             the rest."
+        }
+        None if ended => {
+            "output stops short, and stays that way: the session has \
+             ended with a partial secret in its tail, which §4.1 keeps \
+             withheld (REQ-O-005 — quiescence does not release it). \
+             Reading again returns the same bytes; `--raw` is this \
+             surface's audited opt-in."
+        }
+        None => {
+            "output stops short: the tail is not vouched for yet — a \
+             secret may still be arriving, or an escape sequence is \
+             unfinished (§4.1, REQ-O-008). Read again to pick up the rest."
+        }
     }
-    // `Exited` and `Dead` are the two terminal states (`SessionState`);
-    // an unknown spelling from a newer daemon falls through to the live
-    // wording, which is the reading that advises a harmless retry.
-    if matches!(data["state"].as_str(), Some("Exited") | Some("Dead")) {
-        return "output stops short, and stays that way: the session has \
-                ended with a partial secret in its tail, which §4.1 keeps \
-                withheld (REQ-O-005 — quiescence does not release it). \
-                Reading again returns the same bytes; `--raw` is this \
-                surface's audited opt-in.";
-    }
-    "output stops short: the tail is not vouched for yet — a secret may \
-     still be arriving, or an escape sequence is unfinished (§4.1, \
-     REQ-O-008). Read again to pick up the rest."
 }
 
 /// The §7.5 handshake `holdfast attach` sends, **in full**.
@@ -2275,7 +2361,7 @@ pub fn version() -> ExitCode {
 // exercise the attach banner. Neither exists on a target with no daemon.
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{attach_banner, fit_to_width};
+    use super::{attach_banner, fit_to_width, held_back_note};
 
     /// Render the row the cursor ends on, for the assertions below.
     fn row(p: &vt100::Parser, r: u16) -> String {
@@ -2545,5 +2631,104 @@ mod tests {
         );
         // And it is a bound rather than an absence of one.
         assert!(STOP_RPC_TIMEOUT <= grace * 3);
+    }
+
+    /// **`held_back_note` had no test at all, and the sentence it prints
+    /// for GH #14's bound was advice that can never succeed** — the
+    /// whole of GH #195 on this surface. These rows pin what each cause
+    /// says, and pin it by the *property* a reader acts on rather than
+    /// by the wording.
+    ///
+    /// Two directions, because either alone is satisfied by a constant:
+    /// the static bound must **not** tell the reader to read again, and
+    /// every transient cause must.
+    #[test]
+    fn the_logs_note_tells_the_reader_to_retry_exactly_when_retrying_can_work() {
+        use holdfast_core::output::HeldBackCause as Hb;
+
+        // **Every spelling comes from `HeldBackCause::as_str`, never
+        // from a literal here.** A literal would keep passing after a
+        // rename while `held_back_note` fell into its catch-all and
+        // printed "read again" for the static bound — GH #195 back, with
+        // nothing red. The one literal below is deliberately a word the
+        // enum does not have.
+        let note = |cause: Option<Hb>, state: &str, raw: bool| {
+            let mut d = serde_json::json!({ "state": state });
+            if let Some(c) = cause {
+                d["held_back_cause"] = serde_json::json!(c.as_str());
+            }
+            held_back_note(raw, &d)
+        };
+
+        // The wedge. "Read again" here is the instruction GH #195 is
+        // about, so its absence is the assertion.
+        let stuck = note(Some(Hb::UnvouchedWindow), "Running", false);
+        assert!(
+            !stuck.contains("Read again"),
+            "the static bound must not advise a retry that cannot work: {stuck}"
+        );
+        assert!(
+            stuck.contains("resource_uri"),
+            "…and it must name the recourse that does: {stuck}"
+        );
+
+        // The two that can clear, on a live session. Driven off
+        // `retry_may_advance` rather than a hand-written list, so a
+        // fourth cause joins this loop by existing.
+        for cause in [
+            Hb::InFlightSecret,
+            Hb::IncompleteEscape,
+            Hb::UnvouchedWindow,
+        ] {
+            let live = note(Some(cause), "Running", false);
+            assert_eq!(
+                live.contains("Read again"),
+                cause.retry_may_advance(),
+                "{} advises a retry iff retrying can advance: {live}",
+                cause.as_str()
+            );
+        }
+
+        // REQ-O-005 qualifies exactly one of them: an in-flight secret
+        // in a session that has ended is withheld for ever, and `--raw`
+        // is this surface's audited opt-in.
+        let dead = note(Some(Hb::InFlightSecret), "Exited", false);
+        assert!(!dead.contains("Read again"), "{dead}");
+        assert!(dead.contains("--raw"), "{dead}");
+        // …and the same cause on a live session says the opposite, so
+        // the `state` qualifier is doing work rather than decorating.
+        assert_ne!(dead, note(Some(Hb::InFlightSecret), "Running", false));
+
+        // An older daemon sends no cause and a newer one may send a word
+        // this build has never heard of. Neither may panic, and both get
+        // the wording that advises a harmless retry — which is what this
+        // function did for every case before the field existed.
+        assert!(
+            Hb::from_wire("a_cause_from_the_future").is_none(),
+            "the fixture below has to be a word the enum does not have"
+        );
+        for unknown in [
+            serde_json::Value::Null,
+            serde_json::json!("a_cause_from_the_future"),
+        ] {
+            let d = serde_json::json!({ "state": "Running", "held_back_cause": unknown });
+            let fallback = held_back_note(false, &d);
+            assert!(fallback.contains("Read again"), "{fallback}");
+        }
+        // `--raw` keeps its own sentence on a daemon too old to answer,
+        // because `redact: false` switches §4.1 off before `held_back`
+        // is computed and naming §4.1 there asserts a protection that is
+        // not running.
+        assert!(note(None, "Running", true).contains("REQ-O-008"));
+
+        // Every wire spelling round-trips, so `from_wire` cannot drift
+        // from `as_str` and leave every arm above in the catch-all.
+        for cause in [
+            Hb::InFlightSecret,
+            Hb::IncompleteEscape,
+            Hb::UnvouchedWindow,
+        ] {
+            assert_eq!(Hb::from_wire(cause.as_str()), Some(cause));
+        }
     }
 }

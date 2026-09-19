@@ -44,6 +44,39 @@ is cut, named and published is in
   client that predates the field fails **closed**; nothing an agent sends
   selects it. `holdfast attach --allow-echo` is the CLI spelling ([#137]).
 
+- `read_output` gains **`held_back_cause`**, present exactly when `held_back`
+  is true and `null` otherwise. `held_back` is a disjunction of three rules —
+  §4.1's trailing-region holdback, REQ-O-008's unfinished escape, and [#14]'s
+  window bound — and the response named which of them for none of them. Two
+  of the three clear as output arrives and §4.1's "retry at `next_cursor`" is
+  right for them; the third is a **fixed absolute offset** that does not
+  depend on `buffer.head`, so the documented loop never advances against it.
+  Measured on this repository's own `CHANGELOG.md`: eight consecutive
+  zero-byte reads with the cursor frozen, on ordinary prose containing no
+  credential ([#195]). Carried by `wait_for_pattern` and `send_input`'s
+  `wait_for` fields too — `output_since_start` is the same `read_processed`,
+  so it wedges identically, and that surface's `held_back` is a *wider*
+  disjunction whose extra term (a match intersecting the withheld region) is
+  §4.1's boundary by construction. Mirrored into `_meta.holdfast` on
+  `resources/read`, where there is no `next_cursor` to retry on at all.
+  `get_screen_state` is the one exclusion and not an omission: its
+  `held_back` reports masking rather than a shortened read (REQ-O-011a).
+
+  **It is an exact statement, not a heuristic**, which is what separates it
+  from [#160]'s excluded-rule *warning*: `process` already computed which term
+  produced the boundary, so reporting it infers nothing and has no false-fire
+  rate to measure. [#160] stays open for the warning.
+
+  Naming the three found a **second wedge of the same shape through a
+  different rule**, pre-existing and now pinned by a test:
+  `incomplete_escape` is transient only while `max_bytes >
+  ansi_incomplete_max_bytes` (64). At or below it, `cap_end` stops tracking
+  `buffer.head`, the pending sequence is the same length on every retry, and
+  the read returns zero bytes with the cursor frozen — measured at 1, 8, 32
+  and 64 after a further 300 KB of output, and clearing at 65. Neither shipped
+  surface can reach it (`read_output` defaults to 32 KiB, `holdfast logs`
+  sends 256 KiB), but `max_bytes` is a caller argument with a minimum of 1.
+
 - `read_output` gains `apply_holdback`, the way to ask for the last N lines
   **inside** §4.1's holdback. A bare `tail_lines`/`tail_bytes` is the per-call
   opt-in and still bypasses it, unchanged; `apply_holdback: true` declines that
@@ -180,6 +213,48 @@ is cut, named and published is in
 
 ### Changed
 
+- **§4.1's stated recourse for a held-back read was "retry shortly", and on
+  [#14]'s bound that is advice which can never succeed.** The recourse is
+  `resource_uri`, which every `read_output` response already carries: a
+  resource read reaches `buffer.head`, so the window is never truncated and
+  the bound cannot arise on it. *"A larger `max_bytes`"* — the claim
+  `output/mod.rs` had carried since [#14] — is true only while the ceiling can
+  reach `head`, and `read_output` clamps at 256 KiB. Measured through the MCP
+  wire on a 338,264-byte buffer with the bound at 25,644: every `max_bytes`
+  from the 32 KiB default up to and including the clamped ceiling returned
+  **0 bytes with `next_cursor` frozen**, while a `resources/read` of the same
+  buffer in the same moment returned 336,359 bytes. On a 113 KB buffer the
+  larger read does clear it, at 131,072, which is the case the claim was true
+  of and was stated of all of them ([#195]).
+
+  **What the recourse costs is now stated everywhere it is named, because
+  the first draft of this change got it wrong.** `unvouched_window` clears on
+  a read whose window reaches `buffer.head` — and it clears because such a
+  read *does not apply* [#14]'s declination, not because the candidate was
+  resolved. `resource_uri`, a `tail_*` read and a large enough `max_bytes`
+  are one mechanism with three names. Such a read still runs the full rule
+  set and §4.1's trailing holdback, but a candidate still unterminated at
+  `buffer.head` matches no rule, so if its anchor sits further back than
+  `partial_secret_scan_bytes` it comes back unredacted. Measured: a
+  24,650-byte buffer holding a `-----BEGIN RSA PRIVATE KEY-----` with no
+  footer is returned in full by a resource read in the same moment
+  `read_output` answers `held_back: true` with 17 bytes; append the footer
+  and the same read returns `[REDACTED:private-key]`. That residual is
+  [#14]'s, is unchanged here, and is now asserted in both directions. **There
+  is no read that both makes progress and keeps the declination** — the point
+  of the cause field is that the caller chooses knowing which it holds.
+- `holdfast logs`'s held-back note reads the daemon's cause instead of
+  inferring one. It inferred from `state` and its own `--raw`, which separates
+  two of the three rules and not the third, so a live session wedged on
+  [#14]'s bound was told *"read again to pick up the rest"* ([#195]).
+- **`[limits] resource_read_max_bytes` is refused below the session output
+  ring**, naming the key and the floor. It is the ceiling on the only general
+  recourse above, and `nonzero` was its only floor — so `= 1` loaded, and a
+  `resources/read` paging loop then wedged exactly as `read_output` does. The
+  floor is `registry::DEFAULT_BUFFER_BYTES` and **not** `[limits]
+  output_buffer_bytes`, which is inert ([#128]): relating a live key to a dead
+  one would pass a configuration whose operator believed the invariant held
+  while the real ring stayed at 1 MiB ([#203]).
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of
@@ -1387,6 +1462,9 @@ residuals that are known and accepted.
 [#139]: https://github.com/Sertelegger/holdfast/issues/139
 [#142]: https://github.com/Sertelegger/holdfast/issues/142
 [#149]: https://github.com/Sertelegger/holdfast/issues/149
+[#160]: https://github.com/Sertelegger/holdfast/issues/160
+[#195]: https://github.com/Sertelegger/holdfast/issues/195
+[#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#163]: https://github.com/Sertelegger/holdfast/issues/163

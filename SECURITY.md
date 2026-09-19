@@ -143,6 +143,29 @@ worse than none:**
   bytes.** It exists because a withheld partial has to be reachable somehow.
   Each such read writes a `redaction_disabled` entry to the audit log naming
   the tool and the calling surface. That is by design, not a bypass.
+- **A read whose window reaches `buffer.head` does not apply the GH #14
+  declination, and that is the recourse from a wedged read — say the price
+  out loud.** `held_back_cause: "unvouched_window"` means *this* window ran
+  past the end of its evidence and declined rather than guess. A read that
+  sees the whole buffer is better informed, so the declination does not
+  apply to it; it still runs the full rule set and §4.1's trailing holdback,
+  and `redact: false` remains the only thing that switches redaction itself
+  off. **But a candidate that is still unterminated at `buffer.head` matches
+  no rule**, so if its anchor sits further back than
+  `partial_secret_scan_bytes` (512) it is returned unredacted, with
+  `redactions: {}`. Measured: a 24,650-byte buffer holding a
+  `-----BEGIN RSA PRIVATE KEY-----` with no footer comes back in full from a
+  resource read in the same moment `read_output` answers `held_back: true`
+  with 17 bytes. A `tail_lines`/`tail_bytes` read and any `max_bytes` large
+  enough to reach `buffer.head` do the same thing for the same reason — they
+  are one mechanism with three names, and only `--raw` / `redact: false` is
+  audited.
+
+  This residual predates GH #195 and nothing here changed a byte of it. What
+  changed is that the response now says which kind of boundary a caller is
+  holding, so *"make progress"* and *"keep the declination"* are a choice
+  made with the facts. **There is no read that does both** — and pretending
+  otherwise was the first draft of this bullet.
 - **The redactor is a pattern matcher, and patterns miss.** It catches
   secret-*shaped* values — the vendored rules cover the common token formats
   — and it cannot catch a password like `correct horse battery staple`, which

@@ -113,6 +113,64 @@ pub enum ScreenTracking {
     On,
 }
 
+/// Which of the three rules behind `held_back` stopped this read
+/// (§4.1, REQ-O-008, GH #14).
+///
+/// Mirrors `output::HeldBackCause::as_str`, and the two are asserted
+/// equal in `tests/schema.rs` — same construction as `SessionState`
+/// below and for the same reason.
+///
+/// **What a caller does with it.** `held_back` alone says only *"some of
+/// what you asked for is being withheld"*, and §4.1's answer to that —
+/// retry at `next_cursor` — is right for two of these three and wrong
+/// for ever for the third:
+///
+/// * `in_flight_secret` and `incomplete_escape` are bounded by
+///   `buffer.head`, so new output moves the boundary. **Retry at
+///   `next_cursor`.** If the session is quiescent or exited (`state`,
+///   `interaction_mode`, both in this same response) the boundary will
+///   not move on its own — REQ-O-005 — and `redact: false` is the
+///   audited hatch.
+/// * `unvouched_window` is bounded by the *request*, not by `head`.
+///   Retrying the identical read returns the identical boundary for
+///   ever, however much output arrives. **Fetch `resource_uri` instead**
+///   (GH #195): a resource read's window reaches `buffer.head`, so it is
+///   never truncated and this bound cannot arise on it. Fetch the URI as
+///   given — adding a small `?max_bytes=` re-creates the same short
+///   window and the same bound.
+///
+///   **What that costs, stated because the flag does not state it.** The
+///   bound clears because a window that reaches `buffer.head` does not
+///   run the declination, not because the candidate was resolved. Such a
+///   read still runs the full rule set and §4.1's trailing holdback, but
+///   a candidate that is *still unterminated* at `buffer.head` matches
+///   no rule, so if its anchor is further back than
+///   `partial_secret_scan_bytes` it is returned unredacted. That is a
+///   documented residual of the design and not a property of this field;
+///   it applies equally to a `tail_lines`/`tail_bytes` read and to any
+///   `max_bytes` large enough to reach `buffer.head`. If you need the
+///   declination kept, there is no read that also makes progress —
+///   that is the trade this field exists to make visible.
+///
+/// A size cap is deliberately **not** a value here. It is not a
+/// holdback, the two can be true at once, and `truncated_for_size`
+/// already answers it — see `output::ProcessedRead::held_back_cause`.
+///
+/// Carried by `read_output`, `wait_for_pattern`, `send_input`'s
+/// `wait_for` fields and `resources/read`'s `_meta.holdfast` — every
+/// surface §4.1 calls identical. **`get_screen_state` is the one
+/// exclusion**, and it is not an omission: its `held_back` reports that
+/// the grid was *masked*, not that a read end was pulled back
+/// (REQ-O-011a), so none of these three values is an answer to it and
+/// there is no `next_cursor` for a caller to retry on.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldBackCause {
+    InFlightSecret,
+    IncompleteEscape,
+    UnvouchedWindow,
+}
+
 /// Lifecycle state of a session (§5.2).
 ///
 /// Mirrors `session::SessionState::as_str`, which is a closed vocabulary of
@@ -220,8 +278,21 @@ pub struct ReadOutput {
     pub truncated_at_tail: Option<bool>,
     pub truncated_for_size: Option<bool>,
     /// The read stopped short of `buffer.head` at the holdback boundary
-    /// (§4.1), or an unfinished escape was pulled back (REQ-O-008).
+    /// (§4.1), or an unfinished escape was pulled back (REQ-O-008), or
+    /// the window could not vouch for a candidate inside it (GH #14).
+    /// `held_back_cause` says which, and the three take different
+    /// recourses.
     pub held_back: Option<bool>,
+    /// Which rule held this read back. **Non-null exactly when
+    /// `held_back` is true; present and `null` otherwise**, so branch on
+    /// the value and never on the key's existence.
+    ///
+    /// `in_flight_secret` and `incomplete_escape` can clear as output
+    /// arrives — retry at `next_cursor`. `unvouched_window` never clears
+    /// for the same read at any `max_bytes`; fetch `resource_uri`
+    /// instead, and read that value's own documentation for what the
+    /// wider read does and does not still withhold (GH #195).
+    pub held_back_cause: Option<HeldBackCause>,
     /// `rule kind -> count` for the redactions inside the returned range.
     /// Empty on an unredacted read; absent only on an error envelope.
     pub redactions: Option<std::collections::BTreeMap<String, u64>>,
@@ -280,6 +351,18 @@ pub struct WaitForPattern {
     pub truncated_at_tail: Option<bool>,
     pub truncated_for_size: Option<bool>,
     pub held_back: Option<bool>,
+    /// Which rule held this wait's read back. **Non-null exactly when
+    /// `held_back` is true; present and `null` otherwise.**
+    ///
+    /// The vocabulary is `read_output`'s, because the read is —
+    /// `output_since_start` runs through the same pipeline. This tool's
+    /// `held_back` is wider by one term, a match whose range intersects
+    /// the withheld region, and that term is §4.1's holdback by
+    /// construction, so it reports `in_flight_secret`. Where a match is
+    /// withheld *and* the context read hit `unvouched_window`, the
+    /// static cause is the one reported: the match may yet be released
+    /// by an advancing boundary, and the context read never will be.
+    pub held_back_cause: Option<HeldBackCause>,
     pub next_cursor: Option<u64>,
     /// Set **only** when the daemon clamped the requested deadline
     /// (REQ-T-008). A field that is always present carries no information.
@@ -334,6 +417,7 @@ pub struct SendInput {
     pub truncated_at_tail: Option<bool>,
     pub truncated_for_size: Option<bool>,
     pub held_back: Option<bool>,
+    pub held_back_cause: Option<HeldBackCause>,
     pub next_cursor: Option<u64>,
     pub clamped_timeout_secs: Option<u64>,
     pub interaction_mode: Option<InteractionMode>,

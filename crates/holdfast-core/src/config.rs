@@ -1430,6 +1430,44 @@ impl Config {
             frame_headroom_ceiling,
         )?;
 
+        // **The floor under `resource_read_max_bytes`, and why it is
+        // against a constant rather than against the key beside it (GH
+        // #203, GH #195).**
+        //
+        // `resources/read` is the general recourse from a `read_output`
+        // that came back `held_back_cause: "unvouched_window"`: that
+        // bound arises only while the read window is short of
+        // `buffer.head` (`output/mod.rs`), and a resource read whose
+        // ceiling covers the whole ring always reaches `head`, so the
+        // bound cannot arise there. That is the only general escape from
+        // GH #195's wedge, and it is named in every `read_output`
+        // response.
+        //
+        // It holds today by arithmetic that nothing asserted: the
+        // default ceiling is 4 MiB and the live ring is 1 MiB. **Lowering
+        // this key is a legal, documented edit that silently removes the
+        // escape** — the paging loop then wedges on `resources/read`
+        // exactly as it does on `read_output`, with no error and no
+        // warning. `nonzero` was its only floor, so `= 1` loaded.
+        //
+        // **Against `registry::DEFAULT_BUFFER_BYTES`, deliberately, and
+        // *not* against `limits.output_buffer_bytes`.** That key is
+        // inert: `tests/config_surface.rs` lists it under `INERT` with
+        // `Inert::NamedElsewhere`, because the live value is
+        // `SessionConfig::buffer_capacity`, which `start_session` never
+        // sets and which therefore falls through to the hardcoded
+        // `DEFAULT_BUFFER_BYTES` (GH #128). Relating a live key to a dead
+        // one would let an operator who set `output_buffer_bytes = 64
+        // KiB` and `resource_read_max_bytes = 128 KiB` pass validation
+        // while the real ring stayed at 1 MiB and the escape stayed
+        // broken — a false assurance, which is worse than no check and is
+        // the exact class GH #128 exists to close.
+        at_least(
+            "limits.resource_read_max_bytes",
+            l.resource_read_max_bytes,
+            crate::session::registry::DEFAULT_BUFFER_BYTES,
+        )?;
+
         // `PatternSet::build` enforces this too, as a
         // `HoldfastError::InvalidPattern` from another layer. Validated here
         // as well, with the count in the message, so an over-long list is
@@ -1772,6 +1810,26 @@ fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<(), ConfigError> {
 // `secret::binding::whole_line` is **kept**, because slot patterns need
 // it — the anchoring was the half of GH #45 that was right.
 // ---------------------------------------------------------------------
+
+/// `value` must be able to cover a runtime extent. See the GH #203
+/// comment in [`Config::validate`] for what `floor` is and why it is a
+/// constant rather than another key.
+///
+/// The message names the key twice and the floor's *meaning* once,
+/// because "must be at least 1048576" without "the session output ring
+/// is that size" is a number an operator has no way to act on.
+fn at_least(key: &str, value: usize, floor: usize) -> Result<(), ConfigError> {
+    if value < floor {
+        return Err(ConfigError::invalid(format!(
+            "{key} = {value}, which is smaller than the {floor}-byte session \
+             output ring; a resource read is the documented recourse when a \
+             cursor read is held back at a bound its own window produced, and \
+             it can only be one while it reaches the whole ring, so {key} must \
+             stay at or above {floor}"
+        )));
+    }
+    Ok(())
+}
 
 /// `value` must leave headroom under a wire cap. See the I-9 comment in
 /// [`Config::validate`] for what `ceiling` is and why.
@@ -2865,6 +2923,79 @@ reference = \"db/prod\"
         );
         cfg.validate()
             .expect("the shipped defaults must clear the new headroom check");
+    }
+
+    // --------------------------------- GH #203's floor (the #195 recourse)
+
+    /// A resource ceiling that cannot reach the whole session ring is
+    /// refused at load, because it silently deletes the only general
+    /// recourse from GH #195's wedge.
+    ///
+    /// **The floor is the *live* ring and not the key beside it.**
+    /// `limits.output_buffer_bytes` is inert (`tests/config_surface.rs`
+    /// `INERT`, GH #128) — the ring is `registry::DEFAULT_BUFFER_BYTES`,
+    /// hardcoded — so the pair below is the arrangement a relation
+    /// between the two *keys* would wave through while the real ring
+    /// stayed at 1 MiB and the escape stayed broken. It must be rejected,
+    /// and that is what separates this check from the one that reads as
+    /// obviously right.
+    #[test]
+    fn a_resource_ceiling_under_the_live_ring_is_refused_and_names_the_key() {
+        use crate::session::registry::DEFAULT_BUFFER_BYTES;
+
+        for src in [
+            // The bare case: one byte under the ring.
+            format!(
+                "[limits]\nresource_read_max_bytes = {}\n",
+                DEFAULT_BUFFER_BYTES - 1
+            ),
+            // `nonzero` already caught 0; this is what it let through.
+            "[limits]\nresource_read_max_bytes = 1\n".to_string(),
+            // The trap: both keys lowered together, consistently with
+            // each other. A check written against `output_buffer_bytes`
+            // accepts this and tells the operator an invariant holds
+            // that does not.
+            format!(
+                "[limits]\noutput_buffer_bytes = {}\nresource_read_max_bytes = {}\n",
+                64 * 1024,
+                128 * 1024
+            ),
+        ] {
+            let e = parse_str(&src).expect_err(&format!(
+                "a ceiling under the live ring must be refused: {src}"
+            ));
+            let msg = e.to_string();
+            assert!(
+                msg.contains("resource_read_max_bytes"),
+                "the error must name the key the operator has to change: {msg}"
+            );
+            assert!(
+                msg.contains(&DEFAULT_BUFFER_BYTES.to_string()),
+                "…and the floor, or there is nothing to act on: {msg}"
+            );
+            // An operator reads this in `daemon.log` and on a terminal.
+            // A `\`-continuation whose next line's indentation becomes
+            // content renders as a run of spaces mid-sentence, and
+            // `cargo fmt` does not touch string bodies, so nothing else
+            // in the gate would see it.
+            assert!(
+                !msg.contains("  "),
+                "the message wraps into the operator's face: {msg:?}"
+            );
+        }
+
+        // The pairings, both required. Without the first, a validator
+        // that rejects every resource ceiling passes the rows above;
+        // without the second, one that rejects anything *below* the
+        // shipped 4 MiB default passes them too and refuses a legal
+        // config.
+        Config::default()
+            .validate()
+            .expect("the shipped 4 MiB default must clear its own floor");
+        parse_str(&format!(
+            "[limits]\nresource_read_max_bytes = {DEFAULT_BUFFER_BYTES}\n"
+        ))
+        .expect("a ceiling exactly at the ring is the smallest legal one");
     }
 
     #[test]
