@@ -261,7 +261,7 @@ const EFFECTIVE: &[(&str, &str)] = &[
     ),
     (
         "limits.resource_read_max_bytes",
-        "crates/holdfast-core/src/mcp/mod.rs:628 (MCP resources/read) and crates/holdfast-core/src/daemon/server.rs:2231 (control protocol) — both pass it as read_resource's ceiling.",
+        "crates/holdfast-core/src/mcp/mod.rs:817 (MCP resources/read) and crates/holdfast-core/src/daemon/server.rs:2245 (control protocol) — both pass it as read_prepared's ceiling.",
     ),
     (
         "limits.redaction_lookbehind_bytes",

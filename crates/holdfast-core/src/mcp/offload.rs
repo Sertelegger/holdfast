@@ -22,7 +22,7 @@
 //!
 //! | during one large read | before | after |
 //! |---|---|---|
-//! | daemon worker threads in `R` | **1** of 12 | — |
+//! | daemon threads in `R` / in `S` | **1 / 15**, sampled every 250 ms | — |
 //! | `status`, unrelated session, second client | answered **17** times, worst **2,061 ms** | **1,453** times, median 1.52 ms, worst **8.48 ms** |
 //! | `holdfast list`, a third client | **rc=2 at 5,031 ms** | **rc=0 at 21.7 ms** |
 //!
@@ -31,17 +31,29 @@
 //! seventeen replies across a 2.1 s window is a client that was stopped,
 //! not one that was slow.
 //!
-//! One running thread and fifteen asleep rules out both the diagnoses
-//! that look obvious. It is not CPU saturation — eleven workers were
-//! free — and it is not lock contention, because `status` on an unrelated
-//! session shares no lock with the read. A runtime whose every worker is
-//! parked has nobody left in the I/O driver, so **one synchronous call in
-//! one handler stalls the daemon's whole socket surface, accept loop
-//! included**. The `holdfast list` row is that stall crossing a contract:
+//! **The census reconciles like this, and it is written out because the
+//! first draft of this table did not and could not be checked.** Sixteen
+//! threads carried the runtime's thread name, not twelve: twelve executor
+//! workers plus, for the two sessions this daemon held, the four
+//! `std::thread`s `Session::new` spawns — Linux copies the creating
+//! thread's `comm` into a new one, so a plain thread spawned from a
+//! worker is indistinguishable by name. Plus the main thread, seventeen
+//! in all. Exactly **one** of the sixteen was running at every sample.
+//!
+//! So at most one of the twelve executor workers was doing anything,
+//! which rules out both diagnoses that look obvious. It is not CPU
+//! saturation — at least eleven workers were free — and it is not lock
+//! contention, because `status` on an unrelated session shares no lock
+//! with the read. A runtime whose every worker is parked has nobody left
+//! in the I/O driver, so **one synchronous call in one handler stalls the
+//! daemon's whole socket surface, accept loop included**. The `holdfast
+//! list` row is that stall crossing a contract:
 //! [`crate::protocol::handshake::HANDSHAKE_TIMEOUT`] is five seconds
 //! because *"one frame each way between two local processes"* should
 //! never take longer, and it is right about that — the frame was never
-//! late, the daemon was never asked.
+//! late, the daemon was never asked. (That bound is `handshake.rs`'s own
+//! constant. The spec sets no handshake deadline at all, which is worth
+//! knowing before citing §7.4 for it.)
 //!
 //! §5.2 already states the rule this module generalises, for the one path
 //! that had learned it: *"one wedged session must not be able to consume
@@ -58,10 +70,47 @@
 //! comment that falls through to `Ok(())`. `SpawnError` has exactly two
 //! variants, `ShuttingDown` and `NoThreads`; there is no *"pool full"*.
 //! So a saturated pool **queues, without limit**; it never refuses and it
-//! never parks the runtime. The worst this trade can produce is a read
-//! that waits — possibly for a long time — while `status`, `list` and the
-//! accept loop keep answering, which is the failure the whole exchange is
-//! for.
+//! never parks the runtime.
+//!
+//! ## What a queued call can still hold — and the two sites where that
+//! is not nothing
+//!
+//! For `read_output` and `resources/read` the trade is clean: a queued
+//! call holds no lock at all. `Session::read_processed` takes
+//! `buffer.lock()` only to copy its window and releases it before the
+//! first regex, so the worst those two can produce is a read that waits
+//! while `status`, `list` and the accept loop keep answering.
+//!
+//! **`get_screen_state` and `resize` are not in that position, and an
+//! earlier draft of this paragraph claimed they were.** Both hold
+//! `Session::screen`'s lock across the whole of the work this module
+//! moved — `screen_state` over `capture`, `resize` over `Screen::resize`,
+//! re-seed included. The other consumers of that lock are on the
+//! executor: `screen_tracking` and `cursor_signal`, reached from
+//! `mcp::detection::with_detection`, which is the §5.4 block on
+//! `read_output`, `send_input`, `wait_for_pattern`, **`status`** and
+//! **`list_sessions`** — and `list_sessions` walks the registry, taking
+//! every session's screen lock in turn. `holdfast list` is
+//! `tool/list_sessions`, so it is the same canary as the table above.
+//!
+//! **Sized rather than alarmed about, because the numbers matter more
+//! than the shape.** §4.2a measures the parser at ~86 MB/s, so the
+//! largest seed `clamp_geometry` admits — 1000×1000×4 = 4 MiB — is ~46 ms
+//! in release, and the sum is bounded by `limits.max_concurrent_sessions`
+//! (default 8) because the lock is per session. That is sub-second
+//! degradation of a control call, not GH #201's wedge, and it is **not a
+//! regression**: before this module the holder of that lock was an
+//! executor *worker*, which is strictly worse than a pool thread. What is
+//! genuinely new is the count — the number of threads that can hold
+//! per-session locks at once goes from the twelve workers to the pool's
+//! bound.
+//!
+//! The same count argument, and the same verdict, applies to
+//! `audit::AuditLog::record`, which the read path reaches for a
+//! `redact: false` call: it takes one mutex, acquires no second one
+//! inside it, and writes a single JSON line. Widening its waiters from
+//! twelve to the pool's bound makes a convoy, not a stall — worth knowing
+//! rather than worth changing.
 //!
 //! ## What the rest of the pool's occupants actually cost
 //!
@@ -113,9 +162,10 @@
 //! | 64 | 81 | 92.76 ms | rc=0 throughout, worst 533.7 ms |
 //! | 256 | 273 | 210.23 ms | rc=0 throughout, worst 3,777 ms |
 //!
-//! Reaching 512 *running* needs 512 simultaneous in-flight tool calls,
-//! and §7.4 gives each one its own connection; past that they queue
-//! rather than fail. What the 256 row shows is the trade working as
+//! Reaching 512 *running* needs 512 simultaneous in-flight tool calls —
+//! one connection each, which is `protocol::client::ControlClient`'s
+//! checkout pool and GH #127's doing, **not** something §7.4 says; past
+//! that they queue rather than fail. What the 256 row shows is the trade working as
 //! intended and not disappearing: the reads themselves degraded to
 //! 59–144 s — twelve cores cannot do more — while the control plane
 //! stayed answered. Before this change a **single** read failed it.

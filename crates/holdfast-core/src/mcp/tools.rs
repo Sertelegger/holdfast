@@ -977,12 +977,13 @@ impl HoldfastServer {
         // that was the whole of §4.3's requirement — but it runs them on
         // whichever worker thread is polling this connection, and GH #194
         // made an ordinary 256 KiB read of real-world UTF-8 cost 0.4–3.9 s.
-        // Measured on the shipped wire, one such read left **one** of
-        // twelve workers running and fifteen asleep, stalled an unrelated
-        // session's `status` for 3,546 ms against a 5–27 ms baseline, and
-        // failed a third client's `holdfast list` outright on §7.4's
-        // handshake bound. `crate::mcp::offload` carries the numbers and
-        // the cancellation consequence.
+        // Measured on the shipped wire, one such read left a single thread
+        // running in the whole daemon, stalled an unrelated session's
+        // `status`, and failed a third client's `holdfast list` outright on
+        // the control protocol's handshake bound. **The numbers live in
+        // `crate::mcp::offload` and deliberately not here** — a second copy
+        // of a measurement is a second thing to update, and this one had
+        // already gone stale against that file once.
         //
         // The §9.4 surface is read **above** this line and travels on the
         // `ReadRequest`, because `caller::current()` is a task-local and
@@ -1079,9 +1080,16 @@ impl HoldfastServer {
         // called "not free" — and `find_spans` then runs over the whole
         // rendered grid. At `pty::MAX_COLS` by `pty::MAX_ROWS` — 1000 by
         // 1000, which `clamp_geometry` admits — that seed is 4 MiB, and
-        // the capture parses it twice. Nothing inside
-        // reads a task-local: the §9.4 obligation for `redact: false` is
-        // discharged above, where the caller is still in scope.
+        // the capture parses it twice. Nothing inside reads a task-local:
+        // the §9.4 obligation for `redact: false` is discharged above,
+        // where the caller is still in scope.
+        //
+        // **This one holds `Session::screen`'s lock for the whole
+        // capture**, unlike `read_output`, which is outside every lock by
+        // the time it reaches the pool. `crate::mcp::offload` sizes what
+        // that costs a concurrent `status` or `list_sessions`; it is not
+        // a regression — the holder used to be a worker — but the claim
+        // "a queued call holds nothing" is false here and is not made.
         let capture_session = Arc::clone(&session);
         let capture_processor = Arc::clone(&self.processor);
         let diff_from = args.diff_from;
@@ -1182,14 +1190,6 @@ impl HoldfastServer {
         // Recording it fixes the durable half: `desired_size` is the floor
         // the session returns to when the last writer detaches, so the
         // request outlives the clients rather than the other way round.
-        session.set_desired_size(args.cols, args.rows);
-        // `Some` unconditionally here: this call *is* the request, so the
-        // fold always has a desired size to work with.
-        let (want_cols, want_rows) = self
-            .attach_hub()
-            .effective_size(&session.id, Some((args.cols, args.rows)))
-            .unwrap_or((args.cols, args.rows));
-
         // A failing `ioctl` is Holdfast failing to do its job, not a session
         // outcome, so it takes the protocol channel (§5.1) — and it
         // matters that it does: the alternative is an `ok` reporting
@@ -1201,15 +1201,54 @@ impl HoldfastServer {
         // tool whose name suggests an `ioctl` and nothing more. That
         // suggestion is exactly why it was the easiest of the four to
         // miss.
+        //
+        // **Record, fold, apply and read back under `with_resize_decision`,
+        // which this tool never took and the attach path always did.**
+        // `attach::conn`'s own comment states the hazard: *"the fold is
+        // order-independent; the sequence was not. Two writers on a
+        // multi-thread runtime could each fold and then apply in the
+        // opposite order, leaving the session at a departed or stale
+        // writer's geometry with no further event to correct it."* The
+        // omission predates GH #201 — the statements used to be adjacent
+        // and synchronous, so the window was a scheduler's width — but
+        // putting a `spawn_blocking` hop *and* a multi-megabyte re-seed
+        // between the fold and the apply is not a window to leave open. A
+        // human attaching an 80×24 terminal mid-hop would have had their
+        // geometry overwritten by a fold taken before they arrived, and
+        // the tool would have reported the size it wanted as the size
+        // achieved.
+        //
+        // The guard is a `parking_lot::Mutex` and the closure is
+        // synchronous, so it cannot span an `await` — which is why the
+        // whole sequence goes *inside* the offloaded closure rather than
+        // around it. Holding it across the re-seed is what `attach::conn`
+        // already does, so this adds no new hold, only a second holder.
         let resize_session = Arc::clone(&session);
+        let hub = Arc::clone(self.attach_hub());
+        let (asked_cols, asked_rows) = (args.cols, args.rows);
         let resized = offload::off_runtime("resize's re-seed", move || {
-            resize_session.resize(want_cols, want_rows)
+            hub.with_resize_decision(|| {
+                // `desired_size` is the floor the session returns to when
+                // the last writer detaches, so the request outlives the
+                // clients rather than the other way round — and it is set
+                // inside the guard so the fold below cannot read a value
+                // an attach client's fold has already acted on.
+                resize_session.set_desired_size(asked_cols, asked_rows);
+                // `Some` unconditionally here: this call *is* the request,
+                // so the fold always has a desired size to work with.
+                let (want_cols, want_rows) = hub
+                    .effective_size(&resize_session.id, Some((asked_cols, asked_rows)))
+                    .unwrap_or((asked_cols, asked_rows));
+                resize_session
+                    .resize(want_cols, want_rows)
+                    .map(|()| resize_session.size())
+            })
         })
         .await?;
-        if let Err(e) = resized {
-            return envelope::from_error(&e);
-        }
-        let (cols, rows) = session.size();
+        let (cols, rows) = match resized {
+            Ok(size) => size,
+            Err(e) => return envelope::from_error(&e),
+        };
         // Tell the attached clients, because this changed their view and
         // none of them asked for it. The tool emitted no frame at all
         // before, so a human's terminal learned about an agent's resize

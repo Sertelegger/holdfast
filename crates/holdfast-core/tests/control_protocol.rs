@@ -2220,6 +2220,52 @@ async fn a_redact_false_resource_read_is_audited_as_resource_read() {
     assert_eq!(entry["client_kind"], "cli");
 }
 
+/// The sibling of `a_redact_false_resource_read_is_audited_as_resource_read`,
+/// for the path GH #201 changed and that row does not reach.
+///
+/// **`read_output`'s §9.4 surface is sampled above the blocking hop and
+/// carried in on the `ReadRequest`**, because `caller::current()` is a
+/// task-local and `spawn_blocking` does not inherit one. Re-sampling it
+/// inside the offloaded closure compiles, runs, and silently writes
+/// `in_process` on every `redaction_disabled` entry — `caller::current`
+/// degrades to that rather than failing — which erases the one
+/// distinction the §9.4 log exists to make. The resource path has had a
+/// row pinning this since before GH #201; this is the one for the tool.
+#[tokio::test]
+async fn a_redact_false_read_output_is_audited_as_the_cli_that_asked() {
+    let d = TestDaemon::start("readaudit").await;
+    let client = d.client().await.unwrap();
+    let id = start_bash(&client, "audited").await;
+
+    let params = method::to_cbor(&json!({
+        "session": id,
+        "since_cursor": 0,
+        "redact": false,
+    }))
+    .unwrap();
+    let resp = client.call_raw("tool/read_output", params).await.unwrap();
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+
+    let log = std::fs::read_to_string(d.paths.audit_log()).expect("audit log");
+    let entry = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|e| e["kind"] == "redaction_disabled")
+        .expect("a redaction_disabled entry");
+    assert_eq!(
+        entry["tool"], "read_output",
+        "the read bypassed the audited pipeline, or borrowed another surface's name"
+    );
+    // Derived server-side from the uid-checked handshake, never from the
+    // request — and this is the assertion the hop can break: it reads
+    // `cli` only because the surface was sampled on the task that owns
+    // the caller scope.
+    assert_eq!(
+        entry["client_kind"], "cli",
+        "`in_process` here means the surface was re-sampled on the blocking pool"
+    );
+}
+
 #[tokio::test]
 async fn a_caller_max_bytes_is_clamped_down_against_the_configured_ceiling() {
     // The ceiling is a config knob, so the clamp is observable by setting
@@ -2367,6 +2413,20 @@ enum HoldAt {
 
 struct HeldPty {
     hold_at: HoldAt,
+    /// Arrivals to let through before holding one.
+    ///
+    /// **Zero for three of the five rows, and `1` for `wait_for_pattern`,
+    /// where it is a fact rather than a tolerance.** `run_wait` asks
+    /// `holdback_boundary` whether the match is withheld before it reads,
+    /// and `Session::boundary_snapshot` samples `backend.is_alive()`
+    /// unconditionally on the way — on the executor, where it must stay.
+    /// The count cannot drift: the whole pre-hop path from the tool
+    /// handler to the offloaded read contains no `.await` and no loop
+    /// (`wait::for_pattern` returns on its first poll when the pattern is
+    /// already in the backlog, and the holdback retry loop's `is_alive`
+    /// sits behind a `withheld &&` that short-circuits). So this is 1 or
+    /// the code changed, and the row's `parked` assertion says which.
+    skip: std::sync::atomic::AtomicUsize,
     inner: Arc<holdfast_core::pty::MockPty>,
     armed: std::sync::atomic::AtomicBool,
     entries: std::sync::atomic::AtomicUsize,
@@ -2433,6 +2493,21 @@ impl HeldPty {
         if self.reader_thread.get() == Some(&std::thread::current().id()) {
             return;
         }
+        // **Spent after the guards and before the counter**, or a skipped
+        // arrival would both inflate `parked` and satisfy the rendezvous
+        // with nothing in flight — the bystander-against-an-idle-daemon
+        // vacuity the reader-thread exclusion exists to prevent.
+        if self
+            .skip
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return;
+        }
         self.entries
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // `try_send`, because the row only needs to learn of the first
@@ -2480,8 +2555,9 @@ impl holdfast_core::pty::PtyBackend for HeldPty {
     }
 }
 
-/// Seven times the longest wedge this row can legitimately produce (the
-/// §7.4 handshake bound is 5 s), and inside `.config/nextest.toml`'s
+/// Seven times the longest wedge this row can legitimately produce
+/// (`protocol::handshake::HANDSHAKE_TIMEOUT` is 5 s — that is this
+/// codebase's constant, not a figure §7.4 states), and inside `.config/nextest.toml`'s
 /// `terminate-after`, so a genuine hang names itself here rather than
 /// being killed anonymously by the harness. **A hang detector, not a
 /// window**: every real outcome this row waits for is either immediate
@@ -2499,12 +2575,14 @@ fn insert_held_session(
     name: &str,
     payload: &[u8],
     hold_at: HoldAt,
+    skip: usize,
 ) -> (String, HeldGate) {
     let inner = Arc::new(holdfast_core::pty::MockPty::new());
     inner.queue_output(payload);
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let pty = Arc::new(HeldPty {
         hold_at,
+        skip: std::sync::atomic::AtomicUsize::new(skip),
         inner,
         armed: std::sync::atomic::AtomicBool::new(false),
         entries: std::sync::atomic::AtomicUsize::new(0),
@@ -2562,6 +2640,24 @@ fn insert_mock_session(d: &TestDaemon, name: &str) -> String {
 /// slow call returns once released.
 struct Bystander {
     slow: Response,
+    /// Kept alive so a row can ask the daemon further questions after the
+    /// gate has opened — `a_resize_…` needs one to see whether the screen
+    /// really reflowed. Never read: holding it *is* the point, because
+    /// `TestDaemon`'s `Drop` shuts the daemon down and removes its runtime
+    /// directory.
+    #[allow(dead_code)]
+    daemon: TestDaemon,
+    caller: Arc<ControlClient>,
+}
+
+impl Bystander {
+    /// One more call on the same connection the slow call used.
+    async fn then(&self, method: &'static str, params: Value) -> Response {
+        self.caller
+            .call_raw(method, method::to_cbor(&params).unwrap())
+            .await
+            .expect("the follow-up call")
+    }
 }
 
 /// GH #201, driven once per tool that runs the output pipeline: while
@@ -2590,7 +2686,7 @@ struct Bystander {
 ///    not the row running out of patience.
 ///
 /// On `main` every one of these fails in the issue's own words —
-/// `ControlClient::connect` returns the §7.4 handshake timeout, because
+/// `ControlClient::connect` returns the handshake timeout, because
 /// the daemon accepted the connection into the kernel backlog and never
 /// got a thread to answer it on. That is `holdfast list`'s `rc=2`, one
 /// layer down.
@@ -2602,6 +2698,8 @@ async fn a_bystander_served_during(
     tag: &str,
     method: &'static str,
     hold_at: HoldAt,
+    skip: usize,
+    warmup: &[(&'static str, Value)],
     params: impl FnOnce(&str, &[u8]) -> Value,
 ) -> Bystander {
     let d = TestDaemon::start(tag).await;
@@ -2615,7 +2713,7 @@ async fn a_bystander_served_during(
         );
     }
     payload.extend_from_slice(format!("aws_access_key_id = {AWS_KEY}\n").as_bytes());
-    let (held_id, gate) = insert_held_session(&d, "held", &payload, hold_at);
+    let (held_id, gate) = insert_held_session(&d, "held", &payload, hold_at, skip);
     let idle_id = insert_mock_session(&d, "idle");
 
     // The payload has to be *in the buffer* before the call is made, or
@@ -2638,10 +2736,29 @@ async fn a_bystander_served_during(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let caller = d.client().await.expect("the slow client connects");
+    let caller = Arc::new(d.client().await.expect("the slow client connects"));
+    // Let a row put the session in the state it wants to measure —
+    // `a_resize_…` turns Tier B on here — before anything is armed.
+    for (m, p) in warmup {
+        let resp = caller
+            .call_raw(m, method::to_cbor(&p).unwrap())
+            .await
+            .expect("the warm-up call");
+        assert_eq!(resp.status, "ok", "warm-up {m}: {}", resp.details);
+    }
     let slow_params = method::to_cbor(&params(&held_id, &payload)).unwrap();
+    // **`arm()` must stay below the buffer poll above, and this comment is
+    // the only thing saying so.** The gate excludes the session's own
+    // reader thread by latching the first thread to call `backend.read`,
+    // and that latch is unset until a read has happened — while the reader
+    // loop asks `backend.is_alive()` in the same loop. Armed any earlier,
+    // the reader satisfies the rendezvous with nothing in flight, the row
+    // dials the bystander against an idle daemon, and it passes against
+    // the defect it exists to catch. That is the trap this file already
+    // hit once; moving this line up is how it comes back.
     gate.arm();
-    let slow = tokio::spawn(async move { caller.call_raw(method, slow_params).await });
+    let for_slow = Arc::clone(&caller);
+    let slow = tokio::spawn(async move { for_slow.call_raw(method, slow_params).await });
 
     // The rendezvous. From here to `release()` the daemon is inside the
     // pipeline on the held session, and this row knows it because the
@@ -2651,6 +2768,17 @@ async fn a_bystander_served_during(
     // The bystander: `holdfast list`'s shape, in-process. Its own
     // runtime on its own thread, a connection it dials itself, and a
     // question about a session the slow call has never touched.
+    //
+    // **`tool/status` on the *idle* session, and not `tool/list_sessions`,
+    // which is what `holdfast list` actually sends.** The faithful method
+    // is the wrong one here: `list_sessions` walks `registry.all()` and
+    // takes every session's liveness and detection through
+    // `with_detection` — including the held one — so the bystander would
+    // park on this row's own gate and all five rows would go red on a
+    // *fixed* build for a reason that has nothing to do with GH #201. The
+    // property under test is "an unrelated session can be asked about
+    // while this one is in flight", and `status` is the method that asks
+    // exactly that. Do not "correct" this to `list_sessions`.
     let sock = d.paths.control_sock();
     let idle_for_bystander = idle_id.clone();
     let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
@@ -2716,7 +2844,11 @@ async fn a_bystander_served_during(
         .expect("the slow task")
         .expect("the slow call itself completes once the gate opens");
     bystander.join().expect("the bystander thread");
-    Bystander { slow }
+    Bystander {
+        slow,
+        daemon: d,
+        caller,
+    }
 }
 
 /// `read_output` — the call the issue measured at 3,540 ms.
@@ -2726,6 +2858,8 @@ async fn a_read_output_in_flight_does_not_stall_an_unrelated_control_call() {
         "inflight-read",
         "tool/read_output",
         HoldAt::Liveness,
+        0,
+        &[],
         |id, _| json!({ "session": id, "since_cursor": 0, "max_bytes": 262_144 }),
     )
     .await;
@@ -2754,6 +2888,8 @@ async fn a_resource_read_in_flight_does_not_stall_an_unrelated_control_call() {
         "inflight-resource",
         method::METHOD_RESOURCE_READ,
         HoldAt::Liveness,
+        0,
+        &[],
         |id, _| json!({ "uri": format!("holdfast://session/{id}/buffer?since_cursor=0") }),
     )
     .await;
@@ -2776,6 +2912,8 @@ async fn a_screen_capture_in_flight_does_not_stall_an_unrelated_control_call() {
         "inflight-screen",
         "tool/get_screen_state",
         HoldAt::Liveness,
+        0,
+        &[],
         |id, _| json!({ "session": id }),
     )
     .await;
@@ -2796,12 +2934,30 @@ async fn a_screen_capture_in_flight_does_not_stall_an_unrelated_control_call() {
 /// `resize` — the easiest of the four to miss, because the tool's name
 /// says `ioctl` and says nothing about the full `vt100::Parser` re-seed
 /// a width shrink cannot avoid.
+///
+/// **The warm-up is what makes the closing assertion mean anything.** A
+/// `get_screen_state` first turns Tier B on at the session's 120-column
+/// default, so the tracker holds a real grid; without it `Screen::resize`
+/// has nothing to re-seed and every assertion below passes against a
+/// handler that only stored two integers.
+///
+/// **What this row does and does not pin, stated because the gap is
+/// structural and is filed rather than closed here.** `HoldAt::Resize`
+/// parks in `backend.resize()`, which `Session::resize` calls *before*
+/// `screen.lock().resize(..)` — so the row proves the offloaded closure
+/// left the executor, and the grid check below proves the re-seed
+/// happened at all, but neither can prove the re-seed itself ran off the
+/// executor. A mutation that offloads only the `ioctl` and re-seeds
+/// inline still passes. Closing that needs a gate that parks *inside*
+/// the re-seed, which `HeldPty` cannot express.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_resize_in_flight_does_not_stall_an_unrelated_control_call() {
     let b = a_bystander_served_during(
         "inflight-resize",
         "tool/resize",
         HoldAt::Resize,
+        0,
+        &[("tool/get_screen_state", json!({ "session": "held" }))],
         |id, _| json!({ "session": id, "cols": 40, "rows": 12 }),
     )
     .await;
@@ -2812,5 +2968,87 @@ async fn a_resize_in_flight_does_not_stall_an_unrelated_control_call() {
         (data["cols"].as_u64(), data["rows"].as_u64()),
         (Some(40), Some(12)),
         "the resize reported dimensions the session never reached: {data}"
+    );
+
+    // Anti-vacuity, and the only one of these four rows that needed
+    // asking for separately: the response's `cols`/`rows` are read back
+    // from `Session::size()`, which a bare `size.store` satisfies. The
+    // **grid** is the tracker's, and it only narrows if
+    // `Screen::resize` ran.
+    let after = b
+        .then("tool/get_screen_state", json!({ "session": "held" }))
+        .await;
+    assert_eq!(after.status, "ok", "{}", after.details);
+    let grid: Value = method::from_cbor(&after.data).unwrap();
+    assert_eq!(
+        grid["cols"].as_u64(),
+        Some(40),
+        "the session reported 40 columns while its screen was still {} wide — \
+         the resize stored a number and never reflowed the grid",
+        grid["cols"]
+    );
+}
+
+/// `wait_for_pattern` — and with it `send_input(wait_for=)`, which reaches
+/// the same `run_wait`.
+///
+/// **The row that was missing, and the gap it closes was found by
+/// mutation rather than by reading.** Reverting `run_wait`'s two reads to
+/// their inline form survived 1,225 tests: the four rows above cover four
+/// call sites and this path is a fifth, reached by two user-facing tools.
+/// CI caught the revert only because it left `off_runtime_or_unwind` with
+/// no callers and `-D warnings` refuses dead code — a diagnosis about
+/// tidiness standing in for one about scheduling.
+///
+/// `skip = 1` is the one thing here that is not obvious, and
+/// `HeldPty::skip` carries the argument for why it is a constant rather
+/// than a tolerance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_pattern_wait_in_flight_does_not_stall_an_unrelated_control_call() {
+    let b = a_bystander_served_during(
+        "inflight-wait",
+        "tool/wait_for_pattern",
+        HoldAt::Liveness,
+        1,
+        &[],
+        |id, _| {
+            json!({
+                "session": id,
+                // Already in the backlog and far from the tail, which is
+                // what keeps the arrival count at 1: a pattern that does
+                // *not* match sends `wait::for_pattern` into its poll
+                // loop, where `is_alive` is asked every 50 ms and the
+                // count stops being a constant. A pattern matching the
+                // planted credential instead would risk the §4.1
+                // holdback, whose retry loop asks liveness too.
+                "pattern": "Compiling widget",
+                "since_cursor": 0,
+                "max_bytes": 262_144,
+                "timeout_secs": 30,
+            })
+        },
+    )
+    .await;
+
+    assert_eq!(b.slow.status, "ok", "{}", b.slow.details);
+    let data: Value = method::from_cbor(&b.slow.data).unwrap();
+    assert_eq!(
+        data["matched"].as_bool(),
+        Some(true),
+        "the wait did not match, so it never reached the read this row is about: {data}"
+    );
+    // The **second** offloaded read. `run_wait` hops twice — once for
+    // `output_since_start` and once for `match.text` — and only this
+    // assertion says the second one ran.
+    assert!(
+        data["match"]["text"].is_string(),
+        "§5.2's `match.text` is absent, so the match read never happened: {data}"
+    );
+    let since_start = data["output_since_start"]
+        .as_str()
+        .expect("§5.2's output_since_start");
+    assert!(
+        since_start.contains("[REDACTED:aws]") && !since_start.contains(AWS_KEY),
+        "the wait's context read skipped the redaction pipeline"
     );
 }

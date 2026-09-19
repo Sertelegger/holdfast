@@ -402,23 +402,34 @@ is cut, named and published is in
 
 ### Fixed
 
-- **One slow read no longer stalls every other client: the output pipeline
-  runs off the executor's worker threads.** `read_output`, `resources/read`,
-  `get_screen_state` and `resize` all ran §4.1's ANSI strip, redaction and
-  `vt100` re-seed **inline in the async handler**. §4.3 only ever required
+- **One slow read no longer stalls every other client: the MCP read paths run
+  off the executor's worker threads.** `read_output`, `resources/read`,
+  `get_screen_state`, `resize` and `wait_for_pattern`'s two result reads —
+  which `send_input(wait_for=)` shares — all ran §4.1's ANSI strip, redaction
+  and `vt100` re-seed **inline in the async handler**. §4.3 only ever required
   that work to be outside the *buffer lock*, which it was, and §4.2a's
   0.095 ms default read was why nobody asked what thread it was on — but
   [#194] moved that number by 410× for any window carrying one byte above
   `0x7f`, which is every real terminal buffer.
 
+  **Not every blocking thing the daemon does moved, and the two that did not
+  are named rather than implied.** An attached observer's per-chunk redaction
+  (`attach::redact_stream`) is stateful across chunks and wants an owner, not a
+  hop per chunk; the §9.4 audit log's `write_all` is blocking *file I/O* rather
+  than CPU and wants a writer task. Both still run on a worker.
+
   **The symptom was not a slow read.** Measured on the wire, two independent
   `holdfast mcp` processes against one daemon with twelve worker threads: with
-  a single 256 KiB read in flight, **one** worker was running and fifteen were
-  asleep, a `status` on an *unrelated* session was answered **17 times in
-  2.1 s with a worst of 2,061 ms** against a 1.28–5.10 ms baseline, and a
-  third client's `holdfast list` exited **rc=2 after 5,031 ms** on §7.4's
-  handshake bound. One running thread and fifteen idle rules out both obvious
-  diagnoses: it was neither CPU saturation nor lock contention, but a runtime
+  a single 256 KiB read in flight, exactly **one** of the daemon's sixteen
+  runtime-named threads was running and fifteen were asleep — twelve of those
+  sixteen are executor workers, the other four are the `std::thread`s two
+  sessions spawn, which Linux gives the creating thread's name — a `status` on
+  an *unrelated* session was answered **17 times in 2.1 s with a worst of
+  2,061 ms** against a 1.28–5.10 ms baseline, and a third client's `holdfast
+  list` exited **rc=2 after 5,031 ms** on the control protocol's handshake
+  bound (`HANDSHAKE_TIMEOUT`, this codebase's own constant; §7.4 states no
+  handshake deadline). At most one worker busy and eleven free rules out both
+  obvious diagnoses: it was neither CPU saturation nor lock contention, but a runtime
   with no worker left in its I/O driver — so one synchronous call in one
   handler took the daemon's whole socket surface down, accept loop included.
   The operator saw a daemon that looked broken, caused by a read of a session
@@ -437,8 +448,17 @@ is cut, named and published is in
   are accepted, and the trade is stated rather than assumed.** Tokio's
   blocking queue is an uncapped `VecDeque` pushed to *before* the thread cap
   is consulted, and `SpawnError` has no "pool full" variant — so a saturated
-  pool queues without limit and never parks the runtime. Its worst outcome is
-  a read that waits while `status`, `list` and the accept loop keep answering.
+  pool queues without limit and never parks the runtime. For `read_output` and
+  `resources/read` its worst outcome is a read that waits while `status`,
+  `list` and the accept loop keep answering — those two hold no lock once they
+  reach the pool. **`get_screen_state` and `resize` do**: both hold the
+  session's screen lock across the re-seed, and `status` and `list_sessions`
+  read that lock through §5.4's detection block, so a queued capture can delay
+  them. Sized rather than alarming: §4.2a's ~86 MB/s puts the largest seed
+  `clamp_geometry` admits at ~46 ms in release, the lock is per session and
+  sessions are capped at `max_concurrent_sessions` (default 8), and it is not
+  a regression — the holder used to be an executor worker, which is worse.
+  What is new is how many threads can hold such a lock at once.
   Measured at 64 concurrent 256 KiB reads: 81 daemon threads, `status` worst
   92.76 ms; at 256: 273 threads, `status` worst 210.23 ms, `holdfast list`
   rc=0 throughout while the reads themselves degraded to 59–144 s. That
@@ -462,7 +482,7 @@ is cut, named and published is in
   sentence `send_input` has carried since 0.0.6 — but that is not a
   regression: a synchronous call mid-`async fn` has no await point to be
   dropped at either, so these reads were already uncancellable and only the
-  thread changed. The §7.4 handshake's 5 s bound is untouched and is not the
+  thread changed. The handshake's 5 s bound is untouched and is not the
   defect: it is right that one frame between two local processes should never
   take longer, and the frame was never late — the daemon was never asked
   ([#201], [#194]).

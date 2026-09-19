@@ -2228,8 +2228,9 @@ async fn dispatch_resource(
                 // 4 MiB by default against `read_output`'s 256 KiB cap,
                 // so this is the longest single CPU block the daemon can
                 // be asked for — and it is the one that was measured
-                // failing a bystander's `holdfast list` on §7.4's
-                // handshake bound. The §9.4 surface is sampled **here**,
+                // failing a bystander's `holdfast list` on the handshake
+                // bound (`protocol::handshake::HANDSHAKE_TIMEOUT` — a
+                // constant of this codebase, not a figure §7.4 states). The §9.4 surface is sampled **here**,
                 // inside `with_caller`'s scope, because the blocking pool
                 // does not inherit it; `read_prepared` takes it as an
                 // argument so that cannot be forgotten.
