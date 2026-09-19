@@ -28,6 +28,33 @@ use crate::protocol::handshake::ClientKind;
 
 /// §4.3's per-connection outbound bound. **Not configurable in
 /// v0.1.0.** Overflow detaches this client and never blocks the reader.
+///
+/// **64 *frames*, and the unit is a known defect this change deliberately
+/// did not repair** (GH #200). A frame is one PTY `read`, so this is half
+/// a megabyte of 8 KiB chunks and about six kilobytes of the line-sized
+/// ones a `cat` through a PTY actually produces — a threshold that varies
+/// by four orders of magnitude with how chatty the child is, and that at
+/// the small end declares a client slow after a few kilobytes. Measured:
+/// `holdfast watch` on a 380 KB burst delivered 2.6%–23% of it, from a
+/// client that delivered 100% of the same burst the moment this stopped
+/// being the binding constraint.
+///
+/// **It was raised, measured, and put back.** §4.3's two bounds are in
+/// series and only this one detaches: a forwarder that is not scheduled
+/// lags on the 256-frame broadcast instead, and frames lost *there* never
+/// reach this queue to fill it. At 64 the queue wins that race
+/// essentially always; with a megabyte of headroom it stops winning, and
+/// a client that drains nothing is then never detached at all — it
+/// collects gaps forever while holding a socket and two tasks §4.3 says
+/// to reclaim. `a_slow_consumer_is_detached_and_the_reader_keeps_running`
+/// went red in 3 runs of 5 on a loaded machine, and stayed intermittent
+/// after the obvious repairs. Moving this bound safely means moving
+/// §4.2's `output_broadcast_capacity` with it, and that key is inert —
+/// `tests/config_surface.rs` records it as `Inert::NeverNamed` against
+/// the hardcoded `OUTPUT_BROADCAST_FRAMES` — so the two cannot currently
+/// be moved together at all. That is its own change with its own
+/// evidence, and GH #200's fix does not depend on it: what it needed was
+/// for the loss to stop being silent.
 pub const ATTACH_QUEUE_FRAMES: usize = 64;
 
 /// One attached client, as the hub and the audit trail see it.
@@ -58,8 +85,11 @@ pub struct AttachConn {
     /// owner **before a byte of this connection was parsed**.
     pub peer_uid: u32,
     /// Bounded per-connection queue (§4.3: *"their own bounded mpsc,
-    /// default 64 frames"*). Overflow detaches this client and never
-    /// blocks the reader task.
+    /// default 64 frames"* — see [`ATTACH_QUEUE_FRAMES`] for why the
+    /// *number* is now derived and the quote is kept as a quote).
+    /// Overflow detaches this client and never blocks the reader task,
+    /// and the ending still fits: `conn::ENDING_SLOTS` keeps room for
+    /// it (GH #200).
     pub tx: mpsc::Sender<ServerFrame>,
     pub connected_at: Instant,
     /// The geometry this client was last *sent*, so it is not sent again.

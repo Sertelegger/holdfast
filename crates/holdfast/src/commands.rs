@@ -1273,6 +1273,105 @@ fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
     rx
 }
 
+/// What a viewing client knows about how much of the session it was
+/// actually shown (GH #200).
+///
+/// **Two states and not a `bool`, because the two are told differently.**
+/// A gap has a size and the stream continued past it; a `slow_consumer`
+/// ending has no size at all — everything from that instant on was
+/// never queued, and the daemon has no count of what the child went on
+/// to print. Collapsing them would mean either inventing a number for
+/// the second or throwing away the one the first has.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Truncation {
+    /// Nothing was reported missing. **Not a claim that nothing was:**
+    /// it is the absence of a report, which is exactly what this issue
+    /// was about, and it is only as strong as the daemon's reporting.
+    None,
+    /// `n` bytes are known to be missing from what was rendered, summed
+    /// over every gap.
+    Gap(u64),
+}
+
+#[cfg(unix)]
+impl Truncation {
+    fn saw_gap(&mut self, bytes: u64) {
+        *self = match *self {
+            Self::None => Self::Gap(bytes),
+            Self::Gap(n) => Self::Gap(n.saturating_add(bytes)),
+        };
+    }
+}
+
+/// Tell the operator the stream skipped bytes, at the point it skipped
+/// them.
+///
+/// Through `diag!` and therefore stderr, **not** through [`render`]:
+/// stdout is the session's own byte stream and a client that wrote its
+/// own prose into it would corrupt every `holdfast watch > file`. It is
+/// also why this is not rendered inline at the column the gap occurred
+/// in, which would read better and would be the same mistake.
+#[cfg(unix)]
+fn report_gap(what: &str, bytes: u64) {
+    diag!(
+        "holdfast {what}: {bytes} bytes of output were dropped here and are not shown — \
+         `holdfast logs` still has them"
+    );
+}
+
+/// §7.5's `Detached`, rendered, and the exit status that goes with it.
+///
+/// **`slow_consumer` is not a success and this is the one place that is
+/// decided.** Both clients returned `ExitCode::SUCCESS` for every value
+/// of `reason`, so a view that had lost nine tenths of a build log
+/// exited 0 and a script could not tell it from a clean detach. The
+/// other two reasons are unchanged and still exit 0: `session_exit` and
+/// `daemon_shutdown` are the session ending and the daemon going away,
+/// both of which are things that happened to the *session*, and neither
+/// says the operator was shown less than there was.
+///
+/// A gap seen earlier carries the same verdict, because it is the same
+/// fact: the stream this client rendered is not the stream the child
+/// wrote.
+#[cfg(unix)]
+fn finish(what: &str, reason: &str, truncated: Truncation) -> ExitCode {
+    if reason == "slow_consumer" {
+        // No byte count: see `Truncation`. What is knowable is where to
+        // get the rest, and the ring buffer still has it (REQ-O-005).
+        diag!(
+            "holdfast {what}: detached ({reason}) — this view is incomplete from here on; \
+             `holdfast logs` has what the session printed"
+        );
+        return ExitCode::from(EXIT_FAILED);
+    }
+    diag!("holdfast {what}: detached ({reason})");
+    left_cleanly(what, truncated)
+}
+
+/// The exit status for an ending that was nobody's failure — the client
+/// detached, stdin closed, the session ended — **once a gap has already
+/// been reported**.
+///
+/// §18.8's `1` and not a new code: *"the thing you asked for did not
+/// happen"* covers a view that is missing part of the session, and a
+/// truncated stream is not `2`'s *"there should be a daemon and I could
+/// not reach it"* — the daemon was there throughout and said so.
+///
+/// The paths that reach this with `Truncation::None` are unchanged and
+/// still exit 0, which is what `mcp-smoke.sh` asserts of `Ctrl-B d` and
+/// of `watch` under `SIGINT`.
+#[cfg(unix)]
+fn left_cleanly(what: &str, truncated: Truncation) -> ExitCode {
+    match truncated {
+        Truncation::None => ExitCode::SUCCESS,
+        Truncation::Gap(n) => {
+            diag!("holdfast {what}: {n} bytes of this session were never shown");
+            ExitCode::from(EXIT_FAILED)
+        }
+    }
+}
+
 /// Write bytes to the local terminal, unmodified.
 ///
 /// `write_all` and not `print!`: the payload is a PTY's raw byte stream,
@@ -1534,6 +1633,13 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
     // credential, which is the defect the decline exists to prevent.
     let mut submitted: Option<String> = None;
 
+    // **Whether this view is a complete record of the session** (GH
+    // #200). Set by an `OutputGap`, and by a `slow_consumer` ending,
+    // which is the same fact stated as a termination. It is the only
+    // input to the exit status that is not an error the client itself
+    // hit — see [`incomplete_exit`].
+    let mut truncated = Truncation::None;
+
     loop {
         tokio::select! {
             body = frames.recv() => {
@@ -1560,12 +1666,15 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                             diag!("{b}");
                         }
                     }
+                    ServerFrame::OutputGap { bytes, .. } => {
+                        truncated.saw_gap(bytes);
+                        report_gap("attach", bytes);
+                    }
                     ServerFrame::SessionExited { code } => {
                         diag!("holdfast attach: the session exited ({code})");
                     }
                     ServerFrame::Detached { reason } => {
-                        diag!("holdfast attach: detached ({reason})");
-                        return ExitCode::SUCCESS;
+                        return finish("attach", &reason, truncated);
                     }
                     ServerFrame::AwaitingSecret { request_id, prompt_text } => {
                         // On its own line, so it cannot be mistaken for
@@ -1690,7 +1799,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                     // Local stdin closed. Leave without killing the
                     // session, exactly as the detach key does.
                     let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
-                    return ExitCode::SUCCESS;
+                    return left_cleanly("attach", truncated);
                 };
                 // **§6.1's grammar runs first, and it runs during a
                 // secret prompt too.** The order is the whole point: a
@@ -1774,7 +1883,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                 if detached {
                     let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
                     render(b"\r\n");
-                    return ExitCode::SUCCESS;
+                    return left_cleanly("attach", truncated);
                 }
             }
             // Returning, not re-raising: the `return` is what runs
@@ -1886,6 +1995,12 @@ pub async fn watch(session: &str) -> ExitCode {
     let resize_settle = tokio::time::sleep(RESIZE_SETTLE);
     tokio::pin!(resize_settle);
 
+    // See `attach`'s copy: whether this view is a complete record (GH
+    // #200). `watch` is the surface the issue was measured on and the
+    // one a human is most likely to be reading as a record of what
+    // happened.
+    let mut truncated = Truncation::None;
+
     loop {
         tokio::select! {
             body = frames.recv() => {
@@ -1902,12 +2017,15 @@ pub async fn watch(session: &str) -> ExitCode {
                 };
                 match f {
                     ServerFrame::Output { bytes, .. } => render(&bytes),
+                    ServerFrame::OutputGap { bytes, .. } => {
+                        truncated.saw_gap(bytes);
+                        report_gap("watch", bytes);
+                    }
                     ServerFrame::SessionExited { code } => {
                         diag!("holdfast watch: the session exited ({code})");
                     }
                     ServerFrame::Detached { reason } => {
-                        diag!("holdfast watch: detached ({reason})");
-                        return ExitCode::SUCCESS;
+                        return finish("watch", &reason, truncated);
                     }
                     // A watcher is told a secret is being asked for and
                     // **cannot answer it**: `SecretInput` is a write
@@ -1968,7 +2086,7 @@ pub async fn watch(session: &str) -> ExitCode {
                 // and it is a write frame: §7.5 would refuse it
                 // `read_only_attach` and the client would sit there.
                 let _ = frame::write_frame(&mut wr, &WatchOut::Detach.frame()).await;
-                return ExitCode::SUCCESS;
+                return left_cleanly("watch", truncated);
             }
         }
     }

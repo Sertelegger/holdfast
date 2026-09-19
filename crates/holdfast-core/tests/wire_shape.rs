@@ -268,6 +268,30 @@ const RECORDED_VERSIONS: &[(u32, u32)] = &[
     // `outcome` field is a free `String` recorded as `"<str>"`, and the
     // MCP `reason` is not an attach frame at all.
     (1, 3),
+    // 1.4 — `ServerFrame::OutputGap`, the first *new frame* in this log
+    // rather than a new field (GH #200). It names bytes §4.3's bounded
+    // output broadcast dropped for one connection, and it exists because
+    // the daemon already knew the number and threw it away: the lag was
+    // written to the daemon's own stderr as a frame count and the client
+    // was handed the next chunk as though it followed the last. Measured
+    // through the wire, `holdfast watch` delivered as little as 2.6% of a
+    // 380 KB burst and ended on `the daemon closed the connection`.
+    //
+    // **A new server frame is additive and a new client frame would not
+    // be**, which is the distinction the failure message below draws and
+    // the reason this is a minor. `decode_server_frame` maps an
+    // unrecognised `type` onto `ServerFrame::Unknown` and both shipped
+    // clients skip it, so a 1.3 client against a 1.4 daemon is exactly as
+    // it is today — uninformed, which is the bug, and entitled to the
+    // protocol it was built against. There is no such seam in the other
+    // direction: the daemon's `read_loop` has no `Unknown` arm to lean
+    // on, which is why the rule is asymmetric rather than tidy.
+    //
+    // `Detached.reason` does **not** gain a value here, and the frame
+    // exists partly so that it does not. §18.4c closes that set at three
+    // under REQ-D-009; a gap is not an ending, and the attachment it
+    // happens on is still healthy.
+    (1, 4),
 ];
 
 /// The placeholder every opaque string field carries in this file.
@@ -642,6 +666,14 @@ fn server_frames() -> Vec<ServerFrame> {
         ServerFrame::Output {
             session: STR.into(),
             bytes: vec![0x1b],
+        },
+        // Maximal like every other sample, and `bytes` is the one field
+        // here that could be mistaken for `Output`'s: it is an `int`
+        // there and a byte string here, which is the difference the
+        // `wire:` line records.
+        ServerFrame::OutputGap {
+            session: STR.into(),
+            bytes: 1,
         },
         ServerFrame::SessionExited { code: 0 },
         ServerFrame::Resize { cols: 1, rows: 1 },

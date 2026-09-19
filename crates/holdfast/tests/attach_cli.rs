@@ -2313,6 +2313,211 @@ async fn a_client_on_a_terminal_declares_it_and_two_terminals_differ() {
 ///
 /// `run_plain` rather than a pty, because `watch` is the subcommand that
 /// deliberately works from a pipe.
+/// **`attach` carries the same defect and the same fix** (GH #200).
+///
+/// It is a different `AttachRole` on one protocol, so the daemon half is
+/// one code path and role-independent — but the *client* half is two
+/// loops, and the one that was measured losing the burst is `watch`.
+/// Measured through the wire, `attach` delivered 100% of the same 380 KB
+/// on both ASCII and UTF-8 where `watch` delivered 2.6%–23%, and the
+/// reason is not that `attach` is safe: `role: interactive` gets
+/// `redactor: None`, so its forwarder is a memcpy and keeps up. Its
+/// exposure is identical the moment anything slows the client, which is
+/// exactly the state no measurement on a quiet machine will produce.
+///
+/// So this row asserts the surface rather than waiting for the weather:
+/// the gap is named with its size, and a `slow_consumer` ending is not a
+/// success. On a real pty, because `attach` refuses a stdin that is not
+/// a terminal — which is why it is here and not folded into the `watch`
+/// row's `run_plain`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_truncated_attach_names_the_loss_and_does_not_exit_zero() {
+    let replies = vec![
+        enc(&ServerFrame::Attached {
+            session_id: "sess_a200".into(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            state: "Running".into(),
+            exit_code: None,
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: 0,
+        }),
+        enc(&ServerFrame::Output {
+            session: "sess_a200".into(),
+            bytes: b"BEFORE-THE-GAP\r\n".to_vec(),
+        }),
+        enc(&ServerFrame::OutputGap {
+            session: "sess_a200".into(),
+            bytes: 349_525,
+        }),
+        enc(&ServerFrame::Detached {
+            reason: "slow_consumer".into(),
+        }),
+    ];
+    let stub = StubDaemon::start("attachgap", replies, Duration::from_millis(900)).await;
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_a200"], 80, 24);
+    assert_eq!(
+        term.wait_exit(15),
+        1,
+        "a raw-fidelity view missing 349,525 bytes exited 0, which is what a \
+         clean Ctrl-B d exits"
+    );
+    let seen = term.snapshot();
+    assert!(
+        contains(&seen, b"349525 bytes of output were dropped"),
+        "attach must name the gap with its size, as watch does:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        contains(&seen, b"BEFORE-THE-GAP"),
+        "the session's own bytes must still be rendered:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    // **Both halves, because either alone carries the exit status.** A
+    // gap sets it and so does a `slow_consumer` ending, so an assertion
+    // on the code is green when only one of them works — which is what
+    // reverting the ending's arm looks like.
+    assert!(
+        contains(&seen, b"incomplete"),
+        "the ending must say the view is incomplete, not merely echo the \
+         reason token:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+/// **A `watch` that was not shown everything says so, on stderr, and
+/// does not exit 0** (GH #200).
+///
+/// The issue measured a 380 KB burst arriving as 9% of itself, ending on
+/// `holdfast watch: the daemon closed the connection` with exit 0 — a
+/// sentence about a daemon going away, on a stream that had been
+/// silently truncated. Three separate things were wrong and this row
+/// drives all three, because fixing any two of them still leaves an
+/// operator who cannot tell a complete view from a partial one.
+///
+/// **The gap notice goes to stderr and the session's bytes to stdout**,
+/// and that split is asserted rather than assumed. `holdfast watch >
+/// file` is a capture, and a client that wrote its own prose into the
+/// byte stream would corrupt every one of them — the tempting
+/// alternative, rendering the gap inline where it happened, reads better
+/// and is that bug. `run_plain` rather than a pty for exactly this
+/// reason: a terminal merges the two and could not tell them apart.
+///
+/// **Paired with the same stream minus the two frames** (arm 2). Exit 1
+/// on its own is satisfied by a client that fails on everything, and the
+/// project's smoke check asserts `watch` exits 0 under `SIGINT`; the
+/// negative is what says the status still means something.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_truncated_watch_names_the_loss_and_does_not_exit_zero() {
+    fn attached(id: &str) -> Vec<u8> {
+        enc(&ServerFrame::Attached {
+            session_id: id.into(),
+            name: None,
+            cols: 80,
+            rows: 24,
+            state: "Running".into(),
+            exit_code: None,
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: 0,
+        })
+    }
+
+    // Arm 1 — a gap mid-stream, then the ending that names the cause.
+    let replies = vec![
+        attached("sess_w200"),
+        enc(&ServerFrame::Output {
+            session: "sess_w200".into(),
+            bytes: b"BEFORE-THE-GAP\n".to_vec(),
+        }),
+        enc(&ServerFrame::OutputGap {
+            session: "sess_w200".into(),
+            bytes: 349_525,
+        }),
+        enc(&ServerFrame::Output {
+            session: "sess_w200".into(),
+            bytes: b"AFTER-THE-GAP\n".to_vec(),
+        }),
+        enc(&ServerFrame::Detached {
+            reason: "slow_consumer".into(),
+        }),
+    ];
+    let stub = StubDaemon::start("watchgap", replies, Duration::from_millis(900)).await;
+    let out = tokio::task::spawn_blocking({
+        let dir = stub.paths.dir().to_path_buf();
+        move || run_plain(&dir, &["watch", "sess_w200"])
+    })
+    .await
+    .expect("join");
+
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a view missing 349,525 bytes of its session exited {:?}; all stderr:\n{err}",
+        out.status.code()
+    );
+    assert!(
+        err.contains("349525 bytes of output were dropped"),
+        "the gap must be named with its size, not merely hinted at:\n{err}"
+    );
+    assert!(
+        err.contains("slow_consumer") && err.contains("incomplete"),
+        "the ending must say the view is incomplete, not just echo the token:\n{err}"
+    );
+    assert!(
+        !err.contains("the daemon closed the connection"),
+        "the daemon said why it was going; reporting it as an unexplained close \
+         is the sentence GH #200 is about:\n{err}"
+    );
+
+    // The stream continued past the gap, and the notice is not in it.
+    assert!(
+        stdout.contains("BEFORE-THE-GAP") && stdout.contains("AFTER-THE-GAP"),
+        "a gap must not end the stream; stdout was:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("dropped") && !stdout.contains("349525"),
+        "the gap notice leaked into the session's own byte stream, which \
+         corrupts every `holdfast watch > file`:\n{stdout}"
+    );
+
+    // Arm 2 — the separating negative. Same shape, no gap, and an
+    // ending that is the session finishing rather than this client
+    // falling behind.
+    let replies = vec![
+        attached("sess_w200b"),
+        enc(&ServerFrame::Output {
+            session: "sess_w200b".into(),
+            bytes: b"BEFORE-THE-GAP\nAFTER-THE-GAP\n".to_vec(),
+        }),
+        enc(&ServerFrame::SessionExited { code: 0 }),
+        enc(&ServerFrame::Detached {
+            reason: "session_exit".into(),
+        }),
+    ];
+    let stub = StubDaemon::start("watchwhole", replies, Duration::from_millis(900)).await;
+    let out = tokio::task::spawn_blocking({
+        let dir = stub.paths.dir().to_path_buf();
+        move || run_plain(&dir, &["watch", "sess_w200b"])
+    })
+    .await
+    .expect("join");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an untruncated view must still exit 0, or the status says nothing; \
+         all stderr:\n{err}"
+    );
+    assert!(
+        !err.contains("dropped") && !err.contains("incomplete"),
+        "a complete view was told it had lost bytes it never lost:\n{err}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resize_flood_is_coalesced_for_watch_as_well() {
     let mut replies = vec![enc(&ServerFrame::Attached {

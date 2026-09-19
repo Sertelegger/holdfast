@@ -17,6 +17,17 @@ is cut, named and published is in
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
   still not run, because 55 of its tests spawn a real shell ([#91]).
+- Attach protocol **1.4**: `ServerFrame::OutputGap { session, bytes }`, sent
+  when §4.3's bounded output broadcast dropped frames a connection had not
+  read. The count is **exact and in bytes** — the internal `OutputFrame`
+  carries `start`/`end`, so the hole is arithmetic the daemon already had,
+  where `RecvError::Lagged(n)`'s `n` counts PTY reads and converts to bytes
+  by no constant at all. Out of band rather than a marker inside `Output`,
+  because a gap has no position in the payload to occupy and `role:
+  interactive` is REQ-SEC-008's raw-fidelity surface; and a frame rather than
+  a fourth `Detached.reason`, because §18.4c closes that set at three and a
+  gap is not an ending — the attachment is healthy and the stream continues
+  ([#200]).
 - Control protocol **1.2**: a `holdfast/cancel` method and an optional
   `cancel_token` on every request, so an MCP `notifications/cancelled` reaches
   the daemon instead of stopping at the shim. Additive in both directions — a
@@ -495,6 +506,78 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+
+- **`holdfast watch` no longer loses most of a burst *silently* ([#200]).**
+  Measured through the wire, a 380 KB `cat` into a watched session delivered
+  **2.6%–23%** of itself on ASCII and **3.7%** on UTF-8, each ending on
+  `holdfast watch: the daemon closed the connection` — the sentence for a
+  daemon that went away — with no gap marker, no count, and an exit status of
+  0 or 2 depending on which of two silent paths it took.
+
+  **The word doing the work is *silently*, and the loss itself is not
+  claimed to be fixed.** §4.2 chose a bounded broadcast with slow-consumer
+  drop deliberately, because back-pressuring an observer changes the
+  producer's behaviour and a session's output must not stall because
+  somebody is watching it; that trade is untouched here, the reader is
+  still never blocked, and a client that genuinely will not drain is still
+  detached. The separate reason the loss is as *large* as it is has its own
+  entry below, and it was measured and deliberately not repaired here.
+  Three things were wrong about how the loss was reported and each is fixed
+  on its own terms.
+
+  **The ending was written onto the queue whose overflow caused it.**
+  §7.5's teardown rule has no best-effort clause — a `slow_consumer` is an
+  attachment-level event and one `Detached` is always sent for those — but
+  the frame went out with a `try_send` onto a full queue, so the one reason
+  the set exists to name was the one reason that never arrived. The stream
+  now keeps two slots back for the ending, and `run`'s existing `drop(tx)`
+  already lets `write_loop` drain what is queued before the socket closes,
+  so the frame is delivered rather than raced.
+
+  **A broadcast lag said nothing.** The `Lagged(n)` arm wrote `n` to the
+  daemon's own stderr and handed the client the next chunk as though it
+  followed the last, so a hole in a build log was indistinguishable from a
+  build that printed less. It is now `OutputGap`, above.
+
+  **And the exit status said the view was fine.** Both clients returned 0
+  for every `Detached.reason`, so a `watch` that had lost nine tenths of a
+  log was indistinguishable to a script from a clean `Ctrl+C`. A truncated
+  view — a gap, or a `slow_consumer` ending — is §18.8's exit **1**, not 2:
+  the daemon was there throughout and said so. `session_exit` and
+  `daemon_shutdown` still exit 0, because neither says the operator was
+  shown less than there was.
+
+  **What is *not* claimed: this does not make the drop impossible**, and
+  §4.2's choice not to back-pressure an observer is untouched — a session's
+  output must not stall because someone is watching it, so the reader is
+  still never blocked and a client that genuinely will not drain is still
+  detached. What changed is that it cannot happen quietly.
+
+- **Not fixed here, and measured rather than assumed: §4.3's
+  per-connection bound is counted in *frames*, and a frame is one PTY
+  `read` ([#200]).** So 64 is half a megabyte of 8 KiB chunks and about six
+  kilobytes of the line-sized ones a `cat` through a PTY actually produces
+  — a threshold that varies by four orders of magnitude with how chatty the
+  child is. That is why the loss is as large as it is, and the same client
+  that delivered 2.6% of the burst delivered 100% of it the moment this
+  stopped being the binding constraint.
+
+  **It was raised, measured, and put back.** §4.3's two bounds are in
+  series and only this one detaches: a forwarder that is not scheduled lags
+  on the 256-frame broadcast instead, and frames lost *there* never reach
+  the queue to fill it. At 64 the queue wins that race essentially always;
+  with a megabyte of headroom it stops winning, and a client that drains
+  nothing is then never detached at all — it collects gaps forever while
+  holding a socket and two tasks §4.3 says to reclaim. The shipped
+  `a_slow_consumer_is_detached_and_the_reader_keeps_running` went red in 3
+  runs of 5 on a loaded machine and stayed intermittent after the obvious
+  repairs. Moving this bound safely means moving §4.2's
+  `output_broadcast_capacity` with it, and that key is inert — `[#128]`'s
+  own inventory records it as never reaching `broadcast::channel` — so the
+  two cannot currently be moved together at all. Recorded at the constant
+  as a known defect with its measurements, because a number that looks
+  arbitrary and is arbitrary is the kind that gets raised again without
+  them.
 
 - **The `binary` arm of the in-flight test asks the rule as well, so a
   certificate no longer pins the holdback for the rest of the session
@@ -1293,5 +1376,6 @@ residuals that are known and accepted.
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
+[#200]: https://github.com/Sertelegger/holdfast/issues/200
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
 [#166]: https://github.com/Sertelegger/holdfast/issues/166

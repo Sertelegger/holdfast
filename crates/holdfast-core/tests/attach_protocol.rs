@@ -1009,9 +1009,17 @@ async fn an_attach_client_receives_only_bytes_never_offsets() {
 
 #[tokio::test]
 async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
-    // §4.3, §11.2. Three assertions, and (b) and (c) are what make this
+    // §4.3, §11.2. Four assertions, and (b) and (c) are what make this
     // able to fail: detaching the whole *session*, or blocking the
     // reader, both satisfy (a) on its own.
+    //
+    // **(d) is GH #200's and lives here rather than in a sibling row.**
+    // It needs the same 6.4 MB burst and the same non-draining client,
+    // and a second row building them is a second row whose timing can
+    // drift from this one's — measured: a standalone copy without this
+    // row's *draining* client went red under `nextest`'s own parallelism
+    // while this one passed beside it. One fixture, two questions: was
+    // the client detached, and was it told why.
     let d = TestDaemon::start("slow").await;
     let (s, pty) = d.session(None);
 
@@ -1056,22 +1064,25 @@ async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
 
     // (a) the slow client is detached. It reads now, drains whatever the
     // socket buffered, and must reach EOF — bounded, so a daemon that
-    // kept it attached is a red row rather than a hang.
-    let detached = tokio::time::timeout(Duration::from_secs(20), async {
+    // kept it attached is a red row rather than a hang. The frames are
+    // decoded on the way past so (d) can ask what it was told.
+    let ending = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut endings: Vec<String> = Vec::new();
         loop {
             match frame::read_frame_body(&mut slow).await {
-                Ok(_) => continue,
-                Err(FrameError::Eof) => return true,
-                Err(_) => return false,
+                Ok(body) => {
+                    if let Ok(ServerFrame::Detached { reason }) = decode_server_frame(&body) {
+                        endings.push(reason);
+                    }
+                }
+                Err(FrameError::Eof) => return Some(endings),
+                Err(_) => return None,
             }
         }
     })
     .await;
-    assert_eq!(
-        detached,
-        Ok(true),
-        "a client that stopped draining must be detached, not tolerated"
-    );
+    let ending = ending.expect("a client that stopped draining was never detached");
+    let ending = ending.expect("the connection failed rather than closing");
 
     // (b) the draining client still receives every byte afterwards.
     let (seen, saw_last) = fast_reader.await.expect("reader task");
@@ -1087,6 +1098,29 @@ async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
         "the PTY reader stalled behind a slow attach client (head {} -> {})",
         head_before,
         s.buffer_head()
+    );
+
+    // (d) **and it was told why** (GH #200). §7.5: after a successful
+    // handshake every close the daemon initiates is preceded by exactly
+    // one `Detached { reason }` unless a connection-level fault forced
+    // it, and it names this case on the attachment side — *"this client
+    // could not keep up"*. The frame was written with a `try_send` onto
+    // the very queue whose overflow caused the ending, so it was dropped
+    // in the one situation it exists to describe, and what a `holdfast
+    // watch` saw was a bare EOF that its own message calls *"the daemon
+    // closed the connection"* — the sentence for a daemon that went
+    // away.
+    //
+    // **Exactly one**, which is the half a `contains` would miss: a
+    // forwarder that queued the ending on every refused chunk would
+    // satisfy "it arrived" while putting a teardown frame in the middle
+    // of a live stream.
+    assert_eq!(
+        ending,
+        vec!["slow_consumer".to_string()],
+        "a slow consumer must be told exactly once why its view ended; a bare \
+         EOF is indistinguishable from the daemon dying, which is what the \
+         client reports it as"
     );
 }
 
@@ -3593,9 +3627,10 @@ fn the_attach_protocol_carries_no_confirmation_frame() {
     );
     // And the catalogue really is the one this build serialises — without
     // this the loop above passes against an empty array. 6 → 7 and 9 → 10
-    // are 0.0.7's two additive variants (§23.3, Global Constraint 13).
+    // are 0.0.7's two additive variants (§23.3, Global Constraint 13);
+    // 10 → 11 is `OutputGap`, which is GH #200's and is not a §7.5 row.
     assert_eq!(ClientFrameKind::ALL.len(), 7);
-    assert_eq!(KNOWN_SERVER_TYPES.len(), 10);
+    assert_eq!(KNOWN_SERVER_TYPES.len(), 11);
 }
 
 // ------------------------- GH #24: the slot a dead session leaves behind

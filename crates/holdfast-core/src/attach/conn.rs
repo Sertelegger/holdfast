@@ -257,6 +257,18 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
     // and it loses it *silently*: the frames still arrive in the right
     // order, so an ordering-only assertion cannot see it.
     let output = session.subscribe();
+    // **Where this connection's stream starts, so a gap has something to
+    // be measured from** (GH #200). `forward_output` reports a broadcast
+    // drop as an exact byte count, which is the distance between the last
+    // frame it forwarded and the first one after the lag — and a lag that
+    // lands before it has forwarded *any* frame has no such predecessor.
+    // Read immediately after `subscribe`, so a frame published in the
+    // instant between the two is already in this receiver's ring and
+    // arrives with `start < baseline`: the subtraction saturates to zero
+    // and no gap is invented. The residual runs the other way and is
+    // bounded at one PTY chunk — that frame being *dropped* as well needs
+    // the whole 256-frame ring to turn over inside the same window.
+    let baseline = session.buffer_head();
     // **The event subscriptions are taken here too, and this is a fix
     // rather than tidiness.** They used to be taken where the tasks are
     // spawned, which is *after* the `is_awaiting_secret()` replay check
@@ -371,6 +383,8 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
         ))),
     };
 
+    // §4.3's bound for this connection, shared by the one task that
+    // fills the queue and the one that drains it (GH #200).
     let writer = tokio::spawn(write_loop(wr, rx));
     let mut forwarder = tokio::spawn(forward_output(
         Arc::clone(&session),
@@ -379,6 +393,7 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
         exit_events,
         tx.clone(),
         redactor,
+        baseline,
     ));
     let events = tokio::spawn(forward_events(
         Arc::clone(&daemon),
@@ -555,6 +570,69 @@ impl Ending {
             Self::SessionExit => Some("session_exit"),
             Self::DaemonShutdown => Some("daemon_shutdown"),
         }
+    }
+}
+
+/// Turns §4.3's broadcast lag into §7.5's [`ServerFrame::OutputGap`].
+///
+/// **The count the channel gives is not the count to report.**
+/// `RecvError::Lagged(n)` counts *frames*, and a frame is one PTY
+/// `read`: measured on this tree a single 380 KB burst produced frames
+/// from 97 bytes to the 8 KiB ceiling, so `n` is not convertible to
+/// bytes by any constant. The `OutputFrame` spans are, exactly — which
+/// is why the measurement is taken here, one frame late, rather than in
+/// the arm that learns about the lag.
+///
+/// **One notice per lag, not one per dropped frame.** A lag is a single
+/// discontinuity in the stream however many frames fell into it, and
+/// consecutive lags before the next successful receive collapse into the
+/// one hole they actually are.
+struct GapTracker {
+    /// Absolute offset just past the last frame forwarded on this
+    /// connection. Seeded from the buffer head at subscription time.
+    next: u64,
+    /// A lag has been observed and not yet measured.
+    owed: bool,
+}
+
+impl GapTracker {
+    fn new(baseline: u64) -> Self {
+        Self {
+            next: baseline,
+            owed: false,
+        }
+    }
+
+    fn lagged(&mut self) {
+        self.owed = true;
+    }
+
+    /// Queue the notice this frame's arrival makes measurable, then
+    /// record where the stream has reached.
+    ///
+    /// A gap of zero emits nothing: the lag dropped frames this
+    /// connection had already been handed, or the baseline raced a
+    /// publish, and in neither case is there a hole to draw.
+    fn announce(
+        &mut self,
+        session_id: &str,
+        frame: &crate::session::OutputFrame,
+        tx: &mpsc::Sender<ServerFrame>,
+    ) -> Queued {
+        let owed = std::mem::take(&mut self.owed);
+        let missing = frame.start.saturating_sub(self.next);
+        self.next = frame.end;
+        if !owed || missing == 0 {
+            return Queued::Sent;
+        }
+        queue_stream(
+            tx,
+            ServerFrame::OutputGap {
+                session: session_id.to_string(),
+                bytes: missing,
+            },
+            session_id,
+        )
     }
 }
 
@@ -1337,13 +1415,28 @@ async fn write_loop(mut wr: tokio::net::unix::OwnedWriteHalf, mut rx: mpsc::Rece
 /// would be one lagging client's back-pressure on a channel every other
 /// client and `wait_for_pattern` share.
 ///
-/// The `Detached { reason: "slow_consumer" }` is **best effort and
-/// genuinely may not arrive**, which is worth stating rather than
-/// hoping. The queue only fills because the *socket* is full, so the
-/// writer is already parked in `write_frame`; a frame appended behind it
-/// has nowhere to go. What the client observes is the close. §18.6
-/// reasons about the WebSocket's version of this, where the same frame
-/// *is* deliverable.
+/// The `Detached { reason: "slow_consumer" }` **does arrive**, and it
+/// took GH #200 to make that true. This comment used to say the frame
+/// was best effort and genuinely might not — the queue only fills
+/// because the socket is full, so a frame appended behind it has nowhere
+/// to go — and it was right about the mechanism and wrong about what to
+/// do with it. §7.5's teardown rule has no best-effort clause: a
+/// `slow_consumer` is an **attachment-level** event, one `Detached` is
+/// always sent for those, and the one reason the rule exists to name was
+/// the one reason that never reached a client. [`queue_output`] now
+/// keeps [`ENDING_SLOTS`] slots back from the output stream so the
+/// ending always fits, and `run`'s `drop(tx)` lets `write_loop` drain
+/// what is queued before the socket closes — so the frame is delivered
+/// as soon as the peer reads, rather than raced against it.
+///
+/// **What the byte gap costs the redactor: nothing** (GH #200, GH #135).
+/// [`ServerFrame::OutputGap`] is queued *beside* the stream and no byte
+/// takes a different route because of it — `forward_chunk` feeds
+/// `StreamRedactor` exactly the chunks it fed before, in the same order,
+/// with the same carry. A gap is deliberately **not** used to reset the
+/// redactor: its lookbehind would then straddle a discontinuity, which
+/// changes what matches, and this change is required to change nothing
+/// about what is redacted.
 async fn forward_output(
     session: Arc<Session>,
     session_id: String,
@@ -1351,8 +1444,14 @@ async fn forward_output(
     mut exits: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
     tx: mpsc::Sender<ServerFrame>,
     mut redactor: Option<super::redact_stream::StreamRedactor>,
+    baseline: u64,
 ) -> Forwarded {
     use tokio::sync::broadcast::error::RecvError;
+
+    // §4.3's broadcast drop, made reportable. `gaps` carries the absolute
+    // offset just past the last frame this connection forwarded, and
+    // whether a lag is owed a measurement.
+    let mut gaps = GapTracker::new(baseline);
 
     // **The client that arrived after the edge had already passed.**
     // `SessionEvent::Exited` is sent once, by the reader thread, and a
@@ -1404,15 +1503,24 @@ async fn forward_output(
         // would park this task on a channel with no producer left.
         loop {
             match output.try_recv() {
-                Ok(f) => match forward_chunk(&session_id, &f.bytes, &mut redactor, &tx) {
-                    Queued::Sent => {}
-                    // The queue filled or the socket died: there is
-                    // nowhere to put a `SessionExited` either.
-                    Queued::Stopped => return Forwarded::Stopped,
-                },
+                Ok(f) => {
+                    if let Queued::Stopped = gaps.announce(&session_id, &f, &tx) {
+                        return Forwarded::Stopped;
+                    }
+                    match forward_chunk(&session_id, &f.bytes, &mut redactor, &tx) {
+                        Queued::Sent => {}
+                        // The queue filled or the socket died: there is
+                        // nowhere to put a `SessionExited` either.
+                        Queued::Stopped => return Forwarded::Stopped,
+                    }
+                }
                 // §4.3 again: a lag is resynced by continuing, never by
-                // backfilling out of the ring buffer.
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                // backfilling out of the ring buffer — but it is
+                // **measured** before it is continued past (GH #200).
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    gaps.lagged();
+                    continue;
+                }
                 // `Empty` is the ordinary end of the drain; `Closed`
                 // means the `Session` itself is gone and there is
                 // nothing further to read.
@@ -1469,16 +1577,33 @@ async fn forward_output(
             // Redaction and the wire conversion both live in
             // [`forward_chunk`] — see its docs for why there is exactly
             // one of each and why this arm is not allowed to inline them.
-            Ok(f) => match forward_chunk(&session_id, &f.bytes, &mut redactor, &tx) {
-                Queued::Sent => {}
-                Queued::Stopped => return Forwarded::Stopped,
-            },
+            // The gap notice goes on the queue **first**, so a renderer
+            // draws the hole where it happened rather than after the
+            // bytes that followed it.
+            Ok(f) => {
+                if let Queued::Stopped = gaps.announce(&session_id, &f, &tx) {
+                    return Forwarded::Stopped;
+                }
+                match forward_chunk(&session_id, &f.bytes, &mut redactor, &tx) {
+                    Queued::Sent => {}
+                    Queued::Stopped => return Forwarded::Stopped,
+                }
+            }
             // §4.3: *"Attach clients that are only rendering live bytes
             // do not attempt replay."* Resync by **continuing** — a
             // backfill from the ring buffer would interleave stale bytes
             // into a live terminal, and returning here would end the
             // stream for a client that is otherwise fine.
+            //
+            // **Continuing is not the same as saying nothing**, which is
+            // what this arm did until GH #200: `n` went to the daemon's
+            // own stderr and the client was handed the next chunk as
+            // though it followed the last. The measurement is deferred to
+            // the next frame because that is when it becomes possible —
+            // `n` is a frame count, and the byte count needs the `start`
+            // of whatever arrives next.
             Err(RecvError::Lagged(n)) => {
+                gaps.lagged();
                 crate::diag!("holdfast daemon: attach client on {session_id} lagged {n} frames");
             }
             // **The second flush trigger, and the one that hardly ever
@@ -1581,8 +1706,6 @@ fn forward_chunk(
 ///
 /// [`OutputFrame`]: crate::session::OutputFrame
 fn queue_output(session_id: &str, bytes: Vec<u8>, tx: &mpsc::Sender<ServerFrame>) -> Queued {
-    use tokio::sync::mpsc::error::TrySendError;
-
     // A chunk held whole (a secret still arriving) produces nothing to
     // send, and so does a redactor flush with an empty carry. An empty
     // `Output` would be a frame that says the child printed nothing,
@@ -1590,16 +1713,58 @@ fn queue_output(session_id: &str, bytes: Vec<u8>, tx: &mpsc::Sender<ServerFrame>
     if bytes.is_empty() {
         return Queued::Sent;
     }
-    match tx.try_send(ServerFrame::Output {
-        session: session_id.to_string(),
-        bytes,
-    }) {
+    queue_stream(
+        tx,
+        ServerFrame::Output {
+            session: session_id.to_string(),
+            bytes,
+        },
+        session_id,
+    )
+}
+
+/// How many slots of the per-connection queue the **stream** may never
+/// take, so that the attachment's ending always has somewhere to go.
+///
+/// Two, because two frames can still be owed when the queue is at its
+/// fullest: §7.5's exit sequence is `SessionExited` then `Detached`, and
+/// its teardown rule requires both. On the `slow_consumer` path only the
+/// second is sent, so one would do — reserving for the worst of the two
+/// orderings costs two frames of a 512-frame queue and removes the case
+/// analysis.
+///
+/// **This is what makes §7.5's teardown guarantee true rather than
+/// aspirational** (GH #200). `Detached { reason: "slow_consumer" }` was
+/// written with a `try_send` onto the very queue whose overflow had just
+/// caused the ending, so it failed by construction in exactly the case
+/// it names, and a `holdfast watch` that had lost nine tenths of a burst
+/// reported the tidy `the daemon closed the connection` of an EOF. The
+/// frame is not raced against the close either: `run` drops every
+/// `Sender`, and `write_loop` drains what is queued *before* the socket
+/// goes away.
+const ENDING_SLOTS: usize = 2;
+
+/// Put a stream frame — `Output` or `OutputGap` — on the connection's
+/// queue, leaving [`ENDING_SLOTS`] behind for the ending.
+///
+/// A full queue is §4.3's slow consumer and detaches this client. The
+/// `Detached { reason: "slow_consumer" }` is **not** written here: `run`
+/// writes all three wire reasons at one place, so the closed set of
+/// three cannot grow a fourth in a corner.
+fn queue_stream(tx: &mpsc::Sender<ServerFrame>, frame: ServerFrame, session_id: &str) -> Queued {
+    use tokio::sync::mpsc::error::TrySendError;
+
+    // `capacity()` is the number of free slots, so the reserve is
+    // expressed as a refusal rather than as a second channel. Checked
+    // before the send and not after a failure, because `try_send`
+    // reports "full" and cannot report "full except for the reserve".
+    if tx.capacity() <= ENDING_SLOTS {
+        crate::diag!("holdfast daemon: detaching a slow attach client on {session_id}");
+        return Queued::Stopped;
+    }
+    match tx.try_send(frame) {
         Ok(()) => Queued::Sent,
         Err(TrySendError::Full(_)) => {
-            // The `Detached { reason: "slow_consumer" }` is **not**
-            // written here. `run` writes all three wire reasons at one
-            // place, so the closed set of three cannot grow a fourth in
-            // a corner.
             crate::diag!("holdfast daemon: detaching a slow attach client on {session_id}");
             Queued::Stopped
         }
@@ -2016,6 +2181,45 @@ mod tests {
         }
     }
 
+    /// [`DribblePty`] with a chosen chunk size, so that a frame count
+    /// and a byte count are **different numbers** (GH #200).
+    ///
+    /// With one byte per frame the two coincide, and a row asserting the
+    /// gap is in bytes passes just as well against an implementation
+    /// that reports `RecvError::Lagged`'s frame count. Anything but 1
+    /// separates them; 7 is prime to both bounds, so no arithmetic
+    /// coincidence can put the wrong unit on the right answer either.
+    #[derive(Debug)]
+    struct ChunkedPty(Arc<MockPty>, usize);
+
+    impl PtyBackend for ChunkedPty {
+        fn write(&self, data: &[u8]) -> crate::Result<()> {
+            self.0.write(data)
+        }
+        fn read(&self, buf: &mut [u8]) -> crate::Result<usize> {
+            let n = self.1.min(buf.len());
+            if n == 0 {
+                return Ok(0);
+            }
+            self.0.read(&mut buf[..n])
+        }
+        fn signal(&self, sig: crate::pty::Signal) -> crate::Result<()> {
+            self.0.signal(sig)
+        }
+        fn resize(&self, cols: u16, rows: u16) -> crate::Result<()> {
+            self.0.resize(cols, rows)
+        }
+        fn is_alive(&self) -> bool {
+            self.0.is_alive()
+        }
+        fn exit_code(&self) -> Option<i32> {
+            self.0.exit_code()
+        }
+        fn pid(&self) -> Option<u32> {
+            self.0.pid()
+        }
+    }
+
     #[tokio::test]
     async fn broadcast_lag_does_not_replay_stale_bytes() {
         // REQ-C-003 / §4.3: *"Attach clients that are only rendering live
@@ -2061,10 +2265,12 @@ mod tests {
             session.subscribe_events(),
             tx,
             None,
+            0,
         ));
         inner.queue_output(b"Z");
 
         let mut delivered = 0usize;
+        let mut gaps = 0usize;
         let mut saw_marker = false;
         let stop = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < stop {
@@ -2076,12 +2282,28 @@ mod tests {
                         break;
                     }
                 }
+                // The gap this lag opened, announced ahead of the
+                // bytes that followed it (GH #200). Counted rather than
+                // rejected: this row is about what the *stream* does
+                // across a lag, and the exact byte count has a row of
+                // its own below.
+                Ok(Some(ServerFrame::OutputGap { .. })) => gaps += 1,
                 Ok(Some(other)) => panic!("expected Output, got {other:?}"),
                 Ok(None) => break,
                 Err(_) => break,
             }
         }
         forwarder.abort();
+
+        // **The gap is on the wire, not only in the daemon's log.**
+        // Before GH #200 this arm wrote `n` to stderr and handed the
+        // client the next chunk as though it followed the last, so the
+        // two assertions below — resync, and no backfill — were both
+        // green against a stream that lied about its own continuity.
+        assert_eq!(
+            gaps, 1,
+            "a lag must announce itself to the client exactly once, not {gaps} times"
+        );
 
         // The stream **continues** past the gap. A `Lagged` arm that
         // returned would end it here, and the client would go silent for
@@ -2099,6 +2321,277 @@ mod tests {
             delivered <= OUTPUT_BROADCAST_FRAMES + 1,
             "the forwarder replayed {delivered} bytes for a channel that can hold \
              {OUTPUT_BROADCAST_FRAMES}: bytes lost to a lag are gone, not backfilled"
+        );
+    }
+
+    /// The gap a lag opens is reported **in bytes, and exactly** — and
+    /// an unlagged stream reports nothing (GH #200).
+    ///
+    /// **The two arms are one row because neither separates the defect
+    /// alone.** The first is red against `main`, where a lag wrote its
+    /// frame count to the daemon's own stderr and the client was handed
+    /// the next chunk as though it followed the last. But it is equally
+    /// green against a forwarder that emits a gap notice on every frame,
+    /// or one that reports `Lagged(n)`'s `n` — 256 frames here, and a
+    /// number in the wrong unit is not a smaller version of the right
+    /// one. The second arm is what refuses those: ordinary output, no
+    /// lag, and the client must be told nothing at all.
+    ///
+    /// `DribblePty` publishes one frame per byte, so the arithmetic is
+    /// exact rather than approximately right: `burst` frames sent
+    /// through a channel that holds `OUTPUT_BROADCAST_FRAMES` loses the
+    /// difference, and one byte per frame makes that difference the
+    /// byte count too.
+    #[tokio::test]
+    async fn a_lag_reports_the_gap_in_bytes_and_an_unlagged_stream_reports_none() {
+        // Frames, and the bytes each one carries — deliberately not 1,
+        // so the assertion below cannot be satisfied by a frame count.
+        const FRAMES: usize = OUTPUT_BROADCAST_FRAMES * 2;
+        const CHUNK: usize = 7;
+        const LOST_FRAMES: usize = FRAMES - OUTPUT_BROADCAST_FRAMES;
+        const LOST_BYTES: u64 = (LOST_FRAMES * CHUNK) as u64;
+
+        async fn drain(out: &mut mpsc::Receiver<ServerFrame>, until: u8) -> (Vec<u64>, usize) {
+            let mut gaps = Vec::new();
+            let mut bytes = 0usize;
+            let stop = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < stop {
+                match tokio::time::timeout(std::time::Duration::from_millis(200), out.recv()).await
+                {
+                    Ok(Some(ServerFrame::OutputGap { bytes: n, .. })) => gaps.push(n),
+                    Ok(Some(ServerFrame::Output { bytes: b, .. })) => {
+                        bytes += b.len();
+                        if b.contains(&until) {
+                            break;
+                        }
+                    }
+                    Ok(Some(other)) => panic!("expected Output or OutputGap, got {other:?}"),
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            (gaps, bytes)
+        }
+
+        // Arm 1 — starved past the bound, then forwarded.
+        let inner = Arc::new(MockPty::new());
+        let session = crate::session::Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::new(ChunkedPty(Arc::clone(&inner), CHUNK)) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(64 * 1024),
+        );
+        let rx = session.subscribe();
+        inner.queue_output(&vec![b'x'; FRAMES * CHUNK]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while session.buffer_head() < (FRAMES * CHUNK) as u64
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            session.buffer_head(),
+            (FRAMES * CHUNK) as u64,
+            "the fixture must actually overrun the channel"
+        );
+        let (tx, mut out) = mpsc::channel::<ServerFrame>(4096);
+        let forwarder = tokio::spawn(forward_output(
+            Arc::clone(&session),
+            "sess_x".to_string(),
+            rx,
+            session.subscribe_events(),
+            tx,
+            None,
+            0,
+        ));
+        inner.queue_output(b"Z");
+        let (gaps, _) = drain(&mut out, b'Z').await;
+        forwarder.abort();
+
+        assert_eq!(
+            gaps,
+            vec![LOST_BYTES],
+            "one gap, and it must be the {LOST_BYTES} bytes the channel dropped — \
+             not the {LOST_FRAMES} frames `Lagged` counts, and not one notice per frame"
+        );
+
+        // Arm 2 — the separating negative. Same fixture, same forwarder,
+        // nothing starved: a stream that was never behind must arrive
+        // with no gap notice on it at all.
+        let inner = Arc::new(MockPty::new());
+        let session = crate::session::Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::new(ChunkedPty(Arc::clone(&inner), CHUNK)) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(64 * 1024),
+        );
+        let rx = session.subscribe();
+        let (tx, mut out) = mpsc::channel::<ServerFrame>(4096);
+        let forwarder = tokio::spawn(forward_output(
+            Arc::clone(&session),
+            "sess_x".to_string(),
+            rx,
+            session.subscribe_events(),
+            tx,
+            None,
+            session.buffer_head(),
+        ));
+        inner.queue_output(b"hello Z");
+        let (gaps, bytes) = drain(&mut out, b'Z').await;
+        forwarder.abort();
+
+        assert!(
+            bytes > 0,
+            "the negative arm delivered nothing, so it separates nothing"
+        );
+        assert_eq!(
+            gaps,
+            Vec::<u64>::new(),
+            "an unlagged stream was told it had lost bytes it never lost"
+        );
+    }
+
+    /// A gap is measured **from the last frame this connection was
+    /// given**, not from where its stream began (GH #200).
+    ///
+    /// **This row exists because two mutants survived without it**, and
+    /// both are the shape a reader would call obviously covered.
+    /// Deleting `self.next = frame.end` — never advancing the position —
+    /// stayed green, and so did ignoring the `owed` flag. The fixture
+    /// above cannot see either: its lag lands *before* any frame has been
+    /// forwarded, so the position is still the baseline and a stale one
+    /// gives the same answer, and its negative arm has no lag at all so
+    /// `owed` is the only thing keeping it quiet.
+    ///
+    /// The realistic case is the one neither arm has — output, then a
+    /// lag, then more output — and it is the case that was measured
+    /// through the wire: a `holdfast watch` reporting 1,668 bytes
+    /// dropped 3,814 lines into a burst, against 17 lines actually
+    /// missing from the capture. Driven at the tracker rather than
+    /// through a session because the scheduler cannot be asked to lag at
+    /// a chosen offset.
+    #[tokio::test]
+    async fn a_gap_is_measured_from_the_last_frame_delivered() {
+        fn frame(start: u64, end: u64) -> crate::session::OutputFrame {
+            crate::session::OutputFrame {
+                start,
+                end,
+                bytes: Arc::from(&b"x"[..]),
+            }
+        }
+        fn gaps_of(f: impl Fn(&mut GapTracker, &mpsc::Sender<ServerFrame>)) -> Vec<u64> {
+            let (tx, mut rx) = mpsc::channel::<ServerFrame>(64);
+            let mut tracker = GapTracker::new(1_000);
+            f(&mut tracker, &tx);
+            let mut seen = Vec::new();
+            while let Ok(ServerFrame::OutputGap { bytes, .. }) = rx.try_recv() {
+                seen.push(bytes);
+            }
+            seen
+        }
+
+        // Two frames delivered, then a lag, then the stream resumes 90
+        // bytes further on than it stopped.
+        let seen = gaps_of(|t, tx| {
+            t.announce("s", &frame(1_000, 1_040), tx);
+            t.announce("s", &frame(1_040, 1_100), tx);
+            t.lagged();
+            t.announce("s", &frame(1_190, 1_200), tx);
+        });
+        assert_eq!(
+            seen,
+            vec![90],
+            "the gap must be measured from 1100, where this connection's stream \
+             had actually reached — 190 is the distance from the baseline and is \
+             the answer a tracker that never advanced would give"
+        );
+
+        // And a stream that never lagged says nothing, however far its
+        // offsets have travelled.
+        let seen = gaps_of(|t, tx| {
+            t.announce("s", &frame(1_000, 1_040), tx);
+            t.announce("s", &frame(1_040, 1_100), tx);
+        });
+        assert_eq!(
+            seen,
+            Vec::<u64>::new(),
+            "an unlagged stream was told it had lost bytes it never lost"
+        );
+
+        // A second lag is its own hole and is not folded into the first.
+        let seen = gaps_of(|t, tx| {
+            t.lagged();
+            t.announce("s", &frame(1_010, 1_020), tx);
+            t.lagged();
+            t.announce("s", &frame(1_025, 1_030), tx);
+        });
+        assert_eq!(
+            seen,
+            vec![10, 5],
+            "two lags are two gaps, each measured from where the stream was"
+        );
+    }
+
+    /// §7.5's teardown guarantee, at the seam where it used to fail:
+    /// **a queue full of output still has room for the ending** (GH
+    /// #200).
+    ///
+    /// `Detached { reason: "slow_consumer" }` is queued by `run` with a
+    /// `try_send` onto the very queue whose overflow caused the ending,
+    /// so before this change it failed by construction in exactly the
+    /// case it names — and `holdfast watch` reported the tidy `the
+    /// daemon closed the connection` of a bare EOF after losing nine
+    /// tenths of a burst.
+    ///
+    /// Driven at the two calls rather than over a socket because that is
+    /// where the property lives and where it is deterministic: fill the
+    /// queue through the stream path until it refuses, then send the
+    /// ending the way `run` does. A reserve of zero makes the second
+    /// call fail, which is `main`.
+    #[tokio::test]
+    async fn a_full_output_queue_still_admits_the_ending() {
+        let (tx, mut written) = mpsc::channel::<ServerFrame>(8);
+
+        // Fill it the way a burst does — through the stream path, with
+        // nothing draining.
+        let mut queued = 0usize;
+        while let Queued::Sent = queue_output("sess_x", b"xxxx".to_vec(), &tx) {
+            queued += 1;
+            assert!(queued < 100, "the stream path never refused a full queue");
+        }
+        assert!(
+            queued > 0,
+            "the queue refused the first frame, so nothing was under test"
+        );
+
+        // The two frames §7.5 can still owe at this point, in its order.
+        assert!(
+            tx.try_send(ServerFrame::SessionExited { code: 0 }).is_ok(),
+            "a queue that filled with output had no room left for SessionExited"
+        );
+        assert!(
+            tx.try_send(ServerFrame::Detached {
+                reason: "slow_consumer".into()
+            })
+            .is_ok(),
+            "a queue that filled with output had no room left for the one \
+             Detached reason that describes it"
+        );
+
+        // And the reserve is a reserve, not a hole: the frames queued
+        // ahead of the ending are still there to be written, which is
+        // what `run`'s `drop(tx)` then lets `write_loop` drain.
+        let mut seen = Vec::new();
+        while let Ok(f) = written.try_recv() {
+            seen.push(f);
+        }
+        assert_eq!(
+            seen.len(),
+            queued + 2,
+            "the ending displaced queued output instead of fitting beside it"
         );
     }
 
@@ -2183,6 +2676,7 @@ mod tests {
             session.subscribe_events(),
             tx,
             None,
+            0,
         ));
 
         // Ends at `SessionExited` or at 200 ms of silence, and the

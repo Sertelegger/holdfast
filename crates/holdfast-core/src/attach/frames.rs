@@ -319,6 +319,34 @@ pub enum ServerFrame {
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
+    /// **The stream skipped `bytes` bytes here** — §4.3's bounded output
+    /// broadcast dropped frames this connection had not read yet, and
+    /// they are gone (GH #200).
+    ///
+    /// The count is **exact and in bytes**, not the frame count
+    /// `RecvError::Lagged(n)` reports. The internal `OutputFrame` carries
+    /// `start`/`end`, so the hole between the last frame this connection
+    /// forwarded and the first one after the lag is arithmetic the daemon
+    /// already has; `n` frames is a number about the channel's plumbing
+    /// and answers nothing a person watching a build log is asking.
+    ///
+    /// **Out of band, and that is the whole reason it is a frame.** The
+    /// redactor's `[REDACTED:unresolved]` is written *into* the payload
+    /// because a substitution has to sit where the value was. A gap has no
+    /// such position to occupy, and `role: interactive` is REQ-SEC-008's
+    /// raw-fidelity surface — bytes this daemon invented inside `Output`
+    /// would corrupt every byte-exact capture taken through it. So the
+    /// notice travels beside the stream and the renderer decides what to
+    /// draw.
+    ///
+    /// **A frame and not a fourth `Detached.reason`**: §18.4c closes that
+    /// set at three and REQ-D-009 carries the guarantee. This is not an
+    /// ending. The attachment is healthy, the stream continues, and the
+    /// only thing that happened is that part of it is missing.
+    OutputGap {
+        session: String,
+        bytes: u64,
+    },
     SessionExited {
         code: i32,
     },
@@ -673,6 +701,7 @@ impl ServerFrame {
             Self::Attached { .. } => Some("Attached"),
             Self::AttachReject { .. } => Some("AttachReject"),
             Self::Output { .. } => Some("Output"),
+            Self::OutputGap { .. } => Some("OutputGap"),
             Self::SessionExited { .. } => Some("SessionExited"),
             Self::Resize { .. } => Some("Resize"),
             Self::AwaitingSecret { .. } => Some("AwaitingSecret"),
@@ -690,7 +719,19 @@ impl ServerFrame {
 /// one.
 ///
 /// The order is §7.5's — the two handshake frames, then the bulleted
-/// server list — restricted to the variants 0.0.7 implements.
+/// server list — restricted to the variants 0.0.7 implements, plus the
+/// one that is not a §7.5 row at all.
+///
+/// **`OutputGap` sits directly after `Output` and the document has no
+/// bullet to put it beside** (GH #200). It is placed by the rule the
+/// rest of this order follows rather than by transcription: it is a
+/// statement about the output stream and belongs with the frame it
+/// qualifies, the way a gap belongs where the bytes were. It is
+/// recorded here as an insertion rather than an append for the same
+/// reason `BindingApprovalRequired` was — a list a reader can diff
+/// against §7.5 by eye is worth the arithmetic, and an append would
+/// have put it after `Detached`, which is the one place it means
+/// nothing.
 /// `BindingApprovalRequired` **inserted** between `SecretRequestClosed`
 /// and `TransferProgress` when 0.0.7 landed it, exactly where 0.0.6's
 /// version of this comment reserved the slot; `TransferProgress` goes
@@ -702,6 +743,7 @@ pub const KNOWN_SERVER_TYPES: &[&str] = &[
     "Attached",
     "AttachReject",
     "Output",
+    "OutputGap",
     "SessionExited",
     "Resize",
     "AwaitingSecret",
@@ -1191,6 +1233,10 @@ mod tests {
                 session: "s".into(),
                 bytes: vec![],
             },
+            ServerFrame::OutputGap {
+                session: "s".into(),
+                bytes: 0,
+            },
             ServerFrame::SessionExited { code: 0 },
             ServerFrame::Resize { cols: 80, rows: 24 },
             ServerFrame::AwaitingSecret {
@@ -1225,8 +1271,9 @@ mod tests {
         assert_eq!(tags.as_slice(), KNOWN_SERVER_TYPES);
         assert_eq!(
             KNOWN_SERVER_TYPES.len(),
-            10,
-            "ten of §7.5's eleven; only TransferProgress (0.0.9) is deferred"
+            11,
+            "ten of §7.5's eleven — only TransferProgress (0.0.9) is deferred — \
+             plus OutputGap, which is not a §7.5 row at all (GH #200)"
         );
         // The negative: Unknown is decode-only and must not be in the
         // list, or decode_server_frame would refuse to produce it.
