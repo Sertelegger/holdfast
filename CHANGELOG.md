@@ -402,6 +402,18 @@ is cut, named and published is in
 
 ### Fixed
 
+- **`resize` now folds the requested geometry, applies it and reads it back
+  under the attach hub's resize lock**, which the tool had never taken and the
+  attach path always did. `attach::conn`'s own comment states the hazard —
+  *"the fold is order-independent; the sequence was not"* — and the omission
+  was harmless while the two statements were adjacent and synchronous. Putting
+  a `spawn_blocking` hop and a `vt100` re-seed between them is not a window to
+  leave open: a human attaching an 80×24 terminal mid-hop would have had their
+  geometry overwritten by a fold taken before they arrived, and the tool would
+  have reported the size it asked for as the size achieved, with no further
+  event to correct either. Found while moving the re-seed off the executor,
+  and fixed there because that is what widened it ([#201]).
+
 - **One slow read no longer stalls every other client: the MCP read paths run
   off the executor's worker threads.** `read_output`, `resources/read`,
   `get_screen_state`, `resize` and `wait_for_pattern`'s two result reads —
