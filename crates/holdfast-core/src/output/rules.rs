@@ -7,7 +7,7 @@
 
 pub use super::redact::UNRESOLVED_KIND;
 
-use regex::bytes::{Regex, RegexSet};
+use regex::bytes::{Regex, RegexSet, RegexSetBuilder};
 use serde::Deserialize;
 use std::sync::{Arc, OnceLock};
 
@@ -224,7 +224,7 @@ impl RuleSet {
                 negative: spec.negative,
             });
         }
-        let prefilter = RegexSet::new(&patterns).map_err(|source| RuleError::Pattern {
+        let prefilter = build_prefilter(&patterns).map_err(|source| RuleError::Pattern {
             name: "<prefilter>".into(),
             source,
         })?;
@@ -264,6 +264,52 @@ impl RuleSet {
             .collect()
     }
 }
+
+/// The lazy-DFA cache ceiling the prefilter is built with, against the
+/// `regex` crate's 2 MiB default (GH #194's second cliff).
+///
+/// **It is a ceiling, not an allocation, and the distinction is the
+/// whole reason the number can be this large.** `regex` grows the cache
+/// as a search discovers states and gives up on the DFA — falling back
+/// to the one-state-at-a-time engine — when the cache would pass the
+/// limit. The shipped fifty-one-rule set saturates well below any of
+/// the candidates: sweeping 2/4/8/16/32/64 MiB over six corpora
+/// (1 MiB of this repository's own source, its `grep -rn` output, its
+/// `CHANGELOG`+`README`+`ROADMAP`, REQ-O-007's 41,472 B default read
+/// window, 380 KB of `git log`, and 5.4 MB of concatenated `.rs`) the
+/// resident cache tops out at **10.4 MiB at 16 MiB and stops growing**
+/// — 32 MiB and 64 MiB measure the same 10.6 MiB. What the headroom
+/// buys is not memory spent, it is the cliff staying gone when §9.2's
+/// quarterly gitleaks refresh makes the set bigger.
+///
+/// **Measured, release build, prefilter scan only, worst corpus** (1 MiB
+/// of this repository's own `.rs`, zero bytes ≥ 0x80 — this is not the
+/// Unicode cliff, it is the cache one):
+///
+/// ```text
+/// dfa_size_limit   total over the six corpora   resident cache
+/// 2 MiB (default)              355.1 ms                1.8 MiB
+/// 8 MiB                        105.0 ms                7.6 MiB
+/// 16 MiB                        19.4 ms               10.4 MiB
+/// 64 MiB                        23.9 ms               10.5 MiB
+/// ```
+///
+/// The cost is paid **per thread that concurrently runs a redaction
+/// scan**, because `regex` keeps a cache pool rather than one cache:
+/// measured on the same corpus, 2.5 MiB/thread today against 5.9
+/// MiB/thread here, so twelve concurrent readers move 29 MiB to 69 MiB.
+/// There is one `RuleSet` per daemon — `builtin_shared` is a process-wide
+/// `OnceLock` and `Config::redaction_rules_shared` hands the same `Arc`
+/// to the single `OutputProcessor` in `HoldfastServer` — so that is the
+/// whole of it, not a per-session figure.
+fn build_prefilter(patterns: &[String]) -> Result<RegexSet, regex::Error> {
+    RegexSetBuilder::new(patterns)
+        .dfa_size_limit(PREFILTER_DFA_SIZE_LIMIT)
+        .build()
+}
+
+/// 64 MiB — see [`build_prefilter`] for the sweep this came off.
+const PREFILTER_DFA_SIZE_LIMIT: usize = 64 * 1024 * 1024;
 
 /// The line a host prints at startup when the operator has switched
 /// rules off, or `None` when the set is the shipped one (GH #128).
@@ -342,6 +388,75 @@ pub fn builtin_shared() -> Arc<RuleSet> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GH #194's second cliff: the prefilter's lazy DFA outgrows the
+    /// `regex` crate's 2 MiB default cache and falls off it, on **pure
+    /// ASCII** — a separate failure from the Unicode word boundary and
+    /// with a separate fix.
+    ///
+    /// **The corpus is the rule file with its non-ASCII bytes removed,
+    /// and that is not a convenience.** Every near-miss a real DFA cache
+    /// meets is in there by construction — fifty-one rules' worth of
+    /// positive *and* negative examples, so the automaton is dragged
+    /// deep into many rules at once and then told no — and it is
+    /// `include_str!`-compiled, so the test needs no fixture and cannot
+    /// drift from the rules it is about. Stripping bytes ≥ 0x80 is what
+    /// makes this a measurement of the cache and not of the quit set:
+    /// with them in, both arms are slow for the *other* reason.
+    ///
+    /// **The assertion is a ratio inside one process, deliberately.** An
+    /// absolute millisecond budget is a statement about the machine;
+    /// this is a statement about the engine, and the mechanism — a cache
+    /// that either holds the automaton or is cleared on every block — is
+    /// not machine-dependent. Measured on this tree, release, 262,144 B:
+    /// **10.33 ms at the crate default against 0.040 ms here, 258x**.
+    /// The floor is 8x, which is thirty times inside the measurement and
+    /// still an order of magnitude clear of "the two are the same".
+    #[test]
+    fn the_prefilter_cache_ceiling_keeps_a_quarter_mib_ascii_window_off_the_slow_path() {
+        use std::time::Instant;
+        let set = RuleSet::builtin().unwrap();
+        let patterns: Vec<String> = set.rules.iter().map(|r| r.pattern.clone()).collect();
+        let stock = RegexSet::new(&patterns).expect("the shipped patterns compile");
+
+        let ascii: Vec<u8> = DEFAULT_RULES_TOML
+            .bytes()
+            .filter(|b| b.is_ascii())
+            .collect();
+        let window: Vec<u8> = ascii.iter().cycle().take(256 * 1024).copied().collect();
+
+        // Same answer from both, or the comparison is between two
+        // different pieces of work rather than two cache ceilings.
+        let stock_hits: Vec<usize> = stock.matches(&window).into_iter().collect();
+        let ours_hits: Vec<usize> = set.prefilter.matches(&window).into_iter().collect();
+        assert_eq!(
+            stock_hits, ours_hits,
+            "the cache ceiling must not change which rules the prefilter names"
+        );
+
+        let bench = |rs: &RegexSet| {
+            for _ in 0..2 {
+                std::hint::black_box(rs.matches(&window).into_iter().count());
+            }
+            let t = Instant::now();
+            for _ in 0..3 {
+                std::hint::black_box(rs.matches(&window).into_iter().count());
+            }
+            t.elapsed().as_secs_f64() / 3.0
+        };
+        let stock_s = bench(&stock);
+        let ours_s = bench(&set.prefilter);
+        assert!(
+            ours_s * 8.0 < stock_s,
+            "a {} B prefilter scan takes {:.3} ms at dfa_size_limit={} and {:.3} ms at \
+             the crate default; GH #194's cache cliff is back or the corpus no longer \
+             reaches it",
+            window.len(),
+            ours_s * 1e3,
+            PREFILTER_DFA_SIZE_LIMIT,
+            stock_s * 1e3,
+        );
+    }
 
     #[test]
     fn the_builtin_set_compiles_and_is_substantial() {

@@ -53,6 +53,29 @@ is cut, named and published is in
   and putting a second, unaudited licence to bypass on the wire is the defect
   this argument exists to close ([#169]).
 
+### Fixed
+
+- **The redaction prefilter is built with a 64 MiB lazy-DFA cache ceiling
+  instead of the `regex` crate's 2 MiB default, so a large *pure-ASCII* read
+  no longer falls off the automaton ([#194]).** This is the second of that
+  issue's two cliffs and it has nothing to do with the first: no byte in the
+  window is ≥ 0x80, and the collapse is the cache being cleared on every block
+  once the fifty-one-rule automaton outgrows it. Measured on this tree,
+  release, prefilter scan only, over the rule file's own examples with the
+  non-ASCII bytes stripped — the densest near-miss corpus there is, and the
+  one the new test uses — **256 KiB costs 10.33 ms at the default and 0.040 ms
+  here**. Across six real corpora the sweep is 355 ms to 19 ms.
+
+  **The number is a ceiling and not an allocation, which is the only reason it
+  can be this large.** The cache grows to what a search needs and stops: at
+  16 MiB it tops out at 10.4 MiB resident and 32 and 64 MiB measure the same,
+  so the headroom buys nothing today and buys the cliff staying gone when
+  §9.2's quarterly gitleaks refresh makes the set bigger. What it does cost is
+  paid per thread concurrently running a redaction scan, because `regex` keeps
+  a cache pool — 2.5 MiB/thread today against 5.9 MiB/thread here on the worst
+  corpus, so twelve concurrent readers move 29 MiB to 69 MiB. There is one
+  `RuleSet` per daemon, not one per session.
+
 ### Changed
 
 - **`[security] redaction_enabled = false` is refused at load, and §9.4's
@@ -1104,5 +1127,6 @@ residuals that are known and accepted.
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
+[#194]: https://github.com/Sertelegger/holdfast/issues/194
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
