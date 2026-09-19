@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "holdfast": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bootstrap",
+      "args": ["mcp"]
+    }
+  }
+}
