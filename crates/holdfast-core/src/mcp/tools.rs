@@ -6020,6 +6020,25 @@ mod tests {
         (id, pty)
     }
 
+    /// `resources/read` the way `mcp/mod.rs` runs it: `prepare` above
+    /// the blocking hop and `read_prepared` on it, with the §9.4 surface
+    /// sampled on the task that owns the caller scope.
+    fn read_via_resource(
+        server: &HoldfastServer,
+        uri_str: &str,
+    ) -> rmcp::model::ReadResourceResult {
+        let (uri, session) = crate::mcp::resources::prepare(&server.registry, uri_str)
+            .expect("a live session resolves");
+        crate::mcp::resources::read_prepared(
+            &session,
+            &server.processor,
+            &uri,
+            uri_str,
+            crate::config::LimitsConfig::default().resource_read_max_bytes,
+            caller::audit_surface(crate::mcp::resources::RESOURCE_READ_TOOL),
+        )
+    }
+
     /// Poll the *session* until `pred` holds, so the arrangement is really
     /// in place before any tool is called.
     async fn settle(session: &Session, what: &str, mut pred: impl FnMut(&Session) -> bool) {
@@ -7086,13 +7105,13 @@ mod tests {
         // not against the inert `output_buffer_bytes` key), so its window
         // reaches `head` and this bound cannot arise there.
         let uri = first["resource_uri"].as_str().expect("a resource uri");
-        let read = crate::mcp::resources::read_resource(
-            &server.registry,
-            &server.processor,
-            uri,
-            crate::config::LimitsConfig::default().resource_read_max_bytes,
-        )
-        .expect("the resource read");
+        // **Through the two halves the transport runs, not a test-only
+        // composition of them** (GH #201): `prepare` above the blocking
+        // hop, `read_prepared` on it. `resources.rs` makes the point
+        // itself — a convenience whose only callers are rows is a second
+        // composition for those rows to agree with instead of the one
+        // that ships.
+        let read = read_via_resource(&server, uri);
         let text = read
             .contents
             .iter()
@@ -7142,13 +7161,7 @@ mod tests {
         })
         .await;
         let closed_uri = crate::mcp::resources::ResourceUri::buffer_uri(&closed_id);
-        let closed_read = crate::mcp::resources::read_resource(
-            &server.registry,
-            &server.processor,
-            &closed_uri,
-            crate::config::LimitsConfig::default().resource_read_max_bytes,
-        )
-        .expect("the resource read");
+        let closed_read = read_via_resource(&server, &closed_uri);
         let closed_text = closed_read
             .contents
             .iter()

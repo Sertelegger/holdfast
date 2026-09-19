@@ -968,8 +968,14 @@ mod tests {
              reaches head and the bound cannot fire"
         );
         let meta_of = |uri: &str, ceiling: usize| -> serde_json::Value {
-            let result =
-                read_resource(&registry, &processor, uri, ceiling).expect("a live session");
+            let result = read_resource(
+                &registry,
+                &processor,
+                uri,
+                ceiling,
+                caller::audit_surface(RESOURCE_READ_TOOL),
+            )
+            .expect("a live session");
             let ResourceContents::TextResourceContents { meta, .. } = &result.contents[0] else {
                 panic!("utf8 travels in `text`")
             };
