@@ -433,18 +433,32 @@ is cut, named and published is in
   task-local the caller identity lives in and a forgotten hoist would have
   rewritten every `redaction_disabled` row to `in_process`.
 
-  **`spawn_blocking` is a bounded pool and the trade is stated rather than
-  assumed.** 512 threads by default, shared with `send_input` and the secret
-  providers — and, notably, *not* with the per-session PTY reader and writer,
-  which are raw `std::thread`s, so a session costs it nothing for its
-  lifetime. A saturated pool *queues* instead of parking the runtime, so its
-  worst outcome is a read that waits while `status`, `list` and the accept
-  loop keep answering. Measured at 64 concurrent 256 KiB reads: 81 daemon
-  threads, `status` worst 92.76 ms; at 256: 273 threads, `status` worst
-  210.23 ms, `holdfast list` rc=0 throughout while the reads themselves
-  degraded to 59–144 s. That degradation is twelve cores doing real work, and
-  it lands on the reads rather than on the control plane, which is the whole
-  trade. **Work on that pool is not cancellable** — the same
+  **`spawn_blocking`'s 512 threads bound how many tasks *run*, not how many
+  are accepted, and the trade is stated rather than assumed.** Tokio's
+  blocking queue is an uncapped `VecDeque` pushed to *before* the thread cap
+  is consulted, and `SpawnError` has no "pool full" variant — so a saturated
+  pool queues without limit and never parks the runtime. Its worst outcome is
+  a read that waits while `status`, `list` and the accept loop keep answering.
+  Measured at 64 concurrent 256 KiB reads: 81 daemon threads, `status` worst
+  92.76 ms; at 256: 273 threads, `status` worst 210.23 ms, `holdfast list`
+  rc=0 throughout while the reads themselves degraded to 59–144 s. That
+  degradation is twelve cores doing real work, and it lands on the reads
+  rather than on the control plane, which is the whole trade.
+
+  **What shares that pool, stated exactly, because a draft of this entry got
+  it half wrong.** The per-session PTY reader and writer are raw
+  `std::thread`s, so a session costs the pool nothing for its lifetime; the
+  secret providers return their thread through an internal poll loop and a
+  `kill_group`, which is stronger than a deadline. But `send_input`'s write is
+  only *answered* within `SEND_INPUT_TIMEOUT` — that timeout wraps the
+  `JoinHandle`, not the work, so the pool thread stays parked on the fd, as
+  `tools.rs` has said at that arm since 0.0.6. `WRITE_LOCK_TIMEOUT` keeps it
+  from multiplying (the next write to the same wedged session fails in 2 s
+  rather than queueing), but those threads outlive their session. **That leak
+  is pre-existing and is not repaired here.** What this release changes is the
+  shared fate: exhausting the pool used to degrade `send_input` and the secret
+  paths, and now takes the read surface with it. **Work on that pool is not
+  cancellable** — the same
   sentence `send_input` has carried since 0.0.6 — but that is not a
   regression: a synchronous call mid-`async fn` has no await point to be
   dropped at either, so these reads were already uncancellable and only the

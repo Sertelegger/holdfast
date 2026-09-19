@@ -115,6 +115,16 @@ FILES:
 /// This binds every subcommand, not just `mcp`. `daemon run` hosts the
 /// same sessions and therefore the same parked writers — more of them,
 /// since it outlives many shims — so it needs the bound at least as much.
+///
+/// **The population it covers grew with GH #201 and the bound did not
+/// need to.** `holdfast_core::mcp::offload` put the output pipeline on
+/// this pool, so an exit can now land on many in-flight scans as well as
+/// on a few parked writers. That does not lengthen the wait — this is a
+/// bound and not a sum — it only means more threads are abandoned in the
+/// instant before exit. Abandoning a scan is also milder than abandoning
+/// a write: `read_processed` holds the buffer lock for a memcpy and runs
+/// every regex outside it, so all but a sliver of a scan's life is spent
+/// holding nothing that a later call would have to wait for.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 fn usage_error(msg: &str) -> ExitCode {
