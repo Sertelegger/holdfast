@@ -806,16 +806,20 @@ impl ServerHandler for HoldfastServer {
         // measured 3.9 s. `--no-daemon` has one runtime for the shim and
         // the tools both, which makes the stall it produces here the same
         // stall with fewer places to hide.
-        let registry = Arc::clone(&self.registry);
+        //
+        // **Parse and resolve above the hop**, the way every `mcp::tools`
+        // site already does: `resources::prepare` says why, and the
+        // visible consequence here is that only the scan crosses, so
+        // `off_runtime` has nothing left to fail at but a join.
+        let (uri, session) = resources::prepare(&self.registry, &request.uri)?;
         let processor = Arc::clone(&self.processor);
-        let uri = request.uri.clone();
+        let uri_str = request.uri.clone();
         let ceiling = self.config.limits.resource_read_max_bytes;
         let surface = caller::audit_surface(resources::RESOURCE_READ_TOOL);
         let result = offload::off_runtime("resources/read's scan", move || {
-            resources::read_resource(&registry, &processor, &uri, ceiling, surface)
+            resources::read_prepared(&session, &processor, &uri, &uri_str, ceiling, surface)
         })
-        .await
-        .unwrap_or_else(Err)?;
+        .await?;
         Ok(result.into())
     }
 }

@@ -454,33 +454,70 @@ pub fn resolve(
     }
 }
 
-/// §5.5.3: read a session buffer through the `read_output` pipeline.
+/// Parse a `holdfast://` URI and resolve the session it names.
 ///
-/// `ceiling` is the daemon's `resource_read_max_bytes`. A caller's
-/// `?max_bytes=N` is clamped **down** against it and never up.
+/// **Split out of [`read_resource`] so a caller can do both *above* a
+/// blocking hop** (GH #201). Everything here can fail and nothing here
+/// costs anything; everything in [`read_prepared`] costs and nothing
+/// there can fail. That is the seam, and it buys three things:
 ///
-/// **`surface` is a parameter and not a `caller::audit_surface` call in
-/// the body** (GH #201). Both transports now run this on the blocking
-/// pool, which does not inherit the task-local the caller identity lives
-/// in — so read inside, every §9.4 row this emits would say `in_process`
-/// on the one transport where a control-protocol connection certainly
-/// existed. Taking it as an argument makes that impossible to get wrong
-/// rather than depending on each call site remembering: a caller that
-/// forgets has nothing to pass.
-pub fn read_resource(
+/// * **§5.5.2 structurally rather than by ordering.** A malformed
+///   parameter was already required to be a JSON-RPC error raised before
+///   any buffer access, and it was, because these two statements happened
+///   to come first in a function body. Now they are in a different
+///   function that the caller must run first.
+/// * **The same shape the four `mcp::tools` sites already have.** Each of
+///   them resolves before the hop and moves an `Arc<Session>` into the
+///   closure. Doing the lookup *inside* the closure made `resources/read`
+///   the one read path whose answer depends on when the blocking pool got
+///   round to it — and specifically it could answer `resource_not_found`
+///   for a retired session that `read_output` would still serve from its
+///   held `Arc`, at the same instant, because eviction drops the
+///   registry's reference and does nothing whatever to the `Session`.
+///   Two defensible answers to one question is the defect; the race that
+///   exposes it is narrow (eviction is count- and byte-triggered, never
+///   time-triggered, so a queue wait alone evicts nothing) and is not the
+///   reason this moved.
+/// * **A post-hop stage that cannot fail**, which is why the call sites
+///   no longer flatten a `Result<Result<_, _>, _>`.
+pub fn prepare(
     registry: &SessionRegistry,
-    processor: &crate::output::OutputProcessor,
     uri_str: &str,
-    ceiling: usize,
-    surface: caller::AuditSurface,
-) -> Result<ReadResourceResult, ErrorData> {
+) -> Result<(ResourceUri, Arc<Session>), ErrorData> {
     // Validation before resolution, before any buffer access: §5.5.2
     // requires a malformed parameter to be a JSON-RPC error rather than
     // a `ResourceContents` that quietly used a default the caller did
     // not ask for.
     let uri = ResourceUri::parse(uri_str).map_err(|e| e.to_error_data())?;
     let session = resolve(registry, &uri.target)?;
+    Ok((uri, session))
+}
 
+/// §5.5.3: read a session buffer through the `read_output` pipeline.
+///
+/// `ceiling` is the daemon's `resource_read_max_bytes`. A caller's
+/// `?max_bytes=N` is clamped **down** against it and never up.
+///
+/// Infallible by construction: [`prepare`] has already raised every error
+/// §5.5.2 defines, so a caller running this on the blocking pool has only
+/// a join failure left to handle.
+///
+/// **`surface` is a parameter and not a `caller::audit_surface` call in
+/// the body** (GH #201). Both transports run this on the blocking pool,
+/// which does not inherit the task-local the caller identity lives in —
+/// so read inside, every §9.4 row this emits would say `in_process` on
+/// the one transport where a control-protocol connection certainly
+/// existed. Taking it as an argument makes that impossible to get wrong
+/// rather than depending on each call site remembering: a caller that
+/// forgets has nothing to pass.
+pub fn read_prepared(
+    session: &Session,
+    processor: &crate::output::OutputProcessor,
+    uri: &ResourceUri,
+    uri_str: &str,
+    ceiling: usize,
+    surface: caller::AuditSurface,
+) -> ReadResourceResult {
     let effective_max = uri.query.max_bytes.unwrap_or(ceiling).min(ceiling);
     let since_cursor = uri
         .query
@@ -552,7 +589,29 @@ pub fn read_resource(
     } else {
         contents
     };
-    Ok(ReadResourceResult::new(vec![contents]))
+    ReadResourceResult::new(vec![contents])
+}
+
+/// [`prepare`] then [`read_prepared`], as the two transports run them.
+///
+/// **A test helper, and it lives in the test module on purpose.** A
+/// production `read_resource` that composed these two would have had no
+/// caller — both transports run the halves either side of
+/// `mcp::offload::off_runtime` — and a convenience whose only callers are
+/// rows is a second composition for those rows to agree with instead of
+/// the one that ships.
+#[cfg(test)]
+fn read_resource(
+    registry: &SessionRegistry,
+    processor: &crate::output::OutputProcessor,
+    uri_str: &str,
+    ceiling: usize,
+    surface: caller::AuditSurface,
+) -> Result<ReadResourceResult, ErrorData> {
+    let (uri, session) = prepare(registry, uri_str)?;
+    Ok(read_prepared(
+        &session, processor, &uri, uri_str, ceiling, surface,
+    ))
 }
 
 #[cfg(test)]

@@ -2231,18 +2231,30 @@ async fn dispatch_resource(
                 // failing a bystander's `holdfast list` on §7.4's
                 // handshake bound. The §9.4 surface is sampled **here**,
                 // inside `with_caller`'s scope, because the blocking pool
-                // does not inherit it; `read_resource` takes it as an
+                // does not inherit it; `read_prepared` takes it as an
                 // argument so that cannot be forgotten.
-                let registry = Arc::clone(&server.registry);
+                //
+                // Parse and resolve stay on this side of the hop —
+                // `resources::prepare` carries the argument — so the two
+                // producers feeding the `match` below are §5.5.2's
+                // validation errors and a join failure, and nothing in
+                // between depends on when the pool got round to it.
                 let processor = Arc::clone(&server.processor);
-                let uri = params.uri.clone();
+                let uri_str = params.uri.clone();
                 let ceiling = server.config.limits.resource_read_max_bytes;
                 let surface = caller::audit_surface(resources::RESOURCE_READ_TOOL);
-                let read = crate::mcp::offload::off_runtime("resources/read's scan", move || {
-                    resources::read_resource(&registry, &processor, &uri, ceiling, surface)
-                })
-                .await
-                .unwrap_or_else(Err);
+                let read: Result<rmcp::model::ReadResourceResult, rmcp::ErrorData> =
+                    match resources::prepare(&server.registry, &params.uri) {
+                        Ok((uri, session)) => {
+                            crate::mcp::offload::off_runtime("resources/read's scan", move || {
+                                resources::read_prepared(
+                                    &session, &processor, &uri, &uri_str, ceiling, surface,
+                                )
+                            })
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    };
                 match read {
                     // §18.3's nearest catalogued code is `bad_params`, so
                     // a peer that knows only §18.3 still reads a
