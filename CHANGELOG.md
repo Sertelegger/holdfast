@@ -197,6 +197,23 @@ is cut, named and published is in
 
 ### Changed
 
+- **§4.1's stated recourse for a held-back read was "retry shortly", and on
+  [#14]'s bound that is advice which can never succeed.** The recourse is
+  `resource_uri`, which every `read_output` response already carries: a
+  resource read reaches `buffer.head`, so the window is never truncated and
+  the bound cannot arise on it. *"A larger `max_bytes`"* — the claim
+  `output/mod.rs` had carried since [#14] — is true only while the ceiling can
+  reach `head`, and `read_output` clamps at 256 KiB. Measured through the MCP
+  wire on a 338,264-byte buffer with the bound at 25,644: every `max_bytes`
+  from the 32 KiB default up to and including the clamped ceiling returned
+  **0 bytes with `next_cursor` frozen**, while a `resources/read` of the same
+  buffer in the same moment returned 336,359 bytes. On a 113 KB buffer the
+  larger read does clear it, at 131,072, which is the case the claim was true
+  of and was stated of all of them ([#195]).
+- `holdfast logs`'s held-back note reads the daemon's cause instead of
+  inferring one. It inferred from `state` and its own `--raw`, which separates
+  two of the three rules and not the third, so a live session wedged on
+  [#14]'s bound was told *"read again to pick up the rest"* ([#195]).
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of

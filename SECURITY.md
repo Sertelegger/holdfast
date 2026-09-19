@@ -143,6 +143,15 @@ worse than none:**
   bytes.** It exists because a withheld partial has to be reachable somehow.
   Each such read writes a `redaction_disabled` entry to the audit log naming
   the tool and the calling surface. That is by design, not a bypass.
+- **`resource_uri` is the recourse from a `held_back_cause:
+  "unvouched_window"` read, and it is *not* an escape hatch.** That bound
+  means the read's own window ran past the end of the evidence, so it
+  declined rather than guess; a `resources/read` is not a weaker read but a
+  wider one — the full redactor, the full rule set, and §4.1's holdback, over
+  a window that reaches `buffer.head`. Nothing is disabled and nothing is
+  audited as disabled, because nothing was. `redact: false` remains the only
+  thing that switches redaction off, and it is the hatch of last resort here
+  as everywhere.
 - **The redactor is a pattern matcher, and patterns miss.** It catches
   secret-*shaped* values — the vendored rules cover the common token formats
   — and it cannot catch a password like `correct horse battery staple`, which

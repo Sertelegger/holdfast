@@ -668,13 +668,55 @@ impl OutputProcessor {
         //
         // No marker is emitted, because nothing is consumed and there is
         // nothing to substitute; §4.1's `held_back` + `next_cursor` are
-        // how the caller is told, exactly as for an in-flight secret. The
-        // recourse is a larger `max_bytes` — `read_output` clamps to
-        // `MAX_READ_MAX_BYTES`, which puts `head` back inside the window —
-        // or a `tail_*` read, or the audited `redact: false`. The residual
-        // is a secret longer than that ceiling plus the lookahead: it
-        // stays withheld from cursor reads, which is the safe direction
-        // and is what REQ-O-005 already licenses.
+        // how the caller is told — but **not** in the way §4.1 describes,
+        // and that difference is GH #195. The other two terms above move
+        // with `buffer.head`; this one is pinned to `[req_start,
+        // cap_end + lookahead)` and does not move at all, so "retry
+        // shortly" is an instruction that can never succeed. That is what
+        // `HeldBackCause::UnvouchedWindow` puts on the wire.
+        //
+        // **The recourse is `resource_uri`, and it is NOT "a larger
+        // `max_bytes`".** That claim stood here since GH #14 and it is
+        // false whenever `head - req_start > MAX_READ_MAX_BYTES +
+        // lookahead_bytes`, because the clamp at `mcp/tools.rs`'s
+        // `MAX_READ_MAX_BYTES` (256 KiB) cannot then put `head` back
+        // inside the window and condition 2 stays satisfied at the
+        // ceiling. Measured through the real MCP wire on this
+        // repository's own `CHANGELOG.md README.md ROADMAP.md` catted
+        // three times (`buffer.head` 338,264, boundary pinned at
+        // 25,644): `max_bytes` of 32,768 / 65,536 / 131,072 / 262,144 —
+        // and 262,145, which clamps to the ceiling — every one of them
+        // returned **0 bytes, `held_back: true`, `next_cursor: 25644`**.
+        // A `resources/read` of the same buffer in the same moment
+        // returned 336,359 bytes.
+        //
+        // A larger `max_bytes` is the recourse in exactly one case and it
+        // is worth naming because it is the common one: when it is large
+        // enough that `cap_end + lookahead >= head`, condition 2 goes
+        // false and the read completes. On a ~113 KB buffer that happens
+        // at 131,072 and the same read returns 87,832 bytes. So it is a
+        // recourse for a buffer that fits under the ceiling, and nothing
+        // in the response tells a caller which case it is in — which is
+        // why the general answer is the one that does not depend on the
+        // buffer's size.
+        //
+        // `resource_uri` reaches `head` by construction:
+        // `resource_read_max_bytes` (4 MiB by default) covers the session
+        // output ring, which is **hardcoded** at
+        // `registry::DEFAULT_BUFFER_BYTES` (1 MiB) — `limits.output_buffer_
+        // bytes` is inert and an operator cannot move it (GH #128,
+        // `tests/config_surface.rs`'s `INERT` table). So `cap_end == head`
+        // on a resource read and condition 2 is never satisfied there.
+        // The one direction that could break it is *lowering* the
+        // ceiling, which is live and whose only floor was `nonzero`;
+        // `config.rs` now refuses a value under the ring (GH #203) rather
+        // than leaving the escape to two defaults happening to line up.
+        // A `tail_*` read and the audited `redact: false` remain the other
+        // two, unchanged.
+        //
+        // The residual is unchanged and is what REQ-O-005 already
+        // licenses: a secret still arriving in the trailing region stays
+        // withheld from cursor reads, which is the safe direction.
         if opts.redact && window_end < w.head {
             let unresolved = self
                 .index
@@ -1518,9 +1560,15 @@ mod tests {
     /// closing anchor resolves to the rule that actually matched, names
     /// the real kind, and consumes the whole key in one read.
     ///
-    /// This is the documented recourse — `read_output` clamps `max_bytes`
-    /// to `MAX_READ_MAX_BYTES` (256 KiB), which puts `buffer.head` back
-    /// inside the window for any key a 1 MiB ring buffer can hold most of.
+    /// This is **one** of the recourses, and the scope matters:
+    /// `read_output` clamps `max_bytes` to `MAX_READ_MAX_BYTES` (256 KiB),
+    /// which puts `buffer.head` back inside the window only while the
+    /// buffer is shorter than that ceiling plus the lookahead. Past that
+    /// it does nothing at all — see
+    /// `a_larger_max_bytes_clears_the_bound_only_while_the_ceiling_can_
+    /// reach_head`, and GH #195, for which the general recourse is
+    /// `resource_uri`.
+    ///
     /// It is also the control that separates *detecting the truncation*
     /// from *withholding whenever the window is short*: the cheap wrong
     /// fix passes the test above and fails this one.
@@ -1826,6 +1874,68 @@ mod tests {
         assert_eq!(later.bytes_returned, 0);
         assert_eq!(later.cursor, second.cursor);
         assert_eq!(later.held_back_cause, Some(HeldBackCause::UnvouchedWindow));
+    }
+
+    /// **§4.1's stated recourse — "retry with a larger `max_bytes`" — is
+    /// false in general, and this is the measurement.**
+    ///
+    /// The bound clears only when `max_bytes` is large enough to put
+    /// `buffer.head` back inside the window. `read_output` clamps to
+    /// `MAX_READ_MAX_BYTES` (256 KiB, `mcp/tools.rs`), so the recourse
+    /// fails outright whenever
+    /// `head - since_cursor > MAX_READ_MAX_BYTES + lookahead_bytes` —
+    /// which the fixture below arranges with a buffer barely over
+    /// 300 KB, well inside the 1 MiB default ring.
+    ///
+    /// Confirmed through the real MCP wire on this repository's own
+    /// `CHANGELOG.md README.md ROADMAP.md` catted three times
+    /// (`buffer.head` 338,264): every `max_bytes` from 32,768 up to and
+    /// including the clamped ceiling returned 0 bytes with
+    /// `next_cursor` frozen at 25,644.
+    ///
+    /// The paired arm is the case where the recourse *does* work, and it
+    /// is why the correction is "scope the claim", not "delete it".
+    #[test]
+    fn a_larger_max_bytes_clears_the_bound_only_while_the_ceiling_can_reach_head() {
+        const CEILING: usize = 256 * 1024; // mcp::tools::MAX_READ_MAX_BYTES
+        let p = processor();
+        let (pem, _) = pem_longer_than(300 * 1024);
+        let buf = format!("$ cat k.pem\n{pem}\n").into_bytes();
+        assert!(
+            buf.len() as u64 > (CEILING + p.limits.lookahead_bytes) as u64,
+            "the fixture must out-run the ceiling, or it pins nothing"
+        );
+
+        let mut boundaries = Vec::new();
+        for max_bytes in [32 * 1024, 64 * 1024, 128 * 1024, CEILING] {
+            let r = read(&buf, 0, max_bytes);
+            assert!(
+                r.held_back,
+                "max_bytes {max_bytes} was supposed to still be short of head"
+            );
+            assert_eq!(r.held_back_cause, Some(HeldBackCause::UnvouchedWindow));
+            boundaries.push(r.cursor);
+        }
+        assert!(
+            boundaries.windows(2).all(|w| w[0] == w[1]),
+            "asking for more moved the boundary, which would make the \
+             documented recourse work after all: {boundaries:?}"
+        );
+
+        // The paired direction: a buffer the ceiling *can* reach resolves
+        // at the same `max_bytes` that failed above. Same rule, same
+        // fixture shape, different size — so the correction is about the
+        // relation between the ceiling and the buffer, not about the
+        // ceiling alone.
+        let (small_pem, _) = pem_longer_than(64 * 1024);
+        let small = format!("$ cat k.pem\n{small_pem}\n").into_bytes();
+        assert!(small.len() < CEILING);
+        let r = read(&small, 0, CEILING);
+        assert!(
+            !r.held_back,
+            "the window reached head, so nothing is unvouched"
+        );
+        assert_eq!(r.held_back_cause, None);
     }
 
     // ------------------------------------------------- ANSI boundary rule

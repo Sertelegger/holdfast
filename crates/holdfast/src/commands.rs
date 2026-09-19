@@ -991,37 +991,91 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
 ///   the audited `redact: false` path if it genuinely needs the bytes"*,
 ///   which on this surface is `--raw` (§4.1:476, and it is audited).
 ///
-/// **What it is told apart *by*, and what it is not.**
-/// `dropped_incomplete_escape` is unusable for this twice over: it is a
-/// `ProcessedRead` field `mcp/tools.rs` never serialises, so it does not
-/// reach this process at all, and it flags the escape being *dropped* —
-/// the arm that does **not** set `held_back`. `redactions` counts
-/// redactions inside the returned bytes; a partial secret matches no
-/// rule by definition, so it is `{}` in exactly the case of interest.
-/// What does reach here is `state` (`tools.rs` sends it beside
-/// `held_back`) and this process's own `--raw`, and between them they
-/// separate all three readings.
+/// **What it is told apart *by*, and what it used to be told apart by.**
+/// This function inferred the cause from `state` and its own `--raw`,
+/// because the daemon did not say. It could separate two of the three
+/// and **not** the third: a live session whose read stopped on GH #14's
+/// bound fell through to the last branch and was told *"read again to
+/// pick up the rest"*, which on that bound can never succeed at any
+/// `max_bytes` — GH #195. The daemon now answers exactly, in
+/// `held_back_cause` beside `held_back`, so the inference is gone and
+/// only the two spellings that are this *surface's* own — `--raw`, and
+/// `holdfast logs` having no cursor to resume from — are decided here.
+///
+/// The `state` branch survives on its own merits and is not a guess: it
+/// qualifies `in_flight_secret`, which is REQ-O-005's case and the one
+/// place where a transient cause is transient in name only.
+///
+/// The older reasoning, still true, about what will *not* serve:
+/// `dropped_incomplete_escape` is unusable twice over — it is a
+/// `ProcessedRead` field `mcp/tools.rs` never serialises, and it flags
+/// the escape being *dropped*, the arm that does **not** set
+/// `held_back`. `redactions` counts redactions inside the returned
+/// bytes; a partial secret matches no rule by definition, so it is `{}`
+/// in exactly the case of interest.
 #[cfg(unix)]
 fn held_back_note(raw: bool, data: &Value) -> &'static str {
-    if raw {
-        return "output stops short at an unfinished escape sequence \
-                (REQ-O-008). Redaction is off on this read, so §4.1's \
-                holdback is not what stopped it. Read again to pick up \
-                the rest.";
+    // An older daemon sends no cause, and a newer one may send a word
+    // this build has never heard of. Both fall through to the wording
+    // that advises a harmless retry, which is what this branch did for
+    // every case before the field existed.
+    match data["held_back_cause"].as_str() {
+        Some("unvouched_window") => {
+            "output stops short, and will stop in the same place however \
+             many times you ask: this read's window could not vouch for a \
+             candidate that runs past the end of it (GH #14), and that \
+             boundary is fixed by the request rather than by how much \
+             output arrives (GH #195). A larger `--tail` does not move it. \
+             `--raw` is this surface's audited opt-in; an agent's recourse \
+             is the `resource_uri` on its own read_output response."
+        }
+        Some("incomplete_escape") => {
+            "output stops short at an unfinished escape sequence \
+             (REQ-O-008). The child is still alive and may yet finish it. \
+             Read again to pick up the rest."
+        }
+        // `Exited` and `Dead` are the two terminal states
+        // (`SessionState`); an unknown spelling from a newer daemon falls
+        // through to the live wording.
+        Some("in_flight_secret")
+            if matches!(data["state"].as_str(), Some("Exited") | Some("Dead")) =>
+        {
+            "output stops short, and stays that way: the session has \
+             ended with a partial secret in its tail, which §4.1 keeps \
+             withheld (REQ-O-005 — quiescence does not release it). \
+             Reading again returns the same bytes; `--raw` is this \
+             surface's audited opt-in."
+        }
+        Some("in_flight_secret") => {
+            "output stops short: a secret may still be arriving in the \
+             tail, so §4.1 is withholding from where it starts. Read \
+             again to pick up the rest."
+        }
+        _ if raw => {
+            // `redact: false` makes `holdback_boundary` return `w.head`
+            // before `held_back` is computed, so §4.1's mechanism is
+            // provably switched off and the same read writes a
+            // `redaction_disabled` row saying so. Kept as a branch
+            // because it is still the right thing to print against a
+            // daemon too old to send a cause.
+            "output stops short at an unfinished escape sequence \
+             (REQ-O-008). Redaction is off on this read, so §4.1's \
+             holdback is not what stopped it. Read again to pick up \
+             the rest."
+        }
+        _ if matches!(data["state"].as_str(), Some("Exited") | Some("Dead")) => {
+            "output stops short, and stays that way: the session has \
+             ended with a partial secret in its tail, which §4.1 keeps \
+             withheld (REQ-O-005 — quiescence does not release it). \
+             Reading again returns the same bytes; `--raw` is this \
+             surface's audited opt-in."
+        }
+        _ => {
+            "output stops short: the tail is not vouched for yet — a \
+             secret may still be arriving, or an escape sequence is \
+             unfinished (§4.1, REQ-O-008). Read again to pick up the rest."
+        }
     }
-    // `Exited` and `Dead` are the two terminal states (`SessionState`);
-    // an unknown spelling from a newer daemon falls through to the live
-    // wording, which is the reading that advises a harmless retry.
-    if matches!(data["state"].as_str(), Some("Exited") | Some("Dead")) {
-        return "output stops short, and stays that way: the session has \
-                ended with a partial secret in its tail, which §4.1 keeps \
-                withheld (REQ-O-005 — quiescence does not release it). \
-                Reading again returns the same bytes; `--raw` is this \
-                surface's audited opt-in.";
-    }
-    "output stops short: the tail is not vouched for yet — a secret may \
-     still be arriving, or an escape sequence is unfinished (§4.1, \
-     REQ-O-008). Read again to pick up the rest."
 }
 
 /// The §7.5 handshake `holdfast attach` sends, **in full**.
@@ -2275,7 +2329,7 @@ pub fn version() -> ExitCode {
 // exercise the attach banner. Neither exists on a target with no daemon.
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{attach_banner, fit_to_width};
+    use super::{attach_banner, fit_to_width, held_back_note};
 
     /// Render the row the cursor ends on, for the assertions below.
     fn row(p: &vt100::Parser, r: u16) -> String {
@@ -2545,5 +2599,70 @@ mod tests {
         );
         // And it is a bound rather than an absence of one.
         assert!(STOP_RPC_TIMEOUT <= grace * 3);
+    }
+
+    /// **`held_back_note` had no test at all, and the sentence it prints
+    /// for GH #14's bound was advice that can never succeed** — the
+    /// whole of GH #195 on this surface. These rows pin what each cause
+    /// says, and pin it by the *property* a reader acts on rather than
+    /// by the wording.
+    ///
+    /// Two directions, because either alone is satisfied by a constant:
+    /// the static bound must **not** tell the reader to read again, and
+    /// every transient cause must.
+    #[test]
+    fn the_logs_note_tells_the_reader_to_retry_exactly_when_retrying_can_work() {
+        let note = |cause: Option<&str>, state: &str, raw: bool| {
+            let mut d = serde_json::json!({ "state": state });
+            if let Some(c) = cause {
+                d["held_back_cause"] = serde_json::json!(c);
+            }
+            held_back_note(raw, &d)
+        };
+
+        // The wedge. "Read again" here is the instruction GH #195 is
+        // about, so its absence is the assertion.
+        let stuck = note(Some("unvouched_window"), "Running", false);
+        assert!(
+            !stuck.contains("Read again"),
+            "the static bound must not advise a retry that cannot work: {stuck}"
+        );
+        assert!(
+            stuck.contains("resource_uri"),
+            "…and it must name the recourse that does: {stuck}"
+        );
+
+        // The two that clear on their own, on a live session.
+        for cause in ["incomplete_escape", "in_flight_secret"] {
+            let live = note(Some(cause), "Running", false);
+            assert!(
+                live.contains("Read again"),
+                "{cause} clears as output arrives and must say so: {live}"
+            );
+        }
+
+        // REQ-O-005 qualifies exactly one of them: an in-flight secret
+        // in a session that has ended is withheld for ever, and `--raw`
+        // is this surface's audited opt-in.
+        let dead = note(Some("in_flight_secret"), "Exited", false);
+        assert!(!dead.contains("Read again"), "{dead}");
+        assert!(dead.contains("--raw"), "{dead}");
+        // …and the same cause on a live session says the opposite, so
+        // the `state` qualifier is doing work rather than decorating.
+        assert_ne!(dead, note(Some("in_flight_secret"), "Running", false));
+
+        // An older daemon sends no cause and a newer one may send a word
+        // this build has never heard of. Neither may panic, and both get
+        // the wording that advises a harmless retry — which is what this
+        // function did for every case before the field existed.
+        for unknown in [None, Some("a_cause_from_the_future")] {
+            let fallback = note(unknown, "Running", false);
+            assert!(fallback.contains("Read again"), "{fallback}");
+        }
+        // `--raw` keeps its own sentence on a daemon too old to answer,
+        // because `redact: false` switches §4.1 off before `held_back`
+        // is computed and naming §4.1 there asserts a protection that is
+        // not running.
+        assert!(note(None, "Running", true).contains("REQ-O-008"));
     }
 }
