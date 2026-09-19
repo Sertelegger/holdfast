@@ -958,10 +958,13 @@ jobs:
       # --- the download path, against a fabricated release ------------------
       #
       # There is no real release to point this at, by construction rather
-      # than by timing: `release.yml` attaches no binary assets because doing
-      # so IS the spec's first-external-distribution event. So this harness is
-      # the permanent answer. It must never be replaced by a test that skips
-      # when no release is found -- that is a test that has never run.
+      # than by timing. `release.yml` does now build and attach the five
+      # §12.1 assets and a `SHA256SUMS.txt`, but to a DRAFT release, and a
+      # draft's assets are not served from `releases/download/vX.Y.Z/` --
+      # promoting one is the spec's first-external-distribution decision and
+      # is deliberately a human step. So this harness is the permanent answer
+      # even after a tag exists. It must never be replaced by a test that
+      # skips when no release is found -- that is a test that has never run.
       - name: The bootstrap download path, over loopback HTTP
         run: ./scripts/plugin-bootstrap-tests.sh
 

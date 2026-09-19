@@ -119,10 +119,13 @@ is cut, named and published is in
   so `/plugin marketplace add Sertelegger/holdfast` then `/plugin install
   holdfast@holdfast` works. **It installs and it does not yet run**, and the
   gap is named rather than implied: the bootstrap downloads the binary for
-  `version.txt` from the matching GitHub Release, and no release carries
-  binaries — `release.yml` attaches none on purpose, because doing so is the
-  §12.3 first-external-distribution event. Until one does, the MCP server
-  fails to start with a message naming the manual install.
+  `version.txt` from the matching GitHub Release, and no release *serves*
+  one. `release.yml` builds and attaches the five §12.1 assets, but to a
+  draft, and a draft's assets are not reachable at
+  `releases/download/vX.Y.Z/` — promoting one is the §12.3
+  first-external-distribution decision and stays a human step. Until someone
+  takes it, the MCP server fails to start with a message naming the manual
+  install.
 - **`plugin/bootstrap` — the launcher, in POSIX sh, with the safe-extraction
   rules asserted rather than commented.** §13.3 words those rules as a
   blacklist ("reject absolute paths, `..` path components, symlinks,
