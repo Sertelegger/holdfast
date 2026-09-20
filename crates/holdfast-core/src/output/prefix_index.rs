@@ -881,7 +881,14 @@ impl PrefixIndex {
                 if !in_flight {
                     continue;
                 }
-                if rule.anchored.is_match(&region[i..]) {
+                // **`anchored_whole_match`, not `anchored.is_match`**
+                // (GH #202). This arm releases a candidate on the ground
+                // that `find_spans` has already redacted it, and a rule
+                // carrying `value_must_not_match` can match here and
+                // decline there — which would release a value that is
+                // still growing toward one the rule *will* accept. See
+                // `CompiledRule::anchored_whole_match`.
+                if rule.anchored_whole_match(&region[i..]) {
                     continue;
                 }
                 return Some(region_start + i as u64);
@@ -1037,7 +1044,12 @@ impl PrefixIndex {
                 if !in_flight {
                     continue;
                 }
-                if rule.anchored.is_match(&region[i..]) {
+                // Shared with the scan above on purpose (GH #202): an
+                // oracle that kept `anchored.is_match` here would differ
+                // from the implementation exactly where a rule refuses
+                // its value, and the differential test that compares the
+                // two would then *require* the leak.
+                if rule.anchored_whole_match(&region[i..]) {
                     continue;
                 }
                 return Some(region_start + i as u64);
@@ -2915,5 +2927,60 @@ mod tests {
             "only {random_sets} random rule sets compiled"
         );
         assert!(checks > 20_000, "only {checks} regions checked");
+
+        // **The refused-value regions, by hand, because the generator
+        // cannot reach them (GH #202).** `random_region` splices indexed
+        // prefixes with random bytes, and the odds of it producing a
+        // value that is digit-free *and* carries one of
+        // `( < > [ ] { } | \` or a backtick are negligible — so with
+        // `value_must_not_match` shipped, reverting either scan to
+        // `anchored.is_match` left this whole target green. That is the
+        // hole these rows close: the implementation and its oracle have
+        // to agree on the arm where a rule matches and then declines.
+        let rules = RuleSet::builtin().unwrap();
+        let index = PrefixIndex::build(&rules, DEFAULT_PREFIX_EXPANSION_LIMIT);
+        let mut in_flight = 0usize;
+        for region in [
+            // refused: no digit, and a bracket, pipe or backtick
+            &b"API_KEY=abcd(efgh"[..],
+            b"$ echo password=my{pass}phrase",
+            b"reassembled the token: `get_screen_state`",
+            b"export TOKEN={GITHUB}",
+            b"pub session_key: Option<SessionKey>,",
+            b"auth_token=alpha|bravo|charlie",
+            // admitted: the same shape with a digit, and two passphrases
+            b"API_KEY=abcd(efg1",
+            b"password=correcthorsebatterystaple",
+            b"MASTER_KEY=correct.horse.battery.staple",
+        ] {
+            check(&index, &rules, region, "refused-value");
+            if index.earliest_partial(&rules, region, 0).is_some() {
+                in_flight += 1;
+            }
+        }
+        // **Not vacuous, and asserted as a discriminating pair rather
+        // than only a count.** Two regions differing in one byte: the
+        // refused one is held in flight, the admissible one is released
+        // because `find_spans` will redact it. `check` above proves the
+        // oracle agrees; this proves there is something to agree about.
+        assert!(
+            index
+                .earliest_partial(&rules, b"API_KEY=abcd(efgh", 0)
+                .is_some(),
+            "a refused value must be in flight, or the rows above agree about nothing"
+        );
+        assert!(
+            index
+                .earliest_partial(&rules, b"API_KEY=abcd(efg1", 0)
+                .is_none(),
+            "one digit makes the same value admissible, and an admissible whole \
+             match is released rather than held"
+        );
+        assert!(
+            in_flight >= 3,
+            "only {in_flight} of the hand rows are in flight; a region whose value \
+             does not run to its end is not a candidate at all, so this floor sits \
+             below the row count on purpose"
+        );
     }
 }

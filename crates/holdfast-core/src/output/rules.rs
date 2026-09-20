@@ -44,6 +44,21 @@ pub enum RuleError {
     /// rather than parsed.
     #[error("no built-in redaction rule is named `{name}`; the built-in set has {count}")]
     UnknownRule { name: String, count: usize },
+    /// GH #202: a rule declares `value_must_not_match` and has no `value`
+    /// capture group for it to judge.
+    ///
+    /// Silently ignoring it is the bad outcome, not the loud one. The
+    /// field's whole job is to make a rule match *less*; a rule that
+    /// declares one and has nowhere to apply it goes on matching
+    /// everything it used to while its own file records a narrowing that
+    /// never happens — the same shape GH #128 found in
+    /// `redaction_enabled`, and the reason `UnknownRule` above is an
+    /// error too.
+    #[error(
+        "rule `{name}` declares `value_must_not_match` but its pattern has no `value` \
+         capture group, so there is no value to judge"
+    )]
+    ValueConstraintWithoutValue { name: String },
 }
 
 /// Top level of the rule file.
@@ -69,6 +84,35 @@ pub struct RuleSpec {
     /// blocks). Governs the partial-secret scanner's continuation test.
     #[serde(default)]
     pub binary: bool,
+    /// A regex which, when it matches the **whole** of the `value`
+    /// capture, disqualifies the candidate: the rule found its label and
+    /// its separator, and then judged what followed not to be a
+    /// credential (GH #202).
+    ///
+    /// **This is upstream gitleaks' own mechanism and its own polarity.**
+    /// `generic-api-key` carries an allowlist whose `regexes` are tested
+    /// against the captured secret and suppress the finding on a full
+    /// match; at the pinned `gitleaks-8.28.0` that regex is
+    /// `^[a-zA-Z_.-]+$`, upstream's documented workaround for the
+    /// positive lookahead Go's engine does not have. This field is that
+    /// same test, and upstream's regex can be written into it verbatim.
+    /// What the shipped rules put in it is **not** upstream's regex, and
+    /// the rule file says why: measured over a corpus of real-shaped
+    /// credentials, upstream's own value constraints drop ten of
+    /// thirty-two, three of them shipped `positive` fixtures of these
+    /// very rules.
+    ///
+    /// **Refusal, not selection, and that is the safe direction.** A
+    /// mistake in a *required* pattern refuses a real credential and
+    /// leaks it; a mistake in this one admits a candidate that is then
+    /// redacted. The field cannot express the first error.
+    ///
+    /// Only meaningful on a rule with a `value` capture group:
+    /// [`RuleError::ValueConstraintWithoutValue`] refuses it otherwise,
+    /// because a rule without one redacts its whole match and has no
+    /// "value" to judge.
+    #[serde(default)]
+    pub value_must_not_match: Option<String>,
     #[serde(default)]
     pub positive: Vec<String>,
     #[serde(default)]
@@ -95,8 +139,67 @@ pub struct CompiledRule {
     /// Whether `pattern` has a capture group named `value`; when it does
     /// only that group is redacted, leaving the context prefix visible.
     pub has_value_group: bool,
+    /// [`RuleSpec::value_must_not_match`], compiled and anchored to both
+    /// ends of the value with `\A…\z` and forced into **byte** mode.
+    ///
+    /// Both of those are load-bearing. Anchoring is what makes the field
+    /// a judgement about the whole value rather than about some substring
+    /// of it — and it is upstream's semantics, whose `^…$` does the same.
+    /// Byte mode is what keeps a value that is not valid UTF-8 from
+    /// silently failing every `.` in the refusal and so being *admitted*
+    /// by accident; a credential arrives as bytes and this rule set
+    /// matches bytes everywhere else.
+    pub value_refusal: Option<Regex>,
     pub positive: Vec<String>,
     pub negative: Vec<String>,
+}
+
+impl CompiledRule {
+    /// Whether a captured `value` is still a credential once the rule's
+    /// own refusal has looked at it (GH #202).
+    ///
+    /// `true` for every rule that declares no refusal, which is fifty of
+    /// the fifty-one shipped rules and every user rule that does not ask
+    /// for one.
+    pub fn value_admissible(&self, value: &[u8]) -> bool {
+        match &self.value_refusal {
+            None => true,
+            Some(re) => !re.is_match(value),
+        }
+    }
+
+    /// The partial-secret scanner's completeness test: *has a whole
+    /// match arrived at `hay`'s start, and will `find_spans` emit a span
+    /// for it?*
+    ///
+    /// **The second clause is the one that is easy to drop, and dropping
+    /// it is a leak.** `PrefixIndex::earliest_partial` stops holding a
+    /// candidate back the moment a whole match exists, on the ground
+    /// that `find_spans` will redact it. A refused value breaks that
+    /// ground: the regex matches, `find_spans` declines, and the bytes
+    /// go out raw — while the value is *still growing*. `API_KEY=abcdefgh`
+    /// at the buffer head is refused, released, and one `9` later it is
+    /// `abcdefgh9`, a credential whose first eight bytes the agent
+    /// already has. Asking the refusal here keeps the candidate in
+    /// flight until it is terminated, which is the direction §4.1 is
+    /// allowed to err in.
+    pub fn anchored_whole_match(&self, hay: &[u8]) -> bool {
+        match (&self.value_refusal, self.has_value_group) {
+            (Some(_), true) => match self.anchored.captures(hay) {
+                Some(caps) => match caps.name("value") {
+                    Some(m) => self.value_admissible(m.as_bytes()),
+                    // A `value` group that did not participate cannot be
+                    // judged, so the match is not one this rule will act
+                    // on. Unreachable for the shipped set (both rules'
+                    // groups are unconditional) and deliberately the
+                    // hold-back answer rather than the release one.
+                    None => false,
+                },
+                None => false,
+            },
+            _ => self.anchored.is_match(hay),
+        }
+    }
 }
 
 /// The active rule set: compiled rules plus a `RegexSet` prefilter.
@@ -208,6 +311,25 @@ impl RuleSet {
                 }
             })?;
             let has_value_group = regex.capture_names().any(|n| n == Some("value"));
+            // GH #202. `\A…\z` rather than `^…$`: `$` also matches
+            // *before* a trailing newline, so a refusal written to
+            // reject `foo` would let `foo\n` through, and `binary` rules
+            // carry newlines inside their values by construction.
+            // `(?s-u:…)` puts the author's own expression in byte mode,
+            // where `.` is any byte and a value that is not valid UTF-8
+            // cannot slip past a refusal by failing to decode.
+            let value_refusal = match &spec.value_must_not_match {
+                None => None,
+                Some(_) if !has_value_group => {
+                    return Err(RuleError::ValueConstraintWithoutValue { name: spec.name });
+                }
+                Some(src) => Some(Regex::new(&format!(r"\A(?s-u:{src})\z")).map_err(|source| {
+                    RuleError::Pattern {
+                        name: spec.name.clone(),
+                        source,
+                    }
+                })?),
+            };
             patterns.push(prefilter_pattern(&spec.pattern));
             rules.push(CompiledRule {
                 name: spec.name,
@@ -220,6 +342,7 @@ impl RuleSet {
                     .map(|ps| ps.into_iter().map(|p| p.into_bytes()).collect()),
                 binary: spec.binary,
                 has_value_group,
+                value_refusal,
                 positive: spec.positive,
                 negative: spec.negative,
             });
@@ -1591,18 +1714,288 @@ mod tests {
         for rule in &set.rules {
             for p in &rule.positive {
                 assert!(
-                    rule.regex.is_match(p.as_bytes()),
+                    rule_redacts(rule, p.as_bytes()),
                     "rule `{}` failed to match its positive example {p:?}",
                     rule.name
                 );
             }
             for n in &rule.negative {
                 assert!(
-                    !rule.regex.is_match(n.as_bytes()),
+                    !rule_redacts(rule, n.as_bytes()),
                     "rule `{}` matched its negative example {n:?}",
                     rule.name
                 );
             }
+        }
+    }
+
+    /// What one rule decides about one input, **spelled the way
+    /// [`find_spans`] spells it** — pattern first, then the rule's own
+    /// `value_must_not_match` (GH #202).
+    ///
+    /// [`find_spans`]: super::super::redact::find_spans
+    fn rule_redacts(rule: &CompiledRule, hay: &[u8]) -> bool {
+        if !rule.has_value_group {
+            return rule.regex.is_match(hay);
+        }
+        rule.regex
+            .captures_iter(hay)
+            .filter_map(|c| c.name("value"))
+            .any(|m| rule.value_admissible(m.as_bytes()))
+    }
+
+    /// **Which negatives the *pattern* refuses and which ones only the
+    /// *refusal* refuses, pinned by name.**
+    ///
+    /// The arm above had to widen when `value_must_not_match` arrived:
+    /// before GH #202 a `negative` meant "the pattern does not match
+    /// this", and now it means "this rule redacts nothing here", which
+    /// is the weaker of the two claims. That widening is correct — a
+    /// fixture asserting a *rule's* behaviour should ask the rule and
+    /// not one half of it — but on its own it lets a pattern quietly
+    /// grow broad enough to match an old negative while the refusal
+    /// catches the fallout and the suite stays green.
+    ///
+    /// So the split is a fixture too. Exactly five of the file's
+    /// negatives are held by a refusal; every other one is held by its
+    /// pattern, as it was before this field existed. A pattern that
+    /// starts matching a negative it used to reject moves a row into the
+    /// first list and reds here even though nothing leaks.
+    #[test]
+    fn the_refusal_holds_exactly_the_negatives_it_is_named_for() {
+        const REFUSAL_HELD: &[(&str, &str)] = &[
+            (
+                "secret-key-assignment",
+                "pub session_key: Option<SessionKey>,",
+            ),
+            (
+                "secret-key-assignment",
+                "master_key = config.master_key.clone()",
+            ),
+            (
+                "generic-secret-assignment",
+                "reassembled the token: `get_screen_state`",
+            ),
+            ("generic-secret-assignment", "export TOKEN={GITHUB}"),
+            (
+                "generic-secret-assignment",
+                "let cancellation_token = cancellation_token.clone();",
+            ),
+        ];
+        let set = RuleSet::builtin().unwrap();
+        let mut held: Vec<(&str, &str)> = Vec::new();
+        for rule in &set.rules {
+            for n in &rule.negative {
+                // The pattern alone still matches, so the refusal is the
+                // only thing standing between this row and a marker.
+                if rule.regex.is_match(n.as_bytes()) {
+                    held.push((rule.name.as_str(), n.as_str()));
+                }
+            }
+        }
+        assert_eq!(
+            held, REFUSAL_HELD,
+            "the set of negatives held by a refusal rather than by a pattern moved; \
+             update this list deliberately rather than to make it pass"
+        );
+        // And the refusal really is what holds them: each row's pattern
+        // matches and the rule still redacts nothing.
+        for (name, row) in REFUSAL_HELD {
+            let rule = set.rules.iter().find(|r| &r.name == name).unwrap();
+            assert!(
+                rule.value_refusal.is_some(),
+                "`{name}` is listed as refusal-held and declares no refusal"
+            );
+            assert!(
+                !rule_redacts(rule, row.as_bytes()),
+                "`{name}` still redacts {row:?}"
+            );
+        }
+    }
+
+    /// A rule that declares `value_must_not_match` and has no `value`
+    /// group is refused at compile time (GH #202).
+    ///
+    /// **Not a no-op, for the same reason `UnknownRule` is not.** The
+    /// field exists to make a rule match *less*; a rule that declares
+    /// one with nowhere to apply it goes on matching everything it used
+    /// to while its own file records a narrowing that never happens.
+    #[test]
+    fn a_value_refusal_without_a_value_group_is_refused_at_compile_time() {
+        let src = r#"
+[[rule]]
+name = "no-value-group"
+kind = "test"
+pattern = '''\bxyzzy-[0-9]{8,}'''
+value_must_not_match = '''[a-z]+'''
+positive = ["xyzzy-01234567"]
+negative = ["xyzzy-1"]
+"#;
+        let err = RuleSet::from_toml(src).expect_err("must not compile");
+        assert!(
+            matches!(&err, RuleError::ValueConstraintWithoutValue { name } if name == "no-value-group"),
+            "wrong error: {err}"
+        );
+
+        // Control: the identical rule *with* a `value` group compiles,
+        // so the arm above is measuring the guard and not a typo.
+        let ok = src.replace(r"\bxyzzy-[0-9]{8,}", r"\bxyzzy-(?P<value>[0-9]{8,})");
+        let set = RuleSet::from_toml(&ok).expect("the value-group form must compile");
+        assert!(set.rules[0].value_refusal.is_some());
+    }
+
+    /// The refusal is anchored to **both** ends of the value and reads
+    /// bytes, not characters (GH #202).
+    ///
+    /// Three separate ways to get this wrong, each of which leaks or
+    /// over-redacts silently, and each pinned here: an unanchored
+    /// refusal would decline any value *containing* the expression; `$`
+    /// in place of `\z` would let a trailing newline past it; and a
+    /// refusal left in Unicode mode fails every `.` on a value that is
+    /// not valid UTF-8 — so a credential carrying one stray byte would
+    /// be *admitted* by a refusal written to decline it, which is the
+    /// direction that leaks.
+    ///
+    /// **`\z` rather than `$` is explicitness and not a fix, and an
+    /// earlier draft of this comment claimed otherwise.** In Perl,
+    /// Python and PCRE `$` also matches *before* a final newline, and
+    /// the draft said swapping it in would let `value\n` past the
+    /// refusal. It would not: in the `regex` crate `$` without `(?m)`
+    /// is end-of-haystack exactly, so the two spellings are the same
+    /// automaton. A mutation swapping them is **equivalent**, which is
+    /// why no row here reds for it — driven directly rather than
+    /// assumed, `\A(?s-u:[a-z]+)$` and `\A(?s-u:[a-z]+)\z` both refuse
+    /// `abcd` and both admit `abcd\n`, and only `(?m)$` differs.
+    #[test]
+    fn a_value_refusal_is_anchored_at_both_ends_and_reads_bytes() {
+        let src = r#"
+[[rule]]
+name = "probe"
+kind = "test"
+pattern = '''\bprobe=(?P<value>[^\s]{4,})'''
+value_must_not_match = '''[a-z]+'''
+positive = ["probe=AB12"]
+negative = ["probe=abcd"]
+"#;
+        let set = RuleSet::from_toml(src).unwrap();
+        let rule = &set.rules[0];
+        assert!(!rule.value_admissible(b"abcd"), "a whole match is refused");
+        assert!(
+            rule.value_admissible(b"abZcd"),
+            "anchoring: a value merely *containing* the expression is not refused"
+        );
+        assert!(
+            rule.value_admissible(b"abcd\n"),
+            "end-anchoring: a trailing byte outside the expression must leave \
+             the value un-refused"
+        );
+
+        // Byte mode. `.` in a Unicode-mode refusal cannot cross an
+        // invalid UTF-8 byte, so `(?s:.+)` would admit this value; in
+        // byte mode it refuses it.
+        let bytes_src = src.replace(r"[a-z]+", r"(?s:.+)");
+        let bytes_set = RuleSet::from_toml(&bytes_src).unwrap();
+        assert!(
+            !bytes_set.rules[0].value_admissible(b"ab\xffcd"),
+            "the refusal must read bytes: a value that is not valid UTF-8 \
+             must not slip past a refusal that covers every byte"
+        );
+    }
+
+    /// **`anchored_whole_match`, driven on all three of its arms —
+    /// including the one the shipped rule set cannot reach.**
+    ///
+    /// Both label-keyed rules have an unconditional `value` group, so
+    /// the "group did not participate" arm is dead code against the
+    /// built-in fifty-one and a corpus over them cannot kill a mutation
+    /// in it. A rule whose `value` sits inside an alternation reaches
+    /// it, and that arm must answer **false** — *hold this candidate
+    /// back* — because a match this rule will not act on is not a
+    /// reason to release bytes that are still arriving. Answering
+    /// `true` there releases them, which is the leak
+    /// `anchored_whole_match` exists to close.
+    #[test]
+    fn anchored_whole_match_holds_back_when_the_value_group_did_not_participate() {
+        let src = r#"
+[[rule]]
+name = "optional-value"
+kind = "test"
+pattern = '''\bprobe=(?:unset|(?P<value>[^\s]{4,}))'''
+value_must_not_match = '''[a-z]+'''
+positive = ["probe=AB12"]
+negative = ["probe=abcd"]
+"#;
+        let set = RuleSet::from_toml(src).unwrap();
+        let rule = &set.rules[0];
+
+        // 1. Whole match, admissible value -> release.
+        assert!(
+            rule.anchored_whole_match(b"probe=AB12"),
+            "an admissible value is a whole match"
+        );
+        // 2. Whole match, refused value -> hold back.
+        assert!(
+            !rule.anchored_whole_match(b"probe=abcd"),
+            "a refused value must not count as a whole match"
+        );
+        // 3. Whole match, `value` group absent -> hold back. The regex
+        //    matches and there is nothing to judge.
+        assert!(
+            rule.anchored.is_match(b"probe=unset"),
+            "the control: the pattern really does match with no `value` group, \
+             so arm 3 is reached rather than short-circuited by arm 2"
+        );
+        assert!(
+            !rule.anchored_whole_match(b"probe=unset"),
+            "a match whose `value` group did not participate must hold back, \
+             not release"
+        );
+        // 4. No match at all -> hold back.
+        assert!(!rule.anchored_whole_match(b"nothing here"));
+
+        // And a rule with no refusal is unaffected on every arm: it
+        // answers exactly what `anchored.is_match` answers.
+        let plain =
+            RuleSet::from_toml(&src.replace("value_must_not_match = '''[a-z]+'''\n", "")).unwrap();
+        let plain = &plain.rules[0];
+        for hay in [
+            &b"probe=AB12"[..],
+            b"probe=abcd",
+            b"probe=unset",
+            b"nothing here",
+        ] {
+            assert_eq!(
+                plain.anchored_whole_match(hay),
+                plain.anchored.is_match(hay),
+                "a rule with no refusal must answer what the anchored form does: {:?}",
+                String::from_utf8_lossy(hay)
+            );
+        }
+    }
+
+    /// Fifty of the fifty-one shipped rules declare no refusal, and for
+    /// those `value_admissible` is unconditionally `true` — so the
+    /// feature cannot have changed what they redact.
+    #[test]
+    fn only_the_two_label_keyed_rules_carry_a_value_refusal() {
+        let set = RuleSet::builtin().unwrap();
+        let with: Vec<&str> = set
+            .rules
+            .iter()
+            .filter(|r| r.value_refusal.is_some())
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            with,
+            vec!["secret-key-assignment", "generic-secret-assignment"],
+            "the set of rules carrying a value refusal moved"
+        );
+        for rule in set.rules.iter().filter(|r| r.value_refusal.is_none()) {
+            assert!(
+                rule.value_admissible(b"anything at all \xff"),
+                "`{}` declares no refusal and must admit every value",
+                rule.name
+            );
         }
     }
 
