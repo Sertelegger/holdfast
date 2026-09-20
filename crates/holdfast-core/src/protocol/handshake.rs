@@ -39,7 +39,22 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// field over, where an older daemon hands an `observer` the raw stream,
 /// and neither is a reason to bump the major: the frames still parse,
 /// which is what a major means (§23.3).
-pub const PROTOCOL_MINOR: u32 = 3;
+///
+/// 1.4 adds `ServerFrame::OutputGap`, a new server frame (GH #200). The
+/// first entry in this log that is a new *frame* rather than a new
+/// field, and it is additive for the reason §7.5's forward-compat seam
+/// exists: `decode_server_frame` maps an unrecognised `type` onto
+/// `ServerFrame::Unknown` and both shipped clients skip it, so a 1.3
+/// client attached to a 1.4 daemon behaves exactly as it does today —
+/// which is to say it renders a truncated stream and says nothing,
+/// because that is the defect, and an older client is entitled to the
+/// protocol it was built against and not to the fix. A 1.4 client
+/// against a 1.3 daemon receives no `OutputGap` because that daemon
+/// never sends one; it is not told the gap happened, which is again
+/// today's behaviour and not a regression. **Neither direction can
+/// mistake the frame for something else**, which is the only property a
+/// minor has to carry.
+pub const PROTOCOL_MINOR: u32 = 4;
 
 /// How long either peer waits for the **first** frame of the handshake
 /// before giving up on the connection.

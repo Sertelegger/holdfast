@@ -236,6 +236,67 @@ fn the_write_channel_carries_the_secret_as_itself() {
     );
 }
 
+/// **A gap's origin is read from the session, next to the subscribe**
+/// (GH #200).
+///
+/// **Here because no runtime test in this workspace can reach the line.**
+/// `run`'s `let baseline = session.buffer_head();` is what a
+/// `GapTracker` subtracts the first gap from, and the only way to
+/// exercise it end to end is a broadcast lag over a real socket — which
+/// `attach/conn.rs`'s own lag row records as unreachable from a client,
+/// because the per-connection queue fills and detaches long before the
+/// 256-frame broadcast can lag. Measured: replacing that call with `0`
+/// leaves **every** `attach::` unit row and **every** `attach_protocol`
+/// row green.
+///
+/// And it is not a small wrong. The baseline is the origin, so a zero
+/// one makes the first gap on a connection report the session's entire
+/// byte count: attach to a session that has printed 10 MB, lag once
+/// before the first frame arrives, and the operator is told *"at least
+/// 10485760 bytes of output were dropped"* about a hole of a few
+/// hundred. The arithmetic itself is covered by
+/// `the_gap_origin_is_the_stream_start_and_not_zero`; what is covered
+/// here is that `run` hands it the session's head rather than a
+/// constant.
+///
+/// **Adjacency is the assertion, not just presence.** The read has to
+/// happen right after `subscribe()`: earlier and it misses frames the
+/// receiver legitimately holds, later and frames published in between
+/// are counted as a hole that never existed. A scanner cannot check
+/// "right after" in general, so it checks that nothing but comments
+/// separates the two — which is the property the ordering argument
+/// actually rests on.
+#[test]
+fn the_gap_origin_is_read_from_the_session_beside_the_subscribe() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let text = read_src(src.join("attach/conn.rs"));
+
+    let (_, after) = text
+        .split_once("let output = session.subscribe();")
+        .expect("`run` no longer subscribes to the session's output at all");
+    let (between, _) = after
+        .split_once("let baseline =")
+        .expect("`run` no longer reads a baseline for the gap tracker (GH #200)");
+
+    assert!(
+        between
+            .lines()
+            .all(|l| l.trim().is_empty() || l.trim_start().starts_with("//")),
+        "something other than a comment now sits between the subscribe and the \
+         baseline read; the two are one operation and a statement between them \
+         is a window where frames are published and then counted as a gap:\n{between}"
+    );
+
+    let (_, decl) = text.split_once("let baseline = ").expect("checked above");
+    let decl = decl.split_once(';').expect("the statement ends").0;
+    assert!(
+        decl.contains("session.buffer_head()"),
+        "the gap's origin is no longer read from the session (it is `{decl}`). A \
+         constant here makes the first gap on every connection report the whole \
+         session, and no runtime test in this workspace can see it"
+    );
+}
+
 /// **The two secret arms of `attach::conn::forward_events` are the two
 /// calls `secret::binding`'s `spawn_forwarder` makes** (GH #105).
 ///
