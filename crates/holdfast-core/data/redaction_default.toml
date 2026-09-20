@@ -454,6 +454,70 @@ pattern = '''(?i)bearer\s+(?P<value>[A-Za-z0-9._~+/-]{20,}=*)'''
 positive = ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz"]
 negative = ["Bearer short"]
 
+# **Both rules below refuse a value whose first byte is another `:`.**
+# That is the part of GH #202 that costs no true positive; it is not the
+# whole of GH #202, and the paragraph below says which half stays open.
+# The separator is
+# already consumed by `[:=]` at that point, so a value opening on a second
+# colon means the source text read `label::…` — a scope-resolution
+# operator in Rust, C++, PHP and Perl, not an assignment. Measured over
+# nine corpora (third-party Rust, crates.io READMEs, this repo's own
+# `git log`, rendered man pages, colourised `grep -rn`, the Python 3.12
+# stdlib, Debian licence texts, and this project's own docs and source),
+# it removes 63% of this pair's matches on `git log` prose, 63% on this
+# repo's own Rust, 53% on READMEs and 26% on the design docs, and takes
+# the share of default-sized read windows the prefilter can skip entirely
+# from 33% to 58% on this repo's source. It removes none of either rule's
+# own positives, and none of a 32-row corpus of constructed real-shaped
+# credentials.
+#
+# `powersync-token` above keeps the broad value class on purpose: it is
+# label-keyed too, but its label is anchored to one vendor's name, so
+# none of the nine corpora measured for #202 reaches it. That is a fact
+# about those corpora and not a property of the rule -- its
+# `[a-z0-9_.-]{0,24}` bridges the underscore, so `powersync_token::Name`
+# inside a PowerSync codebase would reach it exactly as
+# `secret::binding` reached the rules below.
+#
+# **What it gives up, stated rather than hidden -- two things.** First, a
+# credential whose own first byte is `:` *however it is quoted or spaced*
+# -- `["']?` consumes an opening quote and `\s*` a whitespace run
+# including a newline, so `password=:hunter2`, `{"password":":hunter2"}`
+# and the YAML spelling are one class -- is no longer redacted. No
+# provider mints one and no fixture contains one, but the class is real
+# and `tests/redaction_prose.rs` asserts every spelling of it as a
+# documented limitation (REQ-TST-006).
+#
+# Second: **at the buffer tail this trades a marker for a shortened
+# read.** Both rules carry a `value` group, so §4.1's partial-secret scan
+# only disqualifies a candidate where the rule already sees a whole
+# match; matching less means disqualifying less, so `holdback_boundary`
+# moves *earlier* -- never later, which is the direction that would leak.
+# An un-terminated echoed line now comes back truncated with
+# `held_back: true` where it came back mangled, and `prompt.last_line`
+# is `""` while it does. One byte outside the value class releases it.
+#
+# **What it does not close, measured rather than implied.** #202's own
+# headline row -- ``reassembled the token: `get_screen_state` `` -- is a
+# plain `label: value` with no second colon in it, and is still redacted.
+# So is `export TOKEN={GITHUB}`. Closing those means constraining what
+# the value *contains*, and every such constraint measured for #202 drops
+# a real credential with it: a value character class costs a bcrypt hash
+# and a password carrying `!` or `@`, and a required digit costs every
+# digit-free passphrase. `tests/redaction_prose.rs` asserts the headline
+# row is still redacted, so the open half is a number somebody has to
+# move rather than a silence.
+#
+# **What it deliberately does not do.** The label-only match itself is
+# unchanged: `password = not-set-yet` is still `[REDACTED:generic]`, which
+# is the behaviour the 0.0.7 CHANGELOG records under GH #125, and whether
+# that stays is an operator's call (`disabled_redaction_rules`, GH #128)
+# rather than this comment's. Upstream gitleaks constrains its own
+# `generic-api-key` further — `entropy = 3.5`, a ~1,500-word stopword
+# list, and an allowlist rejecting any value matching `^[a-zA-Z_.-]+$` —
+# and every one of those needs a mechanism this rule file has no field
+# for. See GH #202.
+
 # Two-word `*_KEY` labels. Found by walking the providers that have no
 # dedicated rule and checking each one's canonical environment-variable
 # name against `generic-secret-assignment` below: every one of them is
@@ -470,7 +534,7 @@ negative = ["Bearer short"]
 [[rule]]
 name = "secret-key-assignment"
 kind = "generic"
-pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:secret|private|encryption|signing|master|session)[_-]key\b["'\s]*[:=]\s*["']?(?P<value>[^\s"';,)]{8,})'''
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:secret|private|encryption|signing|master|session)[_-]key\b["'\s]*[:=]\s*["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
 prefixes = [
   "secret_key",
   "secret-key",
@@ -490,7 +554,12 @@ positive = [
   "SECRET_KEY = 'django-insecure-0123456789abcdef'",
   "app.encryption_key: 0123456789abcdef",
 ]
-negative = ["SECRET_KEY_FILE=/run/secrets/app", "PUBLIC_KEY=0123456789abcdef", "SECRET_KEY="]
+negative = [
+  "SECRET_KEY_FILE=/run/secrets/app",
+  "PUBLIC_KEY=0123456789abcdef",
+  "SECRET_KEY=",
+  "crate::secret_key::rotation",
+]
 
 # The catch-all. `token` is in the alternation deliberately: without it an
 # assignment to a bare `*_TOKEN` variable -- the shape Linode, Vercel,
@@ -499,7 +568,7 @@ negative = ["SECRET_KEY_FILE=/run/secrets/app", "PUBLIC_KEY=0123456789abcdef", "
 [[rule]]
 name = "generic-secret-assignment"
 kind = "generic"
-pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token)\b["'\s]*[:=]\s*["']?(?P<value>[^\s"';,)]{8,})'''
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token)\b["'\s]*[:=]\s*["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
 prefixes = [
   "password",
   "passwd",
@@ -519,7 +588,13 @@ positive = [
   "api_key: 's3cr3t-value'",
   "LINODE_TOKEN=0123456789abcdef0123456789abcdef",
 ]
-negative = ["password: short", "PASSWORD_FILE_PATH", "token = 1234"]
+negative = [
+  "password: short",
+  "PASSWORD_FILE_PATH",
+  "token = 1234",
+  "the secret::binding flake cluster",
+  "attach::secret::SecretBytes",
+]
 
 # --------------------------------------------------------- the group-3 walk
 #

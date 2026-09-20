@@ -609,6 +609,77 @@ is cut, named and published is in
   as a known defect with its measurements, because a number that looks
   arbitrary and is arbitrary is the kind that gets raised again without
   them.
+- **One byte >= 0x80 anywhere in a read window no longer costs the redaction
+  prefilter its automaton ([#194]).** Forty-five of the fifty-one shipped rules
+  carry a Unicode `\b`, the prefilter was built from the rule source verbatim,
+  and a Unicode word boundary installs a quit set over every byte >= 0x80 — so
+  a single `é`, em dash or emoji dropped the whole `RegexSet` onto the slow
+  engine for the length of the window. Measured on this tree, release, on
+  REQ-O-007's 41,472 B default read window (512 lookbehind + 32,768 + 8,192
+  lookahead): **0.082 ms pure ASCII against 37.4 ms with one em dash at the
+  midpoint, 456x**, and 0.09 ms after; the same holds for a 4-byte emoji and
+  for a lone `0x80`, at the first byte, the midpoint and the last. A default
+  `read_output` of this repository's own `CHANGELOG`+`README`+`ROADMAP` — under
+  1% non-ASCII by volume — goes from 124 ms of span-finding to 13 ms, and a
+  256 KiB read of `git log --color --stat` goes from 4.5 s to 0.8 s through the
+  real MCP wire.
+
+  The prefilter's patterns now carry `(?-u:\b)` where the boundary's meaning
+  provably survives the respelling, and carry no boundary at all where it does
+  not. It is the rewrite [#142] made for the liveness DFA, with the premise
+  read off the pattern text rather than off an indexed prefix, and with
+  deletion instead of refusal as the fallback — a `RegexSet` is one automaton,
+  so one surviving Unicode `\b` re-arms the quit set for the whole set.
+
+  **A prefilter may over-report freely and may never under-report, because
+  `find_spans` runs only the rules it names.** Deleting an assertion can only
+  enlarge a language, so the deletion branch is superset-preserving for every
+  pattern; respelling is superset-preserving only where the pattern's own side
+  of the boundary can be shown to be an ASCII word byte, so it is taken only
+  where the walk can read that premise and the walk bails to deletion
+  everywhere else. Fifteen of the shipped fifty-one take the deletion at their
+  leading boundary — eight on a `k`/`s` head letter, whose `(?i)` expansion
+  reaches U+212A and U+017F; four on a group open; three on a class open.
+  Four constructs that made an earlier revision of this walk *mis-read* the
+  premise — a multi-character escape such as `\pL` or `\x73`, extended `(?x)`
+  mode, a stacked quantifier, and `\b{start}` — are refused outright, each with
+  a rule in the adversarial fixture carrying its divergent haystack as that
+  rule's own positive example. The differential runs over the shipped rules,
+  that fixture, every positive example with seven non-ASCII probes planted at
+  the first byte, the midpoint and the last, the installed `RegexSet` itself,
+  and randomly generated rule sets.
+
+- **The redaction prefilter is built with a 64 MiB lazy-DFA cache ceiling
+  instead of the `regex` crate's 2 MiB default, so a large *pure-ASCII* read
+  no longer falls off the automaton ([#194]).** This is the second of that
+  issue's two cliffs and it is a different failure: no byte in the window is
+  ≥ 0x80, and the collapse is the cache being cleared on every block once the
+  fifty-one-rule automaton outgrows it. Measured on this tree, release,
+  prefilter scan only, over the rule file's own examples with the non-ASCII
+  bytes stripped — the densest near-miss corpus there is, and the one the new
+  test uses — **256 KiB costs 5.5 ms at the default and 0.058 ms here**; over
+  six real corpora the sweep is 578 ms to 25 ms.
+
+  **They are not independent, and the ceiling is the prerequisite.** The
+  ceiling does nothing for the Unicode cliff, but the boundary rewrite makes
+  *this* one worse without it — 20.4 ms against a 5.5 ms base on the same
+  256 KiB — because deleting the quit set means the automaton explores states
+  and then thrashes a 2 MiB cache. Reverting the rewrite alone is safe;
+  reverting the ceiling alone is not.
+
+  **The number is a ceiling and not an allocation, which is the only reason it
+  can be this large.** The cache grows to what a search needs and stops: at
+  16 MiB it tops out at 10.4 MiB resident and 32 and 64 MiB measure the same,
+  so the headroom buys nothing today and buys the cliff staying gone when
+  §9.2's quarterly gitleaks refresh makes the set bigger. The shipped
+  combination is cheaper still — the rewrite deletes the quit set, and a
+  smaller automaton needs a smaller cache — at 5.2 MiB. What it does cost is
+  paid per thread concurrently running a redaction scan, because `regex` keeps
+  a cache pool: 2.6 MiB/thread before against 3.3 MiB/thread now on the worst
+  corpus, so twelve concurrent readers move 29 MiB to 38 MiB. There is one
+  `RuleSet` per daemon, or two when `[security] disabled_redaction_rules` is
+  non-empty — the audit log takes the full built-in set either way — and never
+  one per session.
 - **`resize` now folds the requested geometry, applies it and reads it back
   under the attach hub's resize lock**, which the tool had never taken and the
   attach path always did. `attach::conn`'s own comment states the hazard —
@@ -705,6 +776,69 @@ is cut, named and published is in
   defect: it is right that one frame between two local processes should never
   take longer, and the frame was never late — the daemon was never asked
   ([#201], [#194]).
+- **`generic-secret-assignment` and `secret-key-assignment` no longer fire on a
+  namespace path, which is the largest class of the prose-mangling [#202]
+  measured and is not all of it.** Both rules now refuse a value whose first
+  byte is another `:`.
+  The separator is already consumed by `[:=]` at that point, so a value opening
+  on a second colon means the text read `label::…` — a scope-resolution
+  operator, not an assignment. Measured over nine corpora that contain no
+  credential (third-party Rust, crates.io READMEs, this repository's own
+  `git log`, rendered man pages, colourised `grep -rn`, the Python 3.12 standard
+  library, Debian licence texts, and this project's own docs and source), it
+  removes 63% of the pair's matches on commit prose, 63% on this repository's
+  own Rust, 53% on READMEs and 26% on the design docs, and takes the share of
+  default-sized read windows the redaction prefilter can skip outright from 33%
+  to 58% on this repository's source. **It removes none of either rule's own
+  positives and none of a 32-row corpus of constructed real-shaped credentials**
+  — `tests/redaction_prose.rs` asserts both directions, with every absence arm
+  paired against the pre-fix pattern reinstated by name, so a rule set that
+  matched nothing would fail rather than pass ([#202]).
+
+  **This changes the rate, not the rule.** The pair still matches on the
+  *label* and does not inspect the value, so `password = not-set-yet` is still
+  `[REDACTED:generic]` exactly as [#125] recorded; whether that stays is an
+  operator's call through `disabled_redaction_rules` ([#128]) and not this
+  release's. `powersync-token` keeps the broad value class deliberately: its
+  label is anchored to one vendor's name, so none of the nine corpora measured
+  reaches it — a fact about those corpora rather than a property of that rule,
+  whose own `[a-z0-9_.-]{0,24}` would let `powersync_token::Name` reach it
+  inside a PowerSync codebase.
+
+  **What it does not close, and the reason it stops here.** [#202]'s own
+  headline row — ``reassembled the token: `get_screen_state` `` — is a plain
+  `label: value` with no second colon, and is still redacted; so is
+  `export TOKEN={GITHUB}`. Closing those means constraining what the value
+  *contains*, and every such constraint measured drops a real credential with
+  it — a value character class costs a bcrypt hash and a password carrying `!`
+  or `@`, a required digit costs every digit-free passphrase. That is a
+  security trade rather than a bug fix, so it is written up on [#202] for a
+  decision instead of taken here, and `tests/redaction_prose.rs` asserts the
+  headline row is still redacted so the open half is a number rather than a
+  silence.
+
+  **What it gives up, recorded rather than hidden — two things, not one.**
+  First, a credential whose own first byte is `:` — **however it is quoted or
+  spaced**, since `["']?` consumes an opening quote and `\s*` a whitespace run
+  including a newline, so `password=:hunter2`, `{"password":":hunter2"}` and the
+  YAML spelling are one class and not three — is no longer redacted. No provider
+  mints one and no fixture contains one, but the class is real and ships as an
+  explicit documented-limitation assertion (REQ-TST-006).
+
+  Second, and found by a review lane rather than by the author: **at the buffer
+  tail the change trades a marker for a shortened read.** Both rules carry a
+  `value` capture group, so §4.1's partial-secret scan disqualifies a candidate
+  only where the rule can already see a whole match; a stricter value class
+  matches less often, disqualifies less, and moves `holdback_boundary`
+  **earlier** — never later, which is the direction that would be a leak, and a
+  4,293-prefix monotonicity sweep found 28 boundaries moved earlier and zero
+  later. The user-visible effect is that an un-terminated line the child has
+  echoed (`$ cargo test secret::binding`, no newline yet) now returns truncated
+  with `held_back: true` where it returned mangled, and `status`'s
+  `prompt.last_line` is `""` for as long as that holds. It is a rate and not a
+  strand — one byte outside the value class releases the whole line — and
+  `at_the_buffer_tail_the_fix_withholds_where_it_used_to_mangle` measures both
+  halves rather than asserting the cost away.
 
 - **The `binary` arm of the in-flight test asks the rule as well, so a
   certificate no longer pins the holdback for the rest of the session
@@ -1505,6 +1639,8 @@ residuals that are known and accepted.
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
 [#200]: https://github.com/Sertelegger/holdfast/issues/200
 [#194]: https://github.com/Sertelegger/holdfast/issues/194
+
 [#201]: https://github.com/Sertelegger/holdfast/issues/201
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
+[#202]: https://github.com/Sertelegger/holdfast/issues/202
