@@ -212,13 +212,19 @@ const ZSH_INTEGRATION: &str = concat!(
 /// **second Holdfast injection** is a different guard against a different
 /// thing (REQ-PD-005) and is untouched.
 ///
-/// **What remains unverified, stated rather than implied.** fish is not
-/// installed on the host this was written on, so nothing here has been run
-/// *by this workspace's suite*; `fish_integration_emits_the_measured_
-/// marker_stream_and_exact_exit_codes` is the row that measures it and it
-/// skips. The snippet body itself has been driven on live PTYs in
-/// containers for the three versions above, so the claims in this comment
-/// are measurements — but they were taken out of band, and the one
+/// **What remains unverified, stated rather than implied — and it is less
+/// than this paragraph claimed until 2026-09-20.** It said fish is not
+/// installed on the host this was written on, so nothing here had been run
+/// by this workspace's suite and
+/// `fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes`
+/// skipped. That row now RUNS AND PASSES on fish 3.7.0 (GH #217 / #98): it
+/// was failing on a bash-ism in the suite's own shared assertion helper,
+/// not on anything here, and it skips only where no fish is installed —
+/// which today still includes CI. On a fish >= 4 it runs and fails on the
+/// OSC 133 collision, which is §11.4's scenario and wants a
+/// collision-aware row rather than a change here. The snippet body has
+/// also been driven on live PTYs in containers for the three versions
+/// above; those claims were taken out of band, and the one
 /// question in the same class as the bash and zsh `$?` measurements is
 /// still open here: **the `fish_prompt` wrapper's `printf` runs before the
 /// copied prompt, so `$status` inside the user's own prompt function is

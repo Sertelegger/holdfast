@@ -113,14 +113,28 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     # HOLDFAST_REQUIRE_ALL_SHELLS: "1" is STILL not set, and ci.yml's `test`
-    # job carries the measurement that says why: the fish row cannot pass
-    # on either fish version obtainable on this image, so the variable
-    # would make this job fail on iteration 1, every night, on a defect
-    # that has nothing to do with the race it exists to hunt. A nightly
-    # that is red for a known reason is a nightly nobody reads.
+    # job carries the measurement that says why — **but not the measurement
+    # this comment gave until 2026-09-20**, which was "the fish row cannot
+    # pass on either fish version obtainable on this image". GH #217 / #98
+    # made detection.rs's fish row pass on noble's 3.7.0; the bash-ism was
+    # in the suite's own shared assertion helper.
     #
-    # WHOEVER MAKES THE FISH ROW PASS MUST FLIP IT HERE TOO — this file and
-    # ci.yml both, or the coverage gate is half-applied.
+    # The conclusion survives the reason dying, and that is the only thing
+    # holding this line. This job installs no fish at all (see the apt line
+    # below), so the variable would panic `have()` on iteration 1, every
+    # night, on an absent program rather than on the race it exists to
+    # hunt. And tests/screen.rs's REQ-TS-008 row now honours the variable
+    # itself: satisfying it needs the 4.8.x from ppa:fish-shell/release-4,
+    # which would in turn take detection.rs's row red on the OSC 133
+    # collision. A nightly that is red for a known reason is a nightly
+    # nobody reads.
+    #
+    # SO THE STANDING INSTRUCTION HERE IS NOT "FLIP IT WHEN THE FISH ROW
+    # PASSES" — it passes, and flipping this today reddens the nightly.
+    # It is: flip it here and in ci.yml together, when THIS job installs a
+    # fish that satisfies REQ-TS-008 and detection.rs's row has a
+    # collision-aware expectation. Half-applied is the failure mode the
+    # old wording invited.
     #
     # env:
     #   HOLDFAST_REQUIRE_ALL_SHELLS: "1"
