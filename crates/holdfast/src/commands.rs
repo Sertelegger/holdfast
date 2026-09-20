@@ -72,6 +72,17 @@ pub const EXIT_UNREACHABLE: u8 = 2;
 /// *"there should be a daemon and I could not reach it"*, and here the
 /// daemon was present throughout and said so. §18.8 leaves 3–63
 /// unassigned; this takes the first.
+///
+/// **`#[cfg(unix)]`, unlike its neighbours, because its only readers
+/// are.** `watch` and `attach` are Unix-only surfaces (§3.3), so
+/// `finish` and `left_cleanly` are both `#[cfg(unix)]` and nothing on
+/// Windows can produce this status. An unconditional constant compiles
+/// there as dead code and `-D warnings` fails the `windows-cross` and
+/// `windows-native` jobs — which is what it did, after the same
+/// `#[cfg]` split had already been fixed once in this branch for
+/// `queue_ancillary`. `EXIT_FAILED`/`EXIT_UNREACHABLE`/`EXIT_USAGE`
+/// stay unconditional because they have readers on both platforms.
+#[cfg(unix)]
 pub const EXIT_TRUNCATED: u8 = 3;
 pub const EXIT_USAGE: u8 = 64;
 /// `128 + signo`, the status a shell reports for a signalled child.
