@@ -52,21 +52,35 @@ fails=0
 ok()  { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s: %s\n' "$1" "$2"; fails=$((fails + 1)); }
 
-# **"Has content" means a line that is not a link definition.** The extractor
-# below stops at the next `## ` heading, so every section but the LAST one is
-# bounded by a heading -- and the last one runs to the foot of the file, where
-# the reference-style definitions live. A trailing section with nothing under
-# it therefore extracts ~2.6 KB of `[#45]: https://...` and passes any test
-# that only asks for a non-blank line. That is the same body the broken guard
-# would have shipped, arrived at by a different route, so it is refused by the
-# same rule rather than by a second one.
+# **"Has content" means a line that is not blank, not a link definition and
+# not a heading.** Each exclusion is a section that renders as nothing, and
+# each was found by trying to get an empty release past the rule rather than
+# by reasoning about it:
+#
+#   * **Blank.** `-s` -- the test this file replaced -- counts a lone newline
+#     as content.
+#   * **A link definition.** The extractor below stops at the next `## `
+#     heading, so every section but the LAST is bounded by one; the last runs
+#     to the foot of the file, where the reference-style definitions live. A
+#     trailing section with nothing under it therefore extracts ~2.6 KB of
+#     `[#45]: https://...` and is non-blank. That is the same empty body the
+#     broken guard would have shipped, reached by a different route.
+#   * **A heading.** Keep a Changelog sections are `### Added` / `### Fixed`
+#     over bullets, and this project's `## [Unreleased]` is written that way.
+#     Rename it a version and delete the entries -- or open the new section
+#     with the skeleton and never fill it -- and the section is two
+#     subheadings and nothing else. Measured: that passed a
+#     not-blank-and-not-a-link-definition rule, and the release body was
+#     literally "### Added\n\n### Fixed". No real release body is headings
+#     alone, so there is no false positive here to trade against.
 #
 # One `awk`, not `grep -v ... | grep -q ...`: under `pipefail` the second grep
 # exits early on a match, the first takes SIGPIPE, and the pipeline reports
 # 141 -- rejecting a section that is perfectly good.
 has_prose() { # has_prose <file>
   awk '
-    /^\[[^]]+\]: https?:\/\// { next }
+    /^\[[^]]+\]: https?:\/\// { next }   # a link definition
+    /^[ \t]*#{1,6}[ \t]/      { next }   # a heading
     /[^ \t]/                  { found = 1; exit }
     END                       { exit(found ? 0 : 1) }
   ' "$1"
@@ -187,8 +201,10 @@ self_test() {
       reject)
         if [ "$rc" -eq 0 ]; then
           # The whole point. Print what would have shipped.
+          # Counted with the SAME exclusions `has_prose` applies, or the
+          # diagnostic contradicts the rule it is reporting on.
           bad "$label" "accepted it — body would be $(wc -c < "$out") bytes, \
-$(grep -cvE '^\[[^]]+\]: https?://|^[[:space:]]*$' "$out") of them prose lines"
+$(grep -cvE '^\[[^]]+\]: https?://|^[[:space:]]*$|^[[:space:]]*#{1,6}[[:space:]]' "$out") of them prose lines"
         elif [ "$(grep -c '^\[#45\]: ' "$out" 2>/dev/null || true)" -gt 1 ]; then
           # **Refused, but only after appending** — which is the defect this
           # file exists to fix, surviving into the fix. The check has to run
@@ -247,6 +263,24 @@ $(grep -cvE '^\[[^]]+\]: https?://|^[[:space:]]*$' "$out") of them prose lines"
 '# Changelog
 
 ## [0.0.9] — 2026-09-20'
+
+  # **The Keep a Changelog skeleton with the entries missing.** This is the
+  # one that got past the first version of this guard: `## [Unreleased]` in
+  # this repository is `### Added` over bullets, so renaming it and losing
+  # the bullets -- or opening the new section with the skeleton and never
+  # filling it -- leaves two subheadings that render as nothing.
+  case_run "a section of bare \`###\` skeleton headings is refused" reject "0.0.8" \
+'# Changelog
+
+## [0.0.8] — 2026-09-20
+
+### Added
+
+### Fixed
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- the released thing'
 
   case_run "a section with content is accepted, definitions and all" accept "0.0.8" \
 '# Changelog
