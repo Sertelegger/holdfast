@@ -295,11 +295,17 @@ Cutting one is therefore:
    **The last two are in `Cargo.lock`, and forgetting them breaks every
    build.** It records a version for each workspace member —
    `[[package]] name = "holdfast"` and `[[package]] name = "holdfast-core"`,
-   two `version = "X.Y.Z"` lines about sixteen apart — and `--locked` is on
-   every build this project runs, including the release one. Bump `Cargo.toml`
-   without relocking and the next `cargo` invocation stops dead with
-   *"cannot update the lock file … because --locked was passed to prevent
-   this"*. Do not hand-edit it; run:
+   two `version = "X.Y.Z"` lines about sixteen apart — and **every check in
+   this repository passes `--locked`**, including the release build. Bump
+   `Cargo.toml` without relocking and each of them stops dead with
+
+   ```
+   error: cannot update the lock file /…/Cargo.lock because --locked was passed to prevent this
+   ```
+
+   A bare `cargo build` does **not**: with no `--locked` it relocks silently
+   and succeeds, which is how this reaches a pull request feeling fine and
+   fails in CI. Do not hand-edit the lock; run:
 
    ```bash
    cargo update --workspace --offline
@@ -307,9 +313,21 @@ Cutting one is therefore:
 
    `--workspace` restricts it to the members, `--offline` guarantees it
    reaches no network, and together they are a two-line diff: measured on a
-   `0.0.7` → `0.0.8` bump it printed `Locking 2 packages` and changed exactly
-   those two `version` lines and nothing else. Commit `Cargo.lock` with
-   `Cargo.toml` in the same commit — they are one edit.
+   `0.0.7` → `0.0.8` bump it printed `Locking 2 packages to latest compatible
+   versions`, named the two members, and changed exactly those two `version`
+   lines out of a thousand — the other 34 dependencies were untouched. Commit
+   `Cargo.lock` with `Cargo.toml` in the same commit; they are one edit.
+
+   **If you bump only one of `Cargo.toml`'s two literals, the error is a
+   different one and never mentions the lock file**, which sends you the
+   wrong way. Measured:
+
+   ```
+   error: failed to select a version for the requirement `holdfast-core = "^0.0.7"`
+   candidate versions found which didn't match: 0.0.8
+   ```
+
+   That is the six-literal count failing, not the relock. Fix step 4 first.
 5. **Update the version references in the prose.** None of these fails a
    check, and each one is read as fact:
 

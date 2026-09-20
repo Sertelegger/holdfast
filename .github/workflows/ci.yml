@@ -154,9 +154,14 @@ jobs:
       # this line is the half that stops it coming back: five of the fixtures
       # are sections that must be REFUSED, and every one of them carries link
       # definitions on purpose, so they are cases the old ordering accepted.
-      # Reinstate that ordering and this job goes red -- measured, six
-      # failures. Nothing in `release-rehearsal.yml` covers the notes path,
-      # and it is not a required check either.
+      # Two mutations, both measured, because a bare count is ambiguous about
+      # which mutation produced it: restoring the literal pre-fix block --
+      # no heading check, no prose check, `-s` after the append -- fails 6 of
+      # the 12 cases; moving `has_prose` alone to after the append fails 4,
+      # the fifth reject case being the one whose missing heading returns
+      # before the append is reached at all. Nothing in
+      # `release-rehearsal.yml` covers the notes path, and it is not a
+      # required check either.
       - run: ./scripts/release-notes.sh --self-test
 
   # `dev/workflows/verify.md` has listed `actionlint` under *"CI's own gate,

@@ -240,9 +240,23 @@ because `release.yml` is tag-triggered and holds a write token, so the only
 other way to find out whether it works is to cut a tag and hope. It publishes
 nothing and holds no token; the one command it cannot exercise —
 `gh release create` — is named as the residual in `release.yml`'s own header.
-**It is not a required status check** — one of exactly two such gaps, the
-other being `ci.yml`'s own `plugin` job below: add it alongside the eleven, or
-it is a gate that can go red unnoticed.
+**It is not a required status check**, and it is the larger half of that gap.
+Eighteen contexts report on a commit and **eleven** gate it; the seven that do
+not are this workflow's `assemble` job, its five `pack` matrix cells, and
+`ci.yml`'s own `plugin` job below. An earlier draft of this sentence said
+"exactly two such gaps" — it had counted workflows, where the unit branch
+protection uses is contexts, and a matrix job is one entry that becomes five.
+Count them rather than trusting the number:
+
+```bash
+comm -13 \
+  <(gh api repos/Sertelegger/holdfast/branches/main/protection \
+      --jq '.required_status_checks.contexts[]' | sort) \
+  <(gh api "repos/Sertelegger/holdfast/commits/main/check-runs?per_page=100" \
+      --jq '.check_runs[].name' | sort -u)
+```
+
+Add them alongside the eleven, or they are gates that can go red unnoticed.
 
 Scheduled: a **weekly** flake hunt (Sundays — the suite 100× at 4×
 oversubscribed parallelism) and a **monthly** `cargo mutants` sweep (the 1st).

@@ -74,15 +74,36 @@ bad() { printf '  FAIL  %s: %s\n' "$1" "$2"; fails=$((fails + 1)); }
 #     literally "### Added\n\n### Fixed". No real release body is headings
 #     alone, so there is no false positive here to trade against.
 #
+#   * **An HTML comment or a thematic break.** Both render as nothing, and a
+#     placeholder comment is a plausible thing to leave in a section opened
+#     early.
+#
 # One `awk`, not `grep -v ... | grep -q ...`: under `pipefail` the second grep
 # exits early on a match, the first takes SIGPIPE, and the pipeline reports
 # 141 -- rejecting a section that is perfectly good.
+#
+# **`#+` and not `#{1,6}`.** mawk 1.3.4 is ubuntu-24.04's `/usr/bin/awk` and
+# handles ERE intervals, but mawk 1.3.3 and the BSD awk on macOS -- which is
+# what `dev/workflows/verify.md` runs on -- treat `{1,6}` as literal
+# characters. That would not error; it would silently stop matching headings
+# and reopen the hole above, on the platform where nobody would see it.
+# CLAUDE.md's standing warning is that BSD tools fail silently, and an ERE
+# interval is one of the ways.
+#
+# The link-definition pattern tests `]:` rather than a `https?://` scheme, and
+# tolerates leading spaces, because CommonMark accepts `  [#45]: <https://x>`,
+# `[spec]: ./doc.md` and `[#45]:https://x` and each of those is a definition
+# that renders as nothing. A line matching `^\s*[...]:` in a release body is
+# not prose. All four forms were measured getting an empty body past the
+# scheme-anchored version of this rule.
 has_prose() { # has_prose <file>
   awk '
-    /^\[[^]]+\]: https?:\/\// { next }   # a link definition
-    /^[ \t]*#{1,6}[ \t]/      { next }   # a heading
-    /[^ \t]/                  { found = 1; exit }
-    END                       { exit(found ? 0 : 1) }
+    /^[ \t]*\[[^]]+\][ \t]*:/            { next }  # a link definition
+    /^[ \t]*#+[ \t]/                     { next }  # an ATX heading
+    /^[ \t]*<!--/                        { next }  # an HTML comment
+    /^[ \t]*(---+|\*\*\*+|___+)[ \t]*$/  { next }  # a thematic break
+    /[^ \t]/                             { found = 1; exit }
+    END                                  { exit(found ? 0 : 1) }
   ' "$1"
 }
 
@@ -186,6 +207,15 @@ self_test() {
     local cl="$tmp/CHANGELOG.md" out="$tmp/out.md" rc=0 log
     printf '%s\n%s\n' "$body" "$defs" > "$cl"
     rm -f "$out"
+    # **The extraction, recomputed here rather than taken from `compose`.**
+    # A test that asks the implementation what the right answer is cannot
+    # catch the implementation being wrong. The reject branch below compares
+    # `$out` against this.
+    awk -v v="## [$version]" '
+      index($0, v) == 1 { on = 1; next }
+      on && /^## /      { exit }
+      on                { print }
+    ' "$cl" > "$tmp/extracted.md"
     log="$(compose "$version" "$cl" "$out" 2>&1)" || rc=$?
     case "$want" in
       accept)
@@ -205,11 +235,22 @@ self_test() {
           # diagnostic contradicts the rule it is reporting on.
           bad "$label" "accepted it — body would be $(wc -c < "$out") bytes, \
 $(grep -cvE '^\[[^]]+\]: https?://|^[[:space:]]*$|^[[:space:]]*#{1,6}[[:space:]]' "$out") of them prose lines"
-        elif [ "$(grep -c '^\[#45\]: ' "$out" 2>/dev/null || true)" -gt 1 ]; then
+        elif ! cmp -s "$out" "$tmp/extracted.md"; then
           # **Refused, but only after appending** — which is the defect this
           # file exists to fix, surviving into the fix. The check has to run
           # before the append or it is checking its own output.
-          bad "$label" "refused, but had already appended the link definitions"
+          #
+          # Asserted by recomputing the extraction INDEPENDENTLY (above) and
+          # demanding `$out` still equal it byte for byte. The first spelling
+          # of this counted `[#45]` lines and asked for `-gt 1`, which could
+          # only ever fire for the one trailing fixture whose section already
+          # contains the definitions: moving `has_prose` back after the
+          # append turned exactly 1 of 5 reject cases red instead of 5. A
+          # regression check that catches the regression in one fifth of the
+          # cases it is written over is the failure this whole file is about,
+          # reproduced inside its own test.
+          bad "$label" "refused, but \$out is no longer the extracted section \
+($(wc -c < "$tmp/extracted.md") bytes extracted, $(wc -c < "$out") written)"
         else
           ok "$label"
         fi ;;
