@@ -4883,6 +4883,12 @@ async fn send_input_wait_for_returns_the_identical_shape() {
         "truncated_at_tail",
         "truncated_for_size",
         "held_back",
+        // `held_back_cause` is in the list for the reason the list
+        // exists: §4.1 calls the two surfaces identical, and a qualifier
+        // carried on one of them is a second contract. It is an
+        // *inclusion* list, so a field added to one surface and not the
+        // other would pass silently until it is named here.
+        "held_back_cause",
         "next_cursor",
     ] {
         assert_eq!(
@@ -4893,6 +4899,11 @@ async fn send_input_wait_for_returns_the_identical_shape() {
     // And the shape really is the withheld one, so the agreement above is
     // agreement about something.
     assert_eq!(waited["data"]["held_back"], json!(true));
+    assert_eq!(
+        waited["data"]["held_back_cause"],
+        json!("in_flight_secret"),
+        "a withheld match is `holdback_boundary`'s by construction"
+    );
     assert!(waited["data"]["match"].get("text").is_none());
 
     for id in [wid, sid] {

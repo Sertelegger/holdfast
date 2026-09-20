@@ -2266,25 +2266,37 @@ async fn a_redact_false_read_output_is_audited_as_the_cli_that_asked() {
     );
 }
 
+/// **This row drove the clamp from the config side and no longer can.**
+/// GH #203 put a floor under `limits.resource_read_max_bytes` — a
+/// resource read is the bulk counterpart to a cursor read and can only
+/// be one while it reaches the whole session ring — so `= 8` is now
+/// refused at load and a legal ceiling is at least 1 MiB, which a bash
+/// prompt's buffer cannot reach past. The clamp itself is unchanged and
+/// is driven here from the **caller's** `?max_bytes=`, which is the
+/// other half of the same `min`;
+/// `mcp/resources.rs`'s
+/// `a_caller_max_bytes_is_clamped_down_against_the_ceiling_and_never_up`
+/// still drives the configured ceiling directly, and
+/// `config::tests::a_resource_ceiling_under_the_live_ring_is_refused_and_names_the_key`
+/// is what now pins the config side.
+///
+/// What this row is *for* is the `_meta` contract underneath — §5.5.3's
+/// `truncated_for_size` present, `held_back` absent — and that is
+/// untouched by where the 8 comes from.
 #[tokio::test]
 async fn a_caller_max_bytes_is_clamped_down_against_the_configured_ceiling() {
-    // The ceiling is a config knob, so the clamp is observable by setting
-    // it low rather than by asking for 4 MiB of a small buffer.
-    let config =
-        holdfast_core::config::parse_str("[limits]\nresource_read_max_bytes = 8\n").expect("loads");
-    let d = TestDaemon::start_with("resclamp", config).await;
+    let d = TestDaemon::start_with("resclamp", holdfast_core::config::Config::default()).await;
     let client = d.client().await.unwrap();
     let id = start_bash(&client, "clamped").await;
     read_until(&client, &id, "$").await;
 
-    let uri = format!("holdfast://session/{id}/buffer?since_cursor=0&max_bytes=99999999");
+    let uri = format!("holdfast://session/{id}/buffer?since_cursor=0&max_bytes=8");
     let resp = resource_read(&client, &uri).await;
     assert_eq!(resp.status, "ok", "{}", resp.details);
     let text = first_text(&resp);
     assert!(
         text.len() <= 8,
-        "a caller asking for 99 MB got {} bytes against an 8-byte ceiling — \
-         clamped up, or honoured",
+        "a caller asking for 8 bytes got {} — the cap was raised, not honoured",
         text.len()
     );
 

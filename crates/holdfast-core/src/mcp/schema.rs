@@ -113,6 +113,61 @@ pub enum ScreenTracking {
     On,
 }
 
+/// Which of `held_back`'s two rules stopped this read (§4.1,
+/// REQ-O-008).
+///
+/// Mirrors `output::HeldBackCause::as_str`, and the two are asserted
+/// equal in `tests/schema.rs` — same construction as `SessionState`
+/// below and for the same reason.
+///
+/// **What a caller does with it.** `held_back` alone says only *"some of
+/// what you asked for is being withheld"*, and §4.1's answer to that is
+/// right for **both** of these values: each names a boundary bounded by
+/// `buffer.head`, so new output moves it and the same read makes
+/// progress. **Retry at `next_cursor`.**
+///
+/// * `in_flight_secret` — a known secret *prefix* is still arriving
+///   inside the trailing scan region, so §4.1 withholds from where it
+///   starts. One qualification, and it is REQ-O-005's: a session that is
+///   quiescent or has exited produces no further bytes to move the
+///   boundary with, so this one will not clear on its own. `state` and
+///   `interaction_mode`, both in this same response, are how a caller
+///   tells that apart from a boundary that is about to move, and
+///   `redact: false` is the audited hatch.
+/// * `incomplete_escape` — the read would have ended inside an
+///   unfinished ANSI escape sequence and the child is still alive, so
+///   the tail is held until the sequence completes. The next read starts
+///   at the introducer, so it clears either way — the sequence finishes,
+///   or it over-runs `ansi_incomplete_max_bytes` and is dropped.
+///
+/// **A window that could not judge a candidate inside it is not a value
+/// here, and that absence is GH #195.** It used to be a third one, and
+/// it was bounded by the *request* rather than by `buffer.head`, so a
+/// caller obeying the paragraph above retried the identical read for
+/// ever and never advanced. It is no longer a holdback at all: such a
+/// read now makes full progress, and the region the window could not
+/// vouch for comes back carrying `[REDACTED:unresolved]`, counted in
+/// `redactions` like any other substitution. Every value left here
+/// moves.
+///
+/// A size cap is deliberately **not** a value either. It is not a
+/// holdback, the two can be true at once, and `truncated_for_size`
+/// already answers it — see `output::ProcessedRead::held_back_cause`.
+///
+/// Carried by `read_output`, `wait_for_pattern`, `send_input`'s
+/// `wait_for` fields and `resources/read`'s `_meta.holdfast` — every
+/// surface §4.1 calls identical. **`get_screen_state` is the one
+/// exclusion**, and it is not an omission: its `held_back` reports that
+/// the grid was *masked*, not that a read end was pulled back
+/// (REQ-O-011a), so neither of these values is an answer to it and there
+/// is no `next_cursor` for a caller to retry on.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldBackCause {
+    InFlightSecret,
+    IncompleteEscape,
+}
+
 /// Lifecycle state of a session (§5.2).
 ///
 /// Mirrors `session::SessionState::as_str`, which is a closed vocabulary of
@@ -221,9 +276,27 @@ pub struct ReadOutput {
     pub truncated_for_size: Option<bool>,
     /// The read stopped short of `buffer.head` at the holdback boundary
     /// (§4.1), or an unfinished escape was pulled back (REQ-O-008).
+    /// `held_back_cause` says which, and both of them clear as output
+    /// arrives.
     pub held_back: Option<bool>,
-    /// `rule kind -> count` for the redactions inside the returned range.
+    /// Which rule held this read back. **Non-null exactly when
+    /// `held_back` is true; present and `null` otherwise**, so branch on
+    /// the value and never on the key's existence.
+    ///
+    /// Both values name a boundary bounded by `buffer.head` — retry at
+    /// `next_cursor` — with the one qualification REQ-O-005 puts on
+    /// `in_flight_secret`, stated in that value's own documentation.
+    pub held_back_cause: Option<HeldBackCause>,
+    /// `kind -> count` for the redactions inside the returned range.
     /// Empty on an unredacted read; absent only on an error envelope.
+    ///
+    /// **Every key is a rule's `kind` except one.** `unresolved` names no
+    /// rule — it is §9.2's reserved pseudo-kind, and it means the
+    /// opposite of the others: *nothing matched these bytes, and the read
+    /// window could not vouch for them* (REQ-O-011a, GH #195). It is a
+    /// count of markers really present in `output`, like every other key,
+    /// so a caller totalling this map gets substitutions rather than
+    /// credentials.
     pub redactions: Option<std::collections::BTreeMap<String, u64>>,
     pub next_cursor: Option<u64>,
     /// The `holdfast://` URI that fetches this session's whole buffer as an
@@ -280,6 +353,16 @@ pub struct WaitForPattern {
     pub truncated_at_tail: Option<bool>,
     pub truncated_for_size: Option<bool>,
     pub held_back: Option<bool>,
+    /// Which rule held this wait's read back. **Non-null exactly when
+    /// `held_back` is true; present and `null` otherwise.**
+    ///
+    /// The vocabulary is `read_output`'s, because the read is —
+    /// `output_since_start` runs through the same pipeline. This tool's
+    /// `held_back` is wider by one term, a match whose range intersects
+    /// the withheld region, and that term is §4.1's holdback by
+    /// construction, so it reports `in_flight_secret` — which is also
+    /// the boundary `next_cursor` is set from on that arm.
+    pub held_back_cause: Option<HeldBackCause>,
     pub next_cursor: Option<u64>,
     /// Set **only** when the daemon clamped the requested deadline
     /// (REQ-T-008). A field that is always present carries no information.
@@ -334,6 +417,7 @@ pub struct SendInput {
     pub truncated_at_tail: Option<bool>,
     pub truncated_for_size: Option<bool>,
     pub held_back: Option<bool>,
+    pub held_back_cause: Option<HeldBackCause>,
     pub next_cursor: Option<u64>,
     pub clamped_timeout_secs: Option<u64>,
     pub interaction_mode: Option<InteractionMode>,
@@ -455,8 +539,10 @@ pub struct SessionRecord {
     /// REQ-T-018.
     pub idle_deadline_unix_secs: Option<u64>,
     pub buffer: Option<Buffer>,
-    /// Cumulative `rule kind -> count` for the session (§9.2). Distinct
-    /// from `read_output.redactions`, which is per response (REQ-O-012).
+    /// Cumulative `kind -> count` for the session (§9.2). Distinct from
+    /// `read_output.redactions`, which is per response (REQ-O-012). Keys
+    /// are rule kinds plus the reserved `unresolved` pseudo-kind — see
+    /// `ReadOutput::redactions`.
     pub redaction_stats: Option<std::collections::BTreeMap<String, u64>>,
     pub interaction_mode: Option<InteractionMode>,
     pub detection_tier: Option<DetectionTier>,

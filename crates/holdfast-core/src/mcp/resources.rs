@@ -548,10 +548,12 @@ pub fn read_prepared(
     );
 
     // §5.5.3's extension fields, exactly: `truncated_for_size`,
-    // `held_back`, `truncated_at_tail`, `next_uri`. **`held_back` and
-    // `truncated_for_size` are distinct** — one means Holdfast is
-    // deliberately withholding bytes, the other that more exist beyond a
-    // cap — and collapsing them into one flag is the fault to avoid.
+    // `held_back`, `truncated_at_tail`, `next_uri` — plus
+    // `held_back_cause`, which qualifies `held_back` rather than adding
+    // a fifth independent fact. **`held_back` and `truncated_for_size`
+    // are distinct** — one means Holdfast is deliberately withholding
+    // bytes, the other that more exist beyond a cap — and collapsing
+    // them into one flag is the fault to avoid.
     let mut meta = MetaObject::new();
     let mut holdfast = serde_json::Map::new();
     if read.truncated_for_size {
@@ -559,6 +561,21 @@ pub fn read_prepared(
     }
     if read.held_back {
         holdfast.insert("held_back".into(), json!(true));
+        // Mirrored beside the flag rather than left to `read_output`,
+        // because this surface has no `next_cursor` to retry on and its
+        // continuation is a URI: a caller that gets `held_back` here
+        // still has to know whether `in_flight_secret` on a session that
+        // has stopped (REQ-O-005) is what it is looking at.
+        //
+        // **`_meta` omits a field rather than writing a false one** —
+        // `tests/control_protocol.rs` pins `held_back` being absent on a
+        // size-capped read — so this sits inside the `if` and is present
+        // exactly when `held_back` is. Every value is a `&'static str`
+        // from `HeldBackCause::as_str`, the same vocabulary the tool
+        // emits, so the two surfaces cannot drift apart.
+        if let Some(cause) = read.held_back_cause {
+            holdfast.insert("held_back_cause".into(), json!(cause.as_str()));
+        }
     }
     if read.truncated_at_tail {
         holdfast.insert("truncated_at_tail".into(), json!(true));
@@ -900,6 +917,82 @@ mod tests {
             ResourceTarget::SessionId(session.id.clone()),
             "the published continuation must key on the resolved session: {next}"
         );
+    }
+
+    /// **The `_meta` half of GH #195's cause field, which nothing else
+    /// reaches.**
+    ///
+    /// `read_output`'s copy is pinned by `tests/schema.rs`'s exact key
+    /// set and by `mcp-smoke.sh`; this one is pinned by nothing —
+    /// deleting the three lines that write it leaves the whole suite and
+    /// the smoke script green. It matters here because this surface has
+    /// no `next_cursor` to retry on: its continuation is `next_uri`, and
+    /// REQ-O-005's case — a partial secret in the tail of a session that
+    /// has stopped producing — is the one where re-fetching it can never
+    /// advance.
+    ///
+    /// Three arms, and the third is the one that stops the row passing
+    /// against an unconditional insert.
+    #[test]
+    fn a_held_back_resource_read_names_its_cause_in_meta() {
+        // A GitHub PAT prefix with too few characters after it to match
+        // the rule, sitting at `buffer.head` with no newline behind it:
+        // §4.1's trailing scan sees a known prefix still arriving and
+        // withholds from where it starts. The label is one no rule keys
+        // on, so a *redaction* cannot be what shortens the read.
+        let bytes = b"$ cat note\nsee ghp_0123456789abcdefghij";
+        let (registry, session) = registry_with_session(bytes);
+        let processor = crate::output::OutputProcessor::builtin().expect("built-in rules compile");
+        let meta_of = |uri: &str| -> serde_json::Value {
+            let result = read_resource(
+                &registry,
+                &processor,
+                uri,
+                4 * 1024 * 1024,
+                caller::audit_surface(RESOURCE_READ_TOOL),
+            )
+            .expect("a live session");
+            let ResourceContents::TextResourceContents { meta, .. } = &result.contents[0] else {
+                panic!("utf8 travels in `text`")
+            };
+            match meta {
+                Some(m) => m.0["holdfast"].clone(),
+                None => json!({}),
+            }
+        };
+        let base = format!("holdfast://session/{}/buffer?since_cursor=0", session.id);
+
+        // The arrangement, asserted rather than assumed: §4.1 really is
+        // withholding, or arm 1 is about something else entirely.
+        assert!(
+            session.holdback_boundary(&processor) < session.buffer_head(),
+            "nothing is being withheld, so there is no cause to name"
+        );
+
+        // Arm 1: the holdback fires, and `_meta` says which rule.
+        let held = meta_of(&base);
+        assert_eq!(held["held_back"], json!(true), "{held}");
+        assert_eq!(held["held_back_cause"], json!("in_flight_secret"), "{held}");
+
+        // Arm 2: the same buffer read with redaction off withholds
+        // nothing — `holdback_boundary` returns `head` before
+        // `held_back` is computed — and `_meta` omits both keys rather
+        // than writing a null. That convention is this surface's, pinned
+        // for `held_back` itself by `control_protocol.rs`.
+        let whole = meta_of(&format!("{base}&redact=false"));
+        assert!(whole.get("held_back").is_none(), "{whole}");
+        assert!(whole.get("held_back_cause").is_none(), "{whole}");
+
+        // Arm 3: a size cap is not a holdback, so it names no cause —
+        // without this, an insert outside the `if read.held_back` block
+        // passes arms 1 and 2.
+        let capped = meta_of(&format!(
+            "holdfast://session/{}/buffer?since_cursor=0&redact=false&max_bytes=4",
+            session.id
+        ));
+        assert_eq!(capped["truncated_for_size"], json!(true), "{capped}");
+        assert!(capped.get("held_back").is_none(), "{capped}");
+        assert!(capped.get("held_back_cause").is_none(), "{capped}");
     }
 
     #[test]

@@ -263,8 +263,9 @@ pub struct Session {
     /// Which shell integration was injected, if any.
     pub shell_integration: Option<Shell>,
     state: Mutex<SessionState>,
-    /// Cumulative `{rule kind: count}` for this session — §5.2's
-    /// `status.redaction_stats` (§9.2, REQ-O-012).
+    /// Cumulative `{kind: count}` for this session — §5.2's
+    /// `status.redaction_stats` (§9.2, REQ-O-012). Keyed by rule kind
+    /// plus the reserved `unresolved` pseudo-kind, which names no rule.
     ///
     /// **Not the same number `read_output.redactions` reports, and never
     /// derived from it.** That one describes a single response; this one
@@ -2031,6 +2032,8 @@ impl Session {
         let snapshot = WindowSnapshot {
             window: &[],
             window_start: head,
+            carry_region: &[],
+            carry_region_start: head,
             tail_region: &tail_region,
             tail_region_start: scan_start,
             req_start: head,
@@ -2136,6 +2139,8 @@ impl Session {
         let (
             window,
             window_start,
+            carry_region,
+            carry_region_start,
             tail_region,
             scan_start,
             req_start,
@@ -2182,9 +2187,22 @@ impl Session {
             let scan_start = head
                 .saturating_sub(limits.partial_secret_scan_bytes as u64)
                 .max(tail);
+            // The unvouched scan's own lookbehind (GH #195). It reaches
+            // `UNVOUCHED_CARRY_BYTES` rather than `lookbehind_bytes`
+            // because a read that begins inside a region a previous read
+            // masked has to see the anchor that produced the mask, and
+            // that anchor can be the whole carry behind `req_start`.
+            // Never later than `window_start`, so the region contains the
+            // window and one slice answers for both.
+            let carry_region_start = req_start
+                .saturating_sub(crate::output::UNVOUCHED_CARRY_BYTES as u64)
+                .max(tail)
+                .min(window_start);
             (
                 buffer.slice(window_start, window_end),
                 window_start,
+                buffer.slice(carry_region_start, window_end),
+                carry_region_start,
                 buffer.slice(scan_start, head),
                 scan_start,
                 req_start,
@@ -2199,6 +2217,8 @@ impl Session {
         let snapshot = WindowSnapshot {
             window: &window,
             window_start,
+            carry_region: &carry_region,
+            carry_region_start,
             tail_region: &tail_region,
             tail_region_start: scan_start,
             req_start,
@@ -2970,6 +2990,173 @@ mod tests {
             );
         }
         assert_eq!(joined, "cat id_rsa\n[REDACTED:private-key]\ndone\n");
+    }
+
+    /// **The unvouched scan's region may not claim bytes the ring has
+    /// evicted** (REQ-O-007's clamp half, one region further out).
+    ///
+    /// `OutputBuffer::slice` clamps what it copies to `[tail, head)`, so
+    /// a `carry_region_start` below `tail` does not produce a short read
+    /// — it produces a slice whose **first byte is not the offset the
+    /// caller says it is**. Every offset the scan then reports is low by
+    /// `tail − claimed_start`, which places the mask over the wrong bytes
+    /// in the truncated branch and indexes past the end of the slice in
+    /// the at-`head` one. Dropping `.max(tail)` survived every other row
+    /// in this module, which is why this one is written against the
+    /// clamp rather than against a behaviour.
+    ///
+    /// The ring here is `mock_session`'s 4 KiB and the fixture is ~25 KB,
+    /// so `tail` is far past `UNVOUCHED_CARRY_BYTES` behind any cursor —
+    /// asserted, because a fixture that did not evict would pass against
+    /// the missing clamp.
+    #[test]
+    fn the_unvouched_scan_region_never_claims_bytes_the_ring_has_evicted() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        let mut stream = String::from("cat id_rsa\n-----BEGIN RSA PRIVATE KEY-----\n");
+        for i in 0..600u32 {
+            stream.push_str(&format!("KEYBODY{i:06}MIIEowIBAAKCAQEAy8Dbv8prpJ\n"));
+        }
+        pty.queue_output(stream.as_bytes());
+        wait_for_bytes(&s, stream.len() as u64);
+
+        let (tail, head) = {
+            let b = s.buffer.lock();
+            (b.tail(), b.head())
+        };
+        assert!(
+            tail > crate::output::UNVOUCHED_CARRY_BYTES as u64,
+            "the ring must have evicted further than the carry reaches, or \
+             the clamp this row is about is never exercised (tail {tail})"
+        );
+
+        // Both branches: a small `max_bytes` truncates the window, a large
+        // one reaches `buffer.head`. Every start is clamped into the ring
+        // by `read_processed` itself, including one below `tail`.
+        for max_bytes in [1usize, 512, 4096, 32 * 1024] {
+            for start in [0u64, tail, tail + 1, head.saturating_sub(1), head] {
+                let r = s.read_processed(&ReadRequest::since(start, max_bytes), &p);
+                assert!(
+                    r.cursor >= start.max(tail),
+                    "max_bytes {max_bytes} start {start}: cursor went backwards"
+                );
+                assert!(
+                    r.bytes_returned as u64 <= head - start.clamp(tail, head),
+                    "max_bytes {max_bytes} start {start}: returned more than the \
+                     ring holds, which is the offset skew this row is about"
+                );
+            }
+        }
+    }
+
+    /// **GH #195 on the real read path: a continuation read that begins
+    /// inside a region a previous read masked must mask it too.**
+    ///
+    /// The unit test in `output` pins the same invariant against a
+    /// hand-built snapshot, and it cannot pin *this*: the geometry that
+    /// decides whether the continuation can still see `-----BEGIN` is
+    /// `read_processed`'s `carry_region_start`, which that helper
+    /// supplies for itself. Replacing it with `window_start` — the
+    /// obvious simplification, since the window already has a lookbehind
+    /// — survives every row in `output` and puts a private key body on
+    /// the wire, because `lookbehind_bytes` is 512 and a believed
+    /// candidate reaches `UNVOUCHED_CARRY_BYTES` back.
+    ///
+    /// The key is **unterminated**, which is the whole subject: a
+    /// terminated one matches `private-key-block` as soon as the window
+    /// reaches its footer and was never the leak.
+    #[test]
+    fn paging_inside_a_masked_region_keeps_masking_through_the_session() {
+        // **Not `mock_session()`**, whose ring is 4,096 bytes: the fixture
+        // is 26 KB and the anchor would be evicted before the first read,
+        // which is a different (and real) behaviour with nothing to say
+        // about this one. A row that silently measured eviction instead
+        // would be green for the wrong reason.
+        let pty = Arc::new(MockPty::new());
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(1024 * 1024),
+        );
+        let p = OutputProcessor::builtin().unwrap();
+
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..400u32 {
+            let mut line = format!("KEYBODY{i:06}");
+            while line.len() < 64 {
+                line.push_str("MIIEowIBAAKCAQEAy8Dbv8prpJ");
+            }
+            line.truncate(64);
+            lines.push(line);
+        }
+        let body = lines.join("\n");
+        let prologue = "cat id_rsa\n";
+        let stream = format!("{prologue}-----BEGIN RSA PRIVATE KEY-----\n{body}\n");
+        assert!(
+            !stream.contains("-----END"),
+            "the fixture must be unterminated"
+        );
+        pty.queue_output(stream.as_bytes());
+        wait_for_bytes(&s, stream.len() as u64);
+        assert_eq!(
+            s.buffer.lock().tail(),
+            0,
+            "nothing may have been evicted, or the anchor this row is about \
+             is not in the buffer"
+        );
+
+        let carry = crate::output::UNVOUCHED_CARRY_BYTES as u64;
+        let anchor = prologue.len() as u64;
+        let line_at = |i: usize| anchor + 32 + 65 * i as u64;
+        let last_in_carry = (0..400)
+            .take_while(|i| line_at(*i) + 65 <= anchor + carry)
+            .last()
+            .expect("the carry covers whole body lines");
+        assert!(last_in_carry > 200, "the masked run must be substantial");
+
+        // 512 bytes a read, so the cursor lands strictly between the
+        // anchor and the end of the carry. A default-sized read consumes
+        // the whole carry in one step and never produces a continuation.
+        let mut cursor = 0u64;
+        let mut reads = 0usize;
+        let mut markers = 0usize;
+        let mut resumed_inside = false;
+        while cursor < anchor + carry {
+            reads += 1;
+            assert!(reads <= 64, "paging did not terminate (cursor {cursor})");
+            if cursor > anchor && cursor < anchor + carry {
+                resumed_inside = true;
+            }
+            let r = s.read_processed(&ReadRequest::since(cursor, 512), &p);
+            assert!(r.cursor > cursor, "the cursor stalled at {cursor}");
+            for i in 0..=last_in_carry {
+                assert!(
+                    !r.output.contains(&format!("KEYBODY{i:06}")),
+                    "read {reads} from cursor {cursor} released body line {i}, \
+                     which is inside the carry"
+                );
+            }
+            markers += r.redactions.get("unresolved").copied().unwrap_or(0);
+            cursor = r.cursor;
+        }
+        assert!(
+            resumed_inside,
+            "no read began strictly inside the masked region, so this row \
+             asserted nothing about a continuation"
+        );
+        assert!(
+            markers >= 2,
+            "only {markers} read masked; the continuation must mask too"
+        );
+
+        // Paired: past the carry the candidate is not believed, so this
+        // row cannot pass against an implementation that masks for ever.
+        let after = s.read_processed(&ReadRequest::since(anchor + carry, 512), &p);
+        assert!(after.redactions.is_empty(), "{:?}", after.redactions);
+        assert!(after.output.contains("KEYBODY"));
     }
 
     #[test]

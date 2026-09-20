@@ -35,6 +35,162 @@ use rules::{RuleError, RuleSet};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// How much evidence a candidate the window could not judge is believed
+/// on — and therefore how far one `[REDACTED:unresolved]` may reach past
+/// its anchor, and how far back of `buffer.head` the at-`head` scan looks
+/// for one (GH #14, GH #195, REQ-O-011a).
+///
+/// **Not a tunable, and not in the §4.2 limits table.** It is a bound on
+/// a *disclosure* decision: below it a real key body is released raw,
+/// above it ordinary output is masked, and both ends are the kind of
+/// thing an operator should not be able to move by editing a TOML key
+/// with no warning that it is a disclosure boundary — which is precisely
+/// the complaint GH #14 makes about `redaction_lookahead_bytes`.
+///
+/// **The number is `2 × STREAM_CARRY_BYTES`, and the second derivation
+/// is the load-bearing one.**
+///
+/// * *The one unbounded rule in the shipped set.* `private-key-block` is
+///   `-----BEGIN…PRIVATE KEY-----[\s\S]*?-----END…PRIVATE KEY-----`, and
+///   the lazy quantifier means one match is one key rather than a bundle.
+///   A 16,384-bit RSA key — the largest anyone generates — is 12,464
+///   bytes in PEM, so 16,384 covers it with room and 8,192 does not.
+///   `STREAM_CARRY_BYTES`'s own doc makes the matching argument against
+///   shrinking toward 512, where *"the smallest real PEM is ~1.7 KiB"*.
+///   `_RSA_16384_PEM_FITS_INSIDE_THE_CARRY` holds this at compile time.
+/// * *The same order as the stream, and deliberately not more.*
+///   `attach/redact_stream.rs` withholds an unjudgeable candidate over a
+///   sliding window of exactly this size. **It is not the same number as
+///   the stream's coverage, and an earlier draft of this comment said it
+///   was.** `feed_while_withholding` leaves withholding only on a feed
+///   with no partial open and then sets `split = buf.len()`, so the whole
+///   exit chunk is dropped as well: the stream covers
+///   `2 × STREAM_CARRY_BYTES + r`, with `r` up to the feed size — 8,192
+///   for the in-process pty reader, 65,536 for the subprocess worker.
+///   Measured on one fixture through both surfaces, the read releases at
+///   anchor + 16,400 and the stream at anchor + 24,560.
+///
+///   **The read is therefore the weaker of the two, and that is the
+///   direction REQ-O-011a asks for**, whose words are that a *stream* is
+///   *"never weaker than the tool it renders"*. What must not happen is
+///   the inversion — a read covering more than the live view of the same
+///   bytes would put the leak on `holdfast watch` while the tool looked
+///   safe. `the_stream_is_never_weaker_than_the_read_it_renders` measures
+///   both surfaces rather than comparing two constants, which is what the
+///   row it replaced did and why this was not caught earlier.
+///
+/// What the cap buys, measured on this repository's own contents as the
+/// share of a corpus covered by `unresolved` markers (the CHANGELOG entry
+/// for GH #195 carries the full table). On 5.79 MB of this repository's
+/// Rust the cap costs 2.90% at `max_bytes` 32,768 and **0.28%** at 4 MiB —
+/// it *falls*, because a wider window resolves more candidates outright —
+/// where masking `[u, window_end)` uncapped costs 3.91% and **38.65%**.
+/// Uncapped, the damage scales with a number the caller chooses.
+pub const UNVOUCHED_CARRY_BYTES: usize = 16 * 1024;
+
+/// The second half of [`UNVOUCHED_CARRY_BYTES`]'s derivation, asserted at
+/// compile time because it is a relation between two literals: a
+/// 16,384-bit RSA private key is 12,464 bytes in PEM, and
+/// `private-key-block` is the one unbounded rule in the shipped set. The
+/// first half — parity with `attach/redact_stream.rs` — needs the other
+/// module and is
+/// `the_unvouched_carry_matches_the_stream_it_is_derived_from`.
+const _RSA_16384_PEM_FITS_INSIDE_THE_CARRY: () = assert!(UNVOUCHED_CARRY_BYTES > 12_464);
+
+/// Which of `held_back`'s rules stopped *this* read (§4.1, REQ-O-008).
+///
+/// **`held_back` is a disjunction and the caller was told it was one
+/// thing.** `process` computes it as `safety_end < w.cap_end`, and two
+/// independent rules lower `safety_end`. There were three: GH #14's
+/// window bound was the third, it moved with neither `buffer.head` nor
+/// anything else, and a caller following §4.1's *"retry at
+/// `next_cursor`"* against it never advanced (GH #195). **It is not a
+/// value here because it is no longer a holdback** — the read makes full
+/// progress and the region carries a marker instead. That is the whole
+/// of the change, and the enum shrinking is how it is visible from the
+/// wire.
+///
+/// So every value here names a boundary that **moves with
+/// `buffer.head`**, and §4.1's instruction is right for both. The one
+/// qualification is REQ-O-005's, stated on the variant it belongs to: a
+/// session that has stopped producing output produces no new bytes to
+/// move the boundary with, and `state` and `interaction_mode` in the same
+/// response are how a caller tells that apart from a boundary that is
+/// about to move.
+///
+/// **An exact statement about the read that just happened, not a guess.**
+/// `process` already knows which term produced the final `safety_end`,
+/// because it computed it; reporting it costs a `match` and introduces no
+/// inference, so there is no false-fire rate to measure.
+///
+/// The value is a fact about the boundary, never an instruction: it does
+/// not touch `next_cursor`, `held_back` or the bytes returned, so an
+/// agent that ignores it sees exactly the response it saw before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldBackCause {
+    /// §4.1's targeted holdback: a known secret *prefix* is still
+    /// arriving inside the trailing `partial_secret_scan_bytes` region.
+    ///
+    /// **The bound is a function of `buffer.head`**, so new output moves
+    /// it and the same read makes progress. The exception is stated in
+    /// the same breath by REQ-O-005: quiescence does not release it, so a
+    /// session that stopped mid-token stays withheld — `state` and
+    /// `interaction_mode` in the same response are how a caller tells the
+    /// two apart, and `redact: false` is the audited hatch.
+    InFlightSecret,
+    /// REQ-O-008: the read would have ended inside an unfinished ANSI
+    /// escape sequence and the child is still alive, so the tail is held
+    /// until the sequence completes.
+    ///
+    /// **Transient at every `max_bytes`, which it was not before 0.0.8.**
+    /// The withhold is transient because the next read starts at the
+    /// introducer and scans `max_bytes` past it, so the sequence exceeds
+    /// `ansi_incomplete_max_bytes` and is dropped. That argument needed
+    /// `max_bytes > ansi_incomplete_max_bytes`, and at or below it the
+    /// read returned zero bytes with the cursor frozen for ever — a
+    /// second GH #195 through a different rule. `process` now declines to
+    /// withhold at a boundary that would return the caller nothing, so
+    /// this value never names a wedge. Pinned by
+    /// `an_escape_under_the_incomplete_cap_no_longer_wedges`.
+    IncompleteEscape,
+}
+
+impl HeldBackCause {
+    /// The wire spelling. Mirrored by `mcp::schema::HeldBackCause`, which
+    /// is what the agent is handed as a closed vocabulary; the two are
+    /// asserted equal in both directions in `tests/schema.rs`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeldBackCause::InFlightSecret => "in_flight_secret",
+            HeldBackCause::IncompleteEscape => "incomplete_escape",
+        }
+    }
+
+    /// Parse the wire spelling — the inverse of [`Self::as_str`], so a
+    /// process on the other side of the daemon socket (`holdfast logs`)
+    /// branches on the enum rather than on string literals it would have
+    /// to keep in step by hand.
+    ///
+    /// `None` for anything else, which is what a **newer** daemon's third
+    /// cause looks like to an older CLI. That falls back to the wording a
+    /// daemon too old to send the field at all gets.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "in_flight_secret" => Some(HeldBackCause::InFlightSecret),
+            "incomplete_escape" => Some(HeldBackCause::IncompleteEscape),
+            _ => None,
+        }
+    }
+
+    /// Every variant, for the tests and the vocabulary walk. Adding a
+    /// variant without adding it here fails
+    /// `the_held_back_causes_are_all_enumerated`.
+    pub const ALL: &'static [HeldBackCause] = &[
+        HeldBackCause::InFlightSecret,
+        HeldBackCause::IncompleteEscape,
+    ];
+}
+
 /// Tunables from the §4.2 limits table.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessingLimits {
@@ -219,6 +375,31 @@ pub struct WindowSnapshot<'a> {
     pub tail_region: &'a [u8],
     /// Absolute offset of `tail_region[0]`.
     pub tail_region_start: u64,
+    /// The region the **unvouched** scan reads: `window`, plus up to
+    /// [`UNVOUCHED_CARRY_BYTES`] of extra lookbehind in front of it.
+    /// Empty for a snapshot built only to ask a boundary.
+    ///
+    /// **A third region, and the reason it is not the window is a
+    /// continuation read** (GH #195). When a read masks `[u, e)` the
+    /// cursor lands somewhere in `[u, u + UNVOUCHED_CARRY_BYTES)`, and
+    /// the *next* read has to reach the same verdict about the same
+    /// candidate or it releases the rest of it raw — the exact GH #14
+    /// leak, re-entered from the other side. `lookbehind_bytes` is 512
+    /// and a believed candidate reaches 16 KiB back, so the window cannot
+    /// answer it: the anchor is simply not in the bytes `process` holds.
+    ///
+    /// It is not folded into `window` because `window` is what
+    /// [`OutputProcessor::all_spans`] and
+    /// [`OutputProcessor::render`] run over, and widening *those* is a
+    /// different change with a different blast radius — more matched
+    /// spans, more markers, a longer stripper walk on every read. This
+    /// region is read by one scan and nothing else.
+    ///
+    /// [`OutputProcessor::render`]: OutputProcessor::process
+    pub carry_region: &'a [u8],
+    /// Absolute offset of `carry_region[0]`. Never later than
+    /// `window_start`, and equal to it when the buffer's tail is nearer.
+    pub carry_region_start: u64,
     /// First byte the caller asked for.
     pub req_start: u64,
     /// `buffer.head` at snapshot time.
@@ -250,8 +431,28 @@ pub struct ProcessedRead {
     pub truncated_at_tail: bool,
     pub truncated_for_size: bool,
     pub held_back: bool,
+    /// Which rule produced the boundary — `Some` exactly when
+    /// `held_back`, and `None` otherwise.
+    ///
+    /// **Why it is not a `truncated_for_size` variant.** A size cap is not
+    /// a holdback: `mcp/resources.rs` calls collapsing the two into one
+    /// flag "the fault to avoid", and `a_size_cap_is_not_a_holdback` pins
+    /// it. A size-capped read reports `held_back: false`,
+    /// `held_back_cause: None`, `truncated_for_size: true`. The two flags
+    /// can also both be true at once (`front_clipped`), which one merged
+    /// field could not express.
+    ///
+    /// **Why an unvouched region is not a value.** It is not a holdback
+    /// either, since 0.0.8: the read completes and the region carries a
+    /// `[REDACTED:unresolved]` marker, which `redactions` counts like any
+    /// other. See [`HeldBackCause`].
+    pub held_back_cause: Option<HeldBackCause>,
     pub next_cursor: Option<u64>,
     /// `kind -> count` for the redactions inside the returned range.
+    ///
+    /// Keyed by the rule's `kind`, except for [`redact::UNRESOLVED_KIND`],
+    /// which names no rule and counts the regions this window could not
+    /// vouch for (REQ-O-011a, GH #195).
     pub redactions: BTreeMap<String, usize>,
     /// An unfinished escape was dropped rather than withheld, because the
     /// child has exited or it exceeded `ansi_incomplete_max_bytes`. The
@@ -463,6 +664,86 @@ impl OutputProcessor {
         redact::merge_spans(spans)
     }
 
+    /// The earliest anchor in `[head − `[`UNVOUCHED_CARRY_BYTES`]`, head −
+    /// partial_secret_scan_bytes)` that is still alive at the end of the
+    /// window — the at-`buffer.head` half of GH #14, which no window size
+    /// reaches.
+    ///
+    /// **This is the hole `read_output` had at `head` and `resources/read`
+    /// has always had.** GH #14's declination was gated on `window_end <
+    /// w.head`, so a window that *reached* `head` cleared the bound by not
+    /// running the check rather than by resolving anything. A candidate
+    /// still unterminated at `head` matches no rule, so `find_spans`
+    /// reports nothing and the body goes out raw with `redactions: {}` and
+    /// no audit entry — and `resources/read`, a `tail_*` read and any
+    /// `max_bytes` large enough to reach `head` are **one mechanism with
+    /// three names**, all three doing it. Measured: a 12,350-byte buffer
+    /// holding an unterminated `-----BEGIN RSA PRIVATE KEY-----` gives 17
+    /// bytes with `held_back: true` at `max_bytes` 4,096 and the whole key
+    /// body, raw, at 8,192 and at every larger value.
+    ///
+    /// **Two bounds, and both of them are the point.**
+    ///
+    /// * The region **starts** at `head − UNVOUCHED_CARRY_BYTES`. A
+    ///   candidate anchored further back has had more evidence than the
+    ///   constant licenses and is not believed — the sliding window
+    ///   `attach/redact_stream.rs` already keeps. It is also what keeps
+    ///   this scan off the whole-buffer cost: `resources/read` judges up
+    ///   to 4 MiB, and `earliest_partial` walks a liveness automaton from
+    ///   every anchor it finds.
+    /// * The region **ends** at `head − partial_secret_scan_bytes`, where
+    ///   [`holdback_boundary`](Self::holdback_boundary)'s region begins.
+    ///   The two must not overlap: that one *shortens* and `tail_bytes`
+    ///   opts out of it (REQ-O-003), this one *masks* and nothing opts
+    ///   out of it but `redact: false`. An overlap would mask the
+    ///   in-flight partial REQ-O-003's paired fixture requires a
+    ///   `tail_bytes` read to return.
+    ///
+    /// `earliest_partial` and not `unresolved_from`: the trailing
+    /// value-run detector is a fact about a **window** edge, and at `head`
+    /// there is no window edge — there is the end of what has arrived,
+    /// which is §4.1's question and is answered *targeted*. Running it
+    /// here would stamp a marker over the last partial word of every read.
+    ///
+    /// **The scan reads to `window_end` and the *answer* is filtered, and
+    /// the two are not interchangeable.** `earliest_partial`'s third
+    /// condition is *the rule's own anchored regex does not match yet* —
+    /// asked of `region[i..]`, so a region cut at `head −
+    /// partial_secret_scan_bytes` cannot see a terminator that lands after
+    /// it. Scanning the cut region directly called a **completely
+    /// terminated** `-----BEGIN…-----END` block in flight, and because it
+    /// overlapped the real `private-key` span, `merge_spans` weakened the
+    /// whole match to `unresolved`: a correct, rule-named redaction turned
+    /// into an anonymous one, and `status.redaction_stats` lost the kind.
+    /// Reading to `window_end` and discarding an answer at or after
+    /// `carry_end` gives the same region ownership with the whole
+    /// terminator in evidence, and it is exact rather than conservative
+    /// because the scan returns the **earliest** qualifying anchor: if
+    /// that one is at or after `carry_end`, there is none before it.
+    /// Pinned by `a_terminated_key_block_keeps_its_own_kind_at_head`.
+    fn unvouched_carry(&self, w: &WindowSnapshot<'_>, window_end: u64) -> Option<u64> {
+        let region_start = w.carry_region_start;
+        let carry_end = w
+            .head
+            .saturating_sub(self.limits.partial_secret_scan_bytes as u64)
+            .clamp(region_start, window_end);
+        let carry_start = w
+            .head
+            .saturating_sub(UNVOUCHED_CARRY_BYTES as u64)
+            .clamp(region_start, carry_end);
+        if carry_start >= carry_end {
+            return None;
+        }
+        let at = |off: u64| (off - region_start) as usize;
+        self.index
+            .earliest_partial(
+                &self.rules,
+                &w.carry_region[at(carry_start)..at(window_end)],
+                carry_start,
+            )
+            .filter(|u| *u < carry_end)
+    }
+
     /// Run the pipeline over a snapshot. Pure: no locks, no I/O.
     pub fn process(&self, w: &WindowSnapshot<'_>, opts: &ReadOptions) -> ProcessedRead {
         let window_end = w.window_start + w.window.len() as u64;
@@ -475,6 +756,10 @@ impl OutputProcessor {
         // read would end inside an unfinished escape sequence.
         let mut dropped_incomplete_escape = false;
         let mut safety_end = bound;
+        // Which term is currently *binding*, so the response can say which
+        // of `held_back`'s rules stopped it. Recomputed rather than
+        // inferred: `process` already knows, because it computed it.
+        let mut cause = (holdback < w.cap_end).then_some(HeldBackCause::InFlightSecret);
         if opts.ansi == AnsiMode::Strip {
             let scan_end = bound.clamp(w.window_start, window_end);
             let mut probe = AnsiStripper::new();
@@ -486,13 +771,36 @@ impl OutputProcessor {
             }
             if let Some(seq_start) = probe.pending_start() {
                 let seq_len = scan_end.saturating_sub(seq_start);
-                if w.child_alive && seq_len <= self.limits.ansi_incomplete_max_bytes as u64 {
+                // **`seq_start > w.req_start` is the third condition, and
+                // without it REQ-O-008's withhold is a permanent wedge**
+                // (GH #195, found by PR #215). The withhold is transient
+                // *because* the next read starts at the introducer and
+                // scans `max_bytes` past it, so the sequence exceeds
+                // `ansi_incomplete_max_bytes` and is dropped instead. That
+                // argument needs `max_bytes > ansi_incomplete_max_bytes`:
+                // below it, `cap_end` is `req_start + max_bytes`, it stops
+                // tracking `buffer.head`, and the pending sequence is the
+                // same length on every retry for ever. Measured at
+                // `max_bytes` 1/8/32/64 — zero bytes, cursor frozen, 300 KB
+                // of later output not moving it — and clearing at 65.
+                //
+                // Pulling the read end back to `req_start` returns nothing,
+                // so the withhold buys the caller no bytes and costs it
+                // every byte. Dropping is what the two existing arms
+                // already do when waiting cannot pay, and the stripper
+                // emits nothing for those bytes either way;
+                // `dropped_incomplete_escape` says so.
+                if w.child_alive
+                    && seq_len <= self.limits.ansi_incomplete_max_bytes as u64
+                    && seq_start > w.req_start
+                {
                     // The child may still finish it: withhold the tail.
                     safety_end = seq_start;
+                    cause = Some(HeldBackCause::IncompleteEscape);
                 } else {
                     // A dead child never will, and neither will one that
-                    // has already exceeded the cap. Drop it; the stripper
-                    // emits nothing for those bytes anyway.
+                    // has already exceeded the cap — nor one where waiting
+                    // would return the caller nothing at all.
                     dropped_incomplete_escape = true;
                 }
             }
@@ -520,51 +828,181 @@ impl OutputProcessor {
         // Raising the constant is not the fix: any bound is exceeded by
         // one more byte, and it does not reach a rule with **no indexed
         // prefix**, which gets no holdback at any window size. What closes
-        // the class is noticing that the evidence ran out mid-candidate
-        // and declining — `unresolved_from` reports the earliest offset
-        // this window cannot vouch for, and the read stops there.
+        // the class is noticing that the evidence ran out mid-candidate —
+        // `unresolved_from` reports the earliest offset this window cannot
+        // vouch for.
         //
-        // Three conditions, each load-bearing:
+        // **What the read then does with that offset is one
+        // `[REDACTED:unresolved]` over the region, and not a withhold
+        // (GH #195).** Until 0.0.8 it was a withhold, and the withhold had
+        // two ends and both of them were wrong:
         //
-        // 1. **`opts.redact`** — the audited hatch disables the holdback
-        //    with the redaction, and this is a holdback (§4.1).
-        // 2. **`window_end < w.head`** — the window really was truncated.
-        //    When it reaches `head` the redactor has seen every byte that
-        //    exists, and the only in-flight question left is the one
-        //    `holdback_boundary` already answers over the tail region.
-        //    Applying this bound there too would decline the trailing
-        //    partial word of every read — `buffer.head` lands mid-word
-        //    constantly — and make `held_back` routine, which is the rev.
-        //    10–14 failure the *targeted* holdback exists to avoid.
-        // 3. **no span already covers it to the window's edge** — an
-        //    unbounded *greedy* rule matches right up to the last byte of
-        //    the window, so `render` emits one marker over the whole
-        //    unjudgeable region and no raw byte escapes. Declining as well
-        //    would trade a correct marker and full progress for a withhold
-        //    that buys nothing.
+        // * **It never released.** The bound is a function of
+        //   `since_cursor`, `max_bytes` and bytes already in the buffer —
+        //   not of `buffer.head` — so the identical read returns the
+        //   identical boundary for ever. Measured on this repository's own
+        //   `CHANGELOG.md`, which contains `-----BEGIN RSA PRIVATE
+        //   KEY-----` as **prose**: `buffer.head` 136,206, read 1 returns
+        //   32,768 B, read 2 returns 9,990 B and pins at 42,758, and reads
+        //   3 through 9 return **zero bytes with the cursor frozen**.
+        //   §4.1's `held_back` + `next_cursor` say *retry*, and retrying is
+        //   what does not work.
+        // * **It was selected by the shape of a regex rather than by
+        //   risk.** The old condition 3 — "no span already covers it to the
+        //   window's edge" — exempted an unbounded *greedy* rule, because
+        //   such a rule matches to the last byte of the window and `render`
+        //   already emits one marker over the whole unjudgeable region with
+        //   full progress. That is the right answer, and a **lazy** rule
+        //   never reaches the window edge, so `private-key-block`'s
+        //   `[\s\S]*?` got the withhold instead. Identical risk, opposite
+        //   handling, decided by how somebody wrote the quantifier.
         //
-        // No marker is emitted, because nothing is consumed and there is
-        // nothing to substitute; §4.1's `held_back` + `next_cursor` are
-        // how the caller is told, exactly as for an in-flight secret. The
-        // recourse is a larger `max_bytes` — `read_output` clamps to
-        // `MAX_READ_MAX_BYTES`, which puts `head` back inside the window —
-        // or a `tail_*` read, or the audited `redact: false`. The residual
-        // is a secret longer than that ceiling plus the lookahead: it
-        // stays withheld from cursor reads, which is the safe direction
-        // and is what REQ-O-005 already licenses.
-        if opts.redact && window_end < w.head {
-            let unresolved = self
-                .index
-                .unresolved_from(&self.rules, w.window, w.window_start)
-                .filter(|u| !spans.iter().any(|s| s.start <= *u && s.end >= window_end));
+        // So the greedy arm's answer is now every arm's answer, and it
+        // is the one the `attach`/`watch` stream already gives: one
+        // `[REDACTED:unresolved]` over the region it cannot judge,
+        // bounded by its carry window. REQ-O-011a names the marker as
+        // the one a bounded window emits for *"a match the window cannot
+        // judge"*; this is a bounded window.
+        //
+        // **`get_screen_state` is not a third example, and an earlier
+        // draft of this comment listed it as one.** It masks the cells
+        // where the live render differs from the render at
+        // `holdback_boundary`, which is driven by `unvouched_boundary`
+        // over the trailing `partial_secret_scan_bytes` — so it masks an
+        // in-flight *prefix* and has no handling at all for a candidate
+        // anchored further back. Measured on one buffer in one moment,
+        // `read_output` returns one marker and the grid returns 39 raw
+        // body lines. That is pre-existing and outside this change, but
+        // it is the gap this change opens *between* the two surfaces and
+        // it should not be described as prior art for it.
+        //
+        // **A mask is legal here where a view-driven *withhold* is not.**
+        // `holdback_boundary` explains the asymmetry: a shortened read
+        // cannot be revised, so a wrong withhold is permanent. A mask
+        // denies no range and moves no cursor backwards — the read
+        // completes, the caller may read the same cursor again, and
+        // `redact: false` is the audited hatch that was always the
+        // recourse. Nothing is destroyed that a withhold was not already
+        // destroying, and the caller gets the rest of its page.
+        //
+        // Three conditions survive, each still load-bearing:
+        //
+        // 1. **`opts.redact`** — the audited hatch disables redaction, and
+        //    a marker is redaction (§4.1).
+        // 2. **which detector answers**, which turns on whether the window
+        //    reaches `buffer.head`:
+        //    * *Truncated* (`window_end < w.head`) — `unresolved_from`,
+        //      both its detectors. The window was cut by
+        //      `redaction_lookahead_bytes` and everything past it is
+        //      already in the buffer, so a trailing run of value bytes is
+        //      evidence of a match running off a **window** edge.
+        //    * *At `head`* — the anchored detector only, over
+        //      [`UNVOUCHED_CARRY_BYTES`] and stopping where
+        //      `holdback_boundary`'s region begins. At `head` what follows
+        //      has not arrived rather than been cut, which is §4.1's
+        //      question and REQ-O-003 answers it *targeted*: an indexed
+        //      prefix inside `partial_secret_scan_bytes`. Running the
+        //      trailing-run detector here instead would stamp a marker over
+        //      the last partial word of every read — `buffer.head` lands
+        //      mid-word constantly — which is the rev. 10–14 failure
+        //      wearing a marker instead of a flag.
+        //
+        //      **The two regions are disjoint on purpose.**
+        //      `holdback_boundary` owns `[head − partial_secret_scan_bytes,
+        //      head)` and *shortens*, and `tail_lines`/`tail_bytes` opt out
+        //      of it (REQ-O-003). This scan owns `[head −
+        //      UNVOUCHED_CARRY_BYTES, head − partial_secret_scan_bytes)`
+        //      and *masks*, and nothing opts out of it but `redact: false`,
+        //      because a mask is redaction and the `tail_*` licence is a
+        //      licence to bypass the holdback and nothing else. Overlapping
+        //      them would mask the in-flight partial REQ-O-003's paired
+        //      fixture requires a `tail_bytes` read to return.
+        //
+        //      **This bounds the at-`head` half at the front, and that
+        //      narrows GH #14's residual there rather than closing it.**
+        //      An anchor further back than `UNVOUCHED_CARRY_BYTES` is not
+        //      found, so nothing is masked and the body is released
+        //      exactly as `v0.0.7` released it. The bound is not symmetry:
+        //      `earliest_partial` carries no GH #163 ceiling and walks a
+        //      liveness automaton from every anchor to the end of its
+        //      region, so an uncapped scan over a 1 MiB `resources/read`
+        //      window is quadratic in a buffer an agent controls. The
+        //      truncated branch can afford the whole window because
+        //      `unresolved_from` *is* ceilinged. The visible consequence
+        //      is that protection is **non-monotonic in `max_bytes`** on
+        //      one buffer at one cursor — a smaller read truncates its
+        //      window, takes the other branch, and finds an anchor the
+        //      larger read does not. Pinned, in both directions, by
+        //      `at_head_an_anchor_beyond_the_carry_is_released_and_one_inside_it_is_not`.
+        // 3. **no span already covers it to the window's edge** — the
+        //    greedy case above. A correct, rule-named marker is strictly
+        //    better than an `unresolved` one over the same bytes, and
+        //    `merge_spans` would otherwise weaken the name.
+        //
+        // The recourse for a caller who wants the masked bytes is
+        // unchanged and is the only one that ever worked: the audited
+        // `redact: false`. "A larger `max_bytes`" is **not** a general
+        // recourse and never was — measured on a 338,264 B buffer bound at
+        // 25,644, every one of 32,768 / 65,536 / 131,072 / 262,144 and the
+        // clamped 262,145 returned zero bytes with the cursor frozen.
+        if opts.redact {
+            let unresolved = if window_end < w.head {
+                // `carry_region` and not `window`: see the field's own
+                // doc. A read that starts inside a region a *previous*
+                // read masked has to reach the same verdict, and the
+                // anchor that produced it is up to
+                // `UNVOUCHED_CARRY_BYTES` behind `req_start` — six times
+                // further back than `lookbehind_bytes` reaches.
+                self.index
+                    .unresolved_from(&self.rules, w.carry_region, w.carry_region_start)
+            } else {
+                self.unvouched_carry(w, window_end)
+            }
+            // `<` and not `<=`: at a tie the read stops in the same place
+            // either way, and a span that begins exactly where the read
+            // already ends covers no byte the caller receives.
+            .filter(|u| *u < safety_end)
+            .filter(|u| !spans.iter().any(|s| s.start <= *u && s.end >= window_end));
             if let Some(u) = unresolved {
-                safety_end = safety_end.min(u);
+                // **The marker reaches [`UNVOUCHED_CARRY_BYTES`] past the
+                // anchor and no further, and that cap is the whole of what
+                // this change costs.** The region `[u, window_end)` is
+                // genuinely unjudgeable in full — if the match ended inside
+                // the window `find_spans` would have found it, so a real
+                // match covers every byte of it — but masking all of it
+                // scales the damage with `max_bytes`, which the caller
+                // chooses: measured over 5.79 MB of this repository's
+                // Rust, uncapped masking costs 38.65% at a 4 MiB read
+                // where the cap costs 0.28%.
+                //
+                // Past the cap the candidate is not believed. That is the
+                // same trade `attach/redact_stream.rs` already makes at the
+                // same number — its `2 × STREAM_CARRY_BYTES` sliding window
+                // forgets an opening prefix and resumes mid-body, stated as
+                // §9.2's residual (a) — so a cursor read is now neither
+                // weaker nor stronger than the live stream rendering the
+                // same bytes, which is what REQ-O-011a asks of a stream
+                // ("never weaker than the tool it renders") read the other
+                // way round.
+                let end = (u + UNVOUCHED_CARRY_BYTES as u64).min(window_end);
+                spans.push(redact::Span::unresolved(u, end));
+                spans = redact::merge_spans(spans);
             }
         }
 
         let mut read_end = safety_end.max(w.req_start).min(w.cap_end);
         let held_back = safety_end < w.cap_end;
         let truncated_for_size = w.front_clipped || (w.cap_end < w.head && w.cap_end <= safety_end);
+        // `held_back` and its cause answer the same question and must
+        // never disagree. `then_some(..).flatten()` rather than `cause`:
+        // the escape arm can set a cause at a `seq_start` that `cap_end`
+        // then equals, which is a boundary nobody is held back at.
+        let held_back_cause = held_back.then_some(cause).flatten();
+        debug_assert_eq!(
+            held_back,
+            held_back_cause.is_some(),
+            "held_back and its cause answer the same question and must never disagree"
+        );
 
         // **The continuation cursor must never land inside a secret.**
         //
@@ -676,6 +1114,7 @@ impl OutputProcessor {
             truncated_at_tail: w.truncated_at_tail,
             truncated_for_size,
             held_back,
+            held_back_cause,
             next_cursor: (held_back || truncated_for_size).then_some(read_end),
             redactions,
             dropped_incomplete_escape,
@@ -713,9 +1152,12 @@ impl OutputProcessor {
                         stripper.feed(o, w.window[(o - w.window_start) as usize]);
                     }
                     if span.end > w.req_start && span.start < read_end {
-                        let kind = &self.rules.rules[span.rule].kind;
+                        // `span_kind` and not `rules.rules[span.rule]`: a
+                        // span may be the synthetic `unresolved` one,
+                        // whose `rule` names no rule by construction.
+                        let kind = redact::span_kind(&self.rules, span);
                         out.extend_from_slice(redact::marker(kind).as_bytes());
-                        *redactions.entry(kind.clone()).or_insert(0) += 1;
+                        *redactions.entry(kind.to_string()).or_insert(0) += 1;
                     }
                     off = span.end;
                     continue;
@@ -777,9 +1219,14 @@ mod tests {
         let window_start = req_start.saturating_sub(proc.limits.lookbehind_bytes as u64);
         let window_end = (cap_end + proc.limits.lookahead_bytes as u64).min(head);
         let scan_start = head.saturating_sub(proc.limits.partial_secret_scan_bytes as u64);
+        let carry_start = req_start
+            .saturating_sub(UNVOUCHED_CARRY_BYTES as u64)
+            .min(window_start);
         WindowSnapshot {
             window: &buffer[window_start as usize..window_end as usize],
             window_start,
+            carry_region: &buffer[carry_start as usize..window_end as usize],
+            carry_region_start: carry_start,
             tail_region: &buffer[scan_start as usize..head as usize],
             tail_region_start: scan_start,
             req_start,
@@ -1326,18 +1773,84 @@ mod tests {
     /// Widening the window is not the fix and is not what this pins: any
     /// bound is exceeded by one more byte, and the next size of key is one
     /// `cat` away. What the read owes its caller is to notice that its
-    /// evidence ran out mid-candidate and decline — which is what
-    /// `PrefixIndex::unresolved_from` reports and what §4.1 promises
-    /// everywhere else.
+    /// evidence ran out mid-candidate — which is what
+    /// `PrefixIndex::unresolved_from` reports — and to **say so in the
+    /// payload**: one `[REDACTED:unresolved]` over the region, and the
+    /// read completes.
+    ///
+    /// **This row asserted a withhold until GH #195, and the withhold was
+    /// a wedge.** The fixture below is an *unterminated* key rather than
+    /// the terminated one the row used to carry, and the difference is the
+    /// whole subject: a terminated block matches `private-key-block` the
+    /// moment the window reaches its footer and was never the leak.
+    ///
+    /// **The guarantee is now stated with its bound, and both halves are
+    /// asserted.** A candidate is believed for [`UNVOUCHED_CARRY_BYTES`]
+    /// past its anchor. Within that, **no raw byte on any surface** — and
+    /// measured against `origin/main`, that is a strict gain rather than a
+    /// concession: an 8 KB unterminated key, which is an ordinary
+    /// RSA-8192 one, came back **entirely raw with `redactions: {}` on
+    /// every surface including the default cursor read**, because the
+    /// window reached `buffer.head` and the declination was gated on its
+    /// not doing so. Past the bound the candidate is not believed and the
+    /// remainder is released, which is `attach/redact_stream.rs`'s
+    /// shipped residual (a) at the same number.
+    ///
+    /// The residual is asserted rather than described, because a residual
+    /// nobody measures is a residual that quietly grows.
     #[test]
     fn a_private_key_longer_than_the_lookahead_window_is_never_emitted_raw() {
         let p = processor();
-        let (pem, body) = pem_longer_than(64 * 1024);
+        let carry = UNVOUCHED_CARRY_BYTES as u64;
         let prologue = "$ cat chain.pem\n";
-        let buf = format!("{prologue}{pem}\n$ echo done\n").into_bytes();
 
-        // `read_output`'s own default (`DEFAULT_READ_MAX_BYTES`), so this
-        // is an ordinary call and not a cap contrived to split anything.
+        // ---- arm 1: a key that fits inside the carry. Every surface.
+        let (short_pem, short_body) = pem_longer_than(8 * 1024);
+        let short = format!("{prologue}{}\n", &short_pem[..short_pem.len() - 30]).into_bytes();
+        assert!(
+            !String::from_utf8_lossy(&short).contains("-----END"),
+            "the fixture must be unterminated, which is the shape that leaks"
+        );
+        assert!(
+            (short.len() as u64) < carry,
+            "arm 1 must fit inside the carry or it is arm 2"
+        );
+        // **Probed by line name, not by byte window.** Every body line is
+        // `KEYBODY<n>` then the same 26-character filler, so a 48-byte
+        // window that starts past column 13 is identical in every line and
+        // a `contains` on one proves nothing about where it came from. The
+        // names are unique and each one names its own line.
+        let lines = short_body.len() / 65 + 1;
+        for cap in [4096usize, 32 * 1024, 256 * 1024, 4 * 1024 * 1024] {
+            let w = snapshot(&p, &short, 0, cap, true, false);
+            let r = p.process(&w, &ReadOptions::default());
+            for i in 0..lines {
+                assert!(
+                    !r.output.contains(&format!("KEYBODY{i:06}")),
+                    "max_bytes {cap}: key body line {i} leaked"
+                );
+            }
+            assert!(
+                !r.output.contains(&short_body[..48]),
+                "max_bytes {cap}: the body's own first bytes leaked"
+            );
+            assert_eq!(
+                r.output,
+                format!("{prologue}[REDACTED:unresolved]"),
+                "max_bytes {cap}: one marker over the whole unjudgeable region"
+            );
+            assert_eq!(r.redactions.get(redact::UNRESOLVED_KIND), Some(&1));
+            assert!(!r.held_back, "max_bytes {cap}: masked, not withheld");
+            assert_eq!(
+                r.cursor,
+                short.len() as u64,
+                "max_bytes {cap}: the read made full progress"
+            );
+        }
+
+        // ---- arm 2: a key longer than the carry, read at the default.
+        let (pem, body) = pem_longer_than(64 * 1024);
+        let buf = format!("{prologue}{}\n", &pem[..pem.len() - 30]).into_bytes();
         const CAP: usize = 32 * 1024;
         assert!(
             CAP as u64 + p.limits.lookahead_bytes as u64 + 1 < buf.len() as u64,
@@ -1347,25 +1860,51 @@ mod tests {
         let w = snapshot(&p, &buf, 0, CAP, true, false);
         let r = p.process(&w, &ReadOptions::default());
 
-        // THE HARM, stated as bytes: no run of key body may appear in a
-        // response §4.1 says is redacted. Sampled rather than swept —
-        // the body is 64 KB and every 48-byte window of it is unique.
-        for start in (0..body.len() - 48).step_by(251) {
+        // THE GUARANTEE: no line of key body inside the carry, by name.
+        // The anchor is the `-----BEGIN` at `prologue.len()`; the header
+        // and its newline are 32 bytes, so body line `i` begins at
+        // `anchor + 32 + 65 i`.
+        let anchor = prologue.len() as u64;
+        let line_at = |i: usize| anchor + 32 + 65 * i as u64;
+        let last_masked = (0..body.len() / 65)
+            .take_while(|i| line_at(*i) + 65 <= anchor + carry)
+            .last()
+            .expect("the carry covers whole lines");
+        assert!(last_masked > 200, "the masked run must be substantial");
+        for i in 0..=last_masked {
             assert!(
-                !r.output.contains(&body[start..start + 48]),
-                "key body from offset {start} leaked"
+                !r.output.contains(&format!("KEYBODY{i:06}")),
+                "key body line {i} is inside the carry and leaked"
             );
         }
-        // …and the exact payload, because the absence check alone passes
-        // against an implementation that returns nothing at all.
-        assert_eq!(r.output, prologue);
-        assert!(r.held_back, "the read stopped because it could not vouch");
-        assert_eq!(r.next_cursor, Some(prologue.len() as u64));
-        assert_eq!(r.bytes_returned, prologue.len());
+        assert_eq!(r.redactions.get(redact::UNRESOLVED_KIND), Some(&1));
+        assert!(r
+            .output
+            .starts_with(&format!("{prologue}[REDACTED:unresolved]")));
+        assert!(!r.held_back, "the read is masked, not withheld");
+        assert_eq!(r.bytes_returned, CAP, "…and it made its full progress");
+        // The extent, arithmetically. Probing by line name pins the
+        // residual only at 65-byte granularity, so a mask one byte short
+        // or one byte long survives it; this does not.
+        let marker = redact::marker(redact::UNRESOLVED_KIND);
+        assert_eq!(
+            r.output.len(),
+            (anchor as usize) + marker.len() + (CAP - anchor as usize - carry as usize),
+            "prologue, one marker, and exactly the bytes past the carry"
+        );
+
+        // THE RESIDUAL, asserted in the same breath: past the carry the
+        // candidate is not believed and its bytes are released. Without
+        // this arm the row above passes against an implementation that
+        // masks unboundedly, which is a different and much more expensive
+        // trade than the one that was taken — measured at 38.65% of
+        // this repository's Rust against this bound's 0.28%, on a 4 MiB
+        // read.
         assert!(
-            r.redactions.is_empty(),
-            "nothing was substituted — the bytes were declined, not replaced: {:?}",
-            r.redactions
+            r.output.contains(&format!("KEYBODY{:06}", last_masked + 2)),
+            "the residual moved: a candidate past {carry} bytes of evidence \
+             is no longer believed, and this row is what makes that a \
+             measurement rather than a footnote"
         );
     }
 
@@ -1395,6 +1934,966 @@ mod tests {
         assert_eq!(r.redactions.get("private-key"), Some(&1));
         assert!(!r.output.contains(&body[..48]));
         assert_eq!(r.cursor, buf.len() as u64, "the read made full progress");
+    }
+
+    // ------------------------------------------- GH #195: the paging wedge
+
+    /// **GH #195's reproduction, on the corpus the issue was filed
+    /// against: this repository's own documentation.**
+    ///
+    /// `CHANGELOG.md` contains `-----BEGIN RSA PRIVATE KEY-----` as
+    /// **prose**, in the paragraph describing this very holdback rule.
+    /// `private-key-block` is anchored at both ends, the opening anchor is
+    /// found, `-----END` never arrives, and before 0.0.8 the read stopped
+    /// at that anchor on every retry for ever: measured at `buffer.head`
+    /// 136,206 — read 1 returning 32,768 B, read 2 returning 9,990 B and
+    /// pinning at 42,758, and reads 3 through 9 returning **zero bytes
+    /// with the cursor frozen**.
+    ///
+    /// The file is read from disk rather than synthesised, and that is
+    /// the point: a fixture spelling the anchor out is a fixture that
+    /// passes when somebody reverts the fix and edits the fixture. This
+    /// one goes red if the corpus stops containing the shape *or* if the
+    /// shape stops being handled, and the first assertion tells the two
+    /// apart.
+    #[test]
+    fn the_documented_read_loop_drains_this_repositorys_own_changelog() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let mut buf = Vec::new();
+        for name in ["CHANGELOG.md", "README.md", "ROADMAP.md"] {
+            buf.extend_from_slice(
+                &std::fs::read(root.join(name)).expect("the repository's own docs"),
+            );
+        }
+        // The row is about a corpus that contains the shape. If it stops
+        // containing one, this row proves nothing and must say so rather
+        // than pass.
+        assert!(
+            buf.windows(31)
+                .any(|w| w == b"-----BEGIN RSA PRIVATE KEY-----"),
+            "the corpus no longer contains GH #195's shape, so this row \
+             would pass against the wedge it exists to forbid"
+        );
+
+        let p = processor();
+        let o = ReadOptions::default();
+        let mut cursor = 0u64;
+        let mut reads = 0usize;
+        let mut saw_marker = false;
+        while cursor < buf.len() as u64 {
+            reads += 1;
+            assert!(reads <= 32, "the read loop did not terminate");
+            let w = snapshot(&p, &buf, cursor, 32 * 1024, true, false);
+            let r = p.process(&w, &o);
+            assert!(
+                r.cursor > cursor,
+                "read {reads} returned {} bytes and left the cursor at \
+                 {cursor}: that is GH #195",
+                r.bytes_returned
+            );
+            saw_marker |= r.redactions.contains_key(redact::UNRESOLVED_KIND);
+            cursor = r.cursor;
+        }
+        assert_eq!(
+            cursor,
+            buf.len() as u64,
+            "the loop must consume the corpus, not merely terminate"
+        );
+        // **Relative to the corpus, not an absolute.** These three files
+        // grow, and an absolute bound goes red from documentation growth
+        // alone — which would be misdiagnosed as the wedge returning. The
+        // property is "one read per `max_bytes`, plus one for the mask's
+        // overshoot", and that is what a regression would break.
+        let floor = buf.len().div_ceil(32 * 1024);
+        assert!(
+            reads <= floor + 2,
+            "the default loop drains {} B in {reads} reads against a floor \
+             of {floor}; a count that has grown is the wedge coming back by \
+             degrees",
+            buf.len()
+        );
+        assert!(
+            saw_marker,
+            "the prose anchor must be reported as unresolved rather than \
+             silently released — without this the row passes against a \
+             fix that simply deleted the check"
+        );
+    }
+
+    /// **The gap between surfaces, closed and asserted in both
+    /// directions** (GH #14 at `buffer.head`, GH #195).
+    ///
+    /// GH #14's declination was gated on `window_end < w.head`, so a
+    /// window that *reached* `head` cleared the bound by not running the
+    /// check. `resources/read`, a `tail_*` read and any `max_bytes` large
+    /// enough are **one mechanism with three names**, and all three
+    /// returned an unterminated candidate's body raw with
+    /// `redactions: {}`.
+    ///
+    /// Measured against `origin/main` on this fixture: **every** row of
+    /// the loop below returned the whole key body raw, including the
+    /// plain default cursor read, because an 8 KB key fits inside the
+    /// window. That is the ordinary case — `cat id_rsa` on a fresh
+    /// session — and it is the one the old gate never protected.
+    ///
+    /// **Paired with the two things that must still work**, or the row
+    /// passes against an implementation that masks everything: the
+    /// audited `redact: false` still returns the bytes, and a `tail_*`
+    /// read still returns §4.1's in-flight partial, which REQ-O-003
+    /// requires and which an overlap between this scan's region and
+    /// `holdback_boundary`'s would have destroyed.
+    #[test]
+    fn an_unterminated_key_is_masked_on_every_surface_that_reaches_head() {
+        let p = processor();
+        let (pem, body) = pem_longer_than(8 * 1024);
+        let prologue = "$ cat id_rsa\n";
+        let unterminated = &pem[..pem.len() - 30];
+        assert!(!unterminated.contains("-----END"));
+        let buf = format!("{prologue}{unterminated}\n").into_bytes();
+        assert!(
+            (buf.len() as u64) < UNVOUCHED_CARRY_BYTES as u64,
+            "arm 1 is about a key inside the carry"
+        );
+        let lines = body.len() / 65 + 1;
+
+        // `4096` is smaller than the buffer and `32 KiB` larger, so the
+        // loop crosses the truncated/at-head boundary; 256 KiB is
+        // `read_output`'s ceiling and 4 MiB is `resources/read`'s.
+        for cap in [4096usize, 32 * 1024, 256 * 1024, 4 * 1024 * 1024] {
+            let w = snapshot(&p, &buf, 0, cap, true, false);
+            let r = p.process(&w, &ReadOptions::default());
+            for i in 0..lines {
+                assert!(
+                    !r.output.contains(&format!("KEYBODY{i:06}")),
+                    "max_bytes {cap}: body line {i} raw — the surfaces disagree"
+                );
+            }
+            assert_eq!(
+                r.output,
+                format!("{prologue}[REDACTED:unresolved]"),
+                "max_bytes {cap}"
+            );
+            assert_eq!(r.redactions.get(redact::UNRESOLVED_KIND), Some(&1));
+            assert!(!r.held_back, "max_bytes {cap}: masked, not withheld");
+            assert_eq!(r.cursor, buf.len() as u64, "max_bytes {cap}");
+        }
+
+        // The audited hatch is unchanged: it is the recourse, and a mask
+        // that survived it would be a hole in the recourse.
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        let raw = p.process(
+            &w,
+            &ReadOptions {
+                redact: false,
+                ..Default::default()
+            },
+        );
+        assert!(
+            raw.output.contains("KEYBODY000000"),
+            "`redact: false` is the audited way past every marker"
+        );
+
+        // And §4.1's in-flight partial still reaches a `tail_*` read: the
+        // carry scan stops where `holdback_boundary`'s region begins.
+        let arriving = b"line one\nghp_abcdef".to_vec();
+        let w = snapshot(&p, &arriving, 9, 32 * 1024, true, true);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(
+            r.output, "ghp_abcdef",
+            "REQ-O-003's opt-in must still return the in-flight partial; \
+             an unvouched scan overlapping the trailing region masks it"
+        );
+    }
+
+    /// **A continuation read that begins *inside* a masked region reaches
+    /// the same verdict, and that is what `carry_region` is for.**
+    ///
+    /// When a read masks `[u, u + UNVOUCHED_CARRY_BYTES)` the cursor lands
+    /// somewhere inside that range, and the *next* read has to find the
+    /// same anchor or it releases the rest of the candidate raw — GH #14
+    /// re-entered from the other side, and strictly worse than the wedge
+    /// it replaced. `lookbehind_bytes` is 512 and a believed candidate
+    /// reaches 16 KiB back, so the window cannot answer it: the anchor is
+    /// not among the bytes `process` holds. `WindowSnapshot::carry_region`
+    /// is the extra lookbehind that makes it visible.
+    ///
+    /// Two mutations survived every other row in this file before this
+    /// one existed — `carry_region` swapped back to `window` here, and
+    /// `session/mod.rs` handing `window_start` as `carry_region_start` —
+    /// and both of them are a private key body on the wire.
+    ///
+    /// The paging step is deliberately small (512 B), because the
+    /// property is about a cursor landing *strictly between* the anchor
+    /// and the end of the carry, and a default-sized read consumes the
+    /// whole carry in one step and never produces one. The row asserts
+    /// that such a read happened before it asserts anything about it.
+    #[test]
+    fn a_continuation_read_inside_a_masked_region_still_masks() {
+        let carry = UNVOUCHED_CARRY_BYTES as u64;
+        let (pem, _) = pem_longer_than(64 * 1024);
+        let prologue = "$ cat id_rsa\n";
+        let buf = format!("{prologue}{}\n", &pem[..pem.len() - 30]).into_bytes();
+        let anchor = prologue.len() as u64;
+        // Body line `i` begins at `anchor + 32 + 65 i`; the header and its
+        // newline are 32 bytes. A line wholly inside the carry must never
+        // appear raw.
+        let line_at = |i: usize| anchor + 32 + 65 * i as u64;
+        let last_in_carry = (0..1000)
+            .take_while(|i| line_at(*i) + 65 <= anchor + carry)
+            .last()
+            .expect("the carry covers whole body lines");
+        assert!(last_in_carry > 200);
+
+        let mut cursor = 0u64;
+        let mut markers = 0usize;
+        let mut reads = 0usize;
+        let mut resumed_inside = false;
+        while cursor < anchor + carry {
+            reads += 1;
+            assert!(reads <= 64, "the paging loop did not terminate");
+            if cursor > anchor && cursor < anchor + carry {
+                resumed_inside = true;
+            }
+            let r = read(&buf, cursor, 512);
+            assert!(r.cursor > cursor, "read {reads} made no progress");
+            for i in 0..=last_in_carry {
+                assert!(
+                    !r.output.contains(&format!("KEYBODY{i:06}")),
+                    "read {reads} from cursor {cursor} released body line {i}, \
+                     which is inside the carry"
+                );
+            }
+            markers += r
+                .redactions
+                .get(redact::UNRESOLVED_KIND)
+                .copied()
+                .unwrap_or(0);
+            cursor = r.cursor;
+        }
+        assert!(
+            resumed_inside,
+            "no read began strictly inside the masked region, so this row \
+             asserted nothing about a continuation"
+        );
+        assert!(
+            markers >= 2,
+            "only {markers} read masked; the continuation must mask too, \
+             not merely decline to leak by returning nothing"
+        );
+
+        // Paired: past the carry the candidate is not believed, so the row
+        // above cannot pass against an implementation that masks for ever.
+        let after = read(&buf, anchor + carry, 512);
+        assert!(after.redactions.is_empty(), "{:?}", after.redactions);
+        assert!(after.output.contains("KEYBODY"));
+    }
+
+    /// **`held_back` and `held_back_cause` never disagree, swept rather
+    /// than argued.**
+    ///
+    /// `process` clamps the cause with `held_back.then_some(cause)
+    /// .flatten()`. Mutating that to a bare `cause` **survives** every
+    /// row here, and the reason is that it is an equivalent mutant on the
+    /// two causes that exist: each one lowers `safety_end` below
+    /// `cap_end` in the same statement that sets it. The clamp is kept
+    /// because a third cause need not, and this sweep is what would go
+    /// red if one were added that did not — which is the thing worth
+    /// catching, and is not the mutation.
+    #[test]
+    fn a_cause_is_reported_exactly_when_something_was_held_back() {
+        let p = processor();
+        let o = ReadOptions::default();
+        let bodies: [&[u8]; 6] = [
+            b"ordinary output\n",
+            b"line one\nghp_abcdef",
+            b"done\x1b[0",
+            b"done\x1b[0m and more\n",
+            b"export TOKEN=ghp_0123456789abcdefghij",
+            b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKC",
+        ];
+        let mut swept = 0usize;
+        let mut held = 0usize;
+        for body in bodies {
+            for pad in [0usize, 1, 7, 64, 513, 8193] {
+                let mut buf = vec![b'.'; pad];
+                buf.extend_from_slice(body);
+                for req_start in [0u64, 1, pad as u64, buf.len() as u64] {
+                    if req_start > buf.len() as u64 {
+                        continue;
+                    }
+                    for max_bytes in [1usize, 8, 64, 65, 512, 8192, 32 * 1024] {
+                        for alive in [true, false] {
+                            for bypass in [true, false] {
+                                let w = snapshot(&p, &buf, req_start, max_bytes, alive, bypass);
+                                let r = p.process(&w, &o);
+                                swept += 1;
+                                held += r.held_back as usize;
+                                assert_eq!(
+                                    r.held_back,
+                                    r.held_back_cause.is_some(),
+                                    "held_back {} but cause {:?} — body {:?} pad {pad} \
+                                     req_start {req_start} max_bytes {max_bytes} \
+                                     alive {alive} bypass {bypass}",
+                                    r.held_back,
+                                    r.held_back_cause,
+                                    String::from_utf8_lossy(body),
+                                );
+                                if let Some(c) = r.held_back_cause {
+                                    assert!(HeldBackCause::ALL.contains(&c));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(swept > 2_000, "the sweep shrank to {swept} combinations");
+        assert!(
+            held > 0,
+            "no combination in the sweep was held back, so the agreement \
+             it asserts is vacuous"
+        );
+    }
+
+    /// **The two regions are disjoint, asserted against each other**
+    /// (REQ-O-007's shape, one bound further out).
+    ///
+    /// `holdback_boundary` owns `[head − partial_secret_scan_bytes, head)`
+    /// and *shortens*; the unvouched carry owns
+    /// `[head − UNVOUCHED_CARRY_BYTES, head − partial_secret_scan_bytes)`
+    /// and *masks*. Asserting the sizes alone is green against an
+    /// implementation that overlaps them, which is the one that breaks
+    /// REQ-O-003 — so the property asserted is the *adjacency*, driven
+    /// through a real read.
+    #[test]
+    fn the_unvouched_carry_stops_where_the_trailing_holdback_begins() {
+        let p = processor();
+        let scan = p.limits.partial_secret_scan_bytes as u64;
+        assert!(
+            (UNVOUCHED_CARRY_BYTES as u64) > scan,
+            "a carry inside the trailing region would be the same scan twice"
+        );
+
+        // **The anchor has to be *live* at the end of the region, and the
+        // first draft of this row got that wrong.** It planted
+        // `ghp_abcdef` followed by newlines, so the candidate was **dead**
+        // by the time the scan reached the region's end:
+        // `earliest_partial` answered `None` before `carry_end` was ever
+        // consulted, and the row was green against an implementation with
+        // no `carry_end` at all. Instrumented across all of this module's
+        // tests, the `u < carry_end` filter discarded an answer **zero**
+        // times — the line it exists to hold was dead in the whole suite.
+        //
+        // A live partial is the only fixture that reaches the question: no
+        // delimiter after it, so it is still arriving at `buffer.head`,
+        // and short enough that no rule has matched it yet.
+        let mut buf = vec![b'.'; 4096];
+        buf.extend_from_slice(b"\n");
+        let live_anchor = buf.len() as u64;
+        buf.extend_from_slice(b"ghp_0123456789abcdef");
+        let head = buf.len() as u64;
+        assert!(
+            head - live_anchor <= scan,
+            "the anchor must sit inside `holdback_boundary`'s region"
+        );
+
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, true);
+        let window_end = w.window_start + w.window.len() as u64;
+        // The scan really does find it — without this the assertion below
+        // is satisfied by an answer of `None` for any reason at all, which
+        // is exactly how the first draft passed.
+        assert_eq!(
+            p.index.earliest_partial(
+                &p.rules,
+                &w.carry_region[..(window_end - w.carry_region_start) as usize],
+                w.carry_region_start,
+            ),
+            Some(live_anchor),
+            "the fixture must present a *live* partial, or `carry_end` is \
+             never the reason the answer is `None`"
+        );
+        assert_eq!(
+            p.unvouched_carry(&w, window_end),
+            None,
+            "an anchor at or after `head - partial_secret_scan_bytes` is \
+             `holdback_boundary`'s and must not be masked here: the two \
+             regions are adjacent, not overlapping"
+        );
+
+        let r = p.process(&w, &ReadOptions::default());
+        assert!(
+            !r.redactions.contains_key(redact::UNRESOLVED_KIND),
+            "an anchor inside the trailing region is `holdback_boundary`'s, \
+             and a `tail_*` read opts out of it"
+        );
+        assert!(
+            r.output.ends_with("ghp_0123456789abcdef"),
+            "…and the bytes really are the ones REQ-O-003 promises a \
+             `tail_*` read: {:?}",
+            &r.output[r.output.len().saturating_sub(40)..]
+        );
+    }
+
+    /// **The synthetic span meets a real one, driven through `process`.**
+    ///
+    /// Two lines exist only for this shape — `merge_spans`'s rule that a
+    /// merge swallowing an unresolved span *is* unresolved, and the
+    /// `spans = merge_spans(spans)` that follows the `spans.push` — and
+    /// until this row neither had a test that went through the read path.
+    /// The only coverage was `redact::tests::a_merge_that_swallows_an_
+    /// unresolved_span_is_unresolved`, which hands `merge_spans` two
+    /// literals. **Measured: deleting the re-merge left every test in this
+    /// workspace green.**
+    ///
+    /// Two arrangements, because they fail differently and each is blind
+    /// to the other's fault:
+    ///
+    /// * **The mask starts first.** Without the re-merge `spans` is left
+    ///   *unsorted*, and `render` walks it monotonically —
+    ///   `while spans[next_span].end <= off { next_span += 1 }` never
+    ///   looks back — so it steps past the synthetic span and emits the
+    ///   bytes before the real match **raw**. That is GH #14 re-entered
+    ///   through its own fix, not a mislabel.
+    /// * **The real match starts first and the anchor lands on its end.**
+    ///   Without the rule assignment the merged span carries the rule's
+    ///   name over sixteen kilobytes no rule matched, and
+    ///   `status.redaction_stats` counts a `github` the session never
+    ///   caught — the report `merge_spans`'s own doc says an agent is
+    ///   entitled to disbelieve. The mask-first arrangement cannot see
+    ///   this, because there the merge folds into an already-`UNRESOLVED`
+    ///   head.
+    #[test]
+    fn an_unresolved_mask_that_meets_a_real_match_is_one_marker_and_the_weaker_kind() {
+        let p = processor();
+
+        // ---- arm 1: the mask starts first and swallows the real match.
+        let prologue = "$ cat bundle\n";
+        let mut buf = format!("{prologue}-----BEGIN RSA PRIVATE KEY-----\n").into_bytes();
+        buf.extend(std::iter::repeat_n(b'A', 1024));
+        buf.extend_from_slice(b"\ntoken ");
+        buf.extend_from_slice(GITHUB.as_bytes());
+        buf.extend_from_slice(b"\n");
+        buf.extend(std::iter::repeat_n(b'B', 1024));
+        buf.extend_from_slice(b"\n");
+        assert!(
+            !String::from_utf8_lossy(&buf).contains("-----END"),
+            "the anchor must stay unterminated, which is what makes it a mask"
+        );
+
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        assert_eq!(
+            p.all_spans(w.window, w.window_start).len(),
+            1,
+            "the fixture must contain exactly one real match for the mask \
+             to swallow, or the merge never happens"
+        );
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(
+            r.output,
+            format!("{prologue}[REDACTED:unresolved]"),
+            "one marker over the merged region — not a raw run followed by \
+             two markers"
+        );
+        assert_eq!(
+            r.redactions,
+            std::iter::once((redact::UNRESOLVED_KIND.to_string(), 1)).collect(),
+            "…and one redaction, of the weaker kind: {:?}",
+            r.redactions
+        );
+        assert!(
+            !r.output.contains("-----BEGIN") && !r.output.contains("AAAA"),
+            "the bytes between the anchor and the real match came back raw"
+        );
+
+        // ---- arm 2: the real match starts first and the anchor lands on
+        // its end, which is the merge `merge_spans`'s doc is about.
+        let mut buf =
+            format!("$ env\nTOKEN={GITHUB}-----BEGIN RSA PRIVATE KEY-----\n").into_bytes();
+        // Padded past `partial_secret_scan_bytes`, or the whole buffer is
+        // `holdback_boundary`'s region, `carry_start >= carry_end`
+        // short-circuits, and no mask is ever built — which is how a
+        // shorter draft of this arm passed for the wrong reason.
+        buf.extend(std::iter::repeat_n(
+            b'A',
+            4 * p.limits.partial_secret_scan_bytes,
+        ));
+        buf.extend_from_slice(b"\n");
+        let w = snapshot(&p, &buf, 0, 32 * 1024, true, false);
+        let real = p.all_spans(w.window, w.window_start);
+        assert_eq!(real.len(), 1, "one real match: {real:?}");
+        assert_eq!(
+            redact::span_kind(&p.rules, &real[0]),
+            "github",
+            "the fixture's real match must name a rule, or the weakening \
+             has nothing to weaken"
+        );
+        let r = p.process(&w, &ReadOptions::default());
+        assert!(
+            !r.redactions.contains_key("github"),
+            "a merged span may not claim `github` matched bytes no rule \
+             matched: {:?}",
+            r.redactions
+        );
+        assert_eq!(
+            r.redactions.get(redact::UNRESOLVED_KIND),
+            Some(&1),
+            "…and the merge is counted as `unresolved`: {:?}",
+            r.redactions
+        );
+        assert!(!r.output.contains(GITHUB));
+        assert!(!r.output.contains("-----BEGIN"));
+    }
+
+    /// **An anchor past the read end is not the read's business, and the
+    /// `u < safety_end` filter is what keeps it that way.**
+    ///
+    /// The filter looked like a cheap short-circuit and survived every
+    /// other row here, including a sweep that showed it discarding an
+    /// answer 34 times with `spans` empty each time — where the would-be
+    /// span starts past `read_end`, `render` skips it, and removing the
+    /// filter changes nothing. That is most of its firings and none of
+    /// its purpose.
+    ///
+    /// What it defends is the one arrangement where the late span does
+    /// **not** stay out of the way: a rule's match that straddles
+    /// `read_end`, with the anchor landing on its end.
+    /// `merge_spans` joins spans that merely *touch* (REQ-O-009), so the
+    /// two become one span — which this module's own rule then weakens to
+    /// `unresolved`, and which `advance_past_straddled` then follows to
+    /// `u + UNVOUCHED_CARRY_BYTES`. Without the filter the read consumes
+    /// sixteen kilobytes past its own `max_bytes`, and a correctly
+    /// identified `github` token is reported as an anonymous unjudgeable
+    /// region — in `redactions` and, through it, in
+    /// `status.redaction_stats`.
+    #[test]
+    fn an_anchor_past_the_read_end_does_not_rename_or_extend_a_real_match() {
+        let p = processor();
+        const CAP: usize = 4096;
+
+        // The token straddles `cap_end`; the anchor sits exactly on its
+        // end, which is what makes the two touch.
+        let mut buf = vec![b'.'; CAP - 20];
+        let token_start = buf.len() as u64;
+        buf.extend_from_slice(GITHUB.as_bytes());
+        let anchor = buf.len() as u64;
+        buf.extend_from_slice(b"-----BEGIN RSA PRIVATE KEY-----\n");
+        buf.extend(std::iter::repeat_n(b'A', 40 * 1024));
+        buf.extend_from_slice(b"\n");
+
+        let w = snapshot(&p, &buf, 0, CAP, true, false);
+        // The arrangement really is the one described, or the row is a
+        // restatement of the ordinary case.
+        assert!(
+            token_start < w.cap_end && anchor > w.cap_end,
+            "the match must straddle the read end: {token_start} / {} / {anchor}",
+            w.cap_end
+        );
+        let window_end = w.window_start + w.window.len() as u64;
+        assert_eq!(
+            p.index
+                .unresolved_from(&p.rules, w.carry_region, w.carry_region_start),
+            Some(anchor),
+            "the scan must find an anchor *past* `cap_end`, which is the \
+             answer the filter discards"
+        );
+        assert!(window_end < w.head, "the truncated branch is the subject");
+
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(
+            r.redactions.get("github"),
+            Some(&1),
+            "the match keeps its own kind: {:?}",
+            r.redactions
+        );
+        assert!(
+            !r.redactions.contains_key(redact::UNRESOLVED_KIND),
+            "an anchor the read never reaches must not rename it: {:?}",
+            r.redactions
+        );
+        assert_eq!(
+            r.bytes_returned,
+            (anchor - w.req_start) as usize,
+            "the read consumes to the end of the straddled span and no \
+             further; following the merged span would take it \
+             `UNVOUCHED_CARRY_BYTES` past its own `max_bytes`"
+        );
+        assert!(!r.output.contains(GITHUB));
+
+        // ---- the tie, `u == safety_end` exactly, which `<` declines and
+        // `<=` would take. **It is reachable**, and a previous attempt at
+        // this rule resolved the tie by an argument that had the safety
+        // direction backwards. Put the match so it *ends* on the read end
+        // and the anchor begins there: nothing straddles, so the span
+        // would be invisible on its own — but the merge makes it straddle,
+        // and then the read follows it sixteen kilobytes past `max_bytes`.
+        let mut buf = vec![b'.'; CAP - GITHUB.len()];
+        let token_start = buf.len() as u64;
+        buf.extend_from_slice(GITHUB.as_bytes());
+        let anchor = buf.len() as u64;
+        buf.extend_from_slice(b"-----BEGIN RSA PRIVATE KEY-----\n");
+        buf.extend(std::iter::repeat_n(b'A', 40 * 1024));
+        buf.extend_from_slice(b"\n");
+
+        let w = snapshot(&p, &buf, 0, CAP, true, false);
+        assert_eq!(anchor, w.cap_end, "the fixture must sit exactly on the tie");
+        assert_eq!(
+            p.index
+                .unresolved_from(&p.rules, w.carry_region, w.carry_region_start),
+            Some(anchor),
+            "the scan must answer exactly `safety_end`, or the tie is never \
+             reached and this arm asserts nothing"
+        );
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(
+            r.bytes_returned, CAP,
+            "at the tie the read stops where it was going to stop"
+        );
+        assert_eq!(
+            r.redactions.get("github"),
+            Some(&1),
+            "…and the match that ends there keeps its kind: {:?}",
+            r.redactions
+        );
+        assert!(!r.redactions.contains_key(redact::UNRESOLVED_KIND));
+        assert!(!r.output.contains(GITHUB));
+        let _ = token_start;
+    }
+
+    /// **The read path and the `observer` stream, measured against each
+    /// other on one fixture.**
+    ///
+    /// This row used to be `assert_eq!(UNVOUCHED_CARRY_BYTES, 2 *
+    /// STREAM_CARRY_BYTES)` — a constant identity, which proves nothing
+    /// about either surface's behaviour and which hid the thing it was
+    /// written to guard. `WITHHOLD_WINDOW_BYTES` is the stream's sliding
+    /// *window*, not its coverage: `feed_while_withholding` leaves
+    /// withholding only on a feed with no partial open, and then sets
+    /// `split = buf.len()`, so the **whole exit chunk is dropped too**.
+    /// The stream's coverage is therefore `2 × STREAM_CARRY_BYTES + r`
+    /// with `r` up to the feed size — 8,192 for the in-process pty
+    /// reader and 65,536 for the subprocess worker — where this module's
+    /// is exactly `UNVOUCHED_CARRY_BYTES`.
+    ///
+    /// **So the read is the weaker of the two, and that is the direction
+    /// REQ-O-011a requires.** Its words are that a *stream* is *"never
+    /// weaker than the tool it renders"*; a stream that covers more is a
+    /// stream satisfying it. What this row forbids is the inversion — a
+    /// read that covers more than the live view of the same bytes, which
+    /// would put the leak on `holdfast watch` and leave the tool looking
+    /// safe.
+    #[test]
+    fn the_stream_is_never_weaker_than_the_read_it_renders() {
+        let p = Arc::new(OutputProcessor::builtin().unwrap());
+        let (pem, _) = pem_longer_than(120 * 1024);
+        let prologue = "$ cat chain.pem\n";
+        let buf = format!("{prologue}{}\n", &pem[..pem.len() - 30]).into_bytes();
+        let anchor = prologue.len() as u64;
+
+        // The read path: page it and find the first body line that comes
+        // back raw. Probed by line name — the filler repeats, so a byte
+        // window is not locatable to a line.
+        let first_raw_line = |text: &str| -> Option<usize> {
+            (0..2000).find(|i| text.contains(&format!("KEYBODY{i:06}")))
+        };
+        let mut joined = String::new();
+        let mut cursor = 0u64;
+        let mut reads = 0;
+        while cursor < buf.len() as u64 && reads < 500 {
+            reads += 1;
+            let r = read(&buf, cursor, 32 * 1024);
+            assert!(r.cursor > cursor);
+            joined.push_str(&r.output);
+            cursor = r.cursor;
+        }
+        let read_first_raw = first_raw_line(&joined).expect(
+            "the read must release *something* past the carry, or this row              is comparing a bound against an absence",
+        );
+
+        // The stream, fed at the production pty chunk size. Anything
+        // smaller flatters it: the dropped exit chunk is the difference.
+        let mut stream = crate::attach::redact_stream::StreamRedactor::new(Arc::clone(&p));
+        let mut out: Vec<u8> = Vec::new();
+        for chunk in buf.chunks(8192) {
+            out.extend_from_slice(&stream.feed(chunk));
+        }
+        let stream_text = String::from_utf8_lossy(&out).into_owned();
+        let stream_first_raw = first_raw_line(&stream_text)
+            .expect("the stream must release something past its window too");
+
+        assert!(
+            stream_first_raw >= read_first_raw,
+            "the read covered more of an unjudgeable candidate than the              stream rendering the same bytes: read released line              {read_first_raw}, stream released line {stream_first_raw}.              REQ-O-011a requires the stream to be no weaker than the tool"
+        );
+        // …and the two are the same order of magnitude, or "no weaker"
+        // is being satisfied by a stream that withholds everything.
+        assert!(
+            stream_first_raw < read_first_raw * 4,
+            "the stream withheld {stream_first_raw} lines against the              read's {read_first_raw}; they are no longer the same mechanism"
+        );
+
+        // The read's own bound, stated as a line index so a change to
+        // `UNVOUCHED_CARRY_BYTES` moves it here rather than silently.
+        let line_at = |i: usize| anchor + 32 + 65 * i as u64;
+        assert!(
+            line_at(read_first_raw) >= anchor + UNVOUCHED_CARRY_BYTES as u64,
+            "the read released a line inside its own carry"
+        );
+        assert!(
+            line_at(read_first_raw) < anchor + UNVOUCHED_CARRY_BYTES as u64 + 65,
+            "the read covered more than its carry; the bound moved"
+        );
+
+        // …and the carry covers the largest key the one unbounded
+        // shipped rule can match: a 16,384-bit RSA private key is 12,464
+        // bytes in PEM. That relation is between two literals, so it is
+        // held by `_RSA_16384_PEM_FITS_INSIDE_THE_CARRY` beside the
+        // constant and the compiler checks it; naming it here is how a
+        // reader of this row finds it.
+    }
+
+    /// **At `buffer.head` the scan reaches `UNVOUCHED_CARRY_BYTES` back
+    /// and no further, and an anchor beyond that is released — measured
+    /// here rather than described.**
+    ///
+    /// The at-`head` scan is `[head − UNVOUCHED_CARRY_BYTES, head −
+    /// partial_secret_scan_bytes)`, and it is bounded **at the front**
+    /// for a reason that is not symmetry: `earliest_partial` has no
+    /// GH #163 ceiling and walks a liveness automaton from every anchor
+    /// it finds to the end of its region, so an uncapped scan over a
+    /// 1 MiB `resources/read` window is quadratic in a buffer an agent
+    /// controls. `unresolved_from`, which the truncated branch uses, is
+    /// capped by that ceiling and can afford the whole window.
+    ///
+    /// **The consequences, both of them asserted:** an anchor inside the
+    /// carry is masked on every surface, and one beyond it is released
+    /// exactly as `v0.0.7` released it — `held_back: false`,
+    /// `redactions: {}`, no audit entry. GH #14's at-`head` residual is
+    /// therefore *narrowed*, not closed, and the narrowing is the
+    /// carry's width.
+    ///
+    /// **It also makes the protection non-monotonic in `max_bytes`, on
+    /// one buffer at one cursor**, because `max_bytes` is what decides
+    /// whether the window reaches `head` and therefore which scan runs.
+    /// A smaller read takes the truncated branch, whose region reaches
+    /// `since_cursor − UNVOUCHED_CARRY_BYTES` and finds the anchor; a
+    /// larger one reaches `head` and does not. Pinned below, because it
+    /// is surprising enough that a future reader will otherwise assume
+    /// it is a bug and "fix" it by uncapping the scan.
+    #[test]
+    fn at_head_an_anchor_beyond_the_carry_is_released_and_one_inside_it_is_not() {
+        let carry = UNVOUCHED_CARRY_BYTES as u64;
+        let prologue = "$ cat chain.pem\n";
+
+        // `body_bytes` sized so the key body runs from just after the
+        // anchor to `head`; `head - anchor` is what decides the arm.
+        let case = |body_bytes: usize| {
+            let (pem, _) = pem_longer_than(body_bytes);
+            let buf = format!("{prologue}{}\n", &pem[..pem.len() - 30]).into_bytes();
+            let r = read(&buf, 0, 4 * 1024 * 1024);
+            let span = buf.len() as u64 - prologue.len() as u64;
+            (span, r)
+        };
+
+        // Inside the carry: masked, on the widest read there is.
+        let (span, r) = case(4 * 1024);
+        assert!(
+            span < carry,
+            "arm 1 must sit inside the carry (span {span})"
+        );
+        assert_eq!(r.redactions.get(redact::UNRESOLVED_KIND), Some(&1));
+        assert!(!r.output.contains("KEYBODY000000"));
+
+        // Beyond it: released, and the row says so rather than implying
+        // the gap is closed.
+        let (span, r) = case(48 * 1024);
+        assert!(span > carry, "arm 2 must exceed the carry (span {span})");
+        assert!(
+            r.redactions.is_empty(),
+            "the at-`head` scan reaches {carry} bytes back; an anchor \
+             beyond that is not found, and this row is what keeps that a \
+             measurement: {:?}",
+            r.redactions
+        );
+        assert!(
+            r.output.contains("KEYBODY000000"),
+            "…and the body is released, exactly as v0.0.7 released it"
+        );
+
+        // **Non-monotonic in `max_bytes`, same buffer, same cursor.** The
+        // smaller read truncates its window, takes the other branch, and
+        // finds the anchor its own carry lookbehind reaches.
+        let (pem, _) = pem_longer_than(48 * 1024);
+        let buf = format!("{prologue}{}\n", &pem[..pem.len() - 30]).into_bytes();
+        let small = read(&buf, 0, 4096);
+        assert_eq!(
+            small.redactions.get(redact::UNRESOLVED_KIND),
+            Some(&1),
+            "a truncated window scans `[since_cursor - carry, window_end)` \
+             and must still find it"
+        );
+        let large = read(&buf, 0, 4 * 1024 * 1024);
+        assert!(
+            large.redactions.is_empty(),
+            "the pair is what makes the non-monotonicity a pinned fact \
+             rather than a surprise: {:?}",
+            large.redactions
+        );
+    }
+
+    /// **A terminated block keeps its own kind, at `buffer.head`.**
+    ///
+    /// The carry scan asks `earliest_partial`, whose third condition is
+    /// *the rule's own anchored regex does not match yet* — asked of
+    /// `region[i..]`. A region cut at `head − partial_secret_scan_bytes`
+    /// cannot see a terminator landing after the cut, so a **completely
+    /// terminated** key read as in flight, the synthetic span overlapped
+    /// the real `private-key` one, and `merge_spans` weakened the whole
+    /// match to `unresolved`: a correct, rule-named redaction turned
+    /// anonymous and `status.redaction_stats` lost the kind.
+    ///
+    /// Found by measurement while building GH #195's fix, not by review.
+    #[test]
+    fn a_terminated_key_block_keeps_its_own_kind_at_head() {
+        let p = processor();
+        let (pem, body) = pem_longer_than(8 * 1024);
+        let buf = format!("$ cat id_rsa\n{pem}\n").into_bytes();
+        // The terminator must land inside the trailing region, which is
+        // the arrangement that cut it out of the old scan.
+        let end_at = String::from_utf8_lossy(&buf)
+            .rfind("-----END")
+            .expect("the fixture is a terminated block");
+        assert!(
+            buf.len() - end_at < p.limits.partial_secret_scan_bytes,
+            "the fixture must put `-----END` inside the trailing region, \
+             which is the arrangement that cut it out of the old scan"
+        );
+
+        let r = read(&buf, 0, 32 * 1024);
+        assert_eq!(
+            r.redactions.get("private-key"),
+            Some(&1),
+            "a terminated block names its own rule: {:?}",
+            r.redactions
+        );
+        assert!(
+            !r.redactions.contains_key(redact::UNRESOLVED_KIND),
+            "…and is not weakened to the anonymous kind: {:?}",
+            r.redactions
+        );
+        assert!(!r.output.contains(&body[..48]));
+    }
+
+    /// **REQ-O-008's withhold no longer wedges** (found by PR #215,
+    /// measured, and fixed here rather than documented).
+    ///
+    /// The withhold is transient *because* the next read starts at the
+    /// introducer and scans `max_bytes` past it, so the sequence exceeds
+    /// `ansi_incomplete_max_bytes` and is dropped. That argument needs
+    /// `max_bytes > ansi_incomplete_max_bytes`; at or below it, `cap_end`
+    /// is `req_start + max_bytes`, it stops tracking `buffer.head`, and
+    /// the pending sequence is the same length on every retry. Measured
+    /// on `origin/main`: zero bytes with the cursor frozen at `max_bytes`
+    /// 1, 8, 32 and 64 after a further 300 KB of output, clearing at 65.
+    ///
+    /// **Paired**, or the row passes against an implementation that never
+    /// withholds an escape at all: one byte *above* the introducer the
+    /// withhold still happens and still sets its cause.
+    #[test]
+    fn an_escape_under_the_incomplete_cap_no_longer_wedges() {
+        let p = processor();
+        let cap = p.limits.ansi_incomplete_max_bytes;
+        let mut buf = b"done\x1b[".to_vec();
+        buf.extend(std::iter::repeat_n(b'0', 4000));
+        // A caller that followed `next_cursor` lands exactly on the ESC.
+        const ESC_AT: u64 = 4;
+
+        for max_bytes in [1usize, 8, 32, cap, cap + 1] {
+            let r = read(&buf, ESC_AT, max_bytes);
+            assert!(
+                r.cursor > ESC_AT,
+                "max_bytes {max_bytes}: {} bytes and a frozen cursor",
+                r.bytes_returned
+            );
+            assert!(r.dropped_incomplete_escape || max_bytes > cap);
+            assert_eq!(r.held_back_cause, None, "max_bytes {max_bytes}");
+        }
+
+        // The paired arm: a read that starts *before* the introducer has
+        // bytes to return, so withholding costs it nothing and REQ-O-008
+        // still applies. The sequence must also be under the cap — the
+        // 4,000-byte one above is dropped on its length, which is the arm
+        // `an_over_long_incomplete_escape_is_dropped_rather_than_stalling_reads`
+        // already owns.
+        let short = b"done\x1b[0".to_vec();
+        let r = read(&short, 0, 32 * 1024);
+        assert!(r.held_back, "REQ-O-008's withhold must survive the fix");
+        assert_eq!(r.held_back_cause, Some(HeldBackCause::IncompleteEscape));
+        assert_eq!(r.output, "done");
+        assert_eq!(r.next_cursor, Some(4));
+        assert!(!r.dropped_incomplete_escape);
+    }
+
+    /// **`held_back` is transient-only, and this is the property rather
+    /// than a comment about it** (GH #195).
+    ///
+    /// Before 0.0.8 a third rule lowered `safety_end` at an offset that
+    /// depended on the *request* and not on `buffer.head`, so the
+    /// documented "retry at `next_cursor`" loop never advanced. Every
+    /// remaining cause moves with `buffer.head`: the row drives each one
+    /// and then shows the same read advancing once more output arrives.
+    #[test]
+    fn every_held_back_cause_is_released_by_more_output() {
+        let mut seen: Vec<HeldBackCause> = Vec::new();
+
+        // `in_flight_secret`: a token arriving with no delimiter yet.
+        let arriving = b"line one\nexport TOKEN=ghp_0123456789abcdefghij".to_vec();
+        let r = read(&arriving, 0, 32 * 1024);
+        assert_eq!(r.held_back_cause, Some(HeldBackCause::InFlightSecret));
+        seen.push(HeldBackCause::InFlightSecret);
+        let mut finished = arriving.clone();
+        finished.extend_from_slice(b"ABCDEFGHIJ012345\n$ ");
+        let after = read(&finished, r.cursor, 32 * 1024);
+        assert!(after.cursor > r.cursor, "more output released the boundary");
+
+        // `incomplete_escape`: an unfinished sequence the child may end.
+        let mut esc = b"done\x1b[".to_vec();
+        esc.extend(std::iter::repeat_n(b'0', 8));
+        let r = read(&esc, 0, 32 * 1024);
+        assert_eq!(r.held_back_cause, Some(HeldBackCause::IncompleteEscape));
+        seen.push(HeldBackCause::IncompleteEscape);
+        let mut finished = esc.clone();
+        finished.extend_from_slice(b"m and more\n");
+        let after = read(&finished, r.cursor, 32 * 1024);
+        assert!(after.cursor > r.cursor, "more output released the boundary");
+
+        // Every declared cause was driven, so the row cannot go green by
+        // covering one of them and calling it the set.
+        seen.sort_by_key(|c| c.as_str());
+        let mut all = HeldBackCause::ALL.to_vec();
+        all.sort_by_key(|c| c.as_str());
+        assert_eq!(seen, all, "a cause exists that this row never drove");
+    }
+
+    /// `HeldBackCause::ALL` really is all of them, and the wire spellings
+    /// round-trip. The `match` is what the compiler makes fail when a
+    /// variant is added and this list is not.
+    #[test]
+    fn the_held_back_causes_are_all_enumerated() {
+        fn exhaustive(c: HeldBackCause) -> &'static str {
+            match c {
+                HeldBackCause::InFlightSecret => "in_flight_secret",
+                HeldBackCause::IncompleteEscape => "incomplete_escape",
+            }
+        }
+        assert_eq!(HeldBackCause::ALL.len(), 2);
+        for c in HeldBackCause::ALL {
+            assert_eq!(c.as_str(), exhaustive(*c));
+            assert_eq!(HeldBackCause::from_wire(c.as_str()), Some(*c));
+        }
+        assert_eq!(HeldBackCause::from_wire("unvouched_window"), None);
+        assert_eq!(HeldBackCause::from_wire(""), None);
     }
 
     /// GH #14, **the half no lookahead constant reaches.**
@@ -1463,14 +2962,59 @@ mod tests {
 
         let w = snapshot(&p, &buf, 0, CAP, true, false);
         let r = p.process(&w, &ReadOptions::default());
-        // THE HARM: the value's bytes, in a response §4.1 says is redacted.
-        assert!(
-            !r.output.contains("NOPREFIXSECRETBODY"),
-            "a rule with no index entry leaked its value"
+        // THE HARM: the value's bytes, in a response §4.1 says is
+        // redacted. Since GH #195 the region is **masked** rather than
+        // withheld, so the guarantee is stated with its bound: the first
+        // `UNVOUCHED_CARRY_BYTES` after the candidate's start carry one
+        // marker and no raw byte, and the residual past it is asserted
+        // below rather than left to a comment.
+        //
+        // The blob is uniform filler, so *where* a released byte came
+        // from cannot be read off its content. The assertion is therefore
+        // arithmetic: the payload is the prologue, one marker, and exactly
+        // the bytes between the end of the carry and `cap_end`. An
+        // implementation that masked one byte fewer or one byte more
+        // fails it, and so does one that masked nothing.
+        let marker = redact::marker(redact::UNRESOLVED_KIND);
+        let candidate_start = prologue.len();
+        let released = CAP - candidate_start - UNVOUCHED_CARRY_BYTES;
+        assert_eq!(
+            r.output.len(),
+            prologue.len() + marker.len() + released,
+            "prologue, one marker, and exactly the bytes past the carry"
         );
-        assert_eq!(r.output, prologue);
-        assert!(r.held_back);
-        assert_eq!(r.next_cursor, Some(prologue.len() as u64));
+        assert!(r.output.starts_with(&format!("{prologue}{marker}")));
+        // **The harm is asserted over the whole payload, and a draft of
+        // this row asserted it over a slice that could not contain it.**
+        // Given the line above, `output[..prologue.len() + marker.len()]`
+        // *is* `"$ dump-blob\n[REDACTED:unresolved]"` — so the `contains`
+        // was satisfied by every input it was meant to reject. Swapping
+        // the needle for `"unresolved"` made it fail, which is how the
+        // no-op was demonstrated rather than argued.
+        let carry_end_in_output = prologue.len() + marker.len() + released;
+        assert_eq!(
+            r.output.len(),
+            carry_end_in_output,
+            "the payload is the prologue, one marker, and exactly the bytes \
+             past the carry"
+        );
+        // The strongest form available, and it cannot be off by one: the
+        // payload past the marker is **byte-identical** to the buffer from
+        // the end of the carry to `cap_end`. A mask one byte short leaks a
+        // byte here; one byte long eats one.
+        assert_eq!(
+            &r.output.as_bytes()[prologue.len() + marker.len()..],
+            &buf[candidate_start + UNVOUCHED_CARRY_BYTES..CAP],
+            "the released tail must be exactly the bytes past the carry"
+        );
+        assert!(
+            r.output[prologue.len() + marker.len()..].contains("NOPREFIXSECRETBODY"),
+            "the residual moved: past the carry the candidate is not \
+             believed and its bytes are released"
+        );
+        assert_eq!(r.redactions.get(redact::UNRESOLVED_KIND), Some(&1));
+        assert!(!r.held_back, "masked, not withheld — GH #195");
+        assert_eq!(r.bytes_returned, CAP, "and full progress");
 
         // Paired, as above: a window reaching the end of the blob resolves
         // it to the rule that matched and names that rule's kind, so the
