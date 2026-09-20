@@ -145,6 +145,19 @@ jobs:
       # argument as the two self-tests above it: a guard whose guard is unrun
       # is a guard on trust.
       - run: ./scripts/verify-release-archive.sh --self-test
+      # **And the release BODY, for the sharper version of the same reason.**
+      # `release.yml`'s empty-changelog guard was not merely unrun -- it was
+      # unrunnable: `[ ! -s release-notes.md ]` sat three lines after the step
+      # had appended a newline and every link definition in the file, so it
+      # had never fired and could not. The logic moved into
+      # `scripts/release-notes.sh` with the check in front of the append, and
+      # this line is the half that stops it coming back: four of the fixtures
+      # are sections that must be REFUSED, and every one of them carries link
+      # definitions on purpose, so they are cases the old ordering accepted.
+      # Reinstate that ordering and this job goes red -- measured, five
+      # failures. Nothing in `release-rehearsal.yml` covers the notes path,
+      # and it is not a required check either.
+      - run: ./scripts/release-notes.sh --self-test
 
   # `dev/workflows/verify.md` has listed `actionlint` under *"CI's own gate,
   # which must pass"* since the file was written, and CI did not run it —

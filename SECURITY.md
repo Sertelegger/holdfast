@@ -7,18 +7,55 @@ newest, and the workspace version tracks it. Fixes land on `main` and are not
 backported: a tag here marks a milestone, not a support commitment.
 
 **Things are published under this name, and none of them is a Holdfast anyone
-can run.** A GitHub Release per tag, carrying that version's changelog section
-and **no binary assets** — `release.yml` creates the release and uploads
-nothing. And two `0.0.0` **name reservations** on crates.io, `holdfast` and
-`holdfast-core`, both published 2026-08-20, whose `lib.rs` says *"this version
-contains no usable code"*; `cargo install holdfast` answers *"there is nothing
-to install in `holdfast v0.0.0`, because it has no binaries"*. They were
-published by hand and no workflow can repeat it — `ci-hygiene.sh` denies
-`cargo publish` outside a release workflow, and the release workflow has no
-such step.
+can run.** Three GitHub Releases — `v0.0.5`, `v0.0.6` and `v0.0.7` — each
+carrying that version's changelog section and **no binary assets**, because
+the workflow that produced them uploaded none. And two `0.0.0` **name
+reservations** on crates.io, `holdfast` and `holdfast-core`, both published
+2026-08-20, whose `lib.rs` says *"this version contains no usable code"*;
+`cargo install holdfast` answers *"there is nothing to install in `holdfast
+v0.0.0`, because it has no binaries"*. Those two were published by hand.
+
+**The paragraph above used to describe the workflow rather than the
+artifacts, and two of those descriptions are now false.** It said
+"`release.yml` creates the release and uploads nothing" and "no workflow can
+repeat it — the release workflow has no such step". Both were true when #161
+wrote them on 2026-09-14. Two consecutive merges four days later took out one
+clause each:
+
+- **`release.yml` builds five platform binaries and a `SHA256SUMS.txt` and
+  attaches them** (#198). It attaches them to a **draft**, and a draft's
+  assets are not served from `releases/download/vX.Y.Z/` — so nothing has
+  reached anyone, but the *reason* has changed. It is no longer that nothing
+  is built; it is that promoting a draft is a human running
+  `gh release edit vX.Y.Z --draft=false`, deliberately, and nobody has. No
+  tag has run that path yet either: `v0.0.7` predates it, which is why the
+  three releases above carry no assets and why there is no draft sitting
+  there to promote.
+- **`release.yml` carries a `cargo publish --workspace --locked`** in a
+  `crates-io` job (#197). It is gated on a `CARGO_REGISTRY_TOKEN` repository
+  secret that does not exist, so today it prints why it stopped and exits
+  green, and nothing is uploaded. But the barrier moved from *no code path
+  exists* to *a secret is unset* — and a secret is set in the GitHub UI, with
+  no diff, no pull request and no review. `ci-hygiene.sh` still refuses
+  `cargo publish` in any workflow that is not the tag-triggered release one;
+  what it never refused was the release workflow having the step.
+
+**So "nothing installable has reached anyone" is still true, and it is now a
+statement about two human decisions rather than about absent machinery.** The
+event this project treats as binding is *first external distribution* — the
+moment a build reaches somebody other than the author — and it is defined by
+who receives a build, not by the state of a release object. The draft, and
+the promotion step, are how `release.yml` keeps that moment an act somebody
+takes; its header carries the argument in full.
 
 This section said "nothing is tagged, nothing is on crates.io, and no binaries
-are distributed" from 0.0.3 until now. Only the third clause was still true.
+are distributed" from 0.0.3 until #161. Only the third clause was still true
+by then — and #161's replacement for it was false four days later. Both
+rewrites went wrong the same way, by describing the machinery instead of the
+artifacts, which is why this paragraph now says what exists and leaves what
+`release.yml` does to `release.yml`. `CONTRIBUTING.md`'s release procedure
+names this file's version-pinned claims as a step, for the ones a tag
+invalidates rather than a merge.
 
 | Version | Supported |
 | ------- | --------- |

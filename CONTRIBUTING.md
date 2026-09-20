@@ -265,10 +265,14 @@ Cutting one is therefore:
    definition** — a missing one is why `[0.0.5]` and `[0.0.6]` rendered with
    visible brackets for two releases while `[0.0.7]` did not.
 3. Open a fresh empty `## [Unreleased]`.
-4. Bump the version to match in **three files and four literals**, and
-   commit. Two of the four are in the root `Cargo.toml`:
-   `[workspace.package] version` is the obvious one, and
-   `holdfast-core = { path = "crates/holdfast-core", version = "X.Y.Z" }`
+4. Bump the version to match in **four files and six literals**, and
+   commit. **This step said "three files and four literals" until `Cargo.lock`
+   was measured against it.** The count is restated rather than softened to
+   "the version files": a procedure that names a number is one a reader can
+   check themselves against, and this one was wrong for as long as it was
+   uncheckable. Two of the six are in
+   the root `Cargo.toml`: `[workspace.package] version` is the obvious one,
+   and `holdfast-core = { path = "crates/holdfast-core", version = "X.Y.Z" }`
    under `[workspace.dependencies]` is the second. That one exists because
    crates.io rejects a path-only dependency and there is no
    `version.workspace` to inherit inside a dependency spec. **A stale second
@@ -277,20 +281,76 @@ Cutting one is therefore:
    `holdfast-core`, which is a wrong permanent artifact rather than a red
    check. The two are declared six lines apart so that one edit sees both.
 
-   The other two are `plugin/version.txt` and
+   Two more are `plugin/version.txt` and
    `plugin/.claude-plugin/plugin.json`. The design spec names only
    `Cargo.toml` and `version.txt`, and the third file is the one that matters
    most to an installed user — the plugin install cache is keyed
    `cache/<marketplace>/<plugin>/<version>/` from `plugin.json`, so a release
    that bumps the other two ships a plugin that never updates itself.
    `scripts/plugin-manifest-check.py` fails if the three files disagree, and
-   the `plugin` CI job runs it.
-5. Tag `vX.Y.Z` and push the tag. That triggers
+   the `plugin` CI job runs it — **but `plugin` is the one `ci.yml` job that
+   is not a required status check**, so that guard does not block a merge.
+   Run the script yourself rather than waiting to be told.
+
+   **The last two are in `Cargo.lock`, and forgetting them breaks every
+   build.** It records a version for each workspace member —
+   `[[package]] name = "holdfast"` and `[[package]] name = "holdfast-core"`,
+   two `version = "X.Y.Z"` lines about sixteen apart — and `--locked` is on
+   every build this project runs, including the release one. Bump `Cargo.toml`
+   without relocking and the next `cargo` invocation stops dead with
+   *"cannot update the lock file … because --locked was passed to prevent
+   this"*. Do not hand-edit it; run:
+
+   ```bash
+   cargo update --workspace --offline
+   ```
+
+   `--workspace` restricts it to the members, `--offline` guarantees it
+   reaches no network, and together they are a two-line diff: measured on a
+   `0.0.7` → `0.0.8` bump it printed `Locking 2 packages` and changed exactly
+   those two `version` lines and nothing else. Commit `Cargo.lock` with
+   `Cargo.toml` in the same commit — they are one edit.
+5. **Update the version references in the prose.** None of these fails a
+   check, and each one is read as fact:
+
+   - `SECURITY.md` — "`v0.0.7` is the newest" in the first paragraph, the
+     `` `v0.0.5` – `v0.0.7` `` row of the support table, and the
+     out-of-band-secret bullet saying that echo gating is "on `main`, and in
+     no tag yet, so a `v0.0.7` install does not have it" (that one becomes
+     *wrong*, not merely stale, the moment the tag exists).
+   - `README.md` — the status line and the `## What works today (vX.Y.Z)`
+     heading near the top.
+   - `CLAUDE.md` — the "Project Status" paragraph, which pins the newest tag,
+     quotes that version's `CHANGELOG.md` heading verbatim, and states the
+     workspace version; and the paragraph after it, which names
+     `git log vX.Y.Z..main`.
+
+   `grep -rn "0\.0\.7" --include='*.md' .` finds them plus anything added
+   since this list was written, which is the point of running it rather than
+   trusting the list. Most of its hits are in `CHANGELOG.md` and are
+   **history** — a released section names its own version forever. Change
+   only the claims about what is *newest*, *current* or *not yet tagged*.
+6. Tag `vX.Y.Z` and push the tag. That triggers
    `.github/workflows/release.yml`, which checks that the tag, the crate
-   version and a non-empty changelog section all agree, then publishes the
-   release with that section as the body and the name derived from its
-   heading. **The codename must be on the heading before the tag is
+   version and a changelog section with actual content in it all agree, then
+   publishes the release with that section as the body and the name derived
+   from its heading. **The codename must be on the heading before the tag is
    pushed**, or the release ships without it.
+
+   The changelog half of that check is `scripts/release-notes.sh`, and it is
+   worth knowing what it used to do: the guard was written inline and ran
+   *after* the step had appended every link definition to the file it was
+   testing, so it could not fire. A tag pushed with step 1 skipped — easy,
+   because steps 4 and 6 alone are self-consistent — would have published a
+   release whose entire body was 47 bare link definitions. It now refuses,
+   and `ci.yml`'s `hygiene` job runs the script's fixtures so that it keeps
+   refusing.
+7. **The release is a DRAFT.** `release.yml` attaches five platform binaries
+   and a `SHA256SUMS.txt`, and a draft's assets are not served from
+   `releases/download/vX.Y.Z/`. Before promoting, `curl -I` an asset URL
+   unauthenticated and confirm it 404s, then re-read what the workflow prints:
+   promoting is *first external distribution*, and several deliberate escapes
+   in this tree are conditioned on that not having happened.
 
 ### crates.io
 
