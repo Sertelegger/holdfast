@@ -58,6 +58,31 @@ is cut, named and published is in
   client that predates the field fails **closed**; nothing an agent sends
   selects it. `holdfast attach --allow-echo` is the CLI spelling ([#137]).
 
+- **`held_back_cause`**, present exactly when `held_back` is true and
+  present-and-`null` otherwise, on `read_output`, `wait_for_pattern`,
+  `send_input`'s `wait_for` fields and `resources/read`'s `_meta.holdfast`
+  (where the convention is *omitted* rather than null). A closed two-value
+  vocabulary — `in_flight_secret`, `incomplete_escape` — declared as
+  `$defs/HeldBackCause` and mirrored by `output::HeldBackCause`, the two
+  asserted equal in both directions. `held_back` was a disjunction and the
+  caller was told it was one thing; **both surviving values move with
+  `buffer.head`**, so §4.1's *"retry at `next_cursor`"* is now right for each
+  of them, and the value says what the caller is waiting for. The vocabulary
+  is two rather than three because GH #14's window bound stopped being a
+  holdback — see the entry under *Security*. `get_screen_state` is
+  deliberately excluded: its `held_back` reports masking rather than a
+  shortened read (REQ-O-011a) and it has no `next_cursor`. `holdfast logs`
+  parses the field into the enum and matches **exhaustively**, so a renamed
+  variant is a compile error rather than a silent fall-through to *"read
+  again"* ([#160], [#195]).
+- `limits.resource_read_max_bytes` is refused at load when it falls below the
+  session output ring, naming the key and the floor. The check is against the
+  hardcoded `DEFAULT_BUFFER_BYTES` and **not** against
+  `limits.output_buffer_bytes`, which is inert (GH #128) — relating a live key
+  to a dead one would let `output_buffer_bytes = 64 KiB` with
+  `resource_read_max_bytes = 128 KiB` pass while the real ring stayed at 1 MiB,
+  a false assurance that is worse than no check. `nonzero` was the only floor
+  before, so `= 1` loaded silently ([#203], [#128]).
 - `read_output` gains `apply_holdback`, the way to ask for the last N lines
   **inside** §4.1's holdback. A bare `tail_lines`/`tail_bytes` is the per-call
   opt-in and still bypasses it, unchanged; `apply_holdback: true` declines that
@@ -303,6 +328,111 @@ is cut, named and published is in
 
 ### Security
 
+- **A read window that cannot vouch for a region now emits one
+  `[REDACTED:unresolved]` over it and completes, instead of choosing between
+  withholding it for ever and releasing it raw** ([#195], [#14]). GH #14's
+  declination was gated on `window_end < buffer.head`, and that gate did two
+  wrong things at once. Below it, the boundary is a function of `since_cursor`
+  and `max_bytes` rather than of `buffer.head`, so §4.1's documented *"retry at
+  `next_cursor`"* loop never advanced — measured on this repository's own
+  `CHANGELOG.md`, which carries `-----BEGIN RSA PRIVATE KEY-----` as **prose**
+  in the paragraph describing this very rule: `buffer.head` 136,206, read 1
+  returning 32,768 B, read 2 pinning at 42,758, and reads 3 through 9 returning
+  **zero bytes with the cursor frozen**. Above it, a window that *reached*
+  `head` cleared the bound by not running the check, so `resources/read`, a
+  `tail_*` read and any large enough `max_bytes` — one mechanism with three
+  names — returned an unterminated candidate's body raw with `redactions: {}`
+  and no audit entry. Measured on `v0.0.7`'s pipeline, an 8 KB unterminated
+  PEM — an ordinary RSA-8192 key, `cat id_rsa` on a fresh session — came back
+  **entirely raw on every surface including the plain default cursor read**,
+  because it fits inside the window.
+
+  Both are now one answer, and it is the answer a greedy rule always got here
+  and that `attach`/`watch` already gives: one marker over the region, and full
+  progress. An unbounded *greedy* rule reached the window's last byte, so
+  `render` markered the lot; `private-key-block` uses `[\s\S]*?` — **lazy** —
+  so it never reached the edge and fell through to the withhold. The behaviour
+  was selected by how somebody wrote a quantifier, not by risk.
+
+  **`get_screen_state` is not a third precedent, and a draft of this entry said
+  it was.** Its mask is the cells where the live render differs from the render
+  at `holdback_boundary`, driven over the trailing `partial_secret_scan_bytes`,
+  so it handles an in-flight *prefix* and has no handling at all for a candidate
+  anchored further back: measured on one buffer in one moment, `read_output`
+  returns one marker where the grid returns 39 raw key-body lines. That is
+  pre-existing and untouched here, but it is now a gap **between** two surfaces
+  rather than shared behaviour, and it is filed rather than described away.
+
+  **The candidate is believed for `UNVOUCHED_CARRY_BYTES` (16,384) past its
+  anchor, and that bound is the whole of what the change costs.** The
+  load-bearing derivation is that it covers a 16,384-bit RSA private key,
+  12,464 bytes in PEM, which is the largest thing the one unbounded rule in the
+  shipped set can be asked to hold. It is also `2 × STREAM_CARRY_BYTES`, the
+  sliding window `attach/redact_stream.rs` withholds one over — **but that is
+  not the same number as the stream's coverage, and a draft of this entry
+  claimed parity it does not have.** `feed_while_withholding` leaves
+  withholding only on a feed with no partial open and then sets
+  `split = buf.len()`, dropping the whole exit chunk as well, so the stream
+  covers `2 × STREAM_CARRY_BYTES + r` with `r` up to the feed size — 8,192 for
+  the in-process pty reader, 65,536 for the subprocess worker. Measured through
+  both surfaces on one fixture: the read releases at anchor + 16,400, the
+  stream at anchor + 24,560. **The read is the weaker of the two, which is the
+  direction REQ-O-011a asks for** — its requirement is that a *stream* be never
+  weaker than the tool it renders, and the inversion is what would put the leak
+  on `holdfast watch`. The test now measures both surfaces instead of comparing
+  two constants, which is what the row it replaced did and why this went
+  unnoticed.
+
+  **The false-positive cost, measured rather than asserted**, as the share of
+  a corpus covered by `unresolved` markers, at `max_bytes` 4,096 / 32,768 /
+  262,144 / 4 MiB:
+
+  | corpus | capped (shipped) | uncapped |
+  |---|---|---|
+  | GH #195's own (`CHANGELOG` + `README` + `ROADMAP`, 162,688 B) | 20.14% / 18.07% / **0%** / **0%** | 20.14% / 30.21% / 0% / 0% |
+  | `CHANGELOG.md` alone (119,028 B) | 27.53% / 24.69% / 0% / 0% | 27.53% / 41.29% / 0% / 0% |
+  | `README.md`, `ROADMAP.md`, `CLAUDE.md`, every `.toml` incl. the rule set | **0% at every size** | 0% |
+  | this repository's Rust, 5.79 MB | 2.93% / 2.90% / 1.38% / **0.28%** | 3.07% / 3.91% / 14.56% / **38.65%** |
+
+  The last row is what the cap is for: uncapped, the cost **scales with
+  `max_bytes`** — 38.65% of 5.79 MB on a single bulk read — where capped it
+  falls, because a wider window resolves more candidates outright. The zeroes
+  at 262,144 and above are the window reaching `buffer.head`, where the carry
+  scan looks only at the last 16 KiB and these corpora have no anchor there.
+
+  **`CHANGELOG.md` is the worst corpus in the table and this entry is why**:
+  the file documents the rule, so it contains `-----BEGIN RSA PRIVATE
+  KEY-----` as prose, and writing this paragraph added two more occurrences
+  and moved the measured share from 17.67% to 24.69%. The number is a
+  property of a corpus, not of the change.
+
+  **Two residuals, both stated because both are real.** *(a)* On a **truncated**
+  window a candidate longer than the carry has its first 16,384 bytes masked
+  and the remainder released — weaker than the withhold it replaces, which
+  released nothing at all, and the deliberate price of the wedge going away.
+  *(b)* At **`buffer.head`** the scan reaches `UNVOUCHED_CARRY_BYTES` back and
+  no further, so an anchor beyond that is not found and **nothing** is masked:
+  `v0.0.7`'s behaviour, unchanged. GH #14's at-`head` half is therefore
+  *narrowed* to the carry's width rather than closed. The front bound is not
+  symmetry — `earliest_partial` carries no GH #163 ceiling and walks a liveness
+  automaton from every anchor to the end of its region, so an uncapped scan
+  over a 1 MiB `resources/read` window is quadratic in a buffer an agent
+  controls. The visible consequence is that protection is **non-monotonic in
+  `max_bytes`** on one buffer at one cursor: a smaller read truncates its
+  window, takes the other branch, and finds an anchor the larger read does not.
+  Both directions are pinned by
+  `at_head_an_anchor_beyond_the_carry_is_released_and_one_inside_it_is_not`.
+  For any key the shipped rule set can match, and on any buffer whose candidate
+  sits inside the carry, the masking is complete on every surface. `a_private_key_longer_than_the_lookahead_window_is_never_emitted_raw`
+  asserts both halves, and `a_prefixless_rules_over_long_match_is_not_emitted_raw_either`
+  asserts the extent arithmetically, so an implementation masking one byte
+  fewer or one byte more fails.
+
+  `redact: false` remains the audited recourse and is unchanged. *"A larger
+  `max_bytes`"* was never a general one — measured on a 338,264 B buffer bound
+  at 25,644, every one of 32,768 / 65,536 / 131,072 / 262,144 and the clamped
+  262,145 returned zero bytes with the cursor frozen — and nothing now names
+  it as one.
 - **The plugin bootstrap does not exec whatever `holdfast` is on `$PATH`, and
   §13.3 step 2 says it should.** Self-reported version output is not
   authentication: measured, a five-line shell script that echoes
@@ -702,6 +832,28 @@ is cut, named and published is in
   `RuleSet` per daemon, or two when `[security] disabled_redaction_rules` is
   non-empty — the audit log takes the full built-in set either way — and never
   one per session.
+- **REQ-O-008's unfinished-escape withhold no longer wedges either.** It is
+  transient *because* the next read starts at the introducer and scans
+  `max_bytes` past it, so the sequence exceeds `ansi_incomplete_max_bytes` and
+  is dropped instead — an argument that needs
+  `max_bytes > ansi_incomplete_max_bytes`. At or below it, `cap_end` is
+  `since_cursor + max_bytes`, it stops tracking `buffer.head`, and the pending
+  sequence is the same length on every retry for ever: measured at `max_bytes`
+  1, 8, 32 and 64, zero bytes with the cursor frozen after a further 300 KB of
+  output, clearing at 65. `process` now declines to withhold at a boundary that
+  would return the caller nothing, which is what the two existing arms already
+  do when waiting cannot pay. Unreachable from either shipped surface at the
+  default `ansi_incomplete_max_bytes` — `read_output` defaults to 32 KiB and
+  `holdfast logs` sends 256 KiB — but that key is live with only a `nonzero`
+  floor, so raising it above a read's `max_bytes` put the corner on the default
+  path. Found while building [#195]'s fix, on PR #215 ([#195]).
+- A merged redaction span may no longer claim that a rule matched bytes no rule
+  matched: where a real match and an `unresolved` region overlap, the merge is
+  `unresolved`. The old first-span-wins rule labelled a **completely
+  terminated** key block `unresolved` at `buffer.head`, because the carry
+  scan's region was cut at `head - partial_secret_scan_bytes` and could not
+  see the terminator; the scan now reads to the window's end and filters its
+  *answer* instead. Found by measurement rather than review ([#195]).
 - **`resize` now folds the requested geometry, applies it and reads it back
   under the attach hub's resize lock**, which the tool had never taken and the
   attach path always did. `attach::conn`'s own comment states the hazard —
@@ -1779,6 +1931,9 @@ residuals that are known and accepted.
 
 [#201]: https://github.com/Sertelegger/holdfast/issues/201
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
+[#195]: https://github.com/Sertelegger/holdfast/issues/195
+[#160]: https://github.com/Sertelegger/holdfast/issues/160
+[#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206

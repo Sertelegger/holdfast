@@ -1008,6 +1008,21 @@ impl HoldfastServer {
                     "truncated_at_tail": read.truncated_at_tail,
                     "truncated_for_size": read.truncated_for_size,
                     "held_back": read.held_back,
+                    // Which of `held_back`'s two rules fired. Both name
+                    // a boundary that moves with `buffer.head`, so the
+                    // answer is never "this read can never advance" —
+                    // GH #195's third cause is no longer a holdback at
+                    // all — but REQ-O-005 qualifies `in_flight_secret`
+                    // on a session that has stopped producing, and that
+                    // is the one case where the caller has to do
+                    // something other than retry. Emitted as `null`
+                    // rather than omitted when nothing was withheld:
+                    // §5.4's `outputSchema` is closed and
+                    // `read_output_emits_every_field_5_4_promises`
+                    // asserts an exact key set, so a key that comes and
+                    // goes is one the agent must test for before it can
+                    // branch.
+                    "held_back_cause": read.held_back_cause.map(|c| c.as_str()),
                     "next_cursor": read.next_cursor,
                     // §5.2 declares this without a `?` and nothing had
                     // ever emitted it. The bulk counterpart to this
@@ -4019,6 +4034,32 @@ impl HoldfastServer {
             json!(context.truncated_for_size),
         );
         fields.insert("held_back".into(), json!(withheld || context.held_back));
+        // **This surface's `held_back` is a *wider* disjunction than
+        // `read_output`'s, and the cause has to say so rather than be
+        // dropped.** `withheld` is a fact about the *match* — its range
+        // intersects `[holdback_boundary, buffer.head)` — and `context`
+        // carries `read_output`'s own answer about where the
+        // `output_since_start` read ended. Left out entirely, an agent
+        // waiting on this tool reads `held_back: true` with nothing to
+        // read it by, and §5.2 tells it *"as more bytes arrive the
+        // boundary advances and a retry returns the text"* without
+        // saying which boundary.
+        //
+        // `withheld` is `in_flight_secret` by construction, not by
+        // choice: `boundary` above is `holdback_boundary`, which is
+        // §4.1 and nothing else. **Both arms firing needs no precedence
+        // rule now that both causes move with `buffer.head`** — each
+        // advises the same retry, so the choice cannot change what the
+        // caller does. `withheld` is reported anyway, because on that
+        // arm `next_cursor` below is set from §4.1's boundary, and the
+        // cause naming the boundary the caller will actually resume at
+        // is the one that reads true.
+        let cause = if withheld {
+            Some(crate::output::HeldBackCause::InFlightSecret)
+        } else {
+            context.held_back_cause
+        };
+        fields.insert("held_back_cause".into(), json!(cause.map(|c| c.as_str())));
         fields.insert(
             "next_cursor".into(),
             match (withheld, context.next_cursor) {
@@ -6849,6 +6890,85 @@ mod tests {
                  not a second licence to bypass ({start})"
             );
         }
+
+        kill_everything(&server).await;
+    }
+
+    /// **`wait_for_pattern`'s `held_back` is a wider disjunction than
+    /// `read_output`'s, and the extra term had no cause of its own.**
+    ///
+    /// `run_wait` reports `withheld || context.held_back`, where
+    /// `withheld` is a fact about the *match* rather than about the read
+    /// end. A `held_back_cause` that only forwarded the context read's
+    /// answer would come back `null` on exactly the response that most
+    /// needs one — a match the agent asked for and did not get.
+    ///
+    /// Two arms. Without the second, a field hard-wired to
+    /// `"in_flight_secret"` passes the first.
+    #[tokio::test]
+    async fn a_withheld_match_names_the_rule_that_withheld_it() {
+        let server = HoldfastServer::new();
+        let bytes = format!("$ cat note\r\nsee {IN_FLIGHT}");
+        let (id, _pty) = mock_session(&server, "waitheld", vec![], bytes.as_bytes());
+        let session = server.registry.get(&id).expect("the session");
+        settle(&session, "the partial to reach the tail", |s| {
+            s.detection().last_line.starts_with("see ")
+        })
+        .await;
+        assert!(
+            session.holdback_boundary(&server.processor) < session.buffer_head(),
+            "nothing is being withheld, so there is no match to withhold"
+        );
+
+        // Arm 1: the match sits inside §4.1's holdback, so the tool
+        // withholds it — and `boundary` there is `holdback_boundary`,
+        // which is §4.1 and nothing else.
+        let withheld = row(
+            "wait_for_pattern",
+            &server
+                .wait_for_pattern(Parameters(WaitForPatternArgs {
+                    session: id.clone(),
+                    pattern: Some("ghp_".into()),
+                    since_cursor: Some(0),
+                    timeout_secs: Some(1),
+                    ..Default::default()
+                }))
+                .await
+                .expect("wait_for_pattern"),
+        )
+        .data;
+        assert_eq!(withheld["held_back"], json!(true), "{withheld}");
+        assert_eq!(
+            withheld["held_back_cause"],
+            json!("in_flight_secret"),
+            "a match withheld by §4.1's boundary is §4.1's cause: {withheld}"
+        );
+        assert!(
+            withheld["match"].get("text").is_none(),
+            "the arrangement must really be the withheld one: {withheld}"
+        );
+
+        // Arm 2: a match before the boundary, read through a window that
+        // stops well short of it. Nothing is withheld, and the key is
+        // present and null rather than absent — the same convention
+        // `read_output` keeps.
+        let clean = row(
+            "wait_for_pattern",
+            &server
+                .wait_for_pattern(Parameters(WaitForPatternArgs {
+                    session: id.clone(),
+                    pattern: Some("cat note".into()),
+                    since_cursor: Some(0),
+                    timeout_secs: Some(1),
+                    max_bytes: Some(8),
+                }))
+                .await
+                .expect("wait_for_pattern"),
+        )
+        .data;
+        assert_eq!(clean["matched"], json!(true), "{clean}");
+        assert_eq!(clean["held_back"], json!(false), "{clean}");
+        assert_eq!(clean["held_back_cause"], Value::Null, "{clean}");
 
         kill_everything(&server).await;
     }

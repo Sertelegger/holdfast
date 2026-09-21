@@ -1431,6 +1431,8 @@ mod tests {
         let w = crate::output::WindowSnapshot {
             window: &[],
             window_start: head,
+            carry_region: &[],
+            carry_region_start: head,
             tail_region: tail,
             tail_region_start: start,
             req_start: head,

@@ -1068,6 +1068,43 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
     let emitted_sources: BTreeSet<String> =
         sources.iter().map(|s| s.as_str().to_string()).collect();
 
+    // GH #195's `held_back_cause`, and this one is a walk `output`
+    // already provides: `HeldBackCause::ALL` exists for exactly this, so
+    // a hand-rolled `next_cause` here would be a second list to keep in
+    // step. What `ALL` cannot do on its own is *prove* it is complete —
+    // a variant added to the enum and not to `ALL` leaves it silently
+    // short — so the exhaustive `match` below is what forces the
+    // compiler to notice, and the length check is what forces this file
+    // to be read again.
+    use holdfast_core::output::HeldBackCause as Hb;
+    fn is_enumerated(c: Hb) -> bool {
+        // Exhaustive on purpose, and one arm per variant: a third
+        // variant does not compile here until somebody writes its line,
+        // and writing its line is what makes them look at `ALL`.
+        match c {
+            Hb::InFlightSecret => Hb::ALL.contains(&Hb::InFlightSecret),
+            Hb::IncompleteEscape => Hb::ALL.contains(&Hb::IncompleteEscape),
+        }
+    }
+    for cause in Hb::ALL {
+        assert!(
+            is_enumerated(*cause),
+            "HeldBackCause::ALL is missing {}",
+            cause.as_str()
+        );
+        // The wire spelling round-trips, or `holdfast logs` parses the
+        // daemon's own word into `None` and falls into its catch-all.
+        assert_eq!(Hb::from_wire(cause.as_str()), Some(*cause));
+    }
+    assert_eq!(
+        Hb::ALL.len(),
+        2,
+        "a variant reached the enum without reaching ALL, or a third \
+         cause was added and this file was not read"
+    );
+    assert_eq!(Hb::from_wire("a_cause_from_the_future"), None);
+    let emitted_causes: BTreeSet<String> = Hb::ALL.iter().map(|c| c.as_str().to_string()).collect();
+
     // Both directions. A value emitted but not declared is a response that
     // fails its own schema; a value declared but not emitted is vocabulary
     // the agent is told to branch on and never sees.
@@ -1091,9 +1128,15 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
         emitted_sources,
         "schema::Osc133Source and detect::Osc133Source::as_str disagree"
     );
+    assert_eq!(
+        declared("read_output", "HeldBackCause"),
+        emitted_causes,
+        "schema::HeldBackCause and output::HeldBackCause::as_str disagree"
+    );
     assert_eq!(emitted_states.len(), 4);
     assert_eq!(emitted_shells.len(), 3);
     assert_eq!(emitted_sources.len(), 3);
+    assert_eq!(emitted_causes.len(), 2);
 }
 
 // --------------------------------------------------- real tool responses
@@ -1253,6 +1296,91 @@ async fn read_output_response_matches_its_schema() {
     kill(&server, &id).await;
 }
 
+/// **Every response this file validates carries `held_back_cause: null`,
+/// and `null` satisfies `anyOf: [$ref, null]` whatever the `$ref` says.**
+///
+/// So the closed `outputSchema` was never exercised against a *value*
+/// from that vocabulary: an `as_str` spelling outside the declared enum
+/// would reach an agent as a response failing its own advertised schema,
+/// and nothing here would have seen it. The vocabulary walk in
+/// `the_closed_vocabularies_declare_exactly_what_the_session_emits` is a
+/// good proxy — it compares the two Rust sides — but a proxy is what it
+/// is. This row drives a **real** held-back read through the real tool
+/// and validates the real response.
+///
+/// The arrangement is §4.1's in-flight secret, which is the cause a
+/// session can be driven into deterministically from a shell: a known
+/// prefix with too few characters behind it to complete the rule,
+/// printed with no trailing newline and the shell held open behind it,
+/// so the partial is still sitting at `buffer.head` when the read runs.
+#[tokio::test]
+async fn a_held_back_read_carries_a_declared_cause_and_still_matches_its_schema() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for(&server, &id, "$").await;
+
+    // `see` rather than `TOKEN=`, because the generic rule keys on the
+    // label and a *redaction* would then be what shortened the read.
+    // `sleep` keeps the prompt from landing behind the partial, so the
+    // trailing scan region really does end at an unfinished candidate.
+    server
+        .send_input(Parameters(SendInputArgs {
+            session: id.clone(),
+            data: "printf 'see ghp_%s' 0123456789abcdefghij; sleep 30".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("send_input must not be a protocol error");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let payload = loop {
+        let r = server
+            .read_output(Parameters(ReadOutputArgs {
+                session: id.clone(),
+                since_cursor: Some(0),
+                ..Default::default()
+            }))
+            .await
+            .expect("read_output must not be a protocol error");
+        let p = assert_matches_schema("read_output", &r);
+        if p["data"]["held_back_cause"] == json!("in_flight_secret") {
+            break p;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never reached a state this row is about, so it \
+             would have asserted nothing: {p}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // The value really was non-null and really was validated — without
+    // this the loop above could break on a response the schema happened
+    // to accept for an unrelated reason.
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["held_back"], json!(true));
+    assert!(payload["data"]["held_back_cause"].is_string());
+
+    // The paired negative, in the same run: the declared vocabulary is
+    // closed, so a spelling outside it is rejected. Without this arm the
+    // row above passes against `held_back_cause: { "type": "string" }`.
+    let mut bad = payload.clone();
+    bad["data"]["held_back_cause"] = json!("a_cause_from_the_future");
+    assert_rejected_because(
+        "read_output",
+        &bad,
+        "held_back_cause is a closed vocabulary",
+        |k| {
+            matches!(
+                k,
+                ValidationErrorKind::Enum { .. } | ValidationErrorKind::AnyOf { .. }
+            )
+        },
+    );
+
+    kill(&server, &id).await;
+}
+
 #[tokio::test]
 async fn read_output_emits_every_field_5_4_promises() {
     // The separator that stops the schema tests from being vacuous. Every
@@ -1280,6 +1408,14 @@ async fn read_output_emits_every_field_5_4_promises() {
             // with `Additional properties are not allowed`, and a
             // declared unemitted one fails only here.
             "held_back",
+            // `held_back` is a disjunction and said so nowhere on the
+            // wire, so a caller could not tell §4.1's boundary from
+            // REQ-O-008's — and, before GH #195, could not tell either
+            // from a bound that would never move. The cause is present
+            // on every response — `null` when nothing was withheld — so
+            // that a caller branches on a value rather than on a key's
+            // existence.
+            "held_back_cause",
             "redactions",
             "next_cursor",
             // 0.0.5's resource layer closes §5.2's `resource_uri`, which
@@ -2305,6 +2441,9 @@ async fn wait_for_pattern_response_matches_its_schema() {
             "truncated_at_tail",
             "truncated_for_size",
             "held_back",
+            // GH #195: this tool's `held_back` is `read_output`'s rules
+            // plus a withheld *match*, and it named none of them.
+            "held_back_cause",
             "next_cursor",
             "interaction_mode",
             "detection_tier",

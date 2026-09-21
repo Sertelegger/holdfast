@@ -186,9 +186,14 @@ fn snapshot<'a>(
     let window_start = req_start.saturating_sub(processor.limits.lookbehind_bytes as u64);
     let window_end = (cap_end + processor.limits.lookahead_bytes as u64).min(head);
     let scan_start = head.saturating_sub(processor.limits.partial_secret_scan_bytes as u64);
+    let carry_start = req_start
+        .saturating_sub(holdfast_core::output::UNVOUCHED_CARRY_BYTES as u64)
+        .min(window_start);
     WindowSnapshot {
         window: &buffer[window_start as usize..window_end as usize],
         window_start,
+        carry_region: &buffer[carry_start as usize..window_end as usize],
+        carry_region_start: carry_start,
         tail_region: &buffer[scan_start as usize..head as usize],
         tail_region_start: scan_start,
         req_start,

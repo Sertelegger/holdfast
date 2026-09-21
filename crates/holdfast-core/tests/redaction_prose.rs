@@ -1023,6 +1023,10 @@ fn read(processor: &OutputProcessor, buffer: &[u8]) -> ProcessedRead {
     let w = WindowSnapshot {
         window: buffer,
         window_start: 0,
+        // The whole buffer is the window here, so the unvouched scan's
+        // extra lookbehind (GH #195) has nowhere further back to reach.
+        carry_region: buffer,
+        carry_region_start: 0,
         tail_region: &buffer[scan_start as usize..],
         tail_region_start: scan_start,
         req_start: 0,

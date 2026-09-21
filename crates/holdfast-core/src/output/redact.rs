@@ -13,8 +13,54 @@ use super::rules::RuleSet;
 pub struct Span {
     pub start: u64,
     pub end: u64,
-    /// Index into `RuleSet::rules` — names the kind in the marker.
+    /// Index into `RuleSet::rules` — names the kind in the marker, unless
+    /// it is [`Span::UNRESOLVED`], which names no rule. Turn it into a
+    /// name with [`span_kind`] rather than indexing it directly.
     pub rule: usize,
+}
+
+impl Span {
+    /// The `rule` of a span covering bytes **no rule matched** — a region
+    /// the read window could not vouch for (GH #14, GH #195).
+    ///
+    /// A sentinel rather than an index, because [`UNRESOLVED_KIND`] names
+    /// no rule *by construction*: [`RuleSet::compile`] refuses any rule
+    /// claiming that kind, so there is no index that could carry it and
+    /// minting one would be the collision the reservation exists to make
+    /// impossible. `usize::MAX` is out of range for any `RuleSet::rules`,
+    /// so a direct index panics loudly instead of naming the wrong rule —
+    /// the failure mode worth having, where a small sentinel would name a
+    /// real one.
+    ///
+    /// [`RuleSet::compile`]: super::rules::RuleSet
+    pub const UNRESOLVED: usize = usize::MAX;
+
+    /// One marker over `[start, end)` for a region the window could not
+    /// judge. See [`Self::UNRESOLVED`].
+    pub fn unresolved(start: u64, end: u64) -> Self {
+        Self {
+            start,
+            end,
+            rule: Self::UNRESOLVED,
+        }
+    }
+
+    /// Whether this is the synthetic span rather than a rule's match.
+    pub fn is_unresolved(&self) -> bool {
+        self.rule == Self::UNRESOLVED
+    }
+}
+
+/// The marker kind a span carries — the rule's `kind`, or
+/// [`UNRESOLVED_KIND`] for the synthetic span.
+///
+/// **The one place `Span::rule` may be turned into a name.**
+pub fn span_kind<'a>(rules: &'a RuleSet, span: &Span) -> &'a str {
+    if span.is_unresolved() {
+        UNRESOLVED_KIND
+    } else {
+        &rules.rules[span.rule].kind
+    }
 }
 
 /// What the agent sees in place of a secret.
@@ -88,6 +134,20 @@ pub fn find_spans(rules: &RuleSet, window: &[u8], window_start: u64) -> Vec<Span
 ///
 /// The earliest span names the kind; ties go to the earlier rule, which
 /// is why rule order in the TOML is specific-first.
+///
+/// **One exception, and it is the only claim a merge may weaken: a merge
+/// that swallows an [unresolved](Span::UNRESOLVED) span is unresolved.**
+/// Every other kind asserts *this rule matched these bytes*, and that
+/// assertion is false of the bytes the synthetic span covers — nothing
+/// matched them, which is the whole of what `unresolved` says. A merged
+/// span labelled `github` over sixteen kilobytes the window could not
+/// judge would be a redaction report the agent is entitled to disbelieve,
+/// and it would fold that number into `status.redaction_stats` as a
+/// credential this session caught. The cost is the other direction: a
+/// real match adjacent to an unjudgeable region loses its own name and is
+/// counted as `unresolved`. No byte changes hands either way — both are
+/// one marker over the same range — so the choice is purely about which
+/// statement is true, and only one of them is.
 pub fn merge_spans(mut spans: Vec<Span>) -> Vec<Span> {
     if spans.is_empty() {
         return spans;
@@ -98,6 +158,9 @@ pub fn merge_spans(mut spans: Vec<Span>) -> Vec<Span> {
         match out.last_mut() {
             Some(last) if span.start <= last.end => {
                 last.end = last.end.max(span.end);
+                if span.is_unresolved() {
+                    last.rule = Span::UNRESOLVED;
+                }
             }
             _ => out.push(span),
         }
@@ -472,5 +535,132 @@ mod tests {
         assert_eq!(spans.len(), 1, "the joined window carries one secret");
         assert_eq!((spans[0].start, spans[0].end), (5, 45));
         assert_eq!(r.rules[spans[0].rule].kind, "github");
+    }
+
+    /// **A merge that swallows an unresolved span is unresolved, whichever
+    /// side it arrives from** (GH #195).
+    ///
+    /// `merge_spans` sorts by `(start, rule)` and keeps the first span's
+    /// kind, and `Span::UNRESOLVED` is `usize::MAX`, so at equal starts
+    /// the synthetic span always sorts *last* and the default rule would
+    /// silently keep the rule's name over bytes no rule matched. Both
+    /// orders are driven, because one of them is green against no code at
+    /// all.
+    ///
+    /// The cost is stated in `merge_spans`'s own doc and asserted here
+    /// too: the real kind is lost, and `redactions` counts the merge as
+    /// `unresolved`. That is the direction that keeps the report true.
+    #[test]
+    fn a_merge_that_swallows_an_unresolved_span_is_unresolved() {
+        let real = Span {
+            start: 10,
+            end: 20,
+            rule: 3,
+        };
+        // Unresolved second (the sort order that hits the default path).
+        let merged = merge_spans(vec![real, Span::unresolved(15, 40)]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].start, merged[0].end), (10, 40));
+        assert!(
+            merged[0].is_unresolved(),
+            "a merged span may not claim a rule matched bytes no rule matched"
+        );
+
+        // Unresolved first, which the existing first-span-wins rule
+        // already handles — driven so the row cannot pass by covering one
+        // direction only.
+        let merged = merge_spans(vec![Span::unresolved(5, 15), real]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].start, merged[0].end), (5, 20));
+        assert!(merged[0].is_unresolved());
+
+        // **Touching, not overlapping** — `span.start <= last.end`, so
+        // REQ-O-009's "adjacent partials collapse to a single marker"
+        // reaches this rule too. The synthetic span's end is hard-capped
+        // at `u + UNVOUCHED_CARRY_BYTES` rather than running to the
+        // window's edge, so a real match beginning at exactly that offset
+        // is a reachable arrangement rather than a contrived one, and it
+        // loses its kind from `redactions` and hence from
+        // `status.redaction_stats` (REQ-O-012). No byte leaks; the
+        // accounting does. Driven from both sides.
+        let touching = merge_spans(vec![
+            Span {
+                start: 0,
+                end: 10,
+                rule: 3,
+            },
+            Span::unresolved(10, 20),
+        ]);
+        assert_eq!(touching.len(), 1);
+        assert_eq!((touching[0].start, touching[0].end), (0, 20));
+        assert!(touching[0].is_unresolved());
+
+        let touching = merge_spans(vec![
+            Span::unresolved(0, 10),
+            Span {
+                start: 10,
+                end: 20,
+                rule: 3,
+            },
+        ]);
+        assert_eq!(touching.len(), 1);
+        assert_eq!((touching[0].start, touching[0].end), (0, 20));
+        assert!(touching[0].is_unresolved());
+
+        // Three spans, the unresolved one in the middle, both neighbours
+        // real: the whole run is one `unresolved` marker.
+        let chain = merge_spans(vec![
+            Span {
+                start: 0,
+                end: 10,
+                rule: 3,
+            },
+            Span::unresolved(9, 31),
+            Span {
+                start: 30,
+                end: 40,
+                rule: 5,
+            },
+        ]);
+        assert_eq!(chain.len(), 1);
+        assert_eq!((chain[0].start, chain[0].end), (0, 40));
+        assert!(chain[0].is_unresolved());
+
+        // Disjoint spans keep their own kinds: the weakening is a
+        // consequence of overlapping or touching, not a blanket rule.
+        let merged = merge_spans(vec![real, Span::unresolved(100, 140)]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].rule, 3);
+        assert!(!merged[0].is_unresolved());
+        assert!(merged[1].is_unresolved());
+    }
+
+    /// `span_kind` is total over both shapes, and the sentinel cannot
+    /// name a rule: `usize::MAX` is out of range for any `RuleSet`, so a
+    /// direct index panics rather than mislabelling.
+    #[test]
+    fn the_unresolved_sentinel_names_no_rule() {
+        let r = RuleSet::builtin().unwrap();
+        assert!(
+            r.rules.get(Span::UNRESOLVED).is_none(),
+            "the sentinel must not name a rule, or a marker would carry \
+             somebody else's kind"
+        );
+        assert_eq!(span_kind(&r, &Span::unresolved(0, 1)), UNRESOLVED_KIND);
+        assert_eq!(
+            span_kind(
+                &r,
+                &Span {
+                    start: 0,
+                    end: 1,
+                    rule: 0
+                }
+            ),
+            r.rules[0].kind
+        );
+        assert!(
+            r.rules.iter().all(|rule| rule.kind != UNRESOLVED_KIND),
+            "REQ-O-011a reserves the kind, so no rule may carry it"
+        );
     }
 }
