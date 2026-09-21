@@ -254,10 +254,16 @@ compose() { # compose <version> <changelog> <output>
 
   # **A body has an upper bound and nothing here knew it.** GitHub's release
   # body limit is documented as 125,000 characters. A real
-  # `[Unreleased]` → `[0.0.8]` rename composes ~86 KB today and is still
-  # growing, so the margin is about a third and shrinking — and the failure
+  # `[Unreleased]` → `[0.0.8]` rename composes 95,809 bytes / 95,253
+  # characters as of 2026-09-20 — 24% of headroom left, and it was 85,637
+  # bytes earlier the same evening, so this is not a slow drift. The failure
   # lands on `gh release create`, after five platform builds, on the one
   # workflow that gets no second attempt.
+  #
+  # Thresholded on BYTES against a limit stated in CHARACTERS, deliberately:
+  # a UTF-8 byte count is never smaller than the character count (here by 556,
+  # the em-dashes), so the warning fires early rather than late. Measure the
+  # real limit before turning either number into a hard failure.
   #
   # **A warning and not an error, deliberately.** The limit is taken from
   # GitHub's documentation and has not been measured here; failing a correct
