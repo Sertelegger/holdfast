@@ -658,20 +658,33 @@ is cut, named and published is in
   and no matching section: **exit 0, a 2,779-byte body, zero prose lines** —
   a release whose entire text is link definitions. The logic moved to
   `scripts/release-notes.sh`, which checks the **extracted section before
-  anything is appended** and requires a line that is not blank, not a link
-  definition and not a heading; it also tells "no such heading" apart from
-  "heading with nothing under it", which were one message before.
+  anything is appended** and requires a line that would render as something —
+  not blank, not a link definition, not a heading, not an HTML comment and
+  not a thematic break. It also tells "no such heading" apart from "heading
+  with nothing under it", which were one message before, and both messages
+  are asserted by the self-test rather than merely printed.
 
-  Two holes were found by the self-test rather than by reading it: the
-  extractor runs to **EOF** on the last section, so a trailing empty section
-  swallows the link-definition block and passes any byte-count test; and a
-  section holding only the Keep a Changelog `### Added`/`### Fixed` skeleton
-  **passed** — which is one edit from step 3 of the release procedure, and the
-  shape `[Unreleased]` is written in. A third was found by review: the
-  self-test's own regression assertion fired on **one reject case in five**,
-  because it keyed on a link-reference count instead of recomputing the
-  extraction; at four of five it is now at the ceiling, the fifth returning
-  before the append is reached.
+  **Every one of those exclusions was bought by a case that got an empty
+  release past the rule**, and they were found by attacking the guard rather
+  than by reading it. Two by its own self-test: the extractor runs to **EOF**
+  on the last section, so a trailing empty section swallows the
+  link-definition block and passes any byte-count test; and a section holding
+  only the Keep a Changelog `### Added`/`### Fixed` skeleton **passed** — one
+  edit from step 3 of the release procedure, and the shape `[Unreleased]` is
+  written in. The rest by review, and the worst was in the test itself: the
+  accept branch asserted only that the body was non-blank and carried a link
+  reference, **both of which the appended definitions satisfy on their own**,
+  so deleting the extraction entirely left the self-test green while the
+  script composed the original 48-line, zero-prose body. It now compares
+  bytes against an independently recomputed extraction. Also fixed there: one
+  stray carriage return defeated the predicate outright, a multi-line HTML
+  comment was accepted while the one-line form was refused, the append
+  pattern was narrower than the predicate it had to agree with, and `## `
+  inside a fenced code block truncated the section silently.
+
+  The self-test is **twenty-six cases, ten of them refusals**, held to three
+  named mutations measured at 9, 7 and 4 red, and green under mawk, gawk,
+  `gawk --posix`, `gawk --traditional`, busybox awk and original-awk.
 
   The self-test runs in CI's `hygiene` job, not in the release rehearsal —
   the rehearsal contributes **zero required status checks**, so a test there

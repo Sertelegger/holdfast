@@ -25,18 +25,26 @@
 # them prose.
 #
 # So the check now runs on the EXTRACTED SECTION, BEFORE anything is
-# appended, and it asks for a non-blank line rather than a byte — a section
-# holding one newline is as empty as a section holding none, and `-s` calls
-# the first one content.
+# appended, and it asks for a line that would RENDER AS SOMETHING rather than
+# for a byte. That predicate started as "non-blank" and grew every time
+# somebody got an empty release past it: a section holding one newline is as
+# empty as one holding none, and so is a section of bare `###` skeleton
+# headings, or of link definitions, or of an HTML comment, or of a `---`.
+# `prose_count` below is the list and each exclusion names the case that
+# bought it.
 #
-# **And it is falsifiable, which is the other half.** `--self-test` runs it
-# against fixtures in both directions: sections that must be refused and
-# sections that must be accepted. The refusal fixtures all carry link
-# definitions, deliberately — every one of them is a case the pre-fix guard
-# accepted, so the self-test fails against the old code and passes against
-# this one. It also runs the extractor over this repository's real
-# CHANGELOG.md, which is what would catch the heading format drifting away
-# from what the extractor matches.
+# **And it is falsifiable, which is the other half.** `--self-test` runs
+# fixtures in both directions: sections that must be refused and sections
+# that must be accepted, with the refusal fixtures carrying link definitions
+# deliberately so that each is a case the pre-fix guard accepted. **Both
+# directions matter and the accept side is the one that was wrong**: it once
+# asserted only that the output was non-blank and carried a `[#45]:` line,
+# which the APPENDED definitions satisfy by themselves — so deleting the
+# extraction outright left this file green while it composed the very body
+# the whole exercise exists to refuse. It now compares bytes against an
+# independently recomputed extraction. The self-test also runs the extractor
+# over this repository's real CHANGELOG.md, which is what would catch the
+# heading format drifting away from what the extractor matches.
 #
 # `hygiene` in `ci.yml` runs `--self-test`, not `release-rehearsal.yml`:
 # the rehearsal is not among the required status checks and `hygiene` is,
