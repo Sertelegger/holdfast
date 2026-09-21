@@ -201,15 +201,30 @@ function fence_run(str,   c, n) {
   stripped = $0
   sub(/^[ \t]+/, "", stripped)
   run = fence_run(stripped)
-  if (infence) {
+  # **`incomment` is tested FIRST, and that order is the whole of this
+  # branch.** `<!--` opens an HTML block whose contents are raw until `-->`,
+  # so a ``` inside one is not a fence opener. With the fence arm evaluated
+  # first it opened one, and the file then "ended inside an unterminated
+  # fence" -- a refusal, so it failed closed and no wrong body shipped, but
+  # the message told a release engineer to close a fence that was never open
+  # and was already closed. At tag time, one attempt, that sends somebody
+  # editing a correct changelog.
+  #
+  # It is the defect the shared scanner was built to remove, inverted: one
+  # state machine now, but the comment did not mask the fence. The two are
+  # mutually exclusive -- whichever opened first runs to its own closer --
+  # so the arms below are ordered, not nested, and the reverse case (a
+  # `<!--` inside a fence, which must stay raw) falls into the `infence` arm
+  # and is ignored exactly as it should be.
+  if (incomment) {
+    skip = 1
+    if (stripped ~ /-->/) incomment = 0
+  } else if (infence) {
     skip = 1
     if (run && runchar == openchar && run >= openlen \
         && substr(stripped, run + 1) ~ /^[ \t]*$/) infence = 0
   } else if (run) {
     infence = 1; openchar = runchar; openlen = run; skip = 1
-  } else if (incomment) {
-    skip = 1
-    if (stripped ~ /-->/) incomment = 0
   } else if (stripped ~ /^<!--/) {
     skip = 1
     if (stripped !~ /-->/) incomment = 1
@@ -810,6 +825,45 @@ still code
 -->
 
 - KEEP-ME the entry after the comment ([#45])
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- LEAK-ME the previous release' \
+    'KEEP-ME' 'LEAK-ME'
+
+  # **A fence marker inside a comment is not a fence**, and the pair is here
+  # because a naive fix for one direction breaks the other. CommonMark: an
+  # HTML block opened by `<!--` runs raw to `-->`, and a fenced block runs to
+  # its own closer; whichever opened first wins, so neither may start inside
+  # the other. The first of these refused with "ends inside an unterminated
+  # fence" -- failing closed, but telling a release engineer to close a fence
+  # that was never open, at tag time, with one attempt.
+  case_body "a fence marker inside an HTML comment is not a fence" 0.0.8 \
+'# Changelog
+
+## [0.0.8] — 2026-09-20
+
+<!--
+```
+-->
+
+- KEEP-ME the entry after the comment ([#45])
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- LEAK-ME the previous release' \
+    'KEEP-ME' 'LEAK-ME'
+
+  case_body "a comment marker inside a fence is not a comment" 0.0.8 \
+'# Changelog
+
+## [0.0.8] — 2026-09-20
+
+```
+<!--
+```
+
+- KEEP-ME the entry after the block ([#45])
 
 ## [0.0.7] — 2026-09-01 (Carabiner)
 
