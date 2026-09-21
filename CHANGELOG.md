@@ -510,6 +510,28 @@ is cut, named and published is in
 
 ### Fixed
 
+- **The fish shell-integration row failed on a bash-ism in the test helper
+  all three shells share, not on the fish integration ([#217], [#98]).**
+  `tests/detection.rs`'s shared OSC 133 assertion drove `(exit 42)` — a
+  subshell in bash and zsh, a command *substitution* in fish, which rejects
+  it at parse time. fish ran nothing, emitted no `C`/`D;42` pair and
+  re-prompted, so the stream ended `… A B A B` where the shared
+  expectation wants `… C D;42 A B`. The helper now drives
+  `sh -c 'exit 42'`, one external command in all three shells, and the row
+  passes on fish 3.7.0 — 15 runs of 15. The marker arithmetic is unchanged
+  at 15 and is now derived from the measured stream rather than written
+  beside it. Holdfast's fish snippet was never at fault: it installs and
+  marks correctly, `functions -c fish_prompt` included.
+
+  **`README.md`'s platform-support claim moves with it**, from "fish shell
+  integration is unverified at runtime" to "unverified *by CI*" — CI
+  installs no fish, which is a statement about the runner's package list
+  and no longer one about the row. A fish >= 4 still fails the row on the
+  OSC 133 marker collision; that is §11.4's scenario awaiting a
+  collision-aware row, and it is untouched here. Four comments that blamed
+  a snippet guard REQ-PD-028 had already deleted are corrected against
+  fresh measurements on fish 4.8.1 and 4.9.3. Test-only.
+
 - **`holdfast watch` no longer loses most of a burst *silently* ([#200]).**
   Measured through the wire, a 380 KB `cat` into a watched session delivered
   **2.6%–23%** of itself on ASCII and **3.7%** on UTF-8, each ending on
@@ -1752,6 +1774,8 @@ residuals that are known and accepted.
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
 [#200]: https://github.com/Sertelegger/holdfast/issues/200
 [#194]: https://github.com/Sertelegger/holdfast/issues/194
+[#217]: https://github.com/Sertelegger/holdfast/issues/217
+[#98]: https://github.com/Sertelegger/holdfast/issues/98
 
 [#201]: https://github.com/Sertelegger/holdfast/issues/201
 [#152]: https://github.com/Sertelegger/holdfast/issues/152

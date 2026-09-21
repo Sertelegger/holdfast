@@ -85,17 +85,42 @@ done
 
 # fish is the one gated program this pipeline does not require, and the
 # shortfall is printed on every run rather than left to a comment nobody
-# opens. Measured 2026-08-13 on the ubuntu-24.04 base image, at both fish
-# versions obtainable there: 3.7.0 (noble's archive) fails the row on
-# `(exit 42)`, which is a subshell in bash and zsh and a rejected command
-# substitution in fish; 4.8.1 (the maintainers' PPA) fails it because
-# Holdfast's own snippet guard declines to inject. Installing either would
-# turn a silent skip into a red row that says nothing about CI. See
-# ci.yml above the `test` job.
+# opens.
+#
+# **WHICH fish decides the answer, and this block used to print one answer
+# for both.** Until 2026-09-20 it said any present fish was "expected to
+# FAIL until the row and the snippet guard are fixed", on a measurement
+# that had drifted at both ends: the 3.7.0 arm failed on `(exit 42)` — a
+# subshell in bash and zsh, a rejected command substitution in fish —
+# which GH #217 / #98 fixed in the shared assertion helper, and the fish
+# >= 4 arm blamed a snippet guard that REQ-PD-028 had already deleted.
+# Re-measured 2026-09-20 on 3.7.0, and on 4.8.1 — the version the
+# `fish-req-ts-008` job pins — and 4.9.3, both upstream static builds:
+#
+#   fish < 4   the row RUNS and PASSES. Installing noble's own fish here
+#              is a green row, not a red one.
+#   fish >= 4  the row RUNS and FAILS, on the marker collision — fish
+#              emits OSC 133 natively and the row's expectation models
+#              Holdfast's stream alone. §11.4 writes that scenario out in
+#              full and names a fish >= 4.0 as its acceptance case; what
+#              is missing is a row that models it, not the scenario. A
+#              finding about the suite, not about CI.
+#
+# See ci.yml above the `test` job, and the per-row records in
+# scripts/ci-skip-census.sh.
 if command -v fish >/dev/null 2>&1; then
-  printf '  note  %-8s %-24s %s\n' "fish" "$(command -v fish)" "$(fish --version 2>&1 | head -1)"
-  printf '  note  fish is PRESENT, so its row will RUN — and is expected to FAIL until\n'
-  printf '  note  the row and the snippet guard are fixed. That failure is a finding, not CI.\n'
+  fish_ver="$(fish --version 2>&1 | head -1)"
+  printf '  note  %-8s %-24s %s\n' "fish" "$(command -v fish)" "$fish_ver"
+  # The major, off the `fish, version X.Y.Z` line fish itself prints. A
+  # version we cannot parse is treated as >= 4: the newer branch is the
+  # one that warns, so an unreadable version warns rather than reassures.
+  fish_major="$(printf '%s' "$fish_ver" | sed -n 's/.*version \([0-9][0-9]*\)\..*/\1/p')"
+  if [ -n "$fish_major" ] && [ "$fish_major" -lt 4 ]; then
+    printf '  note  fish is PRESENT and < 4, so fish_integration_… will RUN and is expected to PASS.\n'
+  else
+    printf '  note  fish is PRESENT and >= 4 (or unparseable), so fish_integration_… will RUN and is\n'
+    printf '  note  expected to FAIL on §11.2'"'"'s marker collision. That failure is a finding, not CI.\n'
+  fi
 else
   printf '  note  %-8s %s\n' "fish" "not installed — fish_integration_… will SKIP and the fish snippet stays UNVERIFIED at runtime"
 fi
