@@ -77,6 +77,17 @@
 # every step in `publish` up to and including the verification loop is a line
 # that file also runs.
 #
+# **The same argument applied to the release BODY, which is where it had not
+# been.** Composing the notes was inline YAML, and its empty-section guard was
+# therefore untested — and, it turned out, untestable, because it ran after
+# the step had already appended every link definition in the file to the file
+# it was checking. That logic
+# is now `scripts/release-notes.sh`, its fixtures run as `--self-test` in
+# `ci.yml`'s `hygiene` job rather than in the rehearsal, and the reason for
+# that placement is `verify-release-archive.sh`'s: the rehearsal is not among
+# the required status checks and `hygiene` is, and these fixtures need no
+# build and no runner matrix.
+#
 # **The residual is exactly one command: `gh release create`.** Nothing in
 # this repository can exercise it — `scripts/ci-hygiene.sh` refuses `gh`, a
 # `secrets.` reference and a `contents: write` on any workflow without the
@@ -225,29 +236,32 @@ jobs:
             echo "tag $tag says $version; Cargo.toml says $crate" >&2
             exit 1
           fi
-          # The section for exactly this version, up to the next heading.
-          awk -v v="## [$version]" '
-            index($0, v) == 1 { on = 1; next }
-            on && /^## / { exit }
-            on { print }
-          ' CHANGELOG.md > release-notes.md
-          # **The definitions, or every `[#45]` renders as literal text.**
-          # Reference-style links are defined once at the foot of the file,
-          # after every version section, so the extractor above cannot reach
-          # them — it stops at the next `## `. A body carrying `[#45]` with
-          # no matching definition shows the brackets, which is precisely the
-          # defect the changelog rewrite existed to fix, reintroduced one
-          # surface over. Appending every definition is safe: Markdown
-          # ignores ones nothing references.
-          printf '\n' >> release-notes.md
-          grep -E '^\[[^]]+\]: https?://' CHANGELOG.md >> release-notes.md
-          if [ ! -s release-notes.md ]; then
-            echo "CHANGELOG.md has no '## [$version]' section with content." >&2
-            echo "Cutting a release is: rename [Unreleased] to the version with" >&2
-            echo "its date, commit, then tag. The notes are the section." >&2
-            exit 1
-          fi
-          echo "notes: $(wc -l < release-notes.md) lines"
+          # **The third check is a script because, inline here, it could not
+          # fail.** The extraction and its empty-section guard used to live in
+          # this block in this order: extract the section, `printf '\n'`,
+          # append every link definition in the file, then
+          # `[ ! -s release-notes.md ]`. `-s` is "size greater than zero",
+          # and by the time it ran the file could not have a size of zero —
+          # the `printf` alone guaranteed a byte. The guard sat one line
+          # below the `grep` and two below the `printf` that made it
+          # unreachable, and it had never once fired, so a `v0.0.8` tag
+          # pushed before `## [Unreleased]` was renamed would have published
+          # a draft whose entire body was bare link definitions and no prose.
+          #
+          # `scripts/release-notes.sh` is that logic with the check moved in
+          # FRONT of the append and widened from "has a byte" to "has a line
+          # that RENDERS as something" — not blank, not a link definition, not
+          # a heading, not an HTML comment, not a thematic break. Every one of
+          # those five was bought by a case that got an empty release past the
+          # rule: the extractor runs to EOF on the last section, so a trailing
+          # empty one swallows the definition block; and `## [X.Y.Z]` opened
+          # with Keep a Changelog's `### Added` / `### Fixed` skeleton and
+          # never filled in renders as nothing while looking like content.
+          # It carries fixtures in both directions and
+          # `ci.yml`'s `hygiene` job runs `--self-test` on every pull request,
+          # which is what makes this a check whose failure has been
+          # demonstrated rather than assumed.
+          ./scripts/release-notes.sh "$version" CHANGELOG.md release-notes.md
 
       # `--verify-tag` so a release cannot be created for a tag that is not on
       # the remote, and `--notes-file` so the body is the changelog verbatim

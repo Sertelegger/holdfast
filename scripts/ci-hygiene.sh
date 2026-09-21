@@ -1155,7 +1155,7 @@ fi
 # wrong version that reports clean:
 #
 #   ci.yml -- `grep -E '^  [a-z][a-z0-9-]*:$'` over the whole file returns the
-#   eleven jobs AND `push:`, which is a key of the `on:` block at the same
+#   twelve jobs AND `push:`, which is a key of the `on:` block at the same
 #   indent. So the scan is bounded to a sed RANGE that opens on a column-0
 #   `jobs:` and closes on the next column-0 line, and only then takes
 #   two-space-indented keys. The same mis-count is recorded in the

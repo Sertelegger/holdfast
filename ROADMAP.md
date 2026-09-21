@@ -206,9 +206,13 @@ launcher that fetches the right binary on demand.
 the whole of what is left here. `/plugin marketplace add Sertelegger/holdfast`
 then `/plugin install holdfast@holdfast` installs — measured — and the
 bootstrap it installs then fails with a message naming the manual install,
-because no release carries binaries or a `SHA256SUMS.txt`. `release.yml`
-attaches none on purpose: doing so is the first-external-distribution event,
-not a side effect of writing release notes. So the remaining work is one
+because no *published* release carries binaries or a `SHA256SUMS.txt`. This
+paragraph read "`release.yml` attaches none on purpose", which stopped being
+true at #198: it builds five and attaches them, **to a draft**, and a draft's
+assets are not served from `releases/download/`. The purpose the sentence was
+reaching for survives the correction — promoting that draft is the
+first-external-distribution event, not a side effect of writing release
+notes. So the remaining work is one
 decision and the assets that follow it, not more plugin code. Windows is the
 one part of the plugin that is genuinely unfinished rather than waiting —
 `.mcp.json` has a single `command` string and no platform conditional, so the

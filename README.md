@@ -20,6 +20,10 @@ over — a live session from any terminal. The web UI is still to come; see
 
 - `start_session` — spawn a shell or program on a real PTY
 - `send_input` — type into it
+- `request_secret_input` — ask for a password without ever holding one. The
+  value is typed by an attached human or resolved by a configured provider
+  and goes straight to the PTY; the agent gets back a status and a byte
+  count, never the secret
 - `read_output` — read what it printed, using a cursor you carry between
   calls; escape sequences stripped and secrets replaced with
   `[REDACTED:<kind>]` markers by default
@@ -72,7 +76,10 @@ tells you why rather than delivering it. `holdfast attach --allow-echo` sends it
 anyway, for the programs that ask for a code or an API key without ever clearing
 echo — the value is still masked on your own terminal, and it will still appear
 in the session's output. `request_secret_input`, the tool an agent calls to *ask* for that
-password, ships in 0.0.7 and is one of the twelve above.
+password, ships in 0.0.7 and is one of the twelve above. It was not: this
+sentence said twelve while the list above it enumerated eleven, and
+`request_secret_input` — the tool the sentence is about — was the one it
+left out.
 
 Sessions outlive the MCP client: `holdfast mcp` auto-spawns a daemon on
 first use and reconnects to it afterwards. `holdfast mcp --no-daemon` runs
@@ -233,8 +240,24 @@ because `release.yml` is tag-triggered and holds a write token, so the only
 other way to find out whether it works is to cut a tag and hope. It publishes
 nothing and holds no token; the one command it cannot exercise —
 `gh release create` — is named as the residual in `release.yml`'s own header.
-**It is not a required status check**, which is a gap: add it alongside the
-eleven, or it is a gate that can go red unnoticed.
+**It is not a required status check, and it is now the whole of that gap.**
+Eighteen contexts report on a commit and **twelve** gate it; the six that do
+not are this workflow's `assemble` job and its five `pack` matrix cells.
+This sentence has been wrong twice, in both directions: it first said
+"exactly two such gaps", having counted workflows where branch protection
+counts contexts and a matrix job is one entry that becomes five; then it said
+seven, and `plugin` was made required on 2026-09-20. Count them rather than
+trusting the number:
+
+```bash
+comm -13 \
+  <(gh api repos/Sertelegger/holdfast/branches/main/protection \
+      --jq '.required_status_checks.contexts[]' | sort) \
+  <(gh api "repos/Sertelegger/holdfast/commits/main/check-runs?per_page=100" \
+      --jq '.check_runs[].name' | sort -u)
+```
+
+Add them alongside the twelve, or they are gates that can go red unnoticed.
 
 Scheduled: a **weekly** flake hunt (Sundays — the suite 100× at 4×
 oversubscribed parallelism) and a **monthly** `cargo mutants` sweep (the 1st).
@@ -249,24 +272,47 @@ replaced reached the cap, and the sample count given up is recorded there as a
 knowing trade. `nightly.yml` keeps its name because REQ-TST-004's tier-4 work
 belongs there, not because it runs nightly.
 
-**No job here is blocking yet, and that is now a choice rather than a
-platform limit.** Required status checks need branch protection or a ruleset,
-and both are gated to public repositories on GitHub Free — which this
-repository has been since **2026-09-02**. So they are available; none is
-configured. (That date read 2026-09-01, which is the `v0.0.7` tag's date and
-not this repository's: going public was done by deleting and recreating the
+**All twelve of these jobs gate `main`, and this paragraph said for months
+that none did.** Classic branch protection is live: a pull request is
+required, all twelve contexts must be green, `strict` forces the branch up to
+date with `main` before merge, conversations must be resolved, force-push and
+deletion are blocked, and `enforce_admins` is on — so the owner has no bypass
+either. The twelve are `actionlint`, `clippy`, `fish-req-ts-008`, `fmt`,
+`hygiene`, `macos-native`, `package`, `plugin`, `probe`, `test`,
+`windows-cross` and `windows-native`. **`plugin` was added on 2026-09-20**,
+after the paragraph below had been written saying it was not — which is why
+this list is worth reading off the API rather than off this list:
+
+```bash
+gh api repos/Sertelegger/holdfast/branches/main/protection \
+  --jq '.required_status_checks.contexts'
+```
+
+That became possible only when the repository went public on **2026-09-02**:
+branch protection and rulesets are gated to public repositories on GitHub
+Free. (That date read 2026-09-01, which is the `v0.0.7` tag's date and not
+this repository's: going public was done by deleting and recreating the
 repository, so the object's own `created_at` — `2026-09-02T07:06:34Z`, matching
 its `PublicEvent`, and *after* the tag it now holds — is the event.
-`gh api repos/Sertelegger/holdfast --jq .created_at` is the check.) **This pipeline still observes rather than gates**: a red job does
-not stop a merge, and someone has to look.
+`gh api repos/Sertelegger/holdfast --jq .created_at` is the check.)
 
-Turning them on has one prerequisite and one rule. The prerequisite was
-`paths-ignore`: a workflow filtered out at the `on:` level posts no check at
-all, so any required check would have left every docs-only PR pending
-forever. That filter is gone. The rule is the CI plan's — **do not require a
-check until it has been observed red** — which is why `windows-cross` could
-not have been required before #19 and `windows-native` should not be until it
-has failed once.
+**`plugin` used to be the twelfth job and not required, and that gap is
+closed.** It is the only gate on `scripts/plugin-manifest-check.py`, which
+holds `plugin/version.txt` and `plugin/.claude-plugin/plugin.json` in lockstep
+with the workspace version — so until 2026-09-20 the guard on the release
+version bump could go red without stopping the merge that broke it — the
+change most likely to trip it. What remains unrequired is `release rehearsal`:
+its `assemble` job and its five `pack` matrix cells, six contexts in all.
+
+Turning them on took one prerequisite and one rule, and both are now
+history rather than plan. The prerequisite was `paths-ignore`: a workflow
+filtered out at the `on:` level posts no check at all, so a required check
+would have left every docs-only PR pending forever. That filter was deleted
+first. The rule is the CI plan's — **do not require a check until it has been
+observed red** — which is why `windows-cross` could not have been required
+before #19, and why each of the twelve was added only after a run of it had
+actually failed. `release rehearsal`'s six contexts get the same treatment
+whenever they are added.
 
 **Read the job, not the run.** `gh run list` reports the *run* conclusion, and
 a job carrying `continue-on-error` records `failure` while its run records
@@ -328,7 +374,8 @@ its `--test-threads=192` banner suggests.
 |---|---|
 | Linux x86_64 | **CI** — the full suite on every push and pull request |
 | Windows x86_64 | **CI on two jobs, one of them a real runner** — this row read "Nothing executes. There is no Windows runner and no Windows test job" while the CI table above it listed `windows-native` on `windows-2022`, so the same file contradicted itself. `windows-cross` cross-compiles for the GNU ABI on Linux; `windows-native` runs natively: MSVC clippy over `--all-targets`, `tests/source_guards.rs`, a filtered `--lib` over the modules whose Windows arm differs from its Unix one, and the `#[cfg(windows)]` CLI arms *executed* — exit-64 refusals with their reasons for the daemon-backed subcommands, and `daemon stop`'s idempotent 0. What Windows does at run time: `holdfast mcp` serves MCP over stdio in-process and writes the §9.4 audit trail (there is no daemon, so sessions end with the process), and `version` works. What is **still** unverified there is everything that needs a shell or a PTY — the 55 shell-spawning lib tests and the four shell-spawning integration targets do not run on Windows, so session behaviour on the platform rests on no test. Milestone 0.0.11 |
-| macOS (x86_64 / aarch64) | **Owner-run local execution.** GitHub offers macOS runners; not using one is a deliberate decision rather than a constraint. The suite is run on the owner's machine before a release — a documented verification route, not an absent one |
+| macOS aarch64 | **CI** — `macos-native` on `macos-14` (arm64) runs the full suite under `cargo-nextest` on every push and pull request, and it is a required check. This row read "Owner-run local execution … GitHub offers macOS runners; not using one is a deliberate decision rather than a constraint" while the CI table above it already listed the job: the same self-contradiction `windows-native` had, in the same file, one table apart |
+| macOS x86_64 | **The suite is not run.** `release-rehearsal.yml` builds, packs, checksums and extracts the `macos-x86_64` asset natively on `macos-15-intel`, then *runs the extracted binary* — `holdfast version`, asserted against `Cargo.toml`'s version and against reporting `build unknown`. So Intel macOS is proven to produce a binary that starts; it is not proven to pass a single test, because nothing anywhere executes the suite there. Do not read the aarch64 row as covering it |
 | WSL | Covered indirectly via Linux. GitHub-hosted runners offer no WSL image, so a dedicated runner is post-v0.1.0 |
 
 ### What CI does not verify
@@ -365,15 +412,22 @@ decision and which half is still blocked.
 
 **Spec §11.4's control-path p99 is never asserted in CI.**
 `crates/holdfast-core/tests/stress_write_path.rs` asserts it only where
-`available_parallelism()` reports at least 8 cores, and GitHub's standard
-hosted runners are 2-core on a private repository — so the row runs, guards
-its other two assertions (`parsed == 0`, and the produced-bytes floor that
-stops the run passing vacuously) on every host, and *reports the p99 instead
-of asserting it*. That is deliberate: measured on 2 cores, the sampling loop
-gets 13 turns in three seconds instead of ~590, `percentile(0.99)` of
-thirteen samples **is** the maximum, and the number describes the Linux
-scheduler rather than Holdfast — a real 2-core run of this suite answers
-p99 = 1.11 s against a 500 ms budget, where 48 cores answer 731 µs.
+`available_parallelism()` reports at least 8 cores (`P99_MIN_CORES`), and
+GitHub's standard hosted Linux runners are 4-core on a public repository — so
+the row runs, guards its other two assertions (`parsed == 0`, and the
+produced-bytes floor that stops the run passing vacuously) on every host, and
+*reports the p99 instead of asserting it*. This clause read "2-core on a
+private repository", which was the right number for the wrong repository:
+going public on 2026-09-02 doubled the runner and **changed nothing**, because
+the gate demands 8 either way. `scripts/ci-skip-census.sh` carries the same
+correction in its own header.
+
+Holding the assertion behind that gate is deliberate, and the measurement
+behind it is a historical one, taken on the 2-core runner this repository had
+while it was private: the sampling loop got 13 turns in three seconds instead
+of ~590, `percentile(0.99)` of thirteen samples **is** the maximum, and the
+number describes the Linux scheduler rather than Holdfast — that 2-core run
+answered p99 = 1.11 s against a 500 ms budget, where 48 cores answer 731 µs.
 
 It is **explicit rather than silent** the same way the fish row is. The test
 prints a `not-asserted: <id> cores=… min_cores=…` line, `ci-skip-census.sh`

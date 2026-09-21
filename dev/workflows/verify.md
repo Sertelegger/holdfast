@@ -8,12 +8,18 @@ at the first red tells you one thing when it could have told you five.
 2. `cargo clippy --workspace --all-targets --locked -- -D warnings`
 3. `cargo nextest run --workspace --locked --no-fail-fast --success-output immediate --no-output-indent 2>&1 | tee test-output.log`,
    then `cargo test --workspace --locked --doc`
-4. `./scripts/ci-hygiene.sh`, and **the three self-tests CI's `hygiene` job
+4. `./scripts/ci-hygiene.sh`, and **the four self-tests CI's `hygiene` job
    runs beside it**, which this list omitted while claiming to be that job:
    `./scripts/ci-hygiene.sh --self-test`,
-   `python3 ./scripts/spec-enum-check.py --self-test`, and
+   `python3 ./scripts/spec-enum-check.py --self-test`,
    `./scripts/verify-release-archive.sh --self-test` (§13.3's safe-archive
-   rules against 21 archives built to break them)
+   rules against 21 archives built to break them), and
+   `./scripts/release-notes.sh --self-test` (the release body's
+   empty-section guard; it prints its own case and refusal totals, three of
+   which are derived from `CHANGELOG.md`'s released versions). **This
+   read "the three self-tests" until the fourth landed** — the same drift
+   the sentence itself is a correction for, so check the `hygiene` job's
+   steps rather than this count.
 5. `actionlint .github/workflows/*.yml`
 6. `./scripts/mcp-smoke.sh` — the only check that drives the real JSON-RPC wire
 

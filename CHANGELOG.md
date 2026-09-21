@@ -232,13 +232,21 @@ is cut, named and published is in
   write token. The `on:` block may now name `push:` and `tags:` and nothing
   else, and the three spellings are self-test fixtures.
 
-- **A release now bumps three files, not two.** §12.5 and `CONTRIBUTING.md`
+- **A release now bumps four files, not two.** §12.5 and `CONTRIBUTING.md`
   named `Cargo.toml` and `plugin/version.txt`;
   `plugin/.claude-plugin/plugin.json` carries its own `version` and **that is
   the one `/plugin update` and the install cache key on** — installPath is
   `cache/<marketplace>/<plugin>/<version>/`, and `claude plugin list` reports
   the version from `plugin.json`, not from `version.txt`. A release PR that
   moved the other two would ship a plugin that never updates itself.
+
+  **And `Cargo.lock` is the fourth** — this entry said three until the
+  release-machinery pass below actually counted them. The lock holds the
+  workspace members' versions twice over, and every build in this repository
+  passes `--locked`, so a manifest bumped without a relock fails with *"cannot
+  update the lock file … because `--locked` was passed to prevent this"*.
+  `cargo update --workspace --offline` is the fix and touches exactly those two
+  lines. Six literals across four files, and `CONTRIBUTING.md` now says so.
 - **`[security] redaction_enabled = false` is refused at load, and §9.4's
   `session_start` row no longer carries `redaction_enabled`.** The key disabled
   redaction nowhere: its only consumer was that row, so `false` bought an
@@ -639,6 +647,73 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **The guard that was supposed to refuse an empty release body could not
+  fire, and the release procedure did not mention `Cargo.lock`.** Both are
+  release-time defects that no test or check would have caught, because the
+  release workflow runs once, on a tag, after review.
+
+  `release.yml` tested `[ ! -s release-notes.md ]` **after** appending a
+  newline and ~2.6 KB of link definitions, so the file was never empty.
+  Reproduced against this repository's own changelog with the version bumped
+  and no matching section: **exit 0, a 2,779-byte body, zero prose lines** —
+  a release whose entire text is link definitions. The logic moved to
+  `scripts/release-notes.sh`, which checks the **extracted section before
+  anything is appended** and requires a line that would render as something —
+  not blank, not a link definition, not a heading, not an HTML comment and
+  not a thematic break. It also tells "no such heading" apart from "heading
+  with nothing under it", which were one message before, and both messages
+  are asserted by the self-test rather than merely printed.
+
+  **Every one of those exclusions was bought by a case that got an empty
+  release past the rule**, and they were found by attacking the guard rather
+  than by reading it. Two by its own self-test: the extractor runs to **EOF**
+  on the last section, so a trailing empty section swallows the
+  link-definition block and passes any byte-count test; and a section holding
+  only the Keep a Changelog `### Added`/`### Fixed` skeleton **passed** — one
+  edit from step 3 of the release procedure, and the shape `[Unreleased]` is
+  written in. The rest by review, and the worst was in the test itself: the
+  accept branch asserted only that the body was non-blank and carried a link
+  reference, **both of which the appended definitions satisfy on their own**,
+  so deleting the extraction entirely left the self-test green while the
+  script composed the original 48-line, zero-prose body. It now compares
+  bytes against an independently recomputed extraction. Also fixed there: one
+  stray carriage return defeated the predicate outright, a multi-line HTML
+  comment was accepted while the one-line form was refused, the append
+  pattern was narrower than the predicate it had to agree with, and `## `
+  inside a fenced code block truncated the section silently.
+
+  Also fixed: the extractor's fence tracking was a bare toggle, so a nested
+  fence, a `~~~` closing a ``` , a `## ` inside an HTML comment, or an
+  unterminated fence each produced a **wrong release body at `rc=0`** —
+  dropping the entry after a block, or leaking the previous release into
+  this one. The scanner is marker-aware, shared by every reader of the file,
+  and a changelog that ends inside a fence or a comment is refused outright.
+  Its arms are **ordered** as well: a ``` inside an HTML comment is not a
+  fence opener, and testing the fence arm first made one — which failed
+  closed, but told a release engineer to close a fence that had never
+  opened.
+  The link-definition rule is one spelling rather than an awk pattern and a
+  `grep` pattern that kept diverging, and it is fence-aware, so a definition
+  shown as an *example* inside a code block is no longer collected as real.
+
+  The self-test prints its own totals — a count written here would be stale
+  the day 0.0.8 is cut, since three of its cases are derived from this
+  file's released-version headings. It is held to four named mutations, and
+  it runs under **six awk implementations** in CI rather than the runner's
+  default: that matrix immediately caught a `link_defs | grep -q .` that
+  took SIGPIPE under `pipefail` and refused a changelog with 53 definitions,
+  visible under busybox awk and nowhere else.
+
+  The self-test runs in CI's `hygiene` job, not in the release rehearsal —
+  the rehearsal contributes **zero required status checks**, so a test there
+  would not gate. `scripts/verify-release-archive.sh --self-test` sits in the
+  same job for the same reason.
+
+  Also: `#{1,6}` in the heading rule was an ERE interval **inside `awk`**,
+  which mawk 1.3.3 and macOS's BSD awk treat literally — it would have
+  silently reopened the heading hole on the platform `dev/workflows/verify.md`
+  runs on. Now `#+`.
+
 
 - **The fish shell-integration row failed on a bash-ism in the test helper
   all three shells share, not on the fish integration ([#217], [#98]).**
@@ -1934,6 +2009,5 @@ residuals that are known and accepted.
 [#195]: https://github.com/Sertelegger/holdfast/issues/195
 [#160]: https://github.com/Sertelegger/holdfast/issues/160
 [#203]: https://github.com/Sertelegger/holdfast/issues/203
-[#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206

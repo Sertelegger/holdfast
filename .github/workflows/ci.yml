@@ -145,6 +145,74 @@ jobs:
       # argument as the two self-tests above it: a guard whose guard is unrun
       # is a guard on trust.
       - run: ./scripts/verify-release-archive.sh --self-test
+      # **And the release BODY, for the sharper version of the same reason.**
+      # `release.yml`'s empty-changelog guard was not merely unrun -- it was
+      # unrunnable: `[ ! -s release-notes.md ]` sat one line after the `grep`
+      # that appended every link definition in the file, so it had never
+      # fired and could not. The logic moved into `scripts/release-notes.sh`
+      # with the check in front of the append, and this step is the half that
+      # stops it coming back. It prints its own totals rather than having a
+      # number written here: three of its cases are derived from
+      # `CHANGELOG.md`'s released-version headings, so any count in this
+      # comment would be stale the day 0.0.8 is cut.
+      #
+      # Four mutations are the evidence it can fail, each named because a
+      # bare count says nothing about which mutation produced it: restoring
+      # the literal pre-fix block turns 9 red; moving `has_prose` alone to
+      # after the append, 7; deleting the extraction and keeping the append
+      # (`: > "$out"`), 10; appending the whole changelog a second time
+      # (`cat "$changelog" >> "$out"`), 10.
+      #
+      # **The last two were both GREEN once**, at opposite ends of the same
+      # file. The accept branch asserted that the body was non-blank and
+      # carried a `[#45]:` line -- which the appended definitions satisfy by
+      # themselves, so an empty extraction passed -- and then, once it
+      # compared a PREFIX against the recomputed extraction, everything past
+      # that prefix went unchecked and a body with the changelog stapled to
+      # its end passed too. It now compares the whole file against
+      # extraction + blank + definitions.
+      #
+      # **Every awk, not just this runner's.** The script's rules are awk
+      # programs, and the one regression that reached `main`-bound review was
+      # invisible under `/usr/bin/awk` and red under all five others: a
+      # pattern shared through `awk -v` becomes a *dynamic* regex, where
+      # string-escape processing collapses `\[` to `[`. mawk tolerated it and
+      # gawk, `--posix`, `--traditional`, original-awk and busybox awk each
+      # matched nothing. A single-interpreter run said that was fine.
+      #
+      # So the claim is made true by construction here rather than asserted
+      # in a comment somebody verified once. A missing interpreter FAILS the
+      # step -- `|| exit 1` and no `continue-on-error` -- because the whole
+      # point is that the matrix cannot quietly shrink to one cell.
+      - name: The release-body guard's own fixtures, under every awk
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gawk mawk original-awk busybox
+          shim="$(mktemp -d)"
+          fails=0
+          # `gawk --posix` and `--traditional` are separate cells: they turn
+          # OFF gawk extensions, which is the closest thing to a BSD awk that
+          # a Linux runner can be, and macOS is where `verify.md` runs.
+          for impl in "mawk" "gawk" "gawk --posix" "gawk --traditional" \
+                      "original-awk" "busybox awk"; do
+            bin="${impl%% *}"
+            if ! command -v "$bin" >/dev/null 2>&1; then
+              echo "::error::$bin is not installed; the awk matrix cannot shrink silently"
+              fails=$((fails + 1)); continue
+            fi
+            printf '#!/bin/sh\nexec %s "$@"\n' \
+              "$(command -v "$bin") ${impl#"$bin"}" > "$shim/awk"
+            chmod +x "$shim/awk"
+            echo "=== $impl"
+            if PATH="$shim:$PATH" ./scripts/release-notes.sh --self-test; then
+              echo "--- $impl OK"
+            else
+              echo "::error::release-notes.sh --self-test failed under $impl"
+              fails=$((fails + 1))
+            fi
+          done
+          [ "$fails" -eq 0 ] || exit 1
 
   # `dev/workflows/verify.md` has listed `actionlint` under *"CI's own gate,
   # which must pass"* since the file was written, and CI did not run it —

@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-**Phase: implementation. `v0.0.7` (secrets) is the newest tag and is released — `CHANGELOG.md` carries it as `## [0.0.7] — 2026-09-01`, and the workspace version is `0.0.7`. `main` is protected: a PR, all eleven required checks, strict up-to-date, and no admin bypass.** Dependency bumps land without a CHANGELOG entry, deliberately — this project has never recorded one there, and starting now would make the omissions look like decisions.
+**Phase: implementation. `v0.0.7` (secrets) is the newest tag and is released — `CHANGELOG.md` carries it as `## [0.0.7] — 2026-09-01 (Carabiner)`, codename included because `release.yml` reads it off that heading, and the workspace version is `0.0.7`. `main` is protected: a PR, all twelve required checks — `plugin` joined them on 2026-09-20 — strict up-to-date, and no admin bypass.** Dependency bumps land without a CHANGELOG entry, deliberately — this project has never recorded one there, and starting now would make the omissions look like decisions.
 
 **This block no longer enumerates the work since the tag, and that is the fix rather than an omission.** It listed two items, went stale, was corrected to five, and went stale again: at the time of writing there are over a hundred commits on `main` since `v0.0.7`, so any list here is wrong by the next merge and wrong in the direction that reads as authoritative. `CHANGELOG.md`'s `[Unreleased]` section is the maintained answer and `git log v0.0.7..main` is the mechanical one. Check `git tag --list` against the CHANGELOG's own version headings, and `git log` against the sentence above, rather than trusting either.
 
