@@ -682,9 +682,23 @@ is cut, named and published is in
   pattern was narrower than the predicate it had to agree with, and `## `
   inside a fenced code block truncated the section silently.
 
-  The self-test is **twenty-six cases, ten of them refusals**, held to three
-  named mutations measured at 9, 7 and 4 red, and green under mawk, gawk,
-  `gawk --posix`, `gawk --traditional`, busybox awk and original-awk.
+  Also fixed: the extractor's fence tracking was a bare toggle, so a nested
+  fence, a `~~~` closing a ``` , a `## ` inside an HTML comment, or an
+  unterminated fence each produced a **wrong release body at `rc=0`** —
+  dropping the entry after a block, or leaking the previous release into
+  this one. The scanner is marker-aware, shared by every reader of the file,
+  and a changelog that ends inside a fence or a comment is refused outright.
+  The link-definition rule is one spelling rather than an awk pattern and a
+  `grep` pattern that kept diverging, and it is fence-aware, so a definition
+  shown as an *example* inside a code block is no longer collected as real.
+
+  The self-test prints its own totals — a count written here would be stale
+  the day 0.0.8 is cut, since three of its cases are derived from this
+  file's released-version headings. It is held to four named mutations, and
+  it runs under **six awk implementations** in CI rather than the runner's
+  default: that matrix immediately caught a `link_defs | grep -q .` that
+  took SIGPIPE under `pipefail` and refused a changelog with 53 definitions,
+  visible under busybox awk and nowhere else.
 
   The self-test runs in CI's `hygiene` job, not in the release rehearsal —
   the rehearsal contributes **zero required status checks**, so a test there
@@ -1991,6 +2005,5 @@ residuals that are known and accepted.
 [#195]: https://github.com/Sertelegger/holdfast/issues/195
 [#160]: https://github.com/Sertelegger/holdfast/issues/160
 [#203]: https://github.com/Sertelegger/holdfast/issues/203
-[#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206

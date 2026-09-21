@@ -7,7 +7,7 @@
 #
 #     awk ... CHANGELOG.md > release-notes.md   # the version's section
 #     printf '\n'          >> release-notes.md  # <- 1 byte
-#     grep '^\[..\]: http' >> release-notes.md  # <- ~2.6 KB of link defs
+#     grep '^\[..\]: http' >> release-notes.md  # <- every link definition
 #     if [ ! -s release-notes.md ]; then ... exit 1; fi
 #
 # `-s` is "exists and has a size greater than zero", and by the time it ran
@@ -20,9 +20,15 @@
 # this file is not just a reordering: a `vX.Y.Z` tag pushed after the version
 # bump but before `## [Unreleased]` is renamed passes the tag/Cargo.toml
 # comparison — both say X.Y.Z — reaches here, extracts nothing, and publishes
-# a release whose entire body is 47 bare link definitions. Measured against
-# this repository's own CHANGELOG at `v0.0.8`: 2779 bytes, 48 lines, zero of
-# them prose.
+# a release whose entire body is every link definition in the file and no
+# prose at all.
+#
+# **No byte or line count is quoted for that, deliberately.** Three were, and
+# all three were stale before this paragraph was finished: the figures move
+# with every merged `[Unreleased]` entry, and one set described a commit
+# three merges before this branch's own base. The number that matters does
+# not move -- zero prose lines -- and the rest is
+# `grep -c '^\[[^]]*\]:' CHANGELOG.md` for anyone who wants it today.
 #
 # So the check now runs on the EXTRACTED SECTION, BEFORE anything is
 # appended, and it asks for a line that would RENDER AS SOMETHING rather than
@@ -57,22 +63,40 @@
 set -euo pipefail
 
 fails=0
-ok()  { printf '  ok    %s\n' "$1"; }
+passes=0
+refusals=0
+# `refusals` counts the cases whose subject is the guard saying no, which is
+# the number worth knowing: a suite that only proves acceptance is the suite
+# this file replaced.
+# `ok <label> [refusal]` -- the second argument is passed by the branches
+# whose subject is the guard saying NO. Counted at the call site rather than
+# matched out of the label: a `case` over label text is a hand-maintained
+# list wearing a derivation's clothes, and this file exists to stop writing
+# those.
+ok()  {
+  printf '  ok    %s\n' "$1"
+  passes=$((passes + 1))
+  [ "${2:-}" = refusal ] && refusals=$((refusals + 1))
+  return 0
+}
 bad() { printf '  FAIL  %s: %s\n' "$1" "$2"; fails=$((fails + 1)); }
 
-# **"Has content" means a line that is not blank, not a link definition and
-# not a heading.** Each exclusion is a section that renders as nothing, and
-# each was found by trying to get an empty release past the rule rather than
-# by reasoning about it:
+# **"Has content" means a line that RENDERS as something** -- not blank, not
+# a link definition, not a heading, not an HTML comment and not a thematic
+# break. This lead said "three" while the list under it ran to five, which is
+# the self-contradiction this whole branch keeps finding elsewhere. The rule
+# is `prose_count`; the list is below it; neither is a summary of the other.
+# Each exclusion was bought by a case that got an empty release past the rule
+# rather than by reasoning about it:
 #
 #   * **Blank.** `-s` -- the test this file replaced -- counts a lone newline
 #     as content.
 #   * **A link definition.** The extractor below stops at the next `## `
 #     heading, so every section but the LAST is bounded by one; the last runs
 #     to the foot of the file, where the reference-style definitions live. A
-#     trailing section with nothing under it therefore extracts ~2.6 KB of
-#     `[#45]: https://...` and is non-blank. That is the same empty body the
-#     broken guard would have shipped, reached by a different route.
+#     trailing section with nothing under it therefore extracts every
+#     `[#45]: https://...` in the file and is non-blank. That is the same
+#     empty body the broken guard would have shipped, by a different route.
 #   * **A heading.** Keep a Changelog sections are `### Added` / `### Fixed`
 #     over bullets, and this project's `## [Unreleased]` is written that way.
 #     Rename it a version and delete the entries -- or open the new section
@@ -104,50 +128,140 @@ bad() { printf '  FAIL  %s: %s\n' "$1" "$2"; fails=$((fails + 1)); }
 # that renders as nothing. A line matching `^\s*[...]:` in a release body is
 # not prose. All four forms were measured getting an empty body past the
 # scheme-anchored version of this rule.
-# **One rule list, two callers.** `has_prose` decides and the self-test's
-# failure diagnostic counts, and they used to be separate patterns with a
-# comment claiming they were the same. They were not, so a diagnostic could
-# contradict the rule it was reporting on. `prose_count` is the rule list;
-# both go through it.
 #
-# `LINKDEF` is the `grep` half of the link-definition rule, used by the APPEND
-# below. It and `prose_count`'s awk half were once a scheme-anchored pattern
-# and a `]:` one: the predicate was widened and the append was not, so a
-# changelog written in any of the forms this file advertises got a body whose
-# `[#99]` references were silently never defined -- the exact defect the
-# append exists to prevent, reintroduced by the fix to a different one.
-LINKDEF='^[ \t]*\[[^]]+\][ \t]*:'
+# **There is now ONE spelling of that rule, and it is awk's.** It was two --
+# an awk regex for the predicate and a `grep -E` for the append -- and the
+# pair went wrong three separate ways:
+#
+#   * they drifted, so the predicate called a form a definition and the
+#     append did not collect it, producing a body whose `[#99]` rendered as
+#     brackets;
+#   * sharing the pattern through `awk -v` made it a *dynamic* regex, where
+#     string-escape processing collapses `\[` to `[` -- mawk tolerated it and
+#     gawk, `--posix`, `--traditional`, original-awk and busybox awk all
+#     matched nothing (gawk says so: `escape sequence '\[' treated as plain
+#     '['`);
+#   * and they disagree on a TAB-indented definition even when both are
+#     "correct", because busybox and BSD `grep` read `[ \t]` as the set
+#     {space, backslash, t} while every awk reads it as a tab. Not live on
+#     GNU `grep`, and the nine-case equivalence corpus could not see it
+#     because it had no tab form.
+#
+# A behavioural equivalence test was the right answer to the first two and no
+# answer at all to the third. Deleting one of the two spellings answers all
+# three, so the append is `awk` now and `grep` is gone from this rule.
+#
+# **And the append is fence-aware, which `grep` could not be.** The extractor
+# honours fenced blocks; the append did not, so a link definition shown as an
+# EXAMPLE inside a code fence was collected and emitted as a real definition.
+# Both now run over the same scanner below.
 
-# **The awk copy is a LITERAL regex, not `-v linkdef=...`, and that is not a
-# style choice.** A string passed with `-v` becomes a *dynamic* regex, so awk
-# runs string-escape processing over it first: `\[` collapses to `[` and the
-# pattern silently becomes `^[ \t]*[[^]]+][ \t]*:`, which matches nothing like
-# the same set. mawk and gawk disagree about it, so the shared-variable
-# version passed under `/usr/bin/awk` and failed under gawk, busybox awk,
-# original-awk and `gawk --posix` alike -- a portability break introduced by
-# the fix for the two patterns having drifted apart.
+# --------------------------------------------------------------------------
+# AWK_SCAN -- the shared fence/comment state machine
+# --------------------------------------------------------------------------
 #
-# So they are two spellings again, and the honest guard is behavioural rather
-# than textual: `--self-test` feeds a corpus of definition forms through BOTH
-# and fails if they ever classify one differently. "Same behaviour, asserted"
-# is stronger than "same string, assumed" -- and it is what the drift they
-# came from actually needed.
+# Prepended to every awk program that reads the changelog, so that "is this
+# line structural Markdown or content?" is answered in exactly one place. It
+# sets `skip` for any line inside (or delimiting) a fenced block or an HTML
+# comment, and leaves `infence` / `incomment` readable at END.
+#
+# **The fence toggle is marker-aware, and the bare `fence = !fence` it
+# replaced was wrong four ways** -- each measured, each silently producing a
+# WRONG release body at `rc=0`, which is the failure mode fence tracking was
+# added to prevent:
+#
+#   * a nested fence (4-backtick outer, 3-backtick inner) closed the outer on
+#     the inner's opener, and the entry after the block vanished;
+#   * a `~~~` closed a fence a ``` had opened, leaking a previous release's
+#     entries into the body;
+#   * `## [0.0.7]` inside an HTML comment ended the section, because the
+#     extractor tracked fences and not comments while `prose_count` tracked
+#     comments and not fences -- two state machines, blind to each other;
+#   * and an unterminated fence swallowed the rest of the file.
+#
+# CommonMark's rule is the one implemented: a closer is the same character as
+# the opener, at least as long, and followed by nothing but whitespace.
+#
+# No ERE intervals anywhere -- `{3,}` is literal under mawk 1.3.3 and BSD awk,
+# which would silently stop recognising fences on the platform
+# `dev/workflows/verify.md` runs on. The run length is counted by hand.
+# shellcheck disable=SC2016  # awk program text; `$0` is awk's
+AWK_SCAN='
+function fence_run(str,   c, n) {
+  c = substr(str, 1, 1)
+  if (c != "`" && c != "~") return 0
+  n = 0
+  while (substr(str, n + 1, 1) == c) n++
+  if (n < 3) return 0
+  runchar = c
+  return n
+}
+{
+  gsub(/\r/, "")
+  stripped = $0
+  sub(/^[ \t]+/, "", stripped)
+  run = fence_run(stripped)
+  if (infence) {
+    skip = 1
+    if (run && runchar == openchar && run >= openlen \
+        && substr(stripped, run + 1) ~ /^[ \t]*$/) infence = 0
+  } else if (run) {
+    infence = 1; openchar = runchar; openlen = run; skip = 1
+  } else if (incomment) {
+    skip = 1
+    if (stripped ~ /-->/) incomment = 0
+  } else if (stripped ~ /^<!--/) {
+    skip = 1
+    if (stripped !~ /-->/) incomment = 1
+  } else {
+    skip = 0
+  }
+}
+'
+
+# **A changelog that ends inside a fence or a comment is refused outright.**
+# There is no correct extraction from one: every `## ` after the unterminated
+# opener is invisible, so the section runs to EOF and takes every earlier
+# release with it. Silently publishing that is strictly worse than not
+# publishing.
+wellformed() { # wellformed <changelog>
+  awk "$AWK_SCAN"'
+    END {
+      if (infence)   { print "fence";   exit 1 }
+      if (incomment) { print "comment"; exit 1 }
+    }
+  ' "$1"
+}
+
+# Every reference-style link definition, in file order, skipping any shown
+# inside a fence or a comment.
+link_defs() { # link_defs <changelog>
+  awk "$AWK_SCAN"'
+    !skip && /^[ \t]*\[[^]]+\][ \t]*:/ { print }
+  ' "$1"
+}
+
 prose_count() { # prose_count <file> -- lines that would render as something
-  awk '
+  awk "$AWK_SCAN"'
     # **Strip CR first, on every line.** `/[^ \t]/` treats a lone carriage
     # return as a printing character, so ONE stray `\r` line anywhere in a
     # section made the whole section "prose" -- including the `### Added` /
     # `### Fixed` skeleton this rule was written to refuse. Measured: the
     # same fixture passed with a CR and was refused with it stripped. There
     # is no `.gitattributes` here and nothing else guards line endings.
-    { gsub(/\r/, "") }
+    # **A fenced block IS prose**, unlike everywhere else in this file: it
+    # renders as a code block, so a section containing one is not empty. That
+    # is why `prose_count` runs the shared scanner and then *inverts* its
+    # verdict for fences -- `skip` means "structural" to the extractor and
+    # "still renders" here for a fence, "renders as nothing" for a comment.
+    # The two used to have separate, partial state machines: this one tracked
+    # comments and not fences, the extractor fences and not comments, and a
+    # `## ` inside a comment therefore ended a section the predicate had
+    # already read past.
+    skip && (infence || run)             { n++; next }
+    skip                                 { next }  # an HTML comment
     /^[ \t]*\[[^]]+\][ \t]*:/            { next }  # a link definition
     /^[ \t]*#+[ \t]/                     { next }  # an ATX heading
-    # **A comment BLOCK, not a comment line.** Skipping lines that start with
-    # `<!--` refused the one-line form and accepted the multi-line one --
-    # which is the natural spelling of the placeholder the rule exists for.
-    /^[ \t]*<!--/                        { if ($0 !~ /-->/) inc = 1; next }
-    inc                                  { if ($0 ~ /-->/) inc = 0; next }
     /^[ \t]*(---+|\*\*\*+|___+)[ \t]*$/  { next }  # a thematic break
     /[^ \t]/                             { n++ }
     END                                  { print n + 0 }
@@ -172,6 +286,20 @@ compose() { # compose <version> <changelog> <output>
     return 1
   }
 
+  # **Refuse a changelog that ends inside a fence or a comment**, before
+  # reading anything out of it. Past an unterminated opener every `## ` is
+  # invisible, so the section runs to EOF and carries every earlier release
+  # with it -- silently, at rc=0. There is no correct extraction to fall back
+  # on, so this is a refusal rather than a repair.
+  local unterminated
+  if unterminated="$(wellformed "$changelog")"; then :; else
+    printf '%s ends inside an unterminated %s.\n' "$changelog" "$unterminated" >&2
+    printf 'Every "## " after the opener is invisible to the extractor, so\n' >&2
+    printf 'the section would run to the end of the file and publish earlier\n' >&2
+    printf 'releases as part of this one. Close it.\n' >&2
+    return 1
+  fi
+
   # The section for exactly this version, up to the next heading. `index(...)
   # == 1` rather than a regex because a version is full of dots; the END
   # status distinguishes "no such heading" from "heading with nothing under
@@ -181,17 +309,15 @@ compose() { # compose <version> <changelog> <output>
   # **Fenced blocks are tracked**, because `## ` inside one is not a heading
   # and truncating a section there is silent: the release publishes fine,
   # short, with `rc=0`. `CHANGELOG.md` has no fences today; `CONTRIBUTING.md`
-  # has twelve, so this project does write them, and a changelog entry that
+  # has six, so this project does write them, and a changelog entry that
   # quotes a Markdown heading is one edit away. Four lines and two fixtures
   # against a truncation nobody would see until the release was out.
   local heading
-  if awk -v v="## [$version]" '
-        { gsub(/\r/, "") }
-        /^[ \t]*(```|~~~)/ { fence = !fence }
-        !fence && index($0, v) == 1 { on = 1; found = 1; next }
-        !fence && on && /^## /      { exit }
-        on                          { print }
-        END                         { exit(found ? 0 : 1) }
+  if awk -v v="## [$version]" "$AWK_SCAN"'
+        !skip && index($0, v) == 1 { on = 1; found = 1; next }
+        !skip && on && /^## /      { exit }
+        on                         { print }
+        END                        { exit(found ? 0 : 1) }
       ' "$changelog" > "$out"
   then heading=1
   else heading=0
@@ -225,13 +351,19 @@ compose() { # compose <version> <changelog> <output>
   # Appending every definition is safe: Markdown ignores ones nothing
   # references.
   #
-  # **The same `LINKDEF` the predicate uses.** These two drifted apart once
-  # already and the failure was silent in both directions: a changelog using
-  # the non-canonical forms got a body whose references were never defined,
-  # and an all-non-canonical one was refused at tag time for having "no link
-  # definitions" while having 47.
+  # One spelling, and it is fence-aware: see `link_defs` above.
+  #
+  # **Counted with `awk END`, never `| grep -q .`.** `grep -q` exits on its
+  # first match, `link_defs`'s awk takes SIGPIPE, and under `pipefail` the
+  # pipeline reports 141 -- so the guard fired on a changelog that had 53
+  # definitions. It surfaced only under busybox awk, which is precisely why
+  # the six-interpreter matrix in `ci.yml` exists: one interpreter called it
+  # fine. This is the same trap the note above `prose_count` describes, and
+  # it was walked into three functions later.
+  local ndefs
+  ndefs="$(link_defs "$changelog" | awk 'END { print NR + 0 }')"
   printf '\n' >> "$out"
-  if ! grep -E "$LINKDEF" "$changelog" >> "$out"; then
+  if [ "$ndefs" -eq 0 ]; then
     # Under `set -e` this was previously a bare non-zero `grep` aborting the
     # step with no message at all. It is a real failure — a changelog with no
     # definitions renders every issue reference as brackets — so it keeps the
@@ -241,29 +373,32 @@ compose() { # compose <version> <changelog> <output>
     printf 'brackets. Add the definitions at the foot of the file.\n' >&2
     return 1
   fi
+  link_defs "$changelog" >> "$out"
 
   # **Phrased so the numbers add up.** This read "N lines … plus M link
   # definitions" where N was the total INCLUDING the M, so 171 and 47 read as
   # 218. The counts are now stated as the breakdown they are.
-  local total defs section
+  local total section
+  defs=
   total="$(awk 'END { print NR + 0 }' "$out")"
-  defs="$(grep -cE "$LINKDEF" "$changelog")"
+  defs="$ndefs"
   section=$((total - defs - 1))
   printf 'notes: %s lines total = %s from "## [%s]" + 1 blank + %s link definitions\n' \
     "$total" "$section" "$version" "$defs"
 
   # **A body has an upper bound and nothing here knew it.** GitHub's release
-  # body limit is documented as 125,000 characters. A real
-  # `[Unreleased]` → `[0.0.8]` rename composes 95,809 bytes / 95,253
-  # characters as of 2026-09-20 — 24% of headroom left, and it was 85,637
-  # bytes earlier the same evening, so this is not a slow drift. The failure
-  # lands on `gh release create`, after five platform builds, on the one
-  # workflow that gets no second attempt.
+  # body limit is documented as 125,000 characters, and **this warning
+  # already fires on `main`** — a real `[Unreleased]` → `[0.0.8]` rename is
+  # over the threshold today, so none of this is a prediction. It was three
+  # different numbers across one evening as other lanes merged entries, which
+  # is why none of them is written here: run the script and read what it
+  # prints. The failure it is about lands on `gh release create`, after five
+  # platform builds, on the one workflow that gets no second attempt.
   #
   # Thresholded on BYTES against a limit stated in CHARACTERS, deliberately:
-  # a UTF-8 byte count is never smaller than the character count (here by 556,
-  # the em-dashes), so the warning fires early rather than late. Measure the
-  # real limit before turning either number into a hard failure.
+  # a UTF-8 byte count is never smaller than the character count, so the
+  # warning fires early rather than late. Measure the real limit before
+  # turning either number into a hard failure.
   #
   # **A warning and not an error, deliberately.** The limit is taken from
   # GitHub's documentation and has not been measured here; failing a correct
@@ -322,16 +457,21 @@ self_test() {
     # catch the implementation being wrong. Both branches below compare
     # `$out` against this.
     #
-    # Known limit, stated rather than implied: this is a COPY of `compose`'s
-    # awk, so a mutation applied to both survives. It catches the guard being
-    # reordered, which is what it is for; it does not catch the extractor
-    # being wrong in the same way twice.
-    awk -v v="## [$version]" '
-      { gsub(/\r/, "") }
-      /^[ \t]*(```|~~~)/ { fence = !fence }
-      !fence && index($0, v) == 1 { on = 1; next }
-      !fence && on && /^## /      { exit }
-      on                          { print }
+    # Known limit, stated rather than implied: this shares `AWK_SCAN` with
+    # `compose`, so a mutation inside the scanner survives here too. It
+    # catches the guard being reordered or the body growing a tail, which is
+    # what it is for. **What covers the scanner instead is `case_body`
+    # below**, which asserts on the text of the body rather than on a
+    # recomputation of it -- the fence and comment fixtures name a line that
+    # must appear and a line that must not, which no copy of the extractor
+    # can satisfy by being wrong in the same way.
+    #
+    # Its own fence toggle was `fence = !fence` and therefore carried all
+    # four of the defects that bug had; sharing the scanner was the fix.
+    awk -v v="## [$version]" "$AWK_SCAN"'
+      !skip && index($0, v) == 1 { on = 1; next }
+      !skip && on && /^## /      { exit }
+      on                         { print }
     ' "$cl" > "$tmp/extracted.md"
     log="$(compose "$version" "$cl" "$out" 2>&1)" || rc=$?
     case "$want" in
@@ -344,15 +484,23 @@ self_test() {
         # bare link definitions: byte for byte the original defect, passing
         # the guard written to catch it. Measured, and it is why this compares
         # bytes rather than counting them.
-        local n
-        n="$(wc -c < "$tmp/extracted.md")"
+        # **The WHOLE file, not a prefix.** This compared only the leading
+        # `wc -c` bytes against the extraction, so everything past that point
+        # was unasserted: appending the entire changelog again
+        # (`cat "$changelog" >> "$out"`) left all 26 cases green while the
+        # body shipped with the changelog stapled to its end. That is round
+        # 3's defect -- an assertion that cannot see what sits next to it --
+        # moved from the head of the file to the tail. The body is exactly
+        # the extraction, one blank line, and the definitions; so say that.
+        cat "$tmp/extracted.md" > "$tmp/want.md"
+        printf '\n' >> "$tmp/want.md"
+        link_defs "$cl" >> "$tmp/want.md"
         if [ "$rc" -ne 0 ]; then
           bad "$label" "refused a section that has content (rc=$rc): $log"
-        elif ! head -c "$n" "$out" | cmp -s - "$tmp/extracted.md"; then
-          bad "$label" "accepted, but the body does not start with the \
-extracted section ($n bytes expected)"
-        elif ! grep -q '^\[#45\]: ' "$out"; then
-          bad "$label" "accepted but did not append the link definitions"
+        elif ! cmp -s "$out" "$tmp/want.md"; then
+          bad "$label" "accepted, but the body is not \
+extraction + blank + definitions ($(wc -c < "$tmp/want.md") bytes wanted, \
+$(wc -c < "$out") written)"
         else
           ok "$label"
         fi ;;
@@ -383,7 +531,7 @@ rather than naming: $expect"
           bad "$label" "refused, but \$out is no longer the extracted section \
 ($(wc -c < "$tmp/extracted.md") bytes extracted, $(wc -c < "$out") written)"
         else
-          ok "$label"
+          ok "$label" refusal
         fi ;;
     esac
   }
@@ -509,7 +657,7 @@ $(printf '\r')
   # **`## ` inside a fenced block is not a heading.** Without fence tracking
   # the extractor stops at the fenced line and the release publishes short,
   # green, with nobody told. `CHANGELOG.md` has no fences today;
-  # `CONTRIBUTING.md` has twelve.
+  # `CONTRIBUTING.md` has six (twelve marker lines).
   case_run "a fenced \`## \` does not truncate the section" accept "0.0.8" \
 '# Changelog
 
@@ -581,53 +729,180 @@ some output
     bad "a changelog with no link definitions is refused" \
       "refused, but said '$log' rather than naming the cause"
   else
-    ok "a changelog with no link definitions is refused"
+    ok "a changelog with no link definitions is refused" refusal
   fi
 
-  # --- the two link-definition spellings must agree, line for line -------
+  # --- the section boundary survives fences and comments -----------------
   #
-  # `prose_count`'s awk regex and `LINKDEF` (which `grep` uses for the
-  # append) are separate spellings of one rule, because awk cannot safely
-  # take the shell's copy -- see the note above `prose_count`. Textual
-  # identity is therefore off the table, so this asserts the property that
-  # actually matters: for every form below, the two must make the SAME call.
-  # When they drifted apart before, the damage went both ways -- a body whose
-  # references were never defined, and a false "no link definitions" refusal
-  # at tag time on a changelog that had 47.
-  local lines i line g_match a_prose
-  lines='[#45]: https://x/45
-[#45]: <https://x/45>
-  [#45]: https://x/45
-[#45]:https://x/45
-[spec]: ./docs/SPEC.md
-[Unreleased]: https://x/compare/v0.0.7...main'
-  i=0
-  while IFS= read -r line; do
-    i=$((i + 1))
-    printf '%s\n' "$line" > "$tmp/one.md"
-    g_match=0; printf '%s\n' "$line" | grep -qE "$LINKDEF" && g_match=1
-    a_prose="$(prose_count "$tmp/one.md")"
-    # A definition: grep must match it, and awk must NOT count it as prose.
-    if [ "$g_match" -eq 1 ] && [ "$a_prose" -eq 0 ]; then
-      ok "both spellings call form $i a link definition"
+  # **Asserted on the TEXT of the body**, not against a recomputed
+  # extraction: every one of these was a silent `rc=0` wrong body, and the
+  # thing that makes them wrong is which lines came out. `must` has to
+  # appear, `must_not` has to be absent. A copy of a broken extractor cannot
+  # pass these by agreeing with itself.
+  case_body() { # case_body <label> <version> <body> <must> <must_not>
+    local label="$1" version="$2" body="$3" must="$4" must_not="$5"
+    local cl="$tmp/CHANGELOG.md" out="$tmp/out.md" rc=0 log
+    printf '%s\n%s\n' "$body" "$defs" > "$cl"
+    rm -f "$out"
+    log="$(compose "$version" "$cl" "$out" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      bad "$label" "refused: $log"
+    elif ! grep -qF "$must" "$out"; then
+      bad "$label" "body lost the line it had to keep: $must"
+    elif grep -qF "$must_not" "$out"; then
+      bad "$label" "body leaked a line from another release: $must_not"
     else
-      bad "both spellings call form $i a link definition" \
-        "grep matched=$g_match, prose_count=$a_prose for: $line"
+      ok "$label"
+    fi
+  }
+
+  # A bare `fence = !fence` closed the outer fence on the inner opener, and
+  # everything after the block vanished from the release.
+  case_body "a nested fence does not end the section early" 0.0.8 \
+'# Changelog
+
+## [0.0.8] — 2026-09-20
+
+````
+outer, holding an example:
+```
+## [0.0.7] — not a heading
+```
+````
+
+- KEEP-ME the entry after the block ([#45])
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- LEAK-ME the previous release' \
+    'KEEP-ME' 'LEAK-ME'
+
+  # `~~~` closed a fence that ``` opened, so the section ran on past the
+  # next heading and took the previous release with it.
+  case_body "a mismatched fence marker does not close the fence" 0.0.8 \
+'# Changelog
+
+## [0.0.8] — 2026-09-20
+
+```
+code
+~~~
+still code
+```
+
+- KEEP-ME the entry after the block ([#45])
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- LEAK-ME the previous release' \
+    'KEEP-ME' 'LEAK-ME'
+
+  # The extractor tracked fences and not comments while `prose_count`
+  # tracked comments and not fences: two state machines, blind to each
+  # other, so a `## ` inside a comment ended the section.
+  case_body "a heading inside an HTML comment does not end the section" 0.0.8 \
+'# Changelog
+
+## [0.0.8] — 2026-09-20
+
+<!--
+## [0.0.7] — not a heading
+-->
+
+- KEEP-ME the entry after the comment ([#45])
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- LEAK-ME the previous release' \
+    'KEEP-ME' 'LEAK-ME'
+
+  # --- the link-definition rule classifies every form it advertises ------
+  #
+  # There is one spelling now (`link_defs`, and `prose_count`'s matching
+  # clause), so the old test -- "do the awk and the grep agree?" -- no longer
+  # has two things to compare. What replaced it is the property that test was
+  # a proxy for: every form this file claims to handle must be COLLECTED for
+  # the body and must NOT count as prose, and everything else must do the
+  # opposite.
+  #
+  # **The tab form is here because the old corpus had no tab and the two
+  # spellings disagreed on exactly it**: busybox and BSD `grep` read `[ \t]`
+  # as {space, backslash, t} and every awk reads it as a tab, so a
+  # tab-indented definition was classified one way and collected the other.
+  # A corpus that cannot express the divergence cannot find it.
+  local line defs_hit prose_hit n_forms=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n_forms=$((n_forms + 1))
+    printf '%s\n' "$line" > "$tmp/one.md"
+    defs_hit="$(link_defs "$tmp/one.md" | awk 'END { print NR + 0 }')"
+    prose_hit="$(prose_count "$tmp/one.md")"
+    if [ "$defs_hit" -eq 1 ] && [ "$prose_hit" -eq 0 ]; then
+      ok "collected as a link definition, not prose: $(printf '%s' "$line" | cat -A | head -c 46)"
+    else
+      bad "collected as a link definition, not prose: $line" \
+        "link_defs=$defs_hit prose_count=$prose_hit"
     fi
   done <<EOF
-$lines
+[#45]: https://x/45
+[#45]: <https://x/45>
+  [#45]: https://x/45
+$(printf '\t')[#45]: https://x/45
+[#45]:https://x/45
+[spec]: ./docs/SPEC.md
+[Unreleased]: https://x/compare/v0.0.7...main
 EOF
-  # And the other direction, or a rule that called EVERYTHING a definition
-  # would pass every case above.
+  # Seven forms is the claim this file makes; assert the loop saw them all,
+  # or a heredoc that lost a line would shrink the corpus silently.
+  if [ "$n_forms" -eq 7 ]; then
+    ok "the link-definition corpus is all seven advertised forms"
+  else
+    bad "the link-definition corpus is all seven advertised forms" \
+      "the loop saw $n_forms"
+  fi
+
+  # The other direction, or a rule calling EVERYTHING a definition would pass
+  # every case above.
   for line in '- a real entry ([#45])' 'Plain prose.' '  indented prose'; do
     printf '%s\n' "$line" > "$tmp/one.md"
-    g_match=0; printf '%s\n' "$line" | grep -qE "$LINKDEF" && g_match=1
-    a_prose="$(prose_count "$tmp/one.md")"
-    if [ "$g_match" -eq 0 ] && [ "$a_prose" -eq 1 ]; then
-      ok "both spellings call \"$line\" prose"
+    defs_hit="$(link_defs "$tmp/one.md" | awk 'END { print NR + 0 }')"
+    prose_hit="$(prose_count "$tmp/one.md")"
+    if [ "$defs_hit" -eq 0 ] && [ "$prose_hit" -eq 1 ]; then
+      ok "counted as prose, not collected: \"$line\""
     else
-      bad "both spellings call \"$line\" prose" \
-        "grep matched=$g_match, prose_count=$a_prose"
+      bad "counted as prose, not collected: \"$line\"" \
+        "link_defs=$defs_hit prose_count=$prose_hit"
+    fi
+  done
+
+  # **A definition shown as an EXAMPLE inside a fence is not a definition.**
+  # The extractor honoured fences and the `grep` append did not, so one got
+  # collected and emitted into the body as real.
+  # shellcheck disable=SC2016  # a literal fence, not a command substitution
+  printf '```\n[#45]: https://x/45\n```\n' > "$tmp/one.md"
+  defs_hit="$(link_defs "$tmp/one.md" | awk 'END { print NR + 0 }')"
+  if [ "$defs_hit" -eq 0 ]; then
+    ok "a link definition inside a fence is not collected"
+  else
+    bad "a link definition inside a fence is not collected" "collected $defs_hit"
+  fi
+
+  # --- a changelog that ends mid-fence or mid-comment is refused ----------
+  #
+  # Each of these leaves every later `## ` invisible, so the section runs to
+  # EOF and takes earlier releases with it. Measured before the check: a body
+  # carrying the previous release's entries, at rc=0.
+  for kind in fence comment; do
+    case "$kind" in
+      fence)   printf '# C\n\n## [0.0.8]\n\n- a real entry\n\n```\n' > "$tmp/bad.md" ;;
+      comment) printf '# C\n\n## [0.0.8]\n\n- a real entry\n\n<!-- oops\n' > "$tmp/bad.md" ;;
+    esac
+    printf '%s\n' "$defs" >> "$tmp/bad.md"
+    rc=0; log="$(compose 0.0.8 "$tmp/bad.md" "$tmp/bad-out.md" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s' "$log" | grep -q "unterminated"; then
+      ok "a changelog ending inside a $kind is refused" refusal
+    else
+      bad "a changelog ending inside a $kind is refused" "rc=$rc log=$log"
     fi
   done
 
@@ -642,10 +917,25 @@ EOF
     versions="$(sed -n 's/^## \[\([0-9][^]]*\)\].*/\1/p' "$repo_cl")"
     for v in $versions; do
       seen=$((seen + 1))
-      if compose "$v" "$repo_cl" "$tmp/real.md" >/dev/null 2>&1; then
-        ok "CHANGELOG.md's own [$v] section extracts"
+      # **`rc == 0` is not enough, and these three proved it**: under the
+      # mutation that deleted the extraction they all stayed green while
+      # composing a bare-definition body from the project's real changelog.
+      # So the body is compared against the same
+      # extraction + blank + definitions the fixtures use.
+      awk -v vv="## [$v]" "$AWK_SCAN"'
+        !skip && index($0, vv) == 1 { on = 1; next }
+        !skip && on && /^## /       { exit }
+        on                          { print }
+      ' "$repo_cl" > "$tmp/real-want.md"
+      printf '\n' >> "$tmp/real-want.md"
+      link_defs "$repo_cl" >> "$tmp/real-want.md"
+      if ! compose "$v" "$repo_cl" "$tmp/real.md" >/dev/null 2>&1; then
+        bad "CHANGELOG.md's own [$v] section composes" "it did not"
+      elif ! cmp -s "$tmp/real.md" "$tmp/real-want.md"; then
+        bad "CHANGELOG.md's own [$v] section composes" \
+          "body is not extraction + blank + definitions"
       else
-        bad "CHANGELOG.md's own [$v] section extracts" "it did not"
+        ok "CHANGELOG.md's own [$v] section composes"
       fi
     done
     # A derivation that matches nothing would report clean having checked
@@ -658,20 +948,28 @@ EOF
     if compose 99.99.99 "$repo_cl" "$tmp/real.md" >/dev/null 2>&1; then
       bad "a version CHANGELOG.md does not declare is refused" "accepted 99.99.99"
     else
-      ok "a version CHANGELOG.md does not declare is refused"
+      ok "a version CHANGELOG.md does not declare is refused" refusal
     fi
   else
     bad "CHANGELOG.md is readable from the script's own directory" \
       "not found at $repo_cl"
   fi
 
+  # **The totals are printed, not asserted anywhere.** `mcp-smoke.sh` records
+  # that its own "all 38 checks" drifted five times with nothing going red,
+  # which is why it prints its total instead; the same applies here, and more
+  # sharply, because three of these cases are derived from `CHANGELOG.md`'s
+  # released-version headings and cutting 0.0.8 adds a fourth. Any comment
+  # naming a fixed number here is stale-by-construction at the next release.
   echo
   if [ "$fails" -ne 0 ]; then
-    echo "release-notes SELF-TEST FAILED ($fails)"
+    echo "release-notes SELF-TEST FAILED ($fails of $((passes + fails)))"
     return 1
   fi
-  echo "release-notes SELF-TEST OK — an empty section is refused before"
-  echo "anything is appended to it, and a real one still composes."
+  printf 'release-notes SELF-TEST OK (%s cases, %s of them refusals, %s\n' \
+    "$passes" "$refusals" "$seen"
+  echo "derived from CHANGELOG.md's released versions) — an empty section is"
+  echo "refused before anything is appended to it, and a real one composes."
 }
 
 usage() { sed -n '/^# Usage:/,/--self-test$/p' "$0" >&2; exit 2; }

@@ -285,10 +285,13 @@ Cutting one is therefore:
    path — and surfaces only as a *published* `holdfast` bound to an older
    `holdfast-core`, which is a wrong permanent artifact rather than a red
    check. The two are **thirty-four lines apart** — `Cargo.toml:6` and
-   `:40` — and proximity was never the mechanism: `Cargo.toml`'s own comment
-   above the dependency says "twenty-odd lines apart" and records that an
-   earlier draft of it claimed six. This line claimed six too. Naming both
-   literals here is the mechanism.
+   `:40`, and that is a count, not an estimate. Proximity was never the
+   mechanism. This line claimed six; `Cargo.toml`'s own comment above the
+   dependency says "twenty-odd" and records that an *earlier* draft of it
+   claimed six — so all three figures have been wrong, and the comment is
+   **still** wrong today, because twenty-odd is not thirty-four. Naming both
+   literals in this step is the mechanism; the distance between them is
+   trivia that has now gone stale three times.
 
    Two more are `plugin/version.txt` and
    `plugin/.claude-plugin/plugin.json`. The design spec names only
