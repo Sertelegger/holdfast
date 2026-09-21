@@ -805,17 +805,17 @@ is cut, named and published is in
   whose own `[a-z0-9_.-]{0,24}` would let `powersync_token::Name` reach it
   inside a PowerSync codebase.
 
-  **What it does not close, and the reason it stops here.** [#202]'s own
-  headline row — ``reassembled the token: `get_screen_state` `` — is a plain
-  `label: value` with no second colon, and is still redacted; so is
-  `export TOKEN={GITHUB}`. Closing those means constraining what the value
-  *contains*, and every such constraint measured drops a real credential with
-  it — a value character class costs a bcrypt hash and a password carrying `!`
-  or `@`, a required digit costs every digit-free passphrase. That is a
-  security trade rather than a bug fix, so it is written up on [#202] for a
-  decision instead of taken here, and `tests/redaction_prose.rs` asserts the
-  headline row is still redacted so the open half is a number rather than a
-  silence.
+  **What it did not close, and what followed.** [#202]'s own headline row —
+  ``reassembled the token: `get_screen_state` `` — is a plain `label: value`
+  with no second colon, so this change could not see it; neither could it see
+  `export TOKEN={GITHUB}`. **The `value_must_not_match` entry below closes
+  both**, and the reasoning recorded here about why they could not be closed
+  was right about the two constraints it names and wrong to stop at them: a
+  value character class does cost a bcrypt hash and a password carrying `!` or
+  `@`, and a required digit does cost every digit-free passphrase — but
+  refusing only their **conjunction** costs neither. Both halves are
+  unreleased, so this paragraph is corrected in place rather than left to read
+  as a shipped decision.
 
   **What it gives up, recorded rather than hidden — two things, not one.**
   First, a credential whose own first byte is `:` — **however it is quoted or
@@ -839,6 +839,119 @@ is cut, named and published is in
   strand — one byte outside the value class releases the whole line — and
   `at_the_buffer_tail_the_fix_withholds_where_it_used_to_mangle` measures both
   halves rather than asserting the cost away.
+
+- **`generic-secret-assignment` and `secret-key-assignment` judge the value as
+  well as the label, so [#202]'s headline row is no longer mangled.** Both
+  rules gain a `value_must_not_match` refusal, a new optional field on a §9.2
+  rule: a regex which, when it matches the **whole** of the `value` capture,
+  says the bytes after the separator are not a credential. Both declare the
+  same one — **a value carrying no digit *and* one of `( < > [ ] { } | \` or a
+  backtick is refused.** So ``reassembled the token: `get_screen_state` ``,
+  `export TOKEN={GITHUB}`, `let cancellation_token = cancellation_token.clone();`
+  and `pub for_token: Token![for],` come back byte-identical.
+
+  **The refused set is exactly "bytes no machine-generated token alphabet
+  contains".** Walked one alphabet at a time — base64 (`+ / =`), base64url
+  (`- _`), base62, base58, hex, crypt/bcrypt radix-64 (`. /`), UUID (`-`), PEM
+  bodies, Azure's `~` — none contains a bracket, a pipe, a backslash or a
+  backtick. Human-chosen and generator-chosen *passwords* are the exception and
+  are the documented limitation below: Django's `get_random_secret_key()`
+  alphabet carries `(` outright, and every generator checked emits digits too,
+  so the digit clause rescues them — but symbols-on/digits-off is a real
+  configuration. **`_`, `.`
+  and `:` are deliberately *not* in it**, and that is the correction a review
+  lane forced: they are the highest-yield bytes for prose (they alone take
+  third-party Rust from 1,140 matches to 273) and they are also the separators
+  real credentials use. With them in, the refusal dropped **seven** real
+  credential shapes outright — dot- and underscore-separated diceware
+  passphrases (a *recommended* shape: period and underscore are one-click
+  separator options in 1Password, Bitwarden, KeePassXC and xkcdpass, and EFF
+  wordlist words carry no digit by construction), a colon-separated one, a
+  HashiCorp Vault `hvs.<base62>` token and a Doppler `dp.st.<base62>` token —
+  **neither of which has a shape-keyed backstop rule in this file**, with a
+  digit-free Vault body at roughly 1 in 68 — an underscore-bearing base64url
+  value, and a dotted `SECRET_KEY`. All seven are now rows of the credential
+  corpus and all seven are redacted.
+
+  Measured over nine credential-free corpora at REQ-O-007's default 41,472 B
+  read window, counting the spans `read_output` emits: third-party Rust
+  (`syn`/`tokio`/`hyper`/`serde`/`regex`/`rmcp`, 10.6 MiB) **1,140 → 331**; the
+  Python 3.12 standard library (10.1 MiB) **61 → 22**; this project's own `.rs`
+  (5.2 MiB) **114 → 23**; its docs (5.0 MiB) **55 → 10**; this repository's
+  `git log` (1.2 MiB) **19 → 12**; 1,200 crates.io READMEs (4.8 MiB) **9 → 3**;
+  man pages, colourised `grep -rn` and Debian licence texts **0 → 0**. **It
+  drops none of a 41-row corpus of real-shaped credentials and none of the 61
+  positive fixtures the 51 rules carried before it — 68 now, seven having been
+  added with it.**
+
+  **The disjunction is the whole design.** A bare "must contain a digit" drops
+  13 of the 41; a bare value character class drops the bcrypt hash and the
+  punctuation-bearing password. Refusing only the *conjunction* of "no digit"
+  and "a byte no credential alphabet has" drops none.
+
+  **Why the refusal is not the one upstream ships, measured rather than
+  asserted.** gitleaks' `generic-api-key` at the pinned `gitleaks-8.28.0`
+  carries `entropy = 3.5`, 1,446 stopwords and an allowlist rejecting
+  `^[a-zA-Z_.-]+$`; both source files are byte-identical at v8.30.1, so this
+  was a divergence from the vendored rule's own design and not a stale
+  snapshot. Applied to the same 41 rows, **upstream's constraints drop 19**,
+  three of them shipped `positive` fixtures of these two rules: entropy 3.5
+  alone drops 10, including `export DB_PASSWORD=hunter2hunter2` (H=2.807) and
+  `api_key: 's3cr3t-value'` (H=3.418); the stopword list drops 5, including
+  `SECRET_KEY = 'django-insecure-…'` on `django` and a Doppler token on `dev.`;
+  the allowlist regex drops 11. Entropy is also the wrong measure on its own
+  terms: over these corpora it is a proxy for value *length* and ranks
+  `input.parse::<Token![struct]>(` (H=4.28) above the diceware passphrase
+  `correcthorsebatterystaple` (H=3.36) — of 15 sampled digit-free code
+  expressions that clear 3.5 bits, 13 outrank it, and none is a credential.
+  Upstream's allowlist regex fits the new field verbatim — that is the point of
+  the field's shape — but its *expression* assumes a value alphabet of
+  `[\w.=-]` this rule set does not have.
+
+  **It buys GH [#194]'s prefilter skip nothing, and that is the trade.** The
+  refusal is applied *after* the rule matches, so the prefilter still names the
+  pair and the skip never fires: the share of default-sized windows with an
+  empty hit set is unchanged to the window (third-party Rust 75.4%, CPython
+  92.2%, this project's source 58.3%, its docs 71.4%, `git log` 67.7%). Moving
+  the constraint into the pattern would move that number, and with no
+  lookaround in the `regex` crate "at least eight bytes, one of them a digit"
+  needs a nine-branch union over the index of the first digit — built,
+  confirmed correct, and rejected for costing an order of magnitude on scan
+  time and being unmaintainable in a hand-edited file.
+  `the_value_side_half_does_not_buy_the_prefilter_a_skip` records the trade as
+  a fixture rather than leaving it to be assumed. Scan cost is otherwise flat
+  or better: on the windows that name the pair, third-party Rust goes
+  1.81 → 1.48 ms because 1,140 candidates become 331 spans; on the same corpus
+  with its non-ASCII stripped — which separates this from [#206]'s per-rule
+  `\b` cliff — it is 0.866 → 0.887 ms, the refusal's own cost at roughly 18 ns
+  per candidate.
+
+  **What it gives up, asserted rather than hidden.** A credential that has no
+  digit *and* carries a bracket, pipe, backslash or backtick —
+  `api_key=alpha(bravo)charlie`, `SECRET_KEY=[bracketed-secret]` — is no longer
+  redacted. Only a password generator running with symbols on and digits off
+  mints one; no provider does, and one digit anywhere brings it back. The class
+  ships as an explicit documented-limitation assertion (REQ-TST-006), paired in
+  both directions so a rule set that matched nothing would fail rather than
+  pass. `password = not-set-yet` is **unchanged**, so [#125]'s recorded
+  behaviour stands and switching the pair off is still the operator's call
+  through `disabled_redaction_rules` ([#128]).
+
+  **What it does not close.** 1,140 → 331 is a 71% cut and not a fix: the
+  residual is still dominated by `_`- and `.`-bearing identifiers
+  (`node.as_token`, `ProgressToken`) and by a bare alphabetic value
+  (`secret: SecretBytes`), and those are indistinguishable from a digit-free
+  passphrase by anything in the value. `a_bare_alphabetic_value_is_the_residual_false_positive`
+  asserts the residual at its measured value so this does not read as closed.
+
+  **And it moves `holdback_boundary` earlier, for the same reason the colon
+  refusal did — but this one had to be made to.** `earliest_partial` releases a
+  candidate once the rule's anchored form sees a whole match, on the ground
+  that `find_spans` has redacted it. A refused value breaks that ground: the
+  pattern matches, `find_spans` declines, and `API_KEY=abcdefgh` goes out raw
+  one byte before it becomes `abcdefgh9`. The scan therefore asks
+  `CompiledRule::anchored_whole_match`, which re-runs the refusal, and a
+  refused value stays in flight until it is terminated ([#202]).
 
 - **The `binary` arm of the in-flight test asks the rule as well, so a
   certificate no longer pins the holdback for the rest of the session
@@ -1644,3 +1757,4 @@ residuals that are known and accepted.
 [#152]: https://github.com/Sertelegger/holdfast/issues/152
 [#166]: https://github.com/Sertelegger/holdfast/issues/166
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
+[#206]: https://github.com/Sertelegger/holdfast/issues/206
