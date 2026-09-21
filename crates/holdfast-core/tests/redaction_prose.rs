@@ -15,24 +15,38 @@
 //! replaced by a marker the caller cannot undo except by re-reading the
 //! whole window with `redact: false`.
 //!
-//! **One of those two is fixed here and the other is not, and the
-//! difference is the whole shape of this target.** Both rules now refuse
-//! a value whose first byte is another `:`: the separator is already
-//! consumed by `[:=]` at that point, so a value opening on a second colon
-//! means the source read `label::…` — a scope-resolution operator, not an
-//! assignment. That costs no true positive, so it ships.
-//! `` the token: `get_screen_state` `` has no second colon in it and is
-//! **still redacted**; closing that means judging what the value
-//! *contains*, and every constraint measured for #202 drops a real
-//! credential with it. [`the_issues_headline_row_is_still_redacted`]
-//! asserts the open half at its measured value rather than leaving the
-//! reader to assume the issue was closed.
+//! **Both are fixed now, in two steps taken separately, and the target
+//! keeps them separable.**
+//!
+//! 1. **The separator half.** Both rules refuse a value whose first byte
+//!    is another `:`: the separator is already consumed by `[:=]` at
+//!    that point, so a value opening on a second colon means the source
+//!    read `label::…` — a scope-resolution operator, not an assignment.
+//!    [`NAMESPACE_PROSE`] is its corpus and [`PRE_FIX_RULES`] its
+//!    control.
+//! 2. **The value half.** Both rules carry `value_must_not_match`, which
+//!    refuses a value with **no digit in it that also carries a
+//!    structural byte** — one of `_ . : ( < > [ ] { } | \` or a
+//!    backtick, the punctuation that makes an identifier, a path, a call
+//!    or markup. `` the token: `get_screen_state` `` has no second colon
+//!    and so survived step 1; it is refused here.
+//!    [`VALUE_SIDE_PROSE`] is its corpus and [`COLON_ONLY_RULES`] — the
+//!    rules exactly as `main` carried them between the two — its
+//!    control.
+//!
+//! The disjunction is what makes step 2 cost nothing. A bare "must
+//! contain a digit" drops every digit-free passphrase; a bare value
+//! character class drops a bcrypt hash and a password carrying `!` or
+//! `@`; refusing only their *conjunction* drops neither, and
+//! [`REAL_SHAPED_CREDENTIALS`] asserts that over thirty-four rows.
 //!
 //! **Why the assertions here are not vacuous.** Every arm that asserts an
-//! *absence* is paired with the same input run through the **pre-fix**
-//! pattern, installed by name over the built-in set through
-//! [`RuleSet::builtin_with_extra`]. A rule set that stopped matching
-//! anything at all would pass the absence arms and fail the controls.
+//! *absence* is paired with the same input run through the rule set that
+//! came **before the step it measures**, installed by name over the
+//! built-in set through [`RuleSet::builtin_with_extra`]. A rule set that
+//! stopped matching anything at all would pass the absence arms and fail
+//! the controls. Each corpus additionally carries a `not_vacuous` floor,
+//! because an emptied table passes an absence arm *and* its control.
 //!
 //! [`RuleSet::builtin_with_extra`]: holdfast_core::output::rules::RuleSet::builtin_with_extra
 
@@ -41,6 +55,32 @@ use std::sync::Arc;
 use holdfast_core::output::redact::{find_spans, redact_str};
 use holdfast_core::output::rules::RuleSet;
 use holdfast_core::output::{OutputProcessor, ProcessedRead, ReadOptions, WindowSnapshot};
+
+/// **The intermediate control: both rules exactly as `main` carried them
+/// between GH #202's two halves.** The colon refusal is in the pattern;
+/// `value_must_not_match` is absent.
+///
+/// The arms for the value-side half measure against *this*, not against
+/// [`PRE_FIX_RULES`]. Measuring the second half against the state before
+/// the first would credit it with the first half's work, and the two
+/// halves refuse different things for different reasons.
+const COLON_ONLY_RULES: &str = r#"
+[[rule]]
+name = "secret-key-assignment"
+kind = "generic"
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:secret|private|encryption|signing|master|session)[_-]key\b["'\s]*[:=]\s*["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
+prefixes = ["secret_key", "secret-key", "private_key", "private-key", "encryption_key", "encryption-key", "signing_key", "signing-key", "master_key", "master-key", "session_key", "session-key"]
+positive = ["CLERK_SECRET_KEY=sk_test_0123456789abcdef01234567"]
+negative = ["SECRET_KEY_FILE=/run/secrets/app"]
+
+[[rule]]
+name = "generic-secret-assignment"
+kind = "generic"
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token)\b["'\s]*[:=]\s*["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
+prefixes = ["password", "passwd", "secret", "apikey", "api_key", "api-key", "accesstoken", "access_token", "access-token", "authtoken", "auth_token", "auth-token"]
+positive = ["export DB_PASSWORD=hunter2hunter2"]
+negative = ["password: short"]
+"#;
 
 /// The value expression both rules carried before GH #202, reinstated by
 /// name so the absence arms below have something to be measured against.
@@ -81,6 +121,68 @@ const NAMESPACE_PROSE: &[&str] = &[
     "hash_password::<sha2::Sha256>(\"my_password\", \"abcd\", &mut buf1);",
     "the private_key::pkcs8_parser module re-exports it unchanged",
     "app.encryption_key::ROTATION_INTERVAL is a compile-time constant",
+];
+
+/// **GH #202's value-side half: prose and source where the label and the
+/// separator are both there and the value is still not a credential.**
+///
+/// Nothing here has a second colon against the separator, so the first
+/// half of #202 cannot see any of it and every row came back mangled on
+/// `main` until this change. What each row's value has instead is one of
+/// `( < > [ ] { } | \` or a backtick — a bracket, a pipe, a backslash or
+/// a quote, none of which appears in any credential alphabet — and no
+/// digit anywhere to vouch for it.
+///
+/// **`_`, `.` and `:` are deliberately absent from that set** and two
+/// rows here were rewritten when they came out: `as_token: node.as_token`
+/// and `app.encryption_key: ROTATION_INTERVAL` carried nothing else and
+/// are mangled again. They are the residual, not the fix — see
+/// [`a_bare_alphabetic_value_is_the_residual_false_positive`].
+///
+/// The first three are the issue's own measured rows, in the issue's own
+/// words; the rest are taken from the same corpora as [`NAMESPACE_PROSE`].
+/// Every row is a **verbatim line from one of those corpora**, not a
+/// constructed one, because a constructed row is easy to get wrong in
+/// the direction that makes the arm vacuous: an earlier draft of this
+/// table wrote `input.parse::<Token![struct]>()` without the
+/// `struct_token:` label that precedes it in `syn`, and that row matches
+/// neither rule in *any* version, so it would have proved nothing while
+/// reading as evidence. `the_colon_only_pattern_mangled_every_one_of_
+/// those_rows` is what catches that, and it caught exactly that.
+///
+/// The last two rows are `secret-key-assignment`'s. Without them this
+/// table measures one rule of the pair and the other could be reverted
+/// silently.
+const VALUE_SIDE_PROSE: &[&str] = &[
+    // #202's own measured rows: the headline, the second example in the
+    // issue body, and the shape that dominated its count on this
+    // repository's own source.
+    "reassembled the token: `get_screen_state`",
+    "export TOKEN={GITHUB}",
+    "let cancellation_token = cancellation_token.clone();",
+    // third-party Rust (`syn`) — the single largest contributor to the
+    // 1,140 matches over 10.6 MiB, all of it `*_token:` struct fields.
+    "pub for_token: Token![for],",
+    "try_token: input.parse()?,",
+    "trait_token: self.trait_token.clone(),",
+    "colon2_token: &Option<Token![::]>,",
+    // the Python 3.12 standard library
+    "token = Token(typeid, self.address, rident)",
+    "secret = bytes(password, self.encoding)",
+    "proxy_passwd = unquote(proxy_passwd)",
+    // this project's own source and docs
+    "pub cancel_token: Option<String>,",
+    "confirmation_token: token.map(str::to_string),",
+    // **The backtick, as the only structural byte in the value.** Every
+    // other row here would still be refused with the backtick removed
+    // from the set — #202's own headline row carries `_` as well — so a
+    // mutation deleting it survived until this row existed. Markdown and
+    // colourised `grep` quote bare identifiers after a label constantly,
+    // and this is that shape with nothing else in it.
+    "the token: `getscreenstate` is reassembled",
+    // `secret-key-assignment`'s half of the pair
+    "pub session_key: Option<SessionKey>,",
+    "master_key = config.master_key.clone()",
 ];
 
 /// Credential shapes the **label-only** rules are the only thing that
@@ -128,6 +230,38 @@ const REAL_SHAPED_CREDENTIALS: &[&str] = &[
     "password=Kaefergartenstrasse",
     "api_key=abcdefghijklmnopqrstuvwx",
     "session_key: qwertyuiopasdfgh",
+    // no digit *and* not one unbroken run of letters -- the two rows a
+    // bare "must contain a digit" and a bare "must be alphabetic" would
+    // each drop, added for GH #202's value-side half. Hyphens are not in
+    // the refused set and neither is `@` or `!`.
+    "MASTER_KEY=correct-horse-battery-staple",
+    "password=P@ssword!Secure",
+    // **The seven rows a review lane added, and the reason the refused
+    // set is narrower than its first draft.** Every one is digit-free
+    // *and* carries `_`, `.` or `:` — which the first draft refused, so
+    // every one of them leaked in full. They are here because the first
+    // thirty-four could not see the defect: none of those rows was in
+    // the class the refusal can act on at all, so "drops none of the
+    // thirty-four" was true by construction and measured nothing.
+    //
+    // Period and underscore are one-click separator options in
+    // 1Password, Bitwarden, KeePassXC and xkcdpass, and EFF-wordlist
+    // words carry no digit by construction, so the first two are a
+    // *recommended* password shape rather than a contrived one.
+    "MASTER_KEY=correct.horse.battery.staple",
+    "MASTER_KEY=correct_horse_battery_staple",
+    "password=my:very:secret:phrase",
+    "SECRET_KEY=django.insecure.keyphrase",
+    // Two vendor tokens whose prefix *guarantees* the `.`, and which
+    // this rule set has no shape-keyed backstop for: a digit-free body
+    // is about 1 in 68 for Vault's 24 base62 characters and 1 in 1,140
+    // for Doppler's 40.
+    "access_token=hvs.CAESIJxKzWqTvNbMqLdFgHjKlPoIuYtReWqAsDfGhJkL",
+    "DOPPLER_TOKEN=dp.st.AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh",
+    // base64url: `_` is in its alphabet, `-` is too, and neither is
+    // refused. `secrets.token_urlsafe()` is the standard Flask
+    // `SECRET_KEY` recipe.
+    "api_key=abcd_efgh_ijkl_mnopqrst",
 ];
 
 /// **The guard that keeps the two corpus-driven arms from passing on an
@@ -159,6 +293,11 @@ fn builtin() -> RuleSet {
 
 fn pre_fix() -> RuleSet {
     RuleSet::builtin_with_extra(PRE_FIX_RULES).expect("the pre-fix rule set must compile")
+}
+
+/// `main` between GH #202's two halves — see [`COLON_ONLY_RULES`].
+fn colon_only() -> RuleSet {
+    RuleSet::builtin_with_extra(COLON_ONLY_RULES).expect("the colon-only rule set must compile")
 }
 
 /// The names of the rules that produced a span, in span order.
@@ -213,6 +352,83 @@ fn the_pre_fix_pattern_mangled_every_one_of_those_prose_rows() {
     );
 }
 
+// -------------------------------------- Part 1b: the value-side half
+
+/// **GH #202's other half: the label and the separator are both there,
+/// and the value is still not a credential.**
+///
+/// `value_must_not_match` refuses a value that carries no digit *and*
+/// carries one of the bytes that make source-code or markup structure.
+#[test]
+fn a_structural_value_with_no_digit_in_it_is_not_a_credential() {
+    not_vacuous(VALUE_SIDE_PROSE, 15, "VALUE_SIDE_PROSE");
+    let rules = builtin();
+    let mut mangled = Vec::new();
+    for row in VALUE_SIDE_PROSE {
+        let out = redact_str(&rules, row);
+        if out != *row {
+            mangled.push(format!("{row:?}\n  -> {out:?} by {:?}", hits(&rules, row)));
+        }
+    }
+    assert!(
+        mangled.is_empty(),
+        "{} of {} value-side rows came back altered:\n{}",
+        mangled.len(),
+        VALUE_SIDE_PROSE.len(),
+        mangled.join("\n")
+    );
+}
+
+/// **Control for the arm above, against `main` rather than against
+/// 0.0.7.** Every one of those rows was mangled by the pattern that
+/// shipped *after* the colon refusal — so the arm above measures the
+/// value-side half specifically, not the two halves together.
+#[test]
+fn the_colon_only_pattern_mangled_every_one_of_those_rows() {
+    not_vacuous(VALUE_SIDE_PROSE, 15, "VALUE_SIDE_PROSE");
+    let rules = colon_only();
+    let mut survived = Vec::new();
+    for row in VALUE_SIDE_PROSE {
+        if redact_str(&rules, row) == *row {
+            survived.push(*row);
+        }
+    }
+    assert!(
+        survived.is_empty(),
+        "{} value-side rows were already clean before this change, so they prove \
+         nothing about it — a row with no label, or with a second colon the first \
+         half already caught, lands here:\n{:#?}",
+        survived.len(),
+        survived
+    );
+}
+
+/// **Both rules of the pair are exercised by that table**, and neither
+/// could be reverted without a row going red.
+///
+/// Without this arm `VALUE_SIDE_PROSE` could drift into fourteen rows
+/// that all reach `generic-secret-assignment`, and
+/// `secret-key-assignment`'s refusal could be deleted outright with the
+/// whole file green.
+#[test]
+fn the_value_side_table_reaches_both_rules_of_the_pair() {
+    let before = colon_only();
+    let mut by_rule: std::collections::BTreeMap<String, usize> = Default::default();
+    for row in VALUE_SIDE_PROSE {
+        for name in hits(&before, row) {
+            *by_rule.entry(name).or_default() += 1;
+        }
+    }
+    for name in ["generic-secret-assignment", "secret-key-assignment"] {
+        assert!(
+            by_rule.get(name).copied().unwrap_or_default() > 0,
+            "no row of VALUE_SIDE_PROSE reaches `{name}`, so this target cannot see \
+             its refusal disappear: {by_rule:?}"
+        );
+    }
+    eprintln!("GH #202 value-side rows by rule: {by_rule:?}");
+}
+
 // ---------------------------------------------- Part 2: nothing was traded
 
 /// The anti-regression that matters: **a variant that drops one of these
@@ -220,7 +436,7 @@ fn the_pre_fix_pattern_mangled_every_one_of_those_prose_rows() {
 /// only thing that catches, and every row must still come back redacted.
 #[test]
 fn every_credential_shape_the_label_only_rules_catch_is_still_caught() {
-    not_vacuous(REAL_SHAPED_CREDENTIALS, 32, "REAL_SHAPED_CREDENTIALS");
+    not_vacuous(REAL_SHAPED_CREDENTIALS, 41, "REAL_SHAPED_CREDENTIALS");
     let rules = builtin();
     let mut lost = Vec::new();
     for row in REAL_SHAPED_CREDENTIALS {
@@ -244,7 +460,7 @@ fn every_credential_shape_the_label_only_rules_catch_is_still_caught() {
 /// it loses nothing.
 #[test]
 fn the_fix_moved_the_credential_set_in_neither_direction() {
-    not_vacuous(REAL_SHAPED_CREDENTIALS, 32, "REAL_SHAPED_CREDENTIALS");
+    not_vacuous(REAL_SHAPED_CREDENTIALS, 41, "REAL_SHAPED_CREDENTIALS");
     let (after, before) = (builtin(), pre_fix());
     let mut differing = Vec::new();
     for row in REAL_SHAPED_CREDENTIALS {
@@ -399,27 +615,233 @@ fn a_credential_whose_first_byte_is_a_colon_is_the_documented_limitation() {
 /// each of those was measured against the corpus above and drops a real
 /// credential: a value class costs `password=$2b$12$…` and
 /// `password=P@ssw0rd!…`, a required digit costs every one of the four
-/// digit-free passphrases in `REAL_SHAPED_CREDENTIALS`. That is a
-/// security trade for a human to take, not a test to encode.
+/// digit-free passphrases in `REAL_SHAPED_CREDENTIALS`.
 ///
-/// So this row asserts the residual **is still there**. When somebody
-/// takes that decision it goes red, which is the point: an issue half
-/// closed should not read as an issue closed.
+/// **That reasoning was right about the two constraints it names and
+/// wrong to stop there, and this row is the rewrite rather than the
+/// deletion.** A required digit does cost every digit-free passphrase; a
+/// value *character class* — an allowlist of bytes the value may be
+/// drawn from — does cost the bcrypt hash and the punctuation-bearing
+/// password. What costs neither is the **disjunction**: refuse a value
+/// only when it has no digit *and* carries a structural byte. Measured
+/// over the same corpora, that takes third-party Rust from 1,140
+/// matches to 79 and drops **none** of `REAL_SHAPED_CREDENTIALS`,
+/// including all four digit-free passphrases and both rows added with
+/// it.
+///
+/// So the three rows below are asserted **clean**, in both directions,
+/// and the residual moved rather than closing: see
+/// [`a_digit_free_structural_credential_is_the_documented_limitation`].
 #[test]
-fn the_issues_headline_row_is_still_redacted() {
-    let rules = builtin();
+fn the_issues_headline_row_is_no_longer_redacted() {
+    let (rules, before) = (builtin(), colon_only());
     for row in [
         "reassembled the token: `get_screen_state`",
         "export TOKEN={GITHUB}",
         "let cancellation_token = cancellation_token.clone();",
     ] {
+        assert_eq!(
+            redact_str(&rules, row),
+            row,
+            "GH #202's headline row is redacted again — this is the row the issue \
+             was written about"
+        );
+        // And it is a change, not the status quo: `main` carried the
+        // colon refusal and still mangled every one of these.
+        assert_ne!(
+            redact_str(&before, row),
+            row,
+            "the colon-only rule set must mangle {row:?}, or this arm measures nothing"
+        );
+    }
+}
+
+/// **REQ-TST-006 for the value-side half: what it buys the reduction
+/// with.**
+///
+/// A credential that carries **no digit and one of the refused bytes**
+/// — `api_key=alpha(bravo)charlie`, `SECRET_KEY=[bracketed-secret]` — is
+/// no longer redacted. No provider mints one: the refused set is
+/// precisely the bytes absent from every credential alphabet walked
+/// (base64, base64url, base62, base58, hex, crypt radix-64, UUID, PEM,
+/// Azure's `~`), so only a password generator running with symbols on
+/// and digits off can produce one.
+///
+/// **An earlier draft of this test asserted `password=my.pass.phrase`
+/// and `SECRET_KEY=a_b_c_d_e_f_g_h` here, and that was the defect rather
+/// than the limitation.** `.` and `_` were in the refused set, so a
+/// dot- or underscore-separated diceware passphrase — a *recommended*
+/// password shape, offered as a one-click separator by 1Password,
+/// Bitwarden, KeePassXC and xkcdpass — leaked in full, along with
+/// HashiCorp Vault and Doppler tokens whose prefixes guarantee the `.`.
+/// Both rows are now in [`REAL_SHAPED_CREDENTIALS`] and redacted. The
+/// residual below is what is left after taking `_`, `.` and `:` back
+/// out.
+///
+/// **Each row is paired with the same value carrying one digit**, which
+/// must still be redacted. Without that pairing every assertion here is
+/// satisfied by a rule set that matches nothing at all — which is
+/// exactly the failure the `not_vacuous` floor exists for elsewhere in
+/// this file.
+#[test]
+fn a_digit_free_structural_credential_is_the_documented_limitation() {
+    let (rules, before) = (builtin(), colon_only());
+    for (missed, caught) in [
+        ("api_key=alpha(bravo)charlie", "api_key=alpha(bravo1charlie"),
+        (
+            "auth_token=<placeholder-value>",
+            "auth_token=<placeholder-1>",
+        ),
+        ("password=my{pass}phrase", "password=my{pass}phrase1"),
+        ("SECRET_KEY=[bracketed-secret]", "SECRET_KEY=[bracketed-1]"),
+        ("auth_token=alpha|bravo|charlie", "auth_token=alpha|bravo|1"),
+    ] {
+        assert_eq!(
+            redact_str(&rules, missed),
+            missed,
+            "GH #202's value-side residual closed for {missed:?} — update this row \
+             rather than deleting it"
+        );
+        assert_ne!(
+            redact_str(&before, missed),
+            missed,
+            "the colon-only rule set must redact {missed:?}, or this is not a residual"
+        );
+        assert_ne!(
+            redact_str(&rules, caught),
+            caught,
+            "one digit must be enough to bring the value back: {caught:?}"
+        );
+    }
+
+    // The other half of the class, stated as its own pairing: a value
+    // with no digit and **no** structural byte is untouched, however
+    // long or short. This is what keeps the refusal from collapsing into
+    // the bare digit requirement the comment above rejected.
+    for passphrase in [
+        "password=correcthorsebatterystaple",
+        "MASTER_KEY=correct-horse-battery-staple",
+        "MASTER_KEY=correct.horse.battery.staple",
+        "MASTER_KEY=correct_horse_battery_staple",
+        "password=my:very:secret:phrase",
+        "password=P@ssword!Secure",
+        "api_key=abcdefgh",
+    ] {
+        assert_ne!(
+            redact_str(&rules, passphrase),
+            passphrase,
+            "a digit-free value with no structural byte must still be redacted: \
+             {passphrase:?}"
+        );
+    }
+}
+
+/// **What the refusal still gets wrong, from the other side: a bare
+/// alphabetic value.**
+///
+/// The residual on this project's own docs after the change is almost
+/// entirely `secret: SecretBytes`-shaped — a struct field whose value is
+/// one unbroken run of letters. It carries no digit and no structural
+/// byte, so the refusal admits it and the marker still lands on prose.
+///
+/// **That is not an oversight; it is the price of
+/// `password=correcthorsebatterystaple`.** A digit-free run of letters
+/// after a credential label is exactly a passphrase, and nothing in the
+/// value distinguishes the two — the rule set has no dictionary and a
+/// diceware passphrase *is* dictionary words, so it could not use one.
+/// Recording the residual at its measured value is what stops a later
+/// reader concluding the label-keyed rules stopped firing on prose
+/// altogether.
+#[test]
+fn a_bare_alphabetic_value_is_the_residual_false_positive() {
+    let rules = builtin();
+    for row in [
+        "Secret { secret: SecretBytes, done: oneshot::Sender },",
+        "let api_key = ApiKeyMaterial;",
+    ] {
         assert_ne!(
             redact_str(&rules, row),
             row,
-            "GH #202's value-side half has been closed for {row:?} — update this row \
-             and the rule file's comment rather than deleting it"
+            "the bare-alphabetic residual closed for {row:?} — if a later change \
+             separates a passphrase from an identifier, rewrite this row and say \
+             how rather than deleting it"
         );
     }
+    // Paired, so the row is not satisfied by "redact everything": one
+    // structural byte in the same value and it is refused.
+    for row in [
+        "Secret { secret: Secret<Bytes>, done: oneshot::Sender },",
+        "let api_key = ApiKeyMaterial(x);",
+    ] {
+        assert_eq!(
+            redact_str(&rules, row),
+            row,
+            "the same value with a refused byte must be refused: {row:?}"
+        );
+    }
+}
+
+/// **The refusal is honoured by §4.1's holdback, and that is not
+/// cosmetic — the version that was not would leak.**
+///
+/// `PrefixIndex::earliest_partial` stops holding a candidate back once
+/// the rule's anchored form sees a whole match, on the ground that
+/// `find_spans` has already redacted it. A refused value breaks that
+/// ground: the pattern matches, `find_spans` declines, and the bytes go
+/// out raw — **while the value is still growing**. `API_KEY=abcdefgh`
+/// at the buffer head is refused today and is `abcdefgh9` one byte
+/// later, a credential whose first eight bytes the agent already has.
+///
+/// So the scan asks `CompiledRule::anchored_whole_match`, which re-runs
+/// the refusal. The arm below drives the real pipeline at the buffer
+/// tail: the refused value is **held back**, not released, and the
+/// control shows the same read releasing it when the value is
+/// credential-shaped.
+#[test]
+fn a_refused_value_at_the_buffer_tail_is_held_back_rather_than_released() {
+    let p = OutputProcessor::builtin().unwrap();
+
+    // Refused: no digit, and `(` in it. One more byte could make it a
+    // credential, so the read must not hand it over.
+    let growing = "$ echo API_KEY=abcd(efgh";
+    let r = read(&p, growing.as_bytes());
+    assert!(
+        r.held_back,
+        "a refused value at the head must stay in flight, not be released: \
+         output={:?}",
+        r.output
+    );
+    assert!(
+        !r.output.contains("abcd(efgh"),
+        "the in-flight value reached the caller anyway: {:?}",
+        r.output
+    );
+
+    // The growth this protects against: one digit later the same bytes
+    // are a credential, and the marker covers the whole value rather
+    // than the one byte that arrived last.
+    let grown = format!("{growing}9\n");
+    let r = read(&p, grown.as_bytes());
+    assert!(
+        !r.held_back && r.output.contains("[REDACTED:generic]") && !r.output.contains("abcd(efgh"),
+        "the grown value must come back as one marker: held_back={} output={:?}",
+        r.held_back,
+        r.output
+    );
+
+    // Control: terminate the refused value instead of growing it and the
+    // whole line is released, unredacted. The holdback is a rate, not a
+    // strand.
+    let terminated = format!("{growing}\n");
+    let r = read(&p, terminated.as_bytes());
+    assert!(
+        !r.held_back && r.output == terminated && r.redactions.is_empty(),
+        "a terminated refused value must be released whole and unmarked: \
+         held_back={} output={:?} redactions={:?}",
+        r.held_back,
+        r.output,
+        r.redactions
+    );
 }
 
 /// **The second cost, which the arm above is structurally blind to: at
@@ -538,6 +960,59 @@ fn ordinary_prose_leaves_the_prefilter_with_nothing_to_run() {
     );
 }
 
+/// **And the value-side half buys GH #194's skip nothing at all, which
+/// is worth asserting rather than leaving to be assumed.**
+///
+/// The separator half is spelled in the *pattern*, so the prefilter —
+/// which is built from the patterns — stops naming the pair on a window
+/// of namespace prose, and the arm above measures exactly that.
+/// `value_must_not_match` is a **post-match** refusal: `find_spans` runs
+/// the rule and then declines what it captured, so the prefilter still
+/// names the pair on every window of `VALUE_SIDE_PROSE` and the skip
+/// never fires. Measured over the same nine corpora at REQ-O-007's
+/// 41,472 B window, the share of windows with an empty hit set is
+/// **unchanged to the window**: third-party Rust 75.4 %, the CPython
+/// stdlib 92.2 %, this project's own source 58.3 %, its docs 71.4 %,
+/// this repo's `git log` 67.7 %.
+///
+/// The alternative that *would* move it is to put the constraint in the
+/// pattern, and with no lookaround in the `regex` crate "at least eight
+/// bytes and one of them a digit" needs a nine-branch union over the
+/// index of the first digit — built for #202, confirmed correct, and
+/// rejected for costing an order of magnitude on scan time and being
+/// unreadable in a hand-edited file. This row records that the trade was
+/// taken knowingly: **fewer mangled bytes, no cheaper scan.**
+#[test]
+fn the_value_side_half_does_not_buy_the_prefilter_a_skip() {
+    let (after, before) = (builtin(), colon_only());
+    let window = VALUE_SIDE_PROSE.join("\n");
+
+    let names = |set: &RuleSet| -> Vec<String> {
+        set.prefilter
+            .matches(window.as_bytes())
+            .into_iter()
+            .map(|i| set.rules[i].name.clone())
+            .collect()
+    };
+    let (a, b) = (names(&after), names(&before));
+    assert_eq!(
+        a, b,
+        "the prefilter hit set moved, so `value_must_not_match` reached the \
+         prefilter — it is a post-match refusal and must not"
+    );
+    assert!(
+        a.iter().any(|n| n.ends_with("-assignment")),
+        "the control is empty: this window must still name the pair, or the arm \
+         above proves nothing: {a:?}"
+    );
+    // ...and yet nothing is redacted, which is the whole point.
+    assert!(
+        find_spans(&after, window.as_bytes(), 0).is_empty(),
+        "the prefilter names the pair, the rules run, and nothing is redacted"
+    );
+    eprintln!("GH #194/#202 — value-side window still names {a:?}, redacts nothing");
+}
+
 // ---------------------------------------- Part 5: through the real surface
 
 const TAIL: &str = "\nbuild finished in 13.72s\n";
@@ -597,6 +1072,52 @@ fn read_output_returns_ordinary_prose_unaltered_and_reports_nothing() {
         r.redactions.get("generic").copied().unwrap_or_default(),
         NAMESPACE_PROSE.len(),
         "the pre-fix read must report one `generic` redaction per prose row: {:?}",
+        r.redactions
+    );
+}
+
+/// The same, on the **value-side** corpus and against the colon-only
+/// control (GH #202).
+///
+/// `read_output` is the surface the issue was written against, and the
+/// rule-level arms above cannot see a pipeline that redacts on its own
+/// account — §4.1's holdback and the normalised views both run their own
+/// `find_spans`.
+#[test]
+fn read_output_returns_value_side_source_unaltered_and_reports_nothing() {
+    let processor = OutputProcessor::builtin().unwrap();
+    let source = format!("{}{TAIL}", VALUE_SIDE_PROSE.join("\n"));
+
+    let r = read(&processor, source.as_bytes());
+    assert_eq!(
+        r.output, source,
+        "read_output altered source that contains no credential"
+    );
+    assert!(
+        r.redactions.is_empty(),
+        "read_output reported {:?} over source with no credential in it",
+        r.redactions
+    );
+    assert!(
+        !r.held_back,
+        "the value-side corpus must not be held back once terminated"
+    );
+
+    // Control: `main`'s own rules mangle every row of it.
+    let before = OutputProcessor::new(
+        Arc::new(colon_only()),
+        processor.audit.clone(),
+        processor.limits,
+    );
+    let r = read(&before, source.as_bytes());
+    assert_ne!(
+        r.output, source,
+        "the colon-only read must alter the source"
+    );
+    assert_eq!(
+        r.redactions.get("generic").copied().unwrap_or_default(),
+        VALUE_SIDE_PROSE.len(),
+        "the colon-only read must report one `generic` redaction per row: {:?}",
         r.redactions
     );
 }

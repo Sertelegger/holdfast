@@ -197,9 +197,12 @@ const HOST_DEPENDENT_ROWS: &[(&str, &[Need])] = &[
 /// PTY-level test of the add-alt-screen direction. Naming them says which
 /// absences are tolerated and leaves every other one red.
 ///
-/// - `fish` is not installable on the development host (no sudo, no
-///   network, no binary anywhere on the filesystem), so its snippet
-///   remains UNVERIFIED at runtime.
+/// - `fish` is tolerated because CI's `test` job installs none, not
+///   because the row cannot pass: since GH #217 / #98 it PASSES on
+///   fish 3.7.0. It stays listed so a fish-less host still reports a
+///   truthful green rather than a red; `HOLDFAST_REQUIRE_ALL_SHELLS=1` is
+///   what turns that tolerance off, and `ci-skip-census.sh` records why it
+///   is not set yet.
 /// - CPython 3.13 is newer than the system Python of a current LTS —
 ///   `ubuntu-24.04` ships 3.12.3 — so the PyREPL row is genuinely
 ///   unrunnable on mainstream hosts rather than merely inconvenient. It
@@ -214,9 +217,15 @@ const ROWS_THAT_MAY_SKIP: &[&str] = &[
 
 /// The environment variable that turns every skip into a failure.
 ///
-/// CI's Linux job sets it, so a runner missing `fish` — or `dash`, or
-/// `less`, or a PyREPL-era Python — fails loudly instead of reporting a
-/// green nineteen.
+/// **No CI job sets it**, and this doc said "CI's Linux job sets it" until
+/// 2026-09-20 — `grep -rn HOLDFAST_REQUIRE_ALL_SHELLS .github/` answers
+/// four hits and all four are comments, one of them a commented-out
+/// `env:`. Set, it would make a runner missing `fish` — or `dash`, or
+/// `less`, or a PyREPL-era Python — fail loudly instead of reporting a
+/// green nineteen. `ci.yml` above the `test` job and
+/// `scripts/ci-skip-census.sh` both record what is still blocking it, and
+/// since GH #217 / #98 that is REQ-TS-008 in `tests/screen.rs` rather than
+/// this file's fish row.
 const REQUIRE_ALL: &str = "HOLDFAST_REQUIRE_ALL_SHELLS";
 
 fn on_path(program: &str) -> bool {
@@ -1708,9 +1717,38 @@ async fn the_heuristic_decides_at_exactly_the_threshold_on_a_real_ps2_prompt() {
 // OSC 133 shell integration, end to end
 // ---------------------------------------------------------------------
 
+/// A command that exits 42 in **every** shell this file drives, and the
+/// reason it is not spelt `(exit 42)` (GH #217 / #98).
+///
+/// `(exit 42)` is a subshell in bash and zsh and a command **substitution**
+/// in fish, which rejects it at parse time — `command substitutions not
+/// allowed here` on 3.7.0, `… not allowed in command position` on 4.x.
+/// Measured on fish 3.7.0 through this very row: fish ran nothing, emitted
+/// no `C`/`D;42` pair, and re-prompted instead, so the stream ended
+/// `… A B A B` where the shared expectation below wants `… C D;42 A B`.
+/// The bash-ism was in the assertion helper all three shells share, not in
+/// Holdfast's fish integration.
+///
+/// `sh -c 'exit 42'` is **one external command** in bash, zsh and fish
+/// alike — verified in all three, and already the spelling of the fish
+/// 3.7.0 line-editor capture in `detect::scanner`'s
+/// `the_measured_fish_line_editor_repaint_yields_the_command_it_typed`. The
+/// `sh` child carries no shell integration and emits no markers of its own,
+/// so it contributes exactly the one `C` and one `D;42` the arithmetic
+/// below counts on.
+///
+/// **This diverges from the spec on purpose, and the spec is the one that
+/// is wrong.** §11.2's REQ-PD-027 still reads "in each of bash, zsh and
+/// **fish** ... run `echo` / `false` / `(exit 42)`", and §11.4 and §8.5
+/// spell it the same way for bash and zsh. An implementer who follows
+/// that text into the fish arm re-introduces GH #217 / #98 exactly. The
+/// bash and zsh arms are unaffected either way — both spellings exit 42
+/// there — so the fish arm is the whole of the divergence.
+const EXITS_42: &str = "sh -c 'exit 42'";
+
 /// The marker stream a §8.5 integrated shell emits for a session that runs
-/// `echo hello`, `false`, `(exit 42)` — measured, identical for bash 5.3
-/// and zsh 5.9.
+/// `echo hello`, `false`, `sh -c 'exit 42'` — measured, identical for
+/// bash 5.3, zsh 5.9 and fish 3.7.0.
 ///
 /// Read as five groups: the snippet's own completion (`D;0`) and the first
 /// wrapped prompt (`A`, `B`), then `C`, `D;<code>`, `A`, `B` per command.
@@ -1771,10 +1809,42 @@ async fn assert_marker_stream_and_exit_codes(server: &HoldfastServer, id: &str, 
 
     // Synchronise on the marker count, not on `AtPrompt`: the session is
     // already `AtPrompt` at the prompt each command is typed at.
-    await_markers(server, id, 3).await;
-    for (command, total) in [("echo hello", 7), ("false", 11), ("(exit 42)", 15)] {
+    //
+    // **The totals are running totals: `FIRST_PROMPT`, then `PER_COMMAND`
+    // per command.** They were three literals — 3, 7, 11, 15 — and the
+    // last one mattered. A bare count beside a vector expectation is free
+    // to drift away from it, and when the LAST one drifts SHORT the wait
+    // is satisfied by a PREFIX of the stream and the row then passes or
+    // fails by how busy the box was, which is the flake
+    // `a_prompt_that_already_emits_osc_133_meets_the_injected_snippet`
+    // records at length.
+    //
+    // **The two INTERMEDIATE totals are synchronisation, not assertion,
+    // and an earlier draft of this comment claimed otherwise.** Measured
+    // 2026-09-20: setting them to 4 and 9 — each short by enough that the
+    // next command is typed after only the previous one's `C` — leaves
+    // all three rows green, 5 runs of 5 plain and 6 of 6 under
+    // `taskset -c 0`. Nothing but the final exact-vector compare binds
+    // them. They are derived anyway, because a reader takes the model
+    // from them whether or not it is enforced, and the `assert_eq!` below
+    // is what stops the model and the expectation drifting apart.
+    //
+    // Swapping `(exit 42)` for `EXITS_42` moved none of this:
+    // `sh -c 'exit 42'` is one command to the shell, so it marks once,
+    // exactly as `(exit 42)` did on the two shells that accepted it.
+    const FIRST_PROMPT: usize = 3;
+    const PER_COMMAND: usize = 4;
+    const COMMANDS: [&str; 3] = ["echo hello", "false", EXITS_42];
+    assert_eq!(
+        FIRST_PROMPT + PER_COMMAND * COMMANDS.len(),
+        MEASURED_MARKER_STREAM.len(),
+        "the per-command marker model and the measured stream disagree"
+    );
+
+    await_markers(server, id, FIRST_PROMPT).await;
+    for (i, command) in COMMANDS.iter().enumerate() {
         send(server, id, command).await;
-        await_markers(server, id, total).await;
+        await_markers(server, id, FIRST_PROMPT + PER_COMMAND * (i + 1)).await;
     }
 
     let m = markers(&raw(server, id).await);
@@ -1813,7 +1883,7 @@ async fn assert_marker_stream_and_exit_codes(server: &HoldfastServer, id: &str, 
         .iter()
         .map(|e| e["command"].as_str().unwrap_or(""))
         .collect();
-    assert_eq!(commands, vec!["echo hello", "false", "(exit 42)"]);
+    assert_eq!(commands, vec!["echo hello", "false", EXITS_42]);
     // Every entry closed. `exit_code` alone cannot say so — a `D` with no
     // payload parses to `None` and looks identical to a running command —
     // and `duration_ms` is the agent-visible half of the same fact.
@@ -1859,19 +1929,31 @@ async fn zsh_integration_emits_the_measured_marker_stream_and_exact_exit_codes()
 
 #[tokio::test]
 async fn fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes() {
-    // **fish is unverified by this suite.** The spike measured bash and
-    // zsh; fish's snippet was inferred from documented hook equivalence
-    // (§24) and fish is not installed on the machine this milestone was
-    // built on, so this row skips here and has never run in CI. The
-    // snippet body itself *has* since been driven on live PTYs in
-    // containers for fish 3.7.0, 4.0.2 and 4.8.1 (§8.5.1) — including
-    // `functions -c fish_prompt` against the built-in default prompt,
-    // which was the open hazard and is discharged — but those are
-    // out-of-band measurements and this row is what makes them regressible.
+    // **This row PASSES on fish 3.7.0, and until GH #217 / #98 it could
+    // not.** What stopped it was never fish's snippet: the shared
+    // assertion helper sent `(exit 42)`, a bash-ism (see `EXITS_42`), so
+    // fish parse-errored, ran nothing, and re-prompted. The snippet
+    // installs and marks correctly on 3.7.0 — including
+    // `functions -c fish_prompt __holdfast_orig_fish_prompt` against the
+    // built-in default prompt, which was the open hazard and is
+    // discharged. Measured here 2026-09-20, 15 consecutive green runs.
     //
-    // Do not delete this test to make the file honest: the CI matrix
-    // (0.0.11) installs fish, and this is the assertion that will run
-    // there first.
+    // **It still does NOT pass on a fish >= 4, and that is by design, not
+    // by neglect** — see "Since REQ-PD-028" below, which is where this
+    // row's arrangement for a colliding fish is written down. Measured
+    // 2026-09-20 on fish 4.8.1 and 4.9.3 alike (§8.5.1 records the earlier
+    // out-of-band container runs at 3.7.0, 4.0.2 and 4.8.1, and §24 the
+    // hook equivalence the snippet was inferred from): every command
+    // including `EXITS_42` runs and
+    // is marked correctly by BOTH emitters (`C;cmdline_url=sh%20-c%20…`
+    // beside `C;holdfast=1`, `D;42` beside `D;42;holdfast=1`), and the row
+    // fails only on the collision the expectation below does not model.
+    // **A fix to this row's input cannot and must not change that.**
+    //
+    // **fish is still unverified by CI.** The `test` job installs no fish;
+    // `ci-skip-census.sh` carries the record, and that entry now names a
+    // retirement whose condition is MET rather than one that is blocked.
+    // Do not delete this test to make that honest.
     //
     // **Since REQ-PD-028 the arrangement is "no arrangement".** The
     // snippet's native-marking guard is gone, so it runs on every fish and
@@ -1881,8 +1963,17 @@ async fn fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes(
     // markers reach the detector, which is the behaviour worth measuring
     // rather than suppressing. The expectation below is Holdfast's stream and
     // is therefore **known to be wrong for a colliding fish**; that arm is
-    // §11.2's collision scenario, and it is named in §25 as an expected
-    // failure on a fish ≥ 4 runner until it is written.
+    // §11.4's collision scenario, which §11.4 writes out in full — three
+    // entries, both halves each, `osc133_source`, and a fish >= 4.0 named
+    // as its acceptance case. **What is missing is not the scenario but a
+    // row that models it**, and this row is not it.
+    //
+    // §25's entry for this is spent and must not be read as current: its
+    // condition is "until REQ-PD-028 lands", REQ-PD-028 HAS landed, and
+    // its mechanism — "on 4.8.1 Holdfast's version guard declines ... the
+    // session produces zero markers" — is refuted by the 4.8.1
+    // measurement above, where the snippet injects and both emitters mark
+    // every command.
     if !have(Need::Program("fish")) {
         eprintln!(
             "skipping: fish not installed — the fish snippet remains \
@@ -1936,7 +2027,7 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     // **Every wait below is the length of what it is about to assert**,
     // and that is not a stylistic preference. Written as a bare `12` next
     // to an eighteen-marker expectation, the positive half returned at the
-    // `C`, `C` pair `(exit 42)` opens with and compared a twelve-marker
+    // `C`, `C` pair `EXITS_42` opens with and compared a twelve-marker
     // *prefix* to the full stream. On an idle box bash's remaining six
     // markers land in the same PTY read and it passes; under core scarcity
     // the reader drains between the shell's writes and it does not. The
@@ -1966,7 +2057,7 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     )
     .await;
     await_markers(&server, &declined, FIRST_PROMPT).await;
-    send(&server, &declined, "(exit 42)").await;
+    send(&server, &declined, EXITS_42).await;
     let alone = await_markers(&server, &declined, ALONE.len()).await;
     assert_eq!(
         alone, ALONE,
@@ -2036,7 +2127,7 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     // so the two rows differ only in whether a foreign emitter is present.
     let mut expected: Vec<String> = COLLIDING_PROMPT.iter().map(|s| (*s).to_string()).collect();
     let mut both = Vec::new();
-    for (command, code) in [("echo hello", 0), ("false", 1), ("(exit 42)", 42)] {
+    for (command, code) in [("echo hello", 0), ("false", 1), (EXITS_42, 42)] {
         expected.extend(cycle(code));
         send(&server, &id, command).await;
         both = await_markers(&server, &id, expected.len()).await;
@@ -2075,7 +2166,7 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
             "C", "D;0", "A", "B", // Holdfast's injection line, which it marks
             "C", "D;0", "A", "B", // `echo hello`
             "C", "D;1", "A", "B", // `false`
-            "C", "D;42", "A", "B", // `(exit 42)` — every code reported truthfully
+            "C", "D;42", "A", "B", // `EXITS_42` — every code reported truthfully
         ],
         "the user's own emitter must see the real exit status: {both:?}"
     );
@@ -2103,7 +2194,7 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
         .collect();
     assert_eq!(
         commands,
-        vec!["echo hello", "false", "(exit 42)"],
+        vec!["echo hello", "false", EXITS_42],
         "history: {h}"
     );
     assert_eq!(codes, vec![0, 1, 42], "history: {h}");

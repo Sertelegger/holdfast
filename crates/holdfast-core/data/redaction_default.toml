@@ -14,6 +14,16 @@
 #             (§4.1). Omit to auto-derive from `pattern`.
 #   binary    optional; true when the value may contain whitespace or
 #             control bytes (PEM blocks). Defaults to false.
+#   value_must_not_match
+#             optional regex. When it matches the WHOLE `value` capture
+#             the candidate is refused: the rule found its label and its
+#             separator and then judged that what followed is not a
+#             credential. The loader anchors it `\A...\z` and compiles it
+#             in byte mode, so write the bare expression. Requires a
+#             `value` group; declaring it without one is an error, not a
+#             no-op. This is gitleaks' own `allowlist.regexes` mechanism
+#             and its own polarity -- see `generic-secret-assignment`
+#             below for why the shipped expression is not gitleaks'.
 #   positive  MUST match. At least one required.
 #   negative  MUST NOT match. At least one required.
 #
@@ -454,9 +464,13 @@ pattern = '''(?i)bearer\s+(?P<value>[A-Za-z0-9._~+/-]{20,}=*)'''
 positive = ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz"]
 negative = ["Bearer short"]
 
-# **Both rules below refuse a value whose first byte is another `:`.**
-# That is the part of GH #202 that costs no true positive; it is not the
-# whole of GH #202, and the paragraph below says which half stays open.
+# **Both rules below judge what follows the separator, in two steps, and
+# neither step costs a true positive over the corpus measured.** First
+# they refuse a value whose first byte is another `:`; then
+# `value_must_not_match` refuses a value that carries no digit *and*
+# carries one of the bracket-and-quote bytes no credential alphabet
+# uses. The first step is described immediately below and the second
+# under "the value-side half" further down.
 # The separator is
 # already consumed by `[:=]` at that point, so a value opening on a second
 # colon means the source text read `label::…` — a scope-resolution
@@ -497,26 +511,123 @@ negative = ["Bearer short"]
 # `held_back: true` where it came back mangled, and `prompt.last_line`
 # is `""` while it does. One byte outside the value class releases it.
 #
-# **What it does not close, measured rather than implied.** #202's own
-# headline row -- ``reassembled the token: `get_screen_state` `` -- is a
-# plain `label: value` with no second colon in it, and is still redacted.
-# So is `export TOKEN={GITHUB}`. Closing those means constraining what
-# the value *contains*, and every such constraint measured for #202 drops
-# a real credential with it: a value character class costs a bcrypt hash
-# and a password carrying `!` or `@`, and a required digit costs every
-# digit-free passphrase. `tests/redaction_prose.rs` asserts the headline
-# row is still redacted, so the open half is a number somebody has to
-# move rather than a silence.
+# ------------------------------------------------ the value-side half
+#
+# **`value_must_not_match` closes #202's headline row, and it is written
+# as a refusal rather than a requirement on purpose.** #202's own example
+# -- ``reassembled the token: `get_screen_state` `` -- is a plain
+# `label: value` with no second colon in it, so the rule above cannot
+# see it; what distinguishes it from a credential is what the value
+# *contains*. The expression reads: **a value that carries no digit and
+# carries one of `( < > [ ] { } | \` or a backtick is not a credential.**
+#
+# **The refused set is exactly "bytes no *machine-generated token*
+# alphabet contains", and it is deliberately narrower than "bytes that
+# make code".** Walked one alphabet at a time: base64 (`+ / =`),
+# base64url (`- _`), base62, base58, hex, crypt/bcrypt radix-64 (`. /`),
+# UUID (`-`), PEM bodies and Azure's `~` -- none contains a bracket, a
+# pipe, a backslash or a backtick, so refusing those costs nothing a
+# provider can mint.
+#
+# **Human-chosen and generator-chosen *passwords* are the exception, and
+# they are the documented limitation below rather than a gap here.** A
+# password generator with a symbol set enabled can emit `(` or `{`;
+# Django's `get_random_secret_key()` alphabet carries `_` and `(`
+# outright. Every such generator this was checked against emits digits
+# too, so the digit clause rescues them -- but a generator run with
+# symbols on and digits off is a real configuration and its output is
+# refused. That class is asserted in `tests/redaction_prose.rs`.
+#
+# **`_`, `.` and `:` were in this set and were taken out, which is the
+# whole of what a review lane found.** They are the highest-yield bytes
+# for prose -- they alone take third-party Rust from 1140 matches to 273
+# -- and they are also the separators real credentials use. With them in,
+# the refusal dropped **seven** rows of the credential corpus outright:
+# both dot- and underscore-separated diceware passphrases
+# (`correct.horse.battery.staple`, `correct_horse_battery_staple` --
+# period and underscore are one-click separator options in 1Password,
+# Bitwarden, KeePassXC and xkcdpass, and EFF wordlist words carry no
+# digit by construction), a colon-separated one, a HashiCorp Vault
+# `hvs.<base62>` token, a Doppler `dp.st.<base62>` token -- **neither of
+# which has a shape-keyed backstop rule in this file** -- an underscore-
+# bearing base64url value, and a dotted `SECRET_KEY`. A digit-free Vault
+# token is about 1 in 68 by its own alphabet, which is not a rounding
+# error. The narrower set drops **none** of them.
+#
+# **A digit anywhere rescues the value, and that clause is load-bearing.**
+# Without it the refusal drops `password: <MySecretPass123>` and
+# `auth_token = {abcdef1234567890}`, which are bracket-bearing and real.
+#
+# **Measured, nine credential-free corpora, 41,472 B windows (REQ-O-007),
+# counting the spans `read_output` emits:** third-party Rust (syn/tokio/
+# hyper/serde/regex/rmcp, 10.6 MiB) 1140 -> 331; the Python 3.12 stdlib
+# (10.1 MiB) 61 -> 22; this project's own `.rs` (5.2 MiB) 114 -> 23; its
+# docs (5.0 MiB) 55 -> 10; this repo's `git log` (1.2 MiB) 19 -> 12;
+# crates.io READMEs (4.8 MiB) 9 -> 3; man pages, colourised `grep -rn`
+# and Debian licence texts 0 -> 0. **It drops none of a 41-row corpus of
+# real-shaped credentials and none of the sixty-one positive fixtures the
+# fifty-one rules carried before it -- sixty-eight now, seven having
+# been added with it.**
+#
+# **Why it is not upstream's expression, measured rather than asserted.**
+# gitleaks' `generic-api-key` at the pinned `gitleaks-8.28.0` carries
+# `entropy = 3.5`, 1,446 stopwords and an allowlist rejecting
+# `^[a-zA-Z_.-]+$`, and both source files are byte-identical at v8.30.1
+# -- so this is a divergence from the vendored rule's own design and not
+# a stale snapshot. Run against the same 41-row corpus, upstream's
+# constraints **drop nineteen**: entropy 3.5 alone drops ten, including
+# `export DB_PASSWORD=hunter2hunter2` (H=2.807) and
+# `api_key: 's3cr3t-value'` (H=3.418), which are `positive` fixtures of
+# these two rules; the stopword list drops four more, including
+# `SECRET_KEY = 'django-insecure-...'` (a third shipped fixture, on
+# `django`) and a Doppler token on `dev.` -- five in all. Entropy is the
+# worse of the
+# two on its own terms as well: over these corpora it is a proxy for
+# value *length*, and it ranks `input.parse::<Token![struct]>(` (H=4.28)
+# above the diceware passphrase `correcthorsebatterystaple` (H=3.36)
+# that a high-entropy test is supposed to be the way to keep -- 13 of 15
+# sampled digit-free code expressions outrank it. Upstream's allowlist
+# regex fits this field verbatim and is the one piece that transfers in
+# shape, but its *expression* leans on a value alphabet of `[\w.=-]` that
+# this rule set does not have: over the same corpora it leaves 907 of the
+# 1140 third-party-Rust matches standing while costing eleven true
+# positives. A bare "the value must contain a digit", the constraint
+# that looks obvious, costs thirteen.
+#
+# **What it gives up, and the class is real.** A digit-free credential
+# carrying a bracket, a pipe, a backslash or a backtick --
+# `api_key=alpha(bravo)charlie`, `SECRET_KEY=[bracketed-secret]` -- is no
+# longer redacted. A password generator with symbols enabled *and* digits
+# disabled can mint one; no provider does, and no shipped fixture is one.
+# `tests/redaction_prose.rs` asserts the class as a documented limitation
+# (REQ-TST-006) rather than leaving it to be rediscovered.
+#
+# **What it does NOT close, stated because the first draft of this block
+# implied otherwise.** The residual on ordinary source is still
+# substantial and is dominated by `_`- and `.`-bearing identifiers --
+# `node.as_token`, `ProgressToken`, `self.dot2_token` -- and by a bare
+# alphabetic value like `secret: SecretBytes`. Those are indistinguishable
+# from a digit-free passphrase by anything in the value, so closing them
+# means accepting the leak class above. 1140 -> 331 is a 71% cut and not
+# a fix, and the 331 that remain are still very largely false. Turning
+# the pair off entirely stays the operator's call (GH #128).
+#
+# **It also moves `holdback_boundary` earlier, for the same reason the
+# colon refusal did.** `PrefixIndex::earliest_partial` releases a
+# candidate once the rule's anchored form sees a whole match, on the
+# ground that `find_spans` has redacted it; a refused value breaks that
+# ground, so the scan asks `CompiledRule::anchored_whole_match` instead
+# and keeps refused candidates in flight. Releasing them would hand out
+# `API_KEY=abcdefgh` one byte before it becomes `abcdefgh9`.
 #
 # **What it deliberately does not do.** The label-only match itself is
-# unchanged: `password = not-set-yet` is still `[REDACTED:generic]`, which
-# is the behaviour the 0.0.7 CHANGELOG records under GH #125, and whether
-# that stays is an operator's call (`disabled_redaction_rules`, GH #128)
-# rather than this comment's. Upstream gitleaks constrains its own
-# `generic-api-key` further — `entropy = 3.5`, a ~1,500-word stopword
-# list, and an allowlist rejecting any value matching `^[a-zA-Z_.-]+$` —
-# and every one of those needs a mechanism this rule file has no field
-# for. See GH #202.
+# unchanged where the value is credential-shaped: `password = not-set-yet`
+# is still `[REDACTED:generic]`, which is the behaviour the 0.0.7
+# CHANGELOG records under GH #125, and whether that stays is an
+# operator's call (`disabled_redaction_rules`, GH #128) rather than this
+# comment's. `powersync-token` above is label-keyed too and carries
+# neither refusal; that is stated where the rule is and is unchanged
+# here.
 
 # Two-word `*_KEY` labels. Found by walking the providers that have no
 # dedicated rule and checking each one's canonical environment-variable
@@ -549,16 +660,32 @@ prefixes = [
   "session_key",
   "session-key",
 ]
+# See "the value-side half" above. Identical to the expression on
+# `generic-secret-assignment`, deliberately: these two are one rule split
+# by label, and a reader comparing them should find nothing to compare.
+value_must_not_match = '''[^0-9]*[(<>\[\]{}|\\`][^0-9]*'''
 positive = [
   "CLERK_SECRET_KEY=sk_test_0123456789abcdef01234567",
   "SECRET_KEY = 'django-insecure-0123456789abcdef'",
   "app.encryption_key: 0123456789abcdef",
+  # Digit-free passphrases, in the three separator spellings password
+  # generators actually offer. None of `-`, `.` or `_` is refused, and a
+  # review lane found the first draft of this rule refusing the last two.
+  "SESSION_KEY=qwertyuiopasdfgh",
+  "MASTER_KEY=correct-horse-battery-staple",
+  "MASTER_KEY=correct.horse.battery.staple",
+  "MASTER_KEY=correct_horse_battery_staple",
 ]
 negative = [
   "SECRET_KEY_FILE=/run/secrets/app",
   "PUBLIC_KEY=0123456789abcdef",
   "SECRET_KEY=",
   "crate::secret_key::rotation",
+  # GH #202's value-side half, on this rule's own label. Both carry a
+  # refused byte and no digit, so the refusal declines them where the
+  # pattern alone matches.
+  "pub session_key: Option<SessionKey>,",
+  "master_key = config.master_key.clone()",
 ]
 
 # The catch-all. `token` is in the alternation deliberately: without it an
@@ -583,10 +710,19 @@ prefixes = [
   "auth_token",
   "auth-token",
 ]
+# See "the value-side half" above.
+value_must_not_match = '''[^0-9]*[(<>\[\]{}|\\`][^0-9]*'''
 positive = [
   "export DB_PASSWORD=hunter2hunter2",
   "api_key: 's3cr3t-value'",
   "LINODE_TOKEN=0123456789abcdef0123456789abcdef",
+  # A refused byte with a digit beside it is still a credential --
+  # without the digit clause the refusal would drop this one.
+  "auth_token = {abcdef1234567890}",
+  # Digit-free: a passphrase is still a credential, and so is a
+  # dot-prefixed vendor token with a digit-free body (HashiCorp Vault).
+  "password=correcthorsebatterystaple",
+  "access_token=hvs.CAESIJxKzWqTvNbMqLdFgHjKlPoIuYtReWqAsDfGhJkL",
 ]
 negative = [
   "password: short",
@@ -594,6 +730,10 @@ negative = [
   "token = 1234",
   "the secret::binding flake cluster",
   "attach::secret::SecretBytes",
+  # GH #202's headline row, and the two others the issue measured.
+  "reassembled the token: `get_screen_state`",
+  "export TOKEN={GITHUB}",
+  "let cancellation_token = cancellation_token.clone();",
 ]
 
 # --------------------------------------------------------- the group-3 walk

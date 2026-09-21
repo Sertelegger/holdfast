@@ -333,16 +333,19 @@ its `--test-threads=192` banner suggests.
 
 ### What CI does not verify
 
-**`fish` shell integration is unverified at runtime.** `fish` is deliberately
-not installed on the runner, so `tests/detection.rs`'s fish row skips — and
-installing it would not fix that. Measured 2026-08-13 on the `ubuntu-24.04`
-runner image, at both fish versions obtainable on it:
+**`fish` shell integration is unverified BY CI at runtime** — which since
+GH #217 / #98 is a statement about the runner's package list and no longer a
+statement about the row. `fish` is not installed on the runner, so
+`tests/detection.rs`'s fish row skips there. It does **not** skip on a
+developer box that has fish, and on noble's own fish it **passes**:
 
-- **fish 3.7.0** (noble's own archive) — the snippet installs and marks
-  correctly, and the row still fails on its last command. `(exit 42)` is a
-  subshell in `bash` and `zsh` and a *command substitution* in `fish`, which
-  rejects it outright, so the shared assertion helper's expected marker stream
-  never arrives.
+- **fish 3.7.0** (noble's own archive) — **the row passes.** It used to fail
+  on its own last command: `(exit 42)` is a subshell in `bash` and `zsh` and a
+  *command substitution* in `fish`, which rejects it outright, so nothing ran
+  and the shared assertion helper's expected marker stream never arrived. The
+  bash-ism was in that helper, not in the fish integration; it now sends
+  `sh -c 'exit 42'`, which is one external command in all three shells.
+  Installing `fish` on the runner would now turn the skip into a green row.
 - **any fish ≥ 4.0** — a marker collision. Fish emits OSC 133 natively from
   4.0 onward, and Holdfast's snippet now injects unconditionally: the guard that
   used to decline was deleted, because declining left a session with **no `B`
@@ -353,10 +356,12 @@ runner image, at both fish versions obtainable on it:
   `[0, 1, 42]`, `osc133_source: "mixed"`, and no entry for the install line.
   The row still fails because it asserts the *no-collision* marker stream.
 
-So the gap is real, and it is **explicit rather than silent**:
-`scripts/ci-skip-census.sh` asserts the set of skipped rows is exactly the one
-named row, and fails both on an unexpected skip and on that expected skip
-disappearing.
+So the gap is real — a fish >= 4 still fails the row, and CI installs no fish
+at all — and it is **explicit rather than silent**: `scripts/ci-skip-census.sh`
+carries one record per skipped row, keyed on the libtest row name, and fails
+both on an unexpected skip and on an expected skip disappearing. That file is
+also where the retirement is written down, including which half of it is a
+decision and which half is still blocked.
 
 **Spec §11.4's control-path p99 is never asserted in CI.**
 `crates/holdfast-core/tests/stress_write_path.rs` asserts it only where

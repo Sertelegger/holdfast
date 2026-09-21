@@ -100,15 +100,17 @@
 #     INSIDE the allowlist may still skip silently, forever, on any host.
 #   * `HOLDFAST_REQUIRE_ALL_SHELLS=1` turns every skip into a failure and
 #     would supersede the row half of this script entirely. It is not set
-#     yet, and the reason is measured and written down in ci.yml above the
-#     `test` job: DETECTION.RS's fish row cannot pass on any fish
-#     available today. It would also not help REQ-TS-008 if it were set:
-#     the variable is read only by tests/detection.rs's `have()`, whose
-#     own opening assertion requires the `Need` to be in that file's
-#     HOST_DEPENDENT_ROWS table, and tests/screen.rs is a separate binary
-#     that calls neither. That is a gap in the SUITE, tracked as review
-#     finding I7(a) and not fixable from this script; the row half here is
-#     what covers REQ-TS-008 until it is closed.
+#     yet, and **BOTH REASONS THIS PARAGRAPH GAVE UNTIL 2026-09-20 ARE
+#     DEAD**, which is worth more than the sentence that replaced them.
+#     It said detection.rs's fish row cannot pass on any fish available
+#     today: it passes on 3.7.0, see that row's record below. It said the
+#     variable cannot reach REQ-TS-008 because tests/screen.rs is a
+#     separate binary that reads neither it nor `have()`: screen.rs now
+#     declares its own `REQUIRE_ALL` and honours it on both skip arms,
+#     which is review finding I7(a) CLOSED rather than open. What blocks
+#     the variable today is the consequence of that fix — REQ-TS-008's
+#     second arm needs a fish >= 4 and asserts the variable unset below
+#     it, and noble's 3.7.0 lands there. See the two records below.
 #
 # Run it locally exactly as CI does:
 #
@@ -177,19 +179,50 @@ set -uo pipefail
 # Adding an entry here is a deliberate, reviewable act; a row that starts
 # skipping without one turns this job red.
 #
-#   detection.rs's fish row — measured 2026-08-13, in containers on the
-#   ubuntu-24.04 base image, at both fish versions obtainable there:
-#     * fish 3.7.0 (noble's own archive): the snippet installs and marks
-#       correctly, and the row still fails, because the shared assertion
-#       helper sends `(exit 42)` — a SUBSHELL in bash and zsh, a command
-#       SUBSTITUTION in fish, which fish rejects with "command
-#       substitutions not allowed here" before running anything.
-#     * fish >= 4: a marker collision the row asserts the absence of.
-#   Neither is CI's to fix and neither is a reason to stop running the
-#   other twenty rows. RETIRED BY: a fish the row can pass on — at which
-#   point `fish` goes into the apt line in ci.yml's `test` job and the
-#   probe job, HOLDFAST_REQUIRE_ALL_SHELLS=1 gets set in ci.yml and
-#   nightly.yml, and this entry is deleted, in one change.
+#   detection.rs's fish row — **this entry no longer says what it said,
+#   and the difference is the whole point of reading it.** It was written
+#   because the row COULD NOT PASS on any fish; it survives because CI's
+#   `test` job INSTALLS no fish. Those are different claims and only the
+#   second is still true.
+#     * fish 3.7.0 (noble's own archive): the row PASSES. Measured
+#       2026-09-20, 15 consecutive green runs on Ubuntu 24.04's own
+#       3.7.0. What used to fail it was the shared assertion helper
+#       sending `(exit 42)` — a SUBSHELL in bash and zsh, a command
+#       SUBSTITUTION in fish, rejected with "command substitutions not
+#       allowed here" before anything ran. GH #217 / #98 replaced it with
+#       `sh -c 'exit 42'`, which is one external command in all three
+#       shells. That was never a defect in Holdfast's fish integration.
+#     * fish >= 4: still a marker collision the row asserts the absence
+#       of, and still not CI's to fix. Measured 2026-09-20 on fish 4.8.1
+#       — the version `fish-req-ts-008` pins — and on 4.9.3: the snippet
+#       INJECTS on both, and both emitters mark every command,
+#       `sh -c 'exit 42'` included (`C;cmdline_url=sh%20-c%20%27exit%2042%27`
+#       beside `C;holdfast=1`, `D;42` beside `D;42;holdfast=1`), and
+#       the row fails only on the interleaving. §11.4 writes that
+#       scenario out in full — three entries, both halves each,
+#       `osc133_source`, and a fish >= 4.0 as its acceptance case — so
+#       what is missing is a row that models it, not the scenario. A
+#       fish >= 4 in the `test` job would take this row red for that
+#       reason alone.
+#   RETIRED BY: `fish` going into the apt line in ci.yml's `test` job and
+#   the probe job, at which point the row RUNS and PASSES there and this
+#   entry is deleted. **That is now a decision, not a blocker** — the
+#   condition the entry was written against is met. Two things do NOT come
+#   with it, and pretending otherwise is how the last version of this
+#   record went stale:
+#     * HOLDFAST_REQUIRE_ALL_SHELLS=1 still cannot be set in ci.yml or
+#       nightly.yml. screen.rs's REQ-TS-008 row asserts the variable is
+#       unset on BOTH of its skip arms, and its second arm ("a fish too
+#       old to measure") is exactly what noble's 3.7.0 lands on — so
+#       installing 3.7.0 and setting the variable turns that row red.
+#     * the screen.rs record below therefore stays. The two no longer
+#       retire together: a fish 3.7.0 retires this one alone.
+#   EXPECT THIS ENTRY TO FIRE AS `STALE EXEMPTION` ON YOUR OWN BOX if you
+#   have fish, and read that as the census working: the row ran instead of
+#   skipping, which is the retirement condition announcing itself. It did
+#   the same before GH #217 / #98 — the row ran and FAILED then, so it did
+#   not skip either — so this is not a regression introduced by the fix.
+#   In CI, where no fish is installed, the row skips and the entry holds.
 #
 #   screen.rs's REQ-TS-008 row — a DIFFERENT shortfall with a different
 #   retirement, which is why it is a separate record and not a second
@@ -207,8 +240,11 @@ set -uo pipefail
 #   So the row is measured by ci.yml's `fish-req-ts-008` job, which pins
 #   the PPA, and this entry records that it is not measured by the `test`
 #   job. RETIRED BY: the `test` job itself installing a fish >= 4.1 from
-#   that PPA — which today would take detection.rs's row with it, so these
-#   two retire together or not at all.
+#   that PPA — which would still take detection.rs's row with it, on
+#   §11.2's collision. **"These two retire together or not at all" is no
+#   longer true and stood here until 2026-09-20**: a fish 3.7.0 in the
+#   `test` job retires the record above and leaves this one exactly where
+#   it is, because 3.7.0 is what this row's SECOND skip arm is for.
 EXPECTED=(
   "fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes|skipping: fish not installed — the fish snippet remains"
   "only_answering_da1_takes_fish_to_its_first_prompt|skipping: fish not installed — REQ-TS-008's three arms need|skipping: fish not installed at a version this row measures"

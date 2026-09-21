@@ -1041,50 +1041,71 @@ jobs:
     needs: probe
     runs-on: ubuntu-24.04
     timeout-minutes: 40
-    # HOLDFAST_REQUIRE_ALL_SHELLS: "1" is STILL not set, and as of 2026-08-13
-    # that is a measurement rather than a staging decision. The variable
-    # makes tests/detection.rs's `have()` guard PANIC instead of skip and
+    # HOLDFAST_REQUIRE_ALL_SHELLS: "1" is STILL not set, and as of
+    # 2026-09-20 that is a measurement rather than a staging decision — but
+    # a DIFFERENT measurement from the one this block carried, so re-read
+    # the bullets rather than the verdict. The variable makes
+    # tests/detection.rs's `have()` guard PANIC instead of skip and
     # tightens its row census to zero skips, so it can only be set once
     # every gated row can actually run. Two rows skipped when this pipeline
-    # first went green. One is fixed here; the other is not CI's to fix.
+    # first went green. One is fixed here; the other WAS "not CI's to fix"
+    # and is now CI's to decide — see the fish bullet.
     #
     #   * The PyREPL row skipped because ubuntu-24.04 ships CPython 3.12.3.
     #     `actions/setup-python` below puts a 3.13 on PATH, the row runs,
     #     and ci-probe.sh turns the build red if it ever stops being there.
     #
-    #   * The fish row skipped because fish is not installed — and
-    #     INSTALLING IT DOES NOT MAKE IT PASS. Measured 2026-08-13 in
-    #     containers on this exact base image, at both fish versions
-    #     obtainable on it:
+    #   * The fish row skips because fish is not installed — and THIS
+    #     BULLET SAID "INSTALLING IT DOES NOT MAKE IT PASS" UNTIL
+    #     2026-09-20, WHICH IS NO LONGER TRUE OF NOBLE'S OWN FISH. Both
+    #     arms below were re-measured on 2026-09-20 and both had drifted.
     #
-    #     fish 3.7.0, noble's own archive. The snippet installs and marks
-    #     correctly — `functions -c fish_prompt __holdfast_orig_fish_prompt`,
-    #     the open question the row was written for, WORKS on a built-in
-    #     default prompt — and the row still fails, on its last command.
-    #     `(exit 42)` is a subshell in bash and zsh and a command
-    #     SUBSTITUTION in fish, which rejects it outright ("command
-    #     substitutions not allowed here"), so nothing runs and the stream
-    #     ends `… A B A B` where the shared expectation wants
-    #     `… C D;42 A B`. The bash-ism is in the assertion helper all three
-    #     shells share, in crates/, and belongs to whoever owns detection.
+    #     fish 3.7.0, noble's own archive — THE ROW NOW PASSES, 15 green
+    #     runs out of 15. The snippet installs and marks correctly, which
+    #     was already recorded here: `functions -c fish_prompt
+    #     __holdfast_orig_fish_prompt`, the open question the row was
+    #     written for, WORKS on a built-in default prompt. What failed was
+    #     the row's own last command. `(exit 42)` is a subshell in bash and
+    #     zsh and a command SUBSTITUTION in fish, which rejects it outright
+    #     ("command substitutions not allowed here"), so nothing ran and
+    #     the stream ended `… A B A B` where the shared expectation wants
+    #     `… C D;42 A B`. That bash-ism was in the assertion helper all
+    #     three shells share, in crates/, and GH #217 / #98 fixed it there:
+    #     the helper now sends `sh -c 'exit 42'`, one external command in
+    #     all three shells. Installing `fish` here would therefore turn a
+    #     silent skip into a GREEN row — see ci-skip-census.sh's record for
+    #     that row, which is now a decision rather than a blocker.
     #
-    #     fish 4.8.1, the fish maintainers' PPA — the only route to a
-    #     fish >= 4 on this image. Zero markers in 20 s: Holdfast's own
-    #     snippet guard declines to inject. It probes `status test-feature
-    #     no-mark-prompt`, but the feature is NAMED `mark-prompt`
-    #     (`no-mark-prompt` is the spelling that disables it), so the probe
-    #     answers 2 = unrecognised on every fish and the guard collapses to
-    #     "decline on any fish >= 4". Also measured there: fish >= 4.1
-    #     queries the terminal at startup and waits 10 s for a Primary
-    #     Device Attribute reply that a bare PTY never sends.
+    #     fish >= 4 — STILL FAILS, for a reason this comment had wrong.
+    #     It said Holdfast's snippet guard declines to inject, probing
+    #     `status test-feature no-mark-prompt` for a feature named
+    #     `mark-prompt`. REQ-PD-028 DELETED that guard; the snippet now
+    #     injects unconditionally, and the paragraph describing it survived
+    #     the code it described. Re-measured 2026-09-20 on fish 4.8.1 —
+    #     the very version the `fish-req-ts-008` job below pins — and on
+    #     4.9.3, both upstream static builds driven through this very row,
+    #     and the two agree: the snippet injects,
+    #     and BOTH emitters mark every command — `C;cmdline_url=…` beside
+    #     `C;holdfast=1`, `D;42` beside `D;42;holdfast=1`. The row fails on
+    #     the INTERLEAVING; the expectation it checks is Holdfast's stream
+    #     alone. §11.4 writes that scenario out in full — three entries
+    #     with both halves each, `osc133_source`, and a fish >= 4.0 named
+    #     as its acceptance case — so what is missing is a ROW that models
+    #     it, not the scenario. ("unwritten" stood here until 2026-09-20
+    #     and was wrong about the spec.)
+    #     Also still true: fish >= 4.1 queries the terminal at startup and
+    #     waits 10 s for a Primary Device Attribute reply that a bare PTY
+    #     never sends — which is what the `fish-req-ts-008` job measures.
     #
     # THE SHORTFALL IS TWO ROWS IN TWO BINARIES. This comment said "exactly
     # one row of the 21 in tests/detection.rs" until 2026-08-19 and that was
     # measurably false: REQ-TS-008's row in
     # crates/holdfast-core/tests/screen.rs skips on a fish-less host too,
     # for its own reason, and NEITHER measurement above touches it. It never
-    # runs `(exit 42)` — that bash-ism is in detection.rs's shared assertion
-    # helper — and it sets `shell_integration: None` and injects no snippet,
+    # ran `(exit 42)` — that bash-ism WAS in detection.rs's shared
+    # assertion helper and is gone as of GH #217 / #98, which is why this
+    # sentence is past tense — and it sets `shell_integration: None` and
+    # injects no snippet,
     # so the marker collision cannot reach it either. The census could not
     # see the second row because all three skip lines began with the same
     # words and one match satisfied the one agreed prefix.
@@ -1094,21 +1115,39 @@ jobs:
     # on any skip other than those two, on either of them ceasing to happen,
     # and on either ROW going missing from the log.
     #
-    # Setting the variable today would paint this job red for a defect that
-    # is not the pipeline's; installing fish would do the same; dropping
-    # fish from the picture would restore the silent green that this whole
-    # change exists to end. The variable would ALSO not reach REQ-TS-008 if
-    # it were set — it is read only by tests/detection.rs's `have()`, and
-    # tests/screen.rs is a separate binary — which is review finding I7(a)
-    # and a change to that test file rather than to this one.
+    # Setting the variable today would STILL paint this job red, but not
+    # for the reason written here before 2026-09-20. Installing noble's
+    # fish 3.7.0 no longer does: detection.rs's row passes on it. What the
+    # variable would break is tests/screen.rs's REQ-TS-008 row, whose
+    # second skip arm ("a fish too old to measure") is exactly where 3.7.0
+    # lands and which asserts the variable is unset on that arm too. That
+    # row is ALSO the reason a newer fish cannot simply be installed here
+    # instead: the only fish measured to SATISFY REQ-TS-008 is the 4.8.x
+    # from ppa:fish-shell/release-4 — "any fish >= 4.1" is not the
+    # requirement and 4.2.1 fails that row twice over, as the
+    # `fish-req-ts-008` job below records — and that fish takes
+    # detection.rs's row red on the collision. Dropping fish entirely would
+    # restore the silent green that this whole change exists to end. The
+    # variable reaching REQ-TS-008 at all was review finding I7(a) and was
+    # fixed in tests/screen.rs, which now honours it directly rather than
+    # through tests/detection.rs's `have()`.
     #
     # WHAT THAT ROW NEEDED WAS ITS OWN FISH, and it now has one: the
     # `fish-req-ts-008` job below installs fish 4.8.1 and measures it.
     #
-    # WHEN DETECTION.RS'S FISH ROW CAN PASS, five things move in ONE change:
-    # `fish` into the apt line here and in the probe job, the variable set
-    # here and in nightly.yml, and BOTH records deleted from
-    # ci-skip-census.sh.
+    # DETECTION.RS'S FISH ROW CAN NOW PASS (GH #217 / #98), so the "five
+    # things move in ONE change" that stood here is down to THREE, and the
+    # other two are separately blocked rather than merely pending:
+    #   move now, together — `fish` into the apt line here and in the probe
+    #     job, and detection.rs's record deleted from ci-skip-census.sh.
+    #     Deliberately NOT done in the change that fixed the row, because
+    #     nothing outside CI can execute this job: the row was proven on
+    #     noble's own 3.7.0 on a developer box, and turning the runner
+    #     green on it is a separate, observable step.
+    #   blocked — HOLDFAST_REQUIRE_ALL_SHELLS=1 here and in nightly.yml,
+    #     and screen.rs's record. Both need the PPA's 4.8.x in THIS job —
+    #     not merely "a fish >= 4.1" — and that fish takes detection.rs's
+    #     row red on the collision.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

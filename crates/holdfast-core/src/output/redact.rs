@@ -96,6 +96,17 @@ pub fn find_spans(rules: &RuleSet, window: &[u8], window_start: u64) -> Vec<Span
             // so the agent can tell *what* was withheld.
             for caps in rule.regex.captures_iter(window) {
                 if let Some(m) = caps.name("value") {
+                    // GH #202: the rule may refuse what it captured. A
+                    // label-keyed rule finds its label and its separator
+                    // on ordinary prose and on source as readily as on
+                    // an assignment, and `value_must_not_match` is where
+                    // it gets to say the bytes after the separator are
+                    // not a credential. `value_admissible` is `true` for
+                    // every rule that declares no refusal, which is
+                    // forty-nine of the fifty-one shipped.
+                    if !rule.value_admissible(m.as_bytes()) {
+                        continue;
+                    }
                     spans.push(Span {
                         start: window_start + m.start() as u64,
                         end: window_start + m.end() as u64,
