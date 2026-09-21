@@ -688,6 +688,10 @@ is cut, named and published is in
   dropping the entry after a block, or leaking the previous release into
   this one. The scanner is marker-aware, shared by every reader of the file,
   and a changelog that ends inside a fence or a comment is refused outright.
+  Its arms are **ordered** as well: a ``` inside an HTML comment is not a
+  fence opener, and testing the fence arm first made one — which failed
+  closed, but told a release engineer to close a fence that had never
+  opened.
   The link-definition rule is one spelling rather than an awk pattern and a
   `grep` pattern that kept diverging, and it is fence-aware, so a definition
   shown as an *example* inside a code block is no longer collected as real.
