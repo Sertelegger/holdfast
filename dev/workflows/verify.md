@@ -15,7 +15,7 @@ at the first red tells you one thing when it could have told you five.
    `./scripts/verify-release-archive.sh --self-test` (§13.3's safe-archive
    rules against 21 archives built to break them), and
    `./scripts/release-notes.sh --self-test` (the release body's
-   empty-section guard, against five sections that must be refused). **This
+   empty-section guard: twenty-six cases, ten of which must be refused). **This
    read "the three self-tests" until the fourth landed** — the same drift
    the sentence itself is a correction for, so check the `hygiene` job's
    steps rather than this count.

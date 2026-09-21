@@ -151,17 +151,25 @@ jobs:
       # had appended a newline and every link definition in the file, so it
       # had never fired and could not. The logic moved into
       # `scripts/release-notes.sh` with the check in front of the append, and
-      # this line is the half that stops it coming back: five of the fixtures
-      # are sections that must be REFUSED, and every one of them carries link
-      # definitions on purpose, so they are cases the old ordering accepted.
-      # Two mutations, both measured, because a bare count is ambiguous about
-      # which mutation produced it: restoring the literal pre-fix block --
-      # no heading check, no prose check, `-s` after the append -- fails 6 of
-      # the 12 cases; moving `has_prose` alone to after the append fails 4,
-      # the fifth reject case being the one whose missing heading returns
-      # before the append is reached at all. Nothing in
-      # `release-rehearsal.yml` covers the notes path, and it is not a
-      # required check either.
+      # this line is the half that stops it coming back. Twenty-six cases,
+      # ten of them sections that must be REFUSED; the eight written as
+      # `case_run` sections all carry link definitions on purpose, so they
+      # are cases the old ordering accepted. Three mutations, all measured,
+      # because a bare count says nothing about which mutation produced it:
+      #
+      #   * restore the literal pre-fix block (no heading check, no prose
+      #     check, `-s` after the append) ......................... 9 red
+      #   * move `has_prose` alone to after the append ............. 7 red
+      #   * delete the extraction and keep the append (`: > "$out"`) 4 red
+      #
+      # The third is the one that matters. It was GREEN until the accept
+      # branch started comparing against an independently recomputed
+      # extraction: the branch asserted only "not all whitespace" and
+      # "contains a `[#45]:` line", and the appended definitions satisfy both
+      # on their own. So the guard passed while the script composed the
+      # original defect -- 48 lines, zero prose, bare link definitions.
+      # Nothing in `release-rehearsal.yml` covers the notes path, and it is
+      # not a required check either.
       - run: ./scripts/release-notes.sh --self-test
 
   # `dev/workflows/verify.md` has listed `actionlint` under *"CI's own gate,

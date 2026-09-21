@@ -62,15 +62,20 @@ cargo build --workspace && ./scripts/mcp-smoke.sh
 ```
 
 CI runs all four on every push and pull request (see
-[README.md](./README.md#continuous-integration)), but **no check is required
-yet**, so a red job does not block a merge and someone has to notice. That is
-now a choice rather than a limit — required status checks need branch
-protection or a ruleset, both of which are available on a public repository
-under GitHub Free, and this one has been public since **2026-09-02** — the
-repository object's own `created_at`, since going public was done by deleting
-and recreating the repository. This read 2026-09-01, which is the `v0.0.7`
-tag's date and therefore predates the object that holds the tag. Until a
-check is actually marked required, running these locally is still the gate.
+[README.md](./README.md#continuous-integration)), and **twelve of its jobs are
+required status checks**: a red one blocks the merge, `strict` forces the
+branch up to date first, and `enforce_admins` means the owner has no bypass.
+This paragraph said "no check is required yet, so a red job does not block a
+merge" — and went on saying it through the pull request that corrected the
+identical sentence in `README.md`, which is how one repository came to state
+both answers at once.
+
+That became possible when the repository went public on **2026-09-02** —
+the repository object's own `created_at`, since going public was done by
+deleting and recreating the repository. This read 2026-09-01, which is the
+`v0.0.7` tag's date and therefore predates the object that holds the tag.
+Running the four locally is still faster than finding out from CI, but it is
+no longer the only gate.
 
 `cargo test --workspace` was 890 tests at the `v0.0.5` tag: 669 unit (666 in
 `holdfast-core`'s lib, 3 in `holdfast`'s bin), 23 in `tests/detection.rs`, 71 in
@@ -279,7 +284,11 @@ Cutting one is therefore:
    literal fails no build and no test** — the workspace still resolves it by
    path — and surfaces only as a *published* `holdfast` bound to an older
    `holdfast-core`, which is a wrong permanent artifact rather than a red
-   check. The two are declared six lines apart so that one edit sees both.
+   check. The two are **thirty-four lines apart** — `Cargo.toml:6` and
+   `:40` — and proximity was never the mechanism: `Cargo.toml`'s own comment
+   above the dependency says "twenty-odd lines apart" and records that an
+   earlier draft of it claimed six. This line claimed six too. Naming both
+   literals here is the mechanism.
 
    Two more are `plugin/version.txt` and
    `plugin/.claude-plugin/plugin.json`. The design spec names only
@@ -288,9 +297,11 @@ Cutting one is therefore:
    `cache/<marketplace>/<plugin>/<version>/` from `plugin.json`, so a release
    that bumps the other two ships a plugin that never updates itself.
    `scripts/plugin-manifest-check.py` fails if the three files disagree, and
-   the `plugin` CI job runs it — **but `plugin` is the one `ci.yml` job that
-   is not a required status check**, so that guard does not block a merge.
-   Run the script yourself rather than waiting to be told.
+   the `plugin` CI job runs it — **and as of 2026-09-20 `plugin` is a
+   required status check**, so a pull request that bumps two of the three
+   cannot merge. That is new: this step said the opposite for as long as it
+   existed, and told a release engineer to compensate by hand for a hole the
+   repository has since closed.
 
    **The last two are in `Cargo.lock`, and forgetting them breaks every
    build.** It records a version for each workspace member —
