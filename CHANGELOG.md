@@ -231,8 +231,12 @@ is cut, named and published is in
   screen** ([#235]). Attaching to a session idling at its prompt rendered the
   banner and nothing else until somebody pressed Enter, and `watch` rendered
   nothing at all. The screen is painted over the terminal with the cursor
-  where the child left it, then the live stream resumes where the picture
-  ends — or a few bytes before it, never after: the resume point is read
+  where the child left it and the join notice on its top row — not
+  inserted above the prompt, which over a painted screen pushed a prompt on
+  the last row off the bottom — and without touching the terminal's modes,
+  so a detach from `vim` does not leave the human inside the alternate
+  screen. Then the live stream resumes where the picture ends — or a few
+  bytes before it, never after: the resume point is read
   before the capture, so the error a busy session can produce is a few bytes
   drawn twice rather than a few bytes never drawn. `watch` into a file paints
   nothing, because a picture in a capture is bytes the session never printed,

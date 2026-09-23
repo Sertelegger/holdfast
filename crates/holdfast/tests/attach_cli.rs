@@ -1996,40 +1996,37 @@ async fn attach_says_it_attached_and_how_to_leave() {
         String::from_utf8_lossy(&seen)
     );
 
-    let pos = |needle: &[u8]| {
-        seen.windows(needle.len())
-            .position(|w| w == needle)
-            .unwrap_or(usize::MAX)
-    };
-
-    // **Ordering, because presence alone shipped a banner nobody could
-    // see.** The startup `Resize` raises `SIGWINCH`, the child repaints,
-    // and a prompt repaint erases from above the cursor to the end of the
-    // screen — so a banner written first lands in the erased region:
-    // present in the byte stream, absent from the terminal.
-    //
-    // Anchored on the child's prompt rather than on "the first escape
-    // sequence", which was the first version of this assertion and was
-    // useless the moment the banner itself gained colour: its own SGR
-    // codes then satisfied "an escape came first".
+    // **What the terminal shows, not what the byte stream contains,
+    // because presence alone shipped a banner nobody could see.** The
+    // first version printed it before the child's `SIGWINCH` repaint,
+    // which erased it; the second inserted it above the prompt, which —
+    // once the daemon sends the current screen (GH #235) — pushes a prompt
+    // on the last row off the bottom. It now rides the opening screen's
+    // top row, so the assertion is on the rendered screen after the
+    // repaint has had its chance: the notice on row 0, the prompt still
+    // on screen, and the cursor after the prompt, where the child's next
+    // write lands.
+    term.wait_for(b"bash-5.2$", 15);
+    std::thread::sleep(Duration::from_millis(500));
+    let mut screen = vt100::Parser::new(24, 80, 0);
+    screen.process(&term.snapshot());
+    let top = screen.screen().contents_between(0, 0, 0, 80);
     assert!(
-        pos(b"$") < pos(b"\x1b7"),
-        "the banner must follow the child's own output, not precede it:\n{}",
-        String::from_utf8_lossy(&seen)
+        top.contains("attached to") && top.contains("Ctrl-B d"),
+        "the notice is not on the top row once the child has repainted: {top:?}\n{}",
+        screen.screen().contents()
     );
-
-    // Cursor save/restore around it. `attach` is a pass-through and the
-    // child tracks its own cursor, so a banner that does not put it back
-    // leaves the child's next write starting mid-line.
+    let (row, col) = screen.screen().cursor_position();
+    let prompt = screen.screen().contents_between(row, 0, row, 80);
     assert!(
-        contains(&seen, b"\x1b7") && contains(&seen, b"\x1b8"),
-        "the banner must save and restore the cursor:\n{}",
-        String::from_utf8_lossy(&seen)
+        prompt.trim_end().ends_with("bash-5.2$"),
+        "the prompt is not on the cursor's row: {prompt:?}\n{}",
+        screen.screen().contents()
     );
-    assert!(
-        pos(b"\x1b7") < pos(b"attached to") && pos(b"attached to") < pos(b"\x1b8"),
-        "save must precede the text and restore must follow it:\n{}",
-        String::from_utf8_lossy(&seen)
+    assert_eq!(
+        col as usize,
+        prompt.trim_end().len() + 1,
+        "the cursor is not after the prompt, so the child's next write lands elsewhere"
     );
 
     term.type_keys(b"\x02d");
@@ -2879,17 +2876,46 @@ async fn a_stalled_attach_reattaches_on_enter() {
 async fn attach_to_an_idle_session_shows_its_prompt_at_once() {
     let d = TestDaemon::start("idleattach").await;
     let (s, pty) = d.session(None);
-    pty.queue_output(b"earlier output\r\nIDLE-PROMPT$ ");
+    // Enough output that the prompt sits at the bottom of the screen —
+    // the ordinary position for a shell that has done any work, and the
+    // one where a notice inserted above the prompt pushes it off.
+    let mut earlier = Vec::new();
+    for i in 0..60 {
+        earlier.extend_from_slice(format!("earlier output {i:02}\r\n").as_bytes());
+    }
+    earlier.extend_from_slice(b"IDLE-PROMPT$ ");
+    pty.queue_output(&earlier);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while s.buffer_head() == 0 && Instant::now() < deadline {
+    while s.buffer_head() < earlier.len() as u64 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 80, 24);
     term.wait_for(b"IDLE-PROMPT$", 15);
-    let seen = term.snapshot();
+    // Past the older notice's fallback timer, so a client that still
+    // inserted it above the prompt would have done so by now.
+    std::thread::sleep(Duration::from_millis(800));
+
+    let mut screen = vt100::Parser::new(24, 80, 0);
+    screen.process(&term.snapshot());
+    let (row, col) = screen.screen().cursor_position();
+    let prompt = screen.screen().contents_between(row, 0, row, 80);
+    assert_eq!(
+        prompt.trim_end(),
+        "IDLE-PROMPT$",
+        "the prompt is not on screen at the cursor — a notice pushed it off, or the \
+         picture was never painted:\n{}",
+        screen.screen().contents()
+    );
+    assert_eq!(col, 13, "the cursor is not after the prompt");
     assert!(
-        contains(&seen, b"earlier output"),
-        "the screen above the prompt is missing"
+        screen.screen().contents().contains("earlier output 59"),
+        "the screen above the prompt is missing:\n{}",
+        screen.screen().contents()
+    );
+    let top = screen.screen().contents_between(0, 0, 0, 80);
+    assert!(
+        top.contains("attached to"),
+        "the join notice is not on the top row: {top:?}"
     );
     term.type_keys(&[0x02, b'd']);
     assert_eq!(term.wait_exit(10), 0);

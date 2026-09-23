@@ -128,29 +128,29 @@ pub(crate) fn attach_banner(
         Some((cols, rows)) if cols > 0 && rows > 0 => Some(cols as usize),
         _ => None,
     };
+    let text = attach_notice(session, size);
+    let body = match cols {
+        Some(cols) => fit_to_width(&text, cols),
+        None => text,
+    };
+    Some(format!("\x1b7\r\x1b[L{NOTICE_COLOURS}{body}\x1b[0m\x1b8"))
+}
+
+/// The notice's colours, SGR 256: white on the bar's purple.
+#[cfg(unix)]
+const NOTICE_COLOURS: &str = "\x1b[48;5;61m\x1b[38;5;231m";
+
+/// What `holdfast attach` says once it has joined — the words, without
+/// the layout. [`attach_banner`] inserts them above the prompt when the
+/// daemon sends no opening screen; [`paint_snapshot`] puts them on the top
+/// row when it does (GH #235).
+#[cfg(unix)]
+fn attach_notice(session: &str, size: Option<(u16, u16)>) -> String {
     let geometry = match size {
         Some((cols, rows)) if cols > 0 && rows > 0 => format!(" ({cols}x{rows})"),
         _ => String::new(),
     };
-    let text = format!(" holdfast: attached to {session}{geometry} — Ctrl-B d to detach ");
-    Some(banner_bar(&text, cols))
-}
-
-/// The bar both notices share: `text` inserted as a coloured line above
-/// the cursor's row, the cursor put back where it was.
-///
-/// `ESC 8` returns the cursor to the row the bar now occupies; what steps
-/// it back onto the line it came from is the caller's — `attach`'s
-/// trailing newline from `diag::emit` in raw mode, `watch`'s explicit
-/// `ESC[B`. See [`attach_banner`]'s call site for why that step is
-/// load-bearing layout.
-#[cfg(unix)]
-fn banner_bar(text: &str, cols: Option<usize>) -> String {
-    let body = match cols {
-        Some(cols) => fit_to_width(text, cols),
-        None => text.to_string(),
-    };
-    format!("\x1b7\r\x1b[L\x1b[48;5;61m\x1b[38;5;231m{body}\x1b[0m\x1b8")
+    format!(" holdfast: attached to {session}{geometry} — Ctrl-B d to detach ")
 }
 
 /// `holdfast watch`'s notice that it connected, and how to leave (GH
@@ -160,12 +160,10 @@ fn banner_bar(text: &str, cols: Option<usize>) -> String {
 /// line, so there is no sign it connected."* Two shapes, because a watch
 /// has two kinds of output:
 ///
-/// * **stdout is a terminal**: the opening screen has just been painted
-///   over the whole of it, so the notice is [`banner_bar`] inserted above
-///   the cursor's row and written to *stdout* — the screen it decorates —
-///   with an explicit `ESC[B` back onto the child's line, because a
-///   cooked terminal turns `diag!`'s newline into a carriage return as
-///   well and would leave the cursor at column 0 of the child's prompt;
+/// * **stdout is a terminal**: the notice is the top row of the opening
+///   screen [`paint_snapshot`] draws, on *stdout* — the screen it
+///   decorates — and nowhere else, so it neither pushes the child's prompt
+///   off the bottom nor sits where the child's next line lands;
 /// * **stdout is not a terminal** (`holdfast watch s > log`): nothing is
 ///   painted and nothing may be written into the capture, so the notice
 ///   is a sentence on stderr, and only if stderr is a terminal a human is
@@ -184,14 +182,8 @@ pub(crate) fn watch_banner(
         _ => String::new(),
     };
     if stdout_is_terminal {
-        let cols = match size {
-            Some((cols, rows)) if cols > 0 && rows > 0 => Some(cols as usize),
-            _ => None,
-        };
-        let text = format!(" holdfast: watching {session}{geometry} — Ctrl-C to stop ");
         return Some(WatchBanner::OnScreen(format!(
-            "{}\x1b[B",
-            banner_bar(&text, cols)
+            " holdfast: watching {session}{geometry} — Ctrl-C to stop "
         )));
     }
     if stderr_is_terminal {
@@ -206,7 +198,7 @@ pub(crate) fn watch_banner(
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WatchBanner {
-    /// Bytes for stdout, which is the terminal the screen was painted on.
+    /// The words for the top row of the opening screen, on stdout.
     OnScreen(String),
     /// A line for stderr.
     Sentence(String),
@@ -240,6 +232,16 @@ pub(crate) enum WatchBanner {
 ///   its terminal — the web UI's — and a pass-through paints the picture
 ///   into whatever screen the human already has.
 ///
+/// * **A `notice` takes the top row, and the picture the rows below it.**
+///   That is where the client says it has joined and how to leave. The
+///   older notice was a line *inserted above the prompt*, which was sound
+///   while the terminal showed nothing of the session — and which, over a
+///   picture whose prompt sits on the last row, pushes the prompt off the
+///   bottom of the screen: the one line the human attached to see. The top
+///   row is out of the way of the child's next write and of a prompt
+///   repaint, and a full-screen program's first redraw simply paints over
+///   it, which a one-shot notice can afford.
+///
 /// Plain text: the tool's grid has no attributes, and the child's own
 /// repaints bring colour back as it redraws.
 #[cfg(unix)]
@@ -247,6 +249,7 @@ pub(crate) fn paint_snapshot(
     lines: &[String],
     cursor: (u16, u16),
     local: Option<(u16, u16)>,
+    notice: Option<&str>,
 ) -> Vec<u8> {
     let (cursor_row, cursor_col) = (cursor.0 as usize, cursor.1 as usize);
     let mut out = String::from("\x1b[0m\x1b[H\x1b[2J");
@@ -254,6 +257,17 @@ pub(crate) fn paint_snapshot(
         Some((cols, rows)) if cols > 0 && rows > 0 => (Some(cols as usize), Some(rows as usize)),
         _ => (None, None),
     };
+    // No room for a notice on a one-row terminal; the picture wins.
+    let notice = notice.filter(|_| height.is_none_or(|h| h >= 2));
+    let offset = usize::from(notice.is_some());
+    if let Some(text) = notice {
+        let body = match width {
+            Some(w) => fit_to_width(text, w),
+            None => text.to_string(),
+        };
+        out.push_str(&format!("\x1b[1;1H{NOTICE_COLOURS}{body}\x1b[0m"));
+    }
+    let height = height.map(|h| h - offset);
     if !lines.is_empty() {
         let last_text = lines
             .iter()
@@ -277,9 +291,9 @@ pub(crate) fn paint_snapshot(
                 Some(w) => clip_to_width(line, w),
                 None => line.clone(),
             };
-            out.push_str(&format!("\x1b[{};1H{text}", i + 1));
+            out.push_str(&format!("\x1b[{};1H{text}", i + 1 + offset));
         }
-        let row = cursor_row.saturating_sub(top);
+        let row = cursor_row.saturating_sub(top) + offset;
         let col = match width {
             Some(w) => cursor_col.min(w.saturating_sub(1)),
             None => cursor_col,
@@ -2172,16 +2186,24 @@ async fn attach_connected(
                     // painted before the stream resumes where it ends.
                     // An idle session at its prompt used to render as an
                     // empty terminal until somebody pressed Enter.
+                    // The notice rides on the picture's top row rather
+                    // than being inserted above the prompt later, which
+                    // over a painted screen pushes the prompt off the
+                    // bottom — see `paint_snapshot`. Taken, so the older
+                    // path below never prints a second one.
                     ServerFrame::ScreenSnapshot {
                         lines,
                         cursor_row,
                         cursor_col,
                         ..
                     } => {
+                        let size = crate::attach_tty::window_size(tty).ok();
+                        let notice = banner.take().map(|_| attach_notice(session, size));
                         render(&paint_snapshot(
                             &lines,
                             (cursor_row, cursor_col),
-                            crate::attach_tty::window_size(tty).ok(),
+                            size,
+                            notice.as_deref(),
                         ));
                     }
                     ServerFrame::AwaitingSecret {
@@ -2655,20 +2677,18 @@ pub async fn watch(session: &str) -> ExitCode {
                         cursor_col,
                         ..
                     } => {
-                        if stdout_is_terminal {
-                            render(&paint_snapshot(
+                        let size = if stdout_is_terminal {
+                            local_size()
+                        } else {
+                            Some((cols, rows))
+                        };
+                        match watch_banner(&id, size, stdout_is_terminal, stderr_is_terminal) {
+                            Some(WatchBanner::OnScreen(notice)) => render(&paint_snapshot(
                                 &lines,
                                 (cursor_row, cursor_col),
-                                local_size(),
-                            ));
-                        }
-                        match watch_banner(
-                            &id,
-                            if stdout_is_terminal { local_size() } else { Some((cols, rows)) },
-                            stdout_is_terminal,
-                            stderr_is_terminal,
-                        ) {
-                            Some(WatchBanner::OnScreen(bar)) => render(bar.as_bytes()),
+                                size,
+                                Some(&notice),
+                            )),
                             Some(WatchBanner::Sentence(line)) => diag!("{line}"),
                             None => {}
                         }
@@ -3470,7 +3490,7 @@ mod tests {
         let mut p = vt100::Parser::new(24, 80, 0);
         p.process(b"the human's own shell history\r\nmore of it\r\n$ ");
         let lines = grid(&["build output", "user@box $ "], 24);
-        p.process(&paint_snapshot(&lines, (1, 11), Some((80, 24))));
+        p.process(&paint_snapshot(&lines, (1, 11), Some((80, 24)), None));
 
         assert_eq!(row(&p, 0).trim_end(), "build output");
         assert_eq!(row(&p, 1).trim_end(), "user@box $");
@@ -3506,7 +3526,7 @@ mod tests {
             .collect();
         rows[35] = format!("{}PROMPT$ ", "端".repeat(50));
         let mut p = vt100::Parser::new(24, 80, 0);
-        p.process(&paint_snapshot(&rows, (35, 108), Some((80, 24))));
+        p.process(&paint_snapshot(&rows, (35, 108), Some((80, 24)), None));
         let bottom = row(&p, 23);
         assert!(
             bottom.starts_with('端'),
@@ -3536,7 +3556,7 @@ mod tests {
     fn the_picture_changes_no_terminal_mode() {
         let lines = grid(&["vim"], 24);
         let mut p = vt100::Parser::new(24, 80, 0);
-        p.process(&paint_snapshot(&lines, (0, 0), Some((80, 24))));
+        p.process(&paint_snapshot(&lines, (0, 0), Some((80, 24)), None));
         assert!(
             !p.screen().alternate_screen(),
             "the join entered the alternate screen"
@@ -3545,23 +3565,55 @@ mod tests {
         assert_eq!(row(&p, 0).trim_end(), "vim");
     }
 
-    /// **`watch` on a terminal inserts its notice above the cursor's row
-    /// and leaves the cursor on the child's line** — in a *cooked*
-    /// terminal, where `diag!`'s newline would also return the carriage
-    /// and put the child's next write at column 0 of its own prompt.
+    /// **The join notice takes the top row, and the prompt stays on
+    /// screen** (GH #235) — the case that made the older notice wrong over
+    /// a painted screen: a session whose prompt is on its last row, joined
+    /// from a terminal of the same size. Inserted above the prompt, the
+    /// notice pushed the prompt off the bottom; on the top row it costs the
+    /// session's first row instead, which is the one furthest from where
+    /// the human is looking.
     #[test]
-    fn the_watch_notice_leaves_the_cursor_where_the_child_left_it() {
+    fn the_join_notice_takes_the_top_row_and_the_prompt_stays_on_screen() {
+        let mut lines: Vec<String> = (0..24).map(|i| format!("output {i:02}")).collect();
+        lines[23] = "user@box $ ".into();
         let mut p = vt100::Parser::new(24, 80, 0);
-        p.process(b"an earlier line\r\nPROMPT> ");
-        let (r, c) = p.screen().cursor_position();
-        let Some(WatchBanner::OnScreen(bar)) = watch_banner("sess", Some((80, 24)), true, true)
+        p.process(&paint_snapshot(
+            &lines,
+            (23, 11),
+            Some((80, 24)),
+            Some(" holdfast: attached to sess (80x24) — Ctrl-B d to detach "),
+        ));
+        assert!(row(&p, 0).contains("attached to sess"), "{:?}", row(&p, 0));
+        assert_eq!(
+            row(&p, 23).trim_end(),
+            "user@box $",
+            "the prompt was pushed off the screen by the notice"
+        );
+        assert_eq!(
+            row(&p, 1).trim_end(),
+            "output 01",
+            "the rows below the notice shifted"
+        );
+        assert_eq!(
+            p.screen().cursor_position(),
+            (23, 11),
+            "the child's next write must land after its prompt"
+        );
+
+        // And `watch`'s words ride the same row.
+        let Some(WatchBanner::OnScreen(notice)) = watch_banner("sess", Some((80, 24)), true, true)
         else {
             panic!("a terminal stdout gets an on-screen notice");
         };
-        p.process(bar.as_bytes());
-        assert_eq!(p.screen().cursor_position(), (r + 1, c));
-        assert!(row(&p, r).contains("watching sess"));
-        assert!(row(&p, r + 1).contains("PROMPT>"));
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(&paint_snapshot(
+            &lines,
+            (23, 11),
+            Some((80, 24)),
+            Some(&notice),
+        ));
+        assert!(row(&p, 0).contains("watching sess"), "{:?}", row(&p, 0));
+        assert_eq!(row(&p, 23).trim_end(), "user@box $");
     }
 
     /// Into a capture, the notice is a sentence on stderr — or nothing,
