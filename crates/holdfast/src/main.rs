@@ -479,15 +479,32 @@ fn parse(e: &Entry, args: &[String]) -> Result<Parsed, String> {
 /// without a daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Cmd {
-    Mcp { no_daemon: bool },
+    Mcp {
+        no_daemon: bool,
+    },
     DaemonRun,
     DaemonStart,
-    DaemonStop { force: bool },
-    DaemonStatus { json: bool },
-    List { json: bool },
-    Logs { session: String, tail: Option<usize>, raw: bool },
-    Attach { session: String, allow_echo: bool },
-    Watch { session: String },
+    DaemonStop {
+        force: bool,
+    },
+    DaemonStatus {
+        json: bool,
+    },
+    List {
+        json: bool,
+    },
+    Logs {
+        session: String,
+        tail: Option<usize>,
+        raw: bool,
+    },
+    Attach {
+        session: String,
+        allow_echo: bool,
+    },
+    Watch {
+        session: String,
+    },
     Version,
 }
 
@@ -655,10 +672,7 @@ fn unresolved(all: &[Entry], args: &[String]) -> ExitCode {
             &[first],
             &format!("`{first}` needs one of {}", verbs.join("|")),
         ),
-        Some(other) => usage_error_in(
-            &[first],
-            &format!("unknown `{first}` subcommand `{other}`"),
-        ),
+        Some(other) => usage_error_in(&[first], &format!("unknown `{first}` subcommand `{other}`")),
     }
 }
 
@@ -691,7 +705,12 @@ mod tests {
     #[test]
     fn the_banner_declares_the_subcommands_and_flags_the_binary_has() {
         // (path, switches, options, positionals)
-        type Row = (String, Vec<&'static str>, Vec<&'static str>, Vec<&'static str>);
+        type Row = (
+            String,
+            Vec<&'static str>,
+            Vec<&'static str>,
+            Vec<&'static str>,
+        );
         let got: Vec<Row> = entries()
             .into_iter()
             .map(|e| (e.path.join(" "), e.switches, e.options, e.positionals))
@@ -703,8 +722,18 @@ mod tests {
             ("daemon stop".into(), vec!["--force"], vec![], vec![]),
             ("daemon status".into(), vec!["--json"], vec![], vec![]),
             ("list".into(), vec!["--json"], vec![], vec![]),
-            ("logs".into(), vec!["--raw"], vec!["--tail"], vec!["<session>"]),
-            ("attach".into(), vec!["--allow-echo"], vec![], vec!["<session>"]),
+            (
+                "logs".into(),
+                vec!["--raw"],
+                vec!["--tail"],
+                vec!["<session>"],
+            ),
+            (
+                "attach".into(),
+                vec!["--allow-echo"],
+                vec![],
+                vec!["<session>"],
+            ),
             ("watch".into(), vec![], vec![], vec!["<session>"]),
             ("version".into(), vec![], vec![], vec![]),
         ];
@@ -791,7 +820,11 @@ mod tests {
 
     #[test]
     fn help_is_help_wherever_it_is_asked_for() {
-        for rest in [&["--help"][..], &["-h"][..], &["big", "--tial", "--help"][..]] {
+        for rest in [
+            &["--help"][..],
+            &["-h"][..],
+            &["big", "--tial", "--help"][..],
+        ] {
             assert!(
                 matches!(parse(&entry(&["logs"]), &argv(rest)), Ok(Parsed::Help)),
                 "{rest:?}"
@@ -812,7 +845,10 @@ mod tests {
     fn help_text_is_scoped_to_what_was_asked_about() {
         let daemon = help_text(&["daemon"]).expect("daemon is a group");
         for verb in ["run", "start", "stop", "status"] {
-            assert!(daemon.contains(&format!("holdfast daemon {verb}")), "{daemon}");
+            assert!(
+                daemon.contains(&format!("holdfast daemon {verb}")),
+                "{daemon}"
+            );
         }
         assert!(!daemon.contains("holdfast list"), "{daemon}");
 
@@ -827,6 +863,9 @@ mod tests {
         assert!(!logs.contains("holdfast attach"), "{logs}");
 
         assert!(help_text(&["nonsense"]).is_none());
-        assert!(help_text(&["pty-worker"]).is_none(), "hidden from the banner");
+        assert!(
+            help_text(&["pty-worker"]).is_none(),
+            "hidden from the banner"
+        );
     }
 }

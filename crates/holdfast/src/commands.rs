@@ -1204,10 +1204,9 @@ struct Page {
 #[cfg(unix)]
 impl Page {
     fn from_wire(data: Value) -> Result<Self, ExitCode> {
-        let (Some(end), Some(returned)) = (
-            data["cursor"].as_u64(),
-            data["bytes_returned"].as_u64(),
-        ) else {
+        let (Some(end), Some(returned)) =
+            (data["cursor"].as_u64(), data["bytes_returned"].as_u64())
+        else {
             diag!("holdfast logs: malformed response: no cursor or bytes_returned");
             return Err(ExitCode::from(EXIT_FAILED));
         };
@@ -3257,7 +3256,8 @@ mod tests {
                                 "handshake accepted",
                             )
                         } else {
-                            let params: Value = method::from_cbor(&req.params).unwrap_or(Value::Null);
+                            let params: Value =
+                                method::from_cbor(&req.params).unwrap_or(Value::Null);
                             match answer(&req.method, &params) {
                                 Some(data) => Response::ok(req.id, &data, "ok"),
                                 None => {
@@ -3266,7 +3266,10 @@ mod tests {
                                 }
                             }
                         };
-                        if frame::write_frame(&mut stream, &resp.unwrap()).await.is_err() {
+                        if frame::write_frame(&mut stream, &resp.unwrap())
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -3342,7 +3345,10 @@ mod tests {
             )
             .await
             .expect("the stop is bounded");
-            assert_eq!(code, 0, "force {force}: an answered stop whose daemon exits is success");
+            assert_eq!(
+                code, 0,
+                "force {force}: an answered stop whose daemon exits is success"
+            );
             assert!(
                 process_is_gone(pid),
                 "force {force}: `daemon stop` returned while the daemon's process \
@@ -3381,7 +3387,10 @@ mod tests {
         .await
         .expect("the wait for the exit is bounded");
         assert_eq!(code, EXIT_FAILED);
-        assert!(!process_is_gone(lingering.0.id()), "the control: it really was alive");
+        assert!(
+            !process_is_gone(lingering.0.id()),
+            "the control: it really was alive"
+        );
         daemon.abort();
     }
 
@@ -3405,7 +3414,10 @@ mod tests {
             while !process_is_gone(pid) && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(process_is_gone(pid), "an unreaped, killed child is a zombie and gone");
+            assert!(
+                process_is_gone(pid),
+                "an unreaped, killed child is a zombie and gone"
+            );
         }
         child.0.wait().unwrap();
         assert!(process_is_gone(pid), "a reaped child is gone");
@@ -3499,13 +3511,11 @@ mod tests {
         });
         let r = log_reader(&paths).await;
         let mut printed = String::new();
-        let seen = tokio::time::timeout(
-            Duration::from_secs(10),
-            drain(&r, |s| printed.push_str(s)),
-        )
-        .await
-        .expect("a drain chasing a moving head never returned")
-        .unwrap_or_else(|_| panic!("the drain failed"));
+        let seen =
+            tokio::time::timeout(Duration::from_secs(10), drain(&r, |s| printed.push_str(s)))
+                .await
+                .expect("a drain chasing a moving head never returned")
+                .unwrap_or_else(|_| panic!("the drain failed"));
         assert_eq!(printed, "[1000][2000][3000][4000]");
         // From the ring's tail, not from 0 — and what is below it is said
         // to be gone rather than asked for.
@@ -3609,8 +3619,18 @@ mod tests {
     #[test]
     fn the_tail_fallback_counts_lines_the_way_the_daemon_does() {
         let texts = [
-            "", "\n", "\n\n", "a", "a\n", "a\nb", "a\nb\n", "\na\nb\n", "a\n\n\nb\n",
-            "a\nb\nc\n\n", "é\nü\n", "x\r\ny\r\n",
+            "",
+            "\n",
+            "\n\n",
+            "a",
+            "a\n",
+            "a\nb",
+            "a\nb\n",
+            "\na\nb\n",
+            "a\n\n\nb\n",
+            "a\nb\nc\n\n",
+            "é\nü\n",
+            "x\r\ny\r\n",
         ];
         for text in texts {
             let mut buf = holdfast_core::buffer::OutputBuffer::new(1024);

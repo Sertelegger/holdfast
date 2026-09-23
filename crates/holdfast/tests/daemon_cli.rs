@@ -2227,7 +2227,10 @@ fn a_closed_stdout_ends_the_cli_as_it_ends_cat_rather_than_panicking() {
         json!({ "session": session_id, "data": "echo PIPE''_MARK" }),
     );
     let seen = shim.read_until(&session_id, "PIPE_MARK");
-    assert!(seen.contains("PIPE_MARK"), "the session never printed: {seen:?}");
+    assert!(
+        seen.contains("PIPE_MARK"),
+        "the session never printed: {seen:?}"
+    );
 
     for args in [
         &["version"][..],
@@ -2422,7 +2425,10 @@ fn holdfast_logs_prints_everything_the_buffer_holds_not_its_first_page() {
         "the fixture has to be longer than one page for this to test anything: {} bytes",
         out.len()
     );
-    assert!(out.contains("LONG_DONE"), "the end of the session is missing");
+    assert!(
+        out.contains("LONG_DONE"),
+        "the end of the session is missing"
+    );
     assert_eq!(
         numbered_lines(&out),
         (1..=LAST).collect::<Vec<_>>(),
@@ -2452,7 +2458,11 @@ fn logs_tail_longer_than_a_page_has_every_line_it_was_asked_for() {
         "{N} lines have to be longer than one page for this to test the fallback: {} bytes",
         out.len()
     );
-    assert_eq!(out.lines().count(), N, "`--tail {N}` did not print {N} lines");
+    assert_eq!(
+        out.lines().count(),
+        N,
+        "`--tail {N}` did not print {N} lines"
+    );
     let numbers = numbered_lines(&out);
     let first = *numbers.first().expect("some numbered lines");
     // Consecutive to the end: no page seam lost or repeated, and the first
@@ -2476,7 +2486,10 @@ fn help_and_version_flags_answer_on_stdout() {
     for args in [&["--help"][..], &["-h"][..], &["help"][..]] {
         let (code, out, err) = env.run(args);
         assert_eq!(code, 0, "{args:?}: {err}");
-        assert!(out.contains("USAGE:") && out.contains("holdfast mcp"), "{args:?}: {out}");
+        assert!(
+            out.contains("USAGE:") && out.contains("holdfast mcp"),
+            "{args:?}: {out}"
+        );
         assert!(err.is_empty(), "{args:?} wrote to stderr: {err}");
     }
     for args in [&["--version"][..], &["-V"][..]] {
@@ -2486,11 +2499,18 @@ fn help_and_version_flags_answer_on_stdout() {
     }
 
     // One subcommand's help is that subcommand's, however it is asked.
-    for args in [&["logs", "--help"][..], &["logs", "-h"][..], &["help", "logs"][..]] {
+    for args in [
+        &["logs", "--help"][..],
+        &["logs", "-h"][..],
+        &["help", "logs"][..],
+    ] {
         let (code, out, err) = env.run(args);
         assert_eq!(code, 0, "{args:?}: {err}");
         assert!(out.contains("holdfast logs <session>"), "{args:?}: {out}");
-        assert!(!out.contains("holdfast list"), "{args:?} printed more than logs: {out}");
+        assert!(
+            !out.contains("holdfast list"),
+            "{args:?} printed more than logs: {out}"
+        );
     }
     let (code, out, _) = env.run(&["daemon", "--help"]);
     assert_eq!(code, 0);
@@ -2581,7 +2601,10 @@ fn an_unknown_flag_is_a_usage_error_and_changes_nothing() {
     let (code, out, err) = env.run(&["daemon", "stop", "--forse"]);
     assert_eq!(code, 64, "stdout {out} stderr {err}");
     assert!(err.contains("--forse"), "{err}");
-    assert!(alive(pid), "a mistyped `daemon stop` flag stopped the daemon anyway");
+    assert!(
+        alive(pid),
+        "a mistyped `daemon stop` flag stopped the daemon anyway"
+    );
     let (code, out, _) = env.run(&["daemon", "status", "--json"]);
     assert_eq!(code, 0, "the daemon stopped answering: {out}");
 }
@@ -2658,7 +2681,10 @@ fn daemon_stop_returns_once_the_daemon_is_gone_and_its_directory_stays_gone() {
         json!({ "session": session_id, "data": "echo READY''_MARK" }),
     );
     let seen = shim.read_until(&session_id, "READY_MARK");
-    assert!(seen.contains("READY_MARK"), "the shell never started: {seen:?}");
+    assert!(
+        seen.contains("READY_MARK"),
+        "the shell never started: {seen:?}"
+    );
     let pid = env.daemon_pid().expect("pid file");
     shim.kill();
 
@@ -2747,7 +2773,10 @@ fn logs_of_a_session_longer_than_its_buffer_says_the_front_is_gone() {
         err.contains("have left its buffer"),
         "the ring dropped the session's front and nothing said so: {err}"
     );
-    assert!(out.contains("WRAP_DONE"), "the end of the session is missing");
+    assert!(
+        out.contains("WRAP_DONE"),
+        "the end of the session is missing"
+    );
     let numbers = numbered_lines(&out);
     // The ring's oldest byte can fall mid-line, so the first number may be
     // a fragment; everything after it is whole and consecutive.
