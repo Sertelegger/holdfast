@@ -320,11 +320,10 @@ hf_fetch() {
         # `openssl` is on $PATH (with one, it runs `openssl s_client
         # -verify_return_error`, which does check). TLS to GitHub is the
         # whole trust root here -- the manifest that vouches for the archive
-        # arrives over the same connection -- so whatever it fetched is
-        # discarded, success or not.
+        # arrives over the same connection -- so it stops here, success or
+        # not, and what it fetched goes with the temp directory it is in.
         case "$_wout" in
             *'certificate validation not implemented'*)
-                rm -f "$2"
                 # Short on purpose: with the build route it has to fit the
                 # 500 characters `claude mcp list` shows, as T15 checks.
                 hf_die "this wget says it does not verify TLS certificates, and TLS is all that vouches for the download -- install curl, or openssl for busybox, or $HF_BUILD_IT" ;;
