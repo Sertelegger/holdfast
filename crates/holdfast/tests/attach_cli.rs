@@ -3044,3 +3044,128 @@ async fn an_agents_secret_description_is_attributed_to_the_agent() {
     term.type_keys(&[0x02, b'd']);
     assert_eq!(term.wait_exit(10), 0);
 }
+
+/// The agent's request, as the daemon announces it — once for the tool
+/// call, and again when the child's echo drop finds it outstanding.
+fn agents_request(id: &str) -> Vec<u8> {
+    enc(&ServerFrame::AwaitingSecret {
+        request_id: id.into(),
+        prompt_text: "deploy key passphrase".into(),
+        raised_by: Some("tool_call".into()),
+    })
+}
+
+/// **The same request announced twice is one prompt, and what the human
+/// already typed survives the second announcement** (GH #236's review).
+///
+/// The order the dogfood repro did not try: the agent calls
+/// `request_secret_input` first, the human starts typing, and only then
+/// does the child reach `read -s`. The echo-drop edge finds the request
+/// outstanding and the daemon announces it again, with the same id — so
+/// `holdfast attach` drew the label a second time and **emptied the
+/// line**. Measured on a release build: `ab`, then the second frame, then
+/// `c` + Enter, and the child received `c` while the tool reported
+/// success.
+///
+/// The stub sends the second announcement **in answer to a resize**, so
+/// it arrives after the first keystrokes rather than racing them, and an
+/// `Output` behind it on the same socket says when the client has read
+/// it. Two assertions, and a client that ignored neither the label nor
+/// the line fails both: the label is drawn once, and the value submitted
+/// is everything typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_same_secret_request_announced_twice_keeps_what_was_typed() {
+    const SEEN_IT: &[u8] = b"SECOND-ANNOUNCEMENT-READ";
+    let mut again = agents_request("req_twice1");
+    again.extend(enc(&ServerFrame::Output {
+        session: "sess_twice".into(),
+        bytes: SEEN_IT.to_vec(),
+    }));
+    let stub = StubDaemon::start_reacting(
+        "secrettwice",
+        vec![attached_stub("sess_twice"), agents_request("req_twice1")],
+        |f| matches!(f, ClientFrame::Resize { cols: 101, .. }),
+        again,
+        Duration::from_secs(20),
+    )
+    .await;
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_twice"], 100, 30);
+    term.wait_for(SECRET_PROMPT_DRAWN, 15);
+    term.type_keys(b"ab");
+    // Only so the two keystrokes are read before the second announcement
+    // is asked for. A correct client submits `abc` whichever it reads
+    // first; this is what lets the row also catch a client that empties
+    // the line, rather than only one that draws the label twice.
+    std::thread::sleep(Duration::from_millis(500));
+    term.resize(101, 30);
+    let seen = term.wait_for(SEEN_IT, 15);
+    let labels = seen
+        .windows(SECRET_PROMPT_DRAWN.len())
+        .filter(|w| *w == SECRET_PROMPT_DRAWN)
+        .count();
+    assert_eq!(
+        labels,
+        1,
+        "one request was drawn as {labels} prompts:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    term.type_keys(b"c\r");
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter()
+            .any(|x| matches!(x, ClientFrame::SecretInput { .. }))
+    });
+    let submitted: Vec<&[u8]> = sent
+        .iter()
+        .filter_map(|f| match f {
+            ClientFrame::SecretInput {
+                request_id, bytes, ..
+            } if request_id == "req_twice1" => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        submitted,
+        vec![b"abc".as_slice()],
+        "the second announcement emptied the line: the child would have received the \
+         tail of what the human typed"
+    );
+    term.type_keys(&[0x02, b'd']);
+    assert_eq!(term.wait_exit(10), 0);
+}
+
+/// **`watch` reports a request once however many times it is announced,
+/// and a new request again** (GH #236's review). The second half is what
+/// keeps a watch that only ever reported the first request from passing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_reports_one_secret_request_once() {
+    const END: &[u8] = b"WATCH-READ-THEM-ALL";
+    let stub = StubDaemon::start(
+        "watchtwice",
+        vec![
+            attached_stub("sess_wtwice"),
+            agents_request("req_wtwice1"),
+            agents_request("req_wtwice1"),
+            enc(&ServerFrame::SecretRequestClosed {
+                request_id: "req_wtwice1".into(),
+                outcome: "fulfilled".into(),
+            }),
+            agents_request("req_wtwice2"),
+            enc(&ServerFrame::Output {
+                session: "sess_wtwice".into(),
+                bytes: END.to_vec(),
+            }),
+        ],
+        Duration::from_secs(15),
+    )
+    .await;
+    let term = Term::spawn(stub.paths.dir(), &["watch", "sess_wtwice"], 100, 30);
+    let seen = term.wait_for(END, 15);
+    let notice: &[u8] = b"only an attached client can answer it";
+    let reports = seen.windows(notice.len()).filter(|w| *w == notice).count();
+    assert_eq!(
+        reports,
+        2,
+        "two requests, one of them announced twice, were reported {reports} times:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+}
