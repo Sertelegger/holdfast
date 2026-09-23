@@ -5421,11 +5421,19 @@ mod tests {
             "a frame a redaction touches is kept whole, text and marker"
         );
 
-        // `PASSWORD:` then a frame of ` x` then the value. Uncollapsed, the
-        // value rule sees ` x` and nothing it can use; collapsed, the value
-        // follows the label directly.
+        // `PASSWORD=` then a frame of ` x` then the value, indented.
+        // Uncollapsed, the value rule sees ` x` and nothing it can use;
+        // collapsed, the value is on the line after the `=`, indented —
+        // the one line break a label-keyed rule still crosses (GH #245:
+        // how rustfmt and prettier wrap a long assignment).
+        //
+        // **Not `PASSWORD:`, which is what this arm used until GH #245.**
+        // A `:` no longer crosses a line at all, so `PASSWORD:\n<value>`
+        // is not a match collapsed or not (a documented limitation of the
+        // rule, pinned in `tests/redaction_prose.rs`), and the arm was
+        // asserting a join that could no longer form.
         let value = "hunter2hunter2hunter2";
-        let text = format!("PASSWORD:\n x\r\x1b[K{value}\n");
+        let text = format!("PASSWORD=\n x\r\x1b[K    {value}\n");
         let uncollapsed = p.process_at_width(
             &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
             &ReadOptions {
