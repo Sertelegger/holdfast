@@ -44,21 +44,13 @@ pub enum RuleError {
     /// rather than parsed.
     #[error("no built-in redaction rule is named `{name}`; the built-in set has {count}")]
     UnknownRule { name: String, count: usize },
-    /// GH #202: a rule declares `value_must_not_match` and has no `value`
-    /// capture group for it to judge.
-    ///
-    /// Silently ignoring it is the bad outcome, not the loud one. The
-    /// field's whole job is to make a rule match *less*; a rule that
-    /// declares one and has nowhere to apply it goes on matching
-    /// everything it used to while its own file records a narrowing that
-    /// never happens — the same shape GH #128 found in
-    /// `redaction_enabled`, and the reason `UnknownRule` above is an
-    /// error too.
-    #[error(
-        "rule `{name}` declares `value_must_not_match` but its pattern has no `value` \
-         capture group, so there is no value to judge"
-    )]
-    ValueConstraintWithoutValue { name: String },
+    // GH #202 had a `ValueConstraintWithoutValue` variant here: declaring
+    // `value_must_not_match` on a rule with no `value` group was a load
+    // error, because such a rule had nowhere to apply it. GH #245 gave it
+    // somewhere — a rule with no `value` group redacts its whole match,
+    // so its whole match is what the refusal judges — and a refusal with
+    // a subject is no longer a silent no-op, which was the only ground
+    // for the error. See `RuleSpec::value_must_not_match`.
 }
 
 /// Top level of the rule file.
@@ -107,10 +99,15 @@ pub struct RuleSpec {
     /// leaks it; a mistake in this one admits a candidate that is then
     /// redacted. The field cannot express the first error.
     ///
-    /// Only meaningful on a rule with a `value` capture group:
-    /// [`RuleError::ValueConstraintWithoutValue`] refuses it otherwise,
-    /// because a rule without one redacts its whole match and has no
-    /// "value" to judge.
+    /// **What it judges is exactly what the rule would redact** (GH
+    /// #245): the `value` capture on a rule that has one, and the whole
+    /// match on a rule that does not. GH #202 made the second case a load
+    /// error on the ground that such a rule had "no value to judge"; but
+    /// a rule without a `value` group redacts its whole match, so the
+    /// whole match *is* its value, and the error was keeping a
+    /// shape-keyed rule from saying "this is the one shape of my match
+    /// that is not a credential" — which is what `openai-api-key` needs
+    /// for OpenSSH's `sk-ecdsa-sha2-nistp256-cert-v01@openssh.com`.
     #[serde(default)]
     pub value_must_not_match: Option<String>,
     #[serde(default)]
@@ -140,7 +137,8 @@ pub struct CompiledRule {
     /// only that group is redacted, leaving the context prefix visible.
     pub has_value_group: bool,
     /// [`RuleSpec::value_must_not_match`], compiled and anchored to both
-    /// ends of the value with `\A…\z` and forced into **byte** mode.
+    /// ends of the value — the `value` capture, or the whole match on a
+    /// rule without one — with `\A…\z` and forced into **byte** mode.
     ///
     /// Both of those are load-bearing. Anchoring is what makes the field
     /// a judgement about the whole value rather than about some substring
@@ -155,12 +153,15 @@ pub struct CompiledRule {
 }
 
 impl CompiledRule {
-    /// Whether a captured `value` is still a credential once the rule's
-    /// own refusal has looked at it (GH #202).
+    /// Whether the bytes this rule would redact — its `value` capture, or
+    /// its whole match when it has no `value` group — are still a
+    /// credential once the rule's own refusal has looked at them (GH #202,
+    /// GH #245).
     ///
-    /// `true` for every rule that declares no refusal, which is fifty of
-    /// the fifty-one shipped rules and every user rule that does not ask
-    /// for one.
+    /// `true` for every rule that declares no refusal, which is most of
+    /// the shipped set and every user rule that does not ask for one.
+    /// `only_the_rules_named_for_it_carry_a_value_refusal` pins which
+    /// shipped rules do.
     pub fn value_admissible(&self, value: &[u8]) -> bool {
         match &self.value_refusal {
             None => true,
@@ -183,6 +184,14 @@ impl CompiledRule {
     /// already has. Asking the refusal here keeps the candidate in
     /// flight until it is terminated, which is the direction §4.1 is
     /// allowed to err in.
+    ///
+    /// **A rule without a `value` group is asked the same question of
+    /// its whole match** (GH #245), because that is what `find_spans`
+    /// judges for it. `openai-api-key` refuses OpenSSH's
+    /// `sk-ecdsa-sha2-nistp256-cert-v01`; at the buffer head that name is
+    /// a whole match the redactor will decline, so it stays in flight
+    /// until the `@` that follows it kills the rule — rather than being
+    /// released on the ground that a marker covers it.
     pub fn anchored_whole_match(&self, hay: &[u8]) -> bool {
         match (&self.value_refusal, self.has_value_group) {
             (Some(_), true) => match self.anchored.captures(hay) {
@@ -190,14 +199,18 @@ impl CompiledRule {
                     Some(m) => self.value_admissible(m.as_bytes()),
                     // A `value` group that did not participate cannot be
                     // judged, so the match is not one this rule will act
-                    // on. Unreachable for the shipped set (both rules'
-                    // groups are unconditional) and deliberately the
-                    // hold-back answer rather than the release one.
+                    // on. Unreachable for the shipped set (every shipped
+                    // rule's group is unconditional) and deliberately
+                    // the hold-back answer rather than the release one.
                     None => false,
                 },
                 None => false,
             },
-            _ => self.anchored.is_match(hay),
+            (Some(_), false) => match self.anchored.find(hay) {
+                Some(m) => self.value_admissible(m.as_bytes()),
+                None => false,
+            },
+            (None, _) => self.anchored.is_match(hay),
         }
     }
 }
@@ -257,7 +270,7 @@ impl RuleSet {
     ///
     /// An unknown name is [`RuleError::UnknownRule`], never a silent
     /// no-op. Disabling every rule is legal and yields an empty set: the
-    /// operator enumerated all fifty-one by name, the §9.4 row records
+    /// operator enumerated every rule by name, the §9.4 row records
     /// exactly that, and the startup line says it — which is the whole
     /// difference between this and the `redaction_enabled = false` that
     /// GH #128 found recording the opposite of what it did.
@@ -318,11 +331,12 @@ impl RuleSet {
             // `(?s-u:…)` puts the author's own expression in byte mode,
             // where `.` is any byte and a value that is not valid UTF-8
             // cannot slip past a refusal by failing to decode.
+            //
+            // A rule without a `value` group is no longer refused one
+            // (GH #245): its whole match is its value, and
+            // `value_admissible` is what `find_spans` asks of it too.
             let value_refusal = match &spec.value_must_not_match {
                 None => None,
-                Some(_) if !has_value_group => {
-                    return Err(RuleError::ValueConstraintWithoutValue { name: spec.name });
-                }
                 Some(src) => Some(Regex::new(&format!(r"\A(?s-u:{src})\z")).map_err(|source| {
                     RuleError::Pattern {
                         name: spec.name.clone(),
@@ -415,8 +429,8 @@ fn is_case_stable_ascii_word(c: char) -> bool {
 /// `é` anywhere in a read window drops the whole `RegexSet` onto the
 /// slow engine. Measured on REQ-O-007's 41,472 B default read window,
 /// release, prefilter scan only: **0.082 ms pure ASCII against 37.4 ms
-/// with one em dash at the midpoint, 456x** — and the shipped file puts
-/// a `\b` in forty-five of its fifty-one rules, so the prefilter has
+/// with one em dash at the midpoint, 456x** — and the shipped file then
+/// put a `\b` in forty-five of its fifty-one rules, so the prefilter had
 /// been paying that on any output carrying a glyph.
 ///
 /// **Why *every* boundary has to go and not just the unprovable ones.**
@@ -485,8 +499,9 @@ fn is_case_stable_ascii_word(c: char) -> bool {
 /// immediately to the right and not followed by `?`, `*`, `+` or `{`, or
 /// immediately to the left. `\b(?:AKIA|ASIA)` and `\b[0-9]{8,10}` are
 /// both provably fine by hand and both get the deletion anyway, because
-/// a group or a class is past what this walk reads. **Fifteen of the
-/// shipped fifty-one take a deletion at their leading boundary** — eight
+/// a group or a class is past what this walk reads. **When the shipped
+/// set was fifty-one rules, fifteen took a deletion at their leading
+/// boundary** — eight
 /// on a case-unstable head letter, four on a group open, three on a
 /// class open. That costs prefilter selectivity, which costs time.
 ///
@@ -692,8 +707,8 @@ fn mentions_extended_flag(src: &[char]) -> bool {
 /// whole reason the number can be this large.** `regex` grows the cache
 /// as a search discovers states and gives up on the DFA — falling back
 /// to the one-state-at-a-time engine — when the cache would pass the
-/// limit. The shipped fifty-one-rule set saturates well below any of
-/// the candidates. Sweeping over six corpora (1 MiB each of this
+/// limit. The fifty-one-rule set this was measured on saturates well
+/// below any of the candidates. Sweeping over six corpora (1 MiB each of this
 /// repository's own source, its `grep -rn` output and its
 /// `CHANGELOG`+`README`+`ROADMAP`, REQ-O-007's 41,472 B default read
 /// window, 380 KB of `git log`, and 5.4 MB of concatenated `.rs`), one
@@ -869,7 +884,7 @@ mod tests {
     /// prefix under a `\b`, and a boundary whose only neighbour may
     /// match zero times.
     ///
-    /// The shipped fifty-one reach none of these, which is the whole
+    /// No shipped rule reaches any of these, which is the whole
     /// reason they are written out.
     const ADVERSARIAL_BOUNDARY_RULES: &str = r#"
         [[rule]]
@@ -1310,7 +1325,7 @@ mod tests {
         }
 
         // **`builtin_with_extra`, not `builtin`.** The adversarial
-        // constant's whole purpose is shapes the shipped fifty-one do
+        // constant's whole purpose is shapes the shipped rules do
         // not have, and until this line it only ever reached a test
         // asking whether the rewrite *builds*. Each of those rules now
         // carries a positive example that **is** its divergent haystack
@@ -1583,7 +1598,7 @@ mod tests {
     ///
     /// **The corpus is the rule file with its non-ASCII bytes removed,
     /// and that is not a convenience.** Every near-miss a real DFA cache
-    /// meets is in there by construction — fifty-one rules' worth of
+    /// meets is in there by construction — every shipped rule's worth of
     /// positive *and* negative examples, so the automaton is dragged
     /// deep into many rules at once and then told no — and it is
     /// `include_str!`-compiled, so the test needs no fixture and cannot
@@ -1628,7 +1643,7 @@ mod tests {
         // **And that equality cannot fail on this corpus, which is why
         // it is not the guard.** The window is the rule file, so it
         // carries every rule's own positive example and *both* sides
-        // always name all fifty-one. A `prefilter_pattern` returning
+        // always name every rule. A `prefilter_pattern` returning
         // `"(?s).*"` — a filter with no selectivity whatever — passes
         // the row above and then reports a triumphant ratio while
         // measuring nothing. The guard is selectivity on a haystack
@@ -1731,12 +1746,16 @@ mod tests {
 
     /// What one rule decides about one input, **spelled the way
     /// [`find_spans`] spells it** — pattern first, then the rule's own
-    /// `value_must_not_match` (GH #202).
+    /// `value_must_not_match` (GH #202), on the `value` capture or, for a
+    /// rule without one, on the whole match (GH #245).
     ///
     /// [`find_spans`]: super::super::redact::find_spans
     fn rule_redacts(rule: &CompiledRule, hay: &[u8]) -> bool {
         if !rule.has_value_group {
-            return rule.regex.is_match(hay);
+            return rule
+                .regex
+                .find_iter(hay)
+                .any(|m| rule.value_admissible(m.as_bytes()));
         }
         rule.regex
             .captures_iter(hay)
@@ -1756,14 +1775,20 @@ mod tests {
     /// grow broad enough to match an old negative while the refusal
     /// catches the fallout and the suite stays green.
     ///
-    /// So the split is a fixture too. Exactly five of the file's
-    /// negatives are held by a refusal; every other one is held by its
-    /// pattern, as it was before this field existed. A pattern that
-    /// starts matching a negative it used to reject moves a row into the
-    /// first list and reds here even though nothing leaks.
+    /// So the split is a fixture too. The negatives listed here are held
+    /// by a refusal; every other one is held by its pattern, as it was
+    /// before this field existed. A pattern that starts matching a
+    /// negative it used to reject moves a row into the first list and
+    /// reds here even though nothing leaks.
     #[test]
     fn the_refusal_holds_exactly_the_negatives_it_is_named_for() {
         const REFUSAL_HELD: &[(&str, &str)] = &[
+            // GH #245: the OpenSSH algorithm name, judged as a whole
+            // match because `openai-api-key` has no `value` group.
+            (
+                "openai-api-key",
+                "pubkeyacceptedalgorithms sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com",
+            ),
             (
                 "secret-key-assignment",
                 "pub session_key: Option<SessionKey>,",
@@ -1772,6 +1797,8 @@ mod tests {
                 "secret-key-assignment",
                 "master_key = config.master_key.clone()",
             ),
+            // GH #245: a `::` path, led by a `&`.
+            ("secret-key-assignment", "secret_key: &crate::SecretKey,"),
             (
                 "generic-secret-assignment",
                 "reassembled the token: `get_screen_state`",
@@ -1781,6 +1808,9 @@ mod tests {
                 "generic-secret-assignment",
                 "let cancellation_token = cancellation_token.clone();",
             ),
+            // GH #245: the two code shapes the refusal gained.
+            ("generic-secret-assignment", "pub paren_token: token::Paren,"),
+            ("generic-secret-assignment", "semi_token: node.semi_token,"),
         ];
         let set = RuleSet::builtin().unwrap();
         let mut held: Vec<(&str, &str)> = Vec::new();
@@ -1813,35 +1843,51 @@ mod tests {
         }
     }
 
-    /// A rule that declares `value_must_not_match` and has no `value`
-    /// group is refused at compile time (GH #202).
+    /// A rule with **no** `value` group judges its **whole match** with
+    /// `value_must_not_match` (GH #245).
     ///
-    /// **Not a no-op, for the same reason `UnknownRule` is not.** The
-    /// field exists to make a rule match *less*; a rule that declares
-    /// one with nowhere to apply it goes on matching everything it used
-    /// to while its own file records a narrowing that never happens.
+    /// GH #202 made this a load error, on the ground that such a rule had
+    /// "no value to judge". It has one: a rule without a `value` group
+    /// redacts its whole match, so its whole match is what a refusal
+    /// must look at — and `openai-api-key` needs exactly that to decline
+    /// OpenSSH's `sk-ecdsa-sha2-nistp256-cert-v01`.
+    ///
+    /// **Three arms, because each is a way to get it wrong.** The refusal
+    /// must reach `find_spans` (the pipeline), not only the rule helper;
+    /// it must judge the whole match and not a prefix of it; and a match
+    /// it does not refuse must still be redacted, or the arm above is
+    /// satisfied by a rule set that redacts nothing.
     #[test]
-    fn a_value_refusal_without_a_value_group_is_refused_at_compile_time() {
+    fn a_value_refusal_on_a_rule_without_a_value_group_judges_the_whole_match() {
         let src = r#"
 [[rule]]
 name = "no-value-group"
 kind = "test"
-pattern = '''\bxyzzy-[0-9]{8,}'''
-value_must_not_match = '''[a-z]+'''
+pattern = '''\bxyzzy-[0-9a-z]{8,}'''
+value_must_not_match = '''xyzzy-[a-z]+'''
 positive = ["xyzzy-01234567"]
-negative = ["xyzzy-1"]
+negative = ["xyzzy-abcdefgh"]
 "#;
-        let err = RuleSet::from_toml(src).expect_err("must not compile");
-        assert!(
-            matches!(&err, RuleError::ValueConstraintWithoutValue { name } if name == "no-value-group"),
-            "wrong error: {err}"
-        );
+        let set = RuleSet::from_toml(src).expect("a whole-match refusal compiles");
+        let rule = &set.rules[0];
+        assert!(!rule.has_value_group && rule.value_refusal.is_some());
 
-        // Control: the identical rule *with* a `value` group compiles,
-        // so the arm above is measuring the guard and not a typo.
-        let ok = src.replace(r"\bxyzzy-[0-9]{8,}", r"\bxyzzy-(?P<value>[0-9]{8,})");
-        let set = RuleSet::from_toml(&ok).expect("the value-group form must compile");
-        assert!(set.rules[0].value_refusal.is_some());
+        // 1. Refused through the pipeline, not only through the helper.
+        assert!(
+            super::super::redact::find_spans(&set, b"see xyzzy-abcdefgh here", 0).is_empty(),
+            "find_spans must consult the refusal on a rule with no `value` group"
+        );
+        // 2. Judged whole: a match the expression covers only a prefix of
+        //    is admitted, because `\A…\z` anchors both ends.
+        let spans = super::super::redact::find_spans(&set, b"see xyzzy-abcdefgh1 here", 0);
+        assert_eq!(
+            spans.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>(),
+            vec![(4, 19)],
+            "a whole match the refusal does not cover must be redacted, all of it"
+        );
+        // 3. The control: an ordinary match still redacts.
+        assert!(rule_redacts(rule, b"xyzzy-01234567"));
+        assert!(!rule_redacts(rule, b"xyzzy-abcdefgh"));
     }
 
     /// The refusal is anchored to **both** ends of the value and reads
@@ -1907,7 +1953,7 @@ negative = ["probe=abcd"]
     ///
     /// Both label-keyed rules have an unconditional `value` group, so
     /// the "group did not participate" arm is dead code against the
-    /// built-in fifty-one and a corpus over them cannot kill a mutation
+    /// built-in rules and a corpus over them cannot kill a mutation
     /// in it. A rule whose `value` sits inside an alternation reaches
     /// it, and that arm must answer **false** — *hold this candidate
     /// back* — because a match this rule will not act on is not a
@@ -1953,6 +1999,26 @@ negative = ["probe=abcd"]
         // 4. No match at all -> hold back.
         assert!(!rule.anchored_whole_match(b"nothing here"));
 
+        // 5. A rule with **no** `value` group judges its whole anchored
+        //    match (GH #245): refused -> hold back, admitted -> release.
+        let whole = RuleSet::from_toml(
+            &src.replace(r"(?:unset|(?P<value>[^\s]{4,}))", r"[^\s]{4,}")
+                .replace("[a-z]+", "probe=[a-z]+"),
+        )
+        .unwrap();
+        let whole = &whole.rules[0];
+        assert!(!whole.has_value_group && whole.value_refusal.is_some());
+        assert!(
+            whole.anchored_whole_match(b"probe=AB12"),
+            "an admissible whole match releases"
+        );
+        assert!(
+            !whole.anchored_whole_match(b"probe=abcd"),
+            "a refused whole match must not count as one: the redactor will \
+             decline it, so releasing it would hand out bytes still growing"
+        );
+        assert!(!whole.anchored_whole_match(b"nothing here"));
+
         // And a rule with no refusal is unaffected on every arm: it
         // answers exactly what `anchored.is_match` answers.
         let plain =
@@ -1973,11 +2039,11 @@ negative = ["probe=abcd"]
         }
     }
 
-    /// Fifty of the fifty-one shipped rules declare no refusal, and for
+    /// Every shipped rule not named here declares no refusal, and for
     /// those `value_admissible` is unconditionally `true` — so the
     /// feature cannot have changed what they redact.
     #[test]
-    fn only_the_two_label_keyed_rules_carry_a_value_refusal() {
+    fn only_the_rules_named_for_it_carry_a_value_refusal() {
         let set = RuleSet::builtin().unwrap();
         let with: Vec<&str> = set
             .rules
@@ -1987,7 +2053,11 @@ negative = ["probe=abcd"]
             .collect();
         assert_eq!(
             with,
-            vec!["secret-key-assignment", "generic-secret-assignment"],
+            vec![
+                "openai-api-key",
+                "secret-key-assignment",
+                "generic-secret-assignment"
+            ],
             "the set of rules carrying a value refusal moved"
         );
         for rule in set.rules.iter().filter(|r| r.value_refusal.is_none()) {

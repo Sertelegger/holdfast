@@ -219,6 +219,16 @@ is cut, named and published is in
 
 ### Changed
 
+- **`value_must_not_match` works on a rule with no `value` group, and judges
+  its whole match** ([#245]). #202 made that a load error, on the ground that
+  such a rule had no value to judge; but a rule without a `value` group
+  redacts its whole match, so its whole match is what a refusal must look at.
+  `openai-api-key` is the first shipped rule to use it. §4.1's partial-secret
+  scan asks the same question of the whole match, so a refused match still
+  arriving at the buffer head is held until the rule dies rather than released
+  on the ground that a marker covers it. `RuleError::ValueConstraintWithoutValue`
+  is gone with the error it named.
+
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of
@@ -647,6 +657,49 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **A label at the end of a line no longer swallows the next line's first
+  word** ([#245]). Every label-keyed rule separated its label from its value
+  with `\s*`, which crosses line breaks, so ssh's `password: ` followed by
+  `Permission denied, please try again.` came back `[REDACTED:generic]
+  denied`, and so did `Vault token:` over `Successfully authenticated!` and a
+  line of prose ending in `token:` over the `rg -n` hit printed under it. The
+  separator is now horizontal whitespace, with one exception: an `=` may be
+  followed by a line break into an **indented** line, which is how rustfmt and
+  prettier wrap `let token = "<long literal>";` — a shape a hard-coded secret
+  has, and one the old separator caught. A `:` never crosses: over the corpora
+  measured, every `:` that crossed into an indented line was a Python block
+  (`if not have_password:` and the statement under it) — seven of the CPython
+  standard library's 22 `generic` spans. `bearer-authorization`'s
+  `\s+` became `[ \t]+` for the same reason. What that gives up is under
+  Known limitations.
+
+- **`generic-secret-assignment` and `secret-key-assignment` refuse two more
+  code shapes, which were most of what #202 left** ([#245]). A digit-free
+  `::` path (`pub paren_token: token::Paren`, `token: mio::Token`,
+  `secret_key: &crate::SecretKey`) and a digit-free lower-case field access
+  carrying an `_` (`semi_token: node.semi_token`,
+  `self.add_password = self.passwd.add_password`) are no longer redacted.
+  Both branches are digit-free on purpose: allowing digits in the `::` branch
+  also refuses `uuid::Uuid::new_v4(` and a human's `Summer2024::Beach`, and the
+  digit is the one thing in a value that says a person chose it. The
+  field-access branch needs an `_` so that `correct.horse.battery.staple`
+  stays redacted, and lower case so that a Doppler token under a config named
+  `dev_personal` does. Measured over the same credential-free corpora at
+  REQ-O-007's default 41,472 B window: third-party Rust (`syn`, `tokio`,
+  `hyper`, `serde`, `regex`, `rmcp`, `reqwest`, `mio`; 12.2 MB) **342 → 96**
+  label-keyed spans; `rustls`/`jsonwebtoken`/`sqlx` **45 → 43**; every other
+  corpus unchanged or lower, and **every removed span is code** — the list is
+  in the pull request. None of the real-shaped credentials in
+  `tests/redaction_prose.rs` is dropped, and the seven rows this change adds
+  sit one on each side of every new branch.
+
+- **OpenSSH's `sk-ecdsa-sha2-nistp256-cert-v01@openssh.com` is no longer
+  reported as an OpenAI key** ([#245]). `ssh -G`, `ssh -vvv` and any
+  `sshd_config` listing algorithms carried three markers. `openai-api-key`
+  now refuses exactly that family — lower-case letters, digits and hyphens
+  after `sk-ecdsa-` or `sk-ssh-` — and a real key beside the name on the same
+  line is still redacted.
+
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -1518,6 +1571,18 @@ is cut, named and published is in
 
 ### Known limitations
 
+- **A value on the line after a `:` is not reached by a label-keyed rule**
+  ([#245]): YAML's plain scalar on the line after its key, and a credential a
+  prompt echoes on the line after it. The second is the same bytes as ssh's
+  retry prompt with a credential where `Permission` was; the first is legal
+  and rare beside `key: value`. The `=` spelling of the same value is still
+  redacted.
+
+- **A digit-free credential shaped like code is not redacted by the
+  label-keyed rules** ([#245]): letters joined by `::` (`Hello::World`), or
+  lower-case letters mixing `.` and `_` (`correct.horse_battery`). One digit
+  anywhere brings either back.
+
 - **The plugin's Windows entrypoint is unverified, and it is unverified in a
   way no amount of care on this side settles.** `.mcp.json` holds exactly one
   `command` string and the schema has no platform conditional, so §13.3's
@@ -2011,3 +2076,4 @@ residuals that are known and accepted.
 [#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
+[#245]: https://github.com/Sertelegger/holdfast/issues/245

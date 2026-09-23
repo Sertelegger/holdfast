@@ -15,15 +15,15 @@
 #   binary    optional; true when the value may contain whitespace or
 #             control bytes (PEM blocks). Defaults to false.
 #   value_must_not_match
-#             optional regex. When it matches the WHOLE `value` capture
-#             the candidate is refused: the rule found its label and its
-#             separator and then judged that what followed is not a
+#             optional regex. When it matches the WHOLE of what the rule
+#             would redact -- the `value` capture, or the whole match on a
+#             rule without one -- the candidate is refused: the rule found
+#             its shape and then judged that this instance is not a
 #             credential. The loader anchors it `\A...\z` and compiles it
-#             in byte mode, so write the bare expression. Requires a
-#             `value` group; declaring it without one is an error, not a
-#             no-op. This is gitleaks' own `allowlist.regexes` mechanism
-#             and its own polarity -- see `generic-secret-assignment`
-#             below for why the shipped expression is not gitleaks'.
+#             in byte mode, so write the bare expression. This is
+#             gitleaks' own `allowlist.regexes` mechanism and its own
+#             polarity -- see `generic-secret-assignment` below for why
+#             the shipped expression is not gitleaks'.
 #   positive  MUST match. At least one required.
 #   negative  MUST NOT match. At least one required.
 #
@@ -50,16 +50,32 @@ positive = [
 ]
 negative = ["sk-or-v1-0123"]
 
+# GH #245: OpenSSH names its FIDO key types `sk-<alg>@openssh.com`, and
+# `sk-ecdsa-sha2-nistp256-cert-v01` is long enough to satisfy the pattern
+# -- so `ssh -G`, `ssh -vvv` and any `sshd_config` that lists algorithms
+# read as an OpenAI key. This rule has no `value` group, so its refusal
+# judges the whole match, and it declines exactly that family: lower-case
+# letters, digits and hyphens after `sk-ecdsa-` or `sk-ssh-`. No issuer's
+# shape reaches it -- a legacy key is alphanumeric with no hyphen at all,
+# a project key opens `sk-proj-`, and a hex body cannot spell `ssh` or
+# `ecdsa`.
 [[rule]]
 name = "openai-api-key"
 kind = "openai"
 pattern = '''\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{24,}'''
 prefixes = ["sk-", "sk-proj-", "sk-svcacct-", "sk-admin-"]
+value_must_not_match = '''sk-(?:ecdsa|ssh)-[a-z0-9-]*'''
 positive = [
   "sk-AAAABBBBCCCCDDDDEEEEFFFFGGGG",
   "sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGG",
+  # A lower-case hex body -- the shape DeepSeek mints, which nothing but
+  # this rule catches unlabelled -- is outside the refused family.
+  "sk-0123456789abcdef0123456789abcdef",
 ]
-negative = ["sk-tiny"]
+negative = [
+  "sk-tiny",
+  "pubkeyacceptedalgorithms sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com",
+]
 
 [[rule]]
 name = "openai-session-key"
@@ -197,7 +213,7 @@ negative = ["AKIAIOSF"]
 [[rule]]
 name = "aws-secret-access-key"
 kind = "aws"
-pattern = '''(?i)aws_secret_access_key["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9/+=]{40})'''
+pattern = '''(?i)aws_secret_access_key["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[A-Za-z0-9/+=]{40})'''
 positive = ["AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY01"]
 negative = ["AWS_SECRET_ACCESS_KEY=short"]
 
@@ -224,7 +240,7 @@ negative = ["v1.0-0123"]
 [[rule]]
 name = "cloudflare-api-token"
 kind = "cloudflare"
-pattern = '''(?i)\bcloudflare[a-z0-9_.-]{0,24}(?:token|key|secret)\b["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9_.-]{20,})'''
+pattern = '''(?i)\bcloudflare[a-z0-9_.-]{0,24}(?:token|key|secret)\b["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[A-Za-z0-9_.-]{20,})'''
 positive = [
   "CLOUDFLARE_API_TOKEN=0123456789abcdefghij0123456789abcdefghij",
   "cloudflare_global_api_key: 'abcdef0123456789abcdef0123456789abcd'",
@@ -254,7 +270,7 @@ negative = ["rnd_0123"]
 [[rule]]
 name = "railway-token"
 kind = "railway"
-pattern = '''(?i)\brailway[a-z0-9_.-]{0,24}(?:token|key|secret)\b["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9_.-]{16,})'''
+pattern = '''(?i)\brailway[a-z0-9_.-]{0,24}(?:token|key|secret)\b["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[A-Za-z0-9_.-]{16,})'''
 positive = [
   "RAILWAY_TOKEN=0123abcd-4567-89ef-0123-456789abcdef",
   "railway_api_token: 'abcdef0123456789abcdef'",
@@ -287,7 +303,7 @@ negative = ["pscale_pw_0123"]
 [[rule]]
 name = "powersync-token"
 kind = "powersync"
-pattern = '''(?i)\bpowersync[a-z0-9_.-]{0,24}(?:token|key|secret|password)\b["'\s]*[:=]\s*["']?(?P<value>[^\s"';,)]{8,})'''
+pattern = '''(?i)\bpowersync[a-z0-9_.-]{0,24}(?:token|key|secret|password)\b["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[^\s"';,)]{8,})'''
 positive = [
   "POWERSYNC_TOKEN=eyJhbGciOiJSUzI1NiJ9.PLACEHOLDERPLACEHOLDER",
   "export POWERSYNC_DEV_TOKEN='abcdef0123456789'",
@@ -431,7 +447,7 @@ negative = ["hcaik_0123"]
 [[rule]]
 name = "datadog-api-key"
 kind = "datadog"
-pattern = '''(?i)dd_api_key["'\s]*[:=]\s*["']?(?P<value>[a-f0-9]{32})'''
+pattern = '''(?i)dd_api_key["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[a-f0-9]{32})'''
 positive = ["DD_API_KEY=0123456789abcdef0123456789abcdef"]
 negative = ["DD_API_KEY=nothex"]
 
@@ -457,12 +473,19 @@ positive = [
 ]
 negative = ["eyJhbGciOiJIUzI1NiJ9.short"]
 
+# `[ \t]+`, not `\s+` (GH #245): a line that ends in `Bearer` does not own
+# the next line's first word, and a path like
+# `crates/holdfast-core/src/output/redact.rs` is twenty bytes of this
+# value class.
 [[rule]]
 name = "bearer-authorization"
 kind = "bearer"
-pattern = '''(?i)bearer\s+(?P<value>[A-Za-z0-9._~+/-]{20,}=*)'''
+pattern = '''(?i)bearer[ \t]+(?P<value>[A-Za-z0-9._~+/-]{20,}=*)'''
 positive = ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz"]
-negative = ["Bearer short"]
+negative = [
+  "Bearer short",
+  "the header is Authorization: Bearer\ncrates/holdfast-core/src/output/redact.rs:207:",
+]
 
 # **Both rules below judge what follows the separator, in two steps, and
 # neither step costs a true positive over the corpus measured.** First
@@ -620,6 +643,69 @@ negative = ["Bearer short"]
 # and keeps refused candidates in flight. Releasing them would hand out
 # `API_KEY=abcdefgh` one byte before it becomes `abcdefgh9`.
 #
+# ------------------------------------ the two code shapes (GH #245)
+#
+# **GH #245 measured what those 331 were, and two shapes were most of
+# them.** Both are now refused, by the second and third branches of the
+# expression; the first branch is #202's, unchanged.
+#
+# * **A `::` path**: `pub paren_token: token::Paren`, `token: mio::Token`,
+#   `secret_key: &crate::SecretKey` -- letters and `_` in segments joined
+#   by `::`, optionally led by `&` or `*`. A path followed by a call or a
+#   generic already carries a bracket, which the first branch refuses.
+# * **A lower-case field access carrying an `_`**: `node.semi_token`,
+#   `self.passwd.add_password` -- only lower-case letters, `.` and `_`,
+#   with at least one of each separator. The `_` is what keeps it off the
+#   diceware passphrase: every generator that offers `.` and `_` as
+#   separators uses one of them per passphrase, and
+#   `correct.horse.battery.staple` and `correct_horse_battery_staple` are
+#   both still redacted. A dotted vendor token (`hvs.`, `dp.st.`) is not
+#   reached either: its body is base62, which carries upper-case letters,
+#   so `dp.st.dev_personal.<body>` is still redacted too.
+#
+# **Both are digit-free, like #202's branch, and that was a choice
+# between two measured options.** Allowing digits in the `::` branch
+# also refuses `uuid::Uuid::new_v4(` -- and a human's
+# `Summer2024::Beach`. The digit is the one thing in a value that says a
+# person chose it, so it keeps its veto on every branch.
+#
+# **What they still do not close.** A bare CamelCase type --
+# `secret: SecretBytes`, `progress_token: ProgressToken` -- is a
+# CamelCase passphrase by every test available to a regex, and stays
+# redacted. So does anything carrying a digit (`node.dot2_token`,
+# `uuid::Uuid::new_v4(`). The measured before-and-after is in the body of
+# the pull request that closed GH #245 rather than here, because a count
+# written into this file goes stale with the next rule and nothing reds
+# when it does.
+#
+# **What they give up**, asserted in `tests/redaction_prose.rs` as
+# documented limitations: a digit-free credential that is nothing but
+# letters joined by `::`, and a digit-free credential of lower-case
+# letters that mixes `.` and `_`.
+#
+# ---------------------------------- the separator (GH #245)
+#
+# **A label at the end of a line does not own the next line's first word
+# any more.** The separator after `[:=]` was `\s*`, which crosses line
+# breaks, so ssh's `password: ` followed by `Permission denied, please
+# try again.` came back `[REDACTED:generic] denied`, and a line of prose
+# ending in `token:` swallowed the path an `rg -n` printed under it.
+#
+# The separator is now horizontal whitespace, with **one** exception: an
+# `=` may be followed by a line break when the next line is indented.
+# That is how rustfmt and prettier wrap an assignment too long for one
+# line -- `let token =` and then the literal, indented -- and a secret
+# written into source is exactly that long. A `:` never crosses. Over the
+# corpora GH #245 measured, every `:` that crossed into an indented line
+# was a Python block (`if not have_password:` and the statement under
+# it), and the one `=` that crossed was a wrapped assignment.
+#
+# **What that gives up, asserted in `tests/redaction_prose.rs`:** YAML's
+# plain scalar on the line after its key (`password:` then an indented
+# value), and a credential a prompt echoes on the line after it. The
+# same separator is on every label-keyed rule in this file, and
+# `bearer-authorization`'s `\s+` became `[ \t]+` for the same reason.
+#
 # **What it deliberately does not do.** The label-only match itself is
 # unchanged where the value is credential-shaped: `password = not-set-yet`
 # is still `[REDACTED:generic]`, which is the behaviour the 0.0.7
@@ -645,7 +731,7 @@ negative = ["Bearer short"]
 [[rule]]
 name = "secret-key-assignment"
 kind = "generic"
-pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:secret|private|encryption|signing|master|session)[_-]key\b["'\s]*[:=]\s*["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:secret|private|encryption|signing|master|session)[_-]key\b["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
 prefixes = [
   "secret_key",
   "secret-key",
@@ -663,7 +749,11 @@ prefixes = [
 # See "the value-side half" above. Identical to the expression on
 # `generic-secret-assignment`, deliberately: these two are one rule split
 # by label, and a reader comparing them should find nothing to compare.
-value_must_not_match = '''[^0-9]*[(<>\[\]{}|\\`][^0-9]*'''
+value_must_not_match = '''(?x)
+    [^0-9]* [(<>\[\]{}|\\`] [^0-9]*
+  | [&*]? [A-Za-z_]+ (?: :: [A-Za-z_]+ )+
+  | &? [a-z_.]* (?: \. [a-z_.]* _ | _ [a-z_.]* \. ) [a-z_.]*
+'''
 positive = [
   "CLERK_SECRET_KEY=sk_test_0123456789abcdef01234567",
   "SECRET_KEY = 'django-insecure-0123456789abcdef'",
@@ -686,6 +776,8 @@ negative = [
   # pattern alone matches.
   "pub session_key: Option<SessionKey>,",
   "master_key = config.master_key.clone()",
+  # GH #245: a `::` path, here led by a `&`.
+  "secret_key: &crate::SecretKey,",
 ]
 
 # The catch-all. `token` is in the alternation deliberately: without it an
@@ -695,7 +787,7 @@ negative = [
 [[rule]]
 name = "generic-secret-assignment"
 kind = "generic"
-pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token)\b["'\s]*[:=]\s*["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token)\b["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
 prefixes = [
   "password",
   "passwd",
@@ -711,7 +803,11 @@ prefixes = [
   "auth-token",
 ]
 # See "the value-side half" above.
-value_must_not_match = '''[^0-9]*[(<>\[\]{}|\\`][^0-9]*'''
+value_must_not_match = '''(?x)
+    [^0-9]* [(<>\[\]{}|\\`] [^0-9]*
+  | [&*]? [A-Za-z_]+ (?: :: [A-Za-z_]+ )+
+  | &? [a-z_.]* (?: \. [a-z_.]* _ | _ [a-z_.]* \. ) [a-z_.]*
+'''
 positive = [
   "export DB_PASSWORD=hunter2hunter2",
   "api_key: 's3cr3t-value'",
@@ -723,6 +819,10 @@ positive = [
   # dot-prefixed vendor token with a digit-free body (HashiCorp Vault).
   "password=correcthorsebatterystaple",
   "access_token=hvs.CAESIJxKzWqTvNbMqLdFgHjKlPoIuYtReWqAsDfGhJkL",
+  # A formatter that wraps a long assignment puts the value on the next
+  # line, indented under it -- rustfmt and prettier both do -- and that
+  # is the one line break the separator crosses (GH #245).
+  "let token =\n    \"hunter2hunter2hunter2\";",
 ]
 negative = [
   "password: short",
@@ -734,6 +834,15 @@ negative = [
   "reassembled the token: `get_screen_state`",
   "export TOKEN={GITHUB}",
   "let cancellation_token = cancellation_token.clone();",
+  # GH #245: a label at the end of a line does not own the next line's
+  # first word when that line is not indented under it -- ssh's retry
+  # prompt, and an `rg -n` hit under a line of prose.
+  "dev@build-01's password: \r\nPermission denied, please try again.",
+  "the window reassembled a mid-token:\ncrates/holdfast-core/src/output/redact.rs:207:",
+  # GH #245: the two code shapes the value-side refusal gained -- a
+  # `::` path and a lower-case field access carrying an `_`.
+  "pub paren_token: token::Paren,",
+  "semi_token: node.semi_token,",
 ]
 
 # --------------------------------------------------------- the group-3 walk
