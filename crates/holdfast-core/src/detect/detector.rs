@@ -1543,6 +1543,14 @@ mod tests {
         // that emitted `C` is running the command itself, so both
         // executing rungs' premises hold and T1 answers deterministically.
         // A fix that simply stopped licensing at `C` would fail here.
+        //
+        // **Pinned as the classifier's answer, not as the right one for an
+        // agent** (review of GH #240): a `[Y/n]` asked by a builtin — `read
+        // -p` in a function or a sourced installer — reads `Executing` /
+        // `semantic` until a pattern-less wait's deadline (measured by the
+        // review: `timeout` after 4 s). The owner rule cannot tell it from a
+        // running command, because it is one. #240's fix is for a child's
+        // prompt; this case is left open, not closed by it.
         let s = d.snapshot_at(true, ld(true, true), BASH, None, now);
         assert_eq!(
             (s.interaction_mode, s.detection_tier),

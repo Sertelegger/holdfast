@@ -661,11 +661,19 @@ is cut, named and published is in
   a millisecond, 3 times in 10 here, because `less` had not read the `q`
   yet — and an agent that believes it presses `q` again, leaving a stray `q`
   at the shell. A `Fullscreen` or `AwaitingSecret` already showing at the
-  wait's first sample is now answered only once it has held for the settle
-  window, the evidence `AtPrompt` already needs; one the wait watched arrive
-  answers at once, as before, and a prompt that replaces a held one was
-  watched arriving too, so it answers without a second window. Re-measured:
-  0 stale answers in 10, the correct ones in about 50 ms.
+  wait's first sample is now not the answer until there is evidence it is
+  current: the child has printed something since the last input reached it
+  and the mode has held for the settle window, or nothing has come back and
+  it has held for two seconds (never less than the settle window, never past
+  the deadline). One the wait watched arrive answers at once, as before, and
+  so does a prompt that replaces a held one. A settle-window hold alone, the
+  first form of this fix, only moved the stale answer: a `less` still
+  starting took longer than 250 ms to read its `q` under load. Measured with
+  a raw-mode program that reads its key 600 ms late: that hold answered
+  `Fullscreen` 10 times in 10, this one `AtPrompt` 10 times in 10. Still
+  open: a program slower than the two-second hold and silent until then,
+  and output that is not an answer to the key — a draw still in flight, or
+  the line discipline echoing it while `ECHO` is on.
 
 - **`wait_for` and `wait_for_pattern` could not match coloured output with a
   pattern written from the text an agent reads** ([#238]). cargo prints its
@@ -675,8 +683,9 @@ is cut, named and published is in
   `output_since_start`. The scan window now carries an escape-free view
   beside the raw bytes, built by the read path's own stripper with a map
   back to raw offsets (one entry per escape, not per byte), and the pattern
-  is searched in both; the earlier match wins. A pattern that spells an escape still matches the raw bytes,
-  and `match.offset` is still a raw byte offset, as §5.2 requires.
+  is searched in both; the earlier match wins. A pattern that spells an
+  escape still matches the raw bytes, and `match.offset` is still a raw byte
+  offset, as §5.2 requires.
 
 - **A program stopped at a `[Y/n] ` confirmation could read `Executing` for
   the whole wait** ([#240]). The detector records who held the terminal when
@@ -693,7 +702,9 @@ is cut, named and published is in
   the terminal. Measured causally: a 30 ms delay in front of the reader's
   owner sample made the unfixed build answer `Executing` / `semantic` for
   the whole 4 s wait in 8 trials of 8, and the fixed build `AtPrompt` in 8
-  of 8.
+  of 8. Not covered: a `[Y/n]` asked by a shell builtin (`read -p` in a
+  function or a sourced installer) still reads `Executing`, because the
+  shell really is running it.
 
 - **A prompt that regenerates `PS1` at every prompt — starship, the owner's —
   emptied `get_command_history` and dropped the session's first command**
@@ -712,7 +723,15 @@ is cut, named and published is in
     when `PROMPT_COMMAND` is an array, so a regenerator at index ≥ 1 cannot
     run after it — and zsh's `precmd` does the same for a configuration that
     assigns `PS1` there (starship's zsh integration sets `PROMPT` once and
-    was measured unaffected);
+    was measured unaffected). The call is joined with a newline, so a
+    `PROMPT_COMMAND` ending in `;`, `; `, a newline or a `# comment` keeps
+    parsing — `; ` did not, and made bash print a syntax error at every
+    prompt and run none of the line. And it goes immediately *before*
+    bash-preexec's `__bp_interactive_mode`, which has to run last: after
+    it, bash-preexec's `DEBUG` trap took `__holdfast_p` for the user's
+    command and no `preexec` hook — atuin, iTerm2's integration, starship's
+    `took 2s` under bash-preexec — ran for any command. Both were found in
+    review, and measured against bash-preexec 0.5.0, 0.6.0 and master;
   - the injection-line rule applies only to a *foreign* `C`: Holdfast's own
     `C` cannot mark the line that installed it, because the snippet defines
     that emitter while the line runs;
