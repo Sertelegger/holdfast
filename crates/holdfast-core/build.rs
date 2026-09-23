@@ -69,36 +69,62 @@ fn main() {
     println!("cargo:rerun-if-env-changed={VAR}");
 
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
+    let found = derive(&manifest, std::env::var(VAR).ok().as_deref());
+    for warning in &found.warnings {
+        println!("cargo:warning={warning}");
+    }
+    for path in &found.watch {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    println!("cargo:rustc-env={VAR}={}", found.id);
+}
 
-    let id = from_env()
-        .or_else(|| from_vcs_info(&manifest))
+/// Everything the script emits, derived without emitting it — so
+/// `tests/build_script.rs` can drive the precedence below against layouts it
+/// draws, rather than only against whichever checkout happened to build.
+pub struct Derived {
+    pub id: String,
+    /// Paths whose change means the id has to be derived again.
+    pub watch: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
+/// Steps 1 to 4, in order, for a manifest directory and the value of
+/// [`VAR`] in the environment, if any.
+pub fn derive(manifest: &Path, env: Option<&str>) -> Derived {
+    let mut warnings = Vec::new();
+    let mut watch = Vec::new();
+    let id = from_env(env, &mut warnings)
+        .or_else(|| from_vcs_info(manifest))
         .or_else(|| {
             // Only a real checkout gets this far; a package stops at step 2
             // whether or not it found a sha there.
             if manifest.join(".cargo_vcs_info.json").exists() {
                 return None;
             }
-            let found = from_checkout(&manifest)?;
-            for path in &found.watch {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
+            let found = from_checkout(manifest)?;
+            watch = found.watch;
             found.id
         })
         .unwrap_or_else(|| "unknown".to_string());
-
-    println!("cargo:rustc-env={VAR}={id}");
+    Derived {
+        id,
+        watch,
+        warnings,
+    }
 }
 
 /// Step 1. Empty counts as unset, and anything that would not survive being a
 /// `cargo:` directive line is refused rather than emitted.
-fn from_env() -> Option<String> {
-    let value = std::env::var(VAR).ok()?;
-    let value = value.trim();
+fn from_env(value: Option<&str>, warnings: &mut Vec<String>) -> Option<String> {
+    let value = value?.trim();
     if value.is_empty() {
         return None;
     }
     if value.chars().any(|c| c.is_control()) {
-        println!("cargo:warning={VAR} contains a control character and was ignored");
+        warnings.push(format!(
+            "{VAR} contains a control character and was ignored"
+        ));
         return None;
     }
     Some(value.to_string())

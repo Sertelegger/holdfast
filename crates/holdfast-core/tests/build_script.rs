@@ -20,12 +20,17 @@
 #[path = "../build.rs"]
 mod build_script;
 
-use build_script::{from_checkout, short_sha};
+use build_script::{derive, from_checkout, short_sha};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SHA_A: &str = "0123456789abcdef0123456789abcdef01234567";
+const SHA_B: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+fn short(sha: &str) -> String {
+    short_sha(sha).expect("a full object name")
+}
 
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -202,4 +207,152 @@ fn the_watch_never_climbs_above_refs() {
             w.display()
         );
     }
+}
+
+/// **Precedence, step 1 over the rest: the environment, verbatim.**
+/// `release.yml` passes the full 40-hex `github.sha`, and the rehearsal
+/// checks for exactly that, so it is not shortened; empty is unset; and a
+/// value that would end the `rustc-env` directive line early — and make the
+/// rest a directive of its own — is refused with a warning, and the next
+/// step answers.
+#[test]
+fn the_environment_wins_verbatim_and_a_value_that_would_break_the_directive_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest = workspace(tmp.path());
+    write(&tmp.path().join(".git/HEAD"), &format!("{SHA_A}\n"));
+
+    for given in [SHA_B, "v0.0.8-rc1+local"] {
+        let d = derive(&manifest, Some(given));
+        assert_eq!(d.id, given);
+        assert!(d.watch.is_empty(), "{:?}", d.watch);
+        assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+    }
+    assert_eq!(derive(&manifest, Some("  ")).id, short(SHA_A));
+    let d = derive(&manifest, Some("abc\ncargo:rustc-cfg=evil"));
+    assert_eq!(d.id, short(SHA_A));
+    assert_eq!(d.warnings.len(), 1, "{:?}", d.warnings);
+}
+
+/// **Step 2 over step 3: a package reports the commit it was cut from.**
+/// `cargo package` writes `.cargo_vcs_info.json`, and a crate that has one
+/// is a package whatever sits around it — so the `.git` beside it is never
+/// consulted, even when the record carries no sha.
+#[test]
+fn a_package_reports_the_commit_it_was_cut_from_and_never_looks_for_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest = workspace(tmp.path());
+    write(&tmp.path().join(".git/HEAD"), &format!("{SHA_A}\n"));
+    write(
+        &manifest.join(".cargo_vcs_info.json"),
+        &format!(
+            "{{\n  \"git\": {{\n    \"sha1\": \"{SHA_B}\"\n  }},\n  \
+             \"path_in_vcs\": \"crates/holdfast-core\"\n}}"
+        ),
+    );
+    let d = derive(&manifest, None);
+    assert_eq!(
+        d.id,
+        short(SHA_B),
+        "the package's own record, not the checkout"
+    );
+    assert!(d.watch.is_empty(), "{:?}", d.watch);
+
+    write(
+        &manifest.join(".cargo_vcs_info.json"),
+        "{\"path_in_vcs\": \"\"}",
+    );
+    let d = derive(&manifest, None);
+    assert_eq!(d.id, "unknown");
+    assert!(d.watch.is_empty(), "{:?}", d.watch);
+}
+
+/// **The wrong-sha-with-confidence case.** A vendored or registry copy of
+/// this crate sits below somebody else's repository — `cargo vendor` puts it
+/// exactly two levels under the consuming project's `.git` — and that
+/// repository's commit says nothing about this build. The control is the
+/// same repository in this workspace's own layout, so the rows above it are
+/// not passing because the fixture's `.git` is unreadable.
+#[test]
+fn a_copy_that_is_not_this_workspace_never_borrows_a_containing_repositorys_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outer = tmp.path();
+    write(&outer.join(".git/HEAD"), &format!("{SHA_A}\n"));
+    for copy in [
+        outer.join("vendor").join("holdfast-core"),
+        outer
+            .join("index.crates.io-1949cf8c6b5b557f")
+            .join("holdfast-core-0.0.8"),
+    ] {
+        fs::create_dir_all(&copy).unwrap();
+        let d = derive(&copy, None);
+        assert_eq!(d.id, "unknown", "{} borrowed {SHA_A}", copy.display());
+        assert!(d.watch.is_empty(), "{:?}", d.watch);
+    }
+    assert_eq!(derive(&workspace(outer), None).id, short(SHA_A));
+}
+
+/// No `.git` at all — a tarball, or a copy with it stripped: `unknown`,
+/// nothing watched, and no failure, because a build that stopped over its
+/// own label would be the wrong trade.
+#[test]
+fn no_git_is_unknown_and_watches_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = derive(&workspace(tmp.path()), None);
+    assert_eq!(d.id, "unknown");
+    assert!(d.watch.is_empty(), "{:?}", d.watch);
+    assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+}
+
+/// **A linked worktree** — the layout this repository's own lanes build in.
+/// `.git` is a file naming `<main>/.git/worktrees/<name>`, which holds the
+/// worktree's own `HEAD` and a `commondir` pointing back at the refs every
+/// worktree shares; the pointer may be absolute or relative to the file.
+#[test]
+fn a_linked_worktree_reads_its_own_head_and_the_shared_refs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main_git = tmp.path().join("main").join(".git");
+    write(&main_git.join("HEAD"), "ref: refs/heads/main\n");
+    write(&main_git.join("refs/heads/main"), &format!("{SHA_A}\n"));
+    write(&main_git.join("refs/heads/lane"), &format!("{SHA_B}\n"));
+    let wt_gitdir = main_git.join("worktrees").join("lane");
+    write(&wt_gitdir.join("HEAD"), "ref: refs/heads/lane\n");
+    write(&wt_gitdir.join("commondir"), "../..\n");
+
+    for (label, pointer) in [
+        ("absolute", wt_gitdir.display().to_string()),
+        ("relative", "../main/.git/worktrees/lane".to_string()),
+    ] {
+        let root = tmp.path().join(format!("wt-{label}"));
+        let manifest = workspace(&root);
+        write(&root.join(".git"), &format!("gitdir: {pointer}\n"));
+
+        let d = derive(&manifest, None);
+        assert_eq!(
+            d.id,
+            short(SHA_B),
+            "{label}: the worktree's branch, not main's"
+        );
+        assert_all_exist(&d.watch);
+        let watched: Vec<PathBuf> = d.watch.iter().map(|p| p.canonicalize().unwrap()).collect();
+        for want in [wt_gitdir.join("HEAD"), main_git.join("refs/heads/lane")] {
+            assert!(
+                watched.contains(&want.canonicalize().unwrap()),
+                "{label}: {} is not watched: {:?}",
+                want.display(),
+                d.watch
+            );
+        }
+    }
+}
+
+/// A detached `HEAD` is the commit itself, and `HEAD` is what changes.
+#[test]
+fn a_detached_head_is_the_commit_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest = workspace(tmp.path());
+    let head = tmp.path().join(".git/HEAD");
+    write(&head, &format!("{SHA_B}\n"));
+    let d = derive(&manifest, None);
+    assert_eq!(d.id, short(SHA_B));
+    assert!(d.watch.contains(&head), "{:?}", d.watch);
 }
