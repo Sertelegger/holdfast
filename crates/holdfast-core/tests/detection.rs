@@ -3155,7 +3155,9 @@ async fn a_wait_for_written_from_the_text_matches_coloured_output() {
 /// The settle window is widened to 2 s so what is asserted is *which*
 /// sample was answered, not how promptly the reacting thread was
 /// scheduled: the stale answer came back in well under a millisecond, and
-/// the fix holds a carried-over mode for the settle window.
+/// a carried-over mode nothing has answered since the key is held for at
+/// least the settle window. The next row is the same claim
+/// at the default window, with a program slower than it.
 ///
 /// **And the hold must not become a tax on the right answer.** The shell
 /// integration here is live, so the prompt that follows `less` is
@@ -3238,5 +3240,226 @@ async fn a_pattern_less_wait_right_after_a_key_to_a_full_screen_program_waits_fo
         "the wait watched the program leave and still sat out the settle \
          window: {:?}",
         started.elapsed()
+    );
+}
+
+/// A mock session showing a `less`-shaped full-screen program at a
+/// shell-integrated prompt, with `settle_threshold_ms` as given.
+async fn mock_less(
+    settle_threshold_ms: u64,
+) -> (
+    HoldfastServer,
+    std::sync::Arc<holdfast_core::pty::MockPty>,
+    String,
+) {
+    use holdfast_core::detect::DetectionConfig;
+    use holdfast_core::pty::{MockPty, PtyBackend};
+    use holdfast_core::session::{new_session_id, Session, SessionConfig};
+    use std::sync::Arc;
+
+    let server = HoldfastServer::new();
+    let pty = Arc::new(MockPty::new());
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "bash".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn PtyBackend>,
+        SessionConfig {
+            detection: DetectionConfig {
+                settle_threshold_ms,
+                ..DetectionConfig::default()
+            },
+            ..SessionConfig::default()
+        },
+    );
+    let id = session.id.clone();
+    server.registry.insert(session).expect("registry insert");
+    pty.queue_output(
+        b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07less README.md\r\n\
+          \x1b]133;C;holdfast=1\x07\x1b[?1049h\x1b[H\x1b[2JREADME.md\r\n",
+    );
+    await_mode(&server, &id, "Fullscreen").await;
+    (server, pty, id)
+}
+
+/// One pattern-less `wait_for_pattern`, and how long it took.
+async fn pattern_less_wait(server: &HoldfastServer, id: &str) -> (Value, Duration) {
+    pattern_less_wait_for(server, id, 20).await
+}
+
+async fn pattern_less_wait_for(
+    server: &HoldfastServer,
+    id: &str,
+    timeout_secs: u64,
+) -> (Value, Duration) {
+    use holdfast_core::mcp::tools::WaitForPatternArgs;
+    let started = Instant::now();
+    let r = body(
+        &server
+            .wait_for_pattern(Parameters(WaitForPatternArgs {
+                session: id.into(),
+                pattern: None,
+                timeout_secs: Some(timeout_secs),
+                since_cursor: None,
+                max_bytes: None,
+            }))
+            .await
+            .expect("wait_for_pattern must not be a protocol error"),
+    );
+    (r, started.elapsed())
+}
+
+/// The review's reproduction of GH #248, and the reason the first fix
+/// was not one. That fix held a carried-over `Fullscreen` for the settle
+/// window and then answered it; under the load the dogfood pass ran at,
+/// a `less` still starting took longer than that to read its `q`, and the
+/// wait answered `Fullscreen` at ~260 ms, 7 times in 42 — the issue's
+/// exact signature, moved later.
+///
+/// Here the program reads the key 700 ms after it arrives, with the
+/// default settle window, so the settle window runs out while nothing has
+/// come back from the key. The pre-write mode is not the answer then; the
+/// prompt that follows the program's exit is.
+#[tokio::test]
+async fn a_pattern_less_wait_does_not_answer_from_before_a_key_a_slow_program_has_not_read() {
+    use holdfast_core::detect::DEFAULT_SETTLE_THRESHOLD_MS;
+    use std::sync::Arc;
+
+    let (server, pty, id) = mock_less(DEFAULT_SETTLE_THRESHOLD_MS).await;
+    let weak = Arc::downgrade(&pty);
+    pty.on_write(move || {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            if let Some(pty) = weak.upgrade() {
+                pty.queue_output(
+                    b"\x1b[?1049l\x1b]133;D;0;holdfast=1\x07\
+                      \x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07",
+                );
+            }
+        });
+    });
+    keypress(&server, &id, "q").await;
+    let (r, _) = pattern_less_wait(&server, &id).await;
+    assert_ne!(
+        r["data"]["interaction_mode"], "Fullscreen",
+        "answered from the sample before the key was read: {r}"
+    );
+    assert_eq!(r["status"], "ok", "{r}");
+    assert_eq!(r["data"]["interaction_mode"], "AtPrompt", "{r}");
+    assert_eq!(r["data"]["detection_tier"], "semantic", "{r}");
+}
+
+/// The price of the row above, bounded: a key that makes the program print
+/// nothing at all leaves the pre-write mode as the only answer there is,
+/// and it is given once `CARRIED_WITHOUT_OUTPUT_HOLD` has passed — not
+/// before it, and not at the deadline.
+///
+/// Two more arms bound that hold from either side. An operator who raised
+/// the settle window past it gets the settle window, since a key that
+/// produced nothing is weaker evidence than one that produced a redraw and
+/// must not be answered sooner. A deadline shorter than the hold gets an
+/// answer inside the deadline, as the settle window's clamp already does,
+/// rather than `reached: false` beside a mode that was showing throughout.
+#[tokio::test]
+async fn a_key_a_full_screen_program_answers_with_nothing_is_answered_after_the_longer_hold() {
+    use holdfast_core::detect::DEFAULT_SETTLE_THRESHOLD_MS;
+    use holdfast_core::session::wait::CARRIED_WITHOUT_OUTPUT_HOLD;
+
+    let raised = CARRIED_WITHOUT_OUTPUT_HOLD + Duration::from_secs(1);
+    for (arm, settle, timeout_secs, at_least) in [
+        (
+            "default",
+            DEFAULT_SETTLE_THRESHOLD_MS,
+            20,
+            CARRIED_WITHOUT_OUTPUT_HOLD,
+        ),
+        ("raised settle", raised.as_millis() as u64, 20, raised),
+        (
+            "short deadline",
+            DEFAULT_SETTLE_THRESHOLD_MS,
+            1,
+            Duration::ZERO,
+        ),
+    ] {
+        let (server, _pty, id) = mock_less(settle).await;
+        keypress(&server, &id, "x").await;
+        let (r, elapsed) = pattern_less_wait_for(&server, &id, timeout_secs).await;
+        assert_eq!(r["status"], "ok", "{arm}: {r}");
+        assert_eq!(r["data"]["reached"], true, "{arm}: {r}");
+        assert_eq!(r["data"]["interaction_mode"], "Fullscreen", "{arm}: {r}");
+        assert!(
+            elapsed >= at_least,
+            "{arm}: answered a mode nothing had confirmed since the key after \
+             {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "{arm}: a silent key ran the wait toward its deadline: {elapsed:?}"
+        );
+    }
+}
+
+/// And the common case keeps its latency: a key the program answers
+/// without leaving the screen (`less` scrolling) is evidence the mode is
+/// current, so the settle window — 50 ms here — is the whole cost, not the
+/// silent-key hold.
+#[tokio::test]
+async fn a_key_a_full_screen_program_redraws_for_is_answered_after_the_settle_window() {
+    use holdfast_core::session::wait::CARRIED_WITHOUT_OUTPUT_HOLD;
+    use std::sync::Arc;
+
+    let (server, pty, id) = mock_less(50).await;
+    let weak = Arc::downgrade(&pty);
+    pty.on_write(move || {
+        if let Some(pty) = weak.upgrade() {
+            pty.queue_output(b"\x1b[H\x1b[2Jline two\r\n");
+        }
+    });
+    keypress(&server, &id, "j").await;
+    let (r, elapsed) = pattern_less_wait(&server, &id).await;
+    assert_eq!(r["status"], "ok", "{r}");
+    assert_eq!(r["data"]["interaction_mode"], "Fullscreen", "{r}");
+    assert!(
+        elapsed < CARRIED_WITHOUT_OUTPUT_HOLD,
+        "the program redrew for the key and the wait still sat out the \
+         silent-key hold: {elapsed:?}"
+    );
+}
+
+/// A carried mode with **no write behind it** cannot be the mode from
+/// before one, so it needs only the settle window: a session nothing was
+/// ever typed at, sitting at an echo-off read that printed no prompt.
+/// Without that case the silent-key hold would apply to it, since nothing
+/// has come back since a write that never happened.
+#[tokio::test]
+async fn a_carried_mode_with_no_write_behind_it_is_answered_after_the_settle_window() {
+    use holdfast_core::pty::{MockPty, PtyBackend};
+    use holdfast_core::session::wait::CARRIED_WITHOUT_OUTPUT_HOLD;
+    use holdfast_core::session::{new_session_id, Session, SessionConfig};
+    use std::sync::Arc;
+
+    let server = HoldfastServer::new();
+    let pty = Arc::new(MockPty::new());
+    pty.set_echo(Some(false));
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "mock".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn PtyBackend>,
+        SessionConfig::default(),
+    );
+    let id = session.id.clone();
+    server.registry.insert(session).expect("registry insert");
+    await_mode(&server, &id, "AwaitingSecret").await;
+
+    let (r, elapsed) = pattern_less_wait(&server, &id).await;
+    assert_eq!(r["data"]["interaction_mode"], "AwaitingSecret", "{r}");
+    assert!(
+        elapsed < CARRIED_WITHOUT_OUTPUT_HOLD,
+        "no write was ever made, and the wait still held for a key's \
+         answer: {elapsed:?}"
     );
 }

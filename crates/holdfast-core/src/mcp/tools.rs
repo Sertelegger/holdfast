@@ -3695,9 +3695,11 @@ impl HoldfastServer {
     /// makes progress. `Exited` has no prompt to reach at all.
     ///
     /// **Except a `Fullscreen` or `AwaitingSecret` already showing at the
-    /// first sample**, which may predate the write this wait follows and
-    /// is answered only once it has held for the settle window (GH #248,
-    /// `wait::CarriedMode`).
+    /// first sample**, which may predate the write this wait follows. It is
+    /// answered once it has held for the settle window after the child has
+    /// written anything since that write, or for
+    /// `wait::CARRIED_WITHOUT_OUTPUT_HOLD` if it has written nothing (GH
+    /// #248, `wait::CarriedMode`).
     ///
     /// So the caller must read `interaction_mode`, not just `reached`.
     /// That is why §8.3's tier rule applies here: `with_detection`
@@ -3773,11 +3775,15 @@ impl HoldfastServer {
         // are unaffected and cover the common case; this window is only the
         // fallback for "no shell integration and never observed executing".
         let settle = Duration::from_millis(session.settle_threshold_ms()).min(timeout);
-        // GH #248. Held from the first sample, which is a hair after the
-        // call, so one poll of headroom keeps it inside the deadline for
-        // the reason `room` below spells out.
+        // GH #248. Both holds run from the first sample, which is a hair
+        // after the call, so one poll of headroom keeps them inside the
+        // deadline for the reason `room` below spells out.
         let mut carried = wait::CarriedMode::new();
-        let carried_hold = settle.min(timeout.saturating_sub(IDLE_WAIT_POLL));
+        let carried_cap = timeout.saturating_sub(IDLE_WAIT_POLL);
+        let carried_hold = settle.min(carried_cap);
+        let silent_hold = wait::CARRIED_WITHOUT_OUTPUT_HOLD
+            .max(settle)
+            .min(carried_cap);
         let mut saw_executing = false;
         let mut idle_since: Option<std::time::Instant> = None;
         // The mode the wait stopped on, or `None` if the deadline won.
@@ -3798,7 +3804,13 @@ impl HoldfastServer {
                 break Some(InteractionMode::Exited);
             }
             let mode = session.detection().interaction_mode;
-            let fresh = carried.answerable(mode, std::time::Instant::now(), carried_hold);
+            let fresh = carried.answerable(
+                mode,
+                std::time::Instant::now(),
+                session.output_since_last_write(),
+                carried_hold,
+                silent_hold,
+            );
             match mode {
                 // Read from the process, so it cannot be stale.
                 InteractionMode::Exited => break Some(mode),

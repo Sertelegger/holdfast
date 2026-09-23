@@ -116,21 +116,52 @@ pub struct WaitOutcome {
 /// `AwaitingSecret` has the same shape one step later: a secret handed in
 /// by `request_secret_input` and not yet read still shows echo off.
 ///
-/// So a mode **already showing at the first sample** is answered only once
-/// it has held for `hold` — the detector's own settle window, the same
-/// evidence `AtPrompt` already needs when the wait never saw anything
-/// execute. A mode the wait **watched arrive** — any change since the first
-/// sample — is fresh by construction and answers at once, as before.
+/// So a mode **already showing at the first sample** is not the answer
+/// until there is evidence it is not the pre-write one:
 ///
-/// The wait cannot see the write it follows, so this is paid by every wait
-/// that *begins* at one of these modes, including one that follows no
-/// write at all: bounded by the settle window (250 ms by default), and the
-/// price of not answering from a stale sample.
+/// - **The wait watched it arrive** — any change since the first sample —
+///   and it answers at once, as before.
+/// - **The child has written something since the last input reached it**
+///   ([`Session::output_since_last_write`]) and the mode has held for
+///   `hold`, the detector's own settle window: the program reacted and is
+///   still in this mode — `less` scrolled.
+/// - **Nothing has come back since the write**, and the mode has held for
+///   [`CARRIED_WITHOUT_OUTPUT_HOLD`]: the key produced no output at all.
+///
+/// **The first form of this fix held every carried mode for the settle
+/// window alone, and that only moved the stale answer** (review of GH
+/// #248). `less` takes longer than 250 ms to read a key it was sent while
+/// starting, under the load the dogfood pass ran at; the wait then
+/// answered `Fullscreen` at ~260 ms, 7 times in 42, and `status` said
+/// `AtPrompt` a moment later. A wait cannot see a key being read, but it
+/// can see that nothing has answered it yet, and while nothing has, a
+/// longer hold costs nothing but the rare key a program ignores silently.
+/// Measured with a raw-mode program that reads its key 600 ms after it
+/// arrives: the settle-only hold answered `Fullscreen` 10 times in 10,
+/// this one `AtPrompt` 10 times in 10, in ~0.6 s.
+///
+/// **Residuals, all three on the side of the old behaviour.** The longer
+/// hold is a bound, not a proof: a program slower than it and still silent
+/// is answered from the stale sample. Output that is not an answer to the
+/// key counts as one — the tail of a draw still in flight when the key
+/// went in, or the line discipline's own echo of the key, which happens at
+/// the write whenever `ECHO` is on. `less` sets raw mode before it enters
+/// the alternate screen (measured), so neither applies to it once it shows.
 #[derive(Debug, Default)]
 pub struct CarriedMode {
     first: Option<(InteractionMode, Instant)>,
     moved: bool,
 }
+
+/// How long a mode carried into a pattern-less wait is held when nothing
+/// has come back since the last write — see [`CarriedMode`].
+///
+/// Long against the delays that produced GH #248's stale answers (a
+/// `less` still starting took ~1 s to read its `q` at load 18–36) and
+/// short against a deadline, because it is only ever paid by a key that
+/// makes a full-screen program print nothing. Never shorter than the
+/// settle window, which an operator can raise past it.
+pub const CARRIED_WITHOUT_OUTPUT_HOLD: Duration = Duration::from_secs(2);
 
 impl CarriedMode {
     pub fn new() -> Self {
@@ -141,12 +172,23 @@ impl CarriedMode {
     /// Call it for **every** sample, whatever the mode, or a change the
     /// wait did watch goes unrecorded and the mode it produced waits out a
     /// window it should not.
-    pub fn answerable(&mut self, mode: InteractionMode, now: Instant, hold: Duration) -> bool {
+    ///
+    /// `reacted` is [`Session::output_since_last_write`] at this sample;
+    /// `hold` applies when it is true, and `silent_hold` when it is not.
+    pub fn answerable(
+        &mut self,
+        mode: InteractionMode,
+        now: Instant,
+        reacted: bool,
+        hold: Duration,
+        silent_hold: Duration,
+    ) -> bool {
         let (first, since) = *self.first.get_or_insert((mode, now));
         if mode != first {
             self.moved = true;
         }
-        self.moved || now.saturating_duration_since(since) >= hold
+        let held = now.saturating_duration_since(since);
+        self.moved || held >= if reacted { hold } else { silent_hold }
     }
 }
 
@@ -1100,36 +1142,102 @@ mod tests {
     }
 
     /// GH #248: a mode already showing at the wait's first sample may be
-    /// the one from **before** the write the wait follows.
+    /// the one from **before** the write the wait follows. Once the child
+    /// has answered the write, the settle window is enough.
     #[test]
-    fn a_mode_carried_from_before_the_wait_is_answered_only_once_it_has_held() {
+    fn a_carried_mode_the_child_has_answered_since_is_answered_once_it_has_held() {
         use crate::detect::InteractionMode::*;
-        let hold = Duration::from_millis(250);
+        let (hold, silent) = (Duration::from_millis(250), Duration::from_secs(2));
         let t0 = Instant::now();
         let mut c = CarriedMode::new();
-        assert!(!c.answerable(Fullscreen, t0, hold), "the first sample");
-        assert!(!c.answerable(Fullscreen, t0 + Duration::from_millis(200), hold));
         assert!(
-            c.answerable(Fullscreen, t0 + hold, hold),
-            "a mode that held for the window is the answer"
+            !c.answerable(Fullscreen, t0, true, hold, silent),
+            "the first sample"
+        );
+        assert!(!c.answerable(
+            Fullscreen,
+            t0 + Duration::from_millis(200),
+            true,
+            hold,
+            silent
+        ));
+        assert!(
+            c.answerable(Fullscreen, t0 + hold, true, hold, silent),
+            "a mode that held for the window after the child answered is the answer"
+        );
+    }
+
+    /// The review's case: **nothing has come back since the write**, so the
+    /// mode is the pre-write one however long it has held — `less` still
+    /// starting when its `q` went in, answered from at 260 ms 7 times in
+    /// 42 when the settle window was the only hold. Only the longer hold
+    /// makes it the answer, and output arriving makes it the answer at once
+    /// if the settle window has already passed.
+    #[test]
+    fn a_carried_mode_nothing_has_answered_since_the_write_waits_the_longer_hold() {
+        use crate::detect::InteractionMode::*;
+        let (hold, silent) = (Duration::from_millis(250), Duration::from_secs(2));
+        let t0 = Instant::now();
+        let mut c = CarriedMode::new();
+        assert!(!c.answerable(Fullscreen, t0, false, hold, silent));
+        assert!(
+            !c.answerable(Fullscreen, t0 + Duration::from_secs(1), false, hold, silent),
+            "held past the settle window with nothing back since the write: \
+             this is the sample from before the key"
+        );
+        assert!(
+            c.answerable(Fullscreen, t0 + silent, false, hold, silent),
+            "a key that makes the program print nothing is answered, eventually"
+        );
+
+        let mut c = CarriedMode::new();
+        assert!(!c.answerable(AwaitingSecret, t0, false, hold, silent));
+        assert!(!c.answerable(AwaitingSecret, t0 + hold, false, hold, silent));
+        assert!(
+            c.answerable(
+                AwaitingSecret,
+                t0 + Duration::from_millis(600),
+                true,
+                hold,
+                silent
+            ),
+            "the child answered the write and the settle window has passed"
         );
     }
 
     /// The other half: a mode the wait watched arrive is fresh by
     /// construction and answers at once — including the first mode coming
-    /// back after something else was seen.
+    /// back after something else was seen, and whatever `reacted` says.
     #[test]
     fn a_mode_the_wait_watched_arrive_is_answered_at_once() {
         use crate::detect::InteractionMode::*;
-        let hold = Duration::from_millis(250);
+        let (hold, silent) = (Duration::from_millis(250), Duration::from_secs(2));
         let t0 = Instant::now();
         let mut c = CarriedMode::new();
-        assert!(!c.answerable(AwaitingSecret, t0, hold));
-        c.answerable(Executing, t0 + Duration::from_millis(1), hold);
-        assert!(c.answerable(AwaitingSecret, t0 + Duration::from_millis(2), hold));
+        assert!(!c.answerable(AwaitingSecret, t0, false, hold, silent));
+        c.answerable(
+            Executing,
+            t0 + Duration::from_millis(1),
+            false,
+            hold,
+            silent,
+        );
+        assert!(c.answerable(
+            AwaitingSecret,
+            t0 + Duration::from_millis(2),
+            false,
+            hold,
+            silent
+        ));
 
         let mut c = CarriedMode::new();
-        c.answerable(AtPrompt, t0, hold);
-        assert!(c.answerable(Fullscreen, t0 + Duration::from_millis(1), hold));
+        c.answerable(AtPrompt, t0, false, hold, silent);
+        assert!(c.answerable(
+            Fullscreen,
+            t0 + Duration::from_millis(1),
+            false,
+            hold,
+            silent
+        ));
     }
 }

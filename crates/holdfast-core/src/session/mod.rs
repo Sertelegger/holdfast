@@ -333,6 +333,10 @@ pub struct Session {
     /// provider call and comparing it in the writer thread is how that is
     /// refused; see [`WriteRequest::SecretIfUnread`].
     writes_performed: Arc<AtomicU64>,
+    /// `buffer.head` as sampled just before the most recent write the
+    /// backend took — [`WriteAck::pre_write_head`] of the latest write —
+    /// or 0 before any. See [`Session::output_since_last_write`].
+    last_write_head: AtomicU64,
     /// §4.3's write queue — the *push* half of the same fan-out
     /// `output_tx` is the pull half of.
     ///
@@ -862,6 +866,7 @@ impl Session {
             secret_episode: Arc::clone(&secret_episode),
             reader_finished: Arc::clone(&reader_finished),
             writes_performed: Arc::clone(&writes_performed),
+            last_write_head: AtomicU64::new(0),
             write_tx: Mutex::new(write_tx),
             writer: std::sync::OnceLock::new(),
             last_activity_ms: Arc::clone(&last_activity_ms),
@@ -1743,6 +1748,25 @@ impl Session {
         self.writes_performed.load(Ordering::Relaxed)
     }
 
+    /// Whether the child has written anything since the most recent input
+    /// reached it — and `true` for a session no input has reached, where no
+    /// mode can predate a write.
+    ///
+    /// **Evidence that the child reacted to its last input, and no more
+    /// than evidence** (GH #248): a program that was still drawing when the
+    /// key went in makes this `true` before it has read the key. What it
+    /// does establish is the negative, and that is what it is for — `false`
+    /// means nothing has come back since the write, so a mode read now is
+    /// the mode from *before* it. `session::wait::CarriedMode` consumes it.
+    ///
+    /// Compared against the head sampled *before* the write, so output the
+    /// reader pushes in between counts as after it: the error is on the
+    /// side of "reacted", the side the pre-fix behaviour was on always.
+    pub fn output_since_last_write(&self) -> bool {
+        self.writes_performed() == 0
+            || self.buffer_head() > self.last_write_head.load(Ordering::Relaxed)
+    }
+
     /// The prompt line the child has drawn, redacted (§9.2).
     ///
     /// Used by the replay path, which needs the text at *attach* time
@@ -2443,6 +2467,8 @@ impl Session {
         // autofill refuses a credential when this changed under it, and a
         // write that never reached the PTY satisfied no read.
         self.writes_performed.fetch_add(1, Ordering::Relaxed);
+        self.last_write_head
+            .fetch_max(pre_write_head, Ordering::Relaxed);
         self.touch();
         Ok(WriteAck {
             bytes_written: data.len(),
