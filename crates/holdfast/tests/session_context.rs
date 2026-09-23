@@ -1,7 +1,8 @@
 //! A shared daemon, driven by more than one client, through real shims:
-//! whose directory and environment a session starts from (GH #229), and
-//! how long the daemon takes to let go of a shell when it is stopped
-//! (GH #234).
+//! whose directory and environment a session starts from (GH #229), how
+//! long the daemon takes to let go of a shell when it is stopped
+//! (GH #234), and what a client does when the daemon under it goes away
+//! (GH #231).
 //!
 //! `daemon_cli.rs` is this file's neighbour and owns the general
 //! process-level suite. These rows live apart because they are about one
@@ -183,9 +184,20 @@ impl Shim {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send_request(method, params);
+        self.answer(id, method)
+    }
+
+    /// Send a request without waiting for it, for the row that has to act
+    /// while a call is outstanding. [`Shim::answer`] collects it.
+    fn send_request(&mut self, method: &str, params: Value) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        id
+    }
+
+    fn answer(&mut self, id: u64, method: &str) -> Value {
         let deadline = Instant::now() + RESPONSE_TIMEOUT;
         loop {
             let line = match self
@@ -428,5 +440,299 @@ fn an_exited_sessions_name_is_refused_with_the_id_that_reaches_it() {
     let (code, out, err) = inst.run(&["logs", &id]);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("FINAL_WORDS"), "{out:?}");
+    shim.kill();
+}
+
+fn status_of(shim: &mut Shim, session: &str) -> Value {
+    envelope(&shim.call("status", json!({ "session": session }))).clone()
+}
+
+/// **GH #231.** The daemon under an open client stops — `holdfast daemon
+/// stop`, which is every upgrade — and the client's next call used to
+/// answer `daemon_unreachable`, as did every call after it, until
+/// something else started a daemon.
+///
+/// Now the shim starts one the way it started the first, and the call
+/// that found the daemon gone says so plainly: its session is not found,
+/// and the reason is at the front of `details`. The call after that is
+/// an ordinary call with no note, which is the half that proves the note
+/// is about *this* reconnection rather than decoration on every answer.
+#[test]
+fn a_client_whose_daemon_stopped_starts_another_and_says_its_sessions_are_gone() {
+    let inst = Instance::new("respawn");
+    let here = Project::new(&inst, "proj");
+    let mut shim = Shim::launch(&inst, &here.0, &[], &["mcp"]);
+    let started = shim.call(
+        "start_session",
+        json!({ "command": "/bin/sh", "args": ["-c", "sleep 30"], "name": "old" }),
+    );
+    let old_id = envelope(&started)["data"]["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_string();
+    let old_daemon = inst.daemon_pid().expect("a daemon");
+
+    let (code, _, err) = inst.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "{err}");
+
+    let first = status_of(&mut shim, &old_id);
+    assert_eq!(
+        first["status"], "session_not_found",
+        "the old daemon's session cannot exist on the new one: {first}"
+    );
+    let details = first["details"].as_str().unwrap_or_default();
+    assert!(
+        details.starts_with("The Holdfast daemon had stopped")
+            && details.contains("every session from the previous daemon is gone"),
+        "the answer must say plainly that the old sessions are gone: {details:?}"
+    );
+    let new_daemon = inst.daemon_pid().expect("the shim started a daemon");
+    assert_ne!(new_daemon, old_daemon, "that is the old daemon's pid");
+
+    // The shim is usable again, and says nothing more about the restart.
+    let listed = envelope(&shim.call("list_sessions", json!({}))).clone();
+    assert_eq!(listed["status"], "ok", "{listed}");
+    assert_eq!(listed["details"], "0 session(s)", "{listed}");
+    let again = shim.call(
+        "start_session",
+        json!({ "command": "/bin/sh", "args": ["-c", "sleep 30"], "name": "new" }),
+    );
+    assert_eq!(envelope(&again)["status"], "ok", "{again}");
+    shim.kill();
+}
+
+/// Every running `holdfast daemon run` serving `dir`. Linux reads it off
+/// `/proc`; elsewhere this answers `None` and the row relies on its
+/// load-bearing half, which is platform-free.
+fn daemons_for(dir: &Path) -> Option<usize> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let want = format!("HOLDFAST_RUNTIME_DIR={}", dir.display());
+    let mut n = 0;
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let pid = entry.file_name();
+        let pid = pid.to_string_lossy();
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if !String::from_utf8_lossy(&cmdline)
+            .replace('\0', " ")
+            .contains("daemon run")
+        {
+            continue;
+        }
+        let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        if String::from_utf8_lossy(&environ)
+            .split('\0')
+            .any(|kv| kv == want)
+        {
+            n += 1;
+        }
+    }
+    Some(n)
+}
+
+/// **Two clients notice at once, and there is still one daemon** — the
+/// property `two_shims_racing_to_start_share_one_daemon` pins at startup,
+/// pinned here for the restart. Both reconnect through `holdfast daemon
+/// start`, whose lock and re-check are what collapse them; a respawn that
+/// forked `daemon run` itself would give each client a daemon of its own
+/// and silently split the session set in two.
+///
+/// The load-bearing assertion is the shared registry, as in that row: a
+/// session started through one client is visible through the other.
+#[test]
+fn two_clients_that_lost_their_daemon_together_restart_one_daemon() {
+    let inst = Instance::new("race");
+    let here = Project::new(&inst, "proj");
+    let mut a = Shim::launch(&inst, &here.0, &[], &["mcp"]);
+    let mut b = Shim::launch(&inst, &here.0, &[], &["mcp"]);
+    let (code, _, err) = inst.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "{err}");
+
+    let gate = std::sync::Barrier::new(2);
+    let (seen_a, seen_b) = std::thread::scope(|scope| {
+        let ha = scope.spawn(|| {
+            gate.wait();
+            envelope(&a.call("list_sessions", json!({}))).clone()
+        });
+        let hb = scope.spawn(|| {
+            gate.wait();
+            envelope(&b.call("list_sessions", json!({}))).clone()
+        });
+        (ha.join().unwrap(), hb.join().unwrap())
+    });
+    assert_eq!(seen_a["status"], "ok", "{seen_a}");
+    assert_eq!(seen_b["status"], "ok", "{seen_b}");
+    if let Some(n) = daemons_for(&inst.dir) {
+        assert_eq!(n, 1, "the two clients restarted {n} daemons");
+    }
+
+    let started = a.call(
+        "start_session",
+        json!({ "command": "/bin/sh", "args": ["-c", "sleep 30"], "name": "shared" }),
+    );
+    let id = envelope(&started)["data"]["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_string();
+    let listed = envelope(&b.call("list_sessions", json!({}))).clone();
+    let ids: Vec<&str> = listed["data"]["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [id.as_str()],
+        "the two clients are not on one daemon: {listed}"
+    );
+    a.kill();
+    b.kill();
+}
+
+/// **A call the old daemon may already have run is not run again.** The
+/// daemon is killed while a `send_input` is outstanding — after it wrote
+/// the input, while it waits for a pattern that will never come. Re-sent
+/// to a new daemon, a `send_input` or a `start_session` could run twice;
+/// so it is answered, not retried, and the answer is what is known: a new
+/// daemon is up, the old sessions are gone, and whether the call took
+/// effect is unknown.
+///
+/// The call is observed in flight rather than slept for: the command it
+/// types prints a marker, read through `holdfast logs` — a separate
+/// process — and the daemon is killed only once the marker is there.
+#[test]
+fn a_call_in_flight_when_the_daemon_dies_is_answered_not_re_sent() {
+    let inst = Instance::new("inflight");
+    let here = Project::new(&inst, "proj");
+    let mut shim = Shim::launch(&inst, &here.0, &[], &["mcp"]);
+    let started = shim.call(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"] }),
+    );
+    let id = envelope(&started)["data"]["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_string();
+    let daemon = inst.daemon_pid().expect("a daemon");
+
+    let call = shim.send_request(
+        "tools/call",
+        json!({ "name": "send_input", "arguments": {
+            "session": id,
+            "data": "echo IN''_FLIGHT",
+            "wait_for": "NEVER_PRINTED",
+            "timeout_secs": 120,
+        }}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let (_, out, _) = inst.run(&["logs", &id]);
+        if out.contains("IN_FLIGHT") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the call never reached the daemon"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(unsafe { libc::kill(daemon as i32, libc::SIGKILL) }, 0);
+
+    let answer = shim.answer(call, "tools/call");
+    assert_eq!(
+        answer["error"]["data"]["reason"], "daemon_restarted",
+        "a call that may have run must be answered, not re-sent: {answer}"
+    );
+    let message = answer["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("every session from the previous daemon is gone")
+            && message.contains("unknown"),
+        "{message:?}"
+    );
+    // Not re-sent: the new daemon has never heard of any session, and a
+    // re-sent `send_input` would have been refused as `session_not_found`
+    // rather than surfacing here as an error.
+    let listed = envelope(&shim.call("list_sessions", json!({}))).clone();
+    assert_eq!(listed["status"], "ok", "{listed}");
+    assert_eq!(listed["details"], "0 session(s)", "{listed}");
+    assert_ne!(inst.daemon_pid(), Some(daemon), "no new daemon was started");
+    shim.kill();
+}
+
+/// **The listener of a daemon that has just died can still accept.**
+/// Measured with `SIGKILL`: the shim saw its own connection close before
+/// the kernel had closed the dead daemon's listener, so its reconnection
+/// connected, had the handshake reset, and — since `ensure_daemon` rightly
+/// will not spawn over a daemon that accepted — gave up. The shim now
+/// waits such a listener out.
+///
+/// The window is reproduced rather than raced for: the old daemon is
+/// stopped, and a stand-in listener is bound at its socket that accepts
+/// every connection and drops it, as a closing one does, then goes away
+/// on its own after half a second. A shim that gave up on the first reset
+/// answers `daemon_unreachable`; one that waits reaches a new daemon.
+#[test]
+fn a_listener_that_is_still_closing_is_waited_out_rather_than_reported() {
+    use std::os::unix::net::UnixListener;
+
+    let inst = Instance::new("closing");
+    let here = Project::new(&inst, "proj");
+    let mut shim = Shim::launch(&inst, &here.0, &[], &["mcp"]);
+    assert_eq!(
+        envelope(&shim.call("list_sessions", json!({})))["status"],
+        "ok"
+    );
+    let (code, _, err) = inst.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "{err}");
+    // `daemon stop` answers before teardown ends (issue #20); the pid file
+    // is the last thing the daemon removes, so its absence means the
+    // stand-in below is not about to have its socket unlinked under it.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while inst.dir.join("holdfast.pid").exists() {
+        assert!(Instant::now() < deadline, "the old daemon never finished");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let sock = inst.dir.join("control.sock");
+    let _ = std::fs::remove_file(&sock);
+    let closing = UnixListener::bind(&sock).expect("bind the stand-in");
+    closing.set_nonblocking(true).unwrap();
+    let dropped = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_millis(500);
+        let mut accepted = 0;
+        while Instant::now() < until {
+            match closing.accept() {
+                Ok((conn, _)) => {
+                    accepted += 1;
+                    drop(conn);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        drop(closing);
+        let _ = std::fs::remove_file(&sock);
+        accepted
+    });
+
+    let answer = shim.call("list_sessions", json!({}));
+    let accepted = dropped.join().unwrap();
+    assert!(
+        accepted > 0,
+        "the shim never met the closing listener, so this row tested nothing"
+    );
+    assert_eq!(
+        envelope(&answer)["status"],
+        "ok",
+        "a listener on its way out was reported instead of waited out: {answer}"
+    );
+    assert!(
+        inst.daemon_pid().is_some(),
+        "the shim must have started a new daemon"
+    );
     shim.kill();
 }

@@ -647,6 +647,27 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **Once the daemon stopped, every open client answered `daemon_unreachable`
+  until something else started one** ([#231]). `holdfast daemon stop` is the
+  only way to load a new build, so this was every upgrade. The shim now
+  starts a daemon the way it started the first — through `holdfast daemon
+  start`, whose lock and re-check keep several clients noticing at once to
+  one daemon — and the call that found the daemon gone says so at the front
+  of its `details`: *"The Holdfast daemon had stopped, so a new one was
+  started for this call: every session from the previous daemon is gone…"*.
+  **A call is re-sent only when it provably never reached the old daemon** —
+  a dial that failed, or a write into a connection already closed, which is
+  what the first call after a `daemon stop` meets. A call that may already
+  have run — the daemon died while it waited for an answer — is not re-sent,
+  because a `send_input` or `start_session` would run twice; it is answered
+  with a new `data.reason`, `daemon_restarted`, saying the old sessions are
+  gone and whether the call took effect is unknown. A handshake reset by a
+  dead daemon's listener that has not closed yet — measured after `SIGKILL`
+  — is waited out for up to two seconds rather than reported; a handshake
+  that times out is still a wedged daemon and is still reported. With the
+  hang-up above, the stop half of an upgrade fell from 10.1 s to 0.1 s for
+  one idle shell.
+
 - **`terminate` on a shell took its whole grace, and `daemon stop` the whole
   of its own** ([#234]). An interactive shell ignores `SIGTERM` (§4.4), so
   the sweep reached every job and left the shell, and `terminate` of any
@@ -2086,3 +2107,4 @@ residuals that are known and accepted.
 [#229]: https://github.com/Sertelegger/holdfast/issues/229
 [#239]: https://github.com/Sertelegger/holdfast/issues/239
 [#234]: https://github.com/Sertelegger/holdfast/issues/234
+[#231]: https://github.com/Sertelegger/holdfast/issues/231

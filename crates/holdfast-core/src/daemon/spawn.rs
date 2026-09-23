@@ -233,6 +233,12 @@ pub fn start_detached(paths: &RuntimePaths, exe: &Path) -> io::Result<StartOutco
 
 /// The shim's startup path (§3.4): connect, or spawn and connect.
 ///
+/// **And, since GH #231, its path back**: `ShimServer::reconnect` calls
+/// this when the daemon it had goes away, so a shim restarts a daemon
+/// through exactly the lock, re-check and readiness poll it started the
+/// first one with — which is what keeps several shims noticing at once to
+/// one daemon, as it keeps several starting at once to one.
+///
 /// The spawn goes through `holdfast daemon start` rather than forking here,
 /// so this process's direct child is short-lived and reaped by `status()`
 /// — the second fork of the double fork. `daemon start` holds the lock
@@ -272,16 +278,27 @@ pub async fn ensure_daemon(
     // install's daemon an explicit instance and moved §9.4's trail onto
     // tmpfs. Inheritance carries a genuine one across; nothing needs to
     // manufacture it.
-    let status = std::process::Command::new(exe)
-        .arg("daemon")
-        .arg("start")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .status()
-        .map_err(|source| ClientError::Connect {
-            path: exe.display().to_string(),
-            source,
-        })?;
+    //
+    // **On the blocking pool**, because `status()` waits for `daemon
+    // start` — up to its lock and readiness deadlines — and since GH #231
+    // this runs inside a shim that is serving other calls: a tokio worker
+    // parked on a child's exit is one worker fewer for all of them.
+    let program = exe.to_path_buf();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(program)
+            .arg("daemon")
+            .arg("start")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+    })
+    .await
+    .map_err(io::Error::other)
+    .and_then(|status| status)
+    .map_err(|source| ClientError::Connect {
+        path: exe.display().to_string(),
+        source,
+    })?;
     if !status.success() {
         return Err(ClientError::Connect {
             path: sock.display().to_string(),
