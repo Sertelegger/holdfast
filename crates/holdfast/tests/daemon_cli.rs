@@ -1596,6 +1596,23 @@ fn logs_tail_is_inside_the_holdback_in_the_same_moment_read_output_withholds() {
         "a session still producing output was told its tail is final: {err:?}"
     );
 
+    // And the drain — `holdfast logs` with no `--tail` — in the same
+    // moment. Its last read reaches the boundary and returns nothing, and
+    // that is §4.1's holdback, not a stuck daemon: the drain stops there
+    // with the note, exit 0, rather than failing for want of progress
+    // (GH #232). Everything before the boundary is there.
+    let (code, all, err) = env.run(&["logs", "tailhb"]);
+    assert_eq!(
+        code, 0,
+        "a drain that reached the holdback failed instead of stopping: {err}"
+    );
+    assert!(
+        !all.contains(&in_flight),
+        "the drain released the token: {all:?}"
+    );
+    assert!(all.contains("LINE_1\r") && all.ends_with("see "), "{all:?}");
+    assert!(err.contains("may still be arriving"), "{err:?}");
+
     // The bracket. Arms measured either side of a process spawn are only
     // "the same moment" if the holdback was still open at the end of it.
     let after = shim.call_tool(
