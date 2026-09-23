@@ -334,10 +334,18 @@ fn resync(session: &Session, scan_start: u64, outcome: &mut WaitOutcome) -> Resy
 ///
 /// `raw` is the stream exactly as the program wrote it. `text` is the same
 /// stream with its escape sequences removed by the read path's own
-/// [`AnsiStripper`], and `offsets[i]` is the absolute raw offset `text[i]`
-/// came from — which is what lets a match found in `text` be reported in
-/// raw offsets, as §5.2 requires of `match.offset`. See the module doc for
-/// why both are searched.
+/// [`AnsiStripper`], and `runs` maps `text` back to raw offsets — which is
+/// what lets a match found in `text` be reported in raw offsets, as §5.2
+/// requires of `match.offset`. See the module doc for why both are
+/// searched.
+///
+/// **The map is one entry per escape, not one per byte**, and that is a
+/// budget rather than a nicety. The historical and final-rescan windows are
+/// not trimmed: they run from the requested cursor to the head of a ring
+/// an operator can configure to any size, so a per-byte `u64` table was
+/// eight bytes of bookkeeping for every byte a `since_cursor: 0` wait
+/// covered — 8 MiB beside the default 1 MiB ring, and proportionally more
+/// beside a larger one. Runs cost what the output's escapes cost.
 ///
 /// The stripper is resumable, so an escape split across two frames is
 /// removed exactly as one inside a frame is. A window rebuilt from the
@@ -350,7 +358,10 @@ struct Window {
     /// Absolute offset of `raw[0]`.
     start: u64,
     text: Vec<u8>,
-    offsets: Vec<u64>,
+    /// Maximal runs of `text` that were contiguous in the raw stream, as
+    /// `(index in text of the run's first byte, its raw offset)`, in order.
+    /// A new run starts wherever the stripper removed something.
+    runs: Vec<(usize, u64)>,
     stripper: AnsiStripper,
 }
 
@@ -360,7 +371,7 @@ impl Window {
             raw: Vec::with_capacity(bytes.len()),
             start,
             text: Vec::with_capacity(bytes.len()),
-            offsets: Vec::with_capacity(bytes.len()),
+            runs: Vec::new(),
             stripper: AnsiStripper::new(),
         };
         w.push(bytes);
@@ -377,8 +388,14 @@ impl Window {
         self.raw.extend_from_slice(bytes);
         for &b in bytes {
             if let Some(t) = self.stripper.feed(at, b) {
+                let continues = matches!(
+                    self.runs.last(),
+                    Some(&(first, raw)) if raw + (self.text.len() - first) as u64 == at
+                );
+                if !continues {
+                    self.runs.push((self.text.len(), at));
+                }
                 self.text.push(t);
-                self.offsets.push(at);
             }
             at += 1;
         }
@@ -413,10 +430,33 @@ impl Window {
             let drop = self.raw.len() - SCAN_WINDOW_BYTES;
             self.raw.drain(..drop);
             self.start += drop as u64;
-            let gone = self.offsets.partition_point(|&o| o < self.start);
-            self.text.drain(..gone);
-            self.offsets.drain(..gone);
+            // The first text byte still inside the window: text offsets
+            // rise with their index, so this is a binary search.
+            let (mut lo, mut hi) = (0, self.text.len());
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if self.raw_offset(mid) < self.start {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if lo > 0 {
+                let first = (lo < self.text.len()).then(|| self.raw_offset(lo));
+                self.text.drain(..lo);
+                let kept = self.runs.partition_point(|&(i, _)| i <= lo);
+                let mut runs: Vec<(usize, u64)> = first.map(|o| (0, o)).into_iter().collect();
+                runs.extend(self.runs[kept..].iter().map(|&(i, o)| (i - lo, o)));
+                self.runs = runs;
+            }
         }
+    }
+
+    /// The raw offset `text[i]` came from. `i` must be a text index.
+    fn raw_offset(&self, i: usize) -> u64 {
+        let run = self.runs.partition_point(|&(first, _)| first <= i) - 1;
+        let (first, raw) = self.runs[run];
+        raw + (i - first) as u64
     }
 
     /// The earlier of the raw match and the text match, in raw offsets.
@@ -429,10 +469,16 @@ impl Window {
             // A text position maps to the raw offset of the byte there, or
             // to the window's end when it is one past the last text byte —
             // which only an empty match can be.
-            let at = |i: usize| self.offsets.get(i).copied().unwrap_or_else(|| self.end());
+            let at = |i: usize| {
+                if i < self.text.len() {
+                    self.raw_offset(i)
+                } else {
+                    self.end()
+                }
+            };
             let start = at(m.start());
             let end = if m.end() > m.start() {
-                self.offsets[m.end() - 1] + 1
+                self.raw_offset(m.end() - 1) + 1
             } else {
                 start
             };
@@ -996,10 +1042,62 @@ mod tests {
         };
         assert!(w.feed(&mut cursor, &frame));
         assert_eq!(w.raw.len(), SCAN_WINDOW_BYTES);
-        assert_eq!(w.offsets.first().copied(), Some(w.start));
-        assert_eq!(w.text.len(), w.offsets.len());
+        assert_eq!(w.raw_offset(0), w.start, "the first text byte left behind");
+        assert_eq!(w.runs.first().map(|r| r.0), Some(0));
         let found = w.search(&re("RED")).expect("found");
         assert_eq!(found.start, SCAN_WINDOW_BYTES as u64 + 5);
+    }
+
+    /// The run map's one invariant, checked exhaustively rather than at
+    /// the two offsets the rows above happen to look at: every text byte
+    /// maps back to the raw byte it came from, across frames that split
+    /// escapes and across trims that cut through runs, escapes and the
+    /// boundary between them.
+    #[test]
+    fn every_text_byte_maps_back_to_the_raw_byte_it_came_from() {
+        // A deterministic mixture: plain text, SGR, OSC 133 with both
+        // terminators, a charset designator, and bare text between them.
+        let pieces: [&[u8]; 7] = [
+            b"plain text ",
+            b"\x1b[1;32m",
+            b"GREEN",
+            b"\x1b]133;D;0;holdfast=1\x07",
+            b"\x1b]0;title\x1b\\",
+            b"\x1b(B",
+            b"tail\r\n",
+        ];
+        let mut stream = Vec::new();
+        let mut i = 0usize;
+        while stream.len() < SCAN_WINDOW_BYTES * 2 + 4096 {
+            stream.extend_from_slice(pieces[i % pieces.len()]);
+            i = i.wrapping_mul(31).wrapping_add(7);
+        }
+        let mut w = Window::new(0, &[]);
+        let mut cursor = 0u64;
+        // Frames of an awkward size, so escapes straddle them. The whole
+        // map is checked every eighth frame and after the last — every
+        // frame is quadratic and costs seconds in a debug build.
+        let chunks: Vec<&[u8]> = stream.chunks(997).collect();
+        for (n, chunk) in chunks.iter().enumerate() {
+            let frame = OutputFrame {
+                start: cursor,
+                end: cursor + chunk.len() as u64,
+                bytes: Arc::from(*chunk),
+            };
+            assert!(w.feed(&mut cursor, &frame));
+            if n % 8 != 0 && n + 1 != chunks.len() {
+                continue;
+            }
+            for (k, &t) in w.text.iter().enumerate() {
+                let raw = w.raw_offset(k);
+                assert!(raw >= w.start && raw < w.end(), "text {k} maps outside");
+                assert_eq!(
+                    stream[raw as usize], t,
+                    "text byte {k} maps to raw {raw}, which holds another byte"
+                );
+            }
+        }
+        assert!(w.start > 0, "the fixture must have trimmed");
     }
 
     /// GH #248: a mode already showing at the wait's first sample may be
