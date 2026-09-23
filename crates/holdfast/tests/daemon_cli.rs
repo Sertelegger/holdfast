@@ -2344,6 +2344,126 @@ fn watch_ends_when_its_reader_does() {
     shim.kill();
 }
 
+/// Poll `read_output`'s tail until `needle` is in it. The cursor-0 read
+/// `Shim::read_until` makes cannot see past the first 256 KiB, which is
+/// the whole point of the rows that use this.
+fn wait_for_tail(shim: &mut Shim, session: &str, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let resp = shim.call_tool(
+            "read_output",
+            json!({ "session": session, "tail_lines": 3 }),
+        );
+        let out = resp["result"]["structuredContent"]["data"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if out.contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never printed {needle:?}; its tail is {out:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Every line of `out` that is a bare number, in order.
+///
+/// Trimmed at both ends, because bash's line editor leaves a `\r` at the
+/// *start* of the first output line (it follows the bracketed-paste reset
+/// that ANSI stripping removes).
+fn numbered_lines(out: &str) -> Vec<u64> {
+    out.lines().filter_map(|l| l.trim().parse().ok()).collect()
+}
+
+/// A session that has printed well over one `read_output` page — the
+/// command's echo, `1` to `LAST`, and a marker — under `name`.
+fn a_long_session(env: &TestEnv, name: &str) -> (Shim, String) {
+    let mut shim = Shim::start(env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": name }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    shim.call_tool(
+        "send_input",
+        json!({ "session": session_id, "data": format!("seq 1 {LAST}; echo LONG''_DONE") }),
+    );
+    wait_for_tail(&mut shim, &session_id, "LONG_DONE");
+    (shim, session_id)
+}
+
+/// The last number `a_long_session` prints. Chosen so the output is well
+/// past one 256 KiB page and well inside the 1 MiB ring — the first is
+/// asserted below rather than assumed.
+const LAST: u64 = 60_000;
+
+/// **GH #232: `holdfast logs` printed the oldest 256 KiB and stopped**,
+/// silently, exit 0 — and both viewers send the operator to it for what
+/// they missed. It now follows `next_cursor` to the end.
+///
+/// The consecutive-numbers check is what makes this more than "the marker
+/// arrived": a drain that dropped or repeated a page boundary, or began a
+/// page mid-line, breaks the run somewhere in the middle.
+#[test]
+fn holdfast_logs_prints_everything_the_buffer_holds_not_its_first_page() {
+    let env = TestEnv::new("logsall");
+    let (mut shim, session_id) = a_long_session(&env, "long");
+
+    let (code, out, err) = env.run(&["logs", "long"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.len() > 256 * 1024,
+        "the fixture has to be longer than one page for this to test anything: {} bytes",
+        out.len()
+    );
+    assert!(out.contains("LONG_DONE"), "the end of the session is missing");
+    assert_eq!(
+        numbered_lines(&out),
+        (1..=LAST).collect::<Vec<_>>(),
+        "the numbers 1..={LAST} are not all there, once each, in order"
+    );
+    assert!(
+        !err.contains("left its buffer"),
+        "nothing had left the ring, and the note says otherwise: {err}"
+    );
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// **`--tail N` longer than a page was cut to the newest 256 KiB**,
+/// starting mid-line (GH #232). It now has every one of the N lines, whole.
+#[test]
+fn logs_tail_longer_than_a_page_has_every_line_it_was_asked_for() {
+    const N: usize = 50_000;
+    let env = TestEnv::new("logstail");
+    let (mut shim, session_id) = a_long_session(&env, "longtail");
+
+    let (code, out, err) = env.run(&["logs", "longtail", "--tail", &N.to_string()]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.len() > 256 * 1024,
+        "{N} lines have to be longer than one page for this to test the fallback: {} bytes",
+        out.len()
+    );
+    assert_eq!(out.lines().count(), N, "`--tail {N}` did not print {N} lines");
+    let numbers = numbered_lines(&out);
+    let first = *numbers.first().expect("some numbered lines");
+    // Consecutive to the end: no page seam lost or repeated, and the first
+    // line is whole — a cut `10004` reads as `4`, and breaks the run.
+    assert_eq!(numbers, (first..=LAST).collect::<Vec<_>>());
+    assert!(out.contains("LONG_DONE"), "the tail's own end is missing");
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
 /// **GH #233**: `--help`, `-h`, `help`, `--version` and `-V` were
 /// `unknown subcommand`, exit 64. Help that was asked for is an answer:
 /// stdout, exit 0.
@@ -2553,3 +2673,67 @@ fn daemon_stop_returns_once_the_daemon_is_gone_and_its_directory_stays_gone() {
     );
 }
 
+/// A session that has printed more than its ring holds: `logs` prints what
+/// is left, **says** that the front is gone, and does not ask for bytes
+/// the ring no longer has (GH #232).
+///
+/// Asking from cursor 0 — what the command did before — returns the same
+/// bytes, but a cursor below the ring's tail is §9.4's `truncated_at_tail`
+/// and writes an audit row naming a reader that lost its place. A command
+/// asking for everything the buffer holds is not that reader. The shim's
+/// cursor-0 read at the end is the control: it proves the audit row is
+/// written when earned, so its absence above is not an audit log that
+/// writes nothing.
+#[test]
+fn logs_of_a_session_longer_than_its_buffer_says_the_front_is_gone() {
+    const WRAP_LAST: u64 = 200_000;
+    let env = TestEnv::new("logswrap");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "wrapped" }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    shim.call_tool(
+        "send_input",
+        json!({ "session": session_id, "data": format!("seq 1 {WRAP_LAST}; echo WRAP''_DONE") }),
+    );
+    wait_for_tail(&mut shim, &session_id, "WRAP_DONE");
+
+    let (code, out, err) = env.run(&["logs", "wrapped"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        err.contains("have left its buffer"),
+        "the ring dropped the session's front and nothing said so: {err}"
+    );
+    assert!(out.contains("WRAP_DONE"), "the end of the session is missing");
+    let numbers = numbered_lines(&out);
+    // The ring's oldest byte can fall mid-line, so the first number may be
+    // a fragment; everything after it is whole and consecutive.
+    let rest = &numbers[1..];
+    let first = *rest.first().expect("numbered lines");
+    assert!(first > 1, "a 1 MiB ring cannot still hold the first line");
+    assert_eq!(rest, (first..=WRAP_LAST).collect::<Vec<_>>().as_slice());
+
+    let audit_path = env.dir.join("logs").join("audit.log");
+    let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    assert!(
+        !audit.contains("truncated_at_tail"),
+        "`holdfast logs` asked below the ring's tail and was audited for it:\n{audit}"
+    );
+    shim.call_tool(
+        "read_output",
+        json!({ "session": session_id, "since_cursor": 0, "max_bytes": 1024 }),
+    );
+    let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    assert!(
+        audit.contains("truncated_at_tail"),
+        "the control read below the tail was not audited, so the absence above means nothing"
+    );
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}

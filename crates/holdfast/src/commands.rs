@@ -1075,7 +1075,39 @@ pub async fn list(as_json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// How much one `read_output` call asks for — the daemon's ceiling
+/// (`MAX_READ_MAX_BYTES`), so a drain is as few round trips as the wire
+/// allows.
+#[cfg(unix)]
+const LOGS_PAGE_BYTES: u64 = 256 * 1024;
+
 /// `holdfast logs <session> [--tail N] [--raw]`
+///
+/// **It prints everything the session's buffer still holds, and it used
+/// to print the oldest 256 KiB of it** (GH #232). One `read_output` call
+/// returns at most one page, and the command made one call and ignored
+/// both `truncated_for_size` and `next_cursor` — so on any session that
+/// had printed more than a page it stopped mid-line, said nothing, and
+/// exited 0. Both viewers' truncation notices send the operator here for
+/// what they missed, which is almost never the oldest page.
+///
+/// It now follows `next_cursor` to the end, and stops early only where
+/// the daemon says to:
+///
+/// * **`held_back`** — §4.1's holdback, or REQ-O-008's unfinished escape,
+///   at the tail. Since GH #195 both boundaries move only with
+///   `buffer.head`, so asking again at once returns the same bytes; the
+///   loop stops and [`held_back_note`] says why, as before.
+/// * **The head as it stood when the command started.** A session that
+///   prints faster than this reads would otherwise never be caught up
+///   with, and `holdfast logs` would not return. What was there when you
+///   asked is what you get, which is the same contract `cat` gives a file
+///   that is still being written.
+///
+/// Bytes that are gone are said to be gone, on stderr: the ring keeps the
+/// newest output only (REQ-O-005), so a session that has printed more
+/// than it holds starts partway through, and a session that outruns the
+/// read can lose bytes between two pages. Both used to be silent.
 #[cfg(unix)]
 pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCode {
     let client = match connect(ClientKind::Cli).await {
@@ -1085,78 +1117,289 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
-    // §7.2: CLI commands ride the same control socket as the MCP tool
-    // handlers. `holdfast logs` is `read_output` with a human on the other
-    // end, so it goes through `tool/read_output` rather than growing a
-    // parallel method with its own bugs.
-    //
-    // **`apply_holdback` on the `--tail` arm, and it is not decoration
-    // (GH #169).** `tail_lines` alone is §4.1's per-call bypass, and this
-    // surface is named a non-member of it, twice: *"the exemption covers
-    // exactly those two arguments on the one tool that takes them, and
-    // nothing else"*, and then, by name, *"`--raw` is that surface's
-    // opt-in and it is audited; `--tail` is not an opt-in to anything."*
-    // The distinction has to be carried by what the CLI **sends**: the
-    // daemon may not recover it from `client_kind`, which is audit
-    // attribution and never a redaction input (REQ-SEC-018).
-    let mut args = match tail_lines {
-        Some(n) => json!({
-            "session": session,
+    let reader = LogReader {
+        client,
+        session,
+        raw,
+    };
+    let result = match tail_lines {
+        Some(n) => logs_tail(&reader, n).await,
+        None => logs_all(&reader).await,
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => code,
+    }
+}
+
+/// One `holdfast logs` invocation's connection and the two arguments every
+/// call it makes carries.
+#[cfg(unix)]
+struct LogReader<'a> {
+    client: ControlClient,
+    session: &'a str,
+    raw: bool,
+}
+
+#[cfg(unix)]
+impl LogReader<'_> {
+    /// One `tool/<name>` call, answered `ok`, as JSON. Every failure is
+    /// reported here, so a caller only propagates the exit code.
+    async fn call(&self, tool: &str, mut args: Value) -> Result<Value, ExitCode> {
+        args["session"] = json!(self.session);
+        let params = method::to_cbor(&args).map_err(|e| {
+            diag!("holdfast logs: {e}");
+            ExitCode::from(EXIT_FAILED)
+        })?;
+        let resp = self
+            .client
+            .call_raw(&format!("tool/{tool}"), params)
+            .await
+            .map_err(|e| {
+                diag!("holdfast logs: {e}");
+                ExitCode::from(EXIT_UNREACHABLE)
+            })?;
+        if resp.status != "ok" {
+            diag!("holdfast logs: {} — {}", resp.status, resp.details);
+            return Err(ExitCode::from(EXIT_FAILED));
+        }
+        method::from_cbor(&resp.data).map_err(|e| {
+            diag!("holdfast logs: malformed response: {e}");
+            ExitCode::from(EXIT_FAILED)
+        })
+    }
+
+    /// `read_output`, with `--raw`'s one field when it was given.
+    ///
+    /// §3.2's `--raw` is "disable redaction, and audit-log that you did".
+    /// Both halves belong to the daemon: 0.0.3 put the `redaction_disabled`
+    /// audit write inside the read path itself (§9.4), precisely so every
+    /// transport inherits it instead of having to remember. So the flag is
+    /// one field on the call, and the CLI has no audit obligation of its
+    /// own — which also means a drain of several pages writes one row per
+    /// page, each of them true.
+    async fn read(&self, mut args: Value) -> Result<Page, ExitCode> {
+        if self.raw {
+            args["redact"] = json!(false);
+        }
+        let data = self.call("read_output", args).await?;
+        Page::from_wire(data)
+    }
+}
+
+/// One `read_output` answer, reduced to what the drain steers by.
+#[cfg(unix)]
+struct Page {
+    output: String,
+    /// Where this page actually began. Later than the cursor asked for
+    /// exactly when bytes between the two left the ring first.
+    start: u64,
+    truncated_for_size: bool,
+    held_back: bool,
+    next_cursor: Option<u64>,
+    /// The whole answer, for [`held_back_note`].
+    data: Value,
+}
+
+#[cfg(unix)]
+impl Page {
+    fn from_wire(data: Value) -> Result<Self, ExitCode> {
+        let (Some(end), Some(returned)) = (
+            data["cursor"].as_u64(),
+            data["bytes_returned"].as_u64(),
+        ) else {
+            diag!("holdfast logs: malformed response: no cursor or bytes_returned");
+            return Err(ExitCode::from(EXIT_FAILED));
+        };
+        Ok(Self {
+            output: data["output"].as_str().unwrap_or_default().to_string(),
+            start: end.saturating_sub(returned),
+            truncated_for_size: data["truncated_for_size"] == json!(true),
+            held_back: data["held_back"] == json!(true),
+            next_cursor: data["next_cursor"].as_u64(),
+            data,
+        })
+    }
+}
+
+/// What a drain saw besides the bytes, for the notes that follow them.
+#[cfg(unix)]
+#[derive(Default)]
+struct Drained {
+    /// Bytes the session printed before the oldest one the ring still held
+    /// when the drain began.
+    gone_before: u64,
+    /// Bytes that left the ring between two pages of this drain.
+    gone_during: u64,
+    /// The page that stopped at a holdback, if one did.
+    held: Option<Value>,
+}
+
+/// Every page from the ring's oldest byte to the head as it stood at the
+/// start, handed to `sink` in order.
+#[cfg(unix)]
+async fn drain(r: &LogReader<'_>, mut sink: impl FnMut(&str)) -> Result<Drained, ExitCode> {
+    // The extent comes from `status` and not from the first page, because
+    // a page says where it ended and not where the buffer does.
+    let status = r.call("status", json!({})).await?;
+    let (Some(head), Some(tail)) = (
+        status["buffer"]["head"].as_u64(),
+        status["buffer"]["tail"].as_u64(),
+    ) else {
+        diag!("holdfast logs: malformed response: `status` carried no buffer extent");
+        return Err(ExitCode::from(EXIT_FAILED));
+    };
+    let mut seen = Drained {
+        gone_before: tail,
+        ..Drained::default()
+    };
+    // From the ring's tail rather than from 0. Both return the same bytes,
+    // but a cursor below the tail is §9.4's `truncated_at_tail` and is
+    // audited as a reader that lost its place — which a command asking for
+    // "everything you have" is not.
+    let mut cursor = tail;
+    while cursor < head {
+        let page = r
+            .read(json!({ "since_cursor": cursor, "max_bytes": LOGS_PAGE_BYTES }))
+            .await?;
+        seen.gone_during += page.start.saturating_sub(cursor);
+        sink(&page.output);
+        if page.held_back {
+            seen.held = Some(page.data);
+            break;
+        }
+        match page.next_cursor {
+            // Caught up with the head, as it stands now.
+            None => break,
+            Some(next) if next > cursor => cursor = next,
+            // Since GH #195 every read makes progress, so this is a daemon
+            // that has regressed — and a loop that trusted it would spin.
+            Some(next) => {
+                diag!(
+                    "holdfast logs: the daemon returned no progress at byte {next}; \
+                     stopping rather than asking again"
+                );
+                return Err(ExitCode::from(EXIT_FAILED));
+            }
+        }
+    }
+    Ok(seen)
+}
+
+#[cfg(unix)]
+async fn logs_all(r: &LogReader<'_>) -> Result<(), ExitCode> {
+    let seen = drain(r, crate::out::text).await?;
+    report_gone(seen.gone_before, seen.gone_during);
+    if let Some(held) = &seen.held {
+        diag!("holdfast logs: {}", held_back_note(r.raw, held));
+    }
+    Ok(())
+}
+
+/// `--tail N`: one tail read, which is the whole answer unless the N lines
+/// are longer than one page.
+///
+/// **`apply_holdback`, and it is not decoration (GH #169).** `tail_lines`
+/// alone is §4.1's per-call bypass, and this surface is named a non-member
+/// of it, twice: *"the exemption covers exactly those two arguments on the
+/// one tool that takes them, and nothing else"*, and then, by name,
+/// *"`--raw` is that surface's opt-in and it is audited; `--tail` is not an
+/// opt-in to anything."* The distinction has to be carried by what the CLI
+/// **sends**: the daemon may not recover it from `client_kind`, which is
+/// audit attribution and never a redaction input (REQ-SEC-018).
+///
+/// **Longer than a page, and it used to be cut silently** (GH #232). A
+/// tail read keeps the newest `max_bytes` of the N lines and sets
+/// `truncated_for_size`, so `--tail 40000` printed the last 256 KiB
+/// starting mid-line. That case now drains the ring — at most
+/// `DEFAULT_BUFFER_BYTES`, a few pages — and keeps the last N lines of it
+/// here. The drain applies the holdback exactly as the tail read did, so
+/// the fallback withholds nothing less.
+#[cfg(unix)]
+async fn logs_tail(r: &LogReader<'_>, n: usize) -> Result<(), ExitCode> {
+    let page = r
+        .read(json!({
             "tail_lines": n,
             "apply_holdback": true,
-            "max_bytes": 256 * 1024,
-        }),
-        None => json!({ "session": session, "since_cursor": 0, "max_bytes": 256 * 1024 }),
-    };
-    if raw {
-        // §3.2's `--raw` is "disable redaction, and audit-log that you
-        // did". Both halves belong to the daemon: 0.0.3 put the
-        // `redaction_disabled` audit write inside the read path itself
-        // (§9.4), precisely so every transport inherits it instead of
-        // having to remember. So the flag is one field on the existing
-        // call, and the CLI does not get an audit obligation of its own.
-        args["redact"] = json!(false);
-    }
-    let params = match method::to_cbor(&args) {
-        Ok(p) => p,
-        Err(e) => {
-            diag!("holdfast logs: {e}");
-            return ExitCode::from(EXIT_FAILED);
+            "max_bytes": LOGS_PAGE_BYTES,
+        }))
+        .await?;
+    if !page.truncated_for_size {
+        crate::out::text(&page.output);
+        if page.held_back {
+            diag!("holdfast logs: {}", held_back_note(r.raw, &page.data));
         }
-    };
-    let resp = match client.call_raw("tool/read_output", params).await {
-        Ok(r) => r,
-        Err(e) => {
-            diag!("holdfast logs: {e}");
-            return ExitCode::from(EXIT_UNREACHABLE);
-        }
-    };
-    if resp.status != "ok" {
-        diag!("holdfast logs: {} — {}", resp.status, resp.details);
-        return ExitCode::from(EXIT_FAILED);
+        return Ok(());
     }
-    let data: Value = match method::from_cbor(&resp.data) {
-        Ok(v) => v,
-        Err(e) => {
-            diag!("holdfast logs: malformed response: {e}");
-            return ExitCode::from(EXIT_FAILED);
-        }
-    };
-    crate::out::text(data["output"].as_str().unwrap_or_default());
-    // §4.1's holdback can now shorten this read, so say so — on stderr,
-    // because stdout is the log and this surface's point is that it
-    // survives being piped somewhere. Silence here would read as "the
-    // output ended", which is the one thing it does not mean.
-    //
-    // **Flush first.** `print!` goes through Rust's `LineWriter` and
-    // `diag!` writes an unbuffered, locked stderr, so `holdfast logs X
-    // 2>&1 | tail` spliced the note into the middle of the log text.
-    // Ordering two streams is the writer's job, not the reader's.
-    if data["held_back"] == json!(true) {
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        diag!("holdfast logs: {}", held_back_note(raw, &data));
+
+    let mut all = String::new();
+    let seen = drain(r, |s| all.push_str(s)).await?;
+    let lines = last_lines(&all, n);
+    crate::out::text(lines);
+    // The ring's missing front only matters when the N lines reach it.
+    let reaches_front = lines.len() == all.len();
+    report_gone(
+        if reaches_front { seen.gone_before } else { 0 },
+        seen.gone_during,
+    );
+    if let Some(held) = &seen.held {
+        diag!("holdfast logs: {}", held_back_note(r.raw, held));
     }
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+/// The last `n` lines of `text`, counted the way the daemon's
+/// `tail_lines` counts them (`OutputBuffer::tail_lines_start`): a single
+/// trailing newline does not start another line, and fewer than `n` lines
+/// is all of them.
+///
+/// A port of that function rather than an equivalent, because "equivalent"
+/// is where two paths of one flag start to disagree:
+/// `the_tail_fallback_counts_lines_the_way_the_daemon_does` checks it
+/// against the original.
+#[cfg(unix)]
+fn last_lines(text: &str, n: usize) -> &str {
+    let b = text.as_bytes();
+    if n == 0 || b.is_empty() {
+        return "";
+    }
+    let search_end = if b[b.len() - 1] == b'\n' {
+        b.len() - 1
+    } else {
+        b.len()
+    };
+    let mut seen = 0usize;
+    let mut start = b.len();
+    for i in (0..search_end).rev() {
+        if b[i] == b'\n' {
+            seen += 1;
+            if seen == n {
+                start = i + 1;
+                break;
+            }
+        }
+        start = i;
+    }
+    // Every value `start` can take is 0, the length, or one past a
+    // newline, so it is always a char boundary.
+    &text[start..]
+}
+
+/// Say, on stderr, which bytes the output above does not have.
+#[cfg(unix)]
+fn report_gone(gone_before: u64, gone_during: u64) {
+    if gone_before > 0 {
+        diag!(
+            "holdfast logs: the first {gone_before} bytes this session printed have left its buffer \
+             and are not shown"
+        );
+    }
+    if gone_during > 0 {
+        diag!(
+            "holdfast logs: {gone_during} more bytes left the buffer while this was reading it — the \
+             session printed faster than it could be read — and are missing from the middle"
+        );
+    }
 }
 
 /// What `holdfast logs` says on stderr when the read came back
@@ -3190,6 +3433,180 @@ mod tests {
         );
         // And it is a bound rather than an absence of one.
         assert!(STOP_RPC_TIMEOUT <= grace * 3);
+    }
+
+    /// A `holdfast logs` reader connected to `paths`' fake daemon.
+    async fn log_reader(paths: &RuntimePaths) -> LogReader<'static> {
+        let client = ControlClient::connect(&paths.control_sock(), ClientKind::Cli)
+            .await
+            .expect("connect to the fake daemon");
+        LogReader {
+            client,
+            session: "fake",
+            raw: false,
+        }
+    }
+
+    /// One `read_output` page covering `[start, end)`, labelled with its
+    /// start so the test can see which pages were printed.
+    fn page(start: u64, end: u64, next: Option<u64>, held: bool) -> Value {
+        json!({
+            "output": format!("[{start}]"),
+            "cursor": end,
+            "bytes_returned": end - start,
+            "truncated_for_size": next.is_some() && !held,
+            "held_back": held,
+            "held_back_cause": if held { json!("in_flight_secret") } else { Value::Null },
+            "next_cursor": next,
+            "state": "Running",
+        })
+    }
+
+    fn since(params: &Value) -> u64 {
+        params["since_cursor"].as_u64().expect("a cursor read")
+    }
+
+    /// **GH #232's loop has to end.** A session printing faster than the
+    /// CLI reads never lets `next_cursor` come back `null`, so a drain
+    /// that followed it alone would not return — `holdfast logs` on a busy
+    /// build would hang. It stops at the head `status` reported when it
+    /// began. The fake's head never stops moving.
+    #[tokio::test]
+    async fn a_drain_stops_at_the_head_it_started_with_however_fast_the_session_prints() {
+        let paths = scratch("drainhead");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = fake_daemon(&paths, |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 5000, "tail": 1000 } })),
+            "tool/read_output" => {
+                let c = since(p);
+                Some(page(c, c + 1000, Some(c + 1000), false))
+            }
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen = tokio::time::timeout(
+            Duration::from_secs(10),
+            drain(&r, |s| printed.push_str(s)),
+        )
+        .await
+        .expect("a drain chasing a moving head never returned")
+        .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[1000][2000][3000][4000]");
+        // From the ring's tail, not from 0 — and what is below it is said
+        // to be gone rather than asked for.
+        assert_eq!(seen.gone_before, 1000);
+        assert_eq!(seen.gone_during, 0);
+        assert!(seen.held.is_none());
+        daemon.abort();
+    }
+
+    /// A holdback ends the drain on the page that reported it, and that
+    /// page is kept for the note. Reading on would return the same bytes:
+    /// since GH #195 the boundary moves only with `buffer.head`.
+    #[tokio::test]
+    async fn a_drain_stops_at_a_holdback_and_keeps_the_page_that_said_so() {
+        let paths = scratch("drainheld");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let reads = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&reads);
+        let daemon = fake_daemon(&paths, move |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 10_000, "tail": 0 } })),
+            "tool/read_output" => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Some(match since(p) {
+                    0 => page(0, 4000, Some(4000), false),
+                    4000 => page(4000, 6000, Some(6000), true),
+                    c => page(c, c + 1, Some(c + 1), false),
+                })
+            }
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen = drain(&r, |s| printed.push_str(s))
+            .await
+            .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[0][4000]");
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "it read past a holdback");
+        let held = seen.held.expect("the holdback page is kept");
+        assert_eq!(held["held_back_cause"], "in_flight_secret");
+        daemon.abort();
+    }
+
+    /// Bytes that left the ring between two pages are counted, not
+    /// silently skipped: the second page began later than it was asked to.
+    #[tokio::test]
+    async fn a_drain_counts_the_bytes_that_left_the_ring_while_it_read() {
+        let paths = scratch("draingone");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = fake_daemon(&paths, |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 3000, "tail": 0 } })),
+            "tool/read_output" => Some(match since(p) {
+                0 => page(0, 1000, Some(1000), false),
+                // Asked for 1000; the ring had moved on to 1500.
+                1000 => page(1500, 2500, Some(2500), false),
+                c => page(c, 3000, None, false),
+            }),
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen = drain(&r, |s| printed.push_str(s))
+            .await
+            .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[0][1500][2500]");
+        assert_eq!(seen.gone_during, 500);
+        assert_eq!(seen.gone_before, 0);
+        daemon.abort();
+    }
+
+    /// A daemon that hands back the cursor it was given is refused with a
+    /// failure, not asked again for ever.
+    #[tokio::test]
+    async fn a_drain_refuses_a_daemon_that_makes_no_progress() {
+        let paths = scratch("drainstuck");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = fake_daemon(&paths, |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 3000, "tail": 0 } })),
+            "tool/read_output" => {
+                let c = since(p);
+                Some(page(c, c, Some(c), false))
+            }
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), drain(&r, |_| {}))
+            .await
+            .expect("a drain that makes no progress must not spin");
+        assert!(outcome.is_err(), "no progress is a failure");
+        daemon.abort();
+    }
+
+    /// `--tail`'s fallback keeps the last N lines itself, so it has to
+    /// count them exactly as the daemon's `tail_lines` does — or one flag
+    /// means two things depending on how long the lines are. Checked
+    /// against `OutputBuffer::tail_lines_start` itself, over the edges its
+    /// own comments name: a leading newline, a trailing one, blank lines,
+    /// fewer lines than asked for, and nothing at all.
+    #[test]
+    fn the_tail_fallback_counts_lines_the_way_the_daemon_does() {
+        let texts = [
+            "", "\n", "\n\n", "a", "a\n", "a\nb", "a\nb\n", "\na\nb\n", "a\n\n\nb\n",
+            "a\nb\nc\n\n", "é\nü\n", "x\r\ny\r\n",
+        ];
+        for text in texts {
+            let mut buf = holdfast_core::buffer::OutputBuffer::new(1024);
+            buf.push(text.as_bytes());
+            for n in 0..6 {
+                let start = buf.tail_lines_start(n) as usize;
+                assert_eq!(last_lines(text, n), &text[start..], "{text:?}, n = {n}");
+            }
+        }
     }
 
     /// **`held_back_note` had no test at all, and the sentence it
