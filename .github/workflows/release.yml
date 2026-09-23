@@ -159,9 +159,10 @@ jobs:
       - name: Build and pack ${{ matrix.asset }}
         shell: bash
         env:
-          # Or every shipped binary says `build unknown` in its handshake:
-          # `protocol/handshake.rs` reads `option_env!("HOLDFAST_BUILD_SHA")`
-          # and its doc comment names the release pipeline as what wires it.
+          # The full sha, verbatim, in `holdfast version` and the handshake.
+          # Without it holdfast-core's build.rs falls back to the checkout's
+          # HEAD, shortened; `release-rehearsal.yml` checks for this exact
+          # value, which is how it knows the variable reached the build.
           HOLDFAST_BUILD_SHA: ${{ github.sha }}
         run: ./scripts/package-release.sh "${{ matrix.asset }}" dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
