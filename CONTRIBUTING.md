@@ -419,16 +419,21 @@ Cutting one is therefore:
    **The `sha` is the pin; the `ref` is for the reader.** Claude Code takes
    the `sha` when both are present, and a tag without one can be moved.
    `scripts/plugin-manifest-check.py` refuses a pin to a branch, to another
-   URL, to another path, without a full sha, or ahead of `Cargo.toml` — and in
-   a clone that **has** the tag it also checks that the sha is the tag's commit
-   and that the pinned tree's `plugin.json` says `X.Y.Z`. CI's checkout fetches
-   no tags, so there it prints `skip` for that half rather than passing it:
-   run it locally before opening the PR.
+   URL, to another path, without a full sha, or ahead of `Cargo.toml`; checks
+   that the sha is the tag's commit and that the pinned tree's `plugin.json`
+   says `X.Y.Z`; and asks `releases/download/vX.Y.Z/SHA256SUMS.txt` whether
+   the release is served. **That is the check that makes this step's order
+   enforceable**: a pin opened before promotion satisfies every other rule —
+   the tag is real and `Cargo.toml` already names it — and a draft answers
+   404. CI's `plugin` job checks out the tags, and under CI a tag it does not
+   have, or a release that does not answer, fails rather than skips; run
+   locally without them, it says `skip` for that half, which is not a pass.
 
    **The first release that can be pinned is the first whose tag contains
    `plugin/`.** `v0.0.7` does not — the plugin landed after it — so until a
    later release is promoted the source stays `"./plugin"`, and the check
-   refuses a pin to a tag with no plugin tree. Measured on a scratch config
+   refuses a pin to `v0.0.7`: its tree has no `plugin.json`, and it serves
+   no assets. Measured on a scratch config
    directory, a `git-subdir` source with a `sha` installs exactly that
    commit's `plugin/` into the cache under its `plugin.json` version.
 
