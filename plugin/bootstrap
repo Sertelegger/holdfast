@@ -28,6 +28,19 @@ HF_URL_OWN_BIN="https://github.com/Sertelegger/holdfast/tree/main/plugin#using-a
 HF_REPO_GIT="https://github.com/Sertelegger/holdfast"
 HF_ARG1=${1:-}
 HF_NOTE=
+# The download's temp directory. **Empty until this run's own `mktemp` has
+# made it, and empty again once it is removed** -- never a value from the
+# environment. Every deletion in this file is `hf_rm_tmp`, which deletes
+# nothing while this is empty, so the bootstrap can only ever remove a
+# directory it created itself. The failure path used to run
+# `rm -rf "$HF_TMP"` from the very first `hf_die`, long before `mktemp`, and a
+# caller that happened to export HF_TMP lost whatever it named (T16).
+HF_TMP=
+hf_rm_tmp() {
+    [ -n "$HF_TMP" ] || return 0
+    rm -rf "$HF_TMP"
+    HF_TMP=
+}
 
 # --- how a failure reaches the person looking at Claude Code ---------------
 # **stderr alone does not.** Measured with Claude Code 2.1.280: a stdio
@@ -60,24 +73,40 @@ hf_mcp_error() {
     # nothing. Its own stdio is /dev/null so it cannot hold the client's pipe
     # open after we are gone.
     #
-    # **The signal must be one nothing traps.** It was TERM, which the
-    # download phase traps to clean up; dash and busybox then abandon the
-    # `read`, and bash -- macOS's /bin/sh -- runs the trap and goes back to
-    # reading. Measured, with TERM alone: 5 s under dash and busybox, the
-    # writer's full 30 s under bash. ALRM is trapped by nobody here and ends
-    # every shell at 5 s with status 142. KILL a second later is the
-    # backstop, for a caller that started us with ALRM ignored -- which a
-    # non-interactive shell cannot undo -- and it would also bound a trapped
-    # signal, so the harness tells the two apart by the exit status (142,
-    # not KILL's 137), not by the time. Neither runs the EXIT trap, so its
-    # cleanup happens here first.
-    [ -n "${HF_TMP:-}" ] && rm -rf "$HF_TMP"
+    # **Each signal that can end the wait has a trap here, and each trap
+    # exits.** bash -- macOS's /bin/sh -- runs a trap in the middle of a
+    # `read` and then goes back to reading unless the trap exits. The
+    # watchdog used to send TERM, which the download phase trapped to clean
+    # up and carry on, and the wait lasted the writer's full 30 s under bash
+    # against 5 s under dash and busybox (measured). The watchdog sends ALRM,
+    # and its trap ends the wait under all three with 142.
+    #
+    # **And the watchdog is stopped on every way out, before we go.** It is a
+    # separate process, and it used to send its KILL a second after ALRM
+    # whether or not ALRM had already ended this shell -- so it signalled a
+    # PID that was nobody's by then, or somebody else's (measured: the
+    # watchdog ran `kill -KILL <pid>` one second after <pid> had exited 142).
+    # It is stopped with KILL, which a caller cannot have set to be ignored,
+    # and which lands even in the instant after the fork. TERM did not: with
+    # the request already waiting -- which is every run under Claude Code --
+    # the watchdog outlived the bootstrap in 7 of 30 runs under dash and 1 of
+    # 30 under bash (0 of 30 each with KILL; measured).
+    # **The KILL remains for the one case it is for:** a caller that started
+    # us with ALRM ignored, which a non-interactive shell can neither undo
+    # nor trap. Then ALRM does nothing, this shell is still alive and still
+    # the watchdog's parent, and the KILL is what ends it, with 137 -- which
+    # is how the harness tells that case from ALRM's 142, not by the time.
+    hf_rm_tmp
     ( sleep 5; kill -ALRM $$; sleep 1; kill -KILL $$ ) < /dev/null > /dev/null 2>&1 &
     _wd=$!
+    trap 'hf_wd_stop; exit 142' ALRM
+    trap 'hf_wd_stop; exit 143' TERM
+    trap 'hf_wd_stop; exit 129' HUP
+    trap 'hf_wd_stop; exit 130' INT
     _req=
     IFS= read -r _req
     _rc=$?
-    kill "$_wd" 2> /dev/null
+    hf_wd_stop
     [ "$_rc" -eq 0 ] || [ -n "$_req" ] || return 0
     # The request id is echoed back whatever its type. Claude Code sends the
     # number 0; JSON-RPC also allows a string. Anything unreadable gets
@@ -88,9 +117,15 @@ hf_mcp_error() {
     printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"%s"}}\n' \
         "$_id" "$(hf_json_string "$1")"
 }
+hf_wd_stop() { kill -KILL "$_wd" 2> /dev/null; }
 hf_die() {
+    # **A note goes FIRST.** It says why HOLDFAST_BOOTSTRAP_ALLOW_PATH
+    # declined, which is the thing a user who set it needs to read, and
+    # `claude mcp list` shows only 500 characters: the not-published message
+    # is most of them, so a note after it was cut off every time (T8).
+    # First, what gets cut is the end of the link.
     _m="holdfast bootstrap: $*"
-    [ -n "$HF_NOTE" ] && _m="$_m ($HF_NOTE)"
+    [ -n "$HF_NOTE" ] && _m="holdfast bootstrap: $HF_NOTE; and $*"
     echo "$_m" >&2
     hf_mcp_error "$_m"
     exit 1
@@ -268,12 +303,12 @@ hf_expected_hash() {
     printf '%s\n' "$_found"
 }
 
-# hf_fetch <url> <dest>. On failure HF_FETCH_HTTP says who failed: the HTTP
-# status when a server answered with one, `error` when wget saw an HTTP error
-# it does not number, and empty when no server answered at all. The first
-# two are "this release does not have that file", the last is "this host
-# cannot get there", and they need opposite advice -- a manual download from
-# a release page that does not exist is the dead end GH #237 reported.
+# hf_fetch <url> <dest>. On failure HF_FETCH_HTTP says who failed: the final
+# HTTP status when a server answered the request with one, and empty when
+# nothing did. The first is "this release does not have that file" (404) or
+# "the server said no" (anything else), the second is "this host cannot get
+# there", and they need opposite advice -- a manual download from a release
+# page that does not exist is the dead end GH #237 reported.
 hf_fetch() {
     HF_FETCH_HTTP=
     case "$1" in
@@ -292,8 +327,6 @@ hf_fetch() {
         # nothing answered.
         HF_FETCH_HTTP=$(curl --fail --silent --show-error --location --max-time 120 \
             --write-out '%{http_code}' --output "$2" "$1") && return 0
-        [ "$HF_FETCH_HTTP" = 000 ] && HF_FETCH_HTTP=
-        return 1
     elif command -v wget > /dev/null 2>&1; then
         # **The status is read, not inferred from the exit code**, which
         # cannot tell a 404 from anything else: busybox wget exits 1 for
@@ -334,10 +367,21 @@ hf_fetch() {
         # wget's own words, as `curl --show-error` gives curl's; the header
         # lines `-S` added are the indented ones.
         printf '%s\n' "$_wout" | sed -e '/^ /d' -e '/^$/d' >&2
-        return 1
     else
         hf_die "neither curl nor wget is available, so the binary cannot be fetched -- install one, or $HF_BUILD_IT"
     fi
+    # **Only an answer to the request counts.** Nothing answered when curl
+    # writes `000` and when wget prints no status line. Nor did anything when
+    # the LAST status is a redirect: the hop it pointed at never answered --
+    # measured under curl, GNU wget and busybox wget alike, all three of which
+    # reported the 302 of a redirect to a port nothing listens on. On GitHub
+    # that is a firewall that lets github.com through and not the host the
+    # release assets are served from: a host that cannot get there, not a
+    # server that said no (T4c, T15).
+    case "$HF_FETCH_HTTP" in
+        000 | 3??) HF_FETCH_HTTP= ;;
+    esac
+    return 1
 }
 
 # --- 0b. an explicitly opted-in $PATH holdfast -----------------------------
@@ -368,7 +412,10 @@ if [ -n "${HOLDFAST_BOOTSTRAP_ALLOW_PATH:-}" ]; then
     if [ -z "$hf_path_bin" ] || [ ! -x "$hf_path_bin" ]; then
         HF_NOTE="HOLDFAST_BOOTSTRAP_ALLOW_PATH is set but there is no holdfast on \$PATH"
     else
-        hf_path_says=$("$hf_path_bin" version 2>/dev/null | head -n 1) || hf_path_says=
+        # `< /dev/null`: stdin is Claude Code's, with `initialize` waiting on
+        # it, and a probe that reads it takes the request away from whatever
+        # runs next -- the server, or the failure's answer (T8).
+        hf_path_says=$("$hf_path_bin" version 2>/dev/null < /dev/null | head -n 1) || hf_path_says=
         case "$hf_path_says" in
             "holdfast $HF_VERSION" | "holdfast $HF_VERSION "*)
                 hf_log "HOLDFAST_BOOTSTRAP_ALLOW_PATH is set; exec $hf_path_bin"
@@ -401,9 +448,18 @@ mkdir -p "$HF_CACHE_DIR" 2> /dev/null \
 # a bare `mktemp -d` lands in $TMPDIR, which is a different filesystem from
 # $HOME on most Linux installs -- where `mv` degrades to copy-then-unlink and
 # a concurrent bootstrap can exec a half-written binary.
-HF_TMP=$(mktemp -d "$HF_CACHE_DIR/.dl.XXXXXX") || hf_die "cannot create a temp directory in $HF_CACHE_DIR"
+#
+# The traps go in first, so the directory is covered from the moment it
+# exists; `hf_rm_tmp` is a no-op until it does. **A signal exits** rather
+# than cleaning up and carrying on, which is what this used to do -- on
+# through commands whose paths are inside the directory it had just removed.
+trap 'hf_rm_tmp' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+hf_t=$(mktemp -d "$HF_CACHE_DIR/.dl.XXXXXX") || hf_die "cannot create a temp directory in $HF_CACHE_DIR"
+HF_TMP=$hf_t
 chmod 700 "$HF_TMP"
-trap 'rm -rf "$HF_TMP"' EXIT HUP INT TERM
 
 # **Not published and not reachable are different failures with opposite
 # fixes**, and this message used to be one sentence for both: it asked "is
@@ -444,8 +500,7 @@ chmod 755 "$HF_TMP/x/$HF_EXE" || hf_die "cannot chmod the extracted binary"
 # a later run reads is never binary-without-manifest.
 mv -f "$HF_TMP/SHA256SUMS.txt" "$HF_SUMS_CACHED" || hf_die "cannot install the checksum manifest into $HF_CACHE_DIR"
 mv -f "$HF_TMP/x/$HF_EXE" "$HF_CACHED" || hf_die "cannot install the binary into $HF_CACHE_DIR"
-rm -rf "$HF_TMP"
-trap - EXIT
+hf_rm_tmp
 hf_log "installed $HF_CACHED"
 
 # One probe, on the install path only, never on the cache-hit path. A cache
@@ -454,7 +509,10 @@ hf_log "installed $HF_CACHED"
 # installs perfectly and then dies with a bare "Permission denied" on a file
 # that is mode 755 and owned by the caller. Measured: exit 126, no cause
 # named anywhere. This turns that into a sentence.
-if ! "$HF_CACHED" version > /dev/null 2>&1; then
+#
+# `< /dev/null`, as for the $PATH probe above: the `initialize` waiting on
+# stdin belongs to the server exec'd below (T1b).
+if ! "$HF_CACHED" version > /dev/null 2>&1 < /dev/null; then
     if [ -x "$HF_CACHED" ]; then
         hf_die "installed $HF_CACHED but cannot run it -- is $HF_CACHE_ROOT on a noexec mount? Point CLAUDE_PLUGIN_DATA or XDG_CACHE_HOME at an exec-permitted filesystem, or $HF_BUILD_IT"
     fi

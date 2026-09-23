@@ -181,12 +181,23 @@ if ((Test-Path -LiteralPath $Cached) -and (Test-Path -LiteralPath $SumsCached)) 
 }
 
 # --- 2. download ----------------------------------------------------------
-New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+# Each New-Item is caught and said with Die, like `bootstrap`'s: uncaught, it
+# is an error record on stderr and no answer to `initialize` (T14).
+try { New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null } catch {
+    Die "cannot create $CacheDir (read-only or full filesystem?) -- or $BuildIt"
+}
 # Inside the cache directory, not $env:TEMP: a cross-volume Move-Item is a
 # copy-then-delete, and a concurrent bootstrap can then see a half-written
 # binary. Same rule as the Unix half.
+#
+# **Without -Force**, which hands back a directory that already exists as if
+# it had just been made -- and the `finally` below would then delete it. The
+# `try` whose `finally` removes $Tmp starts only once New-Item has created
+# it, so this only ever removes a directory it made, as `bootstrap` does.
 $Tmp = Join-Path $CacheDir (".dl." + [System.IO.Path]::GetRandomFileName())
-New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
+try { New-Item -ItemType Directory -Path $Tmp | Out-Null } catch {
+    Die "cannot create a temp directory in $CacheDir -- make it writable, or $BuildIt"
+}
 try {
     if ($BaseUrl -notmatch '^https://' -and -not $env:HOLDFAST_BOOTSTRAP_INSECURE) {
         Die "refusing a non-TLS URL ($BaseUrl) -- TLS to GitHub is the whole of the v0.1.0 trust root (spec A-4)"

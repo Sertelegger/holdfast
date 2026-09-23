@@ -102,20 +102,35 @@ BASE="http://127.0.0.1:$PORT"
 # "answered HTTP <other>" arm had no row that reached it, and "the LAST status
 # of a redirect chain is the answer" had none either. Under `/to404/` every
 # path is a 302 to the same path under `/gone/`, which is a 404; under
-# `/drop/` the connection is closed with no answer at all; everything else is
-# a 503.
+# `/tonowhere/` it is a 302 to port 1 on loopback, where nothing listens;
+# under
+# `/drop/` the connection is closed with no answer at all; under `/slow/` the
+# 404 comes after three seconds, which is time to signal a download in
+# flight (T16); everything else is a 503.
 PORT2=$((PORT + 1))
 python3 - "$PORT2" > "$S/http2.log" 2>&1 <<'EOF' &
-import http.server, sys
+import http.server, sys, time
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/to404/"):
             self.send_response(302)
             self.send_header("Location", "/gone/" + self.path[len("/to404/"):])
+            # GNU wget otherwise tries to reuse this connection for the next
+            # hop, now and then finds it closed, gives up under `-t 1`, and
+            # the row goes red for the fixture's sake: 4 runs in 150 without
+            # this header, 0 in 800 with it (measured).
+            self.send_header("Connection", "close")
+        elif self.path.startswith("/tonowhere/"):
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1:1/" + self.path[len("/tonowhere/"):])
+            self.send_header("Connection", "close")
         elif self.path.startswith("/gone/"):
             self.send_response(404)
         elif self.path.startswith("/drop/"):
             return
+        elif self.path.startswith("/slow/"):
+            time.sleep(3)
+            self.send_response(404)
         else:
             self.send_response(503)
         self.send_header("Content-Length", "0")
@@ -133,7 +148,9 @@ done
 [ "$i" -lt 100 ] || { echo "second fixture server never came up on $PORT2" >&2; exit 2; }
 BASE503="http://127.0.0.1:$PORT2"
 BASE302="http://127.0.0.1:$PORT2/to404"
+BASENOWHERE="http://127.0.0.1:$PORT2/tonowhere"
 BASEDROP="http://127.0.0.1:$PORT2/drop"
+BASESLOW="http://127.0.0.1:$PORT2/slow"
 CACHE="$S/data"
 BIN="$CACHE/bin/holdfast-v0.1.0-linux-x86_64"
 SUMS="$CACHE/bin/SHA256SUMS-v0.1.0.txt"
@@ -153,6 +170,41 @@ reqs() { grep -c 'GET /' "$S/http.log" 2> /dev/null || echo 0; }
 count_matching() { find "$1" -maxdepth 1 -name "$2" 2> /dev/null | grep -c . || true; }
 cached_bins() { count_matching "$CACHE/bin" 'holdfast-v*'; }
 
+# --- helpers for the rows that read stdout on its own ---------------------
+# jfield <file> <python expression over `j`>: one JSON line, parsed. python3
+# rather than a grep, because "the reply is well-formed JSON-RPC that Claude
+# Code will accept" is the claim, and a grep for a substring would pass a
+# reply with an unescaped quote in it.
+jfield() {
+    python3 -c 'import json,sys
+lines=open(sys.argv[1]).read().splitlines()
+if len(lines)!=1: print("LINES=%d" % len(lines)); sys.exit(0)
+j=json.loads(lines[0])
+print(eval(sys.argv[2]))' "$1" "$2" 2>&1
+}
+INIT='{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"claude-code","version":"2.1.280"}},"jsonrpc":"2.0","id":0}'
+# How many live processes run this harness's bootstrap: the shell itself, or
+# a subshell of it -- the stdin watchdog is one, and carries the same argv.
+# The first word must end in `sh`, which the grep's own argv does not.
+bootstrap_procs() {
+    # shellcheck disable=SC2009
+    # Not pgrep: its count flag is not in macOS's, and an anchored regex over
+    # the whole argv is the match wanted here.
+    ps -A -o args= 2> /dev/null | grep -c "^[^ ]*sh $PLUG/bootstrap " || true
+}
+# `yes` once none is left, polled for half a second: the watchdog that
+# outlived its bootstrap did so for a full second, then sent KILL to a PID
+# that was no longer the bootstrap's (T12).
+bootstrap_gone() {
+    _i=0
+    while [ "$(bootstrap_procs)" -gt 0 ] && [ "$_i" -lt 5 ]; do
+        sleep 0.1
+        _i=$((_i + 1))
+    done
+    _n=$(bootstrap_procs)
+    [ "$_n" -eq 0 ] && echo yes || echo "no, $_n still running"
+}
+
 echo "--- T1 happy path ---"
 out=$(run mcp --flag); rc=$?
 chk "T1 exit 0"              "$rc" 0
@@ -167,6 +219,39 @@ echo "--- T2 second run must not touch the network ---"
 out=$(run version); rc=$?
 chk "T2 exit 0"              "$rc" 0
 chk "T2 requests served"     "$(( $(reqs) - n1 ))" 0
+
+# fab_release <version> <file>: a release of <file> as the only binary, in
+# the shape T1's has, beside it under $S/release.
+fab_release() {
+    mkdir -p "$S/release/v$1" "$S/fab-$1"
+    cp "$2" "$S/fab-$1/holdfast"
+    chmod 755 "$S/fab-$1/holdfast"
+    tar -czf "$S/release/v$1/holdfast-linux-x86_64.tar.gz" -C "$S/fab-$1" holdfast
+    ( cd "$S/release/v$1" && sha256sum holdfast-linux-x86_64.tar.gz > SHA256SUMS.txt )
+}
+
+echo "--- T1b the install's one probe leaves the request on stdin to the server ---"
+# The probe runs `<binary> version` once, after the install. Its stdin was
+# the client's -- where `initialize` is already waiting -- so a binary that
+# reads stdin there took the request from the server exec'd next. This one
+# reads a line under `version`, and says what its stdin held under `mcp`.
+{
+    printf '#!/bin/sh\n'
+    # shellcheck disable=SC2016
+    # Literal: the body of the fabricated binary.
+    printf 'if [ "$1" = version ]; then IFS= read -r l; echo "holdfast 0.1.2"; exit 0; fi\n'
+    # shellcheck disable=SC2016
+    printf 'IFS= read -r l; echo "PROBED-BINARY stdin=[$l]"\n'
+} > "$W/probed"
+fab_release 0.1.2 "$W/probed"
+rm -rf "$CACHE"
+printf '0.1.2\n' > "$PLUG/version.txt"
+out=$(printf '%s\n' '{"id":0}' | env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
+    HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
+    /bin/sh "$PLUG/bootstrap" mcp 2>&1)
+chk "T1b installed, probed, exec'd" "$(printf '%s' "$out" | grep -c 'PROBED-BINARY')" 1
+chk "T1b the server got the request" "$(printf '%s' "$out" | grep -c 'PROBED-BINARY stdin=\[{"id":0}\]')" 1
+printf '0.1.0\n' > "$PLUG/version.txt"
 
 echo "--- T3 corrupted archive: fail closed, nothing cached ---"
 rm -rf "$CACHE"
@@ -221,6 +306,14 @@ out=$(RUN_BASE=$BASE302 run mcp)
 chk "T4c 302 then 404: not published" "$(printf '%s' "$out" | grep -c 'no holdfast v9.9.9 binary to download.*answered 404')" 1
 out=$(RUN_BASE=$BASEDROP run mcp)
 chk "T4c no answer: cannot reach" "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:[0-9]*/drop/v9.9.9/SHA256SUMS.txt')" 1
+# **A redirect whose target never answers is no answer.** The last status
+# the fetcher saw is the 302, and this was "answered HTTP 302 -- retry
+# later". On GitHub it is a firewall that passes github.com and not the host
+# release assets are served from, and the advice for that is the air-gapped
+# one.
+out=$(RUN_BASE=$BASENOWHERE run mcp)
+chk "T4c redirect to nowhere: cannot reach" "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:[0-9]*/tonowhere/v9.9.9/SHA256SUMS.txt')" 1
+chk "T4c redirect to nowhere: not 'answered'" "$(printf '%s' "$out" | grep -c 'answered HTTP')" 0
 printf '0.1.0\n' > "$PLUG/version.txt"
 
 echo "--- T5 manifest has no line for this target ---"
@@ -302,7 +395,29 @@ printf '9.9.9\n' > "$PLUG/version.txt"
 out=$(env -i PATH="$S/nearpath:$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
     HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
     HOLDFAST_BOOTSTRAP_ALLOW_PATH=1 /bin/sh "$PLUG/bootstrap" mcp 2>&1 < /dev/null)
-chk "T8 the 404 carries the why"  "$(printf '%s' "$out" | grep -c "binary to download.*(HOLDFAST_BOOTSTRAP_ALLOW_PATH is set but .*reports 'holdfast 0.1.00")" 1
+chk "T8 the 404 carries the why"  "$(printf '%s' "$out" | grep -c "HOLDFAST_BOOTSTRAP_ALLOW_PATH is set but .*reports 'holdfast 0.1.00.*; and no holdfast v9.9.9 binary to download")" 1
+# **And the why is inside what Claude Code shows.** `claude mcp list` cuts
+# the line at 500 characters (T12), and the not-published message is most of
+# them: the note used to follow it, and was never on screen at all.
+printf '%s\n' "$INIT" | env -i PATH="$S/nearpath:$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
+    HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
+    HOLDFAST_BOOTSTRAP_ALLOW_PATH=1 /bin/sh "$PLUG/bootstrap" mcp > "$S/t8n.out" 2> /dev/null
+chk "T8 the why is in the 500 shown" "$(jfield "$S/t8n.out" '"reports %s" % chr(39) + "holdfast 0.1.00" in ("-32603: " + j["error"]["message"])[:500]')" True
+# **The version probe leaves the request where it was.** It runs the $PATH
+# binary with the client's stdin unless told otherwise, and a binary that
+# reads it there -- this one reads a line -- took `initialize` from the
+# failure's answer, which then had nothing to answer.
+mkdir -p "$S/eatpath"
+{
+    printf '#!/bin/sh\n'
+    # shellcheck disable=SC2016
+    printf '[ "$1" = version ] && { IFS= read -r l; echo "holdfast 0.0.0"; exit 0; }\n'
+} > "$S/eatpath/holdfast"
+chmod 755 "$S/eatpath/holdfast"
+printf '%s\n' "$INIT" | env -i PATH="$S/eatpath:$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
+    HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
+    HOLDFAST_BOOTSTRAP_ALLOW_PATH=1 /bin/sh "$PLUG/bootstrap" mcp > "$S/t8e.out" 2> /dev/null
+chk "T8 the probe leaves the request" "$(jfield "$S/t8e.out" 'repr(j["id"])')" 0
 printf '0.1.0\n' > "$PLUG/version.txt"
 # And with no holdfast on $PATH at all. A PATH built from exactly the tools
 # the bootstrap uses, because the host's own PATH may well hold a holdfast --
@@ -344,19 +459,6 @@ chk "T11 exit nonzero"       "$(yn $rc)" yes
 chk "T11 names the file"     "$(printf '%s' "$out" | grep -c 'version.txt does not hold a version')" 1
 printf '0.1.0\n' > "$PLUG/version.txt"
 
-# --- helpers for the rows that read stdout on its own ---------------------
-# jfield <file> <python expression over `j`>: one JSON line, parsed. python3
-# rather than a grep, because "the reply is well-formed JSON-RPC that Claude
-# Code will accept" is the claim, and a grep for a substring would pass a
-# reply with an unescaped quote in it.
-jfield() {
-    python3 -c 'import json,sys
-lines=open(sys.argv[1]).read().splitlines()
-if len(lines)!=1: print("LINES=%d" % len(lines)); sys.exit(0)
-j=json.loads(lines[0])
-print(eval(sys.argv[2]))' "$1" "$2" 2>&1
-}
-INIT='{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"claude-code","version":"2.1.280"}},"jsonrpc":"2.0","id":0}'
 
 echo "--- T12 a failure under mcp answers initialize, so Claude Code shows it ---"
 # Measured with Claude Code 2.1.280: a server that exits before answering
@@ -402,12 +504,21 @@ env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
     HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
     /bin/sh "$PLUG/bootstrap" mcp < "$S/quiet" > "$S/t12q.out" 2> "$S/t12q.err"; rc=$?
 t1=$(date +%s)
+gone=$(bootstrap_gone)
 kill "$quiet" 2> /dev/null
 chk "T12 silent stdin: bounded"  "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
-# **Which signal ended it, by its status, not by the clock.** ALRM is 142;
-# the KILL a second later is 137, and a watchdog whose first signal is
-# trapped -- TERM was, and bash then resumed the `read` -- still ends by that
-# KILL, a second later, which no wall-clock bound here can tell apart.
+# **Nothing of it outlives it.** The watchdog is its own process, and it sent
+# its KILL a second after the ALRM that had already ended the bootstrap --
+# to a PID that by then could be anybody's. The control is that `ps` works
+# here at all, since a `ps` that failed would count nothing, which is `yes`.
+# shellcheck disable=SC2009
+chk "T12 ps can see processes"   "$([ "$(ps -A -o args= 2> /dev/null | grep -c .)" -gt 0 ] && echo yes || echo no)" yes
+chk "T12 silent stdin: the watchdog went with it" "$gone" yes
+# **Which signal ended it, by its status, not by the clock.** ALRM is 142,
+# TERM 143 and the KILL a second later 137. A watchdog whose first signal
+# the shell trapped and survived -- TERM was, and bash then resumed the
+# `read` -- still ended by that KILL, a second later, which no wall-clock
+# bound here can tell apart.
 chk "T12 silent stdin: ended by ALRM" "$rc" 142
 chk "T12 silent stdin: said why" "$(grep -c 'no holdfast v9.9.9 binary to download' "$S/t12q.err")" 1
 chk "T12 silent stdin: no reply" "$(wc -c < "$S/t12q.out" | tr -d ' ')" 0
@@ -424,9 +535,11 @@ if command -v bash > /dev/null 2>&1; then
         HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
         bash "$PLUG/bootstrap" mcp < "$S/quiet" > /dev/null 2> "$S/t12b.err"; rc=$?
     t1=$(date +%s)
+    gone=$(bootstrap_gone)
     kill "$quiet" 2> /dev/null
     chk "T12 silent stdin, bash: bounded" "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
     chk "T12 silent stdin, bash: ended by ALRM" "$rc" 142
+    chk "T12 silent stdin, bash: the watchdog went with it" "$gone" yes
     chk "T12 silent stdin, bash: said why" "$(grep -c 'no holdfast v9.9.9 binary to download' "$S/t12b.err")" 1
 else
     echo "  skip  T12 silent stdin under bash -- no bash on this host"
@@ -448,6 +561,53 @@ kill "$quiet" 2> /dev/null
 chk "T12 ALRM ignored: bounded"  "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
 chk "T12 ALRM ignored: KILL ends it" "$rc" 137
 chk "T12 ALRM ignored: said why" "$(grep -c 'no holdfast v9.9.9 binary to download' "$S/t12k.err")" 1
+# **The watchdog is stopped with KILL**, because TERM can arrive ignored: a
+# caller that started us ignoring it hands that on to the watchdog, which
+# then shrugged off being stopped and sent its KILL a second later anyway.
+rm -rf "$CACHE"
+sleep 60 > "$S/quiet" &
+quiet=$!
+# shellcheck disable=SC2016
+# Literal: `$0` is the inner shell's, which is the bootstrap's path.
+env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
+    HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
+    /bin/sh -c 'trap "" TERM; exec /bin/sh "$0" mcp' "$PLUG/bootstrap" \
+    < "$S/quiet" > /dev/null 2> /dev/null; rc=$?
+gone=$(bootstrap_gone)
+kill "$quiet" 2> /dev/null
+chk "T12 TERM ignored: ended by ALRM" "$rc" 142
+chk "T12 TERM ignored: the watchdog went with it" "$gone" yes
+# **A signal from outside, during the wait, stops the watchdog too.** It is
+# the other way the bootstrap ends while the watchdog is armed -- Claude Code
+# giving up on the server, a supervisor -- and each has its own trap. Sent
+# once the diagnosis is on stderr, so it lands in the wait and not before.
+# INT is not among them: an asynchronous command here starts with INT
+# ignored, and a shell cannot trap what it inherited ignored.
+for sig in TERM:143 HUP:129; do
+    rm -rf "$CACHE"
+    : > "$S/t12s.err"
+    sleep 60 > "$S/quiet" &
+    quiet=$!
+    env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
+        HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
+        /bin/sh "$PLUG/bootstrap" mcp < "$S/quiet" > /dev/null 2> "$S/t12s.err" &
+    bp=$!
+    i=0
+    while ! grep -q 'binary to download' "$S/t12s.err" && [ "$i" -lt 50 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    sleep 0.2
+    t0=$(date +%s)
+    kill "-${sig%:*}" "$bp"
+    wait "$bp"; rc=$?
+    t1=$(date +%s)
+    gone=$(bootstrap_gone)
+    kill "$quiet" 2> /dev/null
+    chk "T12 ${sig%:*} in the wait: ends it" "$rc" "${sig#*:}"
+    chk "T12 ${sig%:*} in the wait: before the ALRM" "$([ $((t1 - t0)) -lt 3 ] && echo yes || echo "no, $((t1 - t0))s")" yes
+    chk "T12 ${sig%:*} in the wait: the watchdog went with it" "$gone" yes
+done
 # Only under `mcp`: `bootstrap version` run by a person must not print JSON.
 printf '%s\n' "$INIT" | env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
     HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
@@ -549,7 +709,9 @@ if [ -z "$PWSH" ]; then
         echo "  skip  T14 -- no pwsh (set HOLDFAST_PWSH to one); bootstrap.ps1 was NOT exercised"
     fi
 else
-    ps() { # ps <extra env...> -- <args...>
+    # Not named `ps`, which it was: a function by that name shadows the
+    # system `ps` for the rest of this file, and T12 and T16 use that one.
+    pwsh_run() { # pwsh_run <extra env...> -- <args...>
         _e=
         while [ "$1" != -- ]; do _e="$_e $1"; shift; done
         shift
@@ -558,33 +720,35 @@ else
             PROCESSOR_ARCHITECTURE=AMD64 HOLDFAST_BOOTSTRAP_INSECURE=1 $_e \
             "$PWSH" -NoProfile -NonInteractive -File "$PLUG/bootstrap.ps1" "$@" 2>&1 < /dev/null
     }
-    out=$(ps HOLDFAST_BOOTSTRAP_BIN="$S/own/holdfast" -- mcp --flag); rc=$?
+    out=$(pwsh_run HOLDFAST_BOOTSTRAP_BIN="$S/own/holdfast" -- mcp --flag); rc=$?
     chk "T14 BIN exit 0"             "$rc" 0
     chk "T14 BIN argv forwarded"     "$(printf '%s' "$out" | grep -c 'OWN-BINARY argv=\[mcp --flag\]')" 1
-    out=$(ps HOLDFAST_BOOTSTRAP_BIN=holdfast -- mcp); rc=$?
+    out=$(pwsh_run HOLDFAST_BOOTSTRAP_BIN=holdfast -- mcp); rc=$?
     chk "T14 relative refused"       "$(printf '%s' "$out" | grep -c 'must be an absolute path')" 1
     chk "T14 relative exit nonzero"  "$(yn $rc)" yes
-    out=$(ps HOLDFAST_BOOTSTRAP_BIN="$S/own/absent" -- mcp)
+    out=$(pwsh_run HOLDFAST_BOOTSTRAP_BIN="$S/own/absent" -- mcp)
     chk "T14 missing refused"        "$(printf '%s' "$out" | grep -c 'which is not a file -- nothing was downloaded')" 1
     rm -rf "$CACHE"
     printf '9.9.9\n' > "$PLUG/version.txt"
-    out=$(ps HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp); rc=$?
+    out=$(pwsh_run HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp); rc=$?
     chk "T14 404 exit nonzero"       "$(yn $rc)" yes
     chk "T14 404 says not published" "$(printf '%s' "$out" | grep -c 'no holdfast v9.9.9 binary to download.*answered 404')" 1
     chk "T14 404 names the build"    "$(printf '%s' "$out" | grep -c 'set HOLDFAST_BOOTSTRAP_BIN to')" 1
     chk "T14 404 no manual placement" "$(printf '%s' "$out" | grep -c 'place the extracted binary')" 0
-    out=$(ps HOLDFAST_BOOTSTRAP_BASE_URL=http://127.0.0.1:1 -- mcp)
+    out=$(pwsh_run HOLDFAST_BOOTSTRAP_BASE_URL=http://127.0.0.1:1 -- mcp)
     chk "T14 unreachable says so"    "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:1/v9.9.9/SHA256SUMS.txt')" 1
     chk "T14 unreachable places both" "$(printf '%s' "$out" | grep -c 'holdfast-v9.9.9-windows-x86_64.exe with SHA256SUMS.txt beside it as [^ ]*SHA256SUMS-v9.9.9.txt')" 1
-    out=$(ps HOLDFAST_BOOTSTRAP_BASE_URL="$BASE503" -- mcp)
+    out=$(pwsh_run HOLDFAST_BOOTSTRAP_BASE_URL="$BASE503" -- mcp)
     chk "T14 503 is said as such"    "$(printf '%s' "$out" | grep -c 'SHA256SUMS.txt answered HTTP 503 -- retry later, or build it')" 1
-    out=$(ps HOLDFAST_BOOTSTRAP_BASE_URL="$BASE302" -- mcp)
+    out=$(pwsh_run HOLDFAST_BOOTSTRAP_BASE_URL="$BASE302" -- mcp)
     chk "T14 302 then 404: not published" "$(printf '%s' "$out" | grep -c 'no holdfast v9.9.9 binary to download.*answered 404')" 1
+    out=$(pwsh_run HOLDFAST_BOOTSTRAP_BASE_URL="$BASENOWHERE" -- mcp)
+    chk "T14 redirect to nowhere: cannot reach" "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:[0-9]*/tonowhere/v9.9.9/SHA256SUMS.txt')" 1
 
     # **The initialize answer, as T12 checks it for `bootstrap`.** It is what
     # makes CHANGELOG's "says why in Claude Code" true of this file at all;
     # before, it said so of the Unix half only and read as both.
-    psio() { # psio <extra env...> -- <args...>; stdio is the caller's
+    pwsh_io() { # pwsh_io <extra env...> -- <args...>; stdio is the caller's
         _e=
         while [ "$1" != -- ]; do _e="$_e $1"; shift; done
         shift
@@ -593,7 +757,7 @@ else
             PROCESSOR_ARCHITECTURE=AMD64 HOLDFAST_BOOTSTRAP_INSECURE=1 $_e \
             "$PWSH" -NoProfile -NonInteractive -File "$PLUG/bootstrap.ps1" "$@"
     }
-    printf '%s\n' "$INIT" | psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp \
+    printf '%s\n' "$INIT" | pwsh_io HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp \
         > "$S/t14.out" 2> "$S/t14.err"; rc=$?
     chk "T14 init: exit nonzero"     "$(yn $rc)" yes
     chk "T14 init: one JSON-RPC line" "$(jfield "$S/t14.out" 'j["jsonrpc"]')" 2.0
@@ -602,20 +766,20 @@ else
     chk "T14 init: message == stderr line" "$(jfield "$S/t14.out" 'j["error"]["message"] == open(sys.argv[1][:-4]+".err").read().splitlines()[-1]')" True
     chk "T14 init: message says why" "$(jfield "$S/t14.out" '"no holdfast v9.9.9 binary to download" in j["error"]["message"]')" True
     printf '%s\n' '{"jsonrpc":"2.0","id":"req-7","method":"initialize","params":{}}' \
-        | psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp > "$S/t14s.out" 2> /dev/null
+        | pwsh_io HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp > "$S/t14s.out" 2> /dev/null
     chk "T14 init: string id echoed" "$(jfield "$S/t14s.out" 'repr(j["id"])')" "'req-7'"
     printf '%s\n' 'not json' \
-        | psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp > "$S/t14n.out" 2> /dev/null
+        | pwsh_io HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp > "$S/t14n.out" 2> /dev/null
     chk "T14 init: unreadable id is null" "$(jfield "$S/t14n.out" 'repr(j["id"])')" None
-    printf '%s\n' "$INIT" | psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- version \
+    printf '%s\n' "$INIT" | pwsh_io HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- version \
         > "$S/t14v.out" 2> /dev/null
     chk "T14 init: not under 'version'" "$(wc -c < "$S/t14v.out" | tr -d ' ')" 0
-    psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp < /dev/null > "$S/t14z.out" 2> /dev/null
+    pwsh_io HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp < /dev/null > "$S/t14z.out" 2> /dev/null
     chk "T14 init: no request, no reply" "$(wc -c < "$S/t14z.out" | tr -d ' ')" 0
     # Quote, backslash, tab and a non-ASCII letter, echoed from a relative
     # HOLDFAST_BOOTSTRAP_BIN into the message: the reply must parse, and say
     # `q"b\s té` -- the tab a space, the rest intact.
-    # Not through psio, which word-splits its env arguments -- on the tab.
+    # Not through pwsh_io, which word-splits its env arguments -- on the tab.
     printf '%s\n' "$INIT" | env -i PATH="$PATH" HOME="$S/fakehome" \
         HOLDFAST_BOOTSTRAP_BIN="$(printf 'q"b\\s\tt\303\251')" \
         "$PWSH" -NoProfile -NonInteractive -File "$PLUG/bootstrap.ps1" mcp \
@@ -625,12 +789,23 @@ else
     sleep 60 > "$S/quiet" &
     quiet=$!
     t0=$(date +%s)
-    psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp < "$S/quiet" > "$S/t14q.out" 2> "$S/t14q.err"
+    pwsh_io HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp < "$S/quiet" > "$S/t14q.out" 2> "$S/t14q.err"
     t1=$(date +%s)
     kill "$quiet" 2> /dev/null
     chk "T14 init: silent stdin bounded" "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
     chk "T14 init: silent stdin said why" "$(grep -c 'no holdfast v9.9.9 binary to download' "$S/t14q.err")" 1
     chk "T14 init: silent stdin no reply" "$(wc -c < "$S/t14q.out" | tr -d ' ')" 0
+    # A cache directory it cannot write, as T9 has for `bootstrap`. Uncaught,
+    # New-Item's failure was an error record on stderr and no answer.
+    rm -rf "$CACHE"
+    mkdir -p "$CACHE/bin"
+    chmod 500 "$CACHE/bin"
+    printf '%s\n' "$INIT" | pwsh_io HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp \
+        > "$S/t14r.out" 2> "$S/t14r.err"; rc=$?
+    chmod 700 "$CACHE/bin"
+    chk "T14 read-only cache: exit nonzero" "$(yn $rc)" yes
+    chk "T14 read-only cache: says so" "$(grep -c 'cannot create a temp directory in' "$S/t14r.err")" 1
+    chk "T14 read-only cache: answers initialize" "$(jfield "$S/t14r.out" '"cannot create a temp directory" in j["error"]["message"]')" True
     printf '0.1.0\n' > "$PLUG/version.txt"
 fi
 
@@ -707,6 +882,8 @@ for f in $FLAVOURS; do
     chk "T15 $f: no answer is not retried" "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
     out=$(wrun "$P" http://127.0.0.1:1 mcp)
     chk "T15 $f: unreachable says so" "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:1/v9.9.9/SHA256SUMS.txt')" 1
+    out=$(wrun "$P" "$BASENOWHERE" mcp)
+    chk "T15 $f: redirect to nowhere: cannot reach" "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:[0-9]*/tonowhere/v9.9.9/SHA256SUMS.txt')" 1
     printf '0.1.0\n' > "$PLUG/version.txt"
 done
 # **A wget that says it did not check the certificate is refused.** busybox
@@ -735,6 +912,119 @@ case "$FLAVOURS" in
         fi
         ;;
 esac
+
+echo "--- T16 the bootstrap deletes only a directory it created ---"
+# The failure path removes the download's temp directory, HF_TMP, and it used
+# to run that from the very first failure -- long before `mktemp` -- by
+# whatever HF_TMP held. A caller that exported HF_TMP for a directory of its
+# own lost it to the first early failure. Each row inherits HF_TMP naming a
+# directory with a file in it, and asserts two things: the failure's own
+# message, so the row is known to have reached the path it names, and that
+# the directory and its file are still there.
+V="$S/victim"
+kept() { [ -f "$V/keepme" ] && echo yes || echo no; }
+t16() { # t16 <label> <message> <env assignments...> <shell> <script>; argv `mcp`
+    _l=$1; _w=$2; shift 2
+    rm -rf "$V"; mkdir -p "$V"; : > "$V/keepme"
+    _o=$(env -i HF_TMP="$V" "$@" mcp 2>&1 < /dev/null)
+    chk "T16 $_l: reached" "$(printf '%s' "$_o" | grep -c "$_w")" 1
+    chk "T16 $_l: HF_TMP's dir is kept" "$(kept)" yes
+}
+mkdir -p "$S/lone" "$S/nover" "$S/nosha" "$S/nomktemp" "$S/fixmktemp"
+cp "$PLUG/bootstrap" "$S/lone/"
+cp "$PLUG/bootstrap" "$PLUG/lib-safe-extract.sh" "$S/nover/"
+for t in tr sed uname mkdir mktemp chmod rm cut head ls wc mv dirname sleep curl tar gzip; do
+    ln -sf "$(command -v "$t")" "$S/nosha/$t"
+done
+printf '#!/bin/sh\nexit 1\n' > "$S/nomktemp/mktemp"
+chmod 755 "$S/nomktemp/mktemp"
+rm -rf "$CACHE"
+t16 "BIN relative" 'must be an absolute path' \
+    PATH="$PATH" HOLDFAST_BOOTSTRAP_BIN=holdfast /bin/sh "$PLUG/bootstrap"
+# shellcheck disable=SC2088
+# Literal on purpose: an unexpanded tilde is the case under test.
+t16 "BIN with a tilde" 'nothing expands ~' \
+    PATH="$PATH" HOLDFAST_BOOTSTRAP_BIN='~/holdfast' /bin/sh "$PLUG/bootstrap"
+t16 "BIN missing" 'not an executable file' \
+    PATH="$PATH" HOLDFAST_BOOTSTRAP_BIN="$S/own/absent" /bin/sh "$PLUG/bootstrap"
+t16 "own directory unknown" 'cannot locate my own directory' \
+    PATH="$PATH" /bin/sh "$S/lone/bootstrap"
+t16 "version.txt missing" 'version.txt is missing' \
+    PATH="$PATH" /bin/sh "$S/nover/bootstrap"
+printf 'main\n' > "$PLUG/version.txt"
+t16 "version.txt not a version" 'does not hold a version' \
+    PATH="$PATH" /bin/sh "$PLUG/bootstrap"
+printf '0.1.0\n' > "$PLUG/version.txt"
+t16 "no prebuilt" "no prebuilt binary for 'FreeBSD'" \
+    PATH="$S/bsd:$PATH" CLAUDE_PLUGIN_DATA="$CACHE" /bin/sh "$PLUG/bootstrap"
+t16 "nowhere to cache" 'nowhere to cache the binary' \
+    PATH="$PATH" /bin/sh "$PLUG/bootstrap"
+t16 "no SHA-256 tool" 'no SHA-256 tool found' \
+    PATH="$S/nosha" CLAUDE_PLUGIN_DATA="$CACHE" /bin/sh "$PLUG/bootstrap"
+mkdir -p "$CACHE/bin"
+chmod 500 "$CACHE/bin"
+t16 "cache not writable" 'is not writable' \
+    PATH="$PATH" CLAUDE_PLUGIN_DATA="$CACHE" /bin/sh "$PLUG/bootstrap"
+chmod 700 "$CACHE/bin"
+t16 "mktemp fails" 'cannot create a temp directory' \
+    PATH="$S/nomktemp:$PATH" CLAUDE_PLUGIN_DATA="$CACHE" /bin/sh "$PLUG/bootstrap"
+# Past `mktemp`: HF_TMP is the bootstrap's own now, and that one IS removed.
+printf '9.9.9\n' > "$PLUG/version.txt"
+rm -rf "$CACHE"
+t16 "a 404, after its own temp dir" 'no holdfast v9.9.9 binary to download' \
+    PATH="$PATH" CLAUDE_PLUGIN_DATA="$CACHE" HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" \
+    HOLDFAST_BOOTSTRAP_INSECURE=1 /bin/sh "$PLUG/bootstrap"
+chk "T16 a 404: its own temp dir is gone" "$(count_matching "$CACHE/bin" '.dl.*')" 0
+# **A signal mid-download ends the run.** It used to remove the temp
+# directory and carry on, into commands whose paths were inside it; now the
+# trap exits, and the EXIT trap does the removing. Sent once the temp
+# directory exists, while the `/slow/` 404 is still three seconds away.
+rm -rf "$CACHE" "$V"
+mkdir -p "$V"
+: > "$V/keepme"
+env -i HF_TMP="$V" PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
+    HOLDFAST_BOOTSTRAP_BASE_URL="$BASESLOW" HOLDFAST_BOOTSTRAP_INSECURE=1 \
+    /bin/sh "$PLUG/bootstrap" mcp < /dev/null > "$S/t16t.out" 2>&1 &
+bp=$!
+i=0
+while [ "$(count_matching "$CACHE/bin" '.dl.*')" -eq 0 ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+chk "T16 TERM mid-download: it was mid-download" "$(count_matching "$CACHE/bin" '.dl.*')" 1
+kill -TERM "$bp"
+wait "$bp"; rc=$?
+chk "T16 TERM mid-download: exits 143" "$rc" 143
+chk "T16 TERM mid-download: does not carry on" "$(grep -c 'binary to download' "$S/t16t.out")" 0
+chk "T16 TERM mid-download: its own temp dir is gone" "$(count_matching "$CACHE/bin" '.dl.*')" 0
+chk "T16 TERM mid-download: HF_TMP's dir is kept" "$(kept)" yes
+printf '0.1.0\n' > "$PLUG/version.txt"
+# **Nor a path it has already removed, once it is somebody else's again.**
+# The install removes its temp directory and then runs the binary once; a
+# failure there removed "the temp directory" a second time, by name. Here
+# `mktemp` always answers the same name, and the binary's probe puts a
+# directory back at it before failing -- standing in for whatever else
+# comes to own that name.
+# shellcheck disable=SC2016
+# Literal: the body of the fake `mktemp`.
+printf '#!/bin/sh\nd=$(dirname "$2")/.dl.fixed\nmkdir "$d" && echo "$d"\n' > "$S/fixmktemp/mktemp"
+chmod 755 "$S/fixmktemp/mktemp"
+{
+    printf '#!/bin/sh\n'
+    # shellcheck disable=SC2016
+    # Literal `$1`: the fabricated binary's; the two paths are filled in now.
+    printf 'if [ "$1" = version ]; then mkdir -p "%s" && : > "%s/keepme"; exit 1; fi\n' \
+        "$CACHE/bin/.dl.fixed" "$CACHE/bin/.dl.fixed"
+    printf 'echo RECREATOR-RAN\n'
+} > "$W/recreator"
+fab_release 0.1.3 "$W/recreator"
+printf '0.1.3\n' > "$PLUG/version.txt"
+rm -rf "$CACHE"
+t16 "a failure after its own was removed" 'but cannot run it' \
+    PATH="$S/fixmktemp:$PATH" CLAUDE_PLUGIN_DATA="$CACHE" HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" \
+    HOLDFAST_BOOTSTRAP_INSECURE=1 /bin/sh "$PLUG/bootstrap"
+chk "T16 ...and the directory now at its old name is kept" "$([ -f "$CACHE/bin/.dl.fixed/keepme" ] && echo yes || echo no)" yes
+printf '0.1.0\n' > "$PLUG/version.txt"
 
 echo ""
 echo "pass=$pass fail=$fail skipped-sections=$skipped   http requests served=$(reqs)"
