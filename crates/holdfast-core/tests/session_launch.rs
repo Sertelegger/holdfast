@@ -28,11 +28,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// What every probe prints, on one line: the directory it runs in, the
-/// `PWD` it was handed, and the variables under test. `[…]` so an empty
-/// value is visible, and no `{`, which a profile would read as a slot.
-const PROBE: &str = "printf 'PROBE_OUT d=[%s] pwd=[%s] mark=[%s] home=[%s] path=[%s]\\n' \
-     \"$(pwd -P)\" \"$PWD\" \"$MARK\" \"$HOME\" \"$PATH\"; sleep 30";
+/// What every probe prints, on one line: the directory it runs in and the
+/// variables under test. `[…]` so an empty value is visible, and no `{`,
+/// which a profile would read as a slot.
+///
+/// **Not `$PWD`**, which a shell re-derives from the real directory when
+/// the inherited one disagrees — so a probe that printed it would pass
+/// whether or not Holdfast set it. `PWD` has its own row below, read by a
+/// program that takes its environment as given.
+const PROBE: &str = "printf 'PROBE_OUT d=[%s] mark=[%s] home=[%s] path=[%s]\\n' \
+     \"$(pwd -P)\" \"$MARK\" \"$HOME\" \"$PATH\"; sleep 30";
 
 fn body(r: &rmcp::model::CallToolResult) -> Value {
     r.structured_content.clone().expect("structured content")
@@ -174,11 +179,6 @@ async fn a_command_session_in_a_daemon_starts_where_its_caller_is() {
         project_b.path(),
         "the session ran in the daemon's directory, not its caller's: {seen:?}"
     );
-    assert_eq!(
-        seen["pwd"],
-        project_b.path(),
-        "`PWD` must name where the child runs, not where the environment came from"
-    );
     assert_eq!(seen["mark"], "from-the-client", "{seen:?}");
     assert!(
         seen["path"].ends_with(":/client-only-bin"),
@@ -227,7 +227,6 @@ async fn an_explicit_cwd_outranks_the_callers_directory() {
     let seen = probe_line(&server, &id);
     kill_all(&server);
     assert_eq!(seen["d"], elsewhere.path(), "{seen:?}");
-    assert_eq!(seen["pwd"], elsewhere.path(), "{seen:?}");
 }
 
 /// A client whose own directory has gone is refused rather than fallen
@@ -316,8 +315,57 @@ async fn in_process_a_session_inherits_this_processs_environment() {
     kill_all(&server);
     let here = std::env::current_dir().unwrap().canonicalize().unwrap();
     assert_eq!(seen["d"], here.to_str().unwrap(), "{seen:?}");
-    assert_eq!(seen["pwd"], here.to_str().unwrap(), "{seen:?}");
     assert_eq!(seen["home"], std::env::var("HOME").unwrap(), "{seen:?}");
+}
+
+/// `PWD` names the directory the child really runs in — on both hosts,
+/// and over an inherited value that names somewhere else.
+///
+/// Read by `/usr/bin/env`, which prints its environment exactly as it
+/// was handed it. A shell would not do: it re-derives `PWD` when the
+/// inherited one disagrees with `.`, which is why `bash` never showed
+/// the stale value and a script reading `$PWD` from Python did.
+#[tokio::test]
+async fn the_child_is_told_the_directory_it_really_runs_in() {
+    let project_b = Scratch::new("pwd");
+    let elsewhere = Scratch::new("pwd-explicit");
+    let server = HoldfastServer::new();
+    let env_dump = |cwd: Option<&str>| StartSessionArgs {
+        command: Some("/usr/bin/env".into()),
+        cwd: cwd.map(String::from),
+        ..Default::default()
+    };
+
+    // In a daemon: the caller's environment says it is somewhere else.
+    let mut client = a_client_in(project_b.path());
+    client
+        .env
+        .as_mut()
+        .unwrap()
+        .insert("PWD".into(), "/not/where/it/runs".into());
+    let hosted = hosted_by_daemon(Some(client), start(&server, env_dump(None))).await;
+
+    // In-process, with an explicit `cwd` away from this process's own —
+    // so the inherited `PWD` (this test's) is the wrong one there too.
+    let in_process = start(&server, env_dump(Some(elsewhere.path()))).await;
+
+    for (id, want) in [(hosted, project_b.path()), (in_process, elsewhere.path())] {
+        let session = server.registry.get(&id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let text = loop {
+            let text = String::from_utf8_lossy(&session.read_from(0, 1 << 20).bytes).to_string();
+            if !session.is_alive() && session.reader_finished() {
+                break text;
+            }
+            assert!(Instant::now() < deadline, "env never finished: {text:?}");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let pwd: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.trim_end().strip_prefix("PWD="))
+            .collect();
+        assert_eq!(pwd, [want], "the child was handed the wrong PWD: {text:?}");
+    }
 }
 
 /// **GH #239.** Every session is handed a pager that does not wait, and
