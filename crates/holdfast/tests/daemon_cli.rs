@@ -2645,24 +2645,62 @@ fn daemon_stop_returns_once_the_daemon_is_gone_and_its_directory_stays_gone() {
         started["result"]["structuredContent"]["status"], "ok",
         "{started}"
     );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    // The shell has to be running its read loop before it is stopped: a
+    // SIGTERM that lands while bash is still starting, before it has set
+    // itself up to ignore one, kills it at once — a fast stop with nothing
+    // to wait for, and a red row that says nothing about the stop.
+    shim.call_tool(
+        "send_input",
+        json!({ "session": session_id, "data": "echo READY''_MARK" }),
+    );
+    let seen = shim.read_until(&session_id, "READY_MARK");
+    assert!(seen.contains("READY_MARK"), "the shell never started: {seen:?}");
     let pid = env.daemon_pid().expect("pid file");
     shim.kill();
 
-    let (code, out, err) = env.run(&["daemon", "stop"]);
+    // **The issue's own idiom, run by a shell**: `daemon stop && rm -rf`,
+    // with the daemon's state read in the instant between the two. The
+    // window this closes is milliseconds wide — the old stop returned as
+    // the daemon began a teardown that takes little longer — so a check
+    // made after `TestEnv::run`'s 10 ms exit poll sees the daemon gone
+    // whether or not the stop waited for it. Measured: that version of
+    // this row passed against a stop that did not wait, twice in two.
+    let script = format!(
+        "\"$0\" daemon stop || exit $?; \
+         if kill -0 {pid} 2>/dev/null; then \
+           echo \"STATE alive $(cut -d')' -f2- /proc/{pid}/stat 2>/dev/null | cut -d' ' -f2)\"; \
+         else echo 'STATE gone'; fi; \
+         rm -rf \"$HOLDFAST_RUNTIME_DIR\""
+    );
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .arg(BIN)
+        .env("HOLDFAST_RUNTIME_DIR", &env.dir)
+        .env("XDG_CONFIG_HOME", env.dir.join("xdg-config"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run sh");
+    let (code, out, err) =
+        wait_bounded(child, CLI_TIMEOUT).expect("`daemon stop && rm -rf` did not finish");
     assert_eq!(code, 0, "stdout: {out} stderr: {err}");
     assert!(out.contains("daemon stopped"), "{out}");
-    if have_proc() {
-        assert!(
-            ended(pid),
-            "`daemon stop` returned while the daemon (pid {pid}) was still running"
-        );
-    }
+    // A zombie has finished everything it will do to the directory.
+    assert!(
+        out.contains("STATE gone") || out.contains("STATE alive Z"),
+        "`daemon stop` returned while the daemon (pid {pid}) was still running: {out}"
+    );
     assert!(
         err.contains("waiting for 1 live session"),
         "a stop that spends the whole grace must say what it is waiting for: {err}"
     );
 
-    std::fs::remove_dir_all(&env.dir).expect("remove the runtime directory");
     // Longer than everything the daemon did after answering, measured
     // before this fix: the teardown and the 250 ms runtime shutdown.
     std::thread::sleep(Duration::from_millis(750));

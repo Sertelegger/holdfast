@@ -3361,11 +3361,13 @@ mod tests {
         let paths = scratch("noexit");
         let _scoped = Scoped(paths.clone());
         paths.ensure_dir().unwrap();
-        let mut lingering = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .expect("spawn sleep");
-        let daemon = answering_daemon(&paths, lingering.id());
+        let lingering = Reaped(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let daemon = answering_daemon(&paths, lingering.0.id());
 
         let code = tokio::time::timeout(
             Duration::from_secs(20),
@@ -3379,9 +3381,7 @@ mod tests {
         .await
         .expect("the wait for the exit is bounded");
         assert_eq!(code, EXIT_FAILED);
-        assert!(!process_is_gone(lingering.id()), "the control: it really was alive");
-        let _ = lingering.kill();
-        let _ = lingering.wait();
+        assert!(!process_is_gone(lingering.0.id()), "the control: it really was alive");
         daemon.abort();
     }
 
@@ -3390,13 +3390,15 @@ mod tests {
     /// reports as alive.
     #[test]
     fn a_zombie_is_gone_and_a_live_process_is_not() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
+        let mut child = Reaped(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let pid = child.0.id();
         assert!(!process_is_gone(pid), "a sleeping child is alive");
-        child.kill().unwrap();
+        child.0.kill().unwrap();
         if std::path::Path::new("/proc/self/stat").exists() {
             // Not yet reaped: a zombie. Wait for the kill to land.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -3405,8 +3407,19 @@ mod tests {
             }
             assert!(process_is_gone(pid), "an unreaped, killed child is a zombie and gone");
         }
-        child.wait().unwrap();
+        child.0.wait().unwrap();
         assert!(process_is_gone(pid), "a reaped child is gone");
+    }
+
+    /// A child that is killed and reaped when the row ends, pass or fail,
+    /// so a failing row does not leave a `sleep 60` behind it — which
+    /// nextest reports as a leak and a later row could trip over.
+    struct Reaped(std::process::Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     /// The bound the shipped command really passes must leave room for
