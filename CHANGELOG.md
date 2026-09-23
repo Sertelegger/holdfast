@@ -687,14 +687,16 @@ is cut, named and published is in
   priority order — secrets, then how to wait for a command without guessing
   at `$PS1`, then what `interaction_mode` and `detection_tier` mean, then
   output handling, then a one-line map of the rest — and now also says
-  never to ask for a secret in chat, and what to do when nobody answers:
-  under `--no-daemon` and on Windows there is no `attach.sock`, so a
-  request can only time out, and the agent is told to name the command
-  that needs the credential rather than ask for it. `send_input`'s own
-  description carries the password rule, the hybrid transport's suffix
-  says how a human answers (`holdfast attach <session>`), and what the old
-  text said about `wait_for_pattern` alone — that a pattern-less wait
-  returns at once for `Fullscreen`, `AwaitingSecret` and `Exited`, that
+  never to ask for a secret in chat, and what to do when nobody answers.
+  That comes back two ways: under `--no-daemon` no client can attach, so
+  the request ends `secret_cancelled` at its timeout, and on Windows it is
+  refused at once as `not_supported_on_platform`. On either, the agent is
+  told to name the command that needs the credential rather than ask for
+  it. `send_input`'s own description carries the password rule, the hybrid
+  transport's suffix says how a human answers (`holdfast attach
+  <session>`), and what the old text said about `wait_for_pattern` alone —
+  that a pattern-less wait ends promptly for `Fullscreen`, `AwaitingSecret`
+  and `Exited`, that
   `prompt.reason` tells a measured prompt from a guessed one, and the
   `warning` on an unmatched wait at a measured prompt — moved into that
   tool's description.
@@ -705,23 +707,38 @@ is cut, named and published is in
   in-process one for `--no-daemon` and Windows. Each must fit, and must
   carry the secret rule within its first quarter, so a later edit that
   grows the text loses the map at the end rather than the rule at the top.
-  `scripts/mcp-smoke.sh` asserts the same on the wire. To see the served
-  text and its length, run `holdfast mcp` and read `initialize`'s
-  `instructions`.
+  The rule is pinned as whole clauses rather than as its words, because
+  the words survive deleting the chat prohibition, deleting the fallback,
+  and inverting `send_input`'s rule. `scripts/mcp-smoke.sh` asserts the
+  same on the wire. To see the served text and its length, run `holdfast
+  mcp` and read `initialize`'s `instructions`.
 
 - **`[REDACTED:unresolved]` is explained to the agent (GH #242, the
-  explanation half).** It is the one marker that names no rule — nothing
-  matched those bytes, and the read could not vouch for them — and agents
-  were told nothing about it, so they read it as *a secret was here*.
-  `read_output`'s description now says what it is, that a re-read — later,
+  explanation half).** It is the one marker that names no rule, and agents
+  were told nothing about it. `read_output`'s description now says it
+  covers bytes the read could not vouch for, starting at something that
+  began like a secret whose end the read could not see; that this is often
+  ordinary text but **can hide a real secret** — the one that began there,
+  or a token a rule did match inside the region, which `merge_spans` then
+  counts as `unresolved` and not under its own kind; that a re-read — later,
   or with a different `max_bytes` — sometimes clears it but is not
   guaranteed to (`output/mod.rs` records protection as non-monotonic in
-  `max_bytes`), that `redact: false` is the reliable way to the text and is
-  audit-logged, and that `redactions` counts only the markers a response
-  substituted, which is how a real marker is told from marker-shaped text
-  already in the output. The server instructions carry the short form. How
-  much the marker masks is the other half of GH #242 and is not changed
-  here.
+  `max_bytes`); that `redact: false` returns the text with any secret in it,
+  is audit-logged, and is for a region the agent already knows is not a
+  credential, not for finding out; and that `redactions` counts only the
+  markers a response substituted, which is how a real marker is told from
+  marker-shaped text already in the output. The server instructions carry
+  the short form.
+
+  **It does not say *nothing matched*, which is how the marker is usually
+  glossed and is false.** An unterminated private-key header followed a
+  few lines later by a GitHub token comes back as one
+  `[REDACTED:unresolved]` with `redactions: {unresolved: 1}` and no
+  `github` count, so a text that called the bytes unmatched and then
+  offered `redact: false` would send an agent to read a live token raw. A
+  row holds the instructions and every tool description to never saying
+  it. How much the marker masks is the other half of GH #242 and is not
+  changed here.
 
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are

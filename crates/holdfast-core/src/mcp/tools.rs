@@ -836,16 +836,21 @@ impl HoldfastServer {
     /// secret-redacted by default: a secret becomes `[REDACTED:<kind>]`,
     /// naming the rule that matched it.
     ///
-    /// `[REDACTED:unresolved]` is different: no rule matched those bytes.
-    /// They belong to something that started like a secret (a private-key
-    /// header, or a token-shaped run of characters) whose end this read
-    /// could not see, so they could not be vouched for. It is often
-    /// ordinary text. A re-read — later, once more output has arrived, or
-    /// with a different `max_bytes` — sometimes clears it, but neither is
-    /// guaranteed. The reliable way to the text is `redact: false`, which
-    /// returns it raw and is recorded in the audit log. `redactions` counts
-    /// only the markers this response substituted, so marker-shaped text
-    /// that was already in the output is not counted.
+    /// `[REDACTED:unresolved]` is different: it covers bytes this read
+    /// could not vouch for. They start at something that began like a
+    /// secret (a private-key header, or a token-shaped run of characters)
+    /// whose end the read could not see. That is often ordinary text, but
+    /// it can hide a real secret: the one that began there, or one a rule
+    /// did match inside the region, which is then counted as `unresolved`
+    /// and not under its own kind. A re-read — later, once more output has
+    /// arrived, or with a different `max_bytes` — sometimes clears it, but
+    /// neither is guaranteed. `redact: false` returns the raw text, any
+    /// secret in it included, and is recorded in the audit log: use it
+    /// only when you already know the region is not a credential (source
+    /// or documentation that quotes a key header, say), not to find out
+    /// whether it is. `redactions` counts only the markers this response
+    /// substituted, so marker-shaped text that was already in the output
+    /// is not counted.
     #[tool(
         annotations(
             title = "Read session output",
@@ -1380,13 +1385,13 @@ impl HoldfastServer {
     /// output_since_start are secret-redacted; match.offset is the raw
     /// byte offset.
     ///
-    /// With no pattern it waits for the session to stop executing and
-    /// returns as soon as it is anything but `Executing`, so `Fullscreen`,
-    /// `AwaitingSecret` and `Exited` come back at once rather than at the
-    /// deadline: read `interaction_mode`, because each needs a different
-    /// action. `detection_tier` and `prompt.reason` tell a measured prompt
-    /// from a guessed one. A wait that ends unmatched against a session
-    /// already back at a measured prompt says so in `warning`.
+    /// With no pattern it waits for the session to stop executing, so
+    /// `Fullscreen`, `AwaitingSecret` and `Exited` come back promptly
+    /// rather than at the deadline: read `interaction_mode`, because each
+    /// needs a different action. `detection_tier` and `prompt.reason` tell
+    /// a measured prompt from a guessed one. A wait that ends unmatched
+    /// against a session already back at a measured prompt says so in
+    /// `warning`.
     #[tool(
         annotations(
             title = "Wait for a regex to match output",

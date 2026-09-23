@@ -24,18 +24,30 @@ fn description(tool: rmcp::model::Tool) -> String {
 }
 
 /// **GH #242, the explanation half.** `[REDACTED:unresolved]` names no
-/// rule and means the opposite of every other marker — nothing matched,
-/// and the read could not vouch for the bytes — and agents were told
-/// nothing about it, so they read it as *a secret was here*. On this
-/// repository's own CHANGELOG it covered whole sections of ordinary prose.
+/// rule, and agents were told nothing about it, so they read it as *a
+/// secret was here*. On this repository's own CHANGELOG it covered whole
+/// sections of ordinary prose.
 ///
 /// Each needle is a separate thing the agent has to be able to act on:
-/// what the marker is (and that it is not a rule's), that a re-read is
-/// **not** a guaranteed way past it, the audited way to the raw text, and
-/// that `redactions` is how a real marker is told from one that was
-/// already in the text.
+/// what the marker is; that it can nonetheless hide a real secret,
+/// including one a rule matched; that a re-read is **not** a guaranteed
+/// way past it; what `redact: false` returns, that it is audited, and
+/// when it may be used; and that `redactions` is how a real marker is
+/// told from one that was already in the text.
 ///
-/// The second needle is a promise *not* made, and it is pinned for that
+/// **The caveat is pinned because the first draft said the opposite.** It
+/// read *"no rule matched those bytes. … It is often ordinary text. … The
+/// reliable way to the text is `redact: false`"*, and the review drove it
+/// against the code: an unterminated private-key header, then a GitHub
+/// token a few lines on, came back as one `[REDACTED:unresolved]` with
+/// `redactions: {unresolved: 1}` and no `github` count, because
+/// `output::redact::merge_spans` folds a real match that meets an
+/// unjudgeable region into the one marker (pinned on the read path by
+/// `output::tests::an_unresolved_mask_that_meets_a_real_match_is_one_marker_and_the_weaker_kind`).
+/// An agent following that text re-reads with `redact: false` and pulls
+/// a live credential into its context believing nothing matched.
+///
+/// The re-read needle is a promise *not* made, and it is pinned for that
 /// reason. `output/mod.rs` records that a larger `max_bytes` "is **not** a
 /// general recourse" and that protection is non-monotonic in it — a read
 /// that reaches `buffer.head` takes a branch `max_bytes` cannot move — so
@@ -45,11 +57,13 @@ fn description(tool: rmcp::model::Tool) -> String {
 fn read_output_explains_the_unresolved_marker_and_the_audited_way_past_it() {
     let d = description(HoldfastServer::read_output_tool_attr());
     for needle in [
-        "[REDACTED:unresolved]",
-        "no rule matched",
+        "`[REDACTED:unresolved]` is different: it covers bytes this read could not vouch for",
+        "it can hide a real secret",
+        "or one a rule did match inside the region, which is then counted as `unresolved`",
         "neither is guaranteed",
-        "The reliable way to the text is `redact: false`",
+        "`redact: false` returns the raw text, any secret in it included",
         "audit log",
+        "use it only when you already know the region is not a credential",
         "`redactions` counts only the markers this response substituted",
     ] {
         assert!(
@@ -59,18 +73,51 @@ fn read_output_explains_the_unresolved_marker_and_the_audited_way_past_it() {
     }
 }
 
+/// What no tool description may say about `[REDACTED:unresolved]`,
+/// compared case-insensitively: that nothing matched the bytes under it.
+/// See the row above for why that is false, and what it costs.
+///
+/// Every tool rather than `read_output` alone, because the claim is the
+/// one a writer reaches for — §9.2 of the spec and `redact.rs`'s own
+/// `UNRESOLVED_KIND` doc both put it that way — and `wait_for_pattern`,
+/// `send_input` and `get_screen_state` all return redacted text. The
+/// server instructions are held to the same list by
+/// `mcp::tests::assert_instructions_survive_the_client`, which this
+/// copies because an integration test cannot see a `#[cfg(test)]` item.
+#[test]
+fn no_tool_description_calls_the_unresolved_marker_unmatched() {
+    const FALSE_UNRESOLVED_CLAIMS: [&str; 2] = ["no rule matched", "nothing matched"];
+    let tools = passthrough::tool_manifest();
+    assert!(tools.len() >= 12, "the router lost tools");
+    for tool in tools {
+        let name = tool.name.to_string();
+        let d = description(tool).to_lowercase();
+        for claim in FALSE_UNRESOLVED_CLAIMS {
+            assert!(
+                !d.contains(claim),
+                "`{name}`'s description says {claim:?}, which is false of \
+                 `[REDACTED:unresolved]` when a real match was folded into it:\n{d}"
+            );
+        }
+    }
+}
+
 /// **What the old instructions said about `wait_for_pattern`, now on the
 /// tool itself.** GH #230's rewrite cut the instructions to what an agent
 /// must not miss and moved per-tool detail to the tool it is about. These
 /// three were only ever in the instructions: that a pattern-less wait
-/// returns at once for the three non-`Executing` modes, that
+/// ends promptly for the three non-`Executing` modes, that
 /// `prompt.reason` separates a measured prompt from a guessed one, and
 /// that an unmatched wait at a measured prompt says so in `warning`.
+///
+/// *Promptly* rather than *at once*: GH #248 holds a `Fullscreen` or
+/// `AwaitingSecret` already showing at the first sample for the settle
+/// window, in case it predates the write the wait follows.
 #[test]
 fn wait_for_pattern_carries_what_the_instructions_used_to_say_about_it() {
     let d = description(HoldfastServer::wait_for_pattern_tool_attr());
     for needle in [
-        "come back at once rather than at the deadline",
+        "`Fullscreen`, `AwaitingSecret` and `Exited` come back promptly rather than at the deadline",
         "`prompt.reason`",
         "`warning`",
     ] {
@@ -87,10 +134,20 @@ fn wait_for_pattern_carries_what_the_instructions_used_to_say_about_it() {
 /// stdin."* — so nothing an agent actually received told it not to type a
 /// password here. The instructions now lead with the rule; this is the
 /// copy on the tool an agent is about to misuse.
+///
+/// **The needle is the prohibition, not its vocabulary.** It used to be
+/// `AwaitingSecret` and `request_secret_input` separately, and the review
+/// rewrote the paragraph as *"Also for a password: when interaction_mode
+/// is AwaitingSecret, type it here directly; request_secret_input is only
+/// needed when no agent knows the value"* — both words present, the rule
+/// inverted, every row green.
 #[test]
 fn send_input_points_a_password_prompt_at_request_secret_input() {
     let d = description(HoldfastServer::send_input_tool_attr());
-    for needle in ["AwaitingSecret", "request_secret_input"] {
+    for needle in [
+        "Not for a password: when `interaction_mode` is `AwaitingSecret`, use `request_secret_input`",
+        "never passes through you",
+    ] {
         assert!(
             d.contains(needle),
             "send_input's advertised description dropped {needle:?}, which is what \

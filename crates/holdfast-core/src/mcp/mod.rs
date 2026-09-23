@@ -58,20 +58,39 @@ use std::sync::Arc;
 // `get_info`, by `tests::assert_instructions_survive_the_client`.
 //
 // So the order is the priority: the secret rule — including what to do
-// when nobody answers it, since under `--no-daemon` and on Windows nothing
-// can — then how to wait for a command without guessing at `$PS1`, then
-// what the state fields mean, then output handling (including what
-// `[REDACTED:unresolved]` is, GH #242), then a one-line map of the rest.
-// Per-tool detail belongs in the tool's own description, which the client
-// carries separately; what this text used to say about `wait_for_pattern`
-// moved into that tool's.
+// when nobody answers it — then how to wait for a command without guessing
+// at `$PS1`, then what the state fields mean, then output handling
+// (including what `[REDACTED:unresolved]` is, GH #242), then a one-line
+// map of the rest. Per-tool detail belongs in the tool's own description,
+// which the client carries separately; what this text used to say about
+// `wait_for_pattern` moved into that tool's. The map carries names and not
+// mechanics for the same reason — process groups and `SIGWINCH` are in
+// `interrupt`'s, `terminate`'s and `resize`'s own descriptions — and that
+// is where the room for the two caveats below came from.
+//
+// **Nobody answering is two statuses, not one.** Under `--no-daemon` no
+// human can answer: no client can attach, so unless a keychain binding
+// does, the request ends `secret_cancelled` at its timeout. On Windows it
+// is refused at once as `not_supported_on_platform`, because
+// `platform::Capabilities::out_of_band_secret_input` is `cfg!(unix)`. The
+// fallback names both, since a rule keyed on the first alone leaves a
+// Windows agent holding a refusal and no instruction.
+//
+// **The unresolved sentence is a caveat and must stay one.** It does not
+// say *no rule matched*: `output::redact::merge_spans` folds a real match
+// that meets an unjudgeable region into the one `unresolved` marker, so a
+// live token can sit under it, uncounted under its own kind
+// (`output::tests::an_unresolved_mask_that_meets_a_real_match_is_one_marker_and_the_weaker_kind`),
+// and an unterminated private-key header may be exactly what it looks
+// like. A sentence that called the marker harmless and then pointed at
+// `redact:false` would send an agent to read that token raw.
 pub const INSTRUCTIONS: &str = "Holdfast gives you persistent PTY-backed terminal sessions.\n\n\
      SECRETS: when interaction_mode is AwaitingSecret the session is at a \
      password prompt. Use request_secret_input, NEVER send_input, and never \
      ask the user to paste a secret into chat: a human at an attached client \
-     types it into the terminal and you get back only a byte count. If it is \
-     cancelled, tell the user which command needs a credential; never ask \
-     for it in chat.\n\n\
+     types it into the terminal and you get back only a byte count. If it \
+     returns secret_cancelled or not_supported_on_platform, tell the user \
+     which command needs a credential; never ask for it in chat.\n\n\
      WAITING: to wait for a command, call wait_for_pattern with NO pattern; \
      it returns once the session is not Executing. Never pass a regex for \
      the shell's prompt: it guesses at $PS1, never matches a custom one, and \
@@ -85,14 +104,15 @@ pub const INSTRUCTIONS: &str = "Holdfast gives you persistent PTY-backed termina
      heuristic (a guess: a quiet session reads as finished).\n\n\
      OUTPUT: read_output pages with a cursor you carry between calls. \
      Output is ANSI-stripped and secrets become [REDACTED:<kind>]. \
-     [REDACTED:unresolved] means no rule matched but the read could not \
-     rule a secret out; it is often ordinary text and a later re-read may \
-     clear it. redact:false shows raw bytes and is audit-logged.\n\n\
+     [REDACTED:unresolved] covers bytes the read could not vouch for: often \
+     ordinary text, but it can hide a real secret, and a later re-read may \
+     clear it. redact:false shows raw bytes, secrets included, and is \
+     audit-logged: use it only when you know the text is not a credential.\n\n\
      TOOLS: start_session spawns a shell or program; send_input types into \
-     it; interrupt sends Ctrl+C to the foreground process group; terminate \
-     ends the session and its process group; get_screen_state returns the \
-     rendered grid, the read for full-screen programs; resize sets the size \
-     and sends SIGWINCH; status and list_sessions describe sessions.";
+     it; interrupt sends Ctrl+C; terminate ends the session; \
+     get_screen_state returns the rendered grid, the read for full-screen \
+     programs; resize sets the size; status and list_sessions describe \
+     sessions.";
 
 /// How much of a server's `instructions` Claude Code passes to the model,
 /// in UTF-16 code units (GH #230).
@@ -901,6 +921,62 @@ mod tests {
     /// end and not the rule at the top.
     pub(super) const SAFETY_RULES_WITHIN: usize = CLIENT_INSTRUCTIONS_BUDGET / 4;
 
+    /// The secret rule as **clauses**, each of which must end inside
+    /// [`SAFETY_RULES_WITHIN`].
+    ///
+    /// Clauses and not vocabulary, because vocabulary survives the edits
+    /// that matter. This list was `AwaitingSecret`, `request_secret_input`
+    /// and `NEVER send_input`, and the review of GH #230 measured three
+    /// mutations it passed: deleting *never ask the user to paste a secret
+    /// into chat* — the exact failure #230 names — deleting the fallback
+    /// for a request nobody answers, and deleting the whole `$PS1`
+    /// paragraph. A reword that keeps the words and changes what they say
+    /// still gets past a clause; one that keeps the *meaning* in different
+    /// words fails here, and should, so whoever makes it re-reads the rule.
+    ///
+    /// The fallback names both statuses because a request nobody can
+    /// answer comes back two ways: `secret_cancelled` at its timeout under
+    /// `--no-daemon`, and `not_supported_on_platform` at once on Windows.
+    /// `scripts/mcp-smoke.sh` carries the same four strings.
+    const SECRET_RULE_CLAUSES: [&str; 4] = [
+        "when interaction_mode is AwaitingSecret",
+        "Use request_secret_input, NEVER send_input",
+        "never ask the user to paste a secret into chat",
+        "If it returns secret_cancelled or not_supported_on_platform, tell the user \
+         which command needs a credential; never ask for it in chat",
+    ];
+
+    /// What the rest of the text must still say, anywhere in it — the
+    /// whole of it fits the budget, so presence is enough.
+    const BODY_CLAUSES: [&str; 7] = [
+        // WAITING. Unpinned before GH #230's review: the paragraph could
+        // be deleted with every row green.
+        "call wait_for_pattern with NO pattern",
+        "Never pass a regex for the shell's prompt",
+        // OUTPUT (GH #242): what the marker is, that it is not harmless,
+        // and what the way past it costs.
+        "[REDACTED:unresolved] covers bytes the read could not vouch for",
+        "it can hide a real secret",
+        "redact:false shows raw bytes, secrets included",
+        "audit-logged",
+        "use it only when you know the text is not a credential",
+    ];
+
+    /// What neither the instructions nor any tool description may say
+    /// about `[REDACTED:unresolved]`, compared case-insensitively.
+    ///
+    /// The first draft of GH #242's text said *no rule matched those
+    /// bytes*, and the review ran it against the code: an unterminated
+    /// private-key header, then a GitHub token a few lines on that the
+    /// `github` rule matches, came back as one `[REDACTED:unresolved]`
+    /// with `redactions: {unresolved: 1}` — `merge_spans` folds the real
+    /// match into the region. A text that says nothing matched and then
+    /// points at `redact:false` sends an agent to read that token raw.
+    /// `tests/agent_guidance.rs` holds every tool description to a copy
+    /// of this list — a copy because an integration test cannot see a
+    /// `#[cfg(test)]` item of the library.
+    const FALSE_UNRESOLVED_CLAIMS: [&str; 2] = ["no rule matched", "nothing matched"];
+
     /// The one assertion both transports' `instructions` go through, so
     /// the in-process text and the shim's cannot be held to two different
     /// standards (GH #230).
@@ -928,20 +1004,26 @@ mod tests {
                 kept <= SAFETY_RULES_WITHIN
             })
             .collect();
-        for rule in ["AwaitingSecret", "request_secret_input", "NEVER send_input"] {
+        for rule in SECRET_RULE_CLAUSES {
             assert!(
                 head.contains(rule),
-                "{transport}: `{rule}` is not in the first {SAFETY_RULES_WITHIN} units of \
-                 the instructions. The password-prompt rule goes first, because it is the \
-                 one whose absence costs a credential:\n{head}"
+                "{transport}: `{rule}` does not end within the first {SAFETY_RULES_WITHIN} \
+                 units of the instructions. The password-prompt rule goes first, because it \
+                 is the one whose absence costs a credential:\n{head}"
             );
         }
-        // GH #242's explanation half: the marker that names no rule is
-        // explained, and so is the audited way past it.
-        for needle in ["[REDACTED:unresolved]", "redact:false", "audit"] {
+        for clause in BODY_CLAUSES {
             assert!(
-                text.contains(needle),
-                "{transport}: the instructions no longer mention `{needle}`"
+                text.contains(clause),
+                "{transport}: the instructions no longer say `{clause}`:\n{text}"
+            );
+        }
+        let lower = text.to_lowercase();
+        for claim in FALSE_UNRESOLVED_CLAIMS {
+            assert!(
+                !lower.contains(claim),
+                "{transport}: the instructions say `{claim}` of the unresolved marker, \
+                 which is false when a real match was folded into it:\n{text}"
             );
         }
     }

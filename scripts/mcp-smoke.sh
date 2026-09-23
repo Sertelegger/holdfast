@@ -553,22 +553,35 @@ jcheck "initialize's instructions name every tool" \
 # so a response that never arrived is `"null"` rather than a `null` that
 # jq happily measures as short. 2048 is `mcp::CLIENT_INSTRUCTIONS_BUDGET`
 # and 512 its first quarter, the Rust row's `SAFETY_RULES_WITHIN`; the
-# needles are that row's too, and each must END inside the quarter, as
-# there, rather than merely start in it.
+# needles are that row's `SECRET_RULE_CLAUSES`, and each must END inside
+# the quarter, as there, rather than merely start in it. Clauses, not
+# words: the words `AwaitingSecret`, `request_secret_input` and `NEVER
+# send_input` all survived deleting the chat prohibition and the fallback
+# for a request nobody answers, which is what GH #230's review measured.
+# The last element is the claim the text must NOT make about
+# `[REDACTED:unresolved]` (GH #242's review): a real match folded into the
+# region means something did match, and the text points at `redact:false`.
 jcheck "initialize's instructions fit the client's budget with the secret rule first (GH #230)" \
   'resp(1).result.instructions as $i
    | [($i | type), ($i | length <= 2048),
-      (["AwaitingSecret","request_secret_input","NEVER send_input"]
+      (["when interaction_mode is AwaitingSecret",
+        "Use request_secret_input, NEVER send_input",
+        "never ask the user to paste a secret into chat",
+        "If it returns secret_cancelled or not_supported_on_platform, tell the user which command needs a credential; never ask for it in chat"]
        | map(. as $n | ($i | index($n)) as $x | ($x != null and $x + ($n | length) <= 512))
-       | all)]' \
-  '["string",true,true]'
+       | all),
+      ($i | ascii_downcase | (contains("no rule matched") or contains("nothing matched")) | not)]' \
+  '["string",true,true,true]'
 # And the two tool descriptions the short instructions now lean on: what
-# `[REDACTED:unresolved]` is and the audited way past it (GH #242), and the
-# password rule on the tool an agent would misuse.
-jcheck "read_output explains [REDACTED:unresolved]; send_input points at request_secret_input" \
+# `[REDACTED:unresolved]` is, that it can still hide a real secret, and the
+# audited way past it (GH #242); and the password prohibition on the tool
+# an agent would misuse, as the prohibition rather than its vocabulary.
+jcheck "read_output explains [REDACTED:unresolved]; send_input says it is not for a password" \
   '[(tool("read_output").description | gsub("\\s+";" ")
-     | contains("[REDACTED:unresolved]") and contains("`redact: false`")),
-    (tool("send_input").description | contains("request_secret_input"))]' \
+     | contains("[REDACTED:unresolved]") and contains("`redact: false`")
+       and contains("it can hide a real secret")),
+    (tool("send_input").description | gsub("\\s+";" ")
+     | contains("Not for a password: when `interaction_mode` is `AwaitingSecret`, use `request_secret_input`"))]' \
   '[true,true]'
 
 # ------------------------------------------------- the advertised surface
