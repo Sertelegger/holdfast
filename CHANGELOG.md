@@ -246,7 +246,9 @@ is cut, named and published is in
   unrelated repository cannot report that repository's commit — else
   `unknown`. It never fails a build. Every commit now recompiles
   `holdfast-core`, which is what a build id that changes with the commit
-  costs ([#178]).
+  costs. The release rehearsal's check that `HOLDFAST_BUILD_SHA` reached the
+  build now looks for the exact 40-hex sha, since a build it did not reach
+  no longer says `build unknown` ([#178]).
 - **`holdfast daemon stop` returns once the daemon has exited**, not once it
   has answered. The answer comes before the daemon's teardown, so `daemon
   stop && rm -rf "$HOLDFAST_RUNTIME_DIR"` raced it; the stop now waits up to
@@ -688,10 +690,13 @@ is cut, named and published is in
   exit 0 — and both viewers' truncation notices send the operator there for
   what they missed. One `read_output` returns at most one page, and the command
   made one call and ignored `truncated_for_size` and `next_cursor`. It now
-  follows `next_cursor` to the end, stopping at a holdback (where
-  `held_back_note` says why, as before) and at the head as it stood when the
-  command started, so a session printing faster than it can be read cannot
-  keep it running. It reads from the ring's tail rather than from 0, so it is
+  follows `next_cursor` to the end, stopping only at a holdback that makes no
+  progress (where `held_back_note` says why, as before) and at the head as it
+  stood when the command started, so a session printing faster than it can be
+  read cannot keep it running. A page the daemon ended early at an escape
+  sequence its own boundary cut in half — most pages of coloured output — is
+  read past, as §4.1 says to: stopping there would have ended `holdfast logs`
+  of a `grep --color` log a third of the way in. It reads from the ring's tail rather than from 0, so it is
   no longer audited as `truncated_at_tail`, and says on stderr when the
   session's front has left the buffer or bytes left it mid-read. `--tail N`
   longer than one page was cut to the newest 256 KiB, starting mid-line; it
@@ -708,9 +713,11 @@ is cut, named and published is in
   commands write to the control socket, and a daemon dying mid-call must still
   read as "unreachable", exit 2. Any other stdout failure (`> /dev/full`) is
   said on stderr and exits 1. **`holdfast watch | head` never exited at all**,
-  because it discarded its write errors; it now ends at the first write after
-  its reader has gone. `attach` is unchanged: its stdout is the terminal it
-  holds in raw mode ([#218]).
+  because it discarded its write errors; it now ends as soon as its reader has
+  gone, including on a session that has stopped printing — `holdfast watch s
+  | grep -m1 READY` no longer waits for the session's next output to notice.
+  `attach` is unchanged: its stdout is the terminal it holds in raw mode
+  ([#218]).
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
