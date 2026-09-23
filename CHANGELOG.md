@@ -346,6 +346,37 @@ is cut, named and published is in
 
 ### Security
 
+- **Database URLs outside the old scheme list, and several common credential
+  spellings, went out raw; they are redacted now** ([#244]).
+  `database-connection-password` takes the TLS schemes (`rediss://`,
+  `amqps://`), `mariadb`, `mssql`, `sqlserver`, `oracle`, `cockroachdb`,
+  `clickhouse`, `snowflake`, `valkey`, `neo4j` and `bolt`; a `+driver` suffix
+  (SQLAlchemy's `postgresql+psycopg2://`, `mysql+pymysql://`, and
+  `mongodb+srv://`); an empty user (`redis://:<password>@host`); and a `/` or
+  an `@` inside the password. Four rules are new: `url-userinfo-password`
+  (`https://user:<password>@host`, a `git clone` with a token in it, a proxy
+  URL, an RTSP camera), `basic-authorization` (`Authorization: Basic <base64>`
+  as curl `-v`, a `requests` dict or an nginx `proxy_set_header` spell it),
+  `mysql-cli-password` (`mysql -u root -p<password>`, the spelling §9.2's own
+  table names) and `registry-login-password` (`docker login -p <password>` and
+  its `podman`/`nerdctl`/`buildah`/`skopeo`/`oras`/`helm registry` siblings).
+  `generic-secret-assignment` takes `_PASS`, `_PWD` and `PASSPHRASE` labels —
+  behind a separator, so `bypass=` and the shell's own `PWD=` and `OLDPWD=` are
+  not labels — and `secret-key-assignment` takes Laravel's `APP_KEY`.
+  Measured over the credential-free corpora #245 used (49.5 MB), the new
+  rules and labels add **seven** spans, every one of them a credential-shaped
+  example: `mysql -ppassword` in the design doc, `http://letme:in@yo.local` in
+  `reqwest`'s proxy tests.
+
+- `basic-authorization`, `mysql-cli-password` and a token-carrying
+  `https://x-access-token:`/`oauth2:`/`gitlab-ci-token:`/`x-token-auth:` URL are
+  **held back while still arriving** at the buffer head: each rule's
+  prefix-index entry is the literal where its credential begins, so no byte of
+  one is handed out raw one read before the rest arrives (§4.1). An entry at
+  the program name or the scheme would instead hold `mysqldump`,
+  `docker-compose`, curl's `Authorization:` and every URL a program prints —
+  `ordinary_command_heads_are_not_held_back` pins that it does not.
+
 - **A read window that cannot vouch for a region now emits one
   `[REDACTED:unresolved]` over it and completes, instead of choosing between
   withholding it for ever and releasing it raw** ([#195], [#14]). GH #14's
@@ -1571,6 +1602,17 @@ is cut, named and published is in
 
 ### Known limitations
 
+- **A URL password behind an ordinary username is not held back while it is
+  still arriving** ([#244]). `url-userinfo-password` indexes only the
+  token-carrying usernames, because an entry at `https://` would hold every URL
+  a program prints. Such a password is redacted as soon as its `@` arrives; a
+  read that lands before then hands out the part that has.
+
+- `bearer-authorization`, `basic-authorization`, `registry-login-password` and
+  a `mysql -p` that is not the first argument keep GH #152's gap: a context
+  rule's candidate is held only while every byte after its prefix is
+  printable, and each of these has a space before its value.
+
 - **A value on the line after a `:` is not reached by a label-keyed rule**
   ([#245]): YAML's plain scalar on the line after its key, and a credential a
   prompt echoes on the line after it. The second is the same bytes as ssh's
@@ -2077,3 +2119,4 @@ residuals that are known and accepted.
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
 [#245]: https://github.com/Sertelegger/holdfast/issues/245
+[#244]: https://github.com/Sertelegger/holdfast/issues/244

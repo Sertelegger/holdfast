@@ -1789,6 +1789,11 @@ mod tests {
                 "openai-api-key",
                 "pubkeyacceptedalgorithms sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com",
             ),
+            // GH #244: English after `Basic`, refused for its length.
+            (
+                "basic-authorization",
+                "Authorization: Basic authentication is required",
+            ),
             (
                 "secret-key-assignment",
                 "pub session_key: Option<SessionKey>,",
@@ -2055,6 +2060,7 @@ negative = ["probe=abcd"]
             with,
             vec![
                 "openai-api-key",
+                "basic-authorization",
                 "secret-key-assignment",
                 "generic-secret-assignment"
             ],

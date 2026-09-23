@@ -314,21 +314,212 @@ negative = [
   "POWERSYNC_TOKEN=",
 ]
 
+# GH #244 widened this in four directions at once, each one a spelling
+# that went out raw:
+#
+# * **More schemes**, and the TLS ones: `rediss://` (Upstash, Heroku),
+#   `amqps://`, `mariadb://`, `mssql://`, and the rest of what a
+#   `DATABASE_URL` holds in practice.
+# * **A `+driver` suffix**, which is how SQLAlchemy spells every URL it
+#   takes (`postgresql+psycopg2://`, `mysql+pymysql://`) and how MongoDB
+#   spells `mongodb+srv://` -- so that is no longer its own alternative.
+# * **An empty user.** `redis://:<password>@host` is Redis's own form
+#   for a server with `requirepass` and no ACL user.
+# * **A `/` or an `@` inside the password.** SQLAlchemy splits the
+#   userinfo at the first `@` and keeps a raw `/` in the password;
+#   redis-py and `urllib` split at the *last* `@`. The value class
+#   therefore runs to the last `@` before whitespace, a quote or a
+#   backtick: where the two readings disagree this redacts the longer
+#   one, which over-covers a host rather than leaking a password.
+#
+# The value is still only the password: `postgresql://svc:` and
+# `@db.internal` stay visible.
 [[rule]]
 name = "database-connection-password"
 kind = "connection-string"
-pattern = '''\b(?:postgres|postgresql|mysql|mongodb\+srv|mongodb|redis|amqp)://[^:@/\s]+:(?P<value>[^@/\s]+)@'''
+pattern = '''\b(?:postgres(?:ql)?|mysql|mariadb|mssql|sqlserver|oracle|cockroachdb|clickhouse|snowflake|mongodb|rediss?|valkeys?|amqps?|neo4j|bolt)(?:\+[A-Za-z0-9_]+)*://[^:@/\s]*:(?P<value>[^\s"'`]+)@'''
 prefixes = [
   "postgres://",
   "postgresql://",
+  "postgresql+",
   "mysql://",
+  "mysql+",
+  "mariadb://",
+  "mariadb+",
+  "mssql://",
+  "mssql+",
+  "sqlserver://",
+  "oracle://",
+  "oracle+",
+  "cockroachdb://",
+  "cockroachdb+",
+  "clickhouse://",
+  "clickhouse+",
+  "snowflake://",
   "mongodb://",
-  "mongodb+srv://",
+  "mongodb+",
   "redis://",
+  "rediss://",
+  "redis+",
+  "valkey://",
+  "valkeys://",
   "amqp://",
+  "amqps://",
+  "neo4j://",
+  "neo4j+",
+  "bolt://",
+  "bolt+",
 ]
-positive = ["postgresql://svc:hunter2GOESHERE@db.internal:5432/app"]
-negative = ["postgresql://db.internal:5432/app"]
+positive = [
+  "postgresql://svc:hunter2GOESHERE@db.internal:5432/app",
+  "REDIS_URL=rediss://default:hunter2GOESHERE@x.upstash.io:6379",
+  "REDIS_URL=redis://:hunter2GOESHERE@cache:6379/0",
+  "SQLALCHEMY_DATABASE_URI=postgresql+psycopg2://app:hunter2GOESHERE@db/app",
+  "mysql+pymysql://app:hunter2GOESHERE@db/app",
+  "CELERY_BROKER_URL=amqps://app:hunter2GOESHERE@mq.internal/vhost",
+  "mariadb://app:hunter2GOESHERE@db/app",
+  "mssql://sa:hunter2GOESHERE@db/app",
+  "mongodb+srv://app:hunter2GOESHERE@cluster0.example.net/?retryWrites=true",
+  "postgresql+asyncpg://app:hunter2/GOES@db/app",
+  "redis://:hunter2@GOESHERE@cache:6379/0",
+]
+negative = [
+  "postgresql://db.internal:5432/app",
+  "redis://localhost:6379/0",
+  "mongodb+srv://cluster0.example.net/?retryWrites=true",
+]
+
+# **Credentials in the userinfo of any other URL** (GH #244):
+# `https://admin:<password>@host`, a `git clone` over HTTPS with a token
+# in it, `HTTPS_PROXY=http://user:<password>@proxy:3128`, an RTSP camera.
+#
+# **It redacts the whole `scheme://user:password@`, not only the
+# password, and that is for the frame budget rather than for the
+# reader.** A marker is sized by its kind, not by what it replaces, and
+# with an empty user and a one-byte password this rule's shortest match
+# is `ws://:x@` -- eight bytes, which tiles back to back with no
+# separator because the next `ws` starts on a word boundary. Redacting
+# only the value would leave seven of those eight bytes and add the
+# marker to each tile, the widest growth anywhere in this file and past
+# the worst case `Config::validate` sizes `MAX_FRAME_BYTES`' headroom
+# from. Redacting the whole match replaces the eight bytes with one
+# marker. `tests/redaction_growth.rs` measures both spellings.
+#
+# **The value class is RFC 3986's authority, not the database rule's.**
+# It stops at `/`, `?` and `#`, so a port followed by an `@` in the path
+# -- Vite's `http://localhost:5173/@vite/client`, npm's `/@scope/` -- is
+# not read as a password. Inside the authority it runs to the last `@`,
+# which is where `urllib` splits.
+#
+# **Its prefix-index entries are narrow on purpose, and the gap that
+# leaves is stated rather than hidden.** An entry at `https://` would hold
+# every URL a program prints at the buffer head until its authority ends
+# -- `https://example.internal` can still become
+# `https://example.internal:<password>@` -- and ordinary output must never
+# be held back (`ordinary_build_output_never_yields_a_boundary`). So the
+# entries are the usernames that exist to carry a token --
+# `x-access-token` (GitHub), `oauth2` and `gitlab-ci-token` (GitLab),
+# `x-token-auth` (Bitbucket) -- with the colon that ends them, which no
+# ordinary URL contains. A password still arriving behind any other
+# username is **not** held at the buffer head, and is redacted as soon as
+# its `@` arrives; that is §4.1's partial-secret window, open for this
+# rule and closed for the four spellings above.
+#
+# The scheme list is explicit rather than `[a-z][a-z0-9+.-]*` so that
+# the rule's match begins at a literal; `sftp` is absent because its
+# match begins one byte before `ftp://`, which would cost the whole rule
+# its liveness automaton (`rule_may_start_one_byte_before`).
+[[rule]]
+name = "url-userinfo-password"
+kind = "url-password"
+pattern = '''\b(?:https?|ftps?|ssh|git(?:\+(?:ssh|https?))?|svn(?:\+ssh)?|wss?|smtps?|imaps?|pop3s?|ldaps?|mqtts?|nats|socks(?:4a?|5h?)|rtsps?|rtmps?)://[^:@/?#\s"'`]*:[^/?#\s"'`]+@'''
+prefixes = [
+  "https://x-access-token:",
+  "https://oauth2:",
+  "https://gitlab-ci-token:",
+  "https://x-token-auth:",
+]
+positive = [
+  "curl https://admin:hunter2GOESHERE@internal.example.com/api",
+  "git clone https://x-access-token:hunter2GOESHERE@github.com/org/repo.git",
+  "HTTPS_PROXY=http://proxyuser:hunter2GOESHERE@proxy.corp:3128",
+  "ftp://anonymous:hunter2GOESHERE@ftp.example.org/pub",
+  "rtsp://admin:hunter2GOESHERE@192.168.1.10:554/stream1",
+  "pip install git+https://oauth2:hunter2GOESHERE@gitlab.example.com/org/pkg.git",
+]
+negative = [
+  "https://example.com:8443/path",
+  "http://localhost:5173/@vite/client",
+  "ssh://git@github.com:22/org/repo.git",
+  "https://user@example.com/login",
+  "http://[::1]:8080/",
+]
+
+# ------------------------------------------------------ command-line flags
+#
+# A password passed as an argument is echoed by the terminal, lands in
+# `status.command` and `get_command_history`, and is exactly the shape
+# spec §9.2's table names (`mysql -u u -ppassword`). Neither of these
+# has a label the assignment rules can key on: `mysql`'s `-p` takes its
+# value *attached*, and a registry login's `-p`/`--password` takes it as
+# the next argument, after a space. Both are keyed on the program, and
+# the gap between the program and the flag stays on one line and stops
+# at a pipe, a `;` or a `&`, so a later command's `-p` is not read as
+# this one's.
+#
+# `mysql -p` with no value prompts for the password; it is not a match.
+# `--password-stdin` is the recommended spelling and is not a match
+# either. `--password=…` is also `generic-secret-assignment`'s.
+[[rule]]
+name = "mysql-cli-password"
+kind = "cli-password"
+pattern = '''\b(?:mysql|mariadb)[a-z-]*\b[^\r\n|;&]*?[ \t]-p["']?(?P<value>[^\s"'`;|&<>]+)'''
+# The program name followed by its space, for the same reason
+# `basic-authorization` indexes its whole header: a context rule's
+# candidate is held while every byte after the prefix is printable, so
+# `mysql -phunter2` still arriving is held and `mysqldump` at the buffer
+# head is not. A `-p` further along the line is past a space and is
+# GH #152's gap, as it is for every context rule whose value follows one.
+prefixes = ["mysql ", "mariadb "]
+positive = [
+  "mysql -u root -phunter2GOESHERE app",
+  "mysqldump -uroot -p'hunter2GOESHERE' app > dump.sql",
+  "docker exec -it db mariadb-dump -u root -phunter2GOESHERE --all-databases",
+]
+negative = [
+  "mysql -u root -p app",
+  "mysql -h db -P 3306 -u root -p",
+  "mysql -u root -p < schema.sql; mkdir -pv out",
+]
+
+[[rule]]
+name = "registry-login-password"
+kind = "cli-password"
+pattern = '''\b(?:docker|podman|nerdctl|buildah|skopeo|oras|helm[ \t]+registry)[ \t]+login\b[^\r\n|;&]*?[ \t](?:-p|--password)(?:[ \t]+|=)["']?(?P<value>[^\s"'`;|&<>]+)'''
+# `<program> login`: never followed by a printable run, so it holds
+# nothing -- the value is always past a space, which is GH #152's gap --
+# and, unlike the bare program name, it cannot hold `docker-compose` at
+# the buffer head either.
+prefixes = [
+  "docker login",
+  "podman login",
+  "nerdctl login",
+  "buildah login",
+  "skopeo login",
+  "oras login",
+  "helm registry",
+]
+positive = [
+  "docker login -u ci -p hunter2GOESHERE registry.example.com",
+  "docker login --username ci --password hunter2GOESHERE ghcr.io",
+  "podman login -u ci -p 'hunter2GOESHERE' quay.io",
+  "helm registry login registry.example.com -u ci -p hunter2GOESHERE",
+]
+negative = [
+  "echo $TOKEN | docker login -u ci --password-stdin ghcr.io",
+  "docker login -u ci registry.example.com",
+  "docker run -p 8080:80 nginx",
+]
 
 # ---------------------------------------------------------- communication
 
@@ -485,6 +676,49 @@ positive = ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz"]
 negative = [
   "Bearer short",
   "the header is Authorization: Bearer\ncrates/holdfast-core/src/output/redact.rs:207:",
+]
+
+# `Authorization: Basic <base64 of user:password>` (GH #244) -- a curl
+# `-v` trace, a `requests` header dict, an nginx `proxy_set_header`.
+# Unlike `bearer-authorization` it is keyed on the header name, because
+# `basic` followed by a word is ordinary English; the separator is
+# optional so the config-file spellings (`Authorization "Basic …"`) are
+# reached.
+#
+# **The refusal is a length test, and that is why it costs nothing.**
+# RFC 7617 carries `user:password` in RFC 4648 base64, which is padded, so
+# a real credential is always a multiple of four bytes long. English is
+# not: `Authorization: Basic authentication is required` offers
+# `authentication`, fourteen bytes, and is refused for its length. A
+# refusal on *shape* -- "one lower-case word" -- was tried first and
+# measured to drop the base64 of short lower-case pairs, which encode to
+# lower-case letters more often than intuition says.
+[[rule]]
+name = "basic-authorization"
+kind = "basic-auth"
+pattern = '''(?i)\bauthorization\b["']?[ \t]*[:=]?[ \t]*["']?basic[ \t]+(?P<value>[A-Za-z0-9+/]{4,}={0,2})'''
+# **The index entry is the whole header up to the value, and that is
+# deliberate.** A context rule keeps §4.1's byte-class test (GH #152):
+# a candidate is held while every byte after its prefix is printable.
+# Indexed at `authorization` it would hold `Authorization:` at the buffer
+# head -- ordinary `curl -v` output, one byte before the space that
+# releases it -- and would protect nothing, because the space after the
+# colon ends the run before a credential starts. Indexed at the full
+# canonical spelling, the prefix ends where the credential begins, so a
+# credential still arriving *is* held and nothing else can be.
+prefixes = ["authorization: basic "]
+value_must_not_match = '''(?:[A-Za-z0-9+/=]{4})*[A-Za-z0-9+/=]{1,3}'''
+positive = [
+  "Authorization: Basic dXNlcjpodW50ZXIyR09FU0hFUkU=",
+  "> authorization: basic YWRtaW46aHVudGVyMg==",
+  "{'Authorization': 'Basic dXNlcjpodW50ZXIyR09FU0hFUkU='}",
+  "proxy_set_header Authorization \"Basic dXNlcjpodW50ZXIyR09FU0hFUkU=\";",
+  "Proxy-Authorization: Basic dXNlcjpodW50ZXIyR09FU0hFUkU=",
+]
+negative = [
+  "Authorization: Basic authentication is required",
+  "WWW-Authenticate: Basic realm=\"api\"",
+  "Authorization: Basic <credentials>",
 ]
 
 # **Both rules below judge what follows the separator, in two steps, and
@@ -731,7 +965,7 @@ negative = [
 [[rule]]
 name = "secret-key-assignment"
 kind = "generic"
-pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:secret|private|encryption|signing|master|session)[_-]key\b["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:secret|private|encryption|signing|master|session|app)[_-]key\b["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
 prefixes = [
   "secret_key",
   "secret-key",
@@ -745,6 +979,8 @@ prefixes = [
   "master-key",
   "session_key",
   "session-key",
+  "app_key",
+  "app-key",
 ]
 # See "the value-side half" above. Identical to the expression on
 # `generic-secret-assignment`, deliberately: these two are one rule split
@@ -765,6 +1001,8 @@ positive = [
   "MASTER_KEY=correct-horse-battery-staple",
   "MASTER_KEY=correct.horse.battery.staple",
   "MASTER_KEY=correct_horse_battery_staple",
+  # GH #244: Laravel's `APP_KEY`, which is its encryption key.
+  "APP_KEY=base64:dGhpcyBpcyBhIGxhcmF2ZWwga2V5IGZvciB0ZXN0cw==",
 ]
 negative = [
   "SECRET_KEY_FILE=/run/secrets/app",
@@ -787,10 +1025,13 @@ negative = [
 [[rule]]
 name = "generic-secret-assignment"
 kind = "generic"
-pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token)\b["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:password|passwd|passphrase|[_.-]pass|[_.-]pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token)\b["' \t]*(?::[ \t]*|=[ \t]*(?:\r?\n[ \t]+)?)["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
 prefixes = [
   "password",
   "passwd",
+  "passphrase",
+  "_pass",
+  "_pwd",
   "secret",
   "apikey",
   "api_key",
@@ -819,6 +1060,11 @@ positive = [
   # dot-prefixed vendor token with a digit-free body (HashiCorp Vault).
   "password=correcthorsebatterystaple",
   "access_token=hvs.CAESIJxKzWqTvNbMqLdFgHjKlPoIuYtReWqAsDfGhJkL",
+  # GH #244: the `_PASS` and `_PWD` spellings, and a passphrase label.
+  "DB_PASS=hunter2hunter2",
+  "SMTP_PASS=hunter2hunter2",
+  "export MYSQL_PWD=hunter2hunter2",
+  "GPG_PASSPHRASE=correct-horse-battery",
   # A formatter that wraps a long assignment puts the value on the next
   # line, indented under it -- rustfmt and prettier both do -- and that
   # is the one line break the separator crosses (GH #245).
@@ -843,6 +1089,10 @@ negative = [
   # `::` path and a lower-case field access carrying an `_`.
   "pub paren_token: token::Paren,",
   "semi_token: node.semi_token,",
+  # GH #244: `pass` and `pwd` only count as a label behind a separator,
+  # so `bypass` and the shell's own `PWD` and `OLDPWD` are not labels.
+  "bypass=0123456789abcdef",
+  "OLDPWD=/home/dev/repos/holdfast",
 ]
 
 # --------------------------------------------------------- the group-3 walk
