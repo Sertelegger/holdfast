@@ -549,6 +549,7 @@ fn two_clients_that_lost_their_daemon_together_restart_one_daemon() {
     let here = Project::new(&inst, "proj");
     let mut a = Shim::launch(&inst, &here.0, &[], &["mcp"]);
     let mut b = Shim::launch(&inst, &here.0, &[], &["mcp"]);
+    let old = inst.daemon_pid().expect("a daemon");
     let (code, _, err) = inst.run(&["daemon", "stop"]);
     assert_eq!(code, 0, "{err}");
 
@@ -566,6 +567,17 @@ fn two_clients_that_lost_their_daemon_together_restart_one_daemon() {
     });
     assert_eq!(seen_a["status"], "ok", "{seen_a}");
     assert_eq!(seen_b["status"], "ok", "{seen_b}");
+    // `daemon stop` answers before the old process has exited (issue
+    // #20), and its environment names this runtime dir too — so the
+    // count waits for it, or a slow teardown reads as a second daemon.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while unsafe { libc::kill(old as i32, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the old daemon {old} never exited"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     if let Some(n) = daemons_for(&inst.dir) {
         assert_eq!(n, 1, "the two clients restarted {n} daemons");
     }
