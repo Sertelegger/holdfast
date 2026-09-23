@@ -2958,7 +2958,16 @@ async fn a_prompt_regenerated_after_the_snippet_is_reported_as_degraded() {
     )
     .await;
     // `C` and `D;0` for that line, and then no `A`/`B` ever again.
+    //
+    // **Synchronised on the history, not the buffer** (review of GH #220).
+    // `osc133_source` is the detector's, and the reader feeds the buffer
+    // first and the detector after it, so a read taken once the markers
+    // reach the buffer can see the detector's *earlier* `holdfast` — and a
+    // regression that degraded on that `D` would pass whenever the detector
+    // lagged. The history is fed after the detector, so a closed entry for
+    // this line means the detector has seen its `D`.
     await_markers(&server, &id, 5).await;
+    await_closed_history(&server, &id, 1).await;
     let s = status(&server, &id).await;
     assert_eq!(
         s["osc133_source"], "holdfast",

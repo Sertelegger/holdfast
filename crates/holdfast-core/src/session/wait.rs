@@ -988,6 +988,47 @@ mod tests {
         assert_eq!(o.found, Some(MatchSpan { start, end: k + 1 }));
     }
 
+    /// The two windows rebuilt from the ring search the text view too
+    /// (review of GH #238): the final rescan, which is what answers for
+    /// output that lands in the liveness gap just before a death —
+    /// `cargo test; exit` — and the lag resync. Each is asserted directly,
+    /// because neither path can be steered into from `for_pattern` on
+    /// demand (see `a_lag_resync_rebuilds_from_the_earliest_still_buffered_byte`),
+    /// and a raw-only search in either passed every other row here.
+    #[tokio::test]
+    async fn the_final_rescan_and_the_lag_resync_match_coloured_output() {
+        let (s, pty) = mock();
+        let out = b"running 3 tests\r\ntest result: \x1b[32mok\x1b[m. 3 passed\r\n";
+        pty.queue_output(out);
+        while s.buffer_head() < out.len() as u64 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let start = out.windows(11).position(|w| w == b"test result").unwrap() as u64;
+        let k = out.windows(2).position(|w| w == b"ok").unwrap() as u64 + 1;
+        let want = Some(MatchSpan { start, end: k + 1 });
+        let fresh = || WaitOutcome {
+            end: WaitEnd::TimedOut,
+            found: None,
+            scan_start: 0,
+            truncated_at_tail: false,
+        };
+
+        let o = final_rescan(&s, &re("test result: ok"), 0, fresh());
+        assert_eq!(
+            o.end,
+            WaitEnd::Matched,
+            "the final rescan searched raw bytes only"
+        );
+        assert_eq!(o.found, want);
+
+        let rebuilt = resync(&s, 0, &mut fresh());
+        assert_eq!(
+            rebuilt.window.search(&re("test result: ok")),
+            want,
+            "the resync window lost its text view"
+        );
+    }
+
     /// The same, arriving live and split mid-escape across two frames —
     /// the stripper is resumable, so the second frame's `2mok` is not
     /// taken for text.
