@@ -302,7 +302,9 @@ async fn mcp_hybrid() -> ExitCode {
         }
     };
 
-    let service = match ShimServer::new(Arc::new(client))
+    // `with_respawn`: when this daemon goes away the shim starts another
+    // the way it started this one (GH #231).
+    let service = match ShimServer::with_respawn(Arc::new(client), paths, exe)
         .serve(rmcp::transport::stdio())
         .await
     {

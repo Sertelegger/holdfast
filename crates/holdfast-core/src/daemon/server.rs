@@ -793,9 +793,21 @@ impl Daemon {
             // stop` cost ten seconds would be a tax on the common case.
             if !self.clock.is_manual() {
                 let deadline = self.clock.now() + grace;
+                // GH #234: an interactive shell ignores the `SIGTERM`
+                // above and ends on a hangup, once it is alone in its
+                // session. Without this, every shell session held `daemon
+                // stop` for the whole grace — measured at 10.1 s for one
+                // idle `bash` — and that is the upgrade path GH #231 is
+                // about. Once per session, on the first poll it qualifies.
+                let mut hung_up = vec![false; live.len()];
                 while self.clock.now() < deadline {
                     if live.iter().all(|s| !s.is_alive()) {
                         break;
+                    }
+                    for (session, done) in live.iter().zip(hung_up.iter_mut()) {
+                        if !*done {
+                            *done = session.hang_up_idle_shell();
+                        }
                     }
                     let next = (self.clock.now() + STOP_POLL_INTERVAL).min(deadline);
                     self.clock.sleep_until(next).await;
@@ -2394,7 +2406,7 @@ async fn dispatch_tool(
     client_kind: ClientKind,
     cancel: &CancelSignal,
 ) -> Response {
-    let args: serde_json::Value = match method::from_cbor(&req.params) {
+    let mut args: serde_json::Value = match method::from_cbor(&req.params) {
         Ok(v) => v,
         Err(e) => {
             return Response::error(
@@ -2403,6 +2415,17 @@ async fn dispatch_tool(
                 format!("tool arguments are not a JSON-shaped object: {e}"),
             )
         }
+    };
+    // **GH #229: the calling shim's directory and environment, taken out
+    // of the arguments before any handler sees them.** A daemon's own are
+    // whichever client happened to spawn it, so `start_session` needs the
+    // caller's, and — as with the two scopes below — `#[tool]` leaves no
+    // parameter to pass them in. Removed whether or not it parses, so a
+    // malformed context is refused here rather than handed to a tool as
+    // an argument; see `session::launch`.
+    let client = match crate::session::launch::take_client_param(&mut args) {
+        Ok(client) => client,
+        Err(e) => return Response::error(req.id, ErrorCode::BadParams, e),
     };
     // Scope the call to the caller derived from the connection, so the
     // §9.4 audit write inside the read path records who asked without
@@ -2440,6 +2463,11 @@ async fn dispatch_tool(
         passthrough::call_tool(&daemon.server, tool, args).await
     };
     let call = crate::request::with_context(ctx, call);
+    // Every tool call, with or without a context: the scope is also what
+    // tells `start_session` it is running in a daemon at all, so a shim
+    // too old to send one still gets the daemon's environment with the
+    // spawning client's identity scrubbed rather than inherited whole.
+    let call = crate::session::launch::hosted_by_daemon(client, call);
     match caller::with_caller(who, call).await {
         None => Response::error(req.id, ErrorCode::UnknownMethod, format!("no tool {tool}")),
         Some(Err(e)) => tool_error_response(req.id, &e),

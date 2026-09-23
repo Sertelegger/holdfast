@@ -28,8 +28,12 @@
 //! one code the skew makes reachable.
 
 use super::passthrough;
+use crate::daemon::RuntimePaths;
 use crate::protocol::client::{ClientError, ControlClient};
-use crate::protocol::method::{self, TOOL_METHOD_PREFIX};
+use crate::protocol::frame::FrameError;
+use crate::protocol::handshake::ClientKind;
+use crate::protocol::method::{self, CborValue, Response, TOOL_METHOD_PREFIX};
+use crate::session::launch::{ClientLaunch, CLIENT_PARAM};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
@@ -39,16 +43,228 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::json;
 use serde_json::Value;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// The one tool whose call carries the shim's own launch context.
+const START_SESSION: &str = "start_session";
+
+/// What a response carries when the call that produced it had to start a
+/// new daemon first (GH #231). Put in front of `details`, or of the
+/// message of an error, so it is the first thing read.
+const DAEMON_RESTARTED: &str = "The Holdfast daemon had stopped, so a new one was \
+    started for this call: every session from the previous daemon is gone, and its session \
+    ids no longer resolve.";
 
 #[derive(Clone)]
 pub struct ShimServer {
+    link: Arc<Link>,
+}
+
+/// The shim's connection to its daemon, and how to make another one when
+/// that daemon goes away (GH #231).
+///
+/// **Why the shim respawns at all.** It auto-spawns a daemon at startup
+/// (§3.4, §7.3) and then held one `ControlClient` for its life. After a
+/// `holdfast daemon stop` — which is the only way to load a new build, so
+/// it is every upgrade — or a crash, every tool call through every open
+/// client answered `daemon_unreachable`, forever, until something *else*
+/// started a daemon. The shim now does what it did at startup, through
+/// the same `spawn::ensure_daemon`: connect, or run `holdfast daemon
+/// start` — whose lock and re-check are what keep a dozen shims noticing
+/// at once to one daemon, exactly as for a dozen starting at once.
+struct Link {
+    current: parking_lot::Mutex<Connected>,
+    /// `None` for a shim built over a stand-in, which has nothing to
+    /// respawn; such a shim reports a lost daemon as it always did.
+    respawn: Option<Respawn>,
+    /// Held across a reconnection, so calls that fail together reconnect
+    /// once: the second finds the generation already moved on.
+    reconnecting: tokio::sync::Mutex<()>,
+    /// The generation of the newest reconnection that reached a
+    /// **different** daemon. A call that failed on an older generation
+    /// reports the restart even if another call did the reconnecting.
+    restarted_at: AtomicU64,
+}
+
+#[derive(Clone)]
+struct Connected {
     client: Arc<ControlClient>,
+    /// Bumped by every reconnection.
+    generation: u64,
+    /// The daemon's pid from `holdfast.pid` when this connection was
+    /// made. `None` when it could not be read, which counts as "unknown"
+    /// and so as a restart: telling an agent its sessions may be gone
+    /// when they are not costs a `list_sessions`; the reverse costs it a
+    /// run of `session_not_found` it cannot explain.
+    daemon_pid: Option<u32>,
+}
+
+struct Respawn {
+    paths: RuntimePaths,
+    exe: PathBuf,
+}
+
+/// A connection made by [`ShimServer::reconnect`].
+struct Reconnected {
+    client: Arc<ControlClient>,
+    /// Whether it reaches a different daemon than the one that was lost —
+    /// which is what makes the previous daemon's sessions gone.
+    restarted: bool,
 }
 
 impl ShimServer {
+    /// A shim that does not respawn: its daemon is a stand-in (every test
+    /// in this file) or somebody else's to manage.
     pub fn new(client: Arc<ControlClient>) -> Self {
-        Self { client }
+        Self::build(client, None, None)
+    }
+
+    /// The shim `holdfast mcp` runs: when its daemon goes away, it starts
+    /// another exactly as it started the first (GH #231). `exe` is the
+    /// `holdfast` binary that `holdfast daemon start` is run from.
+    pub fn with_respawn(client: Arc<ControlClient>, paths: RuntimePaths, exe: PathBuf) -> Self {
+        let daemon_pid = crate::daemon::server::read_pid_file(&paths);
+        Self::build(client, Some(Respawn { paths, exe }), daemon_pid)
+    }
+
+    fn build(
+        client: Arc<ControlClient>,
+        respawn: Option<Respawn>,
+        daemon_pid: Option<u32>,
+    ) -> Self {
+        Self {
+            link: Arc::new(Link {
+                current: parking_lot::Mutex::new(Connected {
+                    client,
+                    generation: 0,
+                    daemon_pid,
+                }),
+                respawn,
+                reconnecting: tokio::sync::Mutex::new(()),
+                restarted_at: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    fn connected(&self) -> Connected {
+        self.link.current.lock().clone()
+    }
+
+    /// Replace a connection that `err` says is lost, starting a daemon if
+    /// there is none (GH #231).
+    ///
+    /// `None` when there is nothing to do: this shim does not respawn, or
+    /// `err` is not a lost daemon ([`lost_the_daemon`]). A refusal, a
+    /// protocol-major mismatch above all, is a daemon that is there and
+    /// said no, and starting a second one over it is the response §7.3
+    /// forbids at startup and that is no better here.
+    ///
+    /// **Through `spawn::ensure_daemon`, the startup path, not a second
+    /// one.** It connects if a daemon is answering — another shim may
+    /// already have started one — and otherwise runs `holdfast daemon
+    /// start`, whose lock and re-check under the lock are what made
+    /// `two_shims_racing_to_start_share_one_daemon` true at startup and
+    /// make it true here.
+    async fn reconnect(
+        &self,
+        failed: &Connected,
+        err: &ClientError,
+    ) -> Option<Result<Reconnected, ClientError>> {
+        let respawn = self.link.respawn.as_ref()?;
+        if !lost_the_daemon(err) {
+            return None;
+        }
+        let _one_at_a_time = self.link.reconnecting.lock().await;
+        let now = self.connected();
+        if now.generation != failed.generation {
+            // Another call reconnected while this one waited for the lock.
+            return Some(Ok(Reconnected {
+                client: now.client,
+                restarted: self.link.restarted_at.load(Ordering::SeqCst) > failed.generation,
+            }));
+        }
+        // **A daemon that has just died can still be accepting.** Measured
+        // with `SIGKILL`: the shim sees its own connection close before
+        // the kernel has closed the dead daemon's listener, so the next
+        // `connect` succeeds and the handshake is then reset — a `Frame`
+        // error, which `ensure_daemon` rightly refuses to spawn over, for
+        // §7.3's reason: a daemon that accepted is running, or looks it.
+        // Here the connection that was lost a moment ago says otherwise,
+        // so a reset or an EOF on the handshake is retried for as long as
+        // a listener takes to close. A handshake that **times out** is not
+        // retried: that is a wedged daemon, GH #15's case, reported as it
+        // is at startup.
+        let settle = std::time::Instant::now() + RECONNECT_SETTLE;
+        let client = loop {
+            match crate::daemon::spawn::ensure_daemon(
+                &respawn.paths,
+                &respawn.exe,
+                ClientKind::Shim,
+            )
+            .await
+            {
+                Ok(c) => break Arc::new(c),
+                Err(e) if a_closing_listener(&e) && std::time::Instant::now() < settle => {
+                    tokio::time::sleep(RECONNECT_POLL).await;
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        };
+        let daemon_pid = crate::daemon::server::read_pid_file(&respawn.paths);
+        let restarted = !(daemon_pid.is_some() && daemon_pid == now.daemon_pid);
+        let generation = now.generation + 1;
+        *self.link.current.lock() = Connected {
+            client: Arc::clone(&client),
+            generation,
+            daemon_pid,
+        };
+        if restarted {
+            self.link.restarted_at.store(generation, Ordering::SeqCst);
+        }
+        Some(Ok(Reconnected { client, restarted }))
+    }
+
+    /// One tool round trip on `client`, racing `cancelled` as GH #127
+    /// requires. `cancel_seen` records that the cancel arm fired, which
+    /// is what stops a cancelled call from being re-sent after a
+    /// reconnection.
+    async fn round_trip<F: Future<Output = ()>>(
+        client: &ControlClient,
+        method: &str,
+        params: CborValue,
+        token: &str,
+        mut cancelled: Pin<&mut F>,
+        cancel_seen: &mut bool,
+    ) -> Result<Response, ClientError> {
+        let call = client.call_raw_cancellable(method, params, Some(token));
+        tokio::pin!(call);
+        tokio::select! {
+            // **`biased`, so the call is polled before the cancel.**
+            // `select!` is random by default, and a random order lets an
+            // already-cancelled request take the cancel arm on the first
+            // poll — before `call_raw_cancellable` has written anything
+            // — so the daemon sees the cancel *first*, on the connection
+            // the call was going to use. Nothing breaks (the daemon
+            // remembers a cancel that beats its call; see
+            // `Daemon::recently_cancelled`), but it makes the ordinary
+            // case depend on a coin flip, and it cost this file's own
+            // row a spurious pass before it cost it a failure.
+            biased;
+            r = &mut call => r,
+            () = cancelled.as_mut(), if !*cancel_seen => {
+                *cancel_seen = true;
+                let _ = client.cancel(token).await;
+                // `&mut call`, so the round trip is still ours: the
+                // response is read, the connection goes back to the pool,
+                // and the daemon's own word for how the call ended is what
+                // reaches rmcp.
+                (&mut call).await
+            }
+        }
     }
 
     /// Forward one tool call to the daemon and rebuild the MCP result.
@@ -97,50 +313,90 @@ impl ShimServer {
         arguments: Option<serde_json::Map<String, Value>>,
         cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<CallToolResult, ErrorData> {
-        let args = Value::Object(arguments.unwrap_or_default());
+        let mut arguments = arguments.unwrap_or_default();
+        // **GH #229: a session starts where its caller is.** This process
+        // is the one the MCP client launched, in the client's project and
+        // with the client's environment; the daemon is shared by every
+        // client and its own directory and environment are whichever one
+        // spawned it. So the shim says where it is, under a key no tool
+        // argument can have, and the daemon decides what to do with it —
+        // `session::launch` holds the rule, including the one kind of
+        // session (a `profile`) that must ignore it. Inserted *over*
+        // anything the MCP client put there: the context is this
+        // process's to state, not the agent's.
+        if tool == START_SESSION {
+            let context = serde_json::to_value(ClientLaunch::of_this_process())
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            arguments.insert(CLIENT_PARAM.to_string(), context);
+        }
+        let args = Value::Object(arguments);
         let params =
             method::to_cbor(&args).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let method_name = format!("{TOOL_METHOD_PREFIX}{tool}");
-        let call = self
-            .client
-            .call_raw_cancellable(&method_name, params, Some(&token));
-        tokio::pin!(call);
         tokio::pin!(cancelled);
-        let resp = tokio::select! {
-            // **`biased`, so the call is polled before the cancel.**
-            // `select!` is random by default, and a random order lets an
-            // already-cancelled request take the cancel arm on the first
-            // poll — before `call_raw_cancellable` has written anything
-            // — so the daemon sees the cancel *first*, on the connection
-            // the call was going to use. Nothing breaks (the daemon
-            // remembers a cancel that beats its call; see
-            // `Daemon::recently_cancelled`), but it makes the ordinary
-            // case depend on a coin flip, and it cost this file's own
-            // row a spurious pass before it cost it a failure.
-            biased;
-            r = &mut call => r,
-            () = &mut cancelled => {
-                let _ = self.client.cancel(&token).await;
-                // `&mut call`, so the round trip is still ours: the
-                // response is read, the connection goes back to the pool,
-                // and the daemon's own word for how the call ended is what
-                // reaches rmcp.
-                (&mut call).await
-            }
-        }
-        .map_err(map_client_error)?;
+        let mut cancel_seen = false;
+        let first = self.connected();
+        let outcome = Self::round_trip(
+            &first.client,
+            &method_name,
+            params.clone(),
+            &token,
+            cancelled.as_mut(),
+            &mut cancel_seen,
+        )
+        .await;
+
+        // **GH #231: a lost daemon is replaced, and the call re-sent only
+        // when it provably never reached the old one.** `Connect` is a
+        // dial that failed and `BrokenPipe` a write into a connection
+        // the daemon had already closed — the parked connection every
+        // call after a `daemon stop` meets first. Anything else — above
+        // all an EOF while reading the answer — may have run the call
+        // before the daemon went, and re-sending a `send_input` or a
+        // `start_session` would run it twice. That one is answered with
+        // what is known, and no guess.
+        let (resp, restarted) = match outcome {
+            Ok(resp) => (resp, false),
+            Err(e) => match self.reconnect(&first, &e).await {
+                None => return Err(map_client_error(e)),
+                Some(Err(spawn)) => return Err(respawn_failed(&e, spawn)),
+                Some(Ok(fresh)) if never_reached_a_daemon(&e) && !cancel_seen => {
+                    let resp = Self::round_trip(
+                        &fresh.client,
+                        &method_name,
+                        params,
+                        &token,
+                        cancelled.as_mut(),
+                        &mut cancel_seen,
+                    )
+                    .await
+                    .map_err(map_client_error)?;
+                    (resp, fresh.restarted)
+                }
+                Some(Ok(fresh)) => return Err(lost_in_flight(&e, fresh.restarted)),
+            },
+        };
 
         if let Some(e) = resp.control_error() {
-            return Err(rebuild_tool_error(e));
+            let mut err = rebuild_tool_error(e);
+            if restarted {
+                err.message = format!("{DAEMON_RESTARTED} {}", err.message).into();
+            }
+            return Err(err);
         }
 
         let data: Value = method::from_cbor(&resp.data)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let details = if restarted {
+            format!("{DAEMON_RESTARTED} {}", resp.details)
+        } else {
+            resp.details
+        };
         Ok(passthrough::outcome_to_result(passthrough::ToolOutcome {
             status: resp.status,
             data,
-            details: resp.details,
+            details,
         }))
     }
 
@@ -153,11 +409,22 @@ impl ShimServer {
     async fn forward_resource(&self, method: &str, params: Value) -> Result<Value, ErrorData> {
         let params =
             method::to_cbor(&params).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let resp = self
-            .client
-            .call_raw(method, params)
-            .await
-            .map_err(map_client_error)?;
+        let first = self.connected();
+        // GH #231, as for a tool call — except that every `resource/*`
+        // method only reads, so re-sending one that may have reached the
+        // old daemon repeats nothing, and it is re-sent either way.
+        let resp = match first.client.call_raw(method, params.clone()).await {
+            Ok(resp) => resp,
+            Err(e) => match self.reconnect(&first, &e).await {
+                None => return Err(map_client_error(e)),
+                Some(Err(spawn)) => return Err(respawn_failed(&e, spawn)),
+                Some(Ok(fresh)) => fresh
+                    .client
+                    .call_raw(method, params)
+                    .await
+                    .map_err(map_client_error)?,
+            },
+        };
         if let Some(e) = resp.control_error() {
             return Err(rebuild_resource_error(e));
         }
@@ -309,6 +576,105 @@ fn map_client_error(e: ClientError) -> ErrorData {
             "reason": "daemon_unreachable",
             "detail": e.to_string(),
         })),
+    )
+}
+
+/// How long [`ShimServer::reconnect`] waits for a dead daemon's listener
+/// to close. It closes as the process's descriptors are torn down, so
+/// this bounds a race measured in microseconds, generously.
+const RECONNECT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+const RECONNECT_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// A handshake refused by a listener that is going away: accepted, then
+/// reset or closed. Not a timeout — that is a daemon that is there and
+/// not answering.
+fn a_closing_listener(e: &ClientError) -> bool {
+    match e {
+        ClientError::Frame(FrameError::Eof) => true,
+        ClientError::Frame(FrameError::Io(io)) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        ),
+        _ => false,
+    }
+}
+
+/// Whether a failed round trip means the daemon is gone: "nobody is
+/// listening", or the connection broke under the call.
+///
+/// **Not every `Frame` error.** `TooLarge` is this side's own request
+/// refused before a byte was written, and `Cbor` an answer that did not
+/// decode — both from a daemon that is plainly there, and reconnecting
+/// over either would report a restart that did not happen.
+fn lost_the_daemon(e: &ClientError) -> bool {
+    matches!(
+        e,
+        ClientError::Connect { .. }
+            | ClientError::Frame(FrameError::Eof)
+            | ClientError::Frame(FrameError::Io(_))
+    )
+}
+
+/// Whether a failed round trip provably never reached a daemon, so the
+/// call can be re-sent without running it twice (GH #231).
+///
+/// `Connect` is a dial that failed: nothing was written. `BrokenPipe` is
+/// a **write** that failed — a read reports a closed peer as EOF or a
+/// reset, never as a broken pipe — so the daemon had closed the
+/// connection before the request, or a truncated start of it, reached
+/// it, and a truncated frame is not dispatched. Everything else, an EOF
+/// while waiting for the answer above all, may have been run.
+fn never_reached_a_daemon(e: &ClientError) -> bool {
+    match e {
+        ClientError::Connect { .. } => true,
+        ClientError::Frame(FrameError::Io(io)) => io.kind() == std::io::ErrorKind::BrokenPipe,
+        _ => false,
+    }
+}
+
+/// The daemon went away and a new one could not be started.
+///
+/// Still §3.2's `daemon_unreachable`, because that is what it is; the
+/// detail says both halves, since "cannot reach" alone reads as though
+/// nothing was tried.
+fn respawn_failed(lost: &ClientError, spawn: ClientError) -> ErrorData {
+    ErrorData::internal_error(
+        "Internal error".to_string(),
+        Some(serde_json::json!({
+            "reason": "daemon_unreachable",
+            "detail": format!("{lost}; starting a new daemon failed: {spawn}"),
+        })),
+    )
+}
+
+/// A call that may have run on a daemon that has since gone (GH #231).
+///
+/// Not re-sent — see `forward` — so the answer is what is known: a new
+/// daemon is up, the old one's sessions went with it, and whether this
+/// call took effect first cannot be said. `daemon_restarted` names the
+/// case; when the daemon on the far side turns out to be the same one,
+/// the connection merely broke, and `daemon_unreachable` is the honest
+/// reason for that.
+fn lost_in_flight(e: &ClientError, restarted: bool) -> ErrorData {
+    let (reason, message) = if restarted {
+        (
+            "daemon_restarted",
+            "The Holdfast daemon stopped while this call was in flight, and a new one has been \
+             started: every session from the previous daemon is gone, and whether this call \
+             took effect before it stopped is unknown.",
+        )
+    } else {
+        (
+            "daemon_unreachable",
+            "The connection to the Holdfast daemon broke while this call was in flight and has \
+             been re-established; whether this call took effect is unknown.",
+        )
+    };
+    ErrorData::internal_error(
+        message.to_string(),
+        Some(serde_json::json!({ "reason": reason, "detail": e.to_string() })),
     )
 }
 
@@ -1073,6 +1439,146 @@ mod tests {
             }),
             "§7.4.1: data → structuredContent.data, status and details likewise"
         );
+    }
+
+    /// **GH #229: `start_session` carries the shim's own directory and
+    /// environment, under the reserved key, on the wire.**
+    ///
+    /// The shim is the only process in the hybrid path that is the
+    /// client's own; a daemon serving several clients cannot know which
+    /// one's project a call belongs to unless the call says so. Read back
+    /// as a literal CBOR map, for this file's usual reason: a round trip
+    /// through `ClientLaunch` would agree with itself under any key.
+    ///
+    /// The value an MCP client put under the key is **overwritten**: the
+    /// context is this process's to state, and a shim that passed an
+    /// agent's through would let the agent name any directory as "where
+    /// the client is" — harmless for a `command` session, which can name
+    /// its own `cwd`, but the daemon should never have to reason about it.
+    #[tokio::test]
+    async fn start_session_carries_the_shims_own_directory_and_environment() {
+        let dir = scratch_dir("client");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+        let reply = CborValue::Map(vec![
+            (
+                CborValue::Text("status".into()),
+                CborValue::Text("ok".into()),
+            ),
+            (CborValue::Text("data".into()), CborValue::Map(vec![])),
+            (
+                CborValue::Text("details".into()),
+                CborValue::Text("started".into()),
+            ),
+        ]);
+        let captured = stand_in_daemon(sock.clone(), reply);
+        let client = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        let shim = ShimServer::new(Arc::new(client));
+
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("command".into(), json!("bash"));
+        arguments.insert(CLIENT_PARAM.into(), json!({ "cwd": "/somebody/elses" }));
+        shim.forward("start_session", Some(arguments), std::future::pending())
+            .await
+            .expect("the stand-in answered ok");
+        let req = captured.await.expect("the stand-in captured a request");
+        let params = field(&req, "params");
+        assert_eq!(
+            field(params, "command").as_text(),
+            Some("bash"),
+            "the caller's own arguments still travel verbatim"
+        );
+
+        let context = field(params, CLIENT_PARAM);
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            field(context, "cwd").as_text(),
+            Some(here.to_str().unwrap()),
+            "the context must name this process's directory, not the one the MCP \
+             client wrote under the key"
+        );
+        // One variable every test process has, compared by value: a shim
+        // that sent an empty map, or the daemon's, would fail here.
+        let path = std::env::var("PATH").expect("a test process has PATH");
+        assert_eq!(
+            field(field(context, "env"), "PATH").as_text(),
+            Some(path.as_str()),
+            "the context must carry this process's environment"
+        );
+    }
+
+    /// **GH #231: which lost calls may be re-sent.** Only the two that
+    /// provably never reached a daemon — a dial that failed, and a write
+    /// into a connection already closed — because a `send_input` or a
+    /// `start_session` re-sent after the old daemon ran it runs twice.
+    /// Each refusal below is a failure that *can* follow a dispatched
+    /// call; a classifier that answered `true` to any of them would re-send
+    /// it.
+    #[test]
+    fn only_a_call_that_never_reached_a_daemon_is_re_sent() {
+        let io = |kind| ClientError::Frame(FrameError::Io(std::io::Error::from(kind)));
+        assert!(never_reached_a_daemon(&ClientError::Connect {
+            path: "control.sock".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        }));
+        assert!(never_reached_a_daemon(&io(std::io::ErrorKind::BrokenPipe)));
+        for maybe_ran in [
+            ClientError::Frame(FrameError::Eof),
+            io(std::io::ErrorKind::ConnectionReset),
+            io(std::io::ErrorKind::TimedOut),
+            ClientError::IdMismatch {
+                expected: 1,
+                got: 2,
+            },
+        ] {
+            assert!(!never_reached_a_daemon(&maybe_ran), "{maybe_ran:?}");
+        }
+    }
+
+    /// The other classifier: which handshake failures are a dead daemon's
+    /// listener still closing, and so worth one more `ensure_daemon`. A
+    /// timeout is not — that is a daemon that is there and not answering,
+    /// and GH #15 is why nothing spawns over it.
+    /// Which failures reconnect at all. The two refused here come from a
+    /// daemon that is plainly still there — this side's own oversized
+    /// request, and an answer that did not decode — and reconnecting over
+    /// them would tell the agent its sessions were gone when they are not.
+    #[test]
+    fn only_a_missing_or_broken_connection_is_a_lost_daemon() {
+        let io = |kind| ClientError::Frame(FrameError::Io(std::io::Error::from(kind)));
+        assert!(lost_the_daemon(&ClientError::Connect {
+            path: "control.sock".into(),
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        }));
+        assert!(lost_the_daemon(&ClientError::Frame(FrameError::Eof)));
+        assert!(lost_the_daemon(&io(std::io::ErrorKind::BrokenPipe)));
+        for there in [
+            ClientError::Frame(FrameError::TooLarge { len: 1 << 30 }),
+            ClientError::Frame(FrameError::Cbor("truncated".into())),
+            ClientError::Refused("client_too_old".into()),
+            ClientError::VersionMismatch { ours: 1, theirs: 2 },
+        ] {
+            assert!(!lost_the_daemon(&there), "{there:?}");
+        }
+    }
+
+    #[test]
+    fn a_reset_handshake_is_a_closing_listener_and_a_silent_one_is_not() {
+        let io = |kind| ClientError::Frame(FrameError::Io(std::io::Error::from(kind)));
+        assert!(a_closing_listener(&ClientError::Frame(FrameError::Eof)));
+        assert!(a_closing_listener(&io(std::io::ErrorKind::ConnectionReset)));
+        assert!(!a_closing_listener(&io(std::io::ErrorKind::TimedOut)));
+        assert!(!a_closing_listener(&ClientError::Refused("too old".into())));
+        assert!(!a_closing_listener(&ClientError::VersionMismatch {
+            ours: 1,
+            theirs: 2
+        }));
     }
 
     /// The negative for the mapping above: a control-protocol *error*

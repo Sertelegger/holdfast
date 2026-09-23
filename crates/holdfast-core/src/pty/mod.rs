@@ -233,6 +233,52 @@ pub trait PtyBackend: Send + Sync {
         self.signal(sig)
     }
 
+    /// Hang up the child — `SIGHUP` to its own process group, which is
+    /// what a terminal closing delivers — and say whether it went out
+    /// (GH #234).
+    ///
+    /// **Not a [`Signal`] variant**, because §7.5's attach `Signal` frame
+    /// maps onto that enum and `term` there means exactly `SIGTERM`; a
+    /// hangup is a step inside `terminate`'s escalation, not a signal a
+    /// client can name. `Session::hang_up_idle_shell` decides *when*.
+    ///
+    /// Defaults to `false`, delivering nothing, so a backend that cannot —
+    /// any platform without the signal — behaves exactly as every backend
+    /// did before this existed.
+    fn hang_up(&self) -> bool {
+        false
+    }
+
+    /// The session leader's argument vector as it is **now** — after any
+    /// `exec` — or `None` when it cannot be read: no pid, a leader already
+    /// reaped, a platform with no reader (GH #234).
+    ///
+    /// **The spawn-time `command` and `args` are not this.** A shell that
+    /// ran `exec python3 app.py` keeps its pid and its process group, so
+    /// a session still reads as a shell by what it was started with while
+    /// its leader is a program with a `SIGTERM` handler of its own — and a
+    /// hangup would cut that handler short, or make a server that reads
+    /// `SIGHUP` as "reload" reload in the middle of its shutdown.
+    ///
+    /// Defaults to `None`, which `Session::hang_up_idle_shell` reads as
+    /// "send nothing": the pre-GH-#234 escalation.
+    fn leader_argv(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Whether the session leader is **known** to be the only live process
+    /// left in its session (GH #234).
+    ///
+    /// `false` whenever anything else in the session is alive, and whenever
+    /// the question cannot be asked. A hangup to a shell reaches every job
+    /// it has, so a background job that caught `SIGTERM` and is still
+    /// cleaning up would be cut short by one; this is what waits for it.
+    ///
+    /// Defaults to `false`, for `leader_argv`'s reason.
+    fn leader_alone(&self) -> bool {
+        false
+    }
+
     /// Resize the terminal, triggering `SIGWINCH` in the child.
     fn resize(&self, cols: u16, rows: u16) -> Result<()>;
 

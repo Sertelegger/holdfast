@@ -955,6 +955,115 @@ is cut, named and published is in
   Also corrected in passing: `shell.rs` said zsh runs `precmd_functions`
   before the bare `precmd`. zsh 5.9 does the reverse, measured.
 
+- **Once the daemon stopped, every open client answered `daemon_unreachable`
+  until something else started one** ([#231]). `holdfast daemon stop` is the
+  only way to load a new build, so this was every upgrade. The shim now
+  starts a daemon the way it started the first — through `holdfast daemon
+  start`, whose lock and re-check keep several clients noticing at once to
+  one daemon — and the call that found the daemon gone says so at the front
+  of its `details`: *"The Holdfast daemon had stopped, so a new one was
+  started for this call: every session from the previous daemon is gone…"*.
+  **A call is re-sent only when it provably never reached the old daemon** —
+  a dial that failed, or a write into a connection already closed, which is
+  what the first call after a `daemon stop` meets. A call that may already
+  have run — the daemon died while it waited for an answer — is not re-sent,
+  because a `send_input` or `start_session` would run twice; it is answered
+  with a new `data.reason`, `daemon_restarted`, saying the old sessions are
+  gone and whether the call took effect is unknown. A handshake reset by a
+  dead daemon's listener that has not closed yet — measured after `SIGKILL`
+  — is waited out for up to two seconds rather than reported; a handshake
+  that times out is still a wedged daemon and is still reported. If a
+  re-sent call is refused by the new daemon, the refusal's message carries
+  the same note at its front. With the hang-up in the next entry, the stop
+  half of an upgrade no longer sits out its whole grace for an idle shell.
+
+- **`terminate` on a shell took its whole grace, and `daemon stop` the whole
+  of its own** ([#234]). An interactive shell ignores `SIGTERM` (§4.4), so
+  the sweep reached every job and left the shell: `terminate` of any `bash`
+  session waited out its 5 s default before `SIGKILL`, and `daemon stop` its
+  10 s whenever a shell session was open. A shell is now **hung up** —
+  `SIGHUP`, what closing its terminal sends — once two things hold, and each
+  is a case the hangup would otherwise break:
+  - **it is alone in its session.** A shell passes a hangup on to every job
+    it has, so a job that caught the `SIGTERM` — in the foreground or the
+    background — and is still cleaning up would be cut short. The hangup
+    waits until each has finished.
+  - **the leader is an interactive shell now** (no `-c`, no script operand),
+    read from its current argv rather than from what the session was started
+    with. A shell that ran `exec python3 app.py` keeps its pid and group, and
+    a hangup there interrupts that program's `SIGTERM` handler — or makes a
+    server that reads `SIGHUP` as "reload" reload mid-shutdown. Such a
+    program is left to its own handling and the escalation, as before.
+
+  Linux and macOS only; where a session cannot be enumerated nothing
+  changes. The reported case — an idle shell whose background jobs die at
+  the sweep — now ends as soon as they have. The exit code a hung-up shell
+  reports is still `1`: REQ-P-007's documented limitation, which the
+  `SIGKILL` it replaces reported too. The idle reaper still waits out its
+  grace for a shell; it is a background path and was left alone.
+- **An exited session's name, as `holdfast list` shows it, answered a bare
+  `session not found`** ([#234]). §4.1 keeps exited sessions off the name
+  space, so `holdfast logs x79` and `status x79` are still refused once `x79`
+  has exited — but the refusal now says the session with that name has
+  exited and gives the id that still reaches it, newest first when several
+  have carried the name.
+
+- **`git log` and `git diff` sat in `less` until the wait timed out** ([#239]).
+  A session inherited no `PAGER`, so git ran `less` with its default
+  `LESS=FRX`, and the `X` keeps it off the alternate screen: the session read
+  `Executing` rather than `Fullscreen`, `wait_for_pattern` ran to its
+  deadline, and the tail held one screen of the log above a `:`. Every
+  session now starts with `PAGER`, `GIT_PAGER`, `MANPAGER` and
+  `SYSTEMD_PAGER` set to `cat`, after the inherited environment and before
+  the call's own `env` — so a pager inherited from the user's environment
+  loses to them, and a caller that sets any of them in `start_session`'s
+  `env` gets the one it asked for. `GIT_PAGER` is the one that matters most:
+  it outranks `core.pager`, so a git config that pipes through `delta` or
+  `less -S` is covered too, where `PAGER` alone would not be.
+
+- **A session started without `cwd` ran in whichever project had spawned the
+  shared daemon, with that project's environment** ([#229]). The daemon is
+  shared by every MCP client on the machine and outlives them all, and it
+  started every session from its own working directory and environment —
+  which were those of the first client. An agent in project B that omitted
+  `cwd` ran `git`, `cargo` or `rm` in project A, with A's
+  `CLAUDE_PROJECT_DIR` and another Claude session's
+  `CLAUDE_CODE_SESSION_ID`; the tool schema called that default *"the
+  directory the Holdfast server itself was started in"*, which an agent reads
+  as its own project.
+
+  The shim now attaches its own working directory and **its whole
+  environment** to every `start_session`, under a reserved `@client` params
+  key that no tool argument can have, and a `command` session starts from
+  those — the directory and environment of the `holdfast mcp` process the
+  client launched, which is what `--no-daemon` (and so Windows) always did.
+  The whole environment rather than a deny-list of per-project variables,
+  because the list has no end: read off the MCP servers Claude Code had
+  running on the machine this was fixed on, it would have had to include one
+  VS Code window's `SSH_AUTH_SOCK` and askpass handle, one Claude session's
+  messaging token, and whatever `direnv` or `mise` exported for the spawning
+  project. The values cross the control socket and never MCP, so they reach
+  no transcript, and `session_start.env_keys` still records only the keys the
+  call supplied. An explicit `cwd` or `env` still wins.
+
+  **A `profile` session takes neither**, and keeps the daemon's own directory
+  and environment as before: the operator wrote that process ([#55]), and the
+  context is reachable by anything that can speak the control protocol. A
+  daemon-hosted session with no client environment — a profile session, or a
+  request from an older shim — still starts from the daemon's, minus
+  `CLAUDECODE` and the `CLAUDE_` family, which name the spawning client and
+  are wrong for every other. Every session is also given `PWD` naming the
+  directory it really starts in.
+
+  **A client whose own directory has been removed is refused with
+  `invalid_params` and told to pass `cwd`**, rather than started somewhere
+  else: on Linux the shim can no longer read that directory at all, and a
+  context that arrives without one is not read as "use the daemon's", which
+  would be this defect again. A client that names a `cwd` is unaffected.
+  The context's fields are read leniently — one a later shim adds costs a
+  daemon of this release nothing but that field — because a daemon
+  outlives the shims that talk to it.
+
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -2389,3 +2498,7 @@ residuals that are known and accepted.
 [#240]: https://github.com/Sertelegger/holdfast/issues/240
 [#238]: https://github.com/Sertelegger/holdfast/issues/238
 [#248]: https://github.com/Sertelegger/holdfast/issues/248
+[#229]: https://github.com/Sertelegger/holdfast/issues/229
+[#239]: https://github.com/Sertelegger/holdfast/issues/239
+[#234]: https://github.com/Sertelegger/holdfast/issues/234
+[#231]: https://github.com/Sertelegger/holdfast/issues/231
