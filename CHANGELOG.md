@@ -13,6 +13,13 @@ is cut, named and published is in
 
 ### Added
 
+- **`holdfast --help`, `-h`, `help [<subcommand>]`, `<subcommand> --help`,
+  `--version` and `-V`**, all of which were `unknown subcommand`, exit 64 —
+  including REQ-A-002's own stated verification, `holdfast --help`. Help that
+  was asked for goes to stdout and exits 0; one subcommand's help is that
+  subcommand's banner lines, and a group's (`holdfast daemon --help`) is its
+  members' ([#233], [#178]).
+
 - A `windows-2022` CI job: native MSVC clippy over `--all-targets`, the source
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
@@ -218,6 +225,36 @@ is cut, named and published is in
   ENOENT), the committed exec bit, and the version lockstep below.
 
 ### Changed
+
+- **The CLI refuses a flag it does not have**, with exit 64 and that
+  subcommand's usage, where it used to drop it and run: `holdfast list --jsn`
+  printed the table, `holdfast logs big --tial 5` the whole log, and
+  `holdfast daemon stop --forse` **stopped the daemon**, all exit 0. The
+  grammar is read out of the usage banner itself — `[--flag]` is a switch,
+  `[--flag N]` takes a value, `<session>` is required — so a flag the banner
+  does not document is one the binary refuses, and the two cannot drift.
+  Flags may now come before the session (`holdfast logs --raw big`), `--x=v`
+  is `--x v`, and `--` ends the flags for a session whose name starts with a
+  dash ([#233]).
+- **`holdfast version` names the commit it was built from** instead of
+  `(build unknown)` on every build outside the release pipeline, and so does
+  the daemon's control handshake, from the same function. `holdfast-core`'s
+  new `build.rs` takes `HOLDFAST_BUILD_SHA` when the caller set it (the
+  release pipeline does), else the commit in `.cargo_vcs_info.json` (a
+  crates.io package), else the checkout's `HEAD` — read from `.git` beside
+  the workspace and never by walking upward, so a package unpacked under an
+  unrelated repository cannot report that repository's commit — else
+  `unknown`. It never fails a build. Every commit now recompiles
+  `holdfast-core`, which is what a build id that changes with the commit
+  costs ([#178]).
+- **`holdfast daemon stop` returns once the daemon has exited**, not once it
+  has answered. The answer comes before the daemon's teardown, so `daemon
+  stop && rm -rf "$HOLDFAST_RUNTIME_DIR"` raced it; the stop now waits up to
+  five seconds more for the process to be gone (a zombie counts), and says so
+  with exit 1 if it is not. A graceful stop that has not been answered after
+  a second says what it is waiting for — an interactive shell ignores
+  `SIGTERM`, so any stop with one in it spends §3.2's whole ten-second grace,
+  and did so in silence ([#20]).
 
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
@@ -647,6 +684,33 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **`holdfast logs` printed only the oldest 256 KiB of a session**, silently,
+  exit 0 — and both viewers' truncation notices send the operator there for
+  what they missed. One `read_output` returns at most one page, and the command
+  made one call and ignored `truncated_for_size` and `next_cursor`. It now
+  follows `next_cursor` to the end, stopping at a holdback (where
+  `held_back_note` says why, as before) and at the head as it stood when the
+  command started, so a session printing faster than it can be read cannot
+  keep it running. It reads from the ring's tail rather than from 0, so it is
+  no longer audited as `truncated_at_tail`, and says on stderr when the
+  session's front has left the buffer or bytes left it mid-read. `--tail N`
+  longer than one page was cut to the newest 256 KiB, starting mid-line; it
+  now drains and keeps the last N lines itself, counted exactly as the
+  daemon's `tail_lines` counts them ([#232]).
+- **`holdfast logs | head` panicked with a backtrace note and exited 101**, as
+  did `list`, `version`, `daemon status` and `daemon start|stop` whenever the
+  reader left first — the dogfood pass measured it on every `logs` of a long
+  session piped to `head`, and on a third of `list | head -1` runs. Rust
+  ignores `SIGPIPE`, so the write returned `EPIPE` and `println!` panicked.
+  These subcommands now write stdout through one helper that, when the reader
+  has gone, dies of `SIGPIPE` exactly as `cat` does — no message, and 141 from
+  the shell. It is scoped to the stdout write and not the process: the same
+  commands write to the control socket, and a daemon dying mid-call must still
+  read as "unreachable", exit 2. Any other stdout failure (`> /dev/full`) is
+  said on stderr and exits 1. **`holdfast watch | head` never exited at all**,
+  because it discarded its write errors; it now ends at the first write after
+  its reader has gone. `attach` is unchanged: its stdout is the terminal it
+  holds in raw mode ([#218]).
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -2011,3 +2075,8 @@ residuals that are known and accepted.
 [#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
+[#20]: https://github.com/Sertelegger/holdfast/issues/20
+[#178]: https://github.com/Sertelegger/holdfast/issues/178
+[#218]: https://github.com/Sertelegger/holdfast/issues/218
+[#232]: https://github.com/Sertelegger/holdfast/issues/232
+[#233]: https://github.com/Sertelegger/holdfast/issues/233
