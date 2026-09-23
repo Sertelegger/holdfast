@@ -908,7 +908,24 @@ impl OutputProcessor {
     }
 
     /// Run the pipeline over a snapshot. Pure: no locks, no I/O.
+    ///
+    /// With no terminal width, so a redraw is never collapsed (GH #247):
+    /// whether a line wrapped is a question about the width, and a caller
+    /// that cannot answer it gets every byte. `Session::read_processed`
+    /// knows the session's width and calls [`Self::process_at_width`].
     pub fn process(&self, w: &WindowSnapshot<'_>, opts: &ReadOptions) -> ProcessedRead {
+        self.process_at_width(w, opts, None)
+    }
+
+    /// [`Self::process`] for a session `cols` wide, which is what lets
+    /// `ansi: "strip"` drop a redraw a terminal erased (GH #247) — only a
+    /// line that cannot have wrapped at that width; see `erased_redraws`.
+    pub fn process_at_width(
+        &self,
+        w: &WindowSnapshot<'_>,
+        opts: &ReadOptions,
+        cols: Option<u16>,
+    ) -> ProcessedRead {
         let window_end = w.window_start + w.window.len() as u64;
         let holdback = self.holdback_boundary(w, opts);
         // The size cap and the holdback both bound the read; whichever
@@ -1301,10 +1318,9 @@ impl OutputProcessor {
         // **A redraw a terminal erased is not text the caller is shown
         // (GH #247).** See `erased_redraws`; the ranges it returns are
         // skipped by `render` exactly as a span is, minus the marker.
-        let erased = if opts.ansi == AnsiMode::Strip {
-            erased_redraws(w, &spans, read_end)
-        } else {
-            Vec::new()
+        let erased = match (opts.ansi, cols) {
+            (AnsiMode::Strip, Some(cols)) => erased_redraws(w, &spans, read_end, cols),
+            _ => Vec::new(),
         };
         let (mut bytes, mut redactions) = self.render(w, &spans, &erased, read_end, opts);
         if !erased.is_empty() {
@@ -1533,7 +1549,23 @@ fn utf8_read_end(w: &WindowSnapshot<'_>, read_end: u64) -> u64 {
 /// line with no erase (the old tail is still on screen), a redraw with a
 /// tab, a backspace or a cursor movement in it, a redraw that has not
 /// finished inside this page, and every byte under `ansi: raw`, which
-/// promises the bytes. **Nothing that a terminal still shows is dropped.**
+/// promises the bytes.
+///
+/// **And a line that may have wrapped** (the independent review of
+/// GH #247). `\r` returns to column 0 of the row the cursor is on, and an
+/// erase clears that row — so a line wider than the terminal leaves every
+/// row above its last one on screen, and dropping the whole line dropped
+/// text a terminal still shows: 150 `W`s and a `\r\x1b[K` in an 80-column
+/// session read back as nothing where the grid showed two rows of them.
+/// So the line is dropped only if its start column is known and it never
+/// reached past `cols`, counted the conservative way: every character
+/// that is not ASCII as two columns, a column that is unknown after any
+/// escape that can move the cursor, and a page whose first line began
+/// before anything this window can see as unknown too. `cols` is the
+/// session's width when the read is taken; a session widened *after* a
+/// wrapped line was painted is the residual, since the rows it wrapped
+/// onto are still on screen and this counts against the wider width.
+/// **Nothing that a terminal still shows is dropped.**
 ///
 /// **It never touches what redaction sees.** Spans are found on the whole
 /// window before this runs and a range overlapping any of them is not
@@ -1542,12 +1574,18 @@ fn utf8_read_end(w: &WindowSnapshot<'_>, read_end: u64) -> u64 {
 /// not shown. And a line with nothing printable in front of its `\r` —
 /// bash's `\x1b[?2004l\r` before every command's output — is not
 /// "collapsed" into a page that differs only by that `\r`.
-fn erased_redraws(w: &WindowSnapshot<'_>, spans: &[Span], read_end: u64) -> Vec<(u64, u64)> {
+fn erased_redraws(
+    w: &WindowSnapshot<'_>,
+    spans: &[Span],
+    read_end: u64,
+    cols: u16,
+) -> Vec<(u64, u64)> {
     let window_end = w.window_start + w.window.len() as u64;
     let end = read_end.min(window_end);
     if end <= w.req_start {
         return Vec::new();
     }
+    let cols = u32::from(cols);
     let at = |off: u64| w.window[(off - w.window_start) as usize];
     // A CSI sequence at `off`: where it ends and its final byte.
     let csi = |off: u64| -> Option<(u64, u8)> {
@@ -1599,16 +1637,24 @@ fn erased_redraws(w: &WindowSnapshot<'_>, spans: &[Span], read_end: u64) -> Vec<
         (fin == b'K' && matches!(params, b"" | b"0" | b"2")).then_some((next, params == b"2"))
     };
     let mut out: Vec<(u64, u64)> = Vec::new();
-    let mut line_start = w.req_start;
+    // The walk starts at the window, not the page, so the column the
+    // page's first line began at can be known: from the stream's first
+    // byte, or from the first `\r` the lookbehind holds. Before either it
+    // is unknown, and so is every line that began then.
+    let mut col: Option<u32> = (w.window_start == 0).then_some(0);
+    let mut line_start = w.window_start;
     let mut printable = false;
-    let mut off = w.req_start;
+    // The current line began at a known column and has not wrapped.
+    let mut fits = col.is_some();
+    let mut off = w.window_start;
     while off < end {
         let b = at(off);
         // A line feed — or the two other bytes that move the cursor down,
-        // VT and FF — starts a new line.
+        // VT and FF — starts a new line, at the column it left.
         if matches!(b, b'\n' | 0x0b | 0x0c) {
             line_start = off + 1;
             printable = false;
+            fits = col.is_some();
             off += 1;
             continue;
         }
@@ -1619,24 +1665,54 @@ fn erased_redraws(w: &WindowSnapshot<'_>, spans: &[Span], read_end: u64) -> Vec<
             // or a different screen from the text written before it. So
             // anything but SGR ends the line as far as this rule is
             // concerned, and the text in front of it is never dropped.
-            // Found by an independent review, on `\x1b[?1049h`.
+            // Found by an independent review, on `\x1b[?1049h`. An erase
+            // moves no cursor either, so the column survives it; after
+            // anything else it is unknown until the next `\r`.
             match csi(off) {
                 Some((next, b'm')) => off = next,
-                Some((next, _)) => {
+                Some((next, fin)) => {
                     off = next;
                     line_start = off;
                     printable = false;
+                    if !matches!(fin, b'K' | b'J') {
+                        col = None;
+                    }
+                    fits = col.is_some();
                 }
                 None => {
                     off = escape_end(off);
                     line_start = off;
                     printable = false;
+                    col = None;
+                    fits = false;
                 }
             }
             continue;
         }
         if b != b'\r' {
             printable |= b >= 0x20 && b != 0x7f;
+            // Where the cursor goes, counted so that a line that might
+            // have wrapped is taken to have. A character is written at the
+            // column after a full row only by wrapping to the next one.
+            if let Some(c) = col.as_mut() {
+                let width = match b {
+                    0x20..=0x7e => 1,
+                    0xc0..=0xff => 2,
+                    _ => 0,
+                };
+                match b {
+                    b'\t' => *c = ((*c / 8 + 1) * 8).min(cols.saturating_sub(1)),
+                    0x08 => *c = c.saturating_sub(1),
+                    _ if width > 0 => {
+                        if *c + width > cols {
+                            fits = false;
+                            *c = 0;
+                        }
+                        *c += width;
+                    }
+                    _ => {}
+                }
+            }
             off += 1;
             continue;
         }
@@ -1694,13 +1770,17 @@ fn erased_redraws(w: &WindowSnapshot<'_>, spans: &[Span], read_end: u64) -> Vec<
         }
         let drop = (line_start, cr + 1);
         let overlaps_span = spans.iter().any(|s| s.start < drop.1 && drop.0 < s.end);
-        if erased && printable && !overlaps_span {
+        if erased && printable && fits && !overlaps_span && drop.1 > w.req_start {
             out.push(drop);
         }
         if erased {
             line_start = cr + 1;
             printable = false;
         }
+        // `\r` is column 0 on whatever row the cursor is, and a line that
+        // did not end here goes on from there without having wrapped.
+        col = Some(0);
+        fits |= erased;
         off = cr + 1;
     }
     out
@@ -4864,6 +4944,10 @@ mod tests {
 
     // ---------------------------------------- GH #247: erased redraws
 
+    /// A terminal wide enough for every fixture line below: the width the
+    /// dogfood pass's cargo measurement was taken at.
+    const WIDE: u16 = 120;
+
     /// The bytes `cargo build` writes through a pty, in the shape measured
     /// on cargo 1.97 at 120 columns: each `Building` frame padded to the
     /// width and ended by `\r`, followed either by the next frame or by
@@ -4918,9 +5002,10 @@ mod tests {
         let p = processor();
         let (text, shown) = cargo_progress(&["proc-macro2", "quote", "syn", "serde", "regex"]);
         let buf = text.as_bytes();
-        let r = p.process(
+        let r = p.process_at_width(
             &snapshot(&p, buf, 0, 1 << 20, true, false),
             &ReadOptions::default(),
+            Some(WIDE),
         );
         let expected: String = shown.iter().map(|l| format!("{l}\r\n")).collect();
         assert_eq!(r.output, expected);
@@ -4937,9 +5022,10 @@ mod tests {
                 "#".repeat(n / 10)
             ));
         }
-        let r = p.process(
+        let r = p.process_at_width(
             &snapshot(&p, bar.as_bytes(), 0, 1 << 20, true, false),
             &ReadOptions::default(),
+            Some(WIDE),
         );
         // The first `\r` stays: nothing printable is in front of it, so it
         // erased nothing, and the rule drops only what was erased.
@@ -4950,7 +5036,7 @@ mod tests {
 
         // The second spelling: a redraw from column 0 that ends in an
         // erase-to-end, with no erase in front of it.
-        let r = p.process(
+        let r = p.process_at_width(
             &snapshot(
                 &p,
                 b"a much longer old line\rnew\x1b[K\r\n",
@@ -4960,16 +5046,18 @@ mod tests {
                 false,
             ),
             &ReadOptions::default(),
+            Some(WIDE),
         );
         assert_eq!(r.output, "new\r\n");
 
         // `ansi: raw` promises the bytes, and gets them.
-        let raw = p.process(
+        let raw = p.process_at_width(
             &snapshot(&p, buf, 0, 1 << 20, true, false),
             &ReadOptions {
                 ansi: AnsiMode::Raw,
                 ..ReadOptions::default()
             },
+            Some(WIDE),
         );
         assert_eq!(raw.output, text);
     }
@@ -5008,9 +5096,10 @@ mod tests {
             // printable precedes it, so there is nothing to erase.
             "$ ls\r\n\x1b[?2004l\rCargo.toml\r\n",
         ] {
-            let r = p.process(
+            let r = p.process_at_width(
                 &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
                 &ReadOptions::default(),
+                Some(WIDE),
             );
             assert_eq!(
                 r.output,
@@ -5021,6 +5110,72 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    /// **A line that may have wrapped is not collapsed** (the independent
+    /// review of GH #247). `\r` returns to column 0 of the *last* row a
+    /// wrapped line reached and the erase clears that row alone, so the
+    /// rows above it are still on screen. Each case is paired with the
+    /// width at which the same bytes do collapse, so the rule is shown to
+    /// turn on the width and not on the shape.
+    #[test]
+    fn a_line_that_may_have_wrapped_is_not_collapsed() {
+        let p = processor();
+        let read = |text: &str, cols: u16| {
+            p.process_at_width(
+                &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
+                &ReadOptions::default(),
+                Some(cols),
+            )
+            .output
+        };
+        let strip = |text: &str| String::from_utf8(ansi::strip(text.as_bytes())).unwrap();
+
+        // The review's repro: 164 columns of text.
+        let wide = format!("{}IMPORTANT-TAIL\r\x1b[Kdone-51\r\n", "W".repeat(150));
+        assert_eq!(read(&wide, 80), strip(&wide));
+        assert_eq!(read(&wide, 163), strip(&wide), "one column short");
+        assert_eq!(read(&wide, 164), "done-51\r\n", "exactly the width");
+
+        // Wide characters are counted as two columns: 30 of them are 60.
+        let cjk = format!("{}\r\x1b[Kdone\r\n", "日本".repeat(15));
+        assert_eq!(read(&cjk, 59), strip(&cjk));
+        assert_eq!(read(&cjk, 60), "done\r\n");
+
+        // A tab is a jump, not a wrap, and it is counted.
+        let tabbed = "\t\t\tVISIBLE\r\x1b[Kdone\r\n";
+        assert_eq!(read(tabbed, 30), strip(tabbed));
+        assert_eq!(read(tabbed, 31), "done\r\n");
+
+        // A line whose start column is not known — it began in front of
+        // anything the window holds — is never collapsed, at any width.
+        let mut long = "x".repeat(4000);
+        long.push_str("\r\x1b[Kdone\r\n");
+        let r = p.process_at_width(
+            &snapshot(&p, long.as_bytes(), 2000, 1 << 20, true, false),
+            &ReadOptions::default(),
+            Some(u16::MAX),
+        );
+        assert!(r.output.starts_with("xxxx"), "{:?}", &r.output[..16]);
+        // …and one whose start the window does hold is.
+        let mut known = "x".repeat(4000);
+        known.push_str("\r\nbar 1/9\r\x1b[Kdone\r\n");
+        let at = known.find("bar").unwrap() as u64;
+        let r = p.process_at_width(
+            &snapshot(&p, known.as_bytes(), at, 1 << 20, true, false),
+            &ReadOptions::default(),
+            Some(80),
+        );
+        assert_eq!(r.output, "done\r\n");
+
+        // No width, no collapse: `process` is the spelling for a caller
+        // that cannot say.
+        let bar = "bar 1/9\r\x1b[Kdone\r\n";
+        let r = p.process(
+            &snapshot(&p, bar.as_bytes(), 0, 1 << 20, true, false),
+            &ReadOptions::default(),
+        );
+        assert_eq!(r.output, strip(bar));
     }
 
     /// **Every range the collapse drops wrote nothing a terminal still
@@ -5038,9 +5193,16 @@ mod tests {
     /// (`\x1b[?1049h`, `\x1b[A`). The screen is tall enough that nothing
     /// scrolls, so "still visible" means exactly that.
     ///
-    /// **Paired**: the sweep must also have collapsed something, and a
-    /// stream the rule is for must collapse, or the property holds of a
-    /// rule that drops nothing.
+    /// **At two widths, and the narrow one is the third finding.** A
+    /// 120-column terminal never wraps a line these pieces make, so a rule
+    /// that ignored the width passed here while dropping the rows of a
+    /// wrapped line a terminal still shows (150 `W`s and `\r\x1b[K` in an
+    /// 80-column session). At 20 columns most lines wrap, and every one
+    /// that does must be kept.
+    ///
+    /// **Paired**: the sweep must also have collapsed something at each
+    /// width, and a stream the rule is for must collapse, or the property
+    /// holds of a rule that drops nothing.
     #[test]
     fn nothing_a_collapse_drops_is_still_on_a_terminal() {
         struct Rng(u64);
@@ -5095,60 +5257,67 @@ mod tests {
         ];
         // Leaving the alternate screen at the end, so a line the stream
         // left on the main screen is on the screen compared.
-        let screen = |bytes: &[u8]| {
-            let mut t = vt100::Parser::new(200, 120, 0);
+        let screen = |bytes: &[u8], cols: u16| {
+            let mut t = vt100::Parser::new(200, cols, 0);
             t.process(bytes);
             t.process(b"\x1b[?1049l");
             t.screen().clone()
         };
-        // The arrangements the review found, first, because a random walk
+        // The arrangements the reviews found, first, because a random walk
         // reaches each of them too rarely to be the thing that pins it.
-        const FOUND: &[&str] = &[
+        let wrapped = format!("{}IMPORTANT-TAIL\r\x1b[Kdone\r\n", "W".repeat(150));
+        let found: Vec<&str> = vec![
             "VISIBLE\r\x1b[?1049h\x1b[K",
             "VISIBLE\x1b[?1049h\r\x1b[K",
             "VISIBLE\x1b[A\r\x1b[K",
             "VISIBLE\x1b7\r\x1b[K\x1b8",
             "VISIBLE\x0b\r\x1b[K",
+            &wrapped,
+            "a line of twenty-five chars\r\x1b[K",
+            "\t\t\tVISIBLE\r\x1b[K",
         ];
-        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-        let mut collapsed = 0usize;
         let p = processor();
-        for iter in 0..3000 + FOUND.len() {
-            let text: String = match FOUND.get(iter) {
-                Some(found) => found.to_string(),
-                None => {
-                    let n = 1 + rng.below(24);
-                    (0..n).map(|_| PIECES[rng.below(PIECES.len())]).collect()
+        for cols in [120u16, 20] {
+            let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+            let mut collapsed = 0usize;
+            for iter in 0..3000 + found.len() {
+                let text: String = match found.get(iter) {
+                    Some(found) => found.to_string(),
+                    None => {
+                        let n = 1 + rng.below(24);
+                        (0..n).map(|_| PIECES[rng.below(PIECES.len())]).collect()
+                    }
+                };
+                let buf = text.as_bytes();
+                let w = snapshot(&p, buf, 0, 1 << 20, true, false);
+                let erased = erased_redraws(&w, &[], buf.len() as u64, cols);
+                if erased.is_empty() {
+                    continue;
                 }
-            };
-            let buf = text.as_bytes();
-            let w = snapshot(&p, buf, 0, 1 << 20, true, false);
-            let erased = erased_redraws(&w, &[], buf.len() as u64);
-            if erased.is_empty() {
-                continue;
-            }
-            collapsed += 1;
-            let mut swapped = buf.to_vec();
-            let mut stripper = AnsiStripper::new();
-            for (i, byte) in swapped.iter_mut().enumerate() {
-                let printed = stripper.feed(i as u64, *byte).is_some();
-                let inside = erased
-                    .iter()
-                    .any(|(s, e)| *s <= i as u64 && (i as u64) < *e);
-                if inside && printed && (0x20..=0x7e).contains(byte) {
-                    *byte = if *byte == b'#' { b'%' } else { b'#' };
+                collapsed += 1;
+                let mut swapped = buf.to_vec();
+                let mut stripper = AnsiStripper::new();
+                for (i, byte) in swapped.iter_mut().enumerate() {
+                    let printed = stripper.feed(i as u64, *byte).is_some();
+                    let inside = erased
+                        .iter()
+                        .any(|(s, e)| *s <= i as u64 && (i as u64) < *e);
+                    if inside && printed && (0x20..=0x7e).contains(byte) {
+                        *byte = if *byte == b'#' { b'%' } else { b'#' };
+                    }
                 }
+                assert_eq!(
+                    screen(buf, cols).contents(),
+                    screen(&swapped, cols).contents(),
+                    "iter {iter} at {cols} columns: a dropped range is still on screen: \
+                 {text:?} dropped {erased:?}"
+                );
             }
-            assert_eq!(
-                screen(buf).contents(),
-                screen(&swapped).contents(),
-                "iter {iter}: a dropped range is still on screen: {text:?} dropped {erased:?}"
+            assert!(
+                collapsed > 100,
+                "only {collapsed} streams collapsed anything at {cols} columns"
             );
         }
-        assert!(
-            collapsed > 300,
-            "only {collapsed} streams collapsed anything"
-        );
     }
 
     /// **Dropping a redraw never removes a marker, and never lets the text
@@ -5165,9 +5334,10 @@ mod tests {
     fn collapsing_a_redraw_keeps_every_marker_and_hides_every_join() {
         let p = processor();
         let text = format!("progress {GITHUB}\r\x1b[Kdone\n");
-        let r = p.process(
+        let r = p.process_at_width(
             &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
             &ReadOptions::default(),
+            Some(WIDE),
         );
         assert_eq!(r.redactions.get("github"), Some(&1));
         assert_eq!(
@@ -5180,21 +5350,23 @@ mod tests {
         // follows the label directly.
         let value = "hunter2hunter2hunter2";
         let text = format!("PASSWORD:\n x\r\x1b[K{value}\n");
-        let uncollapsed = p.process(
+        let uncollapsed = p.process_at_width(
             &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
             &ReadOptions {
                 ansi: AnsiMode::Raw,
                 ..ReadOptions::default()
             },
+            Some(WIDE),
         );
         assert!(
             uncollapsed.redactions.is_empty(),
             "the premise: no stream the old pipeline judged matches here: {:?}",
             uncollapsed.redactions
         );
-        let r = p.process(
+        let r = p.process_at_width(
             &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
             &ReadOptions::default(),
+            Some(WIDE),
         );
         assert!(
             !r.output.contains(value),

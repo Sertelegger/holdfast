@@ -229,8 +229,16 @@ is cut, named and published is in
   followed by a shorter line with no erase, a tab, a backspace or a cursor
   movement is left as it was, so is a line a cursor move or a screen switch
   separates from the erase, and so is everything under `ansi: "raw"` — a
-  property test replays each dropped range through a terminal emulator to check
-  it. The cursor, `bytes_returned` and every flag are unchanged, because the
+  property test replays each dropped range through a terminal emulator, at a
+  wide and a narrow width, to check it. **So is a line that may have wrapped**,
+  because `\r` returns only to the start of the last row a wrapped line reached
+  and the erase clears that row alone: the line is dropped only if it fits the
+  session's width, counted with every non-ASCII character as two columns, from
+  a start column the read can see (found by the independent review — 150 `W`s
+  and `\r\x1b[K` in an 80-column session read back as nothing while the grid
+  still showed two rows of them). A session widened after such a line was
+  painted is the residual. The cursor, `bytes_returned` and every flag are
+  unchanged, because the
   bytes were read, only not shown; a frame a redaction touches is kept with its
   marker; and the shortened page is itself judged, because removing a frame
   joins the text either side of it.

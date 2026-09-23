@@ -2245,7 +2245,9 @@ impl Session {
             front_clipped,
             truncated_at_tail,
         };
-        let read = processor.process(&snapshot, &req.options);
+        // The width is the session's now: GH #247's collapse drops a
+        // redraw only when the line in front of it cannot have wrapped.
+        let read = processor.process_at_width(&snapshot, &req.options, Some(self.size().0));
 
         // Fold this response's counts into the session tally that
         // `status.redaction_stats` reports (§5.2, REQ-O-012). It is fed
@@ -4866,6 +4868,34 @@ mod tests {
             scrolled_off > 0,
             "no arm scrolled a header off the screen, which is the case GH #224 reports"
         );
+    }
+
+    /// **A read collapses a redraw only where the session's own width says
+    /// the line did not wrap** (GH #247, the independent review).
+    ///
+    /// The review's repro, at the session: 150 `W`s and a tail in an
+    /// 80-column session, then `\r\x1b[K`. The line wrapped over two rows
+    /// and the erase cleared only the last, so the grid still shows the
+    /// first 80 `W`s — and the read, which dropped the whole line, showed
+    /// none. At 200 columns the same bytes never wrapped and are dropped,
+    /// which is the half that proves the width reaches the processor at
+    /// all: a read path that passed no width would keep both.
+    #[test]
+    fn a_read_collapses_a_redraw_only_where_the_session_width_says_it_did_not_wrap() {
+        let p = OutputProcessor::builtin().unwrap();
+        let text = format!("{}IMPORTANT-TAIL\r\x1b[Kdone-51\r\n", "W".repeat(150));
+        for (cols, collapsed) in [(80u16, false), (200, true)] {
+            let (s, pty) = key_session(24, cols);
+            pty.queue_output(text.as_bytes());
+            wait_for_bytes(&s, text.len() as u64);
+            let r = s.read_processed(&ReadRequest::since(0, 1 << 20), &p);
+            if collapsed {
+                assert_eq!(r.output, "done-51\r\n", "at {cols} columns");
+            } else {
+                assert_eq!(r.output.matches('W').count(), 150, "at {cols} columns");
+                assert!(r.output.contains("IMPORTANT-TAIL"), "at {cols} columns");
+            }
+        }
     }
 
     /// **The grid judges the key it shows, not only the bytes behind it**
