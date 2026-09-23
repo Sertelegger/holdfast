@@ -12,26 +12,103 @@ machine so the MCP server has something to run.
 /plugin install holdfast@holdfast
 ```
 
-Then restart Claude Code. The first MCP call downloads the binary; every call
-after that is a file-existence check.
+Then restart Claude Code. The first MCP call downloads the binary for the
+release this plugin build is pinned to; every call after that is a
+file-existence check.
+
+**That download needs a promoted release.** Every release is created as a
+draft, and a draft's assets are not served until a person promotes it
+([CONTRIBUTING.md](../CONTRIBUTING.md#releases)); `v0.0.5` to `v0.0.7` were
+published with no binaries at all. Against either, the server fails to start,
+and `claude mcp list` or `/mcp` says why in one line: *no holdfast vX.Y.Z
+binary to download … To run Holdfast now, build it*. That line is the way in:
+[Using a binary you built yourself](#using-a-binary-you-built-yourself).
 
 `holdfast@holdfast` is `<plugin>@<marketplace>`. The right-hand `holdfast` is
 this repository's `.claude-plugin/marketplace.json` `name` field — it is not
 derived from the repository name, so renaming the repo does not change the
 install line and renaming that field does.
 
+## Using a binary you built yourself
+
+For a build from source — the only way in before a release is promoted, the
+way in on a platform with no prebuilt, and the way to run a checkout you are
+working on — name the binary and the bootstrap runs it and nothing else.
+
+1. **Install it somewhere that outlives your build directory.**
+
+   ```bash
+   # the release this plugin build is pinned to -- see version.txt
+   cargo install --locked --git https://github.com/Sertelegger/holdfast --tag vX.Y.Z holdfast
+   # or a checkout you are working on, from its root
+   cargo install --locked --path crates/holdfast
+   ```
+
+   Both put the binary at `~/.cargo/bin/holdfast`. **`cargo install holdfast`
+   does not work**: crates.io holds a `0.0.0` name reservation with no binary
+   in it, and cargo answers *"there is nothing to install"*. Nor is
+   `target/debug/holdfast` a good thing to name: `cargo clean` then breaks
+   every Claude Code session at once.
+
+2. **Name it in the `env` block of Claude Code's `settings.json`** —
+   `~/.claude/settings.json`, or `settings.json` inside each
+   `CLAUDE_CONFIG_DIR` you use, because every config directory is its own
+   installation:
+
+   ```json
+   { "env": { "HOLDFAST_BOOTSTRAP_BIN": "/home/you/.cargo/bin/holdfast" } }
+   ```
+
+   **The full path, spelled out.** Claude Code passes these values literally
+   — measured, `~` and `$HOME` arrive unexpanded — so the bootstrap refuses a
+   leading `~` or `$` by name rather than guessing what was meant. It also
+   refuses a relative path, since it runs in whichever project Claude Code was
+   started in, and a path that is not an executable file. **It never
+   downloads in place of a binary you named.**
+
+3. **Restart Claude Code.** `claude mcp list` should show
+   `plugin:holdfast:holdfast: … ✔ Connected`.
+
+Upgrading is a rebuild and a daemon restart, and the daemon is the part that
+is easy to miss: the top-level README's
+[Build and try it](../README.md#build-and-try-it) says why, and what it costs.
+
+**Working on the plugin itself.** `/plugin marketplace add /path/to/checkout`
+— a local directory rather than `Sertelegger/holdfast` — loads the checkout's
+`plugin/` in place: measured, the server command it registers is the
+checkout's own `plugin/bootstrap`, so an edit takes effect at the next start.
+`claude --plugin-dir /path/to/checkout/plugin` does the same for one session.
+Once the listing is pinned to a promoted release ([Releasing](#releasing)), a
+local-directory marketplace installs *that* release, and `--plugin-dir` is the
+in-place route.
+
 ## What the bootstrap does
 
 `.mcp.json` registers one stdio server whose command is
 `${CLAUDE_PLUGIN_ROOT}/bootstrap`. On every MCP start that script:
 
-1. reads `version.txt` next to itself — the version this plugin build is
+1. execs `HOLDFAST_BOOTSTRAP_BIN` if it is set, or refuses — see above;
+2. reads `version.txt` next to itself — the version this plugin build is
    pinned to, bumped in the release PR;
-2. execs the cached binary for that version and this target if it is there;
-3. otherwise fetches `SHA256SUMS.txt` and `holdfast-<target>.tar.gz` from the
+3. if `HOLDFAST_BOOTSTRAP_ALLOW_PATH` is set, execs the `holdfast` on `$PATH`
+   when `holdfast version` reports exactly that version, and otherwise says
+   why on stderr and carries on;
+4. execs the cached binary for that version and this target if it is there;
+5. otherwise fetches `SHA256SUMS.txt` and `holdfast-<target>.tar.gz` from the
    matching GitHub Release over TLS, verifies the archive against the freshly
    fetched manifest, extracts exactly one member under the safe-extraction
    rules below, installs it into the cache and execs it.
+
+**When it cannot start the server, it says so where you are looking.** A
+stdio server that exits before answering shows in Claude Code as
+`Failed to connect — CONNECTION_CLOSED` and nothing else. So under `mcp` a
+failing bootstrap answers the `initialize` request Claude Code has already
+sent with a JSON-RPC error carrying its diagnosis, and `claude mcp list` shows
+`Failed to connect — -32603: holdfast bootstrap: <the reason>` (both shapes
+measured with Claude Code 2.1.280). The same line is on stderr, which Claude
+Code keeps in its MCP log, and
+`HOLDFAST_BOOTSTRAP_DEBUG=1 "${CLAUDE_PLUGIN_ROOT}/bootstrap" version`
+reproduces it by hand. Nothing is read from stdin on a success path.
 
 **Cache location.** `$CLAUDE_PLUGIN_DATA/bin/` when the loader exports it —
 which it does — else `$XDG_CACHE_HOME/holdfast/bin/`, else
@@ -48,16 +125,19 @@ what it does not cover: it is not protection against a compromised release or
 a compromised maintainer account. Sigstore/cosign signing is the post-v0.1.0
 answer to that.
 
-## Air-gapped, firewalled, or the release simply is not published yet
+## Air-gapped or firewalled
 
-The bootstrap fails with a message that names the URL and the exact path to
-put the binary at. To install by hand:
+When the release **is** published and this host cannot reach it, the bootstrap
+fails with *cannot reach …* and names the two paths below. (A release that is
+not published fails differently — *no holdfast vX.Y.Z binary to download* —
+and there is nothing to download by hand; build it instead, as above.) To
+install by hand:
 
 1. On a connected machine, download `holdfast-<target>.tar.gz` and
-   `SHA256SUMS.txt` from <https://github.com/Sertelegger/holdfast/releases>
-   for the tag matching this plugin's `version.txt`. `<target>` is one of
-   `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`,
-   `windows-x86_64`.
+   `SHA256SUMS.txt` from the release page for the tag matching this plugin's
+   `version.txt`, `https://github.com/Sertelegger/holdfast/releases/tag/vX.Y.Z`.
+   `<target>` is one of `linux-x86_64`, `linux-aarch64`, `macos-x86_64`,
+   `macos-aarch64`, `windows-x86_64`.
 2. **Verify the checksum yourself.** `sha256sum -c SHA256SUMS.txt
    --ignore-missing`, or `shasum -a 256` and compare. Skipping this moves the
    trust root from GitHub's TLS onto whatever carried the file.
@@ -67,9 +147,8 @@ put the binary at. To install by hand:
    or it is a cache miss**: a binary without its manifest is treated as absent
    and the bootstrap tries to download again.
 
-`cargo install holdfast` also works and needs no network at MCP time — but it
-installs onto `$PATH`, not into the cache, so see `HOLDFAST_BOOTSTRAP_ALLOW_PATH`
-below.
+A build from source with `HOLDFAST_BOOTSTRAP_BIN`, as above, needs no network
+at MCP time either.
 
 The `/holdfast:install` command walks a user through all of this and reads the
 bootstrap's own diagnosis first.
@@ -78,8 +157,9 @@ bootstrap's own diagnosis first.
 
 | Variable | Effect |
 |---|---|
+| `HOLDFAST_BOOTSTRAP_BIN` | Absolute path of a `holdfast` to exec instead of anything else. No search, no version comparison, no download; a relative, `~`-, `$`-led or non-executable value is refused, never worked around |
 | `HOLDFAST_BOOTSTRAP_DEBUG` | Trace to stderr. Safe at any time; stdout stays the MCP transport |
-| `HOLDFAST_BOOTSTRAP_ALLOW_PATH` | Exec whatever `holdfast` is on `$PATH` when it reports the pinned version. **Off by default and that is a security decision** — see below |
+| `HOLDFAST_BOOTSTRAP_ALLOW_PATH` | Exec whatever `holdfast` is on `$PATH` when `holdfast version` reports exactly the pinned version — the second field, compared whole. When it declines, it says why. **Off by default and that is a security decision** — see below |
 | `HOLDFAST_BOOTSTRAP_BASE_URL` | Release base URL. For the test harness; a non-`https://` value is refused unless the next variable is also set |
 | `HOLDFAST_BOOTSTRAP_INSECURE` | Permits a non-TLS base URL. For `scripts/plugin-bootstrap-tests.sh` only |
 | `CLAUDE_PLUGIN_DATA` | Cache root, normally set by the loader |
@@ -93,7 +173,9 @@ a default: **self-reported version output is not authentication.** Any writable
 the process this bootstrap execs inherits the agent's MCP stdio — every command
 the agent runs, and every secret routed through `request_secret_input`. The
 behaviour survives as an opt-in, where setting the variable *is* the
-authorisation.
+authorisation. `HOLDFAST_BOOTSTRAP_BIN` is the stricter spelling of the same
+wish — one named file, nothing searched and no version to spoof — and wins
+when both are set.
 
 ## The safe-extraction rules, and why they are a whitelist
 

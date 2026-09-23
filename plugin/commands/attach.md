@@ -1,16 +1,18 @@
 ---
 description: Explain how to watch or drive a Holdfast session from your own terminal
 argument-hint: "[session name or id substring]"
-allowed-tools: Bash(holdfast:*), Bash(tmux:*)
+allowed-tools: Bash(holdfast:*), Bash(tmux:*), Bash(command:*), Bash(printenv:*)
 ---
 
 Help the user get eyes on a Holdfast session from *their* terminal. Filter to
 sessions whose name or id contains `$1` when it is given.
 
-`holdfast` here is the binary the plugin's bootstrap cached, which is on the
-user's `$PATH` only if they installed it some other way. **Check that first**
-(`command -v holdfast`) and, if it is absent, point at `/holdfast:install`
-rather than printing commands that will not run.
+`holdfast` here is the binary the plugin runs — the one the bootstrap cached,
+or the one `HOLDFAST_BOOTSTRAP_BIN` names — which is on the user's `$PATH` only
+if they put it there. **Check that first** (`command -v holdfast`, then
+`printenv HOLDFAST_BOOTSTRAP_BIN`) and, if neither answers, point at
+`/holdfast:install` rather than printing commands that will not run. A binary
+named by that variable can be run by its full path.
 
 Two subcommands, and the difference is the whole point:
 

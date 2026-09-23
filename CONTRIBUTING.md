@@ -5,8 +5,9 @@ have to pass, and the two testing standards this project actually enforces —
 they are unusual enough that they trip people up, and they are the reason the
 suite is worth anything.
 
-Holdfast is **early**. Milestones 0.0.1 through 0.0.5 have landed on `main`,
-nothing is released, and the surface moves. [ROADMAP.md](./ROADMAP.md) shows
+Holdfast is **early**. Releases up to `v0.0.7` are tagged, none of them
+carries a binary — so building from source is the only way to run it — and the
+surface moves. [ROADMAP.md](./ROADMAP.md) shows
 what is being built next; opening an issue before a large change is
 appreciated.
 
@@ -33,11 +34,20 @@ against them, and prints the exact command for anything missing. If it reports
 a version older than the MSRV, the fix is almost always `rustup self update`
 first and the toolchain install second, in that order.
 
-To point Claude Code at your build:
+To point Claude Code at your build, install it and register the installed
+copy — not `target/debug/holdfast`, which `cargo clean` deletes out from under
+every Claude Code session on the machine:
 
 ```bash
-claude mcp add --scope user holdfast -- "$(pwd)/target/debug/holdfast" mcp
+cargo install --locked --path crates/holdfast
+claude mcp add --scope user holdfast -- "$HOME/.cargo/bin/holdfast" mcp
 ```
+
+After each reinstall, `holdfast daemon stop` then `holdfast daemon start`: the
+daemon keeps running the binary it was started from until it is restarted, and
+stopping it ends every session it holds.
+[README.md](./README.md#build-and-try-it) covers that, the one registration
+each Claude Code config directory needs, and the plugin route.
 
 `holdfast mcp [--no-daemon]` speaks MCP over stdio. By default it runs in
 **hybrid mode**: it auto-spawns a background `holdfast daemon` that owns the
@@ -350,8 +360,9 @@ Cutting one is therefore:
      out-of-band-secret bullet saying that echo gating is "on `main`, and in
      no tag yet, so a `v0.0.7` install does not have it" (that one becomes
      *wrong*, not merely stale, the moment the tag exists).
-   - `README.md` — the status line and the `## What works today (vX.Y.Z)`
-     heading near the top.
+   - `README.md` — the status line near the top. The `## What works today`
+     heading below it no longer carries a version: it describes `main`, and
+     said `v0.0.7` while doing so.
    - `CLAUDE.md` — the "Project Status" paragraph, which pins the newest tag,
      quotes that version's `CHANGELOG.md` heading verbatim, and states the
      workspace version; and the paragraph after it, which names

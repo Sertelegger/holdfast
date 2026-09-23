@@ -696,6 +696,27 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **The install documentation recommended routes that do not work, and left
+  out the one that bites on every upgrade.** `plugin/README.md` said
+  `cargo install holdfast` "also works" and `/holdfast:install` recommended
+  it; crates.io holds a `0.0.0` name reservation with no binary, and cargo
+  refuses it with *"there is nothing to install"*. Both now give
+  `cargo install --locked --git … --tag vX.Y.Z holdfast` with
+  `HOLDFAST_BOOTSTRAP_BIN`, and `plugin/README.md` has a section for exactly
+  that. `README.md`'s *Build and try it* registered `target/debug/holdfast`
+  with Claude Code — which `cargo clean` deletes out from under every session
+  — and said nothing about the daemon: that it outlives Claude Code, is shared
+  by every session, and keeps running the binary it started from until
+  `holdfast daemon stop`, which ends every session it holds. It now installs
+  with `cargo install --path`, gives the stop-and-start upgrade and the reason
+  for the start (GH #231), and says that each `CLAUDE_CONFIG_DIR` needs its own
+  registration and that the plugin and `claude mcp add` should not both be
+  used. `CONTRIBUTING.md`'s setup had the same `target/debug` line and still
+  said *"milestones 0.0.1 through 0.0.5 have landed … nothing is released"*.
+  The *What works today* heading said `v0.0.7` over a list describing `main`;
+  it says `main` now, and the release procedure no longer asks for it to be
+  bumped. A link to `CONTRIBUTING.md#no-binary-assets` pointed at a heading
+  that had been renamed ([#237]).
 - **The plugin bootstrap's "release not found" message sent everyone to a
   manual download that does not exist.** One sentence covered two failures —
   *"is the release published, and is this host online?"* — and then told the
