@@ -1519,7 +1519,7 @@ fn utf8_read_end(w: &WindowSnapshot<'_>, read_end: u64) -> u64 {
 /// the first half of `\r\n`, and both drop everything on that line in
 /// front of it:
 ///
-/// * `\r`, then SGR or mode changes only, then **erase-in-line** —
+/// * `\r`, then SGR only, then **erase-in-line** —
 ///   `\x1b[K`, `\x1b[0K` or `\x1b[2K`. From column 0 all three clear the
 ///   whole row, so nothing written on it before survives. This is how
 ///   cargo clears its bar before printing a `Compiling` line, and how
@@ -1564,6 +1564,31 @@ fn erased_redraws(w: &WindowSnapshot<'_>, spans: &[Span], read_end: u64) -> Vec<
         }
         None
     };
+    // Where a non-CSI escape at `off` ends: a string sequence (OSC, DCS,
+    // SOS, PM, APC) at its BEL or ST, anything else after its
+    // intermediates and one final byte — the grammar `AnsiStripper`
+    // consumes, so no byte of the sequence is mistaken for text.
+    let escape_end = |off: u64| -> u64 {
+        let mut i = off + 1;
+        if i >= end {
+            return end;
+        }
+        if matches!(at(i), b']' | b'P' | b'X' | b'^' | b'_') {
+            i += 1;
+            while i < end {
+                match at(i) {
+                    0x07 => return i + 1,
+                    0x1b if i + 1 < end && at(i + 1) == b'\\' => return i + 2,
+                    _ => i += 1,
+                }
+            }
+            return end;
+        }
+        while i < end && (0x20..=0x2f).contains(&at(i)) {
+            i += 1;
+        }
+        (i + 1).min(end)
+    };
     // Erase-in-line from the cursor or of the whole line: `\x1b[K`,
     // `\x1b[0K`, `\x1b[2K`. Returns the byte after it and whether it was
     // the whole-line form.
@@ -1579,14 +1604,35 @@ fn erased_redraws(w: &WindowSnapshot<'_>, spans: &[Span], read_end: u64) -> Vec<
     let mut off = w.req_start;
     while off < end {
         let b = at(off);
-        if b == b'\n' {
+        // A line feed — or the two other bytes that move the cursor down,
+        // VT and FF — starts a new line.
+        if matches!(b, b'\n' | 0x0b | 0x0c) {
             line_start = off + 1;
             printable = false;
             off += 1;
             continue;
         }
         if b == 0x1b {
-            off = csi(off).map_or(off + 1, |(next, _)| next);
+            // SGR changes no position. Every other sequence might: a
+            // cursor move, a screen switch, a save and restore, a scroll —
+            // after which a `\r` and an erase may land on a different row
+            // or a different screen from the text written before it. So
+            // anything but SGR ends the line as far as this rule is
+            // concerned, and the text in front of it is never dropped.
+            // Found by an independent review, on `\x1b[?1049h`.
+            match csi(off) {
+                Some((next, b'm')) => off = next,
+                Some((next, _)) => {
+                    off = next;
+                    line_start = off;
+                    printable = false;
+                }
+                None => {
+                    off = escape_end(off);
+                    line_start = off;
+                    printable = false;
+                }
+            }
             continue;
         }
         if b != b'\r' {
@@ -1598,7 +1644,12 @@ fn erased_redraws(w: &WindowSnapshot<'_>, spans: &[Span], read_end: u64) -> Vec<
         // it is neither an erase nor a redraw ending in one, so both
         // spellings below decline it.
         let cr = off;
-        // Spelling 1: SGR and mode changes only, then an erase.
+        // Spelling 1: SGR only, then an erase. **Not mode changes**, and
+        // an earlier draft allowed them: `\x1b[?1049h` switches to the
+        // alternate screen, so an erase after it clears *that* screen and
+        // the line in front of the `\r` is still on the main one, shown
+        // again the moment the program leaves — dropping it would drop
+        // text a terminal still shows. Found by an independent review.
         let mut i = cr + 1;
         let mut erased = false;
         while let Some((next, fin)) = csi(i) {
@@ -1606,7 +1657,7 @@ fn erased_redraws(w: &WindowSnapshot<'_>, spans: &[Span], read_end: u64) -> Vec<
                 erased = true;
                 break;
             }
-            if !matches!(fin, b'm' | b'h' | b'l') {
+            if fin != b'm' {
                 break;
             }
             i = next;
@@ -4937,6 +4988,18 @@ mod tests {
             "old text here\r\tnew\x1b[K\n",
             // Cursor movement inside the redraw.
             "0123456789\rab\x1b[3Ccd\x1b[K\n",
+            // A screen switch between the `\r` and the erase: the erase
+            // clears the alternate screen, and the main one keeps its line.
+            "main screen text\r\x1b[?1049h\x1b[K\x1b[?1049l\n",
+            // …or in front of the `\r`, which is the same thing earlier.
+            "main screen text\x1b[?1049h\r\x1b[K\x1b[?1049l\n",
+            // A cursor move in front of the `\r`: the erase clears the row
+            // above, and this one keeps its text.
+            "this row stays\x1b[A\r\x1b[Kthe row above\n",
+            // Save and restore are escapes too.
+            "kept\x1b7\r\x1b[K\x1b8\n",
+            // A vertical tab moves down a row as a line feed does.
+            "this row stays\x0b\r\x1b[Kthe row below\n",
             // Not finished inside the page: nothing is decided.
             "frame one\rframe two",
             // A `\r\n` is a line end and erases nothing.
