@@ -634,7 +634,7 @@ impl SecretSlots {
         match slots.get(session_id) {
             Some(existing) => (existing.request.clone(), false),
             None => {
-                let request = SecretRequest::new(prompt_text.to_string());
+                let request = SecretRequest::new(prompt_text.to_string(), raised_by);
                 slots.insert_vacant(
                     session_id,
                     RaisedRequest {
@@ -696,7 +696,7 @@ impl SecretSlots {
             }
             // Raise.
             None => {
-                let request = SecretRequest::new(prompt_text.to_string());
+                let request = SecretRequest::new(prompt_text.to_string(), RaisedBy::ToolCall);
                 let id = request.request_id.clone();
                 slots.insert_vacant(
                     session_id,

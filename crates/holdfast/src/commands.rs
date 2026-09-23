@@ -133,13 +133,224 @@ pub(crate) fn attach_banner(
         _ => String::new(),
     };
     let text = format!(" holdfast: attached to {session}{geometry} — Ctrl-B d to detach ");
+    Some(banner_bar(&text, cols))
+}
+
+/// The bar both notices share: `text` inserted as a coloured line above
+/// the cursor's row, the cursor put back where it was.
+///
+/// `ESC 8` returns the cursor to the row the bar now occupies; what steps
+/// it back onto the line it came from is the caller's — `attach`'s
+/// trailing newline from `diag::emit` in raw mode, `watch`'s explicit
+/// `ESC[B`. See [`attach_banner`]'s call site for why that step is
+/// load-bearing layout.
+#[cfg(unix)]
+fn banner_bar(text: &str, cols: Option<usize>) -> String {
     let body = match cols {
-        Some(cols) => fit_to_width(&text, cols),
-        None => text,
+        Some(cols) => fit_to_width(text, cols),
+        None => text.to_string(),
     };
-    Some(format!(
-        "\x1b7\r\x1b[L\x1b[48;5;61m\x1b[38;5;231m{body}\x1b[0m\x1b8"
-    ))
+    format!("\x1b7\r\x1b[L\x1b[48;5;61m\x1b[38;5;231m{body}\x1b[0m\x1b8")
+}
+
+/// `holdfast watch`'s notice that it connected, and how to leave (GH
+/// #235).
+///
+/// The dogfood pass: *"Watch rendered 0 bytes and printed no 'watching…'
+/// line, so there is no sign it connected."* Two shapes, because a watch
+/// has two kinds of output:
+///
+/// * **stdout is a terminal**: the opening screen has just been painted
+///   over the whole of it, so the notice is [`banner_bar`] inserted above
+///   the cursor's row and written to *stdout* — the screen it decorates —
+///   with an explicit `ESC[B` back onto the child's line, because a
+///   cooked terminal turns `diag!`'s newline into a carriage return as
+///   well and would leave the cursor at column 0 of the child's prompt;
+/// * **stdout is not a terminal** (`holdfast watch s > log`): nothing is
+///   painted and nothing may be written into the capture, so the notice
+///   is a sentence on stderr, and only if stderr is a terminal a human is
+///   reading.
+///
+/// `None` when neither is a terminal: a script needs no reassurance.
+#[cfg(unix)]
+pub(crate) fn watch_banner(
+    session: &str,
+    size: Option<(u16, u16)>,
+    stdout_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> Option<WatchBanner> {
+    let geometry = match size {
+        Some((cols, rows)) if cols > 0 && rows > 0 => format!(" ({cols}x{rows})"),
+        _ => String::new(),
+    };
+    if stdout_is_terminal {
+        let cols = match size {
+            Some((cols, rows)) if cols > 0 && rows > 0 => Some(cols as usize),
+            _ => None,
+        };
+        let text = format!(" holdfast: watching {session}{geometry} — Ctrl-C to stop ");
+        return Some(WatchBanner::OnScreen(format!(
+            "{}\x1b[B",
+            banner_bar(&text, cols)
+        )));
+    }
+    if stderr_is_terminal {
+        return Some(WatchBanner::Sentence(format!(
+            "holdfast watch: watching {session}{geometry} — Ctrl-C to stop"
+        )));
+    }
+    None
+}
+
+/// Where [`watch_banner`] goes.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WatchBanner {
+    /// Bytes for stdout, which is the terminal the screen was painted on.
+    OnScreen(String),
+    /// A line for stderr.
+    Sentence(String),
+}
+
+/// §7.5's `ScreenSnapshot`, as the bytes that paint it on a terminal of
+/// `local` size (GH #235). **Split out so a test can render it** through
+/// a real emulator, for [`attach_banner`]'s reason: this is cursor
+/// arithmetic, and an assertion that the stream contains the bytes the
+/// code just wrote cannot see a row land in the wrong place.
+///
+/// * **The whole screen is repainted** — `ESC[H ESC[2J`, then each row at
+///   its own absolute position — because the picture is a grid, and the
+///   terminal it lands on holds whatever the human had there before.
+/// * **The rows kept are the ones that matter when the terminal is
+///   shorter than the session**: a window ending at the cursor or the
+///   last row with text on it, whichever is lower, so the prompt the
+///   child is waiting at is on screen rather than below it. Each row is
+///   clipped to the local width in display columns (`fit_to_width`'s
+///   reason: a CJK row is two columns a character).
+/// * **The cursor goes where the child left it**, because the child's
+///   next write lands there — a picture with the cursor anywhere else
+///   has the live stream start in the wrong column.
+/// * **The alternate screen is entered when the child is on it**, so a
+///   full-screen program's own exit from it returns the terminal to the
+///   screen the human had, as it would have without Holdfast in between.
+///
+/// Plain text: the tool's grid has no attributes, and the child's own
+/// repaints bring colour back as it redraws.
+#[cfg(unix)]
+pub(crate) fn paint_snapshot(
+    lines: &[String],
+    cursor: (u16, u16),
+    cursor_visible: bool,
+    alt_screen: bool,
+    local: Option<(u16, u16)>,
+) -> Vec<u8> {
+    let (cursor_row, cursor_col) = (cursor.0 as usize, cursor.1 as usize);
+    let mut out = String::from("\x1b[0m");
+    if alt_screen {
+        out.push_str("\x1b[?1049h");
+    }
+    out.push_str("\x1b[H\x1b[2J");
+    let (width, height) = match local {
+        Some((cols, rows)) if cols > 0 && rows > 0 => (Some(cols as usize), Some(rows as usize)),
+        _ => (None, None),
+    };
+    if !lines.is_empty() {
+        let last_text = lines
+            .iter()
+            .rposition(|l| !l.trim_end().is_empty())
+            .unwrap_or(0);
+        let bottom = last_text.max(cursor_row).min(lines.len() - 1);
+        let top = match height {
+            Some(h) => (bottom + 1).saturating_sub(h),
+            None => 0,
+        };
+        for (i, line) in lines[top..=bottom].iter().enumerate() {
+            // An empty row is already painted by the clear. A row with
+            // text is written as the grid has it, trailing spaces
+            // included — `Password: ` ends in one the child drew, and a
+            // renderer that trimmed it would leave the cursor a column
+            // away from the text in front of it.
+            if line.trim_end().is_empty() {
+                continue;
+            }
+            let text = match width {
+                Some(w) => clip_to_width(line, w),
+                None => line.clone(),
+            };
+            out.push_str(&format!("\x1b[{};1H{text}", i + 1));
+        }
+        let row = cursor_row.saturating_sub(top);
+        let col = match width {
+            Some(w) => cursor_col.min(w.saturating_sub(1)),
+            None => cursor_col,
+        };
+        out.push_str(&format!("\x1b[{};{}H", row + 1, col + 1));
+    }
+    out.push_str(if cursor_visible {
+        "\x1b[?25h"
+    } else {
+        "\x1b[?25l"
+    });
+    out.into_bytes()
+}
+
+/// `s` cut to at most `cols` display columns — [`fit_to_width`] without
+/// the padding, because a painted row must not overwrite the cells past
+/// its own text.
+#[cfg(unix)]
+fn clip_to_width(s: &str, cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > cols {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
+/// The line `holdfast attach` draws when a secret is asked for (GH #236).
+///
+/// **Labelled, and never the prompt again.** The client used to render
+/// `\r\n` + `prompt_text` + `\r\n`: when the child had drawn
+/// `Password: ` itself, the human saw `Password:` twice with nothing
+/// saying the second was Holdfast's, and when the agent had raised the
+/// request its words were indistinguishable from the program's. So:
+///
+/// * `echo_drop` — the text *is* the line the child just drew, which is
+///   on the screen above; repeating it is the duplicate, so it is not;
+/// * `tool_call` — the text is the agent's description, shown and
+///   **attributed to the agent**, because a person about to type a
+///   credential is owed the difference between a program's prompt and a
+///   claim about one;
+/// * absent — a daemon older than 1.5 that cannot say — the text is
+///   quoted neutrally rather than attributed to anybody.
+///
+/// §5.2 keeps an *adopting* call's text off the wire entirely (it would
+/// let an agent relabel a prompt a human may already be typing into), so
+/// an echo-raised request adopted by a tool call is still `echo_drop`
+/// here and the agent's text is still not shown. That is specified, not
+/// an omission.
+///
+/// The text arrives redacted and stripped of anything that can move the
+/// cursor (`redact_for_display`), so quoting it cannot rewrite this line.
+#[cfg(unix)]
+pub(crate) fn secret_prompt_label(prompt_text: &str, raised_by: Option<&str>) -> String {
+    let text = prompt_text.trim();
+    let what = match raised_by {
+        Some("echo_drop") => "the session is reading a secret at the prompt above".to_string(),
+        _ if text.is_empty() => "the session is waiting for a secret".to_string(),
+        Some("tool_call") => format!("the agent asks for a secret: “{text}”"),
+        _ => format!("secret requested: “{text}”"),
+    };
+    format!(
+        "\r\n[holdfast] {what} — type it here; it is not shown and goes only to the \
+         session. Enter sends it, Ctrl-C abandons.\r\n"
+    )
 }
 
 /// Truncate or pad `s` so it occupies exactly `cols` display columns.
@@ -1962,12 +2173,35 @@ async fn attach_connected(
                     ServerFrame::Detached { reason } => {
                         return AttachEnd::Exit(finish("attach", &reason, *truncated));
                     }
-                    ServerFrame::AwaitingSecret { request_id, prompt_text } => {
-                        // On its own line, so it cannot be mistaken for
-                        // part of whatever the child last drew.
-                        render(b"\r\n");
-                        render(prompt_text.as_bytes());
-                        render(b"\r\n");
+                    // **The session's screen as it stands** (GH #235),
+                    // painted before the stream resumes where it ends.
+                    // An idle session at its prompt used to render as an
+                    // empty terminal until somebody pressed Enter.
+                    ServerFrame::ScreenSnapshot {
+                        lines,
+                        cursor_row,
+                        cursor_col,
+                        cursor_visible,
+                        alt_screen,
+                        ..
+                    } => {
+                        render(&paint_snapshot(
+                            &lines,
+                            (cursor_row, cursor_col),
+                            cursor_visible,
+                            alt_screen,
+                            crate::attach_tty::window_size(tty).ok(),
+                        ));
+                    }
+                    ServerFrame::AwaitingSecret {
+                        request_id,
+                        prompt_text,
+                        raised_by,
+                    } => {
+                        // On its own line and labelled as Holdfast's, so
+                        // it cannot be mistaken for the child drawing its
+                        // prompt a second time (GH #236).
+                        render(secret_prompt_label(&prompt_text, raised_by.as_deref()).as_bytes());
                         secret = Some((request_id, crate::attach_tty::SecretLine::default()));
                     }
                     ServerFrame::SecretRequestClosed { request_id, outcome } => {
@@ -2374,6 +2608,14 @@ pub async fn watch(session: &str) -> ExitCode {
         };
 
     let mut frames = spawn_frame_reader(rd);
+    let stdout_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let stderr_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    // The local geometry, for clipping the opening screen — `TIOCGWINSZ`
+    // on stdout, which is the terminal the screen is painted on.
+    let local_size = || {
+        use std::os::unix::io::AsRawFd;
+        crate::attach_tty::window_size(std::io::stdout().as_raw_fd()).ok()
+    };
 
     // Same coalescing as `attach`, for the same reason (GH #66): a watcher
     // receives a `Resize` per frame of somebody else's window drag, and it
@@ -2405,6 +2647,45 @@ pub async fn watch(session: &str) -> ExitCode {
                 };
                 match f {
                     ServerFrame::Output { bytes, .. } => render(&bytes),
+                    // **The screen as it stands, then the notice that
+                    // this is a watch** (GH #235). Painted only onto a
+                    // terminal: `holdfast watch s > log` is a capture of
+                    // what the session prints from here on, and a picture
+                    // drawn into it would be bytes the session never
+                    // printed. The notice goes where a human will see it
+                    // — see `watch_banner` — and after the paint, which
+                    // would otherwise clear it.
+                    ServerFrame::ScreenSnapshot {
+                        session: id,
+                        cols,
+                        rows,
+                        lines,
+                        cursor_row,
+                        cursor_col,
+                        cursor_visible,
+                        alt_screen,
+                        ..
+                    } => {
+                        if stdout_is_terminal {
+                            render(&paint_snapshot(
+                                &lines,
+                                (cursor_row, cursor_col),
+                                cursor_visible,
+                                alt_screen,
+                                local_size(),
+                            ));
+                        }
+                        match watch_banner(
+                            &id,
+                            if stdout_is_terminal { local_size() } else { Some((cols, rows)) },
+                            stdout_is_terminal,
+                            stderr_is_terminal,
+                        ) {
+                            Some(WatchBanner::OnScreen(bar)) => render(bar.as_bytes()),
+                            Some(WatchBanner::Sentence(line)) => diag!("{line}"),
+                            None => {}
+                        }
+                    }
                     ServerFrame::OutputGap { bytes, .. } => {
                         truncated.saw_gap(bytes);
                         report_gap("watch", bytes);
@@ -2419,10 +2700,23 @@ pub async fn watch(session: &str) -> ExitCode {
                     // **cannot answer it**: `SecretInput` is a write
                     // frame, refused `read_only_attach` by §7.5's table.
                     // Reported so the human knows why the session has
-                    // stopped drawing, and nothing more.
-                    ServerFrame::AwaitingSecret { .. } => {
-                        diag!("holdfast watch: the session is waiting for a secret");
-                    }
+                    // stopped drawing — and, since GH #236, whose words
+                    // the description is, for `attach`'s reason.
+                    ServerFrame::AwaitingSecret {
+                        prompt_text,
+                        raised_by,
+                        ..
+                    } => match raised_by.as_deref() {
+                        Some("tool_call") if !prompt_text.trim().is_empty() => diag!(
+                            "holdfast watch: the agent asked for a secret (“{}”); only an \
+                             attached client can answer it",
+                            prompt_text.trim()
+                        ),
+                        _ => diag!(
+                            "holdfast watch: the session is waiting for a secret; only an \
+                             attached client can answer it"
+                        ),
+                    },
                     ServerFrame::SecretRequestClosed { .. } => {}
                     // A watcher is told an approval is pending and
                     // **cannot answer it in any build**: §18.4 rejects
@@ -3170,5 +3464,175 @@ mod tests {
         for cause in Hb::ALL {
             assert_eq!(Hb::from_wire(cause.as_str()), Some(*cause));
         }
+    }
+
+    // ------------------------------------ GH #235: painting the opening screen
+
+    fn grid(rows: &[&str], total: usize) -> Vec<String> {
+        let mut v: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+        v.resize(total, String::new());
+        v
+    }
+
+    /// **The picture lands where it was, and the cursor where the child
+    /// left it** — through a real emulator, over a terminal full of
+    /// something else, because a byte-stream assertion cannot see a row
+    /// land in the wrong place (GH #235).
+    #[test]
+    fn the_opening_screen_replaces_what_was_there_and_puts_the_cursor_back() {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"the human's own shell history\r\nmore of it\r\n$ ");
+        let lines = grid(&["build output", "user@box $ "], 24);
+        p.process(&paint_snapshot(
+            &lines,
+            (1, 11),
+            true,
+            false,
+            Some((80, 24)),
+        ));
+
+        assert_eq!(row(&p, 0).trim_end(), "build output");
+        assert_eq!(row(&p, 1).trim_end(), "user@box $");
+        assert!(
+            !p.screen().contents().contains("shell history"),
+            "the terminal's previous contents survived the paint:\n{}",
+            p.screen().contents()
+        );
+        assert_eq!(
+            p.screen().cursor_position(),
+            (1, 11),
+            "the child's next write must land after its prompt"
+        );
+        assert!(!p.screen().hide_cursor());
+    }
+
+    /// **A terminal shorter than the session shows the rows around the
+    /// cursor, not the top of the grid** — otherwise a 40-row session's
+    /// prompt at row 35 is painted below a 24-row terminal's last line.
+    /// And rows wider than the terminal are cut to it, in display columns.
+    #[test]
+    fn a_smaller_terminal_keeps_the_cursors_rows_and_clips_their_width() {
+        // Text on every row down to the prompt's, and nothing below it —
+        // a session that has scrolled its prompt near the bottom.
+        let mut rows: Vec<String> = (0..40)
+            .map(|i| {
+                if i < 35 {
+                    format!("row {i:02}")
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        rows[35] = format!("{}PROMPT$ ", "端".repeat(50));
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(&paint_snapshot(
+            &rows,
+            (35, 108),
+            true,
+            false,
+            Some((80, 24)),
+        ));
+        let bottom = row(&p, 23);
+        assert!(
+            bottom.starts_with('端'),
+            "the cursor's row should be the last one painted: {bottom:?}"
+        );
+        assert!(
+            !p.screen().contents().contains("row 00"),
+            "rows far above the cursor were painted instead of the ones around it"
+        );
+        assert_eq!(
+            p.screen().cursor_position().0,
+            23,
+            "the cursor must be on the prompt's row in the window"
+        );
+        assert!(
+            p.screen().cursor_position().1 < 80,
+            "the cursor was put past the terminal's last column"
+        );
+    }
+
+    /// A hidden cursor stays hidden, and a child on the alternate screen
+    /// is painted there — so its own exit from it returns the human to the
+    /// screen they had.
+    #[test]
+    fn the_cursor_state_and_the_alternate_screen_follow_the_child() {
+        let lines = grid(&["vim"], 24);
+        let bytes = paint_snapshot(&lines, (0, 0), false, true, Some((80, 24)));
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"MAIN SCREEN");
+        p.process(&bytes);
+        assert!(p.screen().hide_cursor());
+        assert!(p.screen().alternate_screen());
+        p.process(b"\x1b[?1049l");
+        assert!(
+            p.screen().contents().contains("MAIN SCREEN"),
+            "leaving the alternate screen did not return to what the human had"
+        );
+    }
+
+    /// **`watch` on a terminal inserts its notice above the cursor's row
+    /// and leaves the cursor on the child's line** — in a *cooked*
+    /// terminal, where `diag!`'s newline would also return the carriage
+    /// and put the child's next write at column 0 of its own prompt.
+    #[test]
+    fn the_watch_notice_leaves_the_cursor_where_the_child_left_it() {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"an earlier line\r\nPROMPT> ");
+        let (r, c) = p.screen().cursor_position();
+        let Some(WatchBanner::OnScreen(bar)) = watch_banner("sess", Some((80, 24)), true, true)
+        else {
+            panic!("a terminal stdout gets an on-screen notice");
+        };
+        p.process(bar.as_bytes());
+        assert_eq!(p.screen().cursor_position(), (r + 1, c));
+        assert!(row(&p, r).contains("watching sess"));
+        assert!(row(&p, r + 1).contains("PROMPT>"));
+    }
+
+    /// Into a capture, the notice is a sentence on stderr — or nothing,
+    /// when nobody is reading stderr either.
+    #[test]
+    fn the_watch_notice_never_goes_into_a_capture() {
+        assert_eq!(
+            watch_banner("sess", Some((80, 24)), false, true),
+            Some(WatchBanner::Sentence(
+                "holdfast watch: watching sess (80x24) — Ctrl-C to stop".into()
+            ))
+        );
+        assert_eq!(watch_banner("sess", Some((80, 24)), false, false), None);
+    }
+
+    // ---------------------------------- GH #236: whose words the prompt is
+
+    /// **The child's own prompt is not repeated; an agent's description
+    /// is attributed; an unknown source is quoted neutrally** — and every
+    /// form says it is Holdfast's line (GH #236).
+    #[test]
+    fn the_secret_line_says_whose_words_it_is_and_never_repeats_the_childs() {
+        let child = secret_prompt_label("Password: ", Some("echo_drop"));
+        assert!(child.contains("[holdfast]"));
+        assert!(
+            !child.contains("Password"),
+            "the child's prompt is already on screen; printing it again is the duplicate: \
+             {child:?}"
+        );
+        let agent = secret_prompt_label("deploy key passphrase", Some("tool_call"));
+        assert!(
+            agent.contains("the agent asks for a secret: “deploy key passphrase”"),
+            "{agent:?}"
+        );
+        let unknown = secret_prompt_label("Password: ", None);
+        assert!(
+            unknown.contains("secret requested: “Password:”"),
+            "{unknown:?}"
+        );
+        assert!(
+            !unknown.contains("agent"),
+            "text of unknown provenance was attributed to the agent: {unknown:?}"
+        );
+        // An empty agent text is not rendered as empty quotes.
+        let empty = secret_prompt_label("", Some("tool_call"));
+        assert!(!empty.contains("“”"), "{empty:?}");
     }
 }

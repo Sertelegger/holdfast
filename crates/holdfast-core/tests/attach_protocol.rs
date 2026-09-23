@@ -291,7 +291,26 @@ async fn send(s: &mut UnixStream, f: &ClientFrame) {
 /// The bug most of these rows guard against is a daemon that keeps the
 /// connection open, and as a bare `await` that is a hung CI job rather
 /// than a red row.
+/// The next frame, **skipping the one `ScreenSnapshot` a join sends**
+/// (GH #235).
+///
+/// Every connection now receives the session's screen right after
+/// `Attached`, and the rows in this file that predate it are about the
+/// stream, the handshake and the endings — not about the picture. The
+/// snapshot's own rows read it with [`recv_raw`] and assert where it
+/// sits; everything else reads past it here, so a row asking "what
+/// follows `Attached`" is still asking about the stream.
 async fn recv(s: &mut UnixStream) -> ServerFrame {
+    loop {
+        match recv_raw(s).await {
+            ServerFrame::ScreenSnapshot { .. } => continue,
+            other => return other,
+        }
+    }
+}
+
+/// The next frame, whatever it is.
+async fn recv_raw(s: &mut UnixStream) -> ServerFrame {
     let body = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(s))
         .await
         .expect("no frame arrived within 5s")
@@ -302,12 +321,26 @@ async fn recv(s: &mut UnixStream) -> ServerFrame {
 /// Assert the peer closed. `Ok(Err(Eof))` only — a timeout is
 /// `Err(Elapsed)` and must **not** read as success, which is exactly
 /// what `matches!(x, Ok(Err(_)) | Err(_))` would have done.
+///
+/// A join's `ScreenSnapshot` still unread ahead of the close is read
+/// past, for [`recv`]'s reason; any other frame is a failure.
 async fn expect_eof(s: &mut UnixStream, what: &str) {
-    let r = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(s)).await;
-    assert!(
-        matches!(r, Ok(Err(FrameError::Eof))),
-        "{what}: expected the daemon to close, got {r:?}"
-    );
+    loop {
+        let r = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(&mut *s)).await;
+        if let Ok(Ok(body)) = &r {
+            if matches!(
+                decode_server_frame(body),
+                Ok(ServerFrame::ScreenSnapshot { .. })
+            ) {
+                continue;
+            }
+        }
+        assert!(
+            matches!(r, Ok(Err(FrameError::Eof))),
+            "{what}: expected the daemon to close, got {r:?}"
+        );
+        return;
+    }
 }
 
 /// Assert the peer closed, with only this session's still-unread output
@@ -351,6 +384,8 @@ async fn expect_eof_after_output(s: &mut UnixStream, session: &str, what: &str) 
             Ok(Err(FrameError::Eof)) => return,
             Ok(Ok(body)) => match decode_server_frame(&body).expect("a decodable server frame") {
                 ServerFrame::Output { session: id, .. } if id == session => {}
+                // The join's picture, if the row never read past it.
+                ServerFrame::ScreenSnapshot { session: id, .. } if id == session => {}
                 other => panic!(
                     "{what}: only this session's in-flight Output may follow a \
                      client-initiated Detach, and this is not that: {other:?}"
@@ -986,10 +1021,20 @@ async fn an_attach_client_receives_only_bytes_never_offsets() {
     assert!(matches!(recv(&mut c).await, ServerFrame::Attached { .. }));
 
     pty.queue_output(b"MARK");
-    let body = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(&mut c))
-        .await
-        .expect("no Output within 5s")
-        .expect("a frame body");
+    // Past the join's picture (GH #235), which is not `Output` and has
+    // its own rows; the frame after it is the one this row is about.
+    let body = loop {
+        let body = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(&mut c))
+            .await
+            .expect("no Output within 5s")
+            .expect("a frame body");
+        if !matches!(
+            decode_server_frame(&body),
+            Ok(ServerFrame::ScreenSnapshot { .. })
+        ) {
+            break body;
+        }
+    };
     let value: ciborium::value::Value =
         holdfast_core::protocol::frame::decode(&body).expect("decodable");
     let ciborium::value::Value::Map(entries) = value else {
@@ -1531,6 +1576,240 @@ async fn the_operators_broadcast_capacity_reaches_the_session() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+// ------------------------------------------ GH #235: the opening screen
+
+/// Until the session's ring reaches `n`.
+async fn wait_for_head(s: &Session, n: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while s.buffer_head() < n && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(s.buffer_head(), n, "the fixture's output never landed");
+}
+
+/// **A client joining an idle session is shown its screen, and the
+/// stream resumes exactly where the picture ends** (GH #235).
+///
+/// The dogfood pass: `holdfast attach` on a session idling at its prompt
+/// rendered its own banner and nothing else until somebody pressed
+/// Enter, and `holdfast watch` rendered nothing at all. Three claims, and
+/// each fails a plausible implementation:
+///
+/// * **the order** — `Attached`, then the picture, then output: a picture
+///   painted after the first `Output` overwrites it;
+/// * **the picture is the screen**, with the cursor where the child left
+///   it, which is where the child's next write lands;
+/// * **no byte is drawn twice or skipped at the seam**: the pre-join
+///   line must not come back as `Output` (a replay), and the first byte
+///   after the join must (a stream started from the wrong offset).
+#[tokio::test]
+async fn a_join_opens_with_the_screen_and_the_stream_resumes_where_it_ends() {
+    let d = TestDaemon::start("snapshot").await;
+    for (mode, role) in [
+        (AttachMode::ReadWrite, AttachRole::Interactive),
+        (AttachMode::ReadOnly, AttachRole::Observer),
+    ] {
+        // A session per role, so neither sees the other's marker.
+        let (s, pty) = d.session(None);
+        let before = b"before the join\r\nuser@box $ ";
+        pty.queue_output(before);
+        wait_for_head(&s, before.len() as u64).await;
+
+        let mut c = d.dial().await;
+        send(&mut c, &attach_as(&s.id, mode, role)).await;
+        assert!(
+            matches!(recv_raw(&mut c).await, ServerFrame::Attached { .. }),
+            "frame 1 must be Attached"
+        );
+        let ServerFrame::ScreenSnapshot {
+            session,
+            lines,
+            cursor_row,
+            cursor_col,
+            held_back,
+            ..
+        } = recv_raw(&mut c).await
+        else {
+            panic!("{role:?}: frame 2 must be the ScreenSnapshot");
+        };
+        assert_eq!(session, s.id);
+        assert_eq!(
+            lines[0].trim_end(),
+            "before the join",
+            "{role:?}: {lines:?}"
+        );
+        assert_eq!(lines[1].trim_end(), "user@box $", "{role:?}: {lines:?}");
+        assert_eq!(
+            (cursor_row, cursor_col),
+            (1, 11),
+            "{role:?}: the cursor must be where the child left it, after the prompt"
+        );
+        assert!(!held_back, "{role:?}: nothing is being withheld here");
+
+        let marker = format!("AFTER-{role:?}\r\n");
+        pty.queue_output(marker.as_bytes());
+        let seen = stream_until(&mut c, marker.as_bytes(), 10).await;
+        assert!(
+            !contains(&seen, b"before the join"),
+            "{role:?}: the pre-join line came back as Output — the stream started before \
+             the picture ended, which draws it twice"
+        );
+        assert!(
+            seen.starts_with(b"AFTER-"),
+            "{role:?}: the first byte after the join is not the first byte of the stream: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+}
+
+/// **The opening picture is masked by `get_screen_state`'s mask, for
+/// both roles** (GH #235, §9.2).
+///
+/// The snapshot is a re-rendering of history, not the live stream, so it
+/// takes the tool's grid and the tool's redaction — never a second
+/// renderer of the ring buffer, which would be a second masker. An
+/// `interactive` client is masked too: REQ-SEC-008's raw stream is the
+/// bytes that arrive while it is attached, and a picture is the one thing
+/// that could show it a credential it never saw arrive.
+#[tokio::test]
+async fn the_opening_screen_is_masked_like_get_screen_state() {
+    const TOKEN: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+    let d = TestDaemon::start("snapmask").await;
+    let (s, pty) = d.session(None);
+    let line = format!("export GH_TOKEN={TOKEN}\r\n$ ");
+    pty.queue_output(line.as_bytes());
+    wait_for_head(&s, line.len() as u64).await;
+
+    // The tool's own grid, as the reference the frame must agree with.
+    let processor = holdfast_core::output::OutputProcessor::builtin().expect("processor");
+    let holdfast_core::screen::ScreenCapture::Full(tool) = s.screen_state(None, true, &processor)
+    else {
+        panic!("a capture with no diff_from is a full grid");
+    };
+    assert!(
+        !tool.lines.iter().any(|l| l.contains(TOKEN)),
+        "the fixture's reference grid is not masking the token at all"
+    );
+
+    for (mode, role) in [
+        (AttachMode::ReadWrite, AttachRole::Interactive),
+        (AttachMode::ReadOnly, AttachRole::Observer),
+    ] {
+        let mut c = d.dial().await;
+        send(&mut c, &attach_as(&s.id, mode, role)).await;
+        assert!(matches!(
+            recv_raw(&mut c).await,
+            ServerFrame::Attached { .. }
+        ));
+        let ServerFrame::ScreenSnapshot { lines, .. } = recv_raw(&mut c).await else {
+            panic!("frame 2 must be the ScreenSnapshot");
+        };
+        assert!(
+            !lines.iter().any(|l| l.contains(TOKEN)),
+            "{role:?}: the opening screen carried the token raw: {lines:?}"
+        );
+        assert_eq!(
+            lines, tool.lines,
+            "{role:?}: the opening screen is not get_screen_state's grid"
+        );
+    }
+}
+
+/// **The picture goes before a replayed secret prompt**, or it paints
+/// over it (GH #235, §7.5's replay).
+#[tokio::test]
+async fn the_opening_screen_precedes_a_replayed_secret_prompt() {
+    let d = TestDaemon::start("snapreplay").await;
+    let (s, pty) = d.session(None);
+    pty.set_echo(Some(false));
+    pty.queue_output(b"Passphrase: ");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !s.is_awaiting_secret() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(s.is_awaiting_secret(), "the fixture never dropped echo");
+
+    let mut c = d.dial().await;
+    send(&mut c, &attach_to(&s.id)).await;
+    assert!(matches!(
+        recv_raw(&mut c).await,
+        ServerFrame::Attached { .. }
+    ));
+    let ServerFrame::ScreenSnapshot { lines, .. } = recv_raw(&mut c).await else {
+        panic!("frame 2 must be the ScreenSnapshot, ahead of the replayed prompt");
+    };
+    assert_eq!(lines[0].trim_end(), "Passphrase:");
+    match recv_raw(&mut c).await {
+        ServerFrame::AwaitingSecret {
+            prompt_text,
+            raised_by,
+            ..
+        } => {
+            assert_eq!(prompt_text.trim_end(), "Passphrase:");
+            // GH #236: the text is the child's own line, and the frame
+            // says so, so a client need not print it a second time.
+            assert_eq!(raised_by.as_deref(), Some("echo_drop"));
+        }
+        other => panic!("frame 3 must be the replayed AwaitingSecret, got {other:?}"),
+    }
+}
+
+/// **An agent's words are labelled as the agent's** (GH #236).
+///
+/// A request raised by `request_secret_input` on a vacant slot carries
+/// the agent's `prompt_text`; one raised by the child dropping echo
+/// carries the child's own line. The frame says which, so the person
+/// about to type a credential knows whether they are reading the
+/// program's prompt or a description of it. The fan-out reads the
+/// provenance off the slot rather than taking it as an argument, so
+/// neither raise path can pass one that disagrees with the request.
+#[tokio::test]
+async fn a_tool_calls_prompt_is_marked_as_the_agents_and_an_echo_drops_as_the_childs() {
+    let d = TestDaemon::start("provenance").await;
+    let (s, pty) = d.session(None);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    // The agent raises first, on a vacant slot.
+    let hub = d.daemon.attach_hub();
+    let adopted = hub
+        .secrets()
+        .raise_or_adopt(&s.id, "deploy key passphrase", None, true)
+        .expect("a vacant slot is raised, not collided");
+    assert!(adopted.raised_here);
+    hub.broadcast_awaiting_secret(&s.id, &adopted.request_id, &adopted.prompt_text);
+    match recv(&mut c).await {
+        ServerFrame::AwaitingSecret {
+            prompt_text,
+            raised_by,
+            ..
+        } => {
+            assert_eq!(prompt_text, "deploy key passphrase");
+            assert_eq!(raised_by.as_deref(), Some("tool_call"));
+        }
+        other => panic!("expected the agent's AwaitingSecret, got {other:?}"),
+    }
+    let _ = hub.close_secret(&s.id, None);
+
+    // Then the child, on a second session so the slot is fresh.
+    let (s2, pty2) = d.session(None);
+    let mut c2 = attach_ok(&d, &s2.id, AttachMode::ReadWrite).await;
+    pty2.set_echo(Some(false));
+    pty2.queue_output(b"Password: ");
+    match recv(&mut c2).await {
+        ServerFrame::AwaitingSecret { raised_by, .. } => {
+            assert_eq!(raised_by.as_deref(), Some("echo_drop"));
+        }
+        ServerFrame::Output { .. } => match recv(&mut c2).await {
+            ServerFrame::AwaitingSecret { raised_by, .. } => {
+                assert_eq!(raised_by.as_deref(), Some("echo_drop"));
+            }
+            other => panic!("expected the child's AwaitingSecret, got {other:?}"),
+        },
+        other => panic!("expected the child's AwaitingSecret, got {other:?}"),
+    }
+    drop(pty);
+}
+
 #[tokio::test]
 async fn daemon_status_counts_live_attach_clients() {
     // The hardcoded `0` 0.0.5 shipped passes every test that only checks
@@ -1598,6 +1877,9 @@ async fn stream_until(c: &mut UnixStream, needle: &[u8], secs: u64) -> Vec<u8> {
             // `Resize` or a `ProtocolError` arriving mid-stream is a
             // defect in whatever row is running.
             ServerFrame::AwaitingSecret { .. } | ServerFrame::SecretRequestClosed { .. } => {}
+            // The join's picture (GH #235) is not the stream; the rows
+            // about it read it with `recv_raw`.
+            ServerFrame::ScreenSnapshot { .. } => {}
             other => panic!("expected Output, got {other:?}"),
         }
         if acc.windows(needle.len()).any(|w| w == needle) {
@@ -4041,10 +4323,10 @@ fn the_attach_protocol_carries_no_confirmation_frame() {
     // this the loop above passes against an empty array. 6 → 7 and 9 → 10
     // are 0.0.7's two additive variants (§23.3, Global Constraint 13);
     // 10 → 11 is `OutputGap`, GH #200's, and §7.5 now carries it as its
-    // twelfth row — eleven of twelve ship, TransferProgress (0.0.9) does
-    // not.
+    // twelfth row; 11 → 12 is `ScreenSnapshot`, GH #235's thirteenth —
+    // twelve of thirteen ship, TransferProgress (0.0.9) does not.
     assert_eq!(ClientFrameKind::ALL.len(), 7);
-    assert_eq!(KNOWN_SERVER_TYPES.len(), 11);
+    assert_eq!(KNOWN_SERVER_TYPES.len(), 12);
 }
 
 // ------------------------- GH #24: the slot a dead session leaves behind

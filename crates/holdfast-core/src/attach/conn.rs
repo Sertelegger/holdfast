@@ -354,16 +354,27 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
     // and it loses it *silently*: the frames still arrive in the right
     // order, so an ordering-only assertion cannot see it.
     let output = session.subscribe();
-    // **Where this connection's stream starts** (GH #200, GH #210). Read
-    // immediately after `subscribe`, so nothing published after it can be
-    // missed: a frame the receiver already holds that ends at or before
-    // this offset is skipped by the forwarder, and anything the receiver
-    // cannot account for is filled from the ring. It is also the origin a
-    // gap is measured from — a connection that falls behind the ring's
-    // tail is told the distance from *here*, not from the start of the
-    // session, which is what `a_client_that_falls_behind_is_never_detached_and_loses_nothing_silently`
+    // **Where this connection's stream starts, and the picture it starts
+    // from** (GH #235, GH #200). The floor is read after the subscribe and
+    // before the capture, and both orderings are load-bearing:
+    //
+    // * after the subscribe, so every byte past the floor is either in
+    //   this receiver or still in the ring buffer — `forward_output`
+    //   resyncs from the ring whenever the receiver cannot account for an
+    //   offset, so nothing between the two is lost, it is only fetched
+    //   from a different place;
+    // * before the capture, because the capture reflects the screen
+    //   tracker's position and the tracker only moves forward. A floor
+    //   read *after* it could land past what the picture shows and skip
+    //   the bytes in between with no gap to say so; read before, the
+    //   worst case is a few bytes drawn twice (`Session::stream_floor`).
+    //
+    // It is also the origin a gap is measured from: a connection that
+    // falls behind the ring's tail is told the distance from *here*, not
+    // from the start of the session — which `a_client_that_falls_behind_is_never_detached_and_loses_nothing_silently`
     // pins at runtime by printing past the ring before it joins.
-    let baseline = session.buffer_head();
+    let floor = session.stream_floor();
+    let snapshot = screen_snapshot(&session, &daemon.server.processor);
     // **The event subscriptions are taken here too, and this is a fix
     // rather than tidiness.** They used to be taken where the tasks are
     // spawned, which is *after* the `is_awaiting_secret()` replay check
@@ -412,6 +423,16 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
     if tx.send(attached_frame(&session)).await.is_err() {
         return;
     }
+    // **The screen, second, and before the replayed prompt** (GH #235).
+    // A renderer paints the snapshot over the whole terminal, so anything
+    // drawn ahead of it is painted over — the replayed `AwaitingSecret`
+    // below included, which is the one frame here a human must not miss.
+    if let Some(frame) = snapshot {
+        if tx.send(frame).await.is_err() {
+            return;
+        }
+    }
+
     // §7.5's replay: *"Clients that arrive after the request is in flight
     // receive a replay of the most recent un-fulfilled `AwaitingSecret`
     // frame."* Queued on the same FIFO immediately behind `Attached`, so
@@ -432,6 +453,7 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
             .send(ServerFrame::AwaitingSecret {
                 request_id: req.request_id,
                 prompt_text: req.prompt_text,
+                raised_by: Some(req.raised_by.as_str().to_string()),
             })
             .await
             .is_err()
@@ -497,7 +519,7 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
         exit_events,
         tx.clone(),
         redactor,
-        baseline,
+        floor,
         budget,
     ));
     let events = tokio::spawn(forward_events(
@@ -2078,6 +2100,7 @@ async fn forward_events(
                     .send(ServerFrame::AwaitingSecret {
                         request_id: req.request_id,
                         prompt_text: req.prompt_text,
+                        raised_by: Some(req.raised_by.as_str().to_string()),
                     })
                     .await
                     .is_err()
@@ -2342,6 +2365,38 @@ fn protocol_error(reason: &str, frame_kind: Option<String>) -> ServerFrame {
     }
 }
 
+/// §7.5's `ScreenSnapshot` (GH #235): **`get_screen_state`'s capture,
+/// through `get_screen_state`'s mask**, and no rendering of this
+/// module's own.
+///
+/// `Session::screen_state` is the tool's entry point verbatim, with
+/// `redact: true` and the daemon's processor, so whatever the tool's grid
+/// masks this frame masks — and whatever the tool's grid is fixed to mask
+/// next, this frame inherits. That is the whole reason it is not built
+/// from the ring buffer here: a second renderer would be a second masker,
+/// and a second masker is a second place for a key body to get through.
+///
+/// `None` only for a delta, which a capture with no `diff_from` never is.
+fn screen_snapshot(
+    session: &Arc<Session>,
+    processor: &crate::output::OutputProcessor,
+) -> Option<ServerFrame> {
+    match session.screen_state(None, true, processor) {
+        crate::screen::ScreenCapture::Full(grid) => Some(ServerFrame::ScreenSnapshot {
+            session: session.id.clone(),
+            cols: grid.cols,
+            rows: grid.rows,
+            cursor_row: grid.cursor_row,
+            cursor_col: grid.cursor_col,
+            cursor_visible: grid.cursor_visible,
+            alt_screen: grid.alt_screen,
+            lines: grid.lines,
+            held_back: grid.held_back,
+        }),
+        crate::screen::ScreenCapture::Delta(_) => None,
+    }
+}
+
 /// §7.5's `Attached`, built from the session rather than echoed from the
 /// request.
 ///
@@ -2571,6 +2626,56 @@ mod tests {
             outputs * 4 < burst.len() / CHUNK,
             "{outputs} Output frames for {} PTY reads — the catch-up was not batched",
             burst.len() / CHUNK
+        );
+    }
+
+    /// **A stream that starts before the receiver's first frame is filled
+    /// from the ring, not skipped to it** (GH #235, GH #210).
+    ///
+    /// The position `run` is in whenever the join's floor is behind the
+    /// buffer's head: the floor is the screen tracker's offset, which lags
+    /// the head by the chunk the reader has pushed and not yet fed it, and
+    /// that chunk was published before this receiver existed. So the
+    /// receiver's first frame starts *past* the cursor, with no `Lagged`
+    /// to announce it — and a forwarder that trusted the frame over the
+    /// cursor would jump to it and lose the bytes in between silently,
+    /// in neither the opening picture nor the stream.
+    ///
+    /// Found by mutation: with the hole check in `Stream::take` replaced
+    /// by a jump, every other row stayed green, because each of them
+    /// reaches the ring through a `Lagged` first.
+    #[tokio::test]
+    async fn a_stream_starting_before_the_receivers_first_frame_is_filled_from_the_ring() {
+        let inner = Arc::new(MockPty::new());
+        let session = session_on(Arc::new(ChunkedPty(Arc::clone(&inner), 64)), 64 * 1024, 64);
+        inner.queue_output(b"BEFORE-THE-RECEIVER|");
+        wait_head(&session, 20).await;
+
+        // Subscribed only now, so nothing before offset 20 is in it.
+        let rx = session.subscribe();
+        let (tx, mut out) = mpsc::channel::<ServerFrame>(ATTACH_QUEUE_FRAMES);
+        let budget = Arc::new(Budget::default());
+        let forwarder = tokio::spawn(forward_output(
+            Arc::clone(&session),
+            "sess_x".into(),
+            rx,
+            session.subscribe_events(),
+            tx,
+            None,
+            0,
+            Arc::clone(&budget),
+        ));
+        inner.queue_output(b"AFTER-Z");
+        let frames = drain_until(&mut out, &budget, b'Z').await;
+        forwarder.abort();
+        assert_eq!(
+            output_of(&frames),
+            b"BEFORE-THE-RECEIVER|AFTER-Z".to_vec(),
+            "the bytes between the stream's start and the receiver's first frame were lost"
+        );
+        assert!(
+            gaps_of(&frames).is_empty(),
+            "the ring still holds them; nothing was lost"
         );
     }
 
@@ -3021,6 +3126,7 @@ mod tests {
             ServerFrame::AwaitingSecret {
                 request_id: "r".into(),
                 prompt_text: "Password:".into(),
+                raised_by: None,
             },
         );
         assert_eq!(

@@ -13,6 +13,14 @@ is cut, named and published is in
 
 ### Added
 
+- Attach protocol **1.5**: `ServerFrame::ScreenSnapshot`, the session's
+  screen as it stands when a client joins — sent once, after `Attached` and
+  before the first `Output`, and built from `get_screen_state`'s own capture
+  and mask rather than from a second rendering of the ring buffer; and an
+  optional `AwaitingSecret.raised_by` (`echo_drop` | `tool_call`, §9.4's
+  spelling) saying whose words `prompt_text` is. Additive both ways: a 1.4
+  client skips the frame as `Unknown` and ignores the key ([#235], [#236]).
+
 - A `windows-2022` CI job: native MSVC clippy over `--all-targets`, the source
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
@@ -219,6 +227,18 @@ is cut, named and published is in
 
 ### Changed
 
+- **`holdfast attach` and `holdfast watch` open with the session's current
+  screen** ([#235]). Attaching to a session idling at its prompt rendered the
+  banner and nothing else until somebody pressed Enter, and `watch` rendered
+  nothing at all. The screen is painted over the terminal with the cursor
+  where the child left it, then the live stream resumes where the picture
+  ends — or a few bytes before it, never after: the resume point is read
+  before the capture, so the error a busy session can produce is a few bytes
+  drawn twice rather than a few bytes never drawn. `watch` into a file paints
+  nothing, because a picture in a capture is bytes the session never printed,
+  and says it is watching on stderr instead. The picture is masked for both
+  roles — it is a re-rendering of history, not the live stream `interactive`
+  is entitled to raw — and plain text: colour returns as the child redraws.
 - **A `slow_consumer` detach now means the client stopped reading, not that
   it read too slowly** ([#210]). The daemon detaches a connection whose
   socket has accepted no bytes for 30 seconds while bytes were waiting for
@@ -231,10 +251,16 @@ is cut, named and published is in
 - **`holdfast attach` holds the terminal after a `slow_consumer` detach
   instead of exiting** ([#210]). Exiting sent whatever the human typed next —
   into what they believed was the session — to their local shell. Nothing
-  typed while held goes anywhere; `Enter` reattaches, `Ctrl-B d` leaves. No
-  letter does either, because a human who has not read the notice is typing
-  a word. A view that missed output this
+  typed while held goes anywhere; `Enter` reattaches with the screen
+  repainted, `Ctrl-B d` leaves. No letter does either, because a human who
+  has not read the notice is typing a word. A view that missed output this
   way exits 3 however the attachment later ends.
+- **The attach secret prompt is labelled, says whose words it quotes, and no
+  longer prints the child's prompt a second time** ([#236]). An echo-drop
+  request's text is the line the child already drew and is not repeated; a
+  tool call's is shown as the agent's. An *adopting* call's text is still not
+  shown — §5.2 keeps it off the wire so an agent cannot relabel a prompt a
+  human may already be typing into.
 - `limits.output_broadcast_capacity` **is live** ([#210]): `start_session`
   sizes the output broadcast from it. It was accepted, validated and
   documented as a control while the hardcoded `OUTPUT_BROADCAST_FRAMES` sized
@@ -1582,6 +1608,13 @@ is cut, named and published is in
   A suspended viewer on an idle session is not detached at all — nothing is
   waiting for it — until output backs up behind it, as with a suspended
   `ssh`.
+- **Joining a session is a screen-state consumer** ([#235]). The opening
+  picture is `get_screen_state`'s capture, which in `adaptive` mode switches
+  the session's VT100 tracking on until `screen_tracking_idle_disable_secs`
+  pass with no consumer — the cost §4.2a measures, and the `cursor_score`
+  sub-signal becoming available to prompt detection meanwhile, exactly as an
+  agent's own `get_screen_state` call does.
+
 - **The plugin's Windows entrypoint is unverified, and it is unverified in a
   way no amount of care on this side settles.** `.mcp.json` holds exactly one
   `command` string and the schema has no platform conditional, so §13.3's
@@ -2065,6 +2098,8 @@ residuals that are known and accepted.
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
 [#200]: https://github.com/Sertelegger/holdfast/issues/200
 [#210]: https://github.com/Sertelegger/holdfast/issues/210
+[#235]: https://github.com/Sertelegger/holdfast/issues/235
+[#236]: https://github.com/Sertelegger/holdfast/issues/236
 [#194]: https://github.com/Sertelegger/holdfast/issues/194
 [#217]: https://github.com/Sertelegger/holdfast/issues/217
 [#98]: https://github.com/Sertelegger/holdfast/issues/98

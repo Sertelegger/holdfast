@@ -553,12 +553,20 @@ async fn send(s: &mut UnixStream, f: &ClientFrame) {
 /// One server frame, or a failed test — **never a hang.** The workspace
 /// has no `nextest.toml`, so a bare `await` on a daemon that stopped
 /// answering is a hung CI job rather than a red row.
+///
+/// **The one `ScreenSnapshot` a join sends is read past** (GH #235): it
+/// arrives right after `Attached`, and no row in this file is about it.
 async fn recv(s: &mut UnixStream) -> ServerFrame {
-    let body = tokio::time::timeout(Duration::from_secs(10), frame::read_frame_body(s))
-        .await
-        .expect("no frame arrived within 10s")
-        .expect("a frame body");
-    decode_server_frame(&body).expect("a decodable server frame")
+    loop {
+        let body = tokio::time::timeout(Duration::from_secs(10), frame::read_frame_body(&mut *s))
+            .await
+            .expect("no frame arrived within 10s")
+            .expect("a frame body");
+        match decode_server_frame(&body).expect("a decodable server frame") {
+            ServerFrame::ScreenSnapshot { .. } => continue,
+            other => return other,
+        }
+    }
 }
 
 async fn attach_ok(d: &TestDaemon, session: &str, mode: AttachMode) -> UnixStream {
@@ -578,6 +586,7 @@ async fn next_awaiting_secret(c: &mut UnixStream, secs: u64) -> (String, String)
             ServerFrame::AwaitingSecret {
                 request_id,
                 prompt_text,
+                ..
             } => return (request_id, prompt_text),
             ServerFrame::Output { .. } | ServerFrame::Resize { .. } => {}
             other => panic!("expected AwaitingSecret, got {other:?}"),
@@ -623,6 +632,8 @@ async fn stream_until(c: &mut UnixStream, needle: &[u8], secs: u64) -> Vec<u8> {
         match decode_server_frame(&body).expect("a decodable server frame") {
             ServerFrame::Output { bytes, .. } => acc.extend_from_slice(&bytes),
             ServerFrame::AwaitingSecret { .. } | ServerFrame::SecretRequestClosed { .. } => {}
+            // The join's picture (GH #235), not the stream.
+            ServerFrame::ScreenSnapshot { .. } => {}
             // **The child is gone, so no more `Output` is coming — return
             // what arrived and let the caller's own assertion say what is
             // missing.** Frames are ordered, so a needle the child really

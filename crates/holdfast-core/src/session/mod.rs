@@ -1900,6 +1900,42 @@ impl Session {
         self.output_broadcast_capacity
     }
 
+    /// An offset **at or before** the one any [`screen_state`] capture
+    /// started after this call returns will reflect (GH #235).
+    ///
+    /// `holdfast attach` and `holdfast watch` now open with the current
+    /// screen, and the live stream has to resume where that picture
+    /// ends. The picture is the screen tracker's, and the tracker lags
+    /// the ring buffer by whatever chunk the reader thread has pushed and
+    /// not yet fed it — so the buffer's head is *not* a safe place to
+    /// resume: a chunk in that window is in neither the picture nor a
+    /// stream that starts after it, and it vanishes without a gap to say
+    /// so.
+    ///
+    /// **A lower bound, deliberately, and the error it permits is the
+    /// visible one.** A stream started here may repeat the few bytes that
+    /// reached the tracker between this call and the capture; it can
+    /// never skip one. Both halves of the argument are monotonicity: the
+    /// tracker's consumed offset only moves forward (a re-seed restarts
+    /// it at the buffer's head, which is ahead of it), and a tracker that
+    /// is not running when this is read will be seeded, by the capture,
+    /// from a buffer whose head has not moved backwards. The screen lock
+    /// is held across both reads so the tracker cannot be switched on
+    /// between them — the order is `screen → buffer`, the one the
+    /// tracker documents.
+    ///
+    /// For an idle session — the case GH #235 is about — the two numbers
+    /// are equal and the resume is exact.
+    ///
+    /// [`screen_state`]: Self::screen_state
+    pub fn stream_floor(&self) -> u64 {
+        let screen = self.screen.lock();
+        match screen.tracked_head() {
+            Some(head) => head,
+            None => self.buffer.lock().head(),
+        }
+    }
+
     /// A handle on §4.3's write queue.
     ///
     /// Cloned per producer, so every attach connection on a session
@@ -2584,6 +2620,48 @@ mod tests {
     use crate::pty::{MockPty, MAX_COLS, MAX_ROWS, MIN_COLS, MIN_ROWS};
     use crate::screen::{ScreenCapture, ScreenGrid, ScreenTracking};
     use std::time::Instant;
+
+    /// **A join resumes the stream from what the screen shows, not from
+    /// the buffer's head** (GH #235).
+    ///
+    /// The two differ whenever bytes reached the ring without reaching
+    /// the screen tracker yet — ordinarily the one chunk the reader is
+    /// between pushing and feeding, a window no test can hold open. §9.5's
+    /// buffer notice is the deterministic case: `inject_notice` pushes to
+    /// the ring and publishes, and never feeds the tracker. A floor at the
+    /// buffer's head would put the notice in neither the opening picture
+    /// nor the stream; at the tracker's offset it is streamed after the
+    /// picture, which is where it belongs.
+    ///
+    /// The negative: with no tracker running, the floor is the buffer's
+    /// head, because the capture that follows will seed from there.
+    #[test]
+    fn the_stream_floor_is_the_screens_offset_not_the_buffers() {
+        let (s, pty) = mock_session();
+        pty.queue_output(b"a prompt$ ");
+        wait_for_bytes(&s, 10);
+        assert_eq!(
+            s.stream_floor(),
+            s.buffer_head(),
+            "with no tracker running the floor is the head the capture will seed from"
+        );
+
+        // Switch the tracker on the way a join does, then put bytes in the
+        // ring that it has not parsed.
+        let _ = s.screen_state(None, true, &OutputProcessor::builtin().unwrap());
+        let shown = s.buffer_head();
+        s.inject_notice(b"[holdfast] a notice\r\n");
+        assert!(
+            s.buffer_head() > shown,
+            "the fixture's notice never reached the ring"
+        );
+        assert_eq!(
+            s.stream_floor(),
+            shown,
+            "the floor ran ahead of what the screen shows; the bytes in between would be \
+             in neither the opening picture nor the stream"
+        );
+    }
 
     /// **The broadcast holds what the config says, not a constant** (GH
     /// #210). Measured by the lag a subscriber that reads nothing is told

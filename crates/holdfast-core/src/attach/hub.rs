@@ -590,13 +590,27 @@ impl AttachHub {
     /// bounded and overflow detaches that client. A fan-out that blocked
     /// on one slow client would hold up the tool call, the write path, or
     /// whatever else happened to be doing the raising.
+    ///
+    /// **`raised_by` is read off the request, not taken as an argument**
+    /// (GH #236), so the three callers outside this module — a tool
+    /// call's raise and the two re-raises a caller's ending leaves behind
+    /// — cannot pass a provenance that disagrees with the slot. A request
+    /// that is no longer the outstanding one gets `None`, which a client
+    /// renders neutrally; a fan-out for a request already closed is a
+    /// race nobody should be told a provenance about.
     pub fn broadcast_awaiting_secret(&self, session_id: &str, request_id: &str, prompt_text: &str) {
+        let raised_by = self
+            .secrets
+            .outstanding(session_id)
+            .filter(|r| r.request_id == request_id)
+            .map(|r| r.raised_by.as_str().to_string());
         for c in self.clients_of(session_id) {
             queue_ancillary(
                 &c.tx,
                 ServerFrame::AwaitingSecret {
                     request_id: request_id.to_string(),
                     prompt_text: prompt_text.to_string(),
+                    raised_by: raised_by.clone(),
                 },
             );
         }
