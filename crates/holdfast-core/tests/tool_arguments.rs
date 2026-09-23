@@ -416,8 +416,8 @@ async fn the_in_process_transport_refuses_the_same_way_and_still_serves_meta() {
         // (MCP's SEP-1303 reading, so a model can self-correct), where the
         // daemon path — `passthrough::call_tool` rebuilt by the shim —
         // answers a JSON-RPC `-32602`. That divergence predates GH #219:
-        // `request_secret_input`'s refusal has taken both shapes since
-        // 0.0.7. What this row pins is what the issue is about — the call
+        // at `a81b02d` `request_secret_input`'s refusal already took both
+        // shapes, on rmcp 3.2.0. What this row pins is what the issue is about — the call
         // did not run, and the answer names the key — and it takes the
         // message from whichever channel carried it.
         let message = if v["error"]["code"] == json!(-32602) {

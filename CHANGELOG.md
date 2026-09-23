@@ -219,6 +219,34 @@ is cut, named and published is in
 
 ### Changed
 
+- **Every tool refuses an argument it does not declare, and names it (GH
+  #219).** Eleven of the twelve dropped an unknown key without a word, so a
+  typo was honoured as the default it meant to override:
+  `wait_for_pattern { patern: … }` became a pattern-less wait and answered
+  `ok, session is AtPrompt`, `send_input { apend_newline: false }` wrote the
+  newline anyway, and `list_sessions { session: … }` returned every session.
+  The refusal is serde's, and it is the one `request_secret_input` has always
+  given — *unknown field \`patern\`, expected one of \`session\`,
+  \`pattern\`, …* — so it names the key and lists the valid ones. The
+  advertised `inputSchema` of all twelve now says `additionalProperties:
+  false`, so the schema and the deserialiser agree; before, they agreed only
+  by both being open. `list_sessions`, which takes no arguments and so was
+  never handed any, now takes an empty argument type in order to refuse them.
+
+  **What a client sees depends on the transport, and that is rmcp's, not
+  this change's.** The daemon path — the default — answers JSON-RPC
+  `-32602`; `--no-daemon` and Windows answer a tool result with
+  `isError: true` carrying the same text, because rmcp 3 reports a failure
+  of its own argument extractor that way. `request_secret_input`'s refusal
+  already took both shapes before this change. **Nothing an MCP client sends is refused
+  that was not an argument:** `_meta` travels beside `arguments`, not inside
+  it, and a row pins that it is still served. The one real cost is skew — a
+  newer shim forwarding an argument an older daemon does not know is now
+  refused by name instead of run without it, which is the same trade.
+  `scripts/mcp-smoke.sh` carries one paired row per tool, and
+  `tests/tool_arguments.rs` drives both transports from the router's own
+  tool list.
+
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of
