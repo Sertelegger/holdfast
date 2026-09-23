@@ -332,6 +332,50 @@ fn two_clients_in_two_projects_each_start_sessions_in_their_own() {
     shim_b.kill();
 }
 
+/// **GH #229, when the client's own project is gone.** A shim whose
+/// directory has been removed — a worktree deleted under an open client —
+/// cannot say where it is: Linux's `getcwd` fails once the directory is
+/// unlinked. Found by review, with this setup: the daemon read that as
+/// "use your own" and started the session in the first client's project,
+/// with `status: ok`, which is GH #229 itself through a different door.
+///
+/// It is refused, nothing starts, and the same client can still name a
+/// directory. On a platform whose `getcwd` still answers for a removed
+/// directory the shim sends that path, the daemon cannot find it, and the
+/// refusal is the same — so this row asserts the outcome, not the route.
+#[test]
+fn a_client_whose_project_was_removed_is_refused_rather_than_moved() {
+    let inst = Instance::new("gone");
+    let a = Project::new(&inst, "proj-a");
+    let b = Project::new(&inst, "proj-b");
+    let mut shim_a = Shim::launch(&inst, &a.0, &[], &["mcp"]);
+    let mut shim_b = Shim::launch(&inst, &b.0, &[], &["mcp"]);
+    std::fs::remove_dir_all(&b.0).expect("remove the second project");
+
+    let refused = shim_b.call(
+        "start_session",
+        json!({ "command": "/bin/sh", "args": ["-c", "sleep 30"] }),
+    );
+    assert_eq!(
+        refused["error"]["code"], -32602,
+        "a client with no directory was started somewhere else: {refused}"
+    );
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("pass `cwd`"), "{message:?}");
+    let listed = envelope(&shim_a.call("list_sessions", json!({}))).clone();
+    assert_eq!(listed["details"], "0 session(s)", "{listed}");
+
+    let named = shim_b.call(
+        "start_session",
+        json!({ "command": "/bin/sh", "args": ["-c", "sleep 30"], "cwd": a.path() }),
+    );
+    assert_eq!(envelope(&named)["status"], "ok", "{named}");
+    assert_eq!(envelope(&named)["data"]["cwd"], a.path(), "{named}");
+
+    shim_a.kill();
+    shim_b.kill();
+}
+
 /// The reference the fix was measured against: `--no-daemon`, where the
 /// server is the process the client launched and was always right. Kept
 /// as a row so the two transports cannot drift apart again unseen.

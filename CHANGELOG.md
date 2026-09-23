@@ -745,9 +745,16 @@ is cut, named and published is in
   request from an older shim — still starts from the daemon's, minus
   `CLAUDECODE` and the `CLAUDE_` family, which name the spawning client and
   are wrong for every other. Every session is also given `PWD` naming the
-  directory it really starts in. A client whose own directory has been
-  removed since it started is refused with `invalid_params` rather than moved
-  somewhere else.
+  directory it really starts in.
+
+  **A client whose own directory has been removed is refused with
+  `invalid_params` and told to pass `cwd`**, rather than started somewhere
+  else: on Linux the shim can no longer read that directory at all, and a
+  context that arrives without one is not read as "use the daemon's", which
+  would be this defect again. A client that names a `cwd` is unaffected.
+  The context's fields are read leniently — one a later shim adds costs a
+  daemon of this release nothing but that field — because a daemon
+  outlives the shims that talk to it.
 
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are

@@ -314,7 +314,7 @@ impl HoldfastServer {
         // which in-process is this process's own, and in a daemon is the
         // one the shim sent, because the daemon's own is whichever client
         // happened to spawn it. A profile session never takes the
-        // client's: `host.client_cwd` answers `None` for it, and it keeps
+        // client's: `host.start_dir` answers `Own` for it, and it keeps
         // this process's directory as before (GH #55). See
         // `session::launch` for the whole rule.
         let host = crate::session::launch::host();
@@ -326,7 +326,8 @@ impl HoldfastServer {
                 .filter(|p| p.is_dir())
                 .map(|p| p.to_string_lossy().into_owned())
         };
-        cfg.cwd = match (&launch.cwd, host.client_cwd(profiled)) {
+        use crate::session::launch::StartDir;
+        cfg.cwd = match (&launch.cwd, host.start_dir(profiled)) {
             (Some(cwd), _) => match canonical_dir(cwd) {
                 Some(p) => Some(p),
                 None => {
@@ -336,13 +337,16 @@ impl HoldfastServer {
                     ))
                 }
             },
-            // Refused rather than fallen back from. Falling back to this
-            // process's directory is GH #229 exactly — a session running
-            // in somebody else's project — and the only way to reach this
-            // arm is a client whose own directory has been removed since
-            // it started, where no directory Holdfast could pick is the
-            // one the agent meant.
-            (None, Some(client)) => match canonical_dir(client) {
+            // Both client arms are refused rather than fallen back from.
+            // Falling back to this process's directory is GH #229 exactly
+            // — a session running in somebody else's project — and each
+            // arm is a client whose own directory is gone, where no
+            // directory Holdfast could pick is the one the agent meant.
+            //
+            // This one is a shim that read its directory and the daemon
+            // cannot find it: removed between the two, or a platform whose
+            // `getcwd` still answers for a removed directory.
+            (None, StartDir::Client(client)) => match canonical_dir(client) {
                 Some(p) => Some(p),
                 None => {
                     return Err(ErrorData::invalid_params(
@@ -354,10 +358,25 @@ impl HoldfastServer {
                     ))
                 }
             },
+            // And this one a shim that could not read its directory at
+            // all — Linux's `getcwd` fails with `ENOENT` once it has been
+            // removed — or whose path is not UTF-8. Found by review: this
+            // arm used to be the fallback below, so a client whose
+            // project had been deleted was started in the one that spawned
+            // the daemon, with `status: ok`.
+            (None, StartDir::ClientUnknown) => {
+                return Err(ErrorData::invalid_params(
+                    "no cwd was given, and the MCP server's own working directory could not \
+                     be read — it has been removed since the server started, or its path is \
+                     not valid UTF-8; pass `cwd`"
+                        .to_string(),
+                    None,
+                ))
+            }
             // `getcwd(2)` already resolves symlinks, so this is canonical
             // by construction; canonicalise anyway so both arms are
             // provably producing the same kind of path.
-            (None, None) => std::env::current_dir()
+            (None, StartDir::Own) => std::env::current_dir()
                 .and_then(|p| p.canonicalize())
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned()),

@@ -232,6 +232,11 @@ async fn an_explicit_cwd_outranks_the_callers_directory() {
 /// A client whose own directory has gone is refused rather than fallen
 /// back from: the fallback is this process's directory, which is GH #229
 /// exactly — a session in somebody else's project.
+///
+/// **This row is the shim that did read a directory**, which the daemon
+/// then cannot find: removed between the two, or a platform whose
+/// `getcwd` still answers for a removed directory. On Linux a shim in a
+/// removed directory reads none at all, which is the next row.
 #[tokio::test]
 async fn a_caller_whose_directory_is_gone_is_told_so_rather_than_moved() {
     let gone = Scratch::new("gone");
@@ -250,6 +255,49 @@ async fn a_caller_whose_directory_is_gone_is_told_so_rather_than_moved() {
         server.registry.all().is_empty(),
         "a refused call must not have started anything"
     );
+}
+
+/// **A caller that could not say where it is** — a context with no
+/// `cwd`, which is what the shim sends when `getcwd` fails, as it does on
+/// Linux once the directory has been removed. Found by review: the
+/// handler read that absence as "use your own", so a client whose project
+/// had been deleted started in whichever project spawned the daemon, and
+/// was told `ok`. The same client can still name a directory.
+#[tokio::test]
+async fn a_caller_that_could_not_read_its_directory_is_refused_rather_than_moved() {
+    let lost = || ClientLaunch {
+        cwd: None,
+        ..a_client_in("/unused")
+    };
+    let server = HoldfastServer::new();
+    let err = hosted_by_daemon(
+        Some(lost()),
+        server.start_session(Parameters(probe_command())),
+    )
+    .await
+    .expect_err("a session must not silently start in the daemon's directory");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert!(err.message.contains("pass `cwd`"), "{}", err.message);
+    assert!(
+        server.registry.all().is_empty(),
+        "a refused call must not have started anything"
+    );
+
+    let named = Scratch::new("named");
+    let id = hosted_by_daemon(
+        Some(lost()),
+        start(
+            &server,
+            StartSessionArgs {
+                cwd: Some(named.path().into()),
+                ..probe_command()
+            },
+        ),
+    )
+    .await;
+    let seen = probe_line(&server, &id);
+    kill_all(&server);
+    assert_eq!(seen["d"], named.path(), "{seen:?}");
 }
 
 /// **The GH #55 half.** A `profile` session in the same daemon, for the

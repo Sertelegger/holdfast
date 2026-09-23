@@ -93,11 +93,24 @@ pub const CLIENT_PARAM: &str = "@client";
 
 /// What the calling `holdfast mcp` process knows about itself that a
 /// shared daemon cannot: where it is, and what its environment is.
+///
+/// **Unknown fields are ignored, not refused**, and that is a wire
+/// promise rather than leniency. A daemon outlives the shims that talk to
+/// it — by its idle window, and since GH #231 by being restarted rather
+/// than abandoned — so a later shim will send this to a daemon of this
+/// release. A field it adds must cost that daemon nothing but the field;
+/// a refusal would fail every `start_session` it forwards, and no restart
+/// would help, because the daemon is not lost.
+/// `a_later_shims_context_is_read_for_what_this_daemon_knows` pins it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientLaunch {
     /// The shim's working directory — the directory its MCP client
     /// launched it in, which for Claude Code is the project.
+    ///
+    /// **Absent when the shim could not read it**: `getcwd(2)` fails once
+    /// the directory has been removed, and a path that is not UTF-8 has
+    /// no JSON spelling. A daemon must not read absence as "use your
+    /// own" — see [`StartDir::ClientUnknown`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     /// The shim's environment, whole.
@@ -185,18 +198,35 @@ pub fn take_client_param(
         .map_err(|e| format!("`{CLIENT_PARAM}` is not a launch context: {e}"))
 }
 
+/// Where a session with no `cwd` of its own starts (GH #229).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartDir<'a> {
+    /// This process's own directory. Right in-process, where this process
+    /// is the client's; right for a `profile` session, whose directory is
+    /// the operator's (GH #55); and the pre-GH-#229 behaviour for a shim
+    /// too old to say where it is, which is the best a daemon can do.
+    Own,
+    /// The calling client's directory, as its shim stated it.
+    Client(&'a str),
+    /// **The client said where it was and could not say where it is** —
+    /// its shim sent a context with no directory. That is a directory
+    /// removed since the shim started (`getcwd` fails), or one whose path
+    /// is not UTF-8. Starting in [`StartDir::Own`] instead is GH #229
+    /// exactly — a session in whichever project spawned the daemon — so
+    /// the caller is refused and told to pass `cwd`.
+    ClientUnknown,
+}
+
 impl Host {
-    /// The calling client's working directory, when it applies: a
-    /// `command` session in a daemon, from a shim that sent one.
-    ///
-    /// `None` means *"use this process's own"*, which is right
-    /// in-process and is the pre-GH-#229 behaviour for everything else.
-    pub fn client_cwd(&self, profile: bool) -> Option<&str> {
+    /// Where a session with no `cwd` of its own starts. See [`StartDir`].
+    pub fn start_dir(&self, profile: bool) -> StartDir<'_> {
         match self {
             Self::Daemon {
-                client: Some(ClientLaunch { cwd: Some(cwd), .. }),
-            } if !profile => Some(cwd),
-            _ => None,
+                client: Some(ClientLaunch { cwd, .. }),
+            } if !profile => cwd
+                .as_deref()
+                .map_or(StartDir::ClientUnknown, StartDir::Client),
+            _ => StartDir::Own,
         }
     }
 
@@ -379,14 +409,39 @@ mod tests {
         let hosted = Host::Daemon {
             client: Some(client("/b", &[])),
         };
-        assert_eq!(hosted.client_cwd(false), Some("/b"));
+        assert_eq!(hosted.start_dir(false), StartDir::Client("/b"));
         assert_eq!(
-            hosted.client_cwd(true),
-            None,
+            hosted.start_dir(true),
+            StartDir::Own,
             "a profile's directory is the operator's (GH #55)"
         );
-        assert_eq!(Host::Daemon { client: None }.client_cwd(false), None);
-        assert_eq!(Host::InProcess.client_cwd(false), None);
+        assert_eq!(
+            Host::Daemon { client: None }.start_dir(false),
+            StartDir::Own
+        );
+        assert_eq!(Host::InProcess.start_dir(false), StartDir::Own);
+    }
+
+    /// **A context with no directory is not an old shim.** The shim sends
+    /// one whenever it can, so its absence from a context that is there
+    /// means the shim could not read its own directory — removed, or not
+    /// UTF-8 — and falling back to this process's is GH #229. Found by
+    /// review, end to end: a shim whose project was deleted started its
+    /// session in the project that had spawned the daemon.
+    #[test]
+    fn a_client_that_could_not_say_where_it_is_is_not_given_the_daemons_directory() {
+        let lost = Host::Daemon {
+            client: Some(ClientLaunch {
+                cwd: None,
+                env: Some(BTreeMap::new()),
+            }),
+        };
+        assert_eq!(lost.start_dir(false), StartDir::ClientUnknown);
+        assert_eq!(
+            lost.start_dir(true),
+            StartDir::Own,
+            "a profile never took the client's directory, known or not"
+        );
     }
 
     /// The pairing that keeps the scrub honest: a predicate that matched
@@ -433,6 +488,30 @@ mod tests {
 
         let mut absent = serde_json::json!({ "command": "bash" });
         assert_eq!(take_client_param(&mut absent), Ok(None));
+    }
+
+    /// **The forward-compatibility half of the wire.** A daemon of this
+    /// release will be sent contexts by later shims; a field it does not
+    /// know is dropped and the rest is read. Found by review: the struct
+    /// shipped `deny_unknown_fields`, which turned any later field into a
+    /// `bad_params` on every `start_session`.
+    #[test]
+    fn a_later_shims_context_is_read_for_what_this_daemon_knows() {
+        let mut args = serde_json::json!({
+            "command": "bash",
+            CLIENT_PARAM: {
+                "cwd": "/b",
+                "env": { "A": "1" },
+                "umask": 18,
+                "shell": { "path": "/bin/zsh" },
+            },
+        });
+        assert_eq!(
+            take_client_param(&mut args),
+            Ok(Some(client("/b", &[("A", "1")]))),
+            "a field this daemon does not know must not cost the ones it does"
+        );
+        assert_eq!(args, serde_json::json!({ "command": "bash" }));
     }
 
     /// The scope is the whole of what makes a host a daemon — including
