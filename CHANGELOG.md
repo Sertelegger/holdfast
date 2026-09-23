@@ -229,6 +229,30 @@ is cut, named and published is in
   on the ground that a marker covers it. `RuleError::ValueConstraintWithoutValue`
   is gone with the error it named.
 
+- **A progress bar reads back as its last frame** ([#247]). `cargo build` and
+  most progress bars redraw a line by returning to column 0 with `\r` and
+  erasing it, so the byte stream holds every frame and a terminal shows one; a
+  nine-second build read back as mostly `Building [...]` redraws, and a 400-step
+  bar returned 32 KB to `tail_lines: 3`. Under `ansi: "strip"` a line the stream
+  itself erases — `\r` then an erase-in-line, or `\r` then a redraw that ends in
+  one — is now not shown. Nothing a terminal still shows is dropped: a `\r`
+  followed by a shorter line with no erase, a tab, a backspace or a cursor
+  movement is left as it was, so is a line a cursor move or a screen switch
+  separates from the erase, and so is everything under `ansi: "raw"` — a
+  property test replays each dropped range through a terminal emulator, at a
+  wide and a narrow width, to check it. **So is a line that may have wrapped**,
+  because `\r` returns only to the start of the last row a wrapped line reached
+  and the erase clears that row alone: the line is dropped only if it fits the
+  session's width, counted with every non-ASCII character as two columns, from
+  a start column the read can see (found by the independent review — 150 `W`s
+  and `\r\x1b[K` in an 80-column session read back as nothing while the grid
+  still showed two rows of them). A session widened after such a line was
+  painted is the residual. The cursor, `bytes_returned` and every flag are
+  unchanged, because the
+  bytes were read, only not shown; a frame a redaction touches is kept with its
+  marker; and the shortened page is itself judged, because removing a frame
+  joins the text either side of it.
+
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of
@@ -386,6 +410,67 @@ is cut, named and published is in
   would instead hold `mysqldump`, `docker-compose`, curl's `Authorization:` and
   every URL a program prints — `ordinary_command_heads_are_not_held_back` pins
   that it does not.
+
+- **A private key's body no longer goes out raw through a read that starts
+  inside it, or through `get_screen_state` once its header has scrolled
+  off** ([#243], [#224]). [#195]'s fix masked a key for a read that starts
+  *before* its header. A read that starts inside it — every `tail_lines` and
+  `tail_bytes` read, and a cursor partway in — never saw the header, because
+  the window reaches 512 bytes behind the page and a key is kilobytes, so
+  nothing marked the body: on `main` at `a81b02d`, `tail_lines: 30` of a
+  complete 4096-bit key returned 26 raw body lines with `redactions: {}` and
+  `held_back: false`. A read now also looks for a complete `binary`-rule match
+  in the 16 KiB carry region behind its window, which covers the largest key
+  the rule can match, and masks the part that reaches the page with the rule's
+  own marker. The grid had the same gap from the other side — its mask reached
+  the trailing 512 bytes, so with the header scrolled off it returned 36 raw
+  body lines, and `head -n 15` of a key returned all fourteen where
+  `read_output` masked them. It now asks the processor which bytes behind the
+  screen are a key and masks the cells those bytes wrote, found by replaying
+  the parser's own input with the key's printable bytes swapped and comparing
+  cell by cell, so scrolling does not smear the mask onto the prompt after it;
+  and it judges a header still on screen against the text the screen shows.
+  A key a program puts in the window title — which `redact_str` redacted only
+  when the title held all of it — is masked in `get_screen_state`'s `title`
+  and `status`'s and `list_sessions`' too.
+  Both surfaces are swept over every key format — PKCS#1, PKCS#8, encrypted
+  PKCS#8, legacy encrypted PKCS#1 with its `Proc-Type`/`DEK-Info` headers, SEC1
+  EC, DSA and OpenSSH — using throwaway keys stored without their boundaries.
+- **One unterminated `-----BEGIN … PRIVATE KEY-----` no longer blinds every
+  read surface for the next 16 KiB** ([#242]). `private-key-block`'s
+  `[\s\S]*?` never reaches a dead state, so a header nobody closes — this
+  repository's own CHANGELOG has several as prose, and the agent's own command
+  echo is enough — stayed believed until the carry ran out, and the next
+  thirty-odd commands came back as a lone `[REDACTED:unresolved]`, a quarter of
+  `cat CHANGELOG.md` on a read and about a third on `holdfast watch`. The rule
+  is unchanged — a complete `BEGIN`…`END` pair still redacts whatever lies
+  between, a `bat` gutter or a `git show` diff included. What changed is the
+  *candidate*: it is believed only while what follows can still be PEM text
+  (base64 in lines, RFC 1421/4880 armour headers, JSON's escaped line breaks,
+  or whitespace where `echo $KEY` flattened the lines), judged over every
+  stream a read can emit. A prose mention now costs nothing. A candidate that
+  dies *with key material behind it* — `head -n 15 id_rsa` and then a prompt —
+  is masked from its header to the line that ended it, on the read, the grid
+  and the stream alike, rather than released; and a key still arriving when a
+  `watch` stream ends is masked rather than flushed. **And the key body that
+  goes on after a candidate stopped is masked too**, which the narrowing had
+  released and the independent review found: the next screenful of `less`
+  (`less` then a space returned 23 raw body lines with `redactions: {}`), the
+  middle of a key `sed` prints in chunks, and every line of a key printed under
+  a timestamp, a `bat` gutter or a diff's `-` that a pager cut off before its
+  `-----END`, which also covers such a key longer than the read's lookahead.
+  After a private-key header that stopped short of its closing boundary, each
+  line within the carry that carries a key-body run — 48 base64 characters,
+  or 16 on the line after one — is masked on the read, the grid and `watch`,
+  and nothing else is: the prompt, the command and ordinary output between
+  them keep their text. To do that on `watch`, the stream keeps the header in
+  its lookbehind for the carry and holds a line that may still be key body
+  until its line break arrives. The residuals are stated in `output/pem.rs`: a
+  key cut inside the first sixteen characters of its body; a body line of
+  fewer than 48 characters that follows no other; a line holding a SHA-256
+  digest inside the carry behind a private-key header, which is masked; and a
+  key painted a colour per character (`grep -n .` under `--color=auto`), whose
+  header is not in the raw bytes at all.
 
 - **A read window that cannot vouch for a region now emits one
   `[REDACTED:unresolved]` over it and completes, instead of choosing between
@@ -740,6 +825,31 @@ is cut, named and published is in
   now refuses exactly that family — lower-case letters, digits and hyphens
   after `sk-ecdsa-` or `sk-ssh-` — and a real key beside the name on the same
   line is still redacted.
+
+- **The `read_output` paging loop no longer splits a UTF-8 character across
+  two pages** ([#241]). The cap is a raw byte count and each page is decoded
+  on its own, so a character straddling a page boundary came back as U+FFFD
+  on *both* sides, with nothing in the response saying so — on CJK or
+  emoji-heavy output about every other page, and in the emoji of a starship
+  prompt on any page. A read that would end inside a character now ends
+  before it, and the rest of the character is the first thing the next read
+  returns. Where that would return nothing — a `max_bytes` smaller than one
+  character, or a page that *is* the front of one — the read finishes the
+  character instead, at most three bytes past `max_bytes`; pulling back there
+  would hand the caller its own cursor on every retry, which is GH #195's
+  wedge through a third rule. At `buffer.head` a character still arriving is
+  left for the next read while the child lives and emitted as what it is once
+  it has exited. `tail_bytes` and a front-clipped tail no longer open a page
+  on a continuation byte either. None of it is a holdback: no flag, no cause,
+  and `cursor` names the byte the next read starts at.
+- **A `tail_bytes` read larger than `max_bytes` says it was cut** ([#246]).
+  `read_output` clamped `tail_bytes` to `max_bytes` before the session saw
+  it, so the session was asked for a tail that fit, returned it whole, and
+  reported `truncated_for_size: false` over a read that had dropped most of
+  what the caller asked for — `tail_bytes: 140000` came back as 32,768 bytes
+  that claimed to be complete. The clamp is gone: the session front-clips an
+  oversized tail itself, keeps the newest bytes, and sets the flag, exactly
+  as `tail_lines` always did.
 
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
@@ -2165,3 +2275,9 @@ residuals that are known and accepted.
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
 [#245]: https://github.com/Sertelegger/holdfast/issues/245
 [#244]: https://github.com/Sertelegger/holdfast/issues/244
+[#241]: https://github.com/Sertelegger/holdfast/issues/241
+[#246]: https://github.com/Sertelegger/holdfast/issues/246
+[#243]: https://github.com/Sertelegger/holdfast/issues/243
+[#224]: https://github.com/Sertelegger/holdfast/issues/224
+[#242]: https://github.com/Sertelegger/holdfast/issues/242
+[#247]: https://github.com/Sertelegger/holdfast/issues/247

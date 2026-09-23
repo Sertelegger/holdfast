@@ -2173,7 +2173,23 @@ impl Session {
                 let clipped = head
                     .saturating_sub(req.max_bytes as u64)
                     .max(requested_start);
-                (clipped, clipped > requested_start)
+                // **A tail read starts on a character, not inside one
+                // (GH #241).** `tail_bytes` and a front clip are both
+                // byte counts back from `head`, so either can land on the
+                // second byte of a character and open the page with
+                // U+FFFD. The continuation bytes of a character whose
+                // lead is behind the start are not text the caller can
+                // use; skipping at most three of them is. A cursor read
+                // is not snapped: its start is the caller's, and the
+                // paging loop no longer produces one inside a character.
+                let snapped = (0..3u64)
+                    .map(|k| clipped + k)
+                    .find(|off| {
+                        *off >= head || !(0x80..=0xbfu8).contains(&buffer.slice(*off, *off + 1)[0])
+                    })
+                    .unwrap_or(clipped + 3)
+                    .min(head);
+                (snapped, clipped > requested_start)
             } else {
                 (requested_start, false)
             };
@@ -2229,7 +2245,9 @@ impl Session {
             front_clipped,
             truncated_at_tail,
         };
-        let read = processor.process(&snapshot, &req.options);
+        // The width is the session's now: GH #247's collapse drops a
+        // redraw only when the line in front of it cannot have wrapped.
+        let read = processor.process_at_width(&snapshot, &req.options, Some(self.size().0));
 
         // Fold this response's counts into the session tally that
         // `status.redaction_stats` reports (§5.2, REQ-O-012). It is fed
@@ -2395,9 +2413,16 @@ impl Session {
         // surface may take this value; see
         // [`Session::open_unvouched_holdback`].
         let holdback = self.open_unvouched_holdback(processor);
-        self.screen
-            .lock()
-            .capture(diff_from, redact, Instant::now(), &*self.buffer, holdback)
+        // `capture_judged` and not `capture`: the processor is also what
+        // judges which bytes behind the screen are a private key (GH #224).
+        self.screen.lock().capture_judged(
+            diff_from,
+            redact,
+            Instant::now(),
+            &*self.buffer,
+            holdback,
+            Some(processor),
+        )
     }
 
     /// The §8.6 T3c cursor sub-signal, or `None` when Tier B is off.
@@ -2926,6 +2951,63 @@ mod tests {
         assert_eq!(r.output, "export TOKEN=[REDACTED:github]\nnext\n");
         assert_eq!(r.cursor, line.len() as u64);
         assert!(!r.held_back);
+    }
+
+    /// **A tail read opens on a character, never inside one (GH #241).**
+    ///
+    /// `tail_bytes` and a front-clipped tail are byte counts back from
+    /// `head`, so either lands on a continuation byte as readily as on a
+    /// lead, and the page then opens with U+FFFD. Every `tail_bytes` from
+    /// one to the whole buffer is asked here, so every alignment against
+    /// the three- and four-byte characters is reached; the front-clipped
+    /// arm goes through `max_bytes` instead, which is the other road to
+    /// the same arithmetic.
+    #[test]
+    fn a_tail_read_never_opens_inside_a_utf8_character() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        let text = "日本語 🦀 é\n".repeat(20);
+        pty.queue_output(text.as_bytes());
+        wait_for_bytes(&s, text.len() as u64);
+
+        let mut snapped = 0usize;
+        for n in 1..=text.len() {
+            let req = ReadRequest {
+                start: ReadStart::TailBytes(n),
+                holdback: Holdback::BypassedByCallerOptIn,
+                ..ReadRequest::since(0, 32 * 1024)
+            };
+            let r = s.read_processed(&req, &p);
+            assert!(
+                !r.output.contains('\u{fffd}'),
+                "tail_bytes {n} opened inside a character: {:?}",
+                &r.output[..r.output.len().min(16)]
+            );
+            assert!(text.ends_with(&r.output), "tail_bytes {n} is not a suffix");
+            snapped += (r.output.len() < n) as usize;
+        }
+        assert!(snapped > 0, "no tail_bytes value landed inside a character");
+
+        // Front-clipped by `max_bytes` rather than by the argument.
+        for max_bytes in 1..=16usize {
+            let req = ReadRequest {
+                start: ReadStart::TailBytes(text.len()),
+                holdback: Holdback::BypassedByCallerOptIn,
+                ..ReadRequest::since(0, max_bytes)
+            };
+            let r = s.read_processed(&req, &p);
+            assert!(r.truncated_for_size, "max_bytes {max_bytes}: front clip");
+            assert!(
+                !r.output.contains('\u{fffd}'),
+                "max_bytes {max_bytes}: {:?}",
+                r.output
+            );
+            assert_eq!(
+                r.cursor,
+                text.len() as u64,
+                "a tail read still ends at head"
+            );
+        }
     }
 
     /// C-1 on the real read path (§4.1: *"a secret that was partially in
@@ -4665,6 +4747,317 @@ mod tests {
         let g = grid(s.screen_state(None, true, &OutputProcessor::builtin().unwrap()));
         assert_eq!(g.lines[0].trim_end(), "ONCE");
         assert_eq!((g.cursor_row, g.cursor_col), (0, 4));
+    }
+
+    // ---------------------------------------- GH #224: keys on the grid
+
+    /// A session with a ring large enough for any fixture key, Tier B on,
+    /// at `rows × cols`.
+    fn key_session(rows: u16, cols: u16) -> (Arc<Session>, Arc<MockPty>) {
+        let pty = Arc::new(MockPty::new());
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(1 << 20),
+        );
+        s.set_screen_config(ScreenConfig {
+            mode: ScreenTracking::On,
+            rows,
+            cols,
+            ..ScreenConfig::default()
+        });
+        (s, pty)
+    }
+
+    /// Queue `text` and return the grid once the *parser* has caught up
+    /// with it — the reader publishes to the buffer first and to the
+    /// screen after, so waiting on the buffer alone races that gap.
+    fn painted_grid(s: &Session, pty: &MockPty, text: &str, p: &OutputProcessor) -> ScreenGrid {
+        pty.queue_output(text.as_bytes());
+        wait_for_bytes(s, text.len() as u64);
+        let mut g = grid(s.screen_state(None, true, p));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !g.lines.iter().any(|l| l.starts_with("done")) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            g = grid(s.screen_state(None, true, p));
+        }
+        assert!(
+            g.lines.iter().any(|l| l.starts_with("done")),
+            "the parser never reached the end of the fixture: {:?}",
+            g.lines
+        );
+        g
+    }
+
+    /// **`get_screen_state` masks a private key on the grid wherever
+    /// `read_output` masks it** (GH #224, GH #243).
+    ///
+    /// Two shapes, and each was a leak on `main` at `a81b02d` measured on
+    /// the real wire:
+    ///
+    /// * **complete, with its header scrolled off the top.** The render
+    ///   never sees `-----BEGIN`, so its own redactor matches nothing and
+    ///   the holdback mask reaches 512 bytes back: 36 of a 4096-bit key's
+    ///   body lines came back raw. The two larger keys here are taller
+    ///   than a 24-row screen, and every key is taller than the 10-row
+    ///   one, so every fixture reaches this arm at some geometry.
+    /// * **cut short** (`head -n 15`), with a prompt after it. Nothing
+    ///   closes the key, so the render matches nothing whether or not the
+    ///   header is on screen; `read_output` masked the body and the grid
+    ///   returned all of it.
+    ///
+    /// **Paired** with what must survive: the command after the key comes
+    /// back verbatim, on every arm. A grid that masked everything below a
+    /// `-----BEGIN` would pass the rest of this row.
+    ///
+    /// **And every other shape in `Key::shapes`**, at one geometry: the
+    /// independent review of GH #242 found the grid showing a pager's
+    /// next screenful of a key raw — 23 body lines under `less` at 24
+    /// rows — on this branch and on `a81b02d` alike, and the same for a
+    /// decorated key a pager cut off.
+    #[test]
+    fn the_grid_masks_a_private_key_that_read_output_masks() {
+        use crate::output::pem::fixtures::KEYS;
+        let p = OutputProcessor::builtin().unwrap();
+        let mut scrolled_off = 0usize;
+        for key in KEYS {
+            let pem = key.pem().replace('\n', "\r\n");
+            let cut: String = pem.split_inclusive('\n').take(15).collect();
+            // A shape, its text, and the geometries it is painted at.
+            type Arm<'a> = (&'a str, String, &'a [(u16, u16)]);
+            let mut shapes: Vec<Arm> = vec![
+                (
+                    "complete",
+                    format!("$ cat k\r\n{pem}$ echo done\r\ndone\r\n$ "),
+                    &[(40, 120), (24, 80), (10, 100)],
+                ),
+                (
+                    "head -n 15",
+                    format!("$ cat k\r\n{cut}$ echo done\r\ndone\r\n$ "),
+                    &[(40, 120), (24, 80), (10, 100)],
+                ),
+            ];
+            for shape in key.shapes() {
+                if !matches!(shape.name, "complete" | "head -n 9") {
+                    shapes.push((shape.name, shape.text, &[(24, 100)]));
+                }
+            }
+            for (shape, text, geometries) in &shapes {
+                for &(rows, cols) in *geometries {
+                    let (s, pty) = key_session(rows, cols);
+                    let g = painted_grid(&s, &pty, text, &p);
+                    let screen = g.lines.join("\n");
+                    scrolled_off += (!screen.contains("-----BEGIN")
+                        && !screen.contains("[REDACTED:private-key]"))
+                        as usize;
+                    assert_eq!(
+                        key.leaked_in(&screen),
+                        None,
+                        "{} {shape} at {rows}x{cols}: {screen}",
+                        key.name
+                    );
+                    assert!(
+                        g.lines.iter().any(|l| l.trim_end() == "$ echo done"),
+                        "{} {shape} at {rows}x{cols}: the next command was masked: {screen}",
+                        key.name
+                    );
+                    // One marker per masked row at most: the two judges
+                    // overlap on a header that is on screen, and a render
+                    // that painted both would print two markers there.
+                    // Except across `bat`'s gutter glyph, which the key
+                    // render does not swap (it swaps printable ASCII, one
+                    // byte for one) and which therefore splits a row's
+                    // mask in two, around a glyph that carries nothing.
+                    assert!(
+                        text.contains('\u{2502}')
+                            || g.lines.iter().all(|l| l.matches("[REDACTED:").count() <= 1),
+                        "{} {shape} at {rows}x{cols}: {screen}",
+                        key.name
+                    );
+                    // The read path agrees, in the same moment.
+                    let r = s.read_processed(&ReadRequest::since(0, 1 << 20), &p);
+                    assert_eq!(key.leaked_in(&r.output), None, "{} {shape}", key.name);
+                    // The key session's own ring is the only reason this
+                    // is not a leak on a fixture shaped differently: the
+                    // row's premise is that the screen really is showing
+                    // part of the key.
+                    assert!(
+                        screen.contains("[REDACTED:"),
+                        "{} {shape} at {rows}x{cols}: nothing of the key is on \
+                         screen, so this arm tests nothing: {screen}",
+                        key.name
+                    );
+                }
+            }
+        }
+        assert!(
+            scrolled_off > 0,
+            "no arm scrolled a header off the screen, which is the case GH #224 reports"
+        );
+    }
+
+    /// **A read collapses a redraw only where the session's own width says
+    /// the line did not wrap** (GH #247, the independent review).
+    ///
+    /// The review's repro, at the session: 150 `W`s and a tail in an
+    /// 80-column session, then `\r\x1b[K`. The line wrapped over two rows
+    /// and the erase cleared only the last, so the grid still shows the
+    /// first 80 `W`s — and the read, which dropped the whole line, showed
+    /// none. At 200 columns the same bytes never wrapped and are dropped,
+    /// which is the half that proves the width reaches the processor at
+    /// all: a read path that passed no width would keep both.
+    #[test]
+    fn a_read_collapses_a_redraw_only_where_the_session_width_says_it_did_not_wrap() {
+        let p = OutputProcessor::builtin().unwrap();
+        let text = format!("{}IMPORTANT-TAIL\r\x1b[Kdone-51\r\n", "W".repeat(150));
+        for (cols, collapsed) in [(80u16, false), (200, true)] {
+            let (s, pty) = key_session(24, cols);
+            pty.queue_output(text.as_bytes());
+            wait_for_bytes(&s, text.len() as u64);
+            let r = s.read_processed(&ReadRequest::since(0, 1 << 20), &p);
+            if collapsed {
+                assert_eq!(r.output, "done-51\r\n", "at {cols} columns");
+            } else {
+                assert_eq!(r.output.matches('W').count(), 150, "at {cols} columns");
+                assert!(r.output.contains("IMPORTANT-TAIL"), "at {cols} columns");
+            }
+        }
+    }
+
+    /// **A key still arriving, with its header scrolled off, is masked on
+    /// the grid** — the in-flight arm of `OutputProcessor::key_regions`,
+    /// which no row reached (the independent review of GH #242: deleting
+    /// that arm left every test green and put 23 body lines on a 24-row
+    /// grid).
+    ///
+    /// `head -n 45 k; sleep 8` of a 4096-bit key: forty-four body lines
+    /// with nothing after them yet. The header has scrolled off, so the
+    /// grid's own candidate walk sees no anchor; the candidate is alive,
+    /// so it is neither a dead one nor followed by body lines. Only the
+    /// in-flight arm names these bytes. The last line is left half
+    /// written, as a key still streaming is, which is also what gives the
+    /// row a cursor position to wait on — the parser is fed after the
+    /// buffer, and a fixture with no sentinel after it has no other.
+    #[test]
+    fn the_grid_masks_a_key_still_arriving_with_its_header_scrolled_off() {
+        use crate::output::pem::fixtures::KEYS;
+        let p = OutputProcessor::builtin().unwrap();
+        for key in KEYS.iter().filter(|k| k.material_lines().len() > 30) {
+            let (rows, cols) = (24u16, 100u16);
+            let pem = key.pem().replace('\n', "\r\n");
+            let lines: Vec<&str> = pem.split_inclusive('\n').collect();
+            // Up to the forty-fifth line, and never the closing boundary.
+            let cut = (lines.len() - 2).min(44);
+            let last = lines[cut].trim_end();
+            let text = format!(
+                "$ head -n 45 k; sleep 8\r\n{}{}",
+                lines[..cut].concat(),
+                &last[..last.len() / 2]
+            );
+            assert!(!text.contains("-----END"), "{}", key.name);
+            let expect = {
+                let mut t = vt100::Parser::new(rows, cols, 0);
+                t.process(text.as_bytes());
+                t.screen().cursor_position()
+            };
+            let (s, pty) = key_session(rows, cols);
+            pty.queue_output(text.as_bytes());
+            wait_for_bytes(&s, text.len() as u64);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut g = grid(s.screen_state(None, true, &p));
+            while (g.cursor_row, g.cursor_col) != expect && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+                g = grid(s.screen_state(None, true, &p));
+            }
+            assert_eq!(
+                (g.cursor_row, g.cursor_col),
+                expect,
+                "{}: the parser never reached the end of the fixture",
+                key.name
+            );
+            let screen = g.lines.join("\n");
+            // The premise: the header is off the screen, so this is the
+            // byte stream's judge and not the grid's own.
+            assert!(!screen.contains("-----BEGIN"), "{}: {screen}", key.name);
+            assert_eq!(key.leaked_in(&screen), None, "{}: {screen}", key.name);
+            assert!(g.held_back, "{}: {screen}", key.name);
+        }
+    }
+
+    /// **The grid judges the key it shows, not only the bytes behind it**
+    /// (GH #224's second judge).
+    ///
+    /// A render is a reconstruction: here a line of junk follows the
+    /// header and is then overwritten by a carriage return, so the screen
+    /// shows the header and the key body contiguous, and every body line
+    /// is painted in two halves with a carriage return and a cursor move
+    /// between them, so the screen shows whole lines. The byte stream
+    /// does not — it carries the junk between header and body, and since
+    /// GH #242 a `-----BEGIN` candidate ends at the first byte that cannot
+    /// be PEM text; and the body lines after it, which `pem::body_lines`
+    /// masks when a line carries a key-body run, carry only half-line runs
+    /// in any stream a read emits. So the stream's judge sees prose after
+    /// a header and nothing to mask — the read path's residual for this
+    /// shape, which takes a program that writes junk into its own key and
+    /// then paints each line of it in pieces. (With the junk alone, and
+    /// whole lines, the stream's judge masks it too, since the review of
+    /// GH #242.) The grid is not left to the stream's answer on it,
+    /// because the grid emits what it renders.
+    #[test]
+    fn the_grid_masks_a_key_whose_stream_was_overwritten_on_screen() {
+        use crate::output::pem::fixtures::KEYS;
+        let p = OutputProcessor::builtin().unwrap();
+        let key = &KEYS[0];
+        let pem = key.pem().replace('\n', "\r\n");
+        let mut lines = pem.split_inclusive('\n');
+        let header = lines.next().unwrap();
+        let body: String = lines
+            .take(12)
+            .map(|l| {
+                let l = l.trim_end();
+                let half = l.len() / 2;
+                format!("{}\r\x1b[{half}C{}\r\n", &l[..half], &l[half..])
+            })
+            .collect();
+        let (s, pty) = key_session(40, 120);
+        let text = format!("$ cat k\r\n{header}JUNK.\r{body}user@host:~$ echo done\r\ndone\r\n$ ");
+        // The premise: the stream judges this candidate dead with nothing
+        // to mask, so the byte-stream judge cannot be what masks it.
+        assert!(
+            p.key_regions(text.as_bytes(), 0).is_empty(),
+            "the stream's judge must see nothing here, or this row tests the other judge"
+        );
+        let g = painted_grid(&s, &pty, &text, &p);
+        let screen = g.lines.join("\n");
+        assert!(
+            !screen.contains("JUNK"),
+            "the fixture must overwrite its junk: {screen}"
+        );
+        assert_eq!(key.leaked_in(&screen), None, "{screen}");
+        assert!(g.held_back, "{screen}");
+        assert!(screen.contains("$ echo done"), "{screen}");
+    }
+
+    /// The negative the row above cannot give: prose that *names* a key
+    /// header costs the grid nothing (GH #242), and a grid with no key on
+    /// it reports `held_back: false`.
+    #[test]
+    fn the_grid_does_not_mask_prose_that_mentions_a_key_header() {
+        let p = OutputProcessor::builtin().unwrap();
+        let (s, pty) = key_session(24, 80);
+        let text = "$ git grep -n BEGIN CHANGELOG.md\r\n\
+            CHANGELOG.md:12: contains `-----BEGIN RSA PRIVATE KEY-----` as prose\r\n\
+            $ printf -- '-----BEGIN RSA PRIVATE KEY-----\\n'\r\n\
+            -----BEGIN RSA PRIVATE KEY-----\r\n\
+            user@host:~$ echo done\r\ndone\r\n$ ";
+        let g = painted_grid(&s, &pty, text, &p);
+        let screen = g.lines.join("\n");
+        assert!(!g.held_back, "{screen}");
+        assert!(!screen.contains("[REDACTED"), "{screen}");
+        assert!(screen.contains("as prose"), "{screen}");
     }
 
     // ---------------------------------------------- geometry bounds (C3)

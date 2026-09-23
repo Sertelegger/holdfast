@@ -86,10 +86,39 @@ pub const UNRESOLVED_KIND: &str = "unresolved";
 /// Find every secret span in `window`, whose first byte is at absolute
 /// offset `window_start`. Spans come back sorted and non-overlapping.
 pub fn find_spans(rules: &RuleSet, window: &[u8], window_start: u64) -> Vec<Span> {
-    let mut spans = Vec::new();
     // The prefilter names the candidate rules in one pass; without it we
     // would run every rule regex over every window.
-    for rule_idx in rules.prefilter.matches(window).into_iter() {
+    find_spans_of(
+        rules,
+        rules.prefilter.matches(window).into_iter(),
+        window,
+        window_start,
+    )
+}
+
+/// [`find_spans`] for the `binary` rules alone — the rules whose one match
+/// can be longer than any lookbehind, and so the only ones worth asking
+/// about bytes behind a read's window (GH #243). No prefilter: the set is
+/// one rule in the shipped file, and its regex opens on a literal the
+/// engine already searches for directly.
+pub fn find_binary_spans(rules: &RuleSet, window: &[u8], window_start: u64) -> Vec<Span> {
+    let binary = rules
+        .rules
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.binary)
+        .map(|(i, _)| i);
+    find_spans_of(rules, binary, window, window_start)
+}
+
+fn find_spans_of(
+    rules: &RuleSet,
+    which: impl Iterator<Item = usize>,
+    window: &[u8],
+    window_start: u64,
+) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for rule_idx in which {
         let rule = &rules.rules[rule_idx];
         if rule.has_value_group {
             // Context rule: redact the value, leave `DD_API_KEY=` visible
