@@ -73,8 +73,8 @@ use holdfast_core::output::{OutputProcessor, ProcessedRead, ReadOptions, WindowS
 /// *value* for a rule with a `value` capture group.
 struct Fixture {
     /// `rule-name#n`, so two positives of one rule count as two fixtures
-    /// — the sweep's headline number is *fixtures*, and 51 rules ship 61
-    /// of them.
+    /// — the sweep's headline number is *fixtures*, not rules, and a rule
+    /// with several positives contributes each of them.
     id: String,
     rule: String,
     text: String,

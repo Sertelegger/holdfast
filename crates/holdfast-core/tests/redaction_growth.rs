@@ -33,9 +33,16 @@ const SHORTEST: &[(&str, &str)] = &[
     // than the `amqp://a:x@` config.rs worked from.
     ("database-connection-password", "amqp://:x@"),
     ("database-connection-password", "amqp://a:x@"),
+    // The value's second branch, which takes a quote the first stops at
+    // and does not run past an `@` — so it tiles with no separator. Its
+    // two-byte floor is what keeps this row under `amqp://:x@`'s; the
+    // next test measures the one-byte spelling it declined.
+    ("database-connection-password", "amqp://:'x@"),
     ("url-userinfo-password", "ws://:x@"),
     ("mysql-cli-password", "mysql -px"),
+    ("mysql-cli-password", "mysql -p'x'"),
     ("registry-login-password", "oras login -p x"),
+    ("registry-login-password", "oras login -px"),
     ("basic-authorization", "authorization basic abcd"),
     ("generic-secret-assignment", "x_pwd=12345678"),
     ("secret-key-assignment", "app_key=12345678"),
@@ -136,5 +143,56 @@ negative = ["ws://x"]
     eprintln!(
         "url-userinfo-password tiled: whole match {as_shipped:.3}x, value group \
          {as_value_group:.3}x, shipped worst {shipped_worst:.3}x"
+    );
+}
+
+/// **Why the connection string's quote-bearing branch needs two bytes.**
+/// That branch (`a81b02d`'s value class, restored by review of GH #244 so
+/// a password with a `'` in it is redacted again) cannot run past an
+/// `@`, so `amqp://:'@` tiles back to back with no separator. With a
+/// one-byte floor each ten-byte tile would keep nine bytes and gain a
+/// marker — past every shipped worst case above. Measured both ways: the
+/// shipped rule does not match that tile at all, and the one-byte
+/// spelling grows more than anything the shipped set can.
+#[test]
+fn the_connection_string_quote_branch_needs_two_bytes_to_stay_inside_the_bound() {
+    let shipped = RuleSet::builtin().unwrap();
+    let one_byte = RuleSet::builtin_with_extra(
+        r#"
+[[rule]]
+name = "database-connection-password"
+kind = "connection-string"
+pattern = '''\b(?:postgres(?:ql)?|mysql|mariadb|mssql|sqlserver|oracle|cockroachdb|clickhouse|snowflake|mongodb|rediss?|valkeys?|amqps?|neo4j|bolt)(?:\+[A-Za-z0-9_]+)*://[^:@/\s]*:(?P<value>[^\s"'`]+|[^@/\s]+)@'''
+prefixes = ["amqp://"]
+positive = ["amqp://:'@"]
+negative = ["amqp://x"]
+"#,
+    )
+    .unwrap();
+
+    let tile = "amqp://:'@";
+    assert_eq!(
+        redact_str(&shipped, tile),
+        tile,
+        "the shipped rule must not match a one-byte quote password"
+    );
+    let as_one_byte = growth(&one_byte, tile, "");
+    let shipped_ref = &shipped;
+    let shipped_worst = SHORTEST
+        .iter()
+        .flat_map(|(_, unit)| {
+            SEPARATORS
+                .iter()
+                .map(move |sep| growth(shipped_ref, unit, sep))
+        })
+        .fold(0.0f64, f64::max);
+    assert!(
+        as_one_byte > shipped_worst,
+        "the one-byte spelling ({as_one_byte:.3}x) must be past every shipped worst \
+         case ({shipped_worst:.3}x), or the two-byte floor is not what keeps the bound"
+    );
+    eprintln!(
+        "connection string tiled {tile:?}: one-byte branch {as_one_byte:.3}x, shipped \
+         worst {shipped_worst:.3}x"
     );
 }

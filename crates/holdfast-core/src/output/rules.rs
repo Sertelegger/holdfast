@@ -1789,11 +1789,15 @@ mod tests {
                 "openai-api-key",
                 "pubkeyacceptedalgorithms sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com",
             ),
-            // GH #244: English after `Basic`, refused for its length.
+            // GH #244: English after `Basic`, refused for its length —
+            // one row per residue a length that is not a multiple of four
+            // can leave (14, 5 and 7 bytes).
             (
                 "basic-authorization",
                 "Authorization: Basic authentication is required",
             ),
+            ("basic-authorization", "Authorization: Basic realm"),
+            ("basic-authorization", "Authorization: Basic invalid"),
             (
                 "secret-key-assignment",
                 "pub session_key: Option<SessionKey>,",
@@ -1813,9 +1817,18 @@ mod tests {
                 "generic-secret-assignment",
                 "let cancellation_token = cancellation_token.clone();",
             ),
-            // GH #245: the two code shapes the refusal gained.
+            // GH #245: the two code shapes the refusal gained, then each
+            // with the `&` or `*` that may lead it.
             ("generic-secret-assignment", "pub paren_token: token::Paren,"),
             ("generic-secret-assignment", "semi_token: node.semi_token,"),
+            (
+                "generic-secret-assignment",
+                "token: &notification.progress_token,",
+            ),
+            (
+                "generic-secret-assignment",
+                "let secret = *config::DEFAULT_SECRET;",
+            ),
         ];
         let set = RuleSet::builtin().unwrap();
         let mut held: Vec<(&str, &str)> = Vec::new();

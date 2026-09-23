@@ -428,17 +428,74 @@ fn read_output_of_the_whole_env_file_redacts_every_row_and_nothing_else() {
 ///
 /// The index entries that make this hold are chosen so their prefix ends
 /// where the credential begins — `authorization: basic `, `mysql `,
-/// `https://x-access-token:` — which is why these four spellings and not
-/// every spelling of each rule. The rest is the next test.
+/// `https://x-access-token:` — which is why these spellings and not
+/// every spelling of each rule. The rest is the next tests.
+///
+/// **`basic-authorization` and `database-connection-password` get one row
+/// per index entry**, because each entry is a separate spelling that is
+/// held or not on its own: a review of GH #244 found every Basic spelling
+/// but the canonical header released while arriving (the rule had one
+/// entry), and deleting a scheme's entry (`rediss://`, `postgresql+`) went
+/// unnoticed by every test. [`every_index_entry_of_those_two_rules_has_a_row`]
+/// is what keeps a new entry from arriving without one.
+const ARRIVING: &[(&str, &str)] = &[
+    // basic-authorization, one row per index entry.
+    ("> Authorization: Basic ", BASIC_SECRET),
+    ("curl -H 'Authorization:Basic ", BASIC_SECRET),
+    ("authorization: \"Basic ", BASIC_SECRET),
+    ("authorization: 'Basic ", BASIC_SECRET),
+    ("{\"Authorization\": \"Basic ", BASIC_SECRET),
+    ("{\"Authorization\":\"Basic ", BASIC_SECRET),
+    ("{'Authorization': 'Basic ", BASIC_SECRET),
+    ("{'Authorization':'Basic ", BASIC_SECRET),
+    ("proxy_set_header Authorization \"Basic ", BASIC_SECRET),
+    ("AUTHORIZATION=Basic ", BASIC_SECRET),
+    ("authorization = \"Basic ", BASIC_SECRET),
+    ("authorization = 'Basic ", BASIC_SECRET),
+    // database-connection-password, one row per index entry.
+    ("URL=postgres://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=postgresql://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=postgresql+asyncpg://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=mysql://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=mysql+pymysql://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=mariadb://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=mariadb+mariadbconnector://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=mssql://sa:", "Zq7Pw9xLk2Mv"),
+    ("URL=mssql+pyodbc://sa:", "Zq7Pw9xLk2Mv"),
+    ("URL=sqlserver://sa:", "Zq7Pw9xLk2Mv"),
+    ("URL=oracle://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=oracle+oracledb://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=cockroachdb://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=cockroachdb+psycopg://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=clickhouse://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=clickhouse+native://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=snowflake://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=mongodb://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=mongodb+srv://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=redis://:", "Zq7Pw9xLk2Mv"),
+    ("URL=rediss://default:", "Zq7Pw9xLk2Mv"),
+    ("URL=redis+sentinel://:", "Zq7Pw9xLk2Mv"),
+    ("URL=valkey://:", "Zq7Pw9xLk2Mv"),
+    ("URL=valkeys://default:", "Zq7Pw9xLk2Mv"),
+    ("URL=amqp://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=amqps://app:", "Zq7Pw9xLk2Mv"),
+    ("URL=neo4j://neo4j:", "Zq7Pw9xLk2Mv"),
+    ("URL=neo4j+s://neo4j:", "Zq7Pw9xLk2Mv"),
+    ("URL=bolt://neo4j:", "Zq7Pw9xLk2Mv"),
+    ("URL=bolt+s://neo4j:", "Zq7Pw9xLk2Mv"),
+    // One row each for the other rules that hold a credential arriving.
+    ("git clone https://x-access-token:", "Zq7Pw9xLk2Mv"),
+    ("$ mysql -p", "Zq7Pw9xLk2Mv"),
+    ("DB_PASS=", "Zq7Pw9xLk2Mv"),
+];
+
+/// `admin:Zq7Pw9xLk2Mv`, in RFC 4648 base64.
+const BASIC_SECRET: &str = "YWRtaW46WnE3UHc5eExrMk12";
+
 #[test]
 fn no_byte_of_a_credential_still_arriving_is_handed_out_raw() {
     let processor = OutputProcessor::builtin().unwrap();
-    for (context, secret) in [
-        ("> Authorization: Basic ", "YWRtaW46WnE3UHc5eExrMk12"),
-        ("git clone https://x-access-token:", "Zq7Pw9xLk2Mv"),
-        ("$ mysql -p", "Zq7Pw9xLk2Mv"),
-        ("DB_PASS=", "Zq7Pw9xLk2Mv"),
-    ] {
+    for (context, secret) in ARRIVING {
         assert!(
             !context.contains(&secret[..1]),
             "fixture error: the context must not contain the secret's first byte"
@@ -456,6 +513,242 @@ fn no_byte_of_a_credential_still_arriving_is_handed_out_raw() {
             );
         }
     }
+}
+
+/// **The table above is complete for the two rules it enumerates.** An
+/// index entry is a spelling the rule promises to hold while it arrives;
+/// one added to the rule file without a row here is a promise nothing
+/// checks. Matching is ASCII-case-insensitive, as the index's is.
+#[test]
+fn every_index_entry_of_those_two_rules_has_a_row() {
+    let rules = builtin();
+    let contexts: Vec<String> = ARRIVING
+        .iter()
+        .map(|(c, _)| c.to_ascii_lowercase())
+        .collect();
+    for name in ["basic-authorization", "database-connection-password"] {
+        let rule = rules.rules.iter().find(|r| r.name == name).unwrap();
+        let declared = rule
+            .declared_prefixes
+            .as_ref()
+            .unwrap_or_else(|| panic!("`{name}` must declare its index entries"));
+        assert!(
+            declared.len() > 1,
+            "`{name}` has one entry; this test measures nothing"
+        );
+        for prefix in declared {
+            let prefix = String::from_utf8(prefix.clone()).unwrap();
+            assert!(
+                contexts.iter().any(|c| c.contains(&prefix)),
+                "`{name}` indexes {prefix:?} and no row of ARRIVING exercises it"
+            );
+        }
+    }
+}
+
+/// **A Basic spelling with no index entry of its own: what has arrived
+/// may go out, and the refusal is what bounds how much.**
+///
+/// The index holds a header spelling only if it is listed, and whitespace
+/// makes the spellings unbounded — two spaces, a tab. There, a value still
+/// arriving is released unless `find_spans` covers it, and a refusal that
+/// declines the partial value hands it out raw. With a length-only refusal
+/// that was three reads in four, up to every byte but the last (found by
+/// review of GH #244); refusing only an all-lower-case word leaves the
+/// value floor, the three bytes before `{4,}` is a match. Both surfaces
+/// that release from a buffer head are driven: `read_output`'s and the
+/// live stream `attach` and `watch` use.
+///
+/// The arm pins both halves: the floor leak exists (so each spelling
+/// really is unindexed and the bound is not satisfied vacuously by a
+/// hold), and nothing past it does. The control is `b4f935e`'s
+/// length-only refusal, under which every spelling here handed out far
+/// more.
+#[test]
+fn an_unindexed_basic_spelling_hands_out_no_more_than_the_value_floor() {
+    use holdfast_core::attach::StreamRedactor;
+    use std::sync::Arc;
+    const FLOOR: usize = 3;
+    let processor = Arc::new(OutputProcessor::builtin().unwrap());
+    let control = Arc::new(OutputProcessor::new(
+        Arc::new(before_review()),
+        processor.audit.clone(),
+        processor.limits,
+    ));
+    let longest_raw_run = |out: &str, arrived: &str| {
+        (1..=arrived.len())
+            .rev()
+            .find(|&k| out.contains(&arrived[..k]))
+            .unwrap_or(0)
+    };
+    // The widest raw run any read or stream hands out while the value
+    // arrives after `context`.
+    let widest = |processor: &Arc<OutputProcessor>, context: &str| {
+        let full = format!("{context}{BASIC_SECRET}");
+        (context.len() + 1..=full.len())
+            .map(|take| {
+                let arrived = &full[context.len()..take];
+                let r = read(processor, &full.as_bytes()[..take]);
+                let mut stream = StreamRedactor::new(Arc::clone(processor));
+                let streamed = stream.feed(&full.as_bytes()[..take]);
+                let streamed = String::from_utf8_lossy(&streamed);
+                longest_raw_run(&r.output, arrived).max(longest_raw_run(&streamed, arrived))
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    for context in [
+        "> Authorization:  Basic ",
+        "Authorization:\tBasic ",
+        "Authorization: Basic  ",
+        "authorization=\"Basic ",
+    ] {
+        assert!(!context.contains(&BASIC_SECRET[..1]), "fixture error");
+        assert_eq!(
+            widest(&processor, context),
+            FLOOR,
+            "{context:?}: a Basic value still arriving on an unindexed spelling must \
+             hand out the value floor — more is a leak, less means an index entry \
+             holds this spelling and the row does not measure the refusal"
+        );
+        assert!(
+            widest(&control, context) > FLOOR,
+            "{context:?}: the length-only control must hand out more than the floor, \
+             or this row is not evidence about the refusal"
+        );
+    }
+}
+
+/// **The property the refusal's `[a-z]` half rests on, measured rather
+/// than argued: a partial Basic value it refuses never decodes past the
+/// user name and its colon.** A refused partial is one that may be handed
+/// out raw while it arrives (the test above), so if it ever reached the
+/// password's bytes the refusal would be a leak by construction.
+///
+/// Base64 of `user:` reaches an upper-case letter or a digit before the
+/// password in practice — the colon itself encodes to `O` or `6` in two of
+/// its three positions — but not by any law, so this sweeps common
+/// service-account names against dictionary and generated passwords and
+/// every partial length of each. Allowing digits in the refusal fails
+/// here (`nginx:` encodes to `bmdpbng6`).
+#[test]
+fn a_refused_basic_partial_never_decodes_into_the_password() {
+    use base64::Engine as _;
+    let rules = builtin();
+    let rule = rules
+        .rules
+        .iter()
+        .find(|r| r.name == "basic-authorization")
+        .unwrap();
+    let users = [
+        "admin",
+        "root",
+        "user",
+        "ubuntu",
+        "postgres",
+        "elastic",
+        "git",
+        "api",
+        "oauth2",
+        "deploy",
+        "ci",
+        "jenkins",
+        "test",
+        "guest",
+        "service",
+        "svc",
+        "bot",
+        "apikey",
+        "token",
+        "alice",
+        "bob",
+        "dev",
+        "build",
+        "myuser",
+        "username",
+        "mongo",
+        "redis",
+        "rabbitmq",
+        "oracle",
+        "sa",
+        "web",
+        "www-data",
+        "nginx",
+        "app",
+        "kibana",
+        "grafana",
+        "minio",
+        "registry",
+        "docker",
+        "runner",
+        "backup",
+        "monitor",
+        "zabbix",
+        "ftp",
+        "x-access-token",
+        "gitlab-ci-token",
+    ];
+    let mut passwords: Vec<String> = [
+        "password",
+        "sunshine",
+        "letmein",
+        "dragon",
+        "monkey",
+        "football",
+        "iloveyou",
+        "whatever",
+        "trustno1",
+        "changeme",
+        "correcthorsebatterystaple",
+        "hunter2",
+        "welcome",
+        "shadow",
+        "Tr0ub4dor&3",
+        "Zq7Pw9xLk2Mv",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // Generated passwords from a fixed LCG, so the sweep is deterministic.
+    let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#%&*";
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    for _ in 0..400 {
+        let len = 8 + (state % 17) as usize;
+        let pw: String = (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                alphabet[(state >> 33) as usize % alphabet.len()] as char
+            })
+            .collect();
+        passwords.push(pw);
+    }
+    let mut refused_partials = 0usize;
+    for user in users {
+        for pw in &passwords {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pw}"));
+            for k in 1..=b64.len() {
+                if rule.value_admissible(&b64.as_bytes()[..k]) {
+                    continue;
+                }
+                refused_partials += 1;
+                let decoded = k * 6 / 8;
+                assert!(
+                    decoded <= user.len() + 1,
+                    "the refusal declines {:?}, the first {k} bytes of {user}:{pw}'s \
+                     base64, which decode {decoded} bytes — past the user name and \
+                     colon ({}) into the password",
+                    &b64[..k],
+                    user.len() + 1
+                );
+            }
+        }
+    }
+    assert!(
+        refused_partials > 0,
+        "no partial was refused, so this measured nothing about the refusal"
+    );
 }
 
 /// **REQ-TST-006: the spellings the holdback does *not* reach, stated.**
@@ -519,5 +812,396 @@ fn ordinary_command_heads_are_not_held_back() {
                 r.output
             );
         }
+    }
+}
+
+// ------------------------------------------------- the review of #244
+
+/// **The four rules a review of GH #244 changed, exactly as the branch had
+/// them before it** (`b4f935e`). Spelled out, never derived, for the same
+/// reason as [`BEFORE_244`]: a control that moves with the thing it
+/// controls controls nothing.
+const BEFORE_REVIEW: &str = r#"
+[[rule]]
+name = "database-connection-password"
+kind = "connection-string"
+pattern = '''\b(?:postgres(?:ql)?|mysql|mariadb|mssql|sqlserver|oracle|cockroachdb|clickhouse|snowflake|mongodb|rediss?|valkeys?|amqps?|neo4j|bolt)(?:\+[A-Za-z0-9_]+)*://[^:@/\s]*:(?P<value>[^\s"'`]+)@'''
+prefixes = ["postgres://", "postgresql://", "postgresql+", "mysql://", "mysql+", "mariadb://", "mariadb+", "mssql://", "mssql+", "sqlserver://", "oracle://", "oracle+", "cockroachdb://", "cockroachdb+", "clickhouse://", "clickhouse+", "snowflake://", "mongodb://", "mongodb+", "redis://", "rediss://", "redis+", "valkey://", "valkeys://", "amqp://", "amqps://", "neo4j://", "neo4j+", "bolt://", "bolt+"]
+positive = ["postgresql://svc:hunter2GOESHERE@db.internal:5432/app"]
+negative = ["postgresql://db.internal:5432/app"]
+
+[[rule]]
+name = "basic-authorization"
+kind = "basic-auth"
+pattern = '''(?i)\bauthorization\b["']?[ \t]*[:=]?[ \t]*["']?basic[ \t]+(?P<value>[A-Za-z0-9+/]{4,}={0,2})'''
+prefixes = ["authorization: basic "]
+value_must_not_match = '''(?:[A-Za-z0-9+/=]{4})*[A-Za-z0-9+/=]{1,3}'''
+positive = ["Authorization: Basic dXNlcjpodW50ZXIyR09FU0hFUkU="]
+negative = ["Authorization: Basic authentication is required"]
+
+[[rule]]
+name = "mysql-cli-password"
+kind = "cli-password"
+pattern = '''\b(?:mysql|mariadb)[a-z-]*\b[^\r\n|;&]*?[ \t]-p["']?(?P<value>[^\s"'`;|&<>]+)'''
+prefixes = ["mysql ", "mariadb "]
+positive = ["mysql -u root -phunter2GOESHERE app"]
+negative = ["mysql -u root -p app"]
+
+[[rule]]
+name = "registry-login-password"
+kind = "cli-password"
+pattern = '''\b(?:docker|podman|nerdctl|buildah|skopeo|oras|helm[ \t]+registry)[ \t]+login\b[^\r\n|;&]*?[ \t](?:-p|--password)(?:[ \t]+|=)["']?(?P<value>[^\s"'`;|&<>]+)'''
+prefixes = ["docker login", "podman login", "nerdctl login", "buildah login", "skopeo login", "oras login", "helm registry"]
+positive = ["docker login -u ci -p hunter2GOESHERE registry.example.com"]
+negative = ["docker login -u ci registry.example.com"]
+"#;
+
+fn before_review() -> RuleSet {
+    RuleSet::builtin_with_extra(BEFORE_REVIEW).expect("the b4f935e control compiles")
+}
+
+/// One spelling whose **whole** secret must go under a marker, the kind
+/// that marker must be, and whether `b4f935e` let some of it through.
+struct WholeRow {
+    text: &'static str,
+    secret: &'static str,
+    kind: &'static str,
+    leaked_before_review: bool,
+}
+
+/// **Rows where part of a password came back, and rows that pin a
+/// password's inside.** The first group is what the review found: a quote
+/// or a backtick in a connection string's password (redacted at `a81b02d`,
+/// raw at `b4f935e`), a quoted command-line password carrying a byte an
+/// unquoted shell word stops at, and `docker login`'s attached `-p<pw>`.
+/// The second group leaked nothing at `b4f935e` and is here because
+/// nothing asserted it: a password with an `@` in it, a `-p=` flag.
+///
+/// **Asserted on every four-byte run of the secret, not on the secret
+/// whole.** A rule that stops at the `&` of `Xk9#mP&2qLzQ` changes the
+/// output and removes the full secret from it, and still hands out
+/// `&2qLzQ` — which `contains(secret)` cannot see and which is exactly the
+/// defect.
+const WHOLE_SECRET: &[WholeRow] = &[
+    WholeRow {
+        text: "DATABASE_URL=postgres://app:Pa'ss9word@db/app",
+        secret: "Pa'ss9word",
+        kind: "connection-string",
+        leaked_before_review: true,
+    },
+    WholeRow {
+        text: "DATABASE_URL=postgres://app:Pa\"ss9word@db/app",
+        secret: "Pa\"ss9word",
+        kind: "connection-string",
+        leaked_before_review: true,
+    },
+    WholeRow {
+        text: "DATABASE_URL=postgres://app:Pa`ss9word@db/app",
+        secret: "Pa`ss9word",
+        kind: "connection-string",
+        leaked_before_review: true,
+    },
+    WholeRow {
+        text: "MONGO_URL=mongodb://app:Pa'ss9word@db/app",
+        secret: "Pa'ss9word",
+        kind: "connection-string",
+        leaked_before_review: true,
+    },
+    WholeRow {
+        text: "$ mysql -u root -p'Xk9#mP&2qLzQ' app",
+        secret: "Xk9#mP&2qLzQ",
+        kind: "cli-password",
+        leaked_before_review: true,
+    },
+    WholeRow {
+        text: "$ mysql -u root -p\"Xk9|mP;2qLzQ\" app",
+        secret: "Xk9|mP;2qLzQ",
+        kind: "cli-password",
+        leaked_before_review: true,
+    },
+    WholeRow {
+        text: "$ mysqldump -uroot -p'ab<cd>ef12gh' app > dump.sql",
+        secret: "ab<cd>ef12gh",
+        kind: "cli-password",
+        leaked_before_review: true,
+    },
+    WholeRow {
+        text: "$ mysql -u root -p'correct horse battery' app",
+        secret: "correct horse battery",
+        kind: "cli-password",
+        leaked_before_review: true,
+    },
+    WholeRow {
+        text: "$ docker login -u ci -p 'Xk9#mP&2qLzQ' ghcr.io",
+        secret: "Xk9#mP&2qLzQ",
+        kind: "cli-password",
+        leaked_before_review: true,
+    },
+    WholeRow {
+        text: "$ docker login -u ci --password \"Xk9;mP2qLzQ\" ghcr.io",
+        secret: "Xk9;mP2qLzQ",
+        kind: "cli-password",
+        leaked_before_review: true,
+    },
+    WholeRow {
+        text: "$ docker login -u ci -pXk9mP2qLzQ ghcr.io",
+        secret: "Xk9mP2qLzQ",
+        kind: "cli-password",
+        leaked_before_review: true,
+    },
+    // Held at `b4f935e`, asserted by nothing.
+    WholeRow {
+        text: "$ docker login -u ci -p=Xk9mP2qLzQ ghcr.io",
+        secret: "Xk9mP2qLzQ",
+        kind: "cli-password",
+        leaked_before_review: false,
+    },
+    WholeRow {
+        text: "curl https://deploy:Zq7P@w9xLk2Mv@internal.example.com/api",
+        secret: "Zq7P@w9xLk2Mv",
+        kind: "url-password",
+        leaked_before_review: false,
+    },
+    WholeRow {
+        text: "REDIS_URL=redis://:Zq7P@w9xLk2Mv@cache:6379/0",
+        secret: "Zq7P@w9xLk2Mv",
+        kind: "connection-string",
+        leaked_before_review: false,
+    },
+    WholeRow {
+        text: "SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://app:Zq7P/w9xLk2Mv@db/app",
+        secret: "Zq7P/w9xLk2Mv",
+        kind: "connection-string",
+        leaked_before_review: false,
+    },
+];
+
+/// The first four-byte run of `secret` that is visible in `out`, if any.
+fn surviving_run<'a>(out: &str, secret: &'a str) -> Option<&'a str> {
+    (0..=secret.len().saturating_sub(4))
+        .map(|i| &secret[i..i + 4])
+        .find(|run| out.contains(run))
+}
+
+#[test]
+fn no_run_of_a_whole_secret_row_survives_redaction() {
+    not_vacuous(WHOLE_SECRET, 15, "WHOLE_SECRET");
+    let rules = builtin();
+    let processor = OutputProcessor::builtin().unwrap();
+    let mut leaked = Vec::new();
+    for row in WHOLE_SECRET {
+        let context = row.text.replacen(row.secret, "", 1);
+        assert!(
+            row.text.contains(row.secret) && surviving_run(&context, row.secret).is_none(),
+            "fixture error: {:?} must contain its secret, and no run of the secret may \
+             occur in the text around it",
+            row.text
+        );
+        let spans = find_spans(&rules, row.text.as_bytes(), 0);
+        let kinds: Vec<&str> = spans
+            .iter()
+            .map(|s| rules.rules[s.rule].kind.as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![row.kind],
+            "{:?} must carry one `{}` marker",
+            row.text,
+            row.kind
+        );
+
+        let direct = redact_str(&rules, row.text);
+        let source = format!("{}{TAIL}", row.text);
+        let read_back = read(&processor, source.as_bytes()).output;
+        for (surface, out) in [("redact_str", &direct), ("read_output", &read_back)] {
+            if let Some(run) = surviving_run(out, row.secret) {
+                leaked.push(format!(
+                    "{surface}: {:?} -> {out:?} still shows {run:?}",
+                    row.text
+                ));
+            }
+        }
+    }
+    assert!(leaked.is_empty(), "{}", leaked.join("\n"));
+}
+
+/// **Control: the first group leaked at `b4f935e`**, so each row is
+/// evidence about this change and not about one before it. The second
+/// group did not, and is asserted not to — it is a pin, and saying so is
+/// what keeps it from being read as a fix.
+#[test]
+fn the_rows_the_review_found_leaked_before_it() {
+    let before = before_review();
+    for row in WHOLE_SECRET {
+        let out = redact_str(&before, row.text);
+        assert_eq!(
+            surviving_run(&out, row.secret).is_some(),
+            row.leaked_before_review,
+            "{:?} under b4f935e came back {out:?}; `leaked_before_review` says {}",
+            row.text,
+            row.leaked_before_review
+        );
+    }
+}
+
+/// **Every scheme each URL rule names is reached, one row apiece.** The
+/// scheme lists are alternations, so deleting one leaves every other
+/// row green; `neo4j`, `socks5h`, `ldaps` and friends had no positive
+/// fixture and could go without a test noticing. `+driver` spellings are
+/// here too, because that suffix is its own part of the pattern. The
+/// table is written out rather than read from the pattern, so it cannot
+/// shrink with it.
+#[test]
+fn every_scheme_the_two_url_rules_name_is_redacted() {
+    const SECRET: &str = "Zq7Pw9xLk2Mv";
+    let db = [
+        "postgres",
+        "postgresql",
+        "postgresql+psycopg2",
+        "mysql",
+        "mysql+pymysql",
+        "mariadb",
+        "mssql",
+        "mssql+pyodbc",
+        "sqlserver",
+        "oracle",
+        "cockroachdb",
+        "clickhouse",
+        "snowflake",
+        "mongodb",
+        "mongodb+srv",
+        "redis",
+        "rediss",
+        "valkey",
+        "valkeys",
+        "amqp",
+        "amqps",
+        "neo4j",
+        "neo4j+s",
+        "bolt",
+        "bolt+s",
+    ];
+    let url = [
+        "http",
+        "https",
+        "ftp",
+        "ftps",
+        "ssh",
+        "git",
+        "git+ssh",
+        "git+http",
+        "git+https",
+        "svn",
+        "svn+ssh",
+        "ws",
+        "wss",
+        "smtp",
+        "smtps",
+        "imap",
+        "imaps",
+        "pop3",
+        "pop3s",
+        "ldap",
+        "ldaps",
+        "mqtt",
+        "mqtts",
+        "nats",
+        "socks4",
+        "socks4a",
+        "socks5",
+        "socks5h",
+        "rtsp",
+        "rtsps",
+        "rtmp",
+        "rtmps",
+    ];
+    let rules = builtin();
+    let mut missed = Vec::new();
+    for (schemes, rule) in [
+        (&db[..], "database-connection-password"),
+        (&url[..], "url-userinfo-password"),
+    ] {
+        for scheme in schemes {
+            let text = format!("{scheme}://svc:{SECRET}@host.example/x");
+            let names: Vec<String> = find_spans(&rules, text.as_bytes(), 0)
+                .into_iter()
+                .map(|s| rules.rules[s.rule].name.clone())
+                .collect();
+            let out = redact_str(&rules, &text);
+            if names != vec![rule.to_string()] || out.contains(SECRET) {
+                missed.push(format!("{text:?} -> {out:?} by {names:?}, want `{rule}`"));
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{}", missed.join("\n"));
+}
+
+/// **A quoted password runs to its closing quote on its own line, and no
+/// further.** Without the line guard a `-p'…` whose closing quote never
+/// arrives — `ps` cuts a long command line at the terminal's width — ran on
+/// to the next quote anywhere below it, taking the lines between with it.
+/// The first line's value is still covered, by the unquoted branch, as far
+/// as it goes.
+#[test]
+fn a_quoted_password_does_not_run_past_its_line() {
+    let rules = builtin();
+    for (first, next) in [
+        (
+            "root      4242  mysql -u root -p'Xk9mP2qLzQ",
+            "root      4243  sh -c 'sleep 5; echo done'",
+        ),
+        (
+            "ci        4244  docker login -u ci -p \"Xk9mP2qLzQ",
+            "ci        4245  sh -c \"echo ready\"",
+        ),
+    ] {
+        let text = format!("{first}\n{next}");
+        let out = redact_str(&rules, &text);
+        assert!(
+            out.ends_with(&format!("\n{next}")),
+            "the line after an unterminated quote was altered: {out:?}"
+        );
+        assert!(
+            surviving_run(&out, "Xk9mP2qLzQ").is_none(),
+            "the first line's password must still be covered: {out:?}"
+        );
+    }
+}
+
+/// **Where the marker goes, for each spelling of the registry flag.** The
+/// flag and its `=` stay visible and only the password is replaced — so a
+/// reader can see which argument was withheld. Attached `-p<pw>` subsumes
+/// `-p=<pw>` as a *match*, with the `=` inside the value; this pins that the
+/// `=` is read as the separator it is.
+#[test]
+fn each_registry_flag_spelling_keeps_its_flag_visible() {
+    let rules = builtin();
+    for (text, want) in [
+        (
+            "docker login -u ci -p Xk9mP2qLzQ ghcr.io",
+            "docker login -u ci -p [REDACTED:cli-password] ghcr.io",
+        ),
+        (
+            "docker login -u ci -pXk9mP2qLzQ ghcr.io",
+            "docker login -u ci -p[REDACTED:cli-password] ghcr.io",
+        ),
+        (
+            "docker login -u ci -p=Xk9mP2qLzQ ghcr.io",
+            "docker login -u ci -p=[REDACTED:cli-password] ghcr.io",
+        ),
+        (
+            "docker login -u ci --password=Xk9mP2qLzQ ghcr.io",
+            "docker login -u ci --password=[REDACTED:cli-password] ghcr.io",
+        ),
+        (
+            "docker login -u ci -p 'Xk9#mP&2qLzQ' ghcr.io",
+            "docker login -u ci -p [REDACTED:cli-password] ghcr.io",
+        ),
+        (
+            "mysql -u root -p'Xk9#mP&2qLzQ' app",
+            "mysql -u root -p[REDACTED:cli-password] app",
+        ),
+    ] {
+        assert_eq!(redact_str(&rules, text), want, "{text:?}");
     }
 }

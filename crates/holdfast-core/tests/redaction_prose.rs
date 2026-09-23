@@ -1151,7 +1151,8 @@ fn read_output_returns_value_side_source_unaltered_and_reports_nothing() {
 /// `a81b02d` shipped them** — `\s*` after the separator, `\s+` after
 /// `bearer`, and #202's one-branch refusal — and `openai-api-key` with no
 /// refusal at all. Spelled out, never derived, so the control cannot move
-/// with the thing it controls.
+/// with the thing it controls. Every pattern is `a81b02d`'s verbatim, and
+/// so is every example beside it.
 const BEFORE_245: &str = r#"
 [[rule]]
 name = "openai-api-key"
@@ -1185,9 +1186,47 @@ prefixes = ["password", "passwd", "secret", "apikey", "api_key", "api-key", "acc
 value_must_not_match = '''[^0-9]*[(<>\[\]{}|\\`][^0-9]*'''
 positive = ["export DB_PASSWORD=hunter2hunter2"]
 negative = ["password: short"]
+
+[[rule]]
+name = "aws-secret-access-key"
+kind = "aws"
+pattern = '''(?i)aws_secret_access_key["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9/+=]{40})'''
+positive = ["AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY01"]
+negative = ["AWS_SECRET_ACCESS_KEY=short"]
+
+[[rule]]
+name = "cloudflare-api-token"
+kind = "cloudflare"
+pattern = '''(?i)\bcloudflare[a-z0-9_.-]{0,24}(?:token|key|secret)\b["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9_.-]{20,})'''
+positive = ["CLOUDFLARE_API_TOKEN=0123456789abcdefghij0123456789abcdefghij"]
+negative = ["CLOUDFLARE_ACCOUNT_ID=0123"]
+
+[[rule]]
+name = "railway-token"
+kind = "railway"
+pattern = '''(?i)\brailway[a-z0-9_.-]{0,24}(?:token|key|secret)\b["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9_.-]{16,})'''
+positive = ["RAILWAY_TOKEN=0123abcd-4567-89ef-0123-456789abcdef"]
+negative = ["RAILWAY_TOKEN="]
+
+[[rule]]
+name = "powersync-token"
+kind = "powersync"
+pattern = '''(?i)\bpowersync[a-z0-9_.-]{0,24}(?:token|key|secret|password)\b["'\s]*[:=]\s*["']?(?P<value>[^\s"';,)]{8,})'''
+positive = ["export POWERSYNC_DEV_TOKEN='abcdef0123456789'"]
+negative = ["POWERSYNC_TOKEN="]
+
+[[rule]]
+name = "datadog-api-key"
+kind = "datadog"
+pattern = '''(?i)dd_api_key["'\s]*[:=]\s*["']?(?P<value>[a-f0-9]{32})'''
+positive = ["DD_API_KEY=0123456789abcdef0123456789abcdef"]
+negative = ["DD_API_KEY=nothex"]
 "#;
 
-/// `a81b02d` for the four rules GH #245 touched — see [`BEFORE_245`].
+/// `a81b02d` for the rules GH #245 touched — see [`BEFORE_245`]. The five
+/// vendor-keyed label rules are in it because GH #245 changed their
+/// separator too, and without them in the control a revert of any one of
+/// those separators went unnoticed (found by review).
 fn before_245() -> RuleSet {
     RuleSet::builtin_with_extra(BEFORE_245).expect("the a81b02d control compiles")
 }
@@ -1249,6 +1288,75 @@ fn before_gh_245_every_cross_line_row_lost_a_word_on_its_second_line() {
             spans.iter().any(|s| s.start as usize > first_break),
             "the control must redact something past the line break in {row:?}, or \
              the row proves nothing about the separator: {spans:?}"
+        );
+    }
+}
+
+/// **Every label-keyed rule carries the separator, one row apiece.** The
+/// rows above reach only `generic-secret-assignment` and
+/// `bearer-authorization`, and the separator is spelled out in each rule
+/// separately — so a review of GH #245 reverted it on `aws`, `datadog`,
+/// `cloudflare`, `railway` and `powersync` and nothing went red. Each row
+/// here is a label ending one line and a next line that happens to fit that
+/// rule's value class — once after a `:`, once after an `=` into a line
+/// that is not indented — and each must be left alone, where the control
+/// redacted it by the rule the row names.
+#[test]
+fn every_vendor_label_rule_stops_at_the_end_of_its_line() {
+    let (rules, before) = (builtin(), before_245());
+    for (row, rule) in [
+        (
+            "aws_secret_access_key:\n3f1c2a9b8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a refs/heads/main",
+            "aws-secret-access-key",
+        ),
+        (
+            "AWS_SECRET_ACCESS_KEY=\n3f1c2a9b8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a refs/heads/main",
+            "aws-secret-access-key",
+        ),
+        (
+            "DD_API_KEY:\nd41d8cd98f00b204e9800998ecf8427e  empty.txt",
+            "datadog-api-key",
+        ),
+        (
+            "DD_API_KEY=\nd41d8cd98f00b204e9800998ecf8427e  empty.txt",
+            "datadog-api-key",
+        ),
+        (
+            "cloudflare_api_token:\nholdfast-core.redaction_default.toml",
+            "cloudflare-api-token",
+        ),
+        (
+            "CLOUDFLARE_API_TOKEN=\nholdfast-core.redaction_default.toml",
+            "cloudflare-api-token",
+        ),
+        (
+            "railway_token:\nholdfast-core.redaction_default.toml",
+            "railway-token",
+        ),
+        (
+            "RAILWAY_TOKEN=\nholdfast-core.redaction_default.toml",
+            "railway-token",
+        ),
+        (
+            "powersync_token:\nPermission denied, please try again.",
+            "powersync-token",
+        ),
+        (
+            "POWERSYNC_TOKEN=\nPermission denied, please try again.",
+            "powersync-token",
+        ),
+    ] {
+        assert_eq!(
+            redact_str(&rules, row),
+            row,
+            "`{rule}` took the next line's first word in {row:?}: {:?}",
+            hits(&rules, row)
+        );
+        assert!(
+            hits(&before, row).iter().any(|n| n == rule),
+            "the control must redact {row:?} by `{rule}`, or the row does not pin \
+             that rule's separator: {:?}",
+            hits(&before, row)
         );
     }
 }
@@ -1352,6 +1460,37 @@ fn a_value_on_the_line_after_a_colon_is_the_documented_limitation() {
     assert_ne!(redact_str(&rules, caught), caught);
 }
 
+/// **REQ-TST-006: the two `=` spellings the separator does not reach.**
+/// The `=` crosses exactly one line break, into an indented line, and
+/// only when the `=` ends the label's own line — rustfmt's and prettier's
+/// wrap. `a81b02d`'s `\s*` on both sides of the `=` also reached a label
+/// with its `=` on the next line, and an `=` with a blank line before
+/// the value; neither is a formatter's output, and both were found by
+/// review rather than by any corpus. Paired with the control, which
+/// redacted both, and with the rustfmt spelling of the same value.
+#[test]
+fn an_assignment_split_any_other_way_is_the_documented_limitation() {
+    let (rules, before) = (builtin(), before_245());
+    for missed in [
+        "password\n    = \"Tr0ub4dor&3xyz\"",
+        "password =\n\n    \"Tr0ub4dor&3xyz\"",
+    ] {
+        assert_eq!(
+            redact_str(&rules, missed),
+            missed,
+            "the split-assignment residual closed for {missed:?} — rewrite this row \
+             rather than deleting it"
+        );
+        assert_ne!(
+            redact_str(&before, missed),
+            missed,
+            "a81b02d must have redacted {missed:?}, or this is not a residual"
+        );
+    }
+    let caught = "password =\n    \"Tr0ub4dor&3xyz\"";
+    assert!(!redact_str(&rules, caught).contains("Tr0ub4dor"));
+}
+
 /// **The two code shapes, verbatim from the corpora GH #245 measured**
 /// (`syn`, `mio`, CPython, `rustls`). On `a81b02d` every row was redacted;
 /// none carries a digit, so none is a shape #202's digit rule vouches for.
@@ -1367,6 +1506,11 @@ const CODE_SHAPES: &[&str] = &[
     "colon_token: node.colon_token,",
     "self.add_password = self.passwd.add_password",
     "handshake_client_traffic_secret: self.client_handshake_traffic_secret,",
+    // Each branch with the `&` or `*` that may lead it — constructed, the
+    // shape of `&notification.progress_token` in `rmcp` and of a deref of
+    // a static path.
+    "token: &notification.progress_token,",
+    "let secret = *config::DEFAULT_SECRET;",
 ];
 
 #[test]
