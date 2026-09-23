@@ -4238,7 +4238,9 @@ pub struct SendInputArgs {
 pub struct WaitForPatternArgs {
     /// Session id or live session name.
     pub session: String,
-    /// Rust regex matched against the session's raw output bytes.
+    /// Rust regex, matched against the output both as text — ANSI escapes
+    /// removed, as read_output returns it — and as raw bytes; the earlier
+    /// match wins. match.offset is always a raw byte offset.
     ///
     /// **Omit it to wait for the session to stop executing instead. An empty      string is rejected rather than treated as either, because it is a likely client      encoding of \"omit\" and it used to match at offset zero and complete instantly** —
     /// which is not the same claim as "the command finished"; see

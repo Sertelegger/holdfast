@@ -655,6 +655,17 @@ is cut, named and published is in
 
 ### Fixed
 
+- **`wait_for` and `wait_for_pattern` could not match coloured output with a
+  pattern written from the text an agent reads** ([#238]). cargo prints its
+  verdict as `test result: \x1b[32mok\x1b[m`, so `wait_for: "test result:
+  ok"` used its whole deadline and answered `timeout` on a run that had
+  succeeded — with the matching text in the same response's
+  `output_since_start`. The scan window now carries an escape-free view
+  beside the raw bytes, built by the read path's own stripper with each text
+  byte's raw offset kept, and the pattern is searched in both; the earlier
+  match wins. A pattern that spells an escape still matches the raw bytes,
+  and `match.offset` is still a raw byte offset, as §5.2 requires.
+
 - **A program stopped at a `[Y/n] ` confirmation could read `Executing` for
   the whole wait** ([#240]). The detector records who held the terminal when
   a signal arrived, so that a shell's markers license nothing about the
@@ -2076,3 +2087,4 @@ residuals that are known and accepted.
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
 [#220]: https://github.com/Sertelegger/holdfast/issues/220
 [#240]: https://github.com/Sertelegger/holdfast/issues/240
+[#238]: https://github.com/Sertelegger/holdfast/issues/238

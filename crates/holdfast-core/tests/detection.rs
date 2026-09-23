@@ -2925,3 +2925,56 @@ async fn a_confirmation_prompt_from_an_external_program_answers_at_prompt() {
     assert_eq!(h["data"]["entries"][0]["exit_code"], 0, "{h}");
     kill(&server, &id).await;
 }
+
+// ---------------------------------------------------------------------
+// GH #238 — a pattern written from the text an agent reads
+// ---------------------------------------------------------------------
+
+/// GH #238's reproduction at a real shell. cargo, pytest, grep and ls all
+/// colour their key words on a TTY, so the text an agent reads as
+/// `test result: ok` is written as `test result: \x1b[32mok\x1b[m`, and
+/// `send_input{wait_for: "test result: ok"}` used its whole deadline and
+/// answered `timeout` for a run that had succeeded.
+///
+/// The command line's echo cannot satisfy the pattern: it carries
+/// `\033[32m` as eight literal characters between `: ` and `ok`, so only
+/// the *printed* line can match.
+#[tokio::test]
+async fn a_wait_for_written_from_the_text_matches_coloured_output() {
+    let server = HoldfastServer::new();
+    let id = start(&server, bash()).await;
+    await_markers(&server, &id, 3).await;
+
+    let started = Instant::now();
+    let r = body(
+        &server
+            .send_input(Parameters(SendInputArgs {
+                session: id.clone(),
+                data: r"printf 'test result: \033[32mok\033[m. 3 passed\n'".into(),
+                wait_for: Some("test result: ok".into()),
+                timeout_secs: Some(20),
+                ..Default::default()
+            }))
+            .await
+            .expect("send_input must not be a protocol error"),
+    );
+    assert_eq!(r["status"], "ok", "the colour escape hid the match: {r}");
+    assert_eq!(r["data"]["matched"], true, "{r}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "matched only at the deadline: {:?}",
+        started.elapsed()
+    );
+    // What the agent reads is the text it wrote the pattern from …
+    assert_eq!(r["data"]["match"]["text"], "test result: ok", "{r}");
+    // … and `match.offset` is still a raw byte offset (§5.2): the bytes
+    // there are the coloured ones the program wrote.
+    let offset = r["data"]["match"]["offset"].as_u64().expect("offset") as usize;
+    let all = raw(&server, &id).await;
+    assert!(
+        all.as_bytes()[offset..].starts_with(b"test result: \x1b[32mok"),
+        "match.offset does not address the raw bytes: {:?}",
+        &all[offset..(offset + 24).min(all.len())]
+    );
+    kill(&server, &id).await;
+}

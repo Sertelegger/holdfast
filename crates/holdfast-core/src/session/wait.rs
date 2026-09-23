@@ -16,6 +16,27 @@
 //! buys throughput this milestone has no measurement calling for, and
 //! costs the ability to report the match's *text*, which §5.2 requires.
 //!
+//! **The window is kept twice, and a pattern is matched against both**
+//! (GH #238). An agent writes its regex from the text it reads, and what
+//! it reads — `read_output`'s default, `output_since_start`, `match.text`
+//! — has had its ANSI escapes removed. The bytes the program wrote have
+//! not: cargo prints `test result: \x1b[32mok\x1b[m`, so
+//! `wait_for: "test result: ok"` timed out after its whole deadline on a
+//! run that succeeded, with the matching text sitting in the same
+//! response's `output_since_start`. So the window carries an escape-free
+//! view beside the raw bytes, built by the read path's own
+//! [`AnsiStripper`] with every text byte's raw offset recorded, and the
+//! pattern is searched in both. The earlier match wins, by raw offset;
+//! a tie goes to the raw one, whose span is exact.
+//!
+//! Both, rather than the text alone, because a pattern that spells an
+//! escape (`\x1b\[32mok`) is a thing callers were told they could write —
+//! the tool's own documentation said "raw output bytes" — and it must keep
+//! matching. **`match.offset` stays a raw byte offset** (§5.2): a text
+//! match starts at the raw offset of its first byte and ends just past its
+//! last, so escapes *inside* the match are inside the span and escapes
+//! around it are not.
+//!
 //! On broadcast lag the window is rebuilt from
 //! `max(clamp_since_cursor, buffer.tail)` — **not** from the frame
 //! boundary the receiver happened to reach (REQ-C-006). The difference
@@ -24,6 +45,7 @@
 //! silently.
 
 use super::{OutputFrame, Session};
+use crate::output::ansi::AnsiStripper;
 use regex::bytes::Regex;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
@@ -89,14 +111,14 @@ pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> 
     let mut rx = session.subscribe();
 
     // 2. Snapshot under the buffer lock; scan outside it.
-    let (mut window, mut window_start, snapshot_head, truncated_at_tail) = {
+    let (mut window, snapshot_head, truncated_at_tail) = {
         let (tail, head) = session.buffer_extent();
         let requested = spec.since_cursor.unwrap_or(head);
         let clamped = requested.clamp(tail, head);
         let bytes = session.buffer_slice(clamped, head);
-        (bytes, clamped, head, clamped > requested)
+        (Window::new(clamped, &bytes), head, clamped > requested)
     };
-    let scan_start = window_start;
+    let scan_start = window.start;
     let mut scan_cursor = snapshot_head;
 
     let mut outcome = WaitOutcome {
@@ -107,7 +129,7 @@ pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> 
     };
 
     // 3. History.
-    if let Some(found) = search(pattern, &window, window_start) {
+    if let Some(found) = window.search(pattern) {
         outcome.end = WaitEnd::Matched;
         outcome.found = Some(found);
         return outcome;
@@ -136,8 +158,8 @@ pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> 
         let slice = LIVENESS_POLL.min(deadline - now);
         match tokio::time::timeout(slice, rx.recv()).await {
             Ok(Ok(frame)) => {
-                if feed(&mut window, &mut window_start, &mut scan_cursor, &frame) {
-                    if let Some(found) = search(pattern, &window, window_start) {
+                if window.feed(&mut scan_cursor, &frame) {
+                    if let Some(found) = window.search(pattern) {
                         outcome.end = WaitEnd::Matched;
                         outcome.found = Some(found);
                         return outcome;
@@ -149,9 +171,8 @@ pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> 
                 // search start, not from where the receiver resumed.
                 let rebuilt = resync(session, scan_start, &mut outcome);
                 window = rebuilt.window;
-                window_start = rebuilt.window_start;
                 scan_cursor = rebuilt.scan_cursor;
-                if let Some(found) = search(pattern, &window, window_start) {
+                if let Some(found) = window.search(pattern) {
                     outcome.end = WaitEnd::Matched;
                     outcome.found = Some(found);
                     return outcome;
@@ -221,8 +242,8 @@ fn final_rescan(
 ) -> WaitOutcome {
     let (tail, head) = session.buffer_extent();
     let start = scan_start.max(tail);
-    let final_window = session.buffer_slice(start, head);
-    if let Some(found) = search(pattern, &final_window, start) {
+    let final_window = Window::new(start, &session.buffer_slice(start, head));
+    if let Some(found) = final_window.search(pattern) {
         outcome.end = WaitEnd::Matched;
         outcome.found = Some(found);
     } else {
@@ -233,8 +254,7 @@ fn final_rescan(
 
 /// The window a lagged waiter starts again from.
 struct Resync {
-    window: Vec<u8>,
-    window_start: u64,
+    window: Window,
     scan_cursor: u64,
 }
 
@@ -253,54 +273,128 @@ fn resync(session: &Session, scan_start: u64, outcome: &mut WaitOutcome) -> Resy
     if resync_start > scan_start {
         outcome.truncated_at_tail = true;
     }
-    let mut window = session.buffer_slice(resync_start, head);
-    let mut window_start = resync_start;
-    trim(&mut window, &mut window_start);
+    let mut window = Window::new(resync_start, &session.buffer_slice(resync_start, head));
+    window.trim();
     Resync {
         window,
-        window_start,
         scan_cursor: head,
     }
 }
 
-/// Append a frame's unscanned suffix. Returns whether anything was added.
-fn feed(
-    window: &mut Vec<u8>,
-    window_start: &mut u64,
-    scan_cursor: &mut u64,
-    frame: &OutputFrame,
-) -> bool {
-    // The historical scan already covered everything below `scan_cursor`,
-    // so a frame that straddles the cutover contributes only its suffix —
-    // which is what the frame's absolute span is carried for.
-    let from = frame.start.max(*scan_cursor);
-    if from >= frame.end {
-        return false;
-    }
-    // A frame that begins past the window's end would leave a hole; that
-    // can only happen after a lag, which resyncs instead.
-    if from > *window_start + window.len() as u64 {
-        return false;
-    }
-    window.extend_from_slice(&frame.bytes[(from - frame.start) as usize..]);
-    *scan_cursor = frame.end;
-    trim(window, window_start);
-    true
+/// The coalesced scan window (§5.2's second option), kept in two views.
+///
+/// `raw` is the stream exactly as the program wrote it. `text` is the same
+/// stream with its escape sequences removed by the read path's own
+/// [`AnsiStripper`], and `offsets[i]` is the absolute raw offset `text[i]`
+/// came from — which is what lets a match found in `text` be reported in
+/// raw offsets, as §5.2 requires of `match.offset`. See the module doc for
+/// why both are searched.
+///
+/// The stripper is resumable, so an escape split across two frames is
+/// removed exactly as one inside a frame is. A window rebuilt from the
+/// ring (`new`, after a lag or at the final rescan) starts its stripper
+/// at `Ground`; if the rebuild point falls inside a sequence, that
+/// sequence's tail reads as text until the next escape — the same
+/// best-effort `read_output` gives a cursor that lands mid-sequence.
+struct Window {
+    raw: Vec<u8>,
+    /// Absolute offset of `raw[0]`.
+    start: u64,
+    text: Vec<u8>,
+    offsets: Vec<u64>,
+    stripper: AnsiStripper,
 }
 
-fn trim(window: &mut Vec<u8>, window_start: &mut u64) {
-    if window.len() > SCAN_WINDOW_BYTES {
-        let drop = window.len() - SCAN_WINDOW_BYTES;
-        window.drain(..drop);
-        *window_start += drop as u64;
+impl Window {
+    fn new(start: u64, bytes: &[u8]) -> Self {
+        let mut w = Self {
+            raw: Vec::with_capacity(bytes.len()),
+            start,
+            text: Vec::with_capacity(bytes.len()),
+            offsets: Vec::with_capacity(bytes.len()),
+            stripper: AnsiStripper::new(),
+        };
+        w.push(bytes);
+        w
     }
-}
 
-fn search(pattern: &Regex, window: &[u8], window_start: u64) -> Option<MatchSpan> {
-    pattern.find(window).map(|m| MatchSpan {
-        start: window_start + m.start() as u64,
-        end: window_start + m.end() as u64,
-    })
+    /// Absolute offset just past the last raw byte.
+    fn end(&self) -> u64 {
+        self.start + self.raw.len() as u64
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        let mut at = self.end();
+        self.raw.extend_from_slice(bytes);
+        for &b in bytes {
+            if let Some(t) = self.stripper.feed(at, b) {
+                self.text.push(t);
+                self.offsets.push(at);
+            }
+            at += 1;
+        }
+    }
+
+    /// Append a frame's unscanned suffix. Returns whether anything was
+    /// added.
+    fn feed(&mut self, scan_cursor: &mut u64, frame: &OutputFrame) -> bool {
+        // The historical scan already covered everything below
+        // `scan_cursor`, so a frame that straddles the cutover contributes
+        // only its suffix — which is what the frame's absolute span is
+        // carried for.
+        let from = frame.start.max(*scan_cursor);
+        if from >= frame.end {
+            return false;
+        }
+        // A frame that begins past the window's end would leave a hole;
+        // that can only happen after a lag, which resyncs instead.
+        if from > self.end() {
+            return false;
+        }
+        self.push(&frame.bytes[(from - frame.start) as usize..]);
+        *scan_cursor = frame.end;
+        self.trim();
+        true
+    }
+
+    /// Drop from the front past `SCAN_WINDOW_BYTES` of raw stream, and the
+    /// text that came from what was dropped.
+    fn trim(&mut self) {
+        if self.raw.len() > SCAN_WINDOW_BYTES {
+            let drop = self.raw.len() - SCAN_WINDOW_BYTES;
+            self.raw.drain(..drop);
+            self.start += drop as u64;
+            let gone = self.offsets.partition_point(|&o| o < self.start);
+            self.text.drain(..gone);
+            self.offsets.drain(..gone);
+        }
+    }
+
+    /// The earlier of the raw match and the text match, in raw offsets.
+    fn search(&self, pattern: &Regex) -> Option<MatchSpan> {
+        let raw = pattern.find(&self.raw).map(|m| MatchSpan {
+            start: self.start + m.start() as u64,
+            end: self.start + m.end() as u64,
+        });
+        let text = pattern.find(&self.text).map(|m| {
+            // A text position maps to the raw offset of the byte there, or
+            // to the window's end when it is one past the last text byte —
+            // which only an empty match can be.
+            let at = |i: usize| self.offsets.get(i).copied().unwrap_or_else(|| self.end());
+            let start = at(m.start());
+            let end = if m.end() > m.start() {
+                self.offsets[m.end() - 1] + 1
+            } else {
+                start
+            };
+            MatchSpan { start, end }
+        });
+        match (raw, text) {
+            (Some(r), Some(t)) if t.start < r.start => Some(t),
+            (Some(r), _) => Some(r),
+            (None, t) => t,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -642,13 +736,13 @@ mod tests {
         };
         let rebuilt = resync(&s, 0, &mut outcome);
         assert_eq!(
-            rebuilt.window_start, 0,
+            rebuilt.window.start, 0,
             "the scan start is still buffered, so recovery begins there — \
              not at the frame boundary the receiver resumed at"
         );
         assert_eq!(rebuilt.scan_cursor, 11);
         assert_eq!(
-            search(&re(r"LAGx+GED"), &rebuilt.window, rebuilt.window_start),
+            rebuilt.window.search(&re(r"LAGx+GED")),
             Some(MatchSpan { start: 0, end: 10 }),
             "a match whose start preceded the lag is recovered whole"
         );
@@ -662,8 +756,8 @@ mod tests {
         // above, `max(scan_start, tail)` and a bare `tail` are the same
         // expression; here they are not.
         let rebuilt = resync(&s, 4, &mut outcome);
-        assert_eq!(rebuilt.window_start, 4);
-        assert_eq!(rebuilt.window, b"xxxGED\n");
+        assert_eq!(rebuilt.window.start, 4);
+        assert_eq!(rebuilt.window.raw, b"xxxGED\n");
     }
 
     /// The other arm of the same rule: once the tail has moved past the
@@ -692,8 +786,8 @@ mod tests {
             truncated_at_tail: false,
         };
         let rebuilt = resync(&s, 0, &mut outcome);
-        assert_eq!(rebuilt.window_start, 8, "clamped up to the live tail");
-        assert_eq!(rebuilt.window, b"89abcdef");
+        assert_eq!(rebuilt.window.start, 8, "clamped up to the live tail");
+        assert_eq!(rebuilt.window.raw, b"89abcdef");
         assert!(
             outcome.truncated_at_tail,
             "the requested start rolled out of the ring; the agent is told"
@@ -727,5 +821,135 @@ mod tests {
         let out = for_pattern(&s, &re(r"LAGx+GED"), spec(None, 10_000)).await;
         assert_eq!(out.end, WaitEnd::Matched);
         assert_eq!(out.found.expect("a match").start, 0);
+    }
+
+    /// GH #238's reproduction, byte for byte: cargo colours the verdict, so
+    /// the text an agent reads as `test result: ok` is written as
+    /// `test result: \x1b[32mok\x1b[m`. A pattern copied from the text
+    /// never matched the bytes, and the wait timed out after its whole
+    /// deadline on a run that had succeeded.
+    ///
+    /// The offsets are the contract half: `match.offset` is a **raw** byte
+    /// offset (§5.2), so the span starts at the `t` and ends just past the
+    /// `k`, with the colour escape between them inside it and the reset
+    /// after it outside.
+    #[tokio::test]
+    async fn a_pattern_written_from_the_text_matches_coloured_output() {
+        let (s, pty) = mock();
+        let out = b"running 3 tests\r\ntest result: \x1b[32mok\x1b[m. 3 passed\r\n";
+        pty.queue_output(out);
+        while s.buffer_head() < out.len() as u64 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let o = for_pattern(&s, &re("test result: ok"), spec(Some(0), 2000)).await;
+        assert_eq!(
+            o.end,
+            WaitEnd::Matched,
+            "the escape inside the verdict hid it"
+        );
+        let start = out.windows(11).position(|w| w == b"test result").unwrap() as u64;
+        let k = out.windows(2).position(|w| w == b"ok").unwrap() as u64 + 1;
+        assert_eq!(o.found, Some(MatchSpan { start, end: k + 1 }));
+    }
+
+    /// The same, arriving live and split mid-escape across two frames —
+    /// the stripper is resumable, so the second frame's `2mok` is not
+    /// taken for text.
+    #[tokio::test]
+    async fn a_coloured_match_split_inside_its_escape_across_frames_is_found() {
+        let (s, pty) = mock();
+        let writer = Arc::clone(&pty);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            writer.queue_output(b"error\x1b[0m: could not compile\r\ntest result: \x1b[3");
+            std::thread::sleep(Duration::from_millis(60));
+            writer.queue_output(b"2mok\x1b[m.\r\n");
+        });
+        let o = for_pattern(&s, &re("test result: ok\\."), spec(None, 5000)).await;
+        assert_eq!(o.end, WaitEnd::Matched);
+        let found = o.found.expect("a match");
+        assert_eq!(
+            s.buffer_slice(found.start, found.end),
+            b"test result: \x1b[32mok\x1b[m.".to_vec(),
+            "the span is the raw bytes the text match came from"
+        );
+    }
+
+    /// The other view keeps working: a pattern that spells an escape was a
+    /// thing callers were told they could write ("raw output bytes"), and
+    /// it matches nothing in the text view.
+    #[tokio::test]
+    async fn a_pattern_that_spells_an_escape_still_matches_the_raw_bytes() {
+        let (s, pty) = mock();
+        let out = b"test result: \x1b[32mok\x1b[m.\r\n";
+        pty.queue_output(out);
+        while s.buffer_head() < out.len() as u64 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let o = for_pattern(&s, &re(r"\x1b\[32mok"), spec(Some(0), 2000)).await;
+        assert_eq!(o.end, WaitEnd::Matched);
+        assert_eq!(o.found, Some(MatchSpan { start: 13, end: 20 }));
+    }
+
+    /// The tie-break and the ordering rule, over the window directly: the
+    /// earlier match wins **by raw offset** whichever view found it, and a
+    /// tie goes to the raw view, whose span is exact.
+    #[test]
+    fn the_earlier_match_wins_by_raw_offset_whichever_view_found_it() {
+        // `ok` appears first coloured (text view only sees it whole) and
+        // later plain (both views).
+        let w = Window::new(100, b"a \x1b[1mo\x1b[0mk b ok");
+        assert_eq!(
+            w.search(&re("ok")),
+            Some(MatchSpan {
+                start: 106,
+                end: 112
+            }),
+            "the coloured `ok` is earlier and the raw view cannot see it"
+        );
+        // Plain text: both views find the same `ok` and agree exactly.
+        let w = Window::new(100, b"say ok");
+        assert_eq!(
+            w.search(&re("ok")),
+            Some(MatchSpan {
+                start: 104,
+                end: 106
+            })
+        );
+        // An escape before and after the match is not part of it.
+        let w = Window::new(0, b"\x1b[32mok\x1b[m");
+        assert_eq!(w.search(&re("o.")), Some(MatchSpan { start: 5, end: 7 }));
+        // An empty match at the very end maps to the window's end rather
+        // than past its offset table.
+        // A tie at the same start goes to the raw view: here the raw match
+        // runs through the reset escape and the text match stops at `k`.
+        let w = Window::new(0, b"ok\x1b[m tail");
+        assert_eq!(
+            w.search(&re(r"ok\S*")),
+            Some(MatchSpan { start: 0, end: 5 })
+        );
+        let w = Window::new(10, b"ab\x1b[m");
+        assert_eq!(w.search(&re("$")), Some(MatchSpan { start: 15, end: 15 }));
+    }
+
+    /// Trimming drops the text that came from the trimmed bytes and no
+    /// more, so a text match never reports an offset below the window.
+    #[test]
+    fn trimming_keeps_the_two_views_aligned() {
+        let mut w = Window::new(0, &[]);
+        let mut cursor = 0;
+        let mut body = vec![b'x'; SCAN_WINDOW_BYTES];
+        body.extend_from_slice(b"\x1b[31mRED\x1b[0m");
+        let frame = OutputFrame {
+            start: 0,
+            end: body.len() as u64,
+            bytes: Arc::from(&body[..]),
+        };
+        assert!(w.feed(&mut cursor, &frame));
+        assert_eq!(w.raw.len(), SCAN_WINDOW_BYTES);
+        assert_eq!(w.offsets.first().copied(), Some(w.start));
+        assert_eq!(w.text.len(), w.offsets.len());
+        let found = w.search(&re("RED")).expect("found");
+        assert_eq!(found.start, SCAN_WINDOW_BYTES as u64 + 5);
     }
 }
