@@ -383,6 +383,41 @@ Cutting one is therefore:
    unauthenticated and confirm it 404s, then re-read what the workflow prints:
    promoting is *first external distribution*, and several deliberate escapes
    in this tree are conditioned on that not having happened.
+8. **After promoting, pin the marketplace to the tag, in its own pull
+   request.** `.claude-plugin/marketplace.json`'s plugin `source` is what every
+   `/plugin install` and `/plugin update` reads. While it is `"./plugin"` it
+   reads `plugin/` off `main` — and step 4 moved `plugin/version.txt` on `main`
+   before the tag existed, so from the merge of the release PR until the draft
+   is promoted, a new install or an update pins a version whose assets are not
+   served, and its MCP server fails to start ([#237]). A pin that moves only
+   after promotion closes that window: `main` goes on changing `plugin/`, and
+   installs keep the last promoted release until the pin moves.
+
+   ```json
+   "source": {
+     "source": "git-subdir",
+     "url": "https://github.com/Sertelegger/holdfast.git",
+     "path": "plugin",
+     "ref": "vX.Y.Z",
+     "sha": "<git rev-parse vX.Y.Z^{commit}>"
+   }
+   ```
+
+   **The `sha` is the pin; the `ref` is for the reader.** Claude Code takes
+   the `sha` when both are present, and a tag without one can be moved.
+   `scripts/plugin-manifest-check.py` refuses a pin to a branch, to another
+   URL, to another path, without a full sha, or ahead of `Cargo.toml` — and in
+   a clone that **has** the tag it also checks that the sha is the tag's commit
+   and that the pinned tree's `plugin.json` says `X.Y.Z`. CI's checkout fetches
+   no tags, so there it prints `skip` for that half rather than passing it:
+   run it locally before opening the PR.
+
+   **The first release that can be pinned is the first whose tag contains
+   `plugin/`.** `v0.0.7` does not — the plugin landed after it — so until a
+   later release is promoted the source stays `"./plugin"`, and the check
+   refuses a pin to a tag with no plugin tree. Measured on a scratch config
+   directory, a `git-subdir` source with a `sha` installs exactly that
+   commit's `plugin/` into the cache under its `plugin.json` version.
 
 ### crates.io
 
@@ -494,3 +529,8 @@ Then, by hand:
    is a draft. That is the measurement that the event has not happened yet.
 2. Re-read the two escapes above. Promoting ends them.
 3. `gh release edit vX.Y.Z --draft=false`.
+4. Pin the marketplace to the tag — step 8 of [Releases](#releases). Until
+   that merges, what an install gets is decided by the previous pin, or,
+   before the first one, by `main`.
+
+[#237]: https://github.com/Sertelegger/holdfast/issues/237

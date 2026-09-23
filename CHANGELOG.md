@@ -242,6 +242,24 @@ is cut, named and published is in
 
 ### Changed
 
+- **The marketplace listing is pinned to a promoted release, after
+  promotion.** The release PR bumps `plugin/version.txt` on `main` before the
+  tag, the release stays a draft until a person promotes it, and the listing's
+  `source: "./plugin"` reads `main` — so every install or update in between
+  pinned a version with no served assets and its MCP server failed to start.
+  `CONTRIBUTING.md`'s release procedure gains a step 8: once promoted, a pull
+  request points the listing at a `git-subdir` pin of `plugin/` at that tag
+  **and its commit**. `scripts/plugin-manifest-check.py` accepts `"./plugin"`
+  or exactly that shape — this repository's URL, `path: "plugin"`, a `vX.Y.Z`
+  ref no newer than `Cargo.toml`, a full sha — and, in a clone that has the
+  tag, checks the sha against it and the pinned tree's `plugin.json` against
+  the ref. Each refusal has a breakage fixture, and the self-test gains its
+  first *acceptance* fixture, so a rule that refused every pin — the rule as
+  it stood — now fails it. The listing
+  itself stays `"./plugin"` until a release whose tag contains `plugin/` is
+  promoted: `v0.0.7`'s does not, and the check refuses that pin.
+  `release.yml`'s post-draft checklist names the step ([#237]).
+
 - **`HOLDFAST_BOOTSTRAP_ALLOW_PATH` compares the version whole, and says when
   it declines.** It was `grep -q "$version"` over `holdfast version`'s output
   — a regex, unanchored, which `holdfast 0.1.00` and `10.1.0` both satisfy for

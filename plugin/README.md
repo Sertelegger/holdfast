@@ -180,3 +180,14 @@ The spec names only the first two; the install cache is keyed
 `cache/<marketplace>/<plugin>/<version>/` from **plugin.json**, so a release
 that bumps `version.txt` alone ships a plugin that never updates.
 `scripts/plugin-manifest-check.py` fails if they disagree.
+
+**Which tree an install gets is a separate question, and the answer moves
+after promotion.** While `.claude-plugin/marketplace.json`'s `source` is
+`"./plugin"`, an install reads this directory off `main` — which the release PR
+has already bumped to a version whose release is still a draft, so every
+install in that window fails to start. Once a release is promoted, the source
+becomes a `git-subdir` pin of `plugin/` at that tag and its commit, and it
+moves only after the next promotion.
+[CONTRIBUTING.md](../CONTRIBUTING.md#releases) step 8 has the procedure;
+`scripts/plugin-manifest-check.py` accepts `"./plugin"` or a pin of exactly that
+shape and nothing else.
