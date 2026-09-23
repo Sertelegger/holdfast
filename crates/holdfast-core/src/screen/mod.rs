@@ -888,6 +888,18 @@ impl ScreenTracker {
     /// replays from a later start, disagrees with the live grid about
     /// which cell holds what, and masks every cell it disagrees about —
     /// over-masking, the direction this must fail in.
+    ///
+    /// **Its cost is a parse of `[seeded_from, head)`, and that range is
+    /// not small.** `seeded_from` does not move while tracking stays on,
+    /// so after a few megabytes of output the replay is the whole 1 MiB
+    /// ring, on every call made while a key region lies within the seed
+    /// window and the carry of `head` — and on no other call. It is exact
+    /// only from `seeded_from`: a replay started later is a different
+    /// grid, and would mask every cell. Measured, release build, one
+    /// session after `seq 1 300000` and `cat` of a 2048-bit key: tens of
+    /// milliseconds per `get_screen_state` where the same call with no
+    /// key near `head` is under one (the independent review's probe 9;
+    /// the PR body has the command and the numbers).
     fn key_screen(
         &self,
         span: &ReplaySpan<'_>,
@@ -1075,10 +1087,12 @@ impl ScreenTracker {
         //     can overwrite the byte that ended the candidate in the
         //     stream. A candidate a span already covers is the span's.
         if let Some(judge) = judge.filter(|_| redact) {
-            for c in judge
-                .index
-                .unterminated_candidates(&judge.rules, joined.as_bytes(), 0)
-            {
+            for c in judge.index.unterminated_candidates(
+                &judge.rules,
+                joined.as_bytes(),
+                0,
+                crate::output::pem::RegionEnd::Final,
+            ) {
                 if !spans.iter().any(|s| s.start <= c.start && s.end > c.start) {
                     masked.push((c.start as usize, c.end as usize));
                 }

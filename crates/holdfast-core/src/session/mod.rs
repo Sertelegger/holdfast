@@ -4812,6 +4812,12 @@ mod tests {
     /// **Paired** with what must survive: the command after the key comes
     /// back verbatim, on every arm. A grid that masked everything below a
     /// `-----BEGIN` would pass the rest of this row.
+    ///
+    /// **And every other shape in `Key::shapes`**, at one geometry: the
+    /// independent review of GH #242 found the grid showing a pager's
+    /// next screenful of a key raw — 23 body lines under `less` at 24
+    /// rows — on this branch and on `a81b02d` alike, and the same for a
+    /// decorated key a pager cut off.
     #[test]
     fn the_grid_masks_a_private_key_that_read_output_masks() {
         use crate::output::pem::fixtures::KEYS;
@@ -4820,11 +4826,29 @@ mod tests {
         for key in KEYS {
             let pem = key.pem().replace('\n', "\r\n");
             let cut: String = pem.split_inclusive('\n').take(15).collect();
-            for (shape, body) in [("complete", &pem), ("head -n 15", &cut)] {
-                for (rows, cols) in [(40u16, 120u16), (24, 80), (10, 100)] {
+            // A shape, its text, and the geometries it is painted at.
+            type Arm<'a> = (&'a str, String, &'a [(u16, u16)]);
+            let mut shapes: Vec<Arm> = vec![
+                (
+                    "complete",
+                    format!("$ cat k\r\n{pem}$ echo done\r\ndone\r\n$ "),
+                    &[(40, 120), (24, 80), (10, 100)],
+                ),
+                (
+                    "head -n 15",
+                    format!("$ cat k\r\n{cut}$ echo done\r\ndone\r\n$ "),
+                    &[(40, 120), (24, 80), (10, 100)],
+                ),
+            ];
+            for shape in key.shapes() {
+                if !matches!(shape.name, "complete" | "head -n 9") {
+                    shapes.push((shape.name, shape.text, &[(24, 100)]));
+                }
+            }
+            for (shape, text, geometries) in &shapes {
+                for &(rows, cols) in *geometries {
                     let (s, pty) = key_session(rows, cols);
-                    let text = format!("$ cat k\r\n{body}$ echo done\r\ndone\r\n$ ");
-                    let g = painted_grid(&s, &pty, &text, &p);
+                    let g = painted_grid(&s, &pty, text, &p);
                     let screen = g.lines.join("\n");
                     scrolled_off += (!screen.contains("-----BEGIN")
                         && !screen.contains("[REDACTED:private-key]"))
@@ -4843,8 +4867,13 @@ mod tests {
                     // One marker per masked row at most: the two judges
                     // overlap on a header that is on screen, and a render
                     // that painted both would print two markers there.
+                    // Except across `bat`'s gutter glyph, which the key
+                    // render does not swap (it swaps printable ASCII, one
+                    // byte for one) and which therefore splits a row's
+                    // mask in two, around a glyph that carries nothing.
                     assert!(
-                        g.lines.iter().all(|l| l.matches("[REDACTED:").count() <= 1),
+                        text.contains('\u{2502}')
+                            || g.lines.iter().all(|l| l.matches("[REDACTED:").count() <= 1),
                         "{} {shape} at {rows}x{cols}: {screen}",
                         key.name
                     );
@@ -4903,14 +4932,20 @@ mod tests {
     ///
     /// A render is a reconstruction: here a line of junk follows the
     /// header and is then overwritten by a carriage return, so the screen
-    /// shows the header and the key body contiguous. The byte stream does
-    /// not — it carries the junk between them, and since GH #242 a
-    /// `-----BEGIN` candidate ends at the first byte that cannot be PEM
-    /// text, so the stream's judge sees prose after a header and nothing
-    /// to mask. That is the read path's residual for this shape, stated in
-    /// `pem.rs`: it takes a program that writes junk into its own key and
-    /// then paints over it. The grid is not left to the stream's answer on
-    /// it, because the grid emits what it renders.
+    /// shows the header and the key body contiguous, and every body line
+    /// is painted in two halves with a carriage return and a cursor move
+    /// between them, so the screen shows whole lines. The byte stream
+    /// does not — it carries the junk between header and body, and since
+    /// GH #242 a `-----BEGIN` candidate ends at the first byte that cannot
+    /// be PEM text; and the body lines after it, which `pem::body_lines`
+    /// masks when a line carries a key-body run, carry only half-line runs
+    /// in any stream a read emits. So the stream's judge sees prose after
+    /// a header and nothing to mask — the read path's residual for this
+    /// shape, which takes a program that writes junk into its own key and
+    /// then paints each line of it in pieces. (With the junk alone, and
+    /// whole lines, the stream's judge masks it too, since the review of
+    /// GH #242.) The grid is not left to the stream's answer on it,
+    /// because the grid emits what it renders.
     #[test]
     fn the_grid_masks_a_key_whose_stream_was_overwritten_on_screen() {
         use crate::output::pem::fixtures::KEYS;
@@ -4919,7 +4954,14 @@ mod tests {
         let pem = key.pem().replace('\n', "\r\n");
         let mut lines = pem.split_inclusive('\n');
         let header = lines.next().unwrap();
-        let body: String = lines.take(12).collect();
+        let body: String = lines
+            .take(12)
+            .map(|l| {
+                let l = l.trim_end();
+                let half = l.len() / 2;
+                format!("{}\r\x1b[{half}C{}\r\n", &l[..half], &l[half..])
+            })
+            .collect();
         let (s, pty) = key_session(40, 120);
         let text = format!("$ cat k\r\n{header}JUNK.\r{body}user@host:~$ echo done\r\ndone\r\n$ ");
         // The premise: the stream judges this candidate dead with nothing

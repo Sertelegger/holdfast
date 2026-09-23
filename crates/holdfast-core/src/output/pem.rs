@@ -58,6 +58,22 @@
 //! this same walk over its *own* joined render (`ScreenTracker`), which is
 //! the stream it emits, so a header still on screen is judged on what the
 //! screen shows; a header scrolled off it is judged on the byte stream.
+//!
+//! **Where the candidate stops is not where the key stops, either** — the
+//! half of this module the independent review of GH #242 found missing.
+//! A key's body can go on after something that is not PEM text: `less`
+//! paints a screenful and a `:` prompt, and the next screenful is more of
+//! the same key; `sed -n '21,40p'` prints the middle of one after a prompt
+//! and a command; `bat`, `git show`, `docker logs --timestamps` put a
+//! decoration in front of every line, so the candidate stops on the first
+//! decoration having seen no material at all. Each of those was masked
+//! before GH #242, because `[\s\S]*?` kept the candidate believed for the
+//! whole carry, and each was released by the narrowing. So a private-key
+//! candidate that stopped short of its closing boundary is followed for
+//! the rest of the carry by [`body_lines`], which masks every line that
+//! carries a key-body run ([`KEY_LINE_RUN`]) and nothing else: the prompt,
+//! the next command and ordinary output in between keep their text, which
+//! is what GH #242 was for.
 
 use super::ansi::AnsiStripper;
 use super::encoding::lossy_printable_keeps;
@@ -85,6 +101,46 @@ use super::encoding::lossy_printable_keeps;
 /// same line.
 pub const PEM_MATERIAL_RUN: u32 = 16;
 
+/// A line carrying a base64 run this long is a key-body line, wherever on
+/// the line the run sits — the test [`body_lines`] applies after a
+/// private-key candidate stopped short of its closing boundary.
+///
+/// **Forty-eight, and the number is chosen against both sides.** Every
+/// body line a real key is printed with is 64 characters (70 for OpenSSH,
+/// 76 where a MIME encoder wrapped it), so every full line clears it
+/// whatever decoration sits in front of it: a timestamp, a `bat` gutter,
+/// a diff's `-`, `grep -n`'s `12:`. It is above forty so a git object id
+/// is never one, which matters because `git log` is the likeliest output
+/// to follow a key header in prose. A SHA-256 digest (64) is one, and
+/// that is the cost: inside the carry behind a private-key header, a
+/// digest on its own line is masked. The last, short line of a key is
+/// reached by the second arm of [`body_lines`] — a run of
+/// [`PEM_MATERIAL_RUN`] on the line after a body line.
+///
+/// Measured on this repository's own `CHANGELOG.md`, `README.md` and
+/// `ROADMAP.md`: no line within [`UNVOUCHED_CARRY_BYTES`] behind any
+/// private-key header in them carries such a run, which
+/// `the_documented_read_loop_drains_this_repositorys_own_changelog`
+/// asserts through the read path.
+///
+/// [`UNVOUCHED_CARRY_BYTES`]: super::UNVOUCHED_CARRY_BYTES
+pub const KEY_LINE_RUN: u32 = 48;
+
+/// Whether the text a caller judges ends where it will end, or where more
+/// of it can still arrive — which decides what [`body_lines`] makes of a
+/// last line with no line break after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionEnd {
+    /// More may follow: a read's window, the grid's scan to `buffer.head`,
+    /// a live stream's carry. A last line that could still turn out to be
+    /// a key-body line is reported as one to hold, and masked if what has
+    /// arrived of it already carries material.
+    Arriving,
+    /// The text is whole: a window title, a rendered grid, a stream at its
+    /// end. The last line is judged as a line.
+    Final,
+}
+
 /// The longest label accepted between `-----BEGIN` and the dashes that
 /// close it. RFC 7468 sets none; the longest the rule set can match is
 /// `[ A-Z]{0,20}PRIVATE KEY[ A-Z]{0,10}`, 42 bytes, and this is twice
@@ -107,6 +163,19 @@ pub struct PemExtent {
     /// Some stream carried [`PEM_MATERIAL_RUN`] base64 characters before
     /// it died or closed.
     pub material: bool,
+    /// Some stream got past the label's closing dashes: the anchor is a
+    /// whole encapsulation boundary, not `-----BEGIN` and prose.
+    pub header: bool,
+    /// Some stream reached a closing `-----END…-----`.
+    pub closed: bool,
+}
+
+impl PemExtent {
+    /// The candidate stopped short of a closing boundary after a whole
+    /// header — the case [`body_lines`] follows for the rest of the carry.
+    pub fn stopped_short(&self) -> bool {
+        self.header && !self.alive && !self.closed
+    }
 }
 
 /// Whether `region[at..]` opens an RFC 7468 pre-encapsulation boundary,
@@ -178,6 +247,8 @@ pub fn extent(region: &[u8], at: usize) -> PemExtent {
                 end: region.len(),
                 alive: true,
                 material: lanes.iter().any(|l| l.material),
+                header: lanes.iter().any(|l| l.header),
+                closed: false,
             };
         }
         for lane in lanes.iter_mut() {
@@ -194,6 +265,8 @@ pub fn extent(region: &[u8], at: usize) -> PemExtent {
         },
         alive,
         material: lanes.iter().any(|l| l.material),
+        header: lanes.iter().any(|l| l.header),
+        closed: lanes.iter().any(|l| l.phase == Phase::Closed),
     }
 }
 
@@ -266,6 +339,8 @@ struct Lane {
     body_start: usize,
     /// The byte that killed this lane, or one past the closing dash.
     stopped_at: Option<usize>,
+    /// The label's closing dashes arrived.
+    header: bool,
 }
 
 impl Lane {
@@ -281,6 +356,7 @@ impl Lane {
             line_material: false,
             body_start: start,
             stopped_at: None,
+            header: false,
         }
     }
 
@@ -362,6 +438,7 @@ impl Lane {
                 if dashes == 5 {
                     self.body_start = at + 1;
                     self.line_start = at + 1;
+                    self.header = true;
                     self.phase = Phase::Body;
                 } else {
                     self.phase = Phase::Label {
@@ -523,6 +600,189 @@ impl Lane {
     }
 }
 
+/// What [`body_lines`] found after a candidate that stopped short.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BodyLines {
+    /// Runs of key-body lines, as region indices: each from the first
+    /// byte of its first line to the last byte of its last, so a run of
+    /// consecutive body lines is one range and the line break after it is
+    /// not in it. Sorted and disjoint.
+    pub ranges: Vec<(usize, usize)>,
+    /// With [`RegionEnd::Arriving`], where a last line begins that has no
+    /// line break yet and ends inside a base64 run — a body line still
+    /// arriving, as far as anything here can tell. A live stream holds
+    /// from here rather than emitting half a line it may have to mask;
+    /// whether the part that has arrived is masked already is in
+    /// `ranges`.
+    pub hold_from: Option<usize>,
+}
+
+/// The key-body lines of `region[from..to)`, which follows a private-key
+/// candidate that stopped short of its closing boundary (see the module
+/// header, and [`PemExtent::stopped_short`]).
+///
+/// **Line by line, and a line is masked or kept whole.** Lines end at a
+/// raw `\n` or `\r` — a `\r` too, because a pager and a progress display
+/// both repaint a row from column 0 with one, and what follows it is a new
+/// line on screen. A line is a body line when some stream a read can emit
+/// of it — raw, stripped, printable or stripped-printable, the four
+/// [`extent`] walks — carries a base64 run of [`KEY_LINE_RUN`], or of
+/// [`PEM_MATERIAL_RUN`] on the line after a body line (a key's last, short
+/// line). A blank line — nothing but whitespace once escapes are gone —
+/// neither ends a run of body lines nor starts one. Everything else is
+/// kept: a prompt, a command, a pager's `:`, the `-----END` line itself.
+///
+/// **Why not the whole carry, as before GH #242.** That is the
+/// alternative the review offered, and it is the one that undoes the
+/// issue: `head -n 15 id_rsa` and then the next command masked every
+/// command for 16 KiB, and one prose header in `CHANGELOG.md` masked a
+/// quarter of it. A line test keeps both of those whole and still reaches
+/// every body line that arrives after the candidate stopped.
+///
+/// A last line with no break after it is judged as a line when `end` is
+/// [`RegionEnd::Final`], or when `to` is short of the region's end (the
+/// carry ran out inside it, and the bytes after `to` are not this
+/// candidate's). Otherwise it may still be arriving: it is reported as
+/// [`BodyLines::hold_from`] if it ends inside a base64 run, and masked
+/// already if it follows a body line or has carried [`PEM_MATERIAL_RUN`]
+/// — so a read that lands mid-line in a key arriving under a decoration
+/// masks the front of the line, and the next read masks the rest from the
+/// line's own start.
+pub fn body_lines(region: &[u8], from: usize, to: usize, end: RegionEnd) -> BodyLines {
+    let to = to.min(region.len());
+    let mut out = BodyLines::default();
+    if from >= to {
+        return out;
+    }
+    let mut lanes = [
+        SegLane::new(Filter::Raw),
+        SegLane::new(Filter::Stripped),
+        SegLane::new(Filter::Printable),
+        SegLane::new(Filter::StrippedPrintable),
+    ];
+    let mut seg_start = from;
+    let mut prev_body = false;
+    let mut open: Option<(usize, usize)> = None;
+    // One whole line, `[seg_start, seg_end)`.
+    fn judge(
+        seg_start: usize,
+        seg_end: usize,
+        lanes: &[SegLane; 4],
+        prev_body: &mut bool,
+        open: &mut Option<(usize, usize)>,
+        ranges: &mut Vec<(usize, usize)>,
+    ) {
+        // Blank in the stripped-printable stream: nothing a reader sees.
+        if lanes[3].blank {
+            return;
+        }
+        let run = lanes.iter().map(|l| l.max_run).max().unwrap_or(0);
+        if run >= KEY_LINE_RUN || (*prev_body && run >= PEM_MATERIAL_RUN) {
+            *open = Some((open.map_or(seg_start, |o| o.0), seg_end));
+            *prev_body = true;
+        } else {
+            ranges.extend(open.take());
+            *prev_body = false;
+        }
+    }
+    for (i, &b) in region.iter().enumerate().take(to).skip(from) {
+        for lane in lanes.iter_mut() {
+            lane.feed(i, b);
+        }
+        if b == b'\n' || b == b'\r' {
+            judge(
+                seg_start,
+                i,
+                &lanes,
+                &mut prev_body,
+                &mut open,
+                &mut out.ranges,
+            );
+            for lane in lanes.iter_mut() {
+                lane.next_line();
+            }
+            seg_start = i + 1;
+        }
+    }
+    if seg_start < to {
+        if end == RegionEnd::Arriving && to == region.len() {
+            let arriving = !lanes[3].blank && lanes.iter().any(|l| l.run > 0);
+            if arriving {
+                out.hold_from = Some(seg_start);
+                let run = lanes.iter().map(|l| l.max_run).max().unwrap_or(0);
+                if prev_body || run >= PEM_MATERIAL_RUN {
+                    open = Some((open.map_or(seg_start, |o| o.0), to));
+                }
+            }
+        } else {
+            judge(
+                seg_start,
+                to,
+                &lanes,
+                &mut prev_body,
+                &mut open,
+                &mut out.ranges,
+            );
+        }
+    }
+    out.ranges.extend(open);
+    out
+}
+
+/// One stream of one line, for [`body_lines`]: the same filters as
+/// [`Lane`], and only the counts a line test needs. The stripper runs on
+/// across lines, because an escape sequence does not end at one.
+struct SegLane {
+    filter: Filter,
+    stripper: AnsiStripper,
+    /// The base64 run the line currently ends in, and its longest.
+    run: u32,
+    max_run: u32,
+    /// Nothing but spaces and tabs emitted on this line so far.
+    blank: bool,
+}
+
+impl SegLane {
+    fn new(filter: Filter) -> Self {
+        Self {
+            filter,
+            stripper: AnsiStripper::new(),
+            run: 0,
+            max_run: 0,
+            blank: true,
+        }
+    }
+
+    fn next_line(&mut self) {
+        self.run = 0;
+        self.max_run = 0;
+        self.blank = true;
+    }
+
+    fn feed(&mut self, at: usize, raw: u8) {
+        let byte = match self.filter {
+            Filter::Raw => Some(raw),
+            Filter::Printable => lossy_printable_keeps(raw).then_some(raw),
+            Filter::Stripped => self.stripper.feed(at as u64, raw),
+            Filter::StrippedPrintable => self
+                .stripper
+                .feed(at as u64, raw)
+                .filter(|b| lossy_printable_keeps(*b)),
+        };
+        let Some(b) = byte else { return };
+        if b == b'\n' || b == b'\r' {
+            return;
+        }
+        if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=') {
+            self.run += 1;
+            self.max_run = self.max_run.max(self.run);
+        } else {
+            self.run = 0;
+        }
+        self.blank &= matches!(b, b' ' | b'\t');
+    }
+}
+
 /// Throwaway private keys in every format the rule has to hold, for the
 /// tests of every surface that masks one.
 ///
@@ -574,6 +834,150 @@ pub(crate) mod fixtures {
                     .find(|w| text.contains(w))
             })
         }
+
+        /// Every way this key reaches a terminal that some surface has
+        /// had to be taught, as a pty delivers it (`\r\n`), each followed
+        /// by a command that must still reach the reader.
+        ///
+        /// Complete: `cat`, a colour change inside both labels, and three
+        /// decorations the rule's own `[\s\S]*?` still covers (`git show`
+        /// of a removed key, `bat`'s gutter, `grep -n`). Cut short: `head`,
+        /// then the five the independent review of GH #242 reached — the
+        /// next screenful of a pager, the middle of a key printed in
+        /// chunks, and three decorated keys a pager cut off (so no
+        /// `-----END` is ever in the buffer) — each of which the
+        /// narrowing released and `[\s\S]*?` had masked.
+        pub fn shapes(&self) -> Vec<Shape> {
+            let pem = self.pem();
+            let lines: Vec<&str> = pem.lines().collect();
+            let header = lines[0];
+            let body = &lines[1..lines.len() - 1];
+            let half = (body.len() / 2).max(1);
+            let crlf = |ls: &[&str]| -> String { ls.iter().map(|l| format!("{l}\r\n")).collect() };
+            let deco = |ls: &[&str], f: &dyn Fn(usize) -> String| -> String {
+                ls.iter()
+                    .enumerate()
+                    .map(|(i, l)| format!("{}{l}\r\n", f(i)))
+                    .collect()
+            };
+            let first: Vec<&str> = std::iter::once(header)
+                .chain(body[..half].iter().copied())
+                .collect();
+            let removed = |_: usize| "-".to_string();
+            let gutter = |i: usize| format!("{:>4} \u{2502} ", i + 1);
+            let grepped = |i: usize| format!("keys/id_key:{}:", i + 1);
+            let stamped = |i: usize| format!("2026-09-23T12:00:{:02}.{:09}Z ", i % 60, i * 7919);
+            // A pager's prompt, then what `q` leaves behind.
+            let pager = "\x1b[7m:\x1b[27m\x1b[K\r\x1b[K";
+            const DONE: &str = "$ echo done\r\ndone\r\n$ ";
+            let kept = |extra: &[&str]| -> Vec<String> {
+                extra
+                    .iter()
+                    .map(|s| s.to_string())
+                    .chain(["$ echo done".to_string()])
+                    .collect()
+            };
+            let painted = pem.replace("PRIVATE KEY", "PRIV\x1b[1;31mATE KEY\x1b[0m");
+            vec![
+                Shape {
+                    name: "complete",
+                    text: format!("$ cat id_key\r\n{}{DONE}", crlf(&lines)),
+                    complete: true,
+                    kept: kept(&[]),
+                },
+                Shape {
+                    name: "painted",
+                    text: format!("$ cat id_key\r\n{}{DONE}", painted.replace('\n', "\r\n")),
+                    complete: true,
+                    kept: kept(&[]),
+                },
+                Shape {
+                    name: "git show",
+                    text: format!("$ git show\r\n{}{DONE}", deco(&lines, &removed)),
+                    complete: true,
+                    kept: kept(&[]),
+                },
+                Shape {
+                    name: "bat",
+                    text: format!("$ bat id_key\r\n{}{DONE}", deco(&lines, &gutter)),
+                    complete: true,
+                    kept: kept(&[]),
+                },
+                Shape {
+                    name: "grep -n",
+                    text: format!("$ grep -n . id_key\r\n{}{DONE}", deco(&lines, &grepped)),
+                    complete: true,
+                    kept: kept(&[]),
+                },
+                Shape {
+                    name: "head -n 9",
+                    text: format!(
+                        "$ head -n 9 id_key\r\n{}{DONE}",
+                        crlf(&lines[..9.min(lines.len() - 1)])
+                    ),
+                    complete: false,
+                    kept: kept(&[]),
+                },
+                Shape {
+                    name: "less, next screenful",
+                    // `less -XM`'s own prompt on the first screenful, erased
+                    // by the `\r\x1b[K` in front of the second — which is a
+                    // new line on screen, so the prompt keeps its text.
+                    text: format!(
+                        "$ less -XM id_key\r\n{}\x1b[7mid_key lines 1-{} 50%\x1b[27m\x1b[K\
+                         \r\x1b[K{}{pager}{DONE}",
+                        crlf(&first),
+                        first.len(),
+                        crlf(&body[half..])
+                    ),
+                    complete: false,
+                    kept: kept(&["less -XM id_key", "id_key lines 1-"]),
+                },
+                Shape {
+                    name: "sed, in chunks",
+                    text: format!(
+                        "$ sed -n '1,{a}p' id_key\r\n{}$ sed -n '{b},{c}p' id_key\r\n{}{DONE}",
+                        crlf(&first),
+                        crlf(&body[half..]),
+                        a = half + 1,
+                        b = half + 2,
+                        c = body.len() + 1,
+                    ),
+                    complete: false,
+                    kept: kept(&["$ sed -n '1,", &format!("$ sed -n '{},", half + 2)]),
+                },
+                Shape {
+                    name: "git show, paged",
+                    text: format!("$ git show\r\n{}{pager}{DONE}", deco(&first, &removed)),
+                    complete: false,
+                    kept: kept(&[]),
+                },
+                Shape {
+                    name: "bat, paged",
+                    text: format!("$ bat id_key\r\n{}{pager}{DONE}", deco(&first, &gutter)),
+                    complete: false,
+                    kept: kept(&[]),
+                },
+                Shape {
+                    name: "docker logs, cut",
+                    text: format!("$ docker logs -t app\r\n{}{DONE}", deco(&first, &stamped)),
+                    complete: false,
+                    kept: kept(&[]),
+                },
+            ]
+        }
+    }
+
+    /// One of [`Key::shapes`].
+    pub(crate) struct Shape {
+        pub name: &'static str,
+        pub text: String,
+        /// The key's closing boundary is in `text`, so the rule itself
+        /// matches it and a mask carries the rule's name.
+        pub complete: bool,
+        /// Text that must reach the reader verbatim — the commands around
+        /// the key, which GH #242's narrowing exists to keep.
+        pub kept: Vec<String>,
     }
 
     macro_rules! key {
@@ -621,7 +1025,9 @@ mod tests {
             PemExtent {
                 end: text.len(),
                 alive: true,
-                material: true
+                material: true,
+                header: true,
+                closed: false,
             }
         );
     }
@@ -825,6 +1231,91 @@ mod tests {
         );
     }
 
+    /// **What `body_lines` masks after a candidate stopped short, line by
+    /// line** — the independent review's repros in miniature: a pager's
+    /// prompt and then its next screenful, a short last line, a decorated
+    /// line, and a line still arriving.
+    #[test]
+    fn body_lines_masks_key_body_and_keeps_everything_else() {
+        let short = &LINE[..20];
+        let text = format!(
+            ":\r\x1b[K{LINE}\r\n\r\n{LINE}\r\n{short}\r\n$ echo ok\r\nok\r\n\
+             2026-09-23T12:00:00Z {LINE}\r\n{short}\r\n"
+        );
+        let got = body_lines(text.as_bytes(), 0, text.len(), RegionEnd::Final);
+        let masked: Vec<&str> = got.ranges.iter().map(|&(s, e)| &text[s..e]).collect();
+        assert_eq!(
+            masked,
+            vec![
+                // Two body lines around a blank one, and the short last
+                // line after them: one range. The pager's `:` is kept, on
+                // its own line because `\r` ends one.
+                &text[text.find("\x1b[K").unwrap()..text.find("\r\n$ echo").unwrap()],
+                // A decorated line is a body line; the short line after it
+                // follows a body line.
+                &text[text.find("2026").unwrap()..text.len() - 2],
+            ]
+        );
+        assert_eq!(got.hold_from, None, "Final: nothing is arriving");
+
+        // A short line that follows no body line is not one: sixteen
+        // letters of prose after a prompt are prose.
+        let prose = format!("$ echo\r\n{short}\r\n");
+        assert!(
+            body_lines(prose.as_bytes(), 0, prose.len(), RegionEnd::Final)
+                .ranges
+                .is_empty()
+        );
+
+        // Arriving: a last line that ends in a run is held, and masked
+        // already when it follows a body line…
+        let arriving = format!("{LINE}\r\n{}", &LINE[..5]);
+        let got = body_lines(arriving.as_bytes(), 0, arriving.len(), RegionEnd::Arriving);
+        assert_eq!(got.hold_from, Some(LINE.len() + 2));
+        assert_eq!(got.ranges, vec![(0, arriving.len())]);
+        // …or when what has arrived of it already carries material…
+        let alone = format!("$ x\r\n{short}");
+        let got = body_lines(alone.as_bytes(), 0, alone.len(), RegionEnd::Arriving);
+        assert_eq!(got.ranges, vec![(5, alone.len())]);
+        // …and only held, not masked, when it has neither.
+        let word = "$ x\r\nabc";
+        let got = body_lines(word.as_bytes(), 0, word.len(), RegionEnd::Arriving);
+        assert_eq!((got.hold_from, got.ranges.len()), (Some(5), 0));
+        // A prompt ends in a space and is neither.
+        let prompt = "$ x\r\nuser@host:~$ ";
+        let got = body_lines(prompt.as_bytes(), 0, prompt.len(), RegionEnd::Arriving);
+        assert_eq!(got, BodyLines::default());
+        // A line the carry cut short is judged as a line, not held.
+        let got = body_lines(
+            arriving.as_bytes(),
+            0,
+            arriving.len() - 1,
+            RegionEnd::Arriving,
+        );
+        assert_eq!(got.hold_from, None);
+    }
+
+    /// **Only a header that stopped short is followed** — not one that
+    /// closed, not one still alive, and not a label that never closed.
+    #[test]
+    fn only_a_candidate_that_stopped_short_is_followed() {
+        let closed = walk(&format!(
+            "{HEADER}\n{LINE}\n-----END RSA PRIVATE KEY-----\n"
+        ));
+        assert!(closed.closed && !closed.stopped_short());
+        let alive = walk(&format!("{HEADER}\n{LINE}\n"));
+        assert!(alive.alive && !alive.stopped_short());
+        let stopped = walk(&format!("{HEADER}\n{LINE}\n$ prompt"));
+        assert!(stopped.header && stopped.stopped_short());
+        let prose = walk(&format!("{HEADER}` in prose"));
+        assert!(
+            prose.header && prose.stopped_short(),
+            "prose is followed too"
+        );
+        let unclosed = walk("-----BEGIN RSA PRIVATE KEY\u{7f}");
+        assert!(!unclosed.header && !unclosed.stopped_short());
+    }
+
     /// The C1 arm gives up *alive*, and only while some stream is.
     #[test]
     fn a_c1_byte_is_believed_while_any_stream_is_alive_and_ignored_after() {
@@ -836,7 +1327,9 @@ mod tests {
             PemExtent {
                 end: live.len(),
                 alive: true,
-                material: true
+                material: true,
+                header: true,
+                closed: false,
             }
         );
         let mut dead = format!("{HEADER}` prose").into_bytes();

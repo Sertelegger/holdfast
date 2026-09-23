@@ -710,7 +710,7 @@ impl OutputProcessor {
         let redacted = redact::redact_str(&self.rules, text);
         let spans: Vec<Span> = self
             .index
-            .unterminated_candidates(&self.rules, redacted.as_bytes(), 0)
+            .unterminated_candidates(&self.rules, redacted.as_bytes(), 0, pem::RegionEnd::Final)
             .into_iter()
             .map(|c| Span::unresolved(c.start, c.end))
             .collect();
@@ -733,19 +733,30 @@ impl OutputProcessor {
     /// processor can tell — for a surface that masks by *what bytes wrote
     /// a cell* rather than by a read range (GH #224, `get_screen_state`).
     ///
-    /// Three kinds, and they are the same three `process` masks: a
-    /// complete `binary` match; a `-----BEGIN` candidate still believed at
-    /// the region's end; and one that died with key material behind it.
-    /// The last two are capped at [`UNVOUCHED_CARRY_BYTES`] past their
+    /// Four kinds, and they are the four `process` masks: a complete
+    /// `binary` match; a `-----BEGIN` candidate still believed at the
+    /// region's end; one that died with key material behind it; and the
+    /// key-body lines after one that stopped short (`pem::body_lines`) —
+    /// the next screenful of a pager is the case the grid shows most. The
+    /// last three are capped at [`UNVOUCHED_CARRY_BYTES`] past their
     /// anchor, as a read caps them, and a candidate a complete match
     /// covers is that match's. Sorted and disjoint.
+    ///
+    /// The region ends at `buffer.head`, so a last line still arriving is
+    /// masked as far as a read masks it; a line only a live stream would
+    /// hold is not, because a grid has nothing to hold it for.
     pub fn key_regions(&self, region: &[u8], region_start: u64) -> Vec<(u64, u64)> {
         let mut spans = self.binary_spans(region, region_start);
         let complete = spans.clone();
-        for c in self
-            .index
-            .unterminated_candidates(&self.rules, region, region_start)
-        {
+        for c in self.index.unterminated_candidates(
+            &self.rules,
+            region,
+            region_start,
+            pem::RegionEnd::Arriving,
+        ) {
+            if c.resumed && c.in_flight {
+                continue;
+            }
             if !complete
                 .iter()
                 .any(|s| s.start <= c.start && s.end > c.start)
@@ -781,7 +792,12 @@ impl OutputProcessor {
     /// believed over and the one `_RSA_16384_PEM_FITS_INSIDE_THE_CARRY`
     /// holds against the largest key the rule can match. A key painted
     /// with a colour change on every character can exceed it in raw
-    /// bytes; that is outside this reach.
+    /// bytes; that is outside this reach — and the likeliest way to paint
+    /// one is not `lolcat` but `grep -n . id_rsa` under the common
+    /// `grep --color=auto` alias, which wraps every matched character in
+    /// its own colour change and makes a 3 KB key about 64 KB. Its header
+    /// is not in the raw bytes either, so no candidate is found for it
+    /// and nothing follows its body lines.
     fn carry_spans(&self, w: &WindowSnapshot<'_>) -> Vec<Span> {
         if w.carry_region_start >= w.window_start || w.carry_region.is_empty() {
             return Vec::new();
@@ -796,7 +812,8 @@ impl OutputProcessor {
     }
 
     /// The unterminated candidates in `carry_region` that died with key
-    /// material behind them and that no span in `spans` covers — each one
+    /// material behind them, and the key-body lines after one that stopped
+    /// short (`pem::body_lines`), that no span in `spans` covers — each one
     /// capped at [`UNVOUCHED_CARRY_BYTES`] past its anchor and the window's
     /// end. See [`PrefixIndex::unterminated_candidates`].
     ///
@@ -808,7 +825,12 @@ impl OutputProcessor {
     ) -> Vec<prefix_index::Unterminated> {
         let window_end = w.window_start + w.window.len() as u64;
         self.index
-            .unterminated_candidates(&self.rules, w.carry_region, w.carry_region_start)
+            .unterminated_candidates(
+                &self.rules,
+                w.carry_region,
+                w.carry_region_start,
+                pem::RegionEnd::Arriving,
+            )
             .into_iter()
             .filter(|c| !c.in_flight)
             .filter(|c| {
@@ -1188,6 +1210,16 @@ impl OutputProcessor {
             // `pem::extent` stopped believing it, capped at the same
             // `UNVOUCHED_CARRY_BYTES` for the same reason, and one that a
             // complete match covers is left to that match's own marker.
+            //
+            // **And the key body that goes on after it** (the independent
+            // review of GH #242): the next screenful of `less`, the middle
+            // of a key `sed` prints in chunks, every line of a key printed
+            // under a timestamp or a gutter that a pager cut off. Each was
+            // masked while `[\s\S]*?` kept the candidate believed, and
+            // each was released raw by the narrowing — `less` and a space
+            // returned 23 body lines with `redactions: {}`. The lines that
+            // carry key body are masked for the same carry past the
+            // anchor, and the prompt and command between them are not.
             for c in self.dead_candidates(w, &spans) {
                 spans.push(redact::Span::unresolved(c.start, c.end));
             }
@@ -4738,49 +4770,37 @@ mod tests {
     ///   `max_bytes` and at a small one, so both the at-`head` branch and
     ///   the truncated one run.
     ///
-    /// The truncated key is `head -n 9` followed by a prompt — the case
-    /// that is neither closed nor in flight, and that GH #242's narrowing
-    /// would release if dying released.
+    /// The shapes are `pem::fixtures::Key::shapes`. `head -n 9` followed
+    /// by a prompt is the case that is neither closed nor in flight, and
+    /// that GH #242's narrowing would release if dying released. The five
+    /// after it are the independent review's: key body arriving *after*
+    /// the candidate stopped — a pager's next screenful, `sed` in chunks,
+    /// and three decorated keys a pager cut off — each of which the
+    /// narrowing released raw and `a81b02d` masked.
+    ///
+    /// **Paired** with what must survive, on the whole-buffer read: the
+    /// commands around every shape, which is what GH #242 was for.
     #[test]
     fn no_read_shape_returns_key_material_for_any_key_format() {
         let p = processor();
         let o = ReadOptions::default();
         let mut reads = 0usize;
         for key in pem::fixtures::KEYS {
-            let pem = key.pem();
-            let cut: String = pem.lines().take(9).map(|l| format!("{l}\n")).collect();
-            // Three decorations a complete key reaches a terminal in, none
-            // of which is PEM text on its lines — so for these only the
-            // rule's own `[\s\S]*?` match, found behind the window, covers
-            // a read that starts inside them: a removed key in `git show`,
-            // `bat`'s gutter, and `grep -n`.
-            let decorated = |prefix: &dyn Fn(usize) -> String| -> String {
-                pem.lines()
-                    .enumerate()
-                    .map(|(i, l)| format!("{}{l}\n", prefix(i)))
-                    .collect()
-            };
-            let removed = decorated(&|_| "-".into());
-            let gutter = decorated(&|i| format!("{:>4} \u{2502} ", i + 1));
-            let grepped = decorated(&|i| format!("keys/id_key:{}:", i + 1));
-            // And one the raw regex cannot match at all: a colour change
-            // inside both labels, which a terminal paints as the plain
-            // boundary. Only the stripped view carries the match.
-            let painted = pem.replace("PRIVATE KEY", "PRIV\x1b[1;31mATE KEY\x1b[0m");
-            for (shape, text) in [
-                ("painted", catted(&painted)),
-                ("complete", catted(&pem)),
-                ("head -n 9", catted(&cut)),
-                ("git show", catted(&removed)),
-                ("bat", catted(&gutter)),
-                ("grep -n", catted(&grepped)),
-            ] {
-                let buf = text.as_bytes();
+            for shape in key.shapes() {
+                let (name, buf) = (shape.name, shape.text.as_bytes());
                 let head = buf.len() as u64;
                 // Control: the whole-buffer read masks it, so a leak below
                 // is the read shape's and not the fixture's.
                 let whole = p.process(&snapshot(&p, buf, 0, 1 << 20, true, false), &o);
-                assert_eq!(key.leaked_in(&whole.output), None, "{} {shape}", key.name);
+                assert_eq!(key.leaked_in(&whole.output), None, "{} {name}", key.name);
+                for kept in &shape.kept {
+                    assert!(
+                        whole.output.contains(kept.as_str()),
+                        "{} {name}: {kept:?} was masked with the key: {:?}",
+                        key.name,
+                        whole.output
+                    );
+                }
 
                 let mut starts = line_starts(buf);
                 starts.extend((0..head).step_by(53));
@@ -4793,7 +4813,7 @@ mod tests {
                         assert_eq!(
                             key.leaked_in(&r.output),
                             None,
-                            "{} ({shape}): a read from {start} of {head} at max_bytes \
+                            "{} ({name}): a read from {start} of {head} at max_bytes \
                              {max_bytes} returned key material: {:?} redactions {:?}",
                             key.name,
                             r.output,
@@ -4802,10 +4822,10 @@ mod tests {
                         // A complete key the rule matched keeps the rule's
                         // name from inside it too — `unresolved` is for a
                         // region nothing matched, and this one did.
-                        if shape != "head -n 9" && r.output.contains("[REDACTED:") {
+                        if shape.complete && r.output.contains("[REDACTED:") {
                             assert!(
                                 r.redactions.contains_key("private-key"),
-                                "{} ({shape}) from {start}: {:?}",
+                                "{} ({name}) from {start}: {:?}",
                                 key.name,
                                 r.redactions
                             );
@@ -4940,6 +4960,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **After a key header, what is masked is key body and nothing else**
+    /// — the cost side of following a stopped candidate's body lines
+    /// (`pem::body_lines`), measured on the lines likeliest to follow one.
+    ///
+    /// * After a **complete** key nothing is followed: its candidate
+    ///   closed, and the rule's own match is the whole of its mask. A
+    ///   SHA-256 digest on the next line comes back.
+    /// * After a key **cut short**, or a header in **prose**, a git object
+    ///   id (40 hex) and ordinary output come back; a line carrying a run
+    ///   of [`pem::KEY_LINE_RUN`] — here a SHA-256 digest — is masked,
+    ///   which is the stated cost; and past `UNVOUCHED_CARRY_BYTES` from
+    ///   the header even that comes back.
+    #[test]
+    fn after_a_key_header_only_key_body_lines_are_masked() {
+        let p = processor();
+        let o = ReadOptions::default();
+        let key = &pem::fixtures::KEYS[0];
+        let pem = key.pem();
+        let cut: String = pem.lines().take(9).map(|l| format!("{l}\n")).collect();
+        let sha1 = "a81b02d3c4e5f60718293a4b5c6d7e8f90a1b2c3";
+        let sha256 = "66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e";
+        let after =
+            format!("$ git log -1 --format=%H\r\n{sha1}\r\n$ sha256sum f\r\n{sha256}  f\r\n$ ");
+        for (shape, text, digest_masked) in [
+            ("complete", catted(&pem), false),
+            ("head -n 9", catted(&cut), true),
+            (
+                "prose",
+                "$ grep -n BEGIN CHANGELOG.md\r\n12: `-----BEGIN RSA PRIVATE KEY-----` as prose\r\n$ "
+                    .to_string(),
+                true,
+            ),
+        ] {
+            let buf = format!("{text}{after}");
+            let r = p.process(&snapshot(&p, buf.as_bytes(), 0, 1 << 20, true, false), &o);
+            assert_eq!(key.leaked_in(&r.output), None, "{shape}");
+            assert!(r.output.contains(sha1), "{shape}: {:?}", r.output);
+            assert!(r.output.contains("$ sha256sum f"), "{shape}: {:?}", r.output);
+            assert_eq!(
+                !r.output.contains(sha256),
+                digest_masked,
+                "{shape}: {:?}",
+                r.output
+            );
+        }
+
+        // Past the carry, the prose header's reach has ended.
+        let pad: String = (0..UNVOUCHED_CARRY_BYTES / 40)
+            .map(|i| format!("ordinary line {i:024}\r\n"))
+            .collect();
+        let buf = format!("12: `-----BEGIN RSA PRIVATE KEY-----` as prose\r\n{pad}{after}");
+        let r = p.process(&snapshot(&p, buf.as_bytes(), 0, 1 << 20, true, false), &o);
+        assert!(r.output.contains(sha256), "the reach is the carry");
+        assert!(r.redactions.is_empty(), "{:?}", r.redactions);
     }
 
     // ---------------------------------------- GH #247: erased redraws

@@ -17,7 +17,7 @@
 //! that edge, and answers it for rules with no indexed prefix as well,
 //! which is the half no window size reaches.
 
-use super::pem::{self, PemExtent};
+use super::pem::{self, PemExtent, RegionEnd};
 use super::rules::RuleSet;
 use regex_automata::{
     dfa::{dense, Automaton, StartKind},
@@ -491,6 +491,27 @@ pub struct Unterminated {
     /// characters — always true of one that is not `in_flight`, and what
     /// the stream's end-of-stream flush asks of one that is.
     pub material: bool,
+    /// Not a candidate but key-body lines *after* one that stopped short
+    /// of its closing boundary (`pem::body_lines`): a pager's next
+    /// screenful, the middle of a key printed in chunks, a decorated key
+    /// whose candidate died on its first decoration. Masked like a dead
+    /// candidate when not `in_flight`. When `in_flight` it is a last line
+    /// still arriving that may turn out to be one — a live stream holds
+    /// from `start`, and nothing masks it on that account.
+    pub resumed: bool,
+}
+
+/// What [`PrefixIndex::candidate_scan`] found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CandidateScan {
+    /// See [`PrefixIndex::unterminated_candidates`].
+    pub found: Vec<Unterminated>,
+    /// The absolute anchor of every private-key candidate that stopped
+    /// short of its closing boundary, in order: each one's body lines are
+    /// followed for `UNVOUCHED_CARRY_BYTES` past it, so a surface that
+    /// forgets bytes — a live stream's lookbehind — must keep the anchor
+    /// until then or stop finding them.
+    pub stopped_short: Vec<u64>,
 }
 
 impl PrefixIndex {
@@ -756,11 +777,15 @@ impl PrefixIndex {
                 end: at,
                 alive: false,
                 material: false,
+                header: false,
+                closed: false,
             },
             None => PemExtent {
                 end: if rule_alive { region.len() } else { at },
                 alive: rule_alive,
                 material: false,
+                header: false,
+                closed: false,
             },
         }
     }
@@ -813,6 +838,17 @@ impl PrefixIndex {
     /// drops a candidate one of them covers; see
     /// [`OutputProcessor::process`](super::OutputProcessor::process).
     ///
+    /// **And the key-body lines after a candidate that stopped short**
+    /// (`resumed`; the independent review of GH #242). A candidate stops at
+    /// the first byte that is not PEM text, and a key's body can go on
+    /// after one: the next screenful of `less`, the middle of a key
+    /// printed by `sed` in chunks, every line of a key printed with a
+    /// timestamp or a `bat` gutter in front of it. Before GH #242 all of
+    /// those were masked with the rest of the carry; `pem::body_lines`
+    /// masks the lines among them that carry key body, for the same
+    /// `UNVOUCHED_CARRY_BYTES` past the anchor, and keeps the rest.
+    /// `end` says whether the region's last line may still be arriving.
+    ///
     /// Same anchor rules as [`Self::earliest_partial`] — the word
     /// boundary, the prefix, one byte after it — and one entry per anchor.
     pub fn unterminated_candidates(
@@ -820,8 +856,24 @@ impl PrefixIndex {
         rules: &RuleSet,
         region: &[u8],
         region_start: u64,
+        end: RegionEnd,
     ) -> Vec<Unterminated> {
+        self.candidate_scan(rules, region, region_start, end).found
+    }
+
+    /// [`Self::unterminated_candidates`], and the anchors whose body lines
+    /// it followed — which a surface that forgets bytes needs, and nothing
+    /// else does.
+    pub fn candidate_scan(
+        &self,
+        rules: &RuleSet,
+        region: &[u8],
+        region_start: u64,
+        end: RegionEnd,
+    ) -> CandidateScan {
         let mut out = Vec::new();
+        let mut stopped_short = Vec::new();
+        let mut follow: Vec<(usize, usize)> = Vec::new();
         for (i, byte) in region.iter().enumerate() {
             if !self.binary_first_byte[byte.to_ascii_lowercase() as usize] {
                 continue;
@@ -849,12 +901,52 @@ impl PrefixIndex {
                         end: region_start + e.end as u64,
                         in_flight: e.alive,
                         material: e.material,
+                        resumed: false,
                     });
+                }
+                if e.stopped_short() {
+                    stopped_short.push(region_start + i as u64);
+                    let reach = (i + super::UNVOUCHED_CARRY_BYTES).min(region.len());
+                    if e.end < reach {
+                        follow.push((e.end, reach));
+                    }
                 }
                 break;
             }
         }
-        out
+        // One walk per stretch of the region some stopped candidate
+        // reaches, not one per candidate: a file of prose mentioning the
+        // header on every other line would otherwise walk the same
+        // sixteen kilobytes once for each.
+        follow.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(follow.len());
+        for (from, to) in follow {
+            match merged.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+        for (from, to) in merged {
+            let lines = pem::body_lines(region, from, to, end);
+            out.extend(lines.ranges.into_iter().map(|(s, e)| Unterminated {
+                start: region_start + s as u64,
+                end: region_start + e as u64,
+                in_flight: false,
+                material: true,
+                resumed: true,
+            }));
+            out.extend(lines.hold_from.map(|h| Unterminated {
+                start: region_start + h as u64,
+                end: region_start + to as u64,
+                in_flight: true,
+                material: false,
+                resumed: true,
+            }));
+        }
+        CandidateScan {
+            found: out,
+            stopped_short,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -2510,12 +2602,13 @@ mod tests {
         assert!(!rules.rules[pk].regex.is_match(&lone_continuation));
         assert!(!index.binary_in_flight(pk, &lone_continuation, 0));
         assert_eq!(
-            index.unterminated_candidates(&rules, &lone_continuation, 0),
+            index.unterminated_candidates(&rules, &lone_continuation, 0, RegionEnd::Arriving),
             vec![Unterminated {
                 start: 0,
                 end: kill as u64,
                 in_flight: false,
-                material: true
+                material: true,
+                resumed: false,
             }],
             "the whole body in front of the byte that ended it is reported, \
              and every surface masks what is reported"

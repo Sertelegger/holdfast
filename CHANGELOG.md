@@ -401,10 +401,25 @@ is cut, named and published is in
   dies *with key material behind it* — `head -n 15 id_rsa` and then a prompt —
   is masked from its header to the line that ended it, on the read, the grid
   and the stream alike, rather than released; and a key still arriving when a
-  `watch` stream ends is masked rather than flushed. The residual is stated in
-  `output/pem.rs`: a key cut inside the first sixteen characters of its body,
-  or one a program interrupts with junk and then paints over, is judged on the
-  bytes rather than on what a terminal would show.
+  `watch` stream ends is masked rather than flushed. **And the key body that
+  goes on after a candidate stopped is masked too**, which the narrowing had
+  released and the independent review found: the next screenful of `less`
+  (`less` then a space returned 23 raw body lines with `redactions: {}`), the
+  middle of a key `sed` prints in chunks, and every line of a key printed under
+  a timestamp, a `bat` gutter or a diff's `-` that a pager cut off before its
+  `-----END`, which also covers such a key longer than the read's lookahead.
+  After a private-key header that stopped short of its closing boundary, each
+  line within the carry that carries a key-body run — 48 base64 characters,
+  or 16 on the line after one — is masked on the read, the grid and `watch`,
+  and nothing else is: the prompt, the command and ordinary output between
+  them keep their text. To do that on `watch`, the stream keeps the header in
+  its lookbehind for the carry and holds a line that may still be key body
+  until its line break arrives. The residuals are stated in `output/pem.rs`: a
+  key cut inside the first sixteen characters of its body; a body line of
+  fewer than 48 characters that follows no other; a line holding a SHA-256
+  digest inside the carry behind a private-key header, which is masked; and a
+  key painted a colour per character (`grep -n .` under `--color=auto`), whose
+  header is not in the raw bytes at all.
 
 - **A read window that cannot vouch for a region now emits one
   `[REDACTED:unresolved]` over it and completes, instead of choosing between
