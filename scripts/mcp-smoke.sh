@@ -551,11 +551,16 @@ jcheck "initialize's instructions name every tool" \
 # over. jq's `length` counts codepoints where the client counts UTF-16
 # units; the Rust row counts units, and this text is ASCII. `type` first,
 # so a response that never arrived is `"null"` rather than a `null` that
-# jq happily measures as short. The 512 is the first quarter of the
-# budget -- the Rust row's `SAFETY_RULES_WITHIN`.
+# jq happily measures as short. 2048 is `mcp::CLIENT_INSTRUCTIONS_BUDGET`
+# and 512 its first quarter, the Rust row's `SAFETY_RULES_WITHIN`; the
+# needles are that row's too, and each must END inside the quarter, as
+# there, rather than merely start in it.
 jcheck "initialize's instructions fit the client's budget with the secret rule first (GH #230)" \
-  'resp(1).result.instructions
-   | [type, (length <= 2048), ((index("NEVER send_input") // 99999) < 512)]' \
+  'resp(1).result.instructions as $i
+   | [($i | type), ($i | length <= 2048),
+      (["AwaitingSecret","request_secret_input","NEVER send_input"]
+       | map(. as $n | ($i | index($n)) as $x | ($x != null and $x + ($n | length) <= 512))
+       | all)]' \
   '["string",true,true]'
 # And the two tool descriptions the short instructions now lean on: what
 # `[REDACTED:unresolved]` is and the audited way past it (GH #242), and the

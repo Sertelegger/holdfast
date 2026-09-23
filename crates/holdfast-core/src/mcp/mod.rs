@@ -45,29 +45,33 @@ use std::sync::Arc;
 // `scripts/mcp-smoke.sh` asserts every tool name appears here.
 //
 // **Rules first, and the whole of it inside the client's budget (GH
-// #230).** Claude Code keeps the first 2048 characters of a server's
-// instructions and drops the rest — read off its 2.1.280 bundle:
-// `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH ?? 2048`, compared against a
-// JavaScript string length, so UTF-16 code units. This text ran past that
-// and put its one safety rule last: *at a password prompt use
-// request_secret_input, never send_input* started past the cut, so no
-// agent on the default transport ever read it, and the likely failure is
-// an agent asking the user to paste the password into the chat. The dogfood
+// #230).** Claude Code keeps the head of a server's instructions and drops
+// the rest — `CLIENT_INSTRUCTIONS_BUDGET` below says how much and where
+// that number comes from. This text ran past it and put its one safety
+// rule last: *at a password prompt use request_secret_input, never
+// send_input* started past the cut, so no agent on the default transport
+// ever read it, and the likely failure is an agent asking the user to
+// paste the password into the chat. The dogfood
 // log's `truncated from 3165` was the **shim's** string — this plus its
 // suffix — which is the one the plugin's `holdfast mcp` serves on Unix;
 // `--no-daemon` and Windows serve this alone. Both are asserted, through
 // `get_info`, by `tests::assert_instructions_survive_the_client`.
 //
-// So the order is the priority: the secret rule, then how to wait for a
-// command without guessing at `$PS1`, then what the state fields mean,
-// then output handling (including what `[REDACTED:unresolved]` is, GH
-// #242), then a one-line map of the rest. Per-tool detail belongs in the
-// tool's own description, which the client carries separately.
+// So the order is the priority: the secret rule — including what to do
+// when nobody answers it, since under `--no-daemon` and on Windows nothing
+// can — then how to wait for a command without guessing at `$PS1`, then
+// what the state fields mean, then output handling (including what
+// `[REDACTED:unresolved]` is, GH #242), then a one-line map of the rest.
+// Per-tool detail belongs in the tool's own description, which the client
+// carries separately; what this text used to say about `wait_for_pattern`
+// moved into that tool's.
 pub const INSTRUCTIONS: &str = "Holdfast gives you persistent PTY-backed terminal sessions.\n\n\
      SECRETS: when interaction_mode is AwaitingSecret the session is at a \
      password prompt. Use request_secret_input, NEVER send_input, and never \
      ask the user to paste a secret into chat: a human at an attached client \
-     types it into the terminal, and you get back only a byte count.\n\n\
+     types it into the terminal and you get back only a byte count. If it is \
+     cancelled, tell the user which command needs a credential; never ask \
+     for it in chat.\n\n\
      WAITING: to wait for a command, call wait_for_pattern with NO pattern; \
      it returns once the session is not Executing. Never pass a regex for \
      the shell's prompt: it guesses at $PS1, never matches a custom one, and \
@@ -82,14 +86,25 @@ pub const INSTRUCTIONS: &str = "Holdfast gives you persistent PTY-backed termina
      OUTPUT: read_output pages with a cursor you carry between calls. \
      Output is ANSI-stripped and secrets become [REDACTED:<kind>]. \
      [REDACTED:unresolved] means no rule matched but the read could not \
-     rule a secret out; it is often ordinary text, and a larger max_bytes \
-     may resolve it. redact:false shows raw bytes and is audit-logged.\n\n\
+     rule a secret out; it is often ordinary text and a later re-read may \
+     clear it. redact:false shows raw bytes and is audit-logged.\n\n\
      TOOLS: start_session spawns a shell or program; send_input types into \
-     it; interrupt sends Ctrl+C to the foreground process group, sparing the \
-     shell; terminate ends the session and its process group; \
-     get_screen_state returns the rendered grid, right for full-screen \
-     programs (diff_from: changes only); resize sets the size and sends \
-     SIGWINCH; status and list_sessions describe sessions.";
+     it; interrupt sends Ctrl+C to the foreground process group; terminate \
+     ends the session and its process group; get_screen_state returns the \
+     rendered grid, the read for full-screen programs; resize sets the size \
+     and sends SIGWINCH; status and list_sessions describe sessions.";
+
+/// How much of a server's `instructions` Claude Code passes to the model,
+/// in UTF-16 code units (GH #230).
+///
+/// Read off the 2.1.280 bundle: `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH ??
+/// 2048`, compared against a JavaScript `.length`, and the cut keeps the
+/// **head**. One constant for every Rust row that holds text to it — the
+/// instructions on both transports, and the tool descriptions, which the
+/// same knob is named for. `scripts/mcp-smoke.sh` carries the number as a
+/// literal, because a shell script cannot import it; its comment points
+/// here.
+pub const CLIENT_INSTRUCTIONS_BUDGET: usize = 2048;
 
 /// Buffered `list_changed` pulses before a slow subscriber starts
 /// missing them. Small on purpose: the notification is idempotent — a
@@ -879,19 +894,12 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// How much of a server's `instructions` Claude Code passes to the
-    /// model, in UTF-16 code units: 2.1.280's
-    /// `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH ?? 2048`, measured with a
-    /// JavaScript `.length`. The cut keeps the **head**, so a rule past it
-    /// is a rule no agent reads (GH #230).
-    pub(super) const CLAUDE_CODE_INSTRUCTIONS_BUDGET: usize = 2048;
-
     /// Where the secret rule has to start by: the first quarter of the
     /// budget. Fitting the budget is what makes today's client read all of
     /// it; this is what keeps the rule first, so a client with a smaller
     /// cut — or a later edit that grows the text — loses the map at the
     /// end and not the rule at the top.
-    pub(super) const SAFETY_RULES_WITHIN: usize = CLAUDE_CODE_INSTRUCTIONS_BUDGET / 4;
+    pub(super) const SAFETY_RULES_WITHIN: usize = CLIENT_INSTRUCTIONS_BUDGET / 4;
 
     /// The one assertion both transports' `instructions` go through, so
     /// the in-process text and the shim's cannot be held to two different
@@ -905,9 +913,9 @@ mod tests {
     pub(super) fn assert_instructions_survive_the_client(transport: &str, text: &str) {
         let units = text.encode_utf16().count();
         assert!(
-            units <= CLAUDE_CODE_INSTRUCTIONS_BUDGET,
+            units <= CLIENT_INSTRUCTIONS_BUDGET,
             "{transport}: the instructions are {units} UTF-16 units and Claude Code keeps \
-             {CLAUDE_CODE_INSTRUCTIONS_BUDGET}; everything past the cut never reaches the \
+             {CLIENT_INSTRUCTIONS_BUDGET}; everything past the cut never reaches the \
              model. Move detail into the tool's own description."
         );
         // The head a client with a quarter of the budget would keep,

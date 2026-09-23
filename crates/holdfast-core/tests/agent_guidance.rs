@@ -12,7 +12,7 @@
 //! needle is matched against whitespace-collapsed text.
 
 use holdfast_core::mcp::passthrough;
-use holdfast_core::mcp::HoldfastServer;
+use holdfast_core::mcp::{HoldfastServer, CLIENT_INSTRUCTIONS_BUDGET};
 
 fn description(tool: rmcp::model::Tool) -> String {
     tool.description
@@ -30,23 +30,53 @@ fn description(tool: rmcp::model::Tool) -> String {
 /// repository's own CHANGELOG it covered whole sections of ordinary prose.
 ///
 /// Each needle is a separate thing the agent has to be able to act on:
-/// what the marker is (and that it is not a rule's), that a larger read
-/// may clear it, the audited way to the raw text, and that `redactions` is
-/// how a real marker is told from one that was already in the text.
+/// what the marker is (and that it is not a rule's), that a re-read is
+/// **not** a guaranteed way past it, the audited way to the raw text, and
+/// that `redactions` is how a real marker is told from one that was
+/// already in the text.
+///
+/// The second needle is a promise *not* made, and it is pinned for that
+/// reason. `output/mod.rs` records that a larger `max_bytes` "is **not** a
+/// general recourse" and that protection is non-monotonic in it — a read
+/// that reaches `buffer.head` takes a branch `max_bytes` cannot move — so
+/// a description telling the agent a bigger read resolves the marker
+/// would send it round a loop that ends at `redact: false` anyway.
 #[test]
 fn read_output_explains_the_unresolved_marker_and_the_audited_way_past_it() {
     let d = description(HoldfastServer::read_output_tool_attr());
     for needle in [
         "[REDACTED:unresolved]",
         "no rule matched",
-        "larger `max_bytes`",
-        "`redact: false`",
+        "neither is guaranteed",
+        "The reliable way to the text is `redact: false`",
         "audit log",
         "`redactions` counts only the markers this response substituted",
     ] {
         assert!(
             d.contains(needle),
             "read_output's advertised description dropped {needle:?}:\n{d}"
+        );
+    }
+}
+
+/// **What the old instructions said about `wait_for_pattern`, now on the
+/// tool itself.** GH #230's rewrite cut the instructions to what an agent
+/// must not miss and moved per-tool detail to the tool it is about. These
+/// three were only ever in the instructions: that a pattern-less wait
+/// returns at once for the three non-`Executing` modes, that
+/// `prompt.reason` separates a measured prompt from a guessed one, and
+/// that an unmatched wait at a measured prompt says so in `warning`.
+#[test]
+fn wait_for_pattern_carries_what_the_instructions_used_to_say_about_it() {
+    let d = description(HoldfastServer::wait_for_pattern_tool_attr());
+    for needle in [
+        "come back at once rather than at the deadline",
+        "`prompt.reason`",
+        "`warning`",
+    ] {
+        assert!(
+            d.contains(needle),
+            "wait_for_pattern's advertised description dropped {needle:?}:\n{d}"
         );
     }
 }
@@ -78,7 +108,7 @@ fn send_input_points_a_password_prompt_at_request_secret_input() {
 /// answered the hard way. Counted in UTF-16 units, as the client counts.
 #[test]
 fn every_tool_description_fits_the_same_budget() {
-    const BUDGET: usize = 2048;
+    const BUDGET: usize = CLIENT_INSTRUCTIONS_BUDGET;
     let tools = passthrough::tool_manifest();
     assert!(tools.len() >= 12, "the router lost tools");
     for tool in tools {

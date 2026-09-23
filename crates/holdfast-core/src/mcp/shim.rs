@@ -546,12 +546,20 @@ mod tests {
         let sock = dir.join("control.sock");
         // No request is issued; the stand-in only completes the handshake.
         let _captured = stand_in_daemon(sock.clone(), CborValue::Map(vec![]));
-        let client = loop {
+        // Bounded, unlike the loops above it: a stand-in that failed to
+        // bind is a failure with a message, not a row that spins until
+        // nextest's kill names it.
+        let mut client = None;
+        for _ in 0..500 {
             match ControlClient::connect(&sock, ClientKind::Shim).await {
-                Ok(c) => break c,
+                Ok(c) => {
+                    client = Some(c);
+                    break;
+                }
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
             }
-        };
+        }
+        let client = client.expect("the stand-in daemon never accepted a connection");
         let text = ShimServer::new(Arc::new(client))
             .get_info()
             .instructions

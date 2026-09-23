@@ -137,7 +137,8 @@ fn every_tool_advertises_a_closed_input_schema() {
              tool refuses: {schema}"
         );
         // A tool with no arguments still advertises `properties`, as it did
-        // before it gained an argument type: some clients require the key.
+        // before it gained an argument type, so the refusal is the only
+        // change a client sees on that schema.
         assert!(
             schema.get("properties").is_some_and(Value::is_object),
             "`{name}` advertises no `properties` object: {schema}"

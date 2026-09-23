@@ -840,11 +840,12 @@ impl HoldfastServer {
     /// They belong to something that started like a secret (a private-key
     /// header, or a token-shaped run of characters) whose end this read
     /// could not see, so they could not be vouched for. It is often
-    /// ordinary text. A larger `max_bytes` may resolve it; if you need the
-    /// text itself, `redact: false` returns it raw and is recorded in the
-    /// audit log. `redactions` counts only the markers this response
-    /// substituted, so marker-shaped text that was already in the output
-    /// is not counted.
+    /// ordinary text. A re-read — later, once more output has arrived, or
+    /// with a different `max_bytes` — sometimes clears it, but neither is
+    /// guaranteed. The reliable way to the text is `redact: false`, which
+    /// returns it raw and is recorded in the audit log. `redactions` counts
+    /// only the markers this response substituted, so marker-shaped text
+    /// that was already in the output is not counted.
     #[tool(
         annotations(
             title = "Read session output",
@@ -1378,6 +1379,14 @@ impl HoldfastServer {
     /// call is in flight is not missed. match.text and
     /// output_since_start are secret-redacted; match.offset is the raw
     /// byte offset.
+    ///
+    /// With no pattern it waits for the session to stop executing and
+    /// returns as soon as it is anything but `Executing`, so `Fullscreen`,
+    /// `AwaitingSecret` and `Exited` come back at once rather than at the
+    /// deadline: read `interaction_mode`, because each needs a different
+    /// action. `detection_tier` and `prompt.reason` tell a measured prompt
+    /// from a guessed one. A wait that ends unmatched against a session
+    /// already back at a measured prompt says so in `warning`.
     #[tool(
         annotations(
             title = "Wait for a regex to match output",
@@ -4864,7 +4873,7 @@ pub struct GetCommandHistoryArgs {
 /// advertised schema and the deserialiser say the same thing, and it
 /// makes the refusal name the key and list the valid ones — serde's own
 /// *"unknown field \`patern\`, expected one of \`session\`, \`pattern\`,
-/// …"*, which `request_secret_input` has always given.
+/// …"*, which `request_secret_input` already gave.
 ///
 /// **Why no MCP client breaks.** Protocol metadata travels in
 /// `params._meta`, beside `arguments` rather than inside it — rmcp
@@ -4875,17 +4884,18 @@ pub struct GetCommandHistoryArgs {
 ///
 /// **Skew is the one real cost, and it is the right way round.** A shim a
 /// minor ahead forwards an argument its own `tools/list` advertised to a
-/// daemon that predates it, and that daemon now refuses the call naming
-/// the argument, where it used to run the call without it. GH #169's
-/// `apply_holdback` is what the old behaviour costs: an older daemon
-/// silently dropped it and served the bypassing read the caller had
+/// daemon that predates the argument; from this release on, that daemon
+/// refuses the call naming the argument where it used to run the call
+/// without it. GH #169's `apply_holdback` is what the old behaviour
+/// costs: a 0.0.7 daemon, which has neither the field nor this attribute,
+/// drops it without a word and serves the bypassing tail read the caller
 /// declined.
 ///
 /// **`properties: {}` is written in by hand.** schemars omits the key for
 /// a struct with no fields, and rmcp's own schema for an argument-free
 /// tool — what this tool advertised before — carries it. It is optional
-/// in JSON Schema and in MCP, and some clients' tool validators require it
-/// anyway, so the refusal is added without taking it away.
+/// in JSON Schema and in MCP; keeping it means the only change a client
+/// sees on this schema is the refusal, and not a key going missing.
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("properties" = {}))]

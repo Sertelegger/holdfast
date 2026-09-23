@@ -225,8 +225,8 @@ is cut, named and published is in
   `wait_for_pattern { patern: … }` became a pattern-less wait and answered
   `ok, session is AtPrompt`, `send_input { apend_newline: false }` wrote the
   newline anyway, and `list_sessions { session: … }` returned every session.
-  The refusal is serde's, and it is the one `request_secret_input` has always
-  given — *unknown field \`patern\`, expected one of \`session\`,
+  The refusal is serde's, and it is the one `request_secret_input` already
+  gave — *unknown field \`patern\`, expected one of \`session\`,
   \`pattern\`, …* — so it names the key and lists the valid ones. The
   advertised `inputSchema` of all twelve now says `additionalProperties:
   false`, so the schema and the deserialiser agree; before, they agreed only
@@ -687,9 +687,17 @@ is cut, named and published is in
   priority order — secrets, then how to wait for a command without guessing
   at `$PS1`, then what `interaction_mode` and `detection_tier` mean, then
   output handling, then a one-line map of the rest — and now also says
-  never to ask for a secret in chat. `send_input`'s own description says
-  the same thing, and the hybrid transport's suffix says how a human
-  answers: `holdfast attach <session>`.
+  never to ask for a secret in chat, and what to do when nobody answers:
+  under `--no-daemon` and on Windows there is no `attach.sock`, so a
+  request can only time out, and the agent is told to name the command
+  that needs the credential rather than ask for it. `send_input`'s own
+  description carries the password rule, the hybrid transport's suffix
+  says how a human answers (`holdfast attach <session>`), and what the old
+  text said about `wait_for_pattern` alone — that a pattern-less wait
+  returns at once for `Fullscreen`, `AwaitingSecret` and `Exited`, that
+  `prompt.reason` tells a measured prompt from a guessed one, and the
+  `warning` on an unmatched wait at a measured prompt — moved into that
+  tool's description.
 
   **Both strings a client can receive are held to the budget, through
   `get_info`:** the shim's — the shared text plus its suffix, which is what
@@ -705,9 +713,11 @@ is cut, named and published is in
   explanation half).** It is the one marker that names no rule — nothing
   matched those bytes, and the read could not vouch for them — and agents
   were told nothing about it, so they read it as *a secret was here*.
-  `read_output`'s description now says what it is, that a larger
-  `max_bytes` may resolve it, that `redact: false` returns the raw text and
-  is audit-logged, and that `redactions` counts only the markers a response
+  `read_output`'s description now says what it is, that a re-read — later,
+  or with a different `max_bytes` — sometimes clears it but is not
+  guaranteed to (`output/mod.rs` records protection as non-monotonic in
+  `max_bytes`), that `redact: false` is the reliable way to the text and is
+  audit-logged, and that `redactions` counts only the markers a response
   substituted, which is how a real marker is told from marker-shaped text
   already in the output. The server instructions carry the short form. How
   much the marker masks is the other half of GH #242 and is not changed
