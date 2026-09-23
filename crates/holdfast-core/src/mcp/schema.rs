@@ -209,7 +209,11 @@ pub enum ShellIntegration {
 /// Holdfast declined to inject: the snippet is installed and firing, and its
 /// markers are being dropped on arrival. Null until the first marker
 /// arrives, which is genuinely all Holdfast knows before the first prompt
-/// cycle.
+/// cycle. `holdfast_degraded` is Holdfast's own markers with the latest
+/// command's `C` arriving and no `B` before it — the prompt is regenerated
+/// over Holdfast's wrapping, so exit codes are real and `command` text is
+/// not captured (GH #220). The variants carry no doc comments on purpose:
+/// one would turn this `enum` into a `oneOf` in the published schema.
 ///
 /// A new **field** rather than a fourth value on `ShellIntegration`, and
 /// §12.3 is the reason: the append-only rule is written over fields —
@@ -223,6 +227,7 @@ pub enum Osc133Source {
     Holdfast,
     External,
     Mixed,
+    HoldfastDegraded,
 }
 
 /// The `prompt` object carried by every prompt-bearing response (§18.2a).

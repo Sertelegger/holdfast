@@ -578,7 +578,7 @@ jcheck "the §18.2a vocabularies reach the wire" \
       .ScreenTracking.enum, .SessionState.enum, .HeldBackCause.enum]
    + [tool("status").outputSchema["$defs"].ShellIntegration.enum,
       tool("status").outputSchema["$defs"].Osc133Source.enum]' \
-  '[["ok","timeout","session_died","secret_provided","secret_cancelled","session_not_found","name_taken","limit_reached","spawn_failed","not_supported_on_platform","unavailable"],["AtPrompt","Executing","AwaitingSecret","Fullscreen","Exited"],["semantic","terminal_mode","heuristic"],["off","on"],["Starting","Running","Exited","Dead"],["in_flight_secret","incomplete_escape"],["bash","zsh","fish"],["holdfast","external","mixed"]]'
+  '[["ok","timeout","session_died","secret_provided","secret_cancelled","session_not_found","name_taken","limit_reached","spawn_failed","not_supported_on_platform","unavailable"],["AtPrompt","Executing","AwaitingSecret","Fullscreen","Exited"],["semantic","terminal_mode","heuristic"],["off","on"],["Starting","Running","Exited","Dead"],["in_flight_secret","incomplete_escape"],["bash","zsh","fish"],["holdfast","external","mixed","holdfast_degraded"]]'
 
 # GH #195: `held_back` is two rules and the response named which for
 # neither, so an agent could not tell §4.1's boundary from REQ-O-008's

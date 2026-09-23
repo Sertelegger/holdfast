@@ -13,6 +13,13 @@ is cut, named and published is in
 
 ### Added
 
+- `osc133_source` gains a fourth value, **`holdfast_degraded`**: every marker
+  is Holdfast's own, but the latest command's `C` arrived with no `B` in
+  front of it — the prompt is being regenerated over Holdfast's wrapping, so
+  exit codes are real and `command` text cannot be captured. It used to say
+  `holdfast` there, the one answer a caller checks before trusting the
+  history ([#220]).
+
 - A `windows-2022` CI job: native MSVC clippy over `--all-targets`, the source
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
@@ -850,6 +857,103 @@ is cut, named and published is in
   that claimed to be complete. The clamp is gone: the session front-clips an
   oversized tail itself, keeps the newest bytes, and sets the flag, exactly
   as `tail_lines` always did.
+
+- **A pattern-less wait right after a key to a full-screen program could
+  answer from before the key** ([#248]). `send_input{data: "q"}` to `less`
+  and then `wait_for_pattern` with no pattern answered `Fullscreen` in under
+  a millisecond, 3 times in 10 here, because `less` had not read the `q`
+  yet — and an agent that believes it presses `q` again, leaving a stray `q`
+  at the shell. A `Fullscreen` or `AwaitingSecret` already showing at the
+  wait's first sample is now not the answer until there is evidence it is
+  current: the child has printed something since the last input reached it
+  and the mode has held for the settle window, or nothing has come back and
+  it has held for two seconds (never less than the settle window, never past
+  the deadline). One the wait watched arrive answers at once, as before, and
+  so does a prompt that replaces a held one. A settle-window hold alone, the
+  first form of this fix, only moved the stale answer: a `less` still
+  starting took longer than 250 ms to read its `q` under load. Measured with
+  a raw-mode program that reads its key 600 ms late: that hold answered
+  `Fullscreen` 10 times in 10, this one `AtPrompt` 10 times in 10. Still
+  open: a program slower than the two-second hold and silent until then,
+  and output that is not an answer to the key — a draw still in flight, or
+  the line discipline echoing it while `ECHO` is on.
+
+- **`wait_for` and `wait_for_pattern` could not match coloured output with a
+  pattern written from the text an agent reads** ([#238]). cargo prints its
+  verdict as `test result: \x1b[32mok\x1b[m`, so `wait_for: "test result:
+  ok"` used its whole deadline and answered `timeout` on a run that had
+  succeeded — with the matching text in the same response's
+  `output_since_start`. The scan window now carries an escape-free view
+  beside the raw bytes, built by the read path's own stripper with a map
+  back to raw offsets (one entry per escape, not per byte), and the pattern
+  is searched in both; the earlier match wins. A pattern that spells an
+  escape still matches the raw bytes, and `match.offset` is still a raw byte
+  offset, as §5.2 requires.
+
+- **A program stopped at a `[Y/n] ` confirmation could read `Executing` for
+  the whole wait** ([#240]). The detector records who held the terminal when
+  a signal arrived, so that a shell's markers license nothing about the
+  program it launches — and it took that sample when the reader *scanned*
+  the chunk, not when the shell *emitted* it. bash emits `PS0`'s `C` (and
+  readline its paste-off) and forks in the same breath, so a reader that
+  reached the chunk a moment late recorded the **child** as the owner of
+  both; owner then equalled holder, both executing rungs stayed licensed,
+  and a pattern-less wait ran out its deadline. The dogfood pass measured 2
+  trials in 8 on a loaded box. Now a `C` takes the owner recorded at the
+  shell's last `A`/`B`/`D`, and a paste-off that ends an enabled paste keeps
+  the owner that enabled it — both sampled while the shell sat idle holding
+  the terminal. Measured causally: a 30 ms delay in front of the reader's
+  owner sample made the unfixed build answer `Executing` / `semantic` for
+  the whole 4 s wait in 8 trials of 8, and the fixed build `AtPrompt` in 8
+  of 8. Not covered: a `[Y/n]` asked by a shell builtin (`read -p` in a
+  function or a sourced installer) still reads `Executing`, because the
+  shell really is running it.
+
+- **A prompt that regenerates `PS1` at every prompt — starship, the owner's —
+  emptied `get_command_history` and dropped the session's first command**
+  ([#220]). Holdfast wrapped `PS1` with its `A`/`B` markers once; starship's
+  `PROMPT_COMMAND` hook assigns `PS1` afresh before every prompt, so from the
+  first prompt on no `B` arrived, the echo capture never armed, and every
+  entry was `command: ""` beside a correct exit code. Worse, the first command
+  was suppressed outright: its `C` looked like Holdfast's own injection line
+  to the history ring, which took any first `C` with no `B` before it for
+  one. Measured on this machine's starship bash before the fix: three entries
+  for four commands, all empty, at `terminal_mode`, while `osc133_source`
+  said `holdfast`. Now:
+
+  - the bash snippet re-wraps the prompt (and `PS0`) from the **end** of
+    `PROMPT_COMMAND`, after whatever regenerated it — as its own element
+    when `PROMPT_COMMAND` is an array, so a regenerator at index ≥ 1 cannot
+    run after it — and zsh's `precmd` does the same for a configuration that
+    assigns `PS1` there (starship's zsh integration sets `PROMPT` once and
+    was measured unaffected). The call is joined with a newline, so a
+    `PROMPT_COMMAND` ending in `;`, `; `, a newline or a `# comment` keeps
+    parsing — `; ` did not, and made bash print a syntax error at every
+    prompt and run none of the line. And it goes immediately *before*
+    bash-preexec's `__bp_interactive_mode`, which has to run last: after
+    it, bash-preexec's `DEBUG` trap took `__holdfast_p` for the user's
+    command and no `preexec` hook — atuin, iTerm2's integration, starship's
+    `took 2s` under bash-preexec — ran for any command. Both were found in
+    review, and measured against bash-preexec 0.5.0, 0.6.0 and master;
+  - the injection-line rule applies only to a *foreign* `C`: Holdfast's own
+    `C` cannot mark the line that installed it, because the snippet defines
+    that emitter while the line runs;
+  - a prompt width is counted in characters, not bytes. The owner's starship
+    prompt ends `⬢ [Docker] ❯ ` — 13 columns, 17 bytes — so a human's Ctrl-U
+    at it came back as `[REDACTED:unresolved]` for a command that was whole;
+  - when the prompt markers still do not arrive (a hook appended *after*
+    the snippet ran, such as `eval "$(starship init bash)"` typed into a live
+    session) `osc133_source` says `holdfast_degraded`, and the T1 rung no
+    longer holds such a session at `Executing` / `semantic` on the `D` that
+    no `A` will ever follow.
+
+  Re-measured against the real starship: 4 of 4 entries with their text and
+  exit codes, at `semantic`, in bash and in zsh. The CI rows need no
+  starship — they drive a `PROMPT_COMMAND` (and a zsh `precmd`) that
+  regenerates the prompt every cycle.
+
+  Also corrected in passing: `shell.rs` said zsh runs `precmd_functions`
+  before the bare `precmd`. zsh 5.9 does the reverse, measured.
 
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
@@ -2281,3 +2385,7 @@ residuals that are known and accepted.
 [#224]: https://github.com/Sertelegger/holdfast/issues/224
 [#242]: https://github.com/Sertelegger/holdfast/issues/242
 [#247]: https://github.com/Sertelegger/holdfast/issues/247
+[#220]: https://github.com/Sertelegger/holdfast/issues/220
+[#240]: https://github.com/Sertelegger/holdfast/issues/240
+[#238]: https://github.com/Sertelegger/holdfast/issues/238
+[#248]: https://github.com/Sertelegger/holdfast/issues/248

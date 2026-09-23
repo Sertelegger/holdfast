@@ -1053,7 +1053,8 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
         match s {
             Src::Holdfast => Some(Src::External),
             Src::External => Some(Src::Mixed),
-            Src::Mixed => None,
+            Src::Mixed => Some(Src::HoldfastDegraded),
+            Src::HoldfastDegraded => None,
         }
     }
     let mut sources = vec![Src::Holdfast];
@@ -1135,7 +1136,7 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
     );
     assert_eq!(emitted_states.len(), 4);
     assert_eq!(emitted_shells.len(), 3);
-    assert_eq!(emitted_sources.len(), 3);
+    assert_eq!(emitted_sources.len(), 4);
     assert_eq!(emitted_causes.len(), 2);
 }
 
