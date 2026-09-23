@@ -2351,6 +2351,71 @@ fn watch_ends_when_its_reader_does() {
     shim.kill();
 }
 
+/// `watch`'s *writes* go through the same checked path, not only its
+/// departed-reader watch: a stdout that refuses every write is said so,
+/// exit 1, rather than rendered into for ever. `/dev/full` fails each write
+/// with `ENOSPC` and never reports a hang-up to `poll`, so this is the one
+/// place the write path is what ends the watcher on Linux — the rows above
+/// are ended by the departed-reader thread before a write is attempted.
+#[test]
+fn watch_reports_a_stdout_it_cannot_write() {
+    if !Path::new("/dev/full").exists() {
+        println!("skipping: no /dev/full on this platform");
+        return;
+    }
+    let env = TestEnv::new("watchfull");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "full" }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let mut watch = env
+        .cmd()
+        .args(["watch", "full"])
+        .stdin(Stdio::null())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn holdfast watch");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = watch.try_wait().expect("wait for watch") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = watch.kill();
+            let _ = watch.wait();
+            panic!("`holdfast watch > /dev/full` rendered into a failing stdout for 30s");
+        }
+        shim.call_tool(
+            "send_input",
+            json!({ "session": session_id, "data": "echo into-the-void" }),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let mut err = String::new();
+    watch
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut err)
+        .expect("read stderr");
+    assert_eq!(status.code(), Some(1), "{status}; stderr: {err}");
+    assert!(err.contains("cannot write to stdout"), "{err}");
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
 /// **A watcher of a session that has gone quiet ends when its reader
 /// does**, not at the session's next output — `holdfast watch s | grep -m1
 /// READY` against a server that logged `READY` and then waited used to

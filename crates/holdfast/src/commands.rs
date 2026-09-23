@@ -2571,8 +2571,17 @@ pub async fn watch(session: &str) -> ExitCode {
     use holdfast_core::protocol::frame;
 
     // Its stdout is the one this process exists for, so a reader that
-    // leaves ends it — at once, not at the session's next output (GH #218).
+    // leaves ends it as `cat` would (GH #218) — at once, not at the
+    // session's next output.
     crate::out::end_when_reader_leaves();
+    // **And every write below goes through `out`, under the name every
+    // arm already uses.** The module's `render` discards write errors,
+    // which is right for `attach` — its stdout is the terminal it holds in
+    // raw mode, and dying there would skip the restore — and was why
+    // `holdfast watch | head` outlived its reader for ever. Shadowing it
+    // here rather than renaming each call keeps a paint added to this loop
+    // on the right side of that line without its author having to know.
+    let render = crate::out::bytes;
 
     let (rd, mut wr) =
         match dial_attach(session, AttachMode::ReadOnly, AttachRole::Observer, "watch").await {
@@ -2611,15 +2620,7 @@ pub async fn watch(session: &str) -> ExitCode {
                     }
                 };
                 match f {
-                    // `out::bytes` and not `render`: a watcher's stdout is
-                    // the one this process is for, and when its reader
-                    // goes — `holdfast watch build | head` — the process
-                    // ends as `cat` would (GH #218). `render` discarded the
-                    // error, so the watcher outlived its reader for ever.
-                    // `attach` keeps `render`: its stdout is the terminal
-                    // it holds in raw mode, and dying there would skip the
-                    // restore.
-                    ServerFrame::Output { bytes, .. } => crate::out::bytes(&bytes),
+                    ServerFrame::Output { bytes, .. } => render(&bytes),
                     ServerFrame::OutputGap { bytes, .. } => {
                         truncated.saw_gap(bytes);
                         report_gap("watch", bytes);
