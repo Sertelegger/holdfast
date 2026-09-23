@@ -13,9 +13,10 @@ use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::{server, spawn};
 // The `diag!` macro, not the module — every diagnostic below goes to
 // stderr, and on `holdfast daemon run` stderr is `daemon.log`, which §9.2
-// lists as a redacted boundary. `println!` is left alone throughout:
+// lists as a redacted boundary. Stdout is left unredacted throughout:
 // that is the subcommands' actual answer, and `holdfast logs --raw` is
-// specified to be unredacted.
+// specified to be unredacted. It is written through `crate::out` rather
+// than `println!`, which panics when the reader has gone (GH #218).
 use holdfast_core::diag;
 #[cfg(unix)]
 use holdfast_core::mcp::shim::ShimServer;
@@ -665,13 +666,13 @@ pub fn daemon_start() -> ExitCode {
     match spawn::start_detached(&paths, &exe) {
         Ok(spawn::StartOutcome::AlreadyRunning { pid }) => {
             match pid {
-                Some(p) => println!("daemon already running (pid {p})"),
-                None => println!("daemon already running"),
+                Some(p) => crate::out::line(&format!("daemon already running (pid {p})")),
+                None => crate::out::line("daemon already running"),
             }
             ExitCode::SUCCESS
         }
         Ok(spawn::StartOutcome::Started { pid }) => {
-            println!("daemon started (pid {pid})");
+            crate::out::line(&format!("daemon started (pid {pid})"));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -737,30 +738,99 @@ enum StopRpc {
     Failed(String),
 }
 
+/// How long a graceful `daemon/stop` may go unanswered before the operator
+/// is told why it is taking so long (GH #20).
+///
+/// Not a bound — [`STOP_RPC_TIMEOUT`] is — but the point past which silence
+/// reads as a hang. The ordinary cause is the whole of §3.2's grace: an
+/// interactive shell ignores `SIGTERM` (§4.4), so every stop with a shell
+/// in it waits the full ten seconds for the escalation, and it used to wait
+/// them without a word.
 #[cfg(unix)]
-async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
+const STOP_PROGRESS_AFTER: Duration = Duration::from_secs(1);
+
+/// How long `daemon stop` waits, after the daemon has answered or been
+/// killed, for the process to be gone (GH #20).
+///
+/// The answer is sent before the daemon's own teardown — the accept loop
+/// returns, the session sweep runs, `remove_runtime_files_we_own` takes
+/// `bind.lock` and removes the sockets and the pid file, and the runtime
+/// is given `SHUTDOWN_GRACE` to wind down — so a caller that trusted the
+/// answer raced all of that: `daemon stop && rm -rf "$HOLDFAST_RUNTIME_DIR"`
+/// removed the directory and the departing daemon's `ensure_dir` put it
+/// back. Generous, because the teardown is short and a loaded machine is
+/// the only thing that stretches it; a daemon still present at the end is
+/// reported rather than waited on for ever.
+#[cfg(unix)]
+const DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `daemon/stop`, preceded by `daemon/status` on the same connection.
+///
+/// **The status is asked first so the stop can be waited out.** The pid
+/// it carries is the daemon's own answer about itself, from a process that
+/// is demonstrably alive and serving *this* runtime directory — stronger
+/// evidence than `holdfast.pid`, which `confirm_daemon_pid` exists to
+/// distrust, and it is gone by the time the stop has been answered,
+/// because the teardown removes it. `sessions_live` is what the progress
+/// line reports. A daemon that cannot answer `status` is not asked to
+/// stop any differently: the pid is simply not known, and nothing is
+/// waited for.
+#[cfg(unix)]
+async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> (StopRpc, Option<u32>) {
     // No discoverable runtime directory means no socket to call on and
     // no `holdfast.pid` to read, which is the same outcome as nothing
     // listening — and is what the old `connect()` reported too, since a
     // failed `discover()` was raised as `ClientError::Connect`.
     let Some(paths) = paths else {
-        return StopRpc::NotRunning;
+        return (StopRpc::NotRunning, None);
     };
     let client = match ControlClient::connect(&paths.control_sock(), ClientKind::Cli).await {
         Ok(c) => c,
-        Err(ClientError::Connect { .. }) => return StopRpc::NotRunning,
-        Err(e) => return StopRpc::Failed(e.to_string()),
+        Err(ClientError::Connect { .. }) => return (StopRpc::NotRunning, None),
+        Err(e) => return (StopRpc::Failed(e.to_string()), None),
     };
+    let status = client
+        .call::<_, server::DaemonStatus>(method::METHOD_DAEMON_STATUS, &json!({}))
+        .await
+        .ok();
+    let pid = status.as_ref().map(|s| s.pid);
     let params = server::StopParams {
         force: Some(force),
         timeout_secs: None,
     };
-    match client
-        .call::<_, server::StopOutcome>(method::METHOD_DAEMON_STOP, &params)
-        .await
-    {
+    let stop = client.call::<_, server::StopOutcome>(method::METHOD_DAEMON_STOP, &params);
+    tokio::pin!(stop);
+    let answered = if force {
+        stop.await
+    } else {
+        tokio::select! {
+            r = &mut stop => r,
+            () = tokio::time::sleep(STOP_PROGRESS_AFTER) => {
+                diag!("holdfast daemon stop: {}", stop_progress_note(status.as_ref()));
+                stop.await
+            }
+        }
+    };
+    let rpc = match answered {
         Ok(outcome) => StopRpc::Stopped(outcome),
         Err(e) => StopRpc::Failed(e.to_string()),
+    };
+    (rpc, pid)
+}
+
+/// What a slow graceful stop says while it waits.
+#[cfg(unix)]
+fn stop_progress_note(status: Option<&server::DaemonStatus>) -> String {
+    let grace = server::DEFAULT_STOP_GRACE_SECS;
+    match status.map(|s| s.sessions_live) {
+        Some(0) => "waiting for the daemon to finish stopping".to_string(),
+        Some(n) => format!(
+            "waiting for {n} live session(s) to end — a shell ignores SIGTERM and is \
+             killed after {grace}s; `--force` does not wait"
+        ),
+        None => format!(
+            "waiting for the daemon's sessions to end — up to {grace}s; `--force` does not wait"
+        ),
     }
 }
 
@@ -773,6 +843,9 @@ async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
 /// accept loop will not hear — so `--force` follows it with a signal to
 /// the daemon process itself, whether the RPC answered, failed, or never
 /// came back.
+///
+/// **Either way it returns once the daemon is gone, not once it has been
+/// asked** (GH #20) — see [`DAEMON_EXIT_TIMEOUT`].
 #[cfg(unix)]
 pub async fn daemon_stop(force: bool) -> ExitCode {
     let deadline = if force {
@@ -783,43 +856,56 @@ pub async fn daemon_stop(force: bool) -> ExitCode {
     // `paths()` is resolved once, here, rather than twice inside. An
     // undiscoverable runtime directory means no socket and no
     // `holdfast.pid`, and both halves below have to agree about that.
-    ExitCode::from(daemon_stop_within(force, paths().ok(), deadline).await)
+    ExitCode::from(daemon_stop_within(force, paths().ok(), deadline, DAEMON_EXIT_TIMEOUT).await)
 }
 
-/// [`daemon_stop`] with the runtime directory resolved and the RPC
-/// deadline supplied, returning §18.8's exit code as a `u8`.
+/// [`daemon_stop`] with the runtime directory resolved and both deadlines
+/// supplied, returning §18.8's exit code as a `u8`.
 ///
-/// Both seams exist for the same test: "the daemon accepts and never
-/// replies" is the state this bound was written for, and driving it
-/// through `daemon_stop` would mean discovering a real runtime directory
-/// and waiting a real [`STOP_RPC_TIMEOUT`]. `u8` rather than `ExitCode`
+/// The seams exist for the tests: "the daemon accepts and never replies"
+/// is the state the RPC bound was written for, and driving it through
+/// `daemon_stop` would mean discovering a real runtime directory and
+/// waiting a real [`STOP_RPC_TIMEOUT`]. `u8` rather than `ExitCode`
 /// because `ExitCode` cannot be compared, so a test could only assert on
 /// its `Debug` formatting.
 #[cfg(unix)]
-async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeout: Duration) -> u8 {
+async fn daemon_stop_within(
+    force: bool,
+    paths: Option<RuntimePaths>,
+    rpc_timeout: Duration,
+    exit_timeout: Duration,
+) -> u8 {
     // **Both paths are bounded now.** `--force`'s bound was already here
     // because a daemon that accepts and never replies is the state
     // `--force` exists for; the graceful path had the same exposure with
     // nothing to catch it, and §3.2 bounds it too.
-    let rpc = match tokio::time::timeout(rpc_timeout, stop_rpc(force, paths.as_ref())).await {
-        Ok(rpc) => rpc,
-        Err(_) => StopRpc::Failed(format!(
-            "the daemon did not answer daemon/stop within {}s",
-            rpc_timeout.as_secs()
-        )),
-    };
+    let (rpc, status_pid) =
+        match tokio::time::timeout(rpc_timeout, stop_rpc(force, paths.as_ref())).await {
+            Ok(answered) => answered,
+            Err(_) => (
+                StopRpc::Failed(format!(
+                    "the daemon did not answer daemon/stop within {}s",
+                    rpc_timeout.as_secs()
+                )),
+                None,
+            ),
+        };
 
     if !force {
         return match rpc {
             StopRpc::Stopped(outcome) => {
-                println!(
+                if let Err(e) = await_daemon_exit(status_pid, exit_timeout).await {
+                    diag!("holdfast daemon stop: {e}");
+                    return EXIT_FAILED;
+                }
+                crate::out::line(&format!(
                     "daemon stopped ({} session(s) terminated)",
                     outcome.sessions_terminated
-                );
+                ));
                 0
             }
             StopRpc::NotRunning => {
-                println!("no daemon running");
+                crate::out::line("no daemon running");
                 0
             }
             // §18.8's "Operation failed: couldn't stop". Without
@@ -841,15 +927,24 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
         // directory is `NotRunning`.
         None => Escalation::Nothing,
     };
+    // The process to wait out: the one killed, else the one that answered.
+    // Never a pid `escalate_to_sigkill` declined — that one was not
+    // confirmed to be this daemon, and waiting on a stranger would report
+    // its lifetime as ours.
+    let waited = match escalation {
+        Escalation::Killed(pid) => Some(pid),
+        _ => status_pid,
+    };
+    let exited = await_daemon_exit(waited, exit_timeout).await;
 
-    match rpc {
+    let code = match rpc {
         StopRpc::Stopped(outcome) => {
-            println!(
+            crate::out::line(&format!(
                 "daemon stopped ({} session(s) terminated)",
                 outcome.sessions_terminated
-            );
+            ));
             if let Escalation::Killed(pid) = escalation {
-                println!("SIGKILL sent to daemon pid {pid}");
+                crate::out::line(&format!("SIGKILL sent to daemon pid {pid}"));
             }
             // A `NotSignalled` here is not worth a warning: the daemon
             // answered, so the ordinary reason its pid no longer confirms
@@ -863,15 +958,15 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
         // verdict.
         StopRpc::NotRunning => match escalation {
             Escalation::Killed(pid) => {
-                println!("daemon killed (pid {pid})");
+                crate::out::line(&format!("daemon killed (pid {pid})"));
                 0
             }
             Escalation::Nothing => {
-                println!("no daemon running");
+                crate::out::line("no daemon running");
                 0
             }
             Escalation::NotSignalled { pid, why } => {
-                println!("no daemon running");
+                crate::out::line("no daemon running");
                 diag!("holdfast daemon stop: holdfast.pid names pid {pid}, not signalled: {why}");
                 0
             }
@@ -880,7 +975,7 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
             diag!("holdfast daemon stop: {e}");
             match escalation {
                 Escalation::Killed(pid) => {
-                    println!("daemon killed (pid {pid})");
+                    crate::out::line(&format!("daemon killed (pid {pid})"));
                     0
                 }
                 Escalation::Nothing => EXIT_FAILED,
@@ -892,7 +987,78 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
                 }
             }
         }
+    };
+    match exited {
+        Ok(()) => code,
+        Err(e) => {
+            diag!("holdfast daemon stop: {e}");
+            EXIT_FAILED
+        }
     }
+}
+
+/// Wait, bounded, for `pid` to be gone (GH #20). `Ok` at once for `None`:
+/// with no pid there is nothing to wait on, and saying so every time would
+/// be noise about a case that has its own diagnostics.
+///
+/// Polled rather than waited on, because the daemon is not this process's
+/// child — `daemon start` detached it — so there is nothing to `waitpid`.
+#[cfg(unix)]
+async fn await_daemon_exit(pid: Option<u32>, limit: Duration) -> Result<(), String> {
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if process_is_gone(pid) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the daemon (pid {pid}) was stopped but had not exited after {}s; its \
+                 runtime directory may still be in use",
+                limit.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether `pid` has finished everything it will ever do to the runtime
+/// directory: no such process, or a zombie.
+///
+/// **A zombie counts as gone**, and `kill(pid, 0)` alone cannot say so — it
+/// answers `0` for one. The daemon's parent after `daemon start` detached it
+/// is whatever reaps orphans here, and a container whose pid 1 never reaps
+/// would leave it a zombie for ever: exited, holding nothing, and
+/// indistinguishable by signal 0 from a daemon still tearing down. Linux
+/// says which through `/proc`; elsewhere the orphan reaper is `launchd` or
+/// `init`, which reap at once.
+///
+/// **`EPERM` is gone, too.** The pid exists and belongs to another user,
+/// so it is not our daemon: the daemon runs as the uid this CLI runs as —
+/// `peer::is_authorized` refuses every other uid, root included, so no
+/// other CLI could have asked it anything — and a process of our own uid
+/// is never `EPERM` to us. What `EPERM` means is that our daemon exited
+/// and its pid was reused. This read `EPERM` as alive, on the reasoning
+/// that a recycled pid is not ours — which is the reason to call ours
+/// gone — and waited out the bound on a stranger, then exited 1.
+#[cfg(unix)]
+fn process_is_gone(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing and takes no pointers.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH | libc::EPERM)
+        );
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let (_, after_comm) = stat.rsplit_once(')')?;
+            after_comm.split_whitespace().next().map(|s| s == "Z")
+        })
+        .unwrap_or(false)
 }
 
 /// The result of §3.2's `--force` escalation.
@@ -1097,9 +1263,9 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
         Ok(c) => c,
         Err(ClientError::Connect { .. }) => {
             if as_json {
-                println!("{}", json!({ "running": false }));
+                crate::out::line(&json!({ "running": false }).to_string());
             } else {
-                println!("holdfast daemon down");
+                crate::out::line("holdfast daemon down");
             }
             return ExitCode::from(EXIT_UNREACHABLE);
         }
@@ -1117,10 +1283,10 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
             }
         };
     if as_json {
-        println!("{}", serde_json::to_string(&status).unwrap_or_default());
+        crate::out::line(&serde_json::to_string(&status).unwrap_or_default());
     } else {
         let s = status.uptime_secs;
-        println!(
+        crate::out::line(&format!(
             "holdfast daemon up — pid {}, uptime {}:{:02}:{:02}, sessions {} live + {} exited-retained, attach clients {}",
             status.pid,
             s / 3600,
@@ -1129,7 +1295,7 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
             status.sessions_live,
             status.sessions_exited_retained,
             status.attach_clients,
-        );
+        ));
     }
     ExitCode::SUCCESS
 }
@@ -1159,12 +1325,12 @@ pub async fn list(as_json: bool) -> ExitCode {
         }
     };
     if as_json {
-        println!("{}", serde_json::to_string(&data).unwrap_or_default());
+        crate::out::line(&serde_json::to_string(&data).unwrap_or_default());
         return ExitCode::SUCCESS;
     }
     let mut sessions = data["sessions"].as_array().cloned().unwrap_or_default();
     if sessions.is_empty() {
-        println!("no sessions");
+        crate::out::line("no sessions");
         return ExitCode::SUCCESS;
     }
     // Newest first, then by id so the order is total and stable. The sort
@@ -1178,10 +1344,12 @@ pub async fn list(as_json: bool) -> ExitCode {
             .cmp(&a["started_at_unix_secs"].as_u64())
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
-    println!("ID                  NAME          STATE      PID      COMMAND");
+    // One write for the whole table: one place a departed reader is
+    // noticed, rather than one per row.
+    let mut table = String::from("ID                  NAME          STATE      PID      COMMAND\n");
     for s in sessions {
-        println!(
-            "{:<18}  {:<12}  {:<9}  {:<7}  {}",
+        table.push_str(&format!(
+            "{:<18}  {:<12}  {:<9}  {:<7}  {}\n",
             s["id"].as_str().unwrap_or("-"),
             s["name"].as_str().unwrap_or("-"),
             s["state"].as_str().unwrap_or("-"),
@@ -1190,12 +1358,49 @@ pub async fn list(as_json: bool) -> ExitCode {
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "-".into()),
             s["command"].as_str().unwrap_or("-"),
-        );
+        ));
     }
+    crate::out::text(&table);
     ExitCode::SUCCESS
 }
 
+/// How much one `read_output` call asks for — the daemon's ceiling
+/// (`MAX_READ_MAX_BYTES`), so a drain is as few round trips as the wire
+/// allows.
+#[cfg(unix)]
+const LOGS_PAGE_BYTES: u64 = 256 * 1024;
+
 /// `holdfast logs <session> [--tail N] [--raw]`
+///
+/// **It prints everything the session's buffer still holds, and it used
+/// to print the oldest 256 KiB of it** (GH #232). One `read_output` call
+/// returns at most one page, and the command made one call and ignored
+/// both `truncated_for_size` and `next_cursor` — so on any session that
+/// had printed more than a page it stopped mid-line, said nothing, and
+/// exited 0. Both viewers' truncation notices send the operator here for
+/// what they missed, which is almost never the oldest page.
+///
+/// It now follows `next_cursor` to the end, and stops early only where
+/// the daemon says to:
+///
+/// * **A `held_back` page that makes no progress** — §4.1's partial
+///   secret at the tail, which moves only with `buffer.head`, so asking
+///   again at once returns the same bytes; the loop stops and
+///   [`held_back_note`] says why, as before. A `held_back` page that
+///   *did* make progress is read past: REQ-O-008 withholds an escape
+///   sequence cut by the page's own end, wherever that falls, and the
+///   first version of this loop stopped there — a third of the way into
+///   coloured output, and at the same byte on every retry.
+/// * **The head as it stood when the command started.** A session that
+///   prints faster than this reads would otherwise never be caught up
+///   with, and `holdfast logs` would not return. What was there when you
+///   asked is what you get, which is the same contract `cat` gives a file
+///   that is still being written.
+///
+/// Bytes that are gone are said to be gone, on stderr: the ring keeps the
+/// newest output only (REQ-O-005), so a session that has printed more
+/// than it holds starts partway through, and a session that outruns the
+/// read can lose bytes between two pages. Both used to be silent.
 #[cfg(unix)]
 pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCode {
     let client = match connect(ClientKind::Cli).await {
@@ -1205,78 +1410,308 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
-    // §7.2: CLI commands ride the same control socket as the MCP tool
-    // handlers. `holdfast logs` is `read_output` with a human on the other
-    // end, so it goes through `tool/read_output` rather than growing a
-    // parallel method with its own bugs.
-    //
-    // **`apply_holdback` on the `--tail` arm, and it is not decoration
-    // (GH #169).** `tail_lines` alone is §4.1's per-call bypass, and this
-    // surface is named a non-member of it, twice: *"the exemption covers
-    // exactly those two arguments on the one tool that takes them, and
-    // nothing else"*, and then, by name, *"`--raw` is that surface's
-    // opt-in and it is audited; `--tail` is not an opt-in to anything."*
-    // The distinction has to be carried by what the CLI **sends**: the
-    // daemon may not recover it from `client_kind`, which is audit
-    // attribution and never a redaction input (REQ-SEC-018).
-    let mut args = match tail_lines {
-        Some(n) => json!({
-            "session": session,
+    let reader = LogReader {
+        client,
+        session,
+        raw,
+    };
+    let result = match tail_lines {
+        Some(n) => logs_tail(&reader, n).await,
+        None => logs_all(&reader).await,
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => code,
+    }
+}
+
+/// One `holdfast logs` invocation's connection and the two arguments every
+/// call it makes carries.
+#[cfg(unix)]
+struct LogReader<'a> {
+    client: ControlClient,
+    session: &'a str,
+    raw: bool,
+}
+
+#[cfg(unix)]
+impl LogReader<'_> {
+    /// One `tool/<name>` call, answered `ok`, as JSON. Every failure is
+    /// reported here, so a caller only propagates the exit code.
+    async fn call(&self, tool: &str, mut args: Value) -> Result<Value, ExitCode> {
+        args["session"] = json!(self.session);
+        let params = method::to_cbor(&args).map_err(|e| {
+            diag!("holdfast logs: {e}");
+            ExitCode::from(EXIT_FAILED)
+        })?;
+        let resp = self
+            .client
+            .call_raw(&format!("tool/{tool}"), params)
+            .await
+            .map_err(|e| {
+                diag!("holdfast logs: {e}");
+                ExitCode::from(EXIT_UNREACHABLE)
+            })?;
+        if resp.status != "ok" {
+            diag!("holdfast logs: {} — {}", resp.status, resp.details);
+            return Err(ExitCode::from(EXIT_FAILED));
+        }
+        method::from_cbor(&resp.data).map_err(|e| {
+            diag!("holdfast logs: malformed response: {e}");
+            ExitCode::from(EXIT_FAILED)
+        })
+    }
+
+    /// `read_output`, with `--raw`'s one field when it was given.
+    ///
+    /// §3.2's `--raw` is "disable redaction, and audit-log that you did".
+    /// Both halves belong to the daemon: 0.0.3 put the `redaction_disabled`
+    /// audit write inside the read path itself (§9.4), precisely so every
+    /// transport inherits it instead of having to remember. So the flag is
+    /// one field on the call, and the CLI has no audit obligation of its
+    /// own — which also means a drain of several pages writes one row per
+    /// page, each of them true.
+    async fn read(&self, mut args: Value) -> Result<Page, ExitCode> {
+        if self.raw {
+            args["redact"] = json!(false);
+        }
+        let data = self.call("read_output", args).await?;
+        Page::from_wire(data)
+    }
+}
+
+/// One `read_output` answer, reduced to what the drain steers by.
+#[cfg(unix)]
+struct Page {
+    output: String,
+    /// Where this page actually began. Later than the cursor asked for
+    /// exactly when bytes between the two left the ring first.
+    start: u64,
+    truncated_for_size: bool,
+    held_back: bool,
+    next_cursor: Option<u64>,
+    /// The whole answer, for [`held_back_note`].
+    data: Value,
+}
+
+#[cfg(unix)]
+impl Page {
+    fn from_wire(data: Value) -> Result<Self, ExitCode> {
+        let (Some(end), Some(returned)) =
+            (data["cursor"].as_u64(), data["bytes_returned"].as_u64())
+        else {
+            diag!("holdfast logs: malformed response: no cursor or bytes_returned");
+            return Err(ExitCode::from(EXIT_FAILED));
+        };
+        Ok(Self {
+            output: data["output"].as_str().unwrap_or_default().to_string(),
+            start: end.saturating_sub(returned),
+            truncated_for_size: data["truncated_for_size"] == json!(true),
+            held_back: data["held_back"] == json!(true),
+            next_cursor: data["next_cursor"].as_u64(),
+            data,
+        })
+    }
+}
+
+/// What a drain saw besides the bytes, for the notes that follow them.
+#[cfg(unix)]
+#[derive(Default)]
+struct Drained {
+    /// Bytes the session printed before the oldest one the ring still held
+    /// when the drain began.
+    gone_before: u64,
+    /// Bytes that left the ring between two pages of this drain.
+    gone_during: u64,
+    /// The page that ended the drain at a holdback, if one did. Never a
+    /// holdback a later page read past: that one withheld nothing.
+    held: Option<Value>,
+}
+
+/// Every page from the ring's oldest byte to the head as it stood at the
+/// start, handed to `sink` in order.
+#[cfg(unix)]
+async fn drain(r: &LogReader<'_>, mut sink: impl FnMut(&str)) -> Result<Drained, ExitCode> {
+    // The extent comes from `status` and not from the first page, because
+    // a page says where it ended and not where the buffer does.
+    let status = r.call("status", json!({})).await?;
+    let (Some(head), Some(tail)) = (
+        status["buffer"]["head"].as_u64(),
+        status["buffer"]["tail"].as_u64(),
+    ) else {
+        diag!("holdfast logs: malformed response: `status` carried no buffer extent");
+        return Err(ExitCode::from(EXIT_FAILED));
+    };
+    let mut seen = Drained {
+        gone_before: tail,
+        ..Drained::default()
+    };
+    // From the ring's tail rather than from 0. Both return the same bytes,
+    // but a cursor below the tail is §9.4's `truncated_at_tail` and is
+    // audited as a reader that lost its place — which a command asking for
+    // "everything you have" is not.
+    let mut cursor = tail;
+    while cursor < head {
+        let page = r
+            .read(json!({ "since_cursor": cursor, "max_bytes": LOGS_PAGE_BYTES }))
+            .await?;
+        seen.gone_during += page.start.saturating_sub(cursor);
+        sink(&page.output);
+        match page.next_cursor {
+            // Caught up with the head, as it stands now.
+            None => {
+                seen.held = None;
+                break;
+            }
+            // **A holdback that made progress is read past, not stopped
+            // at.** REQ-O-008 withholds an escape sequence that straddles
+            // the page's own end, `since_cursor + max_bytes`, wherever
+            // that falls — so on coloured output most pages come back
+            // `held_back` with the rest of the buffer behind them, and the
+            // retry at `next_cursor` is §4.1's documented recourse and
+            // makes progress. Only the last page's holdback survives to
+            // the note: one that a later page read past withheld nothing.
+            Some(next) if next > cursor => {
+                seen.held = page.held_back.then_some(page.data);
+                cursor = next;
+            }
+            // A holdback that made none is the one that means it: §4.1's
+            // partial secret at the tail, which moves only with
+            // `buffer.head`, so asking again at once returns the same
+            // nothing. Stop, and keep the page for the note.
+            Some(_) if page.held_back => {
+                seen.held = Some(page.data);
+                break;
+            }
+            // Since GH #195 every other read makes progress, so this is a
+            // daemon that has regressed — and a loop that trusted it
+            // would spin.
+            Some(next) => {
+                diag!(
+                    "holdfast logs: the daemon returned no progress at byte {next}; \
+                     stopping rather than asking again"
+                );
+                return Err(ExitCode::from(EXIT_FAILED));
+            }
+        }
+    }
+    Ok(seen)
+}
+
+#[cfg(unix)]
+async fn logs_all(r: &LogReader<'_>) -> Result<(), ExitCode> {
+    let seen = drain(r, crate::out::text).await?;
+    report_gone(seen.gone_before, seen.gone_during);
+    if let Some(held) = &seen.held {
+        diag!("holdfast logs: {}", held_back_note(r.raw, held));
+    }
+    Ok(())
+}
+
+/// `--tail N`: one tail read, which is the whole answer unless the N lines
+/// are longer than one page.
+///
+/// **`apply_holdback`, and it is not decoration (GH #169).** `tail_lines`
+/// alone is §4.1's per-call bypass, and this surface is named a non-member
+/// of it, twice: *"the exemption covers exactly those two arguments on the
+/// one tool that takes them, and nothing else"*, and then, by name,
+/// *"`--raw` is that surface's opt-in and it is audited; `--tail` is not an
+/// opt-in to anything."* The distinction has to be carried by what the CLI
+/// **sends**: the daemon may not recover it from `client_kind`, which is
+/// audit attribution and never a redaction input (REQ-SEC-018).
+///
+/// **Longer than a page, and it used to be cut silently** (GH #232). A
+/// tail read keeps the newest `max_bytes` of the N lines and sets
+/// `truncated_for_size`, so `--tail 40000` printed the last 256 KiB
+/// starting mid-line. That case now drains the ring — at most
+/// `DEFAULT_BUFFER_BYTES`, a few pages — and keeps the last N lines of it
+/// here. The drain applies the holdback exactly as the tail read did, so
+/// the fallback withholds nothing less.
+#[cfg(unix)]
+async fn logs_tail(r: &LogReader<'_>, n: usize) -> Result<(), ExitCode> {
+    let page = r
+        .read(json!({
             "tail_lines": n,
             "apply_holdback": true,
-            "max_bytes": 256 * 1024,
-        }),
-        None => json!({ "session": session, "since_cursor": 0, "max_bytes": 256 * 1024 }),
-    };
-    if raw {
-        // §3.2's `--raw` is "disable redaction, and audit-log that you
-        // did". Both halves belong to the daemon: 0.0.3 put the
-        // `redaction_disabled` audit write inside the read path itself
-        // (§9.4), precisely so every transport inherits it instead of
-        // having to remember. So the flag is one field on the existing
-        // call, and the CLI does not get an audit obligation of its own.
-        args["redact"] = json!(false);
-    }
-    let params = match method::to_cbor(&args) {
-        Ok(p) => p,
-        Err(e) => {
-            diag!("holdfast logs: {e}");
-            return ExitCode::from(EXIT_FAILED);
+            "max_bytes": LOGS_PAGE_BYTES,
+        }))
+        .await?;
+    if !page.truncated_for_size {
+        crate::out::text(&page.output);
+        if page.held_back {
+            diag!("holdfast logs: {}", held_back_note(r.raw, &page.data));
         }
-    };
-    let resp = match client.call_raw("tool/read_output", params).await {
-        Ok(r) => r,
-        Err(e) => {
-            diag!("holdfast logs: {e}");
-            return ExitCode::from(EXIT_UNREACHABLE);
-        }
-    };
-    if resp.status != "ok" {
-        diag!("holdfast logs: {} — {}", resp.status, resp.details);
-        return ExitCode::from(EXIT_FAILED);
+        return Ok(());
     }
-    let data: Value = match method::from_cbor(&resp.data) {
-        Ok(v) => v,
-        Err(e) => {
-            diag!("holdfast logs: malformed response: {e}");
-            return ExitCode::from(EXIT_FAILED);
-        }
-    };
-    print!("{}", data["output"].as_str().unwrap_or_default());
-    // §4.1's holdback can now shorten this read, so say so — on stderr,
-    // because stdout is the log and this surface's point is that it
-    // survives being piped somewhere. Silence here would read as "the
-    // output ended", which is the one thing it does not mean.
-    //
-    // **Flush first.** `print!` goes through Rust's `LineWriter` and
-    // `diag!` writes an unbuffered, locked stderr, so `holdfast logs X
-    // 2>&1 | tail` spliced the note into the middle of the log text.
-    // Ordering two streams is the writer's job, not the reader's.
-    if data["held_back"] == json!(true) {
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        diag!("holdfast logs: {}", held_back_note(raw, &data));
+
+    let mut all = String::new();
+    let seen = drain(r, |s| all.push_str(s)).await?;
+    let lines = last_lines(&all, n);
+    crate::out::text(lines);
+    // The ring's missing front only matters when the N lines reach it.
+    let reaches_front = lines.len() == all.len();
+    report_gone(
+        if reaches_front { seen.gone_before } else { 0 },
+        seen.gone_during,
+    );
+    if let Some(held) = &seen.held {
+        diag!("holdfast logs: {}", held_back_note(r.raw, held));
     }
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+/// The last `n` lines of `text`, counted the way the daemon's
+/// `tail_lines` counts them (`OutputBuffer::tail_lines_start`): a single
+/// trailing newline does not start another line, and fewer than `n` lines
+/// is all of them.
+///
+/// A port of that function rather than an equivalent, because "equivalent"
+/// is where two paths of one flag start to disagree:
+/// `the_tail_fallback_counts_lines_the_way_the_daemon_does` checks it
+/// against the original.
+#[cfg(unix)]
+fn last_lines(text: &str, n: usize) -> &str {
+    let b = text.as_bytes();
+    if n == 0 || b.is_empty() {
+        return "";
+    }
+    let search_end = if b[b.len() - 1] == b'\n' {
+        b.len() - 1
+    } else {
+        b.len()
+    };
+    let mut seen = 0usize;
+    let mut start = b.len();
+    for i in (0..search_end).rev() {
+        if b[i] == b'\n' {
+            seen += 1;
+            if seen == n {
+                start = i + 1;
+                break;
+            }
+        }
+        start = i;
+    }
+    // Every value `start` can take is 0, the length, or one past a
+    // newline, so it is always a char boundary.
+    &text[start..]
+}
+
+/// Say, on stderr, which bytes the output above does not have.
+#[cfg(unix)]
+fn report_gone(gone_before: u64, gone_during: u64) {
+    if gone_before > 0 {
+        diag!(
+            "holdfast logs: the first {gone_before} bytes this session printed have left its buffer \
+             and are not shown"
+        );
+    }
+    if gone_during > 0 {
+        diag!(
+            "holdfast logs: {gone_during} more bytes left the buffer while this was reading it — the \
+             session printed faster than it could be read — and are missing from the middle"
+        );
+    }
 }
 
 /// What `holdfast logs` says on stderr when the read came back
@@ -2701,6 +3136,19 @@ pub async fn watch(session: &str) -> ExitCode {
     use holdfast_core::attach::{AttachMode, AttachRole, ServerFrame};
     use holdfast_core::protocol::frame;
 
+    // Its stdout is the one this process exists for, so a reader that
+    // leaves ends it as `cat` would (GH #218) — at once, not at the
+    // session's next output.
+    crate::out::end_when_reader_leaves();
+    // **And every write below goes through `out`, under the name every
+    // arm already uses.** The module's `render` discards write errors,
+    // which is right for `attach` — its stdout is the terminal it holds in
+    // raw mode, and dying there would skip the restore — and was why
+    // `holdfast watch | head` outlived its reader for ever. Shadowing it
+    // here rather than renaming each call keeps a paint added to this loop
+    // on the right side of that line without its author having to know.
+    let render = crate::out::bytes;
+
     let (rd, mut wr) =
         match dial_attach(session, AttachMode::ReadOnly, AttachRole::Observer, "watch").await {
             Dialled::Ok(rd, wr) => (rd, wr),
@@ -2978,7 +3426,7 @@ pub async fn daemon_stop(_force: bool) -> ExitCode {
          Sessions live inside `holdfast mcp` and end with it. Use WSL for a \
          daemon that outlives the client."
     );
-    println!("no daemon running");
+    crate::out::line("no daemon running");
     ExitCode::SUCCESS
 }
 
@@ -3013,14 +3461,14 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
         // `supported` and `reason` are additive, and are what distinguish a
         // daemon that is down from a platform that has none: only the first
         // is worth retrying or starting.
-        println!(
-            "{}",
-            serde_json::json!({
+        crate::out::line(
+            &serde_json::json!({
                 "running": false,
                 "supported": false,
                 "reason": "no daemon on Windows native (§3.6); sessions live \
                            inside `holdfast mcp` and end with it",
             })
+            .to_string(),
         );
     }
     unsupported("daemon status", Remedy::Wsl)
@@ -3143,7 +3591,7 @@ pub async fn pty_worker(args: &[String]) -> ExitCode {
     use holdfast_core::pty::worker::child::{self, Argv};
     match child::parse_argv(args) {
         Argv::Help => {
-            print!("{PTY_WORKER_USAGE}");
+            crate::out::text(PTY_WORKER_USAGE);
             ExitCode::SUCCESS
         }
         Argv::Usage(why) => {
@@ -3181,15 +3629,21 @@ pub async fn pty_worker(_args: &[String]) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
-/// `holdfast version`
+/// `holdfast version`, and `holdfast --version`/`-V`.
+///
+/// The build is `handshake::build_id()` — the same function the daemon
+/// answers the control handshake with — so this binary and a daemon
+/// started from it cannot describe one build two ways. It said `unknown`
+/// on every build outside the release pipeline until `holdfast-core`'s
+/// `build.rs` derived it (GH #178).
 pub fn version() -> ExitCode {
-    println!(
+    crate::out::line(&format!(
         "holdfast {} (build {}) protocol {}.{}",
         env!("CARGO_PKG_VERSION"),
         holdfast_core::protocol::handshake::build_id(),
         holdfast_core::protocol::PROTOCOL_MAJOR,
         holdfast_core::protocol::PROTOCOL_MINOR,
-    );
+    ));
     ExitCode::SUCCESS
 }
 
@@ -3377,7 +3831,8 @@ mod tests {
                     if frame::write_frame(&mut stream, &resp).await.is_err() {
                         return;
                     }
-                    // Read the `daemon/stop` and never answer it. The
+                    // Read the next request — `daemon/status`, which the
+                    // stop asks first — and never answer it. The
                     // stream is held for the life of this task: letting
                     // it drop would EOF the client's read, the call would
                     // return an error on its own, and the row would be
@@ -3413,7 +3868,12 @@ mod tests {
 
         let code = tokio::time::timeout(
             Duration::from_secs(20),
-            daemon_stop_within(false, Some(paths.clone()), Duration::from_millis(200)),
+            daemon_stop_within(
+                false,
+                Some(paths.clone()),
+                Duration::from_millis(200),
+                DAEMON_EXIT_TIMEOUT,
+            ),
         )
         .await
         .expect(
@@ -3437,11 +3897,251 @@ mod tests {
 
         let code = tokio::time::timeout(
             Duration::from_secs(20),
-            daemon_stop_within(false, Some(paths.clone()), Duration::from_millis(200)),
+            daemon_stop_within(
+                false,
+                Some(paths.clone()),
+                Duration::from_millis(200),
+                DAEMON_EXIT_TIMEOUT,
+            ),
         )
         .await
         .expect("nothing to connect to must not wait for anything");
         assert_eq!(code, 0, "§3.2 makes `daemon stop` idempotent");
+    }
+
+    /// A control socket that completes the handshake and answers every
+    /// other request with `answer(method, params)`, as `ok` data — or
+    /// never answers it, for `None`. Bound before it returns, for the
+    /// reason `wedged_daemon` gives.
+    fn fake_daemon(
+        paths: &RuntimePaths,
+        answer: impl Fn(&str, &Value) -> Option<Value> + Send + Sync + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(paths.control_sock()).unwrap();
+        let answer = Arc::new(answer);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let answer = Arc::clone(&answer);
+                tokio::spawn(async move {
+                    while let Ok(req) = frame::read_frame::<_, Request>(&mut stream).await {
+                        let resp = if req.method == method::METHOD_HANDSHAKE {
+                            Response::ok(
+                                req.id,
+                                &HandshakeData {
+                                    protocol_major: handshake::PROTOCOL_MAJOR,
+                                    protocol_minor: handshake::PROTOCOL_MINOR,
+                                    daemon_version: "fake".into(),
+                                    build: "fake".into(),
+                                    accepted: true,
+                                    reject_reason: None,
+                                },
+                                "handshake accepted",
+                            )
+                        } else {
+                            let params: Value =
+                                method::from_cbor(&req.params).unwrap_or(Value::Null);
+                            match answer(&req.method, &params) {
+                                Some(data) => Response::ok(req.id, &data, "ok"),
+                                None => {
+                                    std::future::pending::<()>().await;
+                                    return;
+                                }
+                            }
+                        };
+                        if frame::write_frame(&mut stream, &resp.unwrap())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// A daemon that answers `daemon/status` with `pid` and `daemon/stop`
+    /// at once — a real daemon's shape, whose process outlives its answer
+    /// by however long its teardown takes. `pid` is a process the test
+    /// controls and stands in for that process.
+    fn answering_daemon(paths: &RuntimePaths, pid: u32) -> tokio::task::JoinHandle<()> {
+        fake_daemon(paths, move |m, _| match m {
+            method::METHOD_DAEMON_STATUS => Some(json!({
+                "pid": pid,
+                "uptime_secs": 1,
+                "version": "fake",
+                "sessions_live": 0,
+                "sessions_exited_retained": 0,
+                "attach_clients": 0,
+                "bridge_sessions": 0,
+            })),
+            method::METHOD_DAEMON_STOP => Some(json!({
+                "stopped_at_unix_secs": 0,
+                "sessions_terminated": 0,
+            })),
+            _ => None,
+        })
+    }
+
+    /// A child of this test that exits after `secs`, reaped by a thread
+    /// the moment it does — so "gone" means gone, and no zombie of the
+    /// test's own making stands in for a daemon that has not exited.
+    fn short_lived(secs: &str) -> (u32, std::thread::JoinHandle<()>) {
+        let mut child = std::process::Command::new("sleep")
+            .arg(secs)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        (pid, reaper)
+    }
+
+    /// **GH #20: `daemon stop` returned on the answer, not on the exit.**
+    /// The daemon answers `daemon/stop` before its own teardown — which
+    /// takes `bind.lock`, runs `ensure_dir`, removes its sockets and pid
+    /// file — so `daemon stop && rm -rf "$HOLDFAST_RUNTIME_DIR"` raced it
+    /// and the directory came back. The stand-in process here outlives the
+    /// answer by a second; the stop must not return before it is gone.
+    ///
+    /// Both paths: `--force` answered by a daemon that could still answer
+    /// has nothing to escalate against, and returns on the same exit.
+    #[tokio::test]
+    async fn a_stop_returns_only_once_the_daemon_process_is_gone() {
+        for force in [false, true] {
+            let paths = scratch("waitexit");
+            let _scoped = Scoped(paths.clone());
+            paths.ensure_dir().unwrap();
+            let (pid, reaper) = short_lived("1");
+            let daemon = answering_daemon(&paths, pid);
+
+            let code = tokio::time::timeout(
+                Duration::from_secs(20),
+                daemon_stop_within(
+                    force,
+                    Some(paths.clone()),
+                    STOP_RPC_TIMEOUT,
+                    DAEMON_EXIT_TIMEOUT,
+                ),
+            )
+            .await
+            .expect("the stop is bounded");
+            assert_eq!(
+                code, 0,
+                "force {force}: an answered stop whose daemon exits is success"
+            );
+            assert!(
+                process_is_gone(pid),
+                "force {force}: `daemon stop` returned while the daemon's process \
+                 (pid {pid}) was still running"
+            );
+            daemon.abort();
+            reaper.join().unwrap();
+        }
+    }
+
+    /// The bound on that wait, and its verdict: a daemon that answered
+    /// and never exited is §18.8's "couldn't stop", not a success and not
+    /// a hang.
+    #[tokio::test]
+    async fn a_daemon_that_answers_and_never_exits_is_reported_within_the_bound() {
+        let paths = scratch("noexit");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let lingering = Reaped(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let daemon = answering_daemon(&paths, lingering.0.id());
+
+        let code = tokio::time::timeout(
+            Duration::from_secs(20),
+            daemon_stop_within(
+                false,
+                Some(paths.clone()),
+                STOP_RPC_TIMEOUT,
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("the wait for the exit is bounded");
+        assert_eq!(code, EXIT_FAILED);
+        assert!(
+            !process_is_gone(lingering.0.id()),
+            "the control: it really was alive"
+        );
+        daemon.abort();
+    }
+
+    /// `process_is_gone` in both directions, and on the case signal 0
+    /// gets wrong: an unreaped child is a zombie, which `kill(pid, 0)`
+    /// reports as alive.
+    #[test]
+    fn a_zombie_is_gone_and_a_live_process_is_not() {
+        let mut child = Reaped(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let pid = child.0.id();
+        assert!(!process_is_gone(pid), "a sleeping child is alive");
+        child.0.kill().unwrap();
+        if std::path::Path::new("/proc/self/stat").exists() {
+            // Not yet reaped: a zombie. Wait for the kill to land.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !process_is_gone(pid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                process_is_gone(pid),
+                "an unreaped, killed child is a zombie and gone"
+            );
+        }
+        child.0.wait().unwrap();
+        assert!(process_is_gone(pid), "a reaped child is gone");
+    }
+
+    /// **A pid another user owns is not our daemon**, so a stop waiting on
+    /// ours is done. The daemon shares this CLI's uid — `is_authorized`
+    /// refuses every other — so `EPERM` from signal 0 means its pid was
+    /// reused by someone else's process. It used to read as alive, and a
+    /// stop waited out its whole bound on a stranger and then exited 1.
+    ///
+    /// Pid 1 stands in for the stranger: root's, wherever this runs as
+    /// anyone else, which CI does.
+    #[test]
+    fn a_pid_another_user_owns_is_gone_for_our_purposes() {
+        // SAFETY: signal 0 sends nothing and takes no pointers.
+        let refused = unsafe { libc::kill(1, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !refused {
+            println!(
+                "skipping: EPERM from signal 0 — this runs as pid 1's owner, so nothing refuses it"
+            );
+            return;
+        }
+        assert!(
+            process_is_gone(1),
+            "`EPERM` means the pid is another user's, so our daemon is not it"
+        );
+    }
+
+    /// A child that is killed and reaped when the row ends, pass or fail,
+    /// so a failing row does not leave a `sleep 60` behind it — which
+    /// nextest reports as a leak and a later row could trip over.
+    struct Reaped(std::process::Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     /// The bound the shipped command really passes must leave room for
@@ -3468,6 +4168,248 @@ mod tests {
         );
         // And it is a bound rather than an absence of one.
         assert!(STOP_RPC_TIMEOUT <= grace * 3);
+    }
+
+    /// A `holdfast logs` reader connected to `paths`' fake daemon.
+    async fn log_reader(paths: &RuntimePaths) -> LogReader<'static> {
+        let client = ControlClient::connect(&paths.control_sock(), ClientKind::Cli)
+            .await
+            .expect("connect to the fake daemon");
+        LogReader {
+            client,
+            session: "fake",
+            raw: false,
+        }
+    }
+
+    /// One `read_output` page covering `[start, end)`, labelled with its
+    /// start so the test can see which pages were printed — and empty
+    /// when it is, as a real page that returned nothing is.
+    fn page(start: u64, end: u64, next: Option<u64>, held: bool) -> Value {
+        held_page(
+            start,
+            end,
+            next,
+            held.then_some(HeldBackCause::InFlightSecret),
+        )
+    }
+
+    /// [`page`], held back for `cause` when there is one.
+    fn held_page(start: u64, end: u64, next: Option<u64>, cause: Option<HeldBackCause>) -> Value {
+        json!({
+            "output": if end > start { format!("[{start}]") } else { String::new() },
+            "cursor": end,
+            "bytes_returned": end - start,
+            "truncated_for_size": next.is_some() && cause.is_none(),
+            "held_back": cause.is_some(),
+            "held_back_cause": cause.map(HeldBackCause::as_str),
+            "next_cursor": next,
+            "state": "Running",
+        })
+    }
+
+    fn since(params: &Value) -> u64 {
+        params["since_cursor"].as_u64().expect("a cursor read")
+    }
+
+    /// **GH #232's loop has to end.** A session printing faster than the
+    /// CLI reads never lets `next_cursor` come back `null`, so a drain
+    /// that followed it alone would not return — `holdfast logs` on a busy
+    /// build would hang. It stops at the head `status` reported when it
+    /// began. The fake's head never stops moving.
+    #[tokio::test]
+    async fn a_drain_stops_at_the_head_it_started_with_however_fast_the_session_prints() {
+        let paths = scratch("drainhead");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = fake_daemon(&paths, |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 5000, "tail": 1000 } })),
+            "tool/read_output" => {
+                let c = since(p);
+                Some(page(c, c + 1000, Some(c + 1000), false))
+            }
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen =
+            tokio::time::timeout(Duration::from_secs(10), drain(&r, |s| printed.push_str(s)))
+                .await
+                .expect("a drain chasing a moving head never returned")
+                .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[1000][2000][3000][4000]");
+        // From the ring's tail, not from 0 — and what is below it is said
+        // to be gone rather than asked for.
+        assert_eq!(seen.gone_before, 1000);
+        assert_eq!(seen.gone_during, 0);
+        assert!(seen.held.is_none());
+        daemon.abort();
+    }
+
+    /// A holdback that makes no progress ends the drain, and the page
+    /// that said so is kept for the note. It is §4.1's partial secret at
+    /// the tail: the boundary moves only with `buffer.head`, so the read
+    /// that reaches it returns nothing, and so would every read after it.
+    /// The page *before* it was held back too, and made progress, which
+    /// is not a reason to stop — see the next row.
+    #[tokio::test]
+    async fn a_drain_stops_at_a_holdback_that_makes_no_progress_and_keeps_that_page() {
+        let paths = scratch("drainheld");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let reads = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&reads);
+        let secret = Some(HeldBackCause::InFlightSecret);
+        let daemon = fake_daemon(&paths, move |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 10_000, "tail": 0 } })),
+            "tool/read_output" => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Some(match since(p) {
+                    0 => page(0, 4000, Some(4000), false),
+                    4000 => held_page(4000, 6000, Some(6000), secret),
+                    6000 => held_page(6000, 6000, Some(6000), secret),
+                    c => page(c, c + 1, Some(c + 1), false),
+                })
+            }
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen = drain(&r, |s| printed.push_str(s))
+            .await
+            .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[0][4000]");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            3,
+            "it asked again after a holdback that made no progress"
+        );
+        let held = seen.held.expect("the holdback page is kept");
+        assert_eq!(held["held_back_cause"], "in_flight_secret");
+        assert_eq!(
+            held["bytes_returned"], 0,
+            "the page kept is the one that stopped it"
+        );
+        daemon.abort();
+    }
+
+    /// **A holdback that made progress is read past** — the review of GH
+    /// #232's first fix. REQ-O-008 withholds an escape sequence cut by the
+    /// page's own end, `since_cursor + max_bytes`, wherever that falls, so
+    /// a page of coloured output comes back `held_back`,
+    /// `incomplete_escape`, with most of the buffer still behind it. The
+    /// drain took that for the end and stopped a third of the way into a
+    /// `grep --color` log, at the same byte on every retry. The fake
+    /// cuts two pages that way, so reading past one is not enough.
+    #[tokio::test]
+    async fn a_drain_reads_past_a_holdback_that_made_progress() {
+        let paths = scratch("drainansi");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let escape = Some(HeldBackCause::IncompleteEscape);
+        let daemon = fake_daemon(&paths, move |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 10_000, "tail": 0 } })),
+            "tool/read_output" => Some(match since(p) {
+                0 => held_page(0, 3997, Some(3997), escape),
+                3997 => held_page(3997, 7995, Some(7995), escape),
+                c => page(c, 10_000, None, false),
+            }),
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen = drain(&r, |s| printed.push_str(s))
+            .await
+            .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[0][3997][7995]");
+        assert!(
+            seen.held.is_none(),
+            "a holdback the drain read past withheld nothing, and the note would say it did"
+        );
+        daemon.abort();
+    }
+
+    /// Bytes that left the ring between two pages are counted, not
+    /// silently skipped: the second page began later than it was asked to.
+    #[tokio::test]
+    async fn a_drain_counts_the_bytes_that_left_the_ring_while_it_read() {
+        let paths = scratch("draingone");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = fake_daemon(&paths, |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 3000, "tail": 0 } })),
+            "tool/read_output" => Some(match since(p) {
+                0 => page(0, 1000, Some(1000), false),
+                // Asked for 1000; the ring had moved on to 1500.
+                1000 => page(1500, 2500, Some(2500), false),
+                c => page(c, 3000, None, false),
+            }),
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen = drain(&r, |s| printed.push_str(s))
+            .await
+            .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[0][1500][2500]");
+        assert_eq!(seen.gone_during, 500);
+        assert_eq!(seen.gone_before, 0);
+        daemon.abort();
+    }
+
+    /// A daemon that hands back the cursor it was given is refused with a
+    /// failure, not asked again for ever.
+    #[tokio::test]
+    async fn a_drain_refuses_a_daemon_that_makes_no_progress() {
+        let paths = scratch("drainstuck");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = fake_daemon(&paths, |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 3000, "tail": 0 } })),
+            "tool/read_output" => {
+                let c = since(p);
+                Some(page(c, c, Some(c), false))
+            }
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), drain(&r, |_| {}))
+            .await
+            .expect("a drain that makes no progress must not spin");
+        assert!(outcome.is_err(), "no progress is a failure");
+        daemon.abort();
+    }
+
+    /// `--tail`'s fallback keeps the last N lines itself, so it has to
+    /// count them exactly as the daemon's `tail_lines` does — or one flag
+    /// means two things depending on how long the lines are. Checked
+    /// against `OutputBuffer::tail_lines_start` itself, over the edges its
+    /// own comments name: a leading newline, a trailing one, blank lines,
+    /// fewer lines than asked for, and nothing at all.
+    #[test]
+    fn the_tail_fallback_counts_lines_the_way_the_daemon_does() {
+        let texts = [
+            "",
+            "\n",
+            "\n\n",
+            "a",
+            "a\n",
+            "a\nb",
+            "a\nb\n",
+            "\na\nb\n",
+            "a\n\n\nb\n",
+            "a\nb\nc\n\n",
+            "é\nü\n",
+            "x\r\ny\r\n",
+        ];
+        for text in texts {
+            let mut buf = holdfast_core::buffer::OutputBuffer::new(1024);
+            buf.push(text.as_bytes());
+            for n in 0..6 {
+                let start = buf.tail_lines_start(n) as usize;
+                assert_eq!(last_lines(text, n), &text[start..], "{text:?}, n = {n}");
+            }
+        }
     }
 
     /// **`held_back_note` had no test at all, and the sentence it

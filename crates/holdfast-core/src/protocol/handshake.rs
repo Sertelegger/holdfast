@@ -105,8 +105,12 @@ pub const PROTOCOL_MINOR: u32 = 5;
 /// out.
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Build identifier reported in the handshake. Wired to a real git SHA
-/// by the release pipeline in 0.0.12; `unknown` until then.
+/// Build identifier reported in the handshake and printed by `holdfast
+/// version`, so the CLI and the daemon it talks to name a build the same
+/// way. This crate's `build.rs` sets it: `HOLDFAST_BUILD_SHA` when the
+/// caller did (the release pipeline does), else the commit the crate was
+/// packaged or checked out at; `unknown` only when none of those answers
+/// (GH #178).
 pub fn build_id() -> &'static str {
     option_env!("HOLDFAST_BUILD_SHA").unwrap_or("unknown")
 }

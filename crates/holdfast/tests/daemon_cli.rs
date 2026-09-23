@@ -1596,6 +1596,23 @@ fn logs_tail_is_inside_the_holdback_in_the_same_moment_read_output_withholds() {
         "a session still producing output was told its tail is final: {err:?}"
     );
 
+    // And the drain — `holdfast logs` with no `--tail` — in the same
+    // moment. Its last read reaches the boundary and returns nothing, and
+    // that is §4.1's holdback, not a stuck daemon: the drain stops there
+    // with the note, exit 0, rather than failing for want of progress
+    // (GH #232). Everything before the boundary is there.
+    let (code, all, err) = env.run(&["logs", "tailhb"]);
+    assert_eq!(
+        code, 0,
+        "a drain that reached the holdback failed instead of stopping: {err}"
+    );
+    assert!(
+        !all.contains(&in_flight),
+        "the drain released the token: {all:?}"
+    );
+    assert!(all.contains("LINE_1\r") && all.ends_with("see "), "{all:?}");
+    assert!(err.contains("may still be arriving"), "{err:?}");
+
     // The bracket. Arms measured either side of a process spawn are only
     // "the same moment" if the holdback was still open at the end of it.
     let after = shim.call_tool(
@@ -2155,5 +2172,1070 @@ fn the_no_daemon_server_honours_a_configured_session_cap() {
          unread: {second}"
     );
 
+    shim.kill();
+}
+
+// ------------------------------------------------ GH #218, #232, #233, #178, #20
+
+/// Run `holdfast args` with a stdout whose reader has already gone, and
+/// return how it ended and what it said on stderr.
+///
+/// **A pipe whose read end is closed before the child starts**, rather than
+/// `| head` and a race: every write the child makes to stdout then fails
+/// with `EPIPE`, so the outcome does not depend on how much it prints or
+/// how fast `head` exits. The dogfood pass measured `list | head -1`
+/// panicking in 10 of 30 runs because it depended on exactly that.
+fn run_with_stdout_closed(env: &TestEnv, args: &[&str]) -> (std::process::ExitStatus, String) {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let mut child = env
+        .cmd()
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run holdfast");
+    let mut err = child.stderr.take().expect("piped stderr");
+    let err_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "`holdfast {}` with its stdout closed did not exit within {CLI_TIMEOUT:?}",
+                args.join(" ")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stderr = String::from_utf8_lossy(&err_h.join().expect("stderr reader")).into_owned();
+    (status, stderr)
+}
+
+/// **GH #218: a reader that leaves early ends the CLI the way it ends
+/// `cat`**, not with a panic, a backtrace note and exit 101.
+///
+/// Every stdout-writing one-shot subcommand, including the two that only
+/// print a line — they share the write path, so one of them regressing
+/// alone is exactly the case a single row would miss.
+#[test]
+fn a_closed_stdout_ends_the_cli_as_it_ends_cat_rather_than_panicking() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let env = TestEnv::new("sigpipe");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "piped" }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    shim.call_tool(
+        "send_input",
+        json!({ "session": session_id, "data": "echo PIPE''_MARK" }),
+    );
+    let seen = shim.read_until(&session_id, "PIPE_MARK");
+    assert!(
+        seen.contains("PIPE_MARK"),
+        "the session never printed: {seen:?}"
+    );
+
+    for args in [
+        &["version"][..],
+        &["--help"][..],
+        // The hidden worker's help is printed by the worker's own code,
+        // not `help`'s, and was the one help path still panicking.
+        &["help", "pty-worker"][..],
+        &["pty-worker", "--help"][..],
+        &["list"][..],
+        &["list", "--json"][..],
+        &["logs", "piped"][..],
+        &["logs", "piped", "--tail", "5"][..],
+        &["daemon", "status"][..],
+    ] {
+        let (status, err) = run_with_stdout_closed(&env, args);
+        assert!(
+            !err.contains("panicked"),
+            "`holdfast {}` panicked on a closed stdout: {err}",
+            args.join(" ")
+        );
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGPIPE),
+            "`holdfast {}` must die of SIGPIPE, as `cat` does, when its reader has gone; \
+             it ended {status} with stderr: {err}",
+            args.join(" ")
+        );
+    }
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// The other half: a write that fails for any reason *but* a departed
+/// reader is a real failure — said on stderr, exit 1 — and not a panic
+/// with 101. `/dev/full` answers every write with `ENOSPC`, and exists
+/// on Linux only.
+#[test]
+fn a_stdout_that_cannot_be_written_is_a_reported_failure() {
+    if !Path::new("/dev/full").exists() {
+        println!("skipping: no /dev/full on this platform");
+        return;
+    }
+    let env = TestEnv::new("devfull");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let out = env
+        .cmd()
+        .arg("version")
+        .stdin(Stdio::null())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run holdfast version");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
+    assert!(!err.contains("panicked"), "{err}");
+    assert!(err.contains("cannot write to stdout"), "{err}");
+}
+
+/// **`holdfast watch | head` never exited** (GH #218): the watcher threw
+/// its write errors away and went on rendering into nothing. It now ends
+/// at the first write after its reader has gone — which, for a session
+/// that is printing, is at once.
+#[test]
+fn watch_ends_when_its_reader_does() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let env = TestEnv::new("watchpipe");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "watched" }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let mut watch = env
+        .cmd()
+        .args(["watch", "watched"])
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn holdfast watch");
+
+    // Keep the session printing until the watcher has had something to
+    // write — bounded, and every round is a fresh chance for it to notice.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = watch.try_wait().expect("wait for watch") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = watch.kill();
+            let _ = watch.wait();
+            panic!("`holdfast watch` outlived its reader by 30s of session output");
+        }
+        shim.call_tool(
+            "send_input",
+            json!({ "session": session_id, "data": "echo still-printing" }),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGPIPE),
+        "`holdfast watch` must end as `cat` would when its reader has gone: {status}"
+    );
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// `watch`'s *writes* go through the same checked path, not only its
+/// departed-reader watch: a stdout that refuses every write is said so,
+/// exit 1, rather than rendered into for ever. `/dev/full` fails each write
+/// with `ENOSPC` and never reports a hang-up to `poll`, so this is the one
+/// place the write path is what ends the watcher on Linux — the rows above
+/// are ended by the departed-reader thread before a write is attempted.
+#[test]
+fn watch_reports_a_stdout_it_cannot_write() {
+    if !Path::new("/dev/full").exists() {
+        println!("skipping: no /dev/full on this platform");
+        return;
+    }
+    let env = TestEnv::new("watchfull");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "full" }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let mut watch = env
+        .cmd()
+        .args(["watch", "full"])
+        .stdin(Stdio::null())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn holdfast watch");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = watch.try_wait().expect("wait for watch") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = watch.kill();
+            let _ = watch.wait();
+            panic!("`holdfast watch > /dev/full` rendered into a failing stdout for 30s");
+        }
+        shim.call_tool(
+            "send_input",
+            json!({ "session": session_id, "data": "echo into-the-void" }),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let mut err = String::new();
+    watch
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut err)
+        .expect("read stderr");
+    assert_eq!(status.code(), Some(1), "{status}; stderr: {err}");
+    assert!(err.contains("cannot write to stdout"), "{err}");
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// **A watcher of a session that has gone quiet ends when its reader
+/// does**, not at the session's next output — `holdfast watch s | grep -m1
+/// READY` against a server that logged `READY` and then waited used to
+/// keep the watcher, and the pipeline, up until something else was
+/// printed.
+///
+/// The reader reads until the session has printed a marker *and* stopped
+/// printing, then closes; nothing is sent to the session after that, and
+/// its buffer head is checked afterwards — so the watcher cannot have been
+/// ended by a write, which is what [`watch_ends_when_its_reader_does`]
+/// already covers.
+#[test]
+fn watch_ends_when_its_reader_does_even_when_the_session_is_quiet() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let env = TestEnv::new("watchquiet");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "quiet" }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let (mut reader, writer) = std::io::pipe().expect("pipe");
+    let mut watch = env
+        .cmd()
+        .args(["watch", "quiet"])
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn holdfast watch");
+    let watch_pid = watch.id();
+
+    // Read what the watcher writes until it has shown the marker and then
+    // half a second of nothing — the marker is re-sent until it shows,
+    // because the watcher may not be attached when the first is printed.
+    // One owner of the read end, polled rather than read blindly, so that
+    // dropping it below really is the last reader leaving.
+    let mut seen = Vec::new();
+    let mut marked = false;
+    let mut quiet_since = Instant::now();
+    let mut last_sent: Option<Instant> = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the watcher never showed the session's output: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        if !marked && last_sent.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+            shim.call_tool(
+                "send_input",
+                json!({ "session": session_id, "data": "echo QUIET''_MARK" }),
+            );
+            last_sent = Some(Instant::now());
+        }
+        let mut fd = libc::pollfd {
+            fd: std::os::unix::io::AsRawFd::as_raw_fd(&reader),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one `pollfd`, owned by this frame, and a count of 1.
+        let ready = unsafe { libc::poll(&mut fd, 1, 100) };
+        if ready > 0 {
+            let mut buf = [0u8; 4096];
+            let n = reader.read(&mut buf).expect("read the watcher's output");
+            assert!(n > 0, "the watcher closed its stdout");
+            seen.extend_from_slice(&buf[..n]);
+            marked |= String::from_utf8_lossy(&seen).contains("QUIET_MARK");
+            quiet_since = Instant::now();
+        } else if marked && quiet_since.elapsed() > Duration::from_millis(500) {
+            break;
+        }
+    }
+    drop(reader);
+    let head = {
+        let st = shim.call_tool("status", json!({ "session": session_id }));
+        st["result"]["structuredContent"]["data"]["buffer"]["head"].clone()
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = watch.try_wait().expect("wait for watch") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = watch.kill();
+            let _ = watch.wait();
+            panic!(
+                "`holdfast watch` (pid {watch_pid}) outlived its reader by 10s on a quiet session"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGPIPE),
+        "`holdfast watch` must end as `cat` would when its reader has gone: {status}"
+    );
+    let st = shim.call_tool("status", json!({ "session": session_id }));
+    assert_eq!(
+        st["result"]["structuredContent"]["data"]["buffer"]["head"], head,
+        "the session printed after the reader left, so a write may have ended the watcher"
+    );
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// Poll `read_output`'s tail until `needle` is in it. The cursor-0 read
+/// `Shim::read_until` makes cannot see past the first 256 KiB, which is
+/// the whole point of the rows that use this.
+fn wait_for_tail(shim: &mut Shim, session: &str, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let resp = shim.call_tool(
+            "read_output",
+            json!({ "session": session, "tail_lines": 3 }),
+        );
+        let out = resp["result"]["structuredContent"]["data"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if out.contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never printed {needle:?}; its tail is {out:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Every line of `out` that is a bare number, in order.
+///
+/// Trimmed at both ends, because bash's line editor leaves a `\r` at the
+/// *start* of the first output line (it follows the bracketed-paste reset
+/// that ANSI stripping removes).
+fn numbered_lines(out: &str) -> Vec<u64> {
+    out.lines().filter_map(|l| l.trim().parse().ok()).collect()
+}
+
+/// A session that has printed well over one `read_output` page — the
+/// command's echo, `1` to `LAST`, and a marker — under `name`.
+fn a_long_session(env: &TestEnv, name: &str) -> (Shim, String) {
+    let mut shim = Shim::start(env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": name }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    shim.call_tool(
+        "send_input",
+        json!({ "session": session_id, "data": format!("seq 1 {LAST}; echo LONG''_DONE") }),
+    );
+    wait_for_tail(&mut shim, &session_id, "LONG_DONE");
+    (shim, session_id)
+}
+
+/// The last number `a_long_session` prints. Chosen so the output is well
+/// past one 256 KiB page and well inside the 1 MiB ring — the first is
+/// asserted below rather than assumed.
+const LAST: u64 = 60_000;
+
+/// **GH #232: `holdfast logs` printed the oldest 256 KiB and stopped**,
+/// silently, exit 0 — and both viewers send the operator to it for what
+/// they missed. It now follows `next_cursor` to the end.
+///
+/// The consecutive-numbers check is what makes this more than "the marker
+/// arrived": a drain that dropped or repeated a page boundary, or began a
+/// page mid-line, breaks the run somewhere in the middle.
+#[test]
+fn holdfast_logs_prints_everything_the_buffer_holds_not_its_first_page() {
+    let env = TestEnv::new("logsall");
+    let (mut shim, session_id) = a_long_session(&env, "long");
+
+    let (code, out, err) = env.run(&["logs", "long"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.len() > 256 * 1024,
+        "the fixture has to be longer than one page for this to test anything: {} bytes",
+        out.len()
+    );
+    assert!(
+        out.contains("LONG_DONE"),
+        "the end of the session is missing"
+    );
+    assert_eq!(
+        numbered_lines(&out),
+        (1..=LAST).collect::<Vec<_>>(),
+        "the numbers 1..={LAST} are not all there, once each, in order"
+    );
+    assert!(
+        !err.contains("left its buffer"),
+        "nothing had left the ring, and the note says otherwise: {err}"
+    );
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// **`--tail N` longer than a page was cut to the newest 256 KiB**,
+/// starting mid-line (GH #232). It now has every one of the N lines, whole.
+#[test]
+fn logs_tail_longer_than_a_page_has_every_line_it_was_asked_for() {
+    const N: usize = 50_000;
+    let env = TestEnv::new("logstail");
+    let (mut shim, session_id) = a_long_session(&env, "longtail");
+
+    let (code, out, err) = env.run(&["logs", "longtail", "--tail", &N.to_string()]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.len() > 256 * 1024,
+        "{N} lines have to be longer than one page for this to test the fallback: {} bytes",
+        out.len()
+    );
+    assert_eq!(
+        out.lines().count(),
+        N,
+        "`--tail {N}` did not print {N} lines"
+    );
+    let numbers = numbered_lines(&out);
+    let first = *numbers.first().expect("some numbered lines");
+    // Consecutive to the end: no page seam lost or repeated, and the first
+    // line is whole — a cut `10004` reads as `4`, and breaks the run.
+    assert_eq!(numbers, (first..=LAST).collect::<Vec<_>>());
+    assert!(out.contains("LONG_DONE"), "the tail's own end is missing");
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// **GH #233**: `--help`, `-h`, `help`, `--version` and `-V` were
+/// `unknown subcommand`, exit 64. Help that was asked for is an answer:
+/// stdout, exit 0.
+#[test]
+fn help_and_version_flags_answer_on_stdout() {
+    let env = TestEnv::new("helpflags");
+    let (code, version, _) = env.run(&["version"]);
+    assert_eq!(code, 0);
+
+    for args in [&["--help"][..], &["-h"][..], &["help"][..]] {
+        let (code, out, err) = env.run(args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        assert!(
+            out.contains("USAGE:") && out.contains("holdfast mcp"),
+            "{args:?}: {out}"
+        );
+        assert!(err.is_empty(), "{args:?} wrote to stderr: {err}");
+    }
+    for args in [&["--version"][..], &["-V"][..]] {
+        let (code, out, err) = env.run(args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        assert_eq!(out, version, "{args:?} is not `holdfast version`");
+    }
+
+    // One subcommand's help is that subcommand's, however it is asked.
+    for args in [
+        &["logs", "--help"][..],
+        &["logs", "-h"][..],
+        &["help", "logs"][..],
+    ] {
+        let (code, out, err) = env.run(args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        assert!(out.contains("holdfast logs <session>"), "{args:?}: {out}");
+        assert!(
+            !out.contains("holdfast list"),
+            "{args:?} printed more than logs: {out}"
+        );
+    }
+    let (code, out, _) = env.run(&["daemon", "--help"]);
+    assert_eq!(code, 0);
+    for verb in ["run", "start", "stop", "status"] {
+        assert!(out.contains(&format!("holdfast daemon {verb}")), "{out}");
+    }
+    let (code, out, _) = env.run(&["help", "daemon", "stop"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("holdfast daemon stop") && !out.contains("holdfast daemon status"));
+
+    let (code, _, err) = env.run(&["help", "nonsense"]);
+    assert_eq!(code, 64, "{err}");
+}
+
+/// REQ-A-002's stated verification, verbatim: *"`holdfast --help` lists
+/// exactly the documented subcommands."* It exited 64 until GH #233.
+///
+/// **The list is a literal**: the documented set as it stands, so adding
+/// or dropping a subcommand is a deliberate edit here and not something
+/// the banner can do on its own. Each one is then asked for its help, so
+/// a banner line with no subcommand behind it fails too.
+#[test]
+fn holdfast_help_lists_exactly_the_documented_subcommands() {
+    let env = TestEnv::new("reqa002");
+    let (code, out, err) = env.run(&["--help"]);
+    assert_eq!(code, 0, "REQ-A-002's own verification must succeed: {err}");
+    let listed: Vec<String> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("    holdfast "))
+        .map(|rest| {
+            rest.split_whitespace()
+                .take_while(|w| !w.starts_with('<') && !w.starts_with('['))
+                .take_while(|w| w.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    let documented = [
+        "mcp",
+        "daemon run",
+        "daemon start",
+        "daemon stop",
+        "daemon status",
+        "list",
+        "logs",
+        "attach",
+        "watch",
+        "version",
+    ];
+    assert_eq!(listed, documented, "the banner's subcommands:\n{out}");
+    for sub in documented {
+        let mut args: Vec<&str> = vec!["help"];
+        args.extend(sub.split(' '));
+        let (code, out, err) = env.run(&args);
+        assert_eq!(code, 0, "`holdfast help {sub}`: {err}");
+        assert!(out.contains(&format!("holdfast {sub}")), "{out}");
+    }
+}
+
+/// **GH #233: an unknown flag was silently dropped** and the command ran
+/// without it — `list --jsn` printed the table, `logs big --tial 5` the
+/// whole log, exit 0 both. Worst of all is a typo on a destructive flag,
+/// so the last case is a running daemon asked to `stop --forse`: it must
+/// refuse, and the daemon must still be there.
+#[test]
+fn an_unknown_flag_is_a_usage_error_and_changes_nothing() {
+    let env = TestEnv::new("badflags");
+    for (args, flag) in [
+        (&["list", "--jsn"][..], "--jsn"),
+        (&["logs", "big", "--tial", "5"][..], "--tial"),
+        (&["mcp", "--no-deamon"][..], "--no-deamon"),
+        (&["version", "--json"][..], "--json"),
+    ] {
+        let (code, out, err) = env.run(args);
+        assert_eq!(code, 64, "{args:?}: stdout {out} stderr {err}");
+        assert!(err.contains(flag), "{args:?} did not name {flag}: {err}");
+        assert!(out.is_empty(), "{args:?} ran anyway: {out}");
+    }
+
+    // A group with its verb missing or wrong names the verbs it has — read
+    // off the banner, so this is the banner's list and not a second copy.
+    let (code, _, err) = env.run(&["daemon"]);
+    assert_eq!(code, 64, "{err}");
+    assert!(err.contains("run|start|stop|status"), "{err}");
+    let (code, _, err) = env.run(&["daemon", "frobnicate"]);
+    assert_eq!(code, 64, "{err}");
+    assert!(err.contains("frobnicate"), "{err}");
+    let (code, _, err) = env.run(&["--jsn"]);
+    assert_eq!(code, 64, "{err}");
+    assert!(err.contains("--jsn"), "{err}");
+
+    // Flags before the session are flags, not a missing session: with no
+    // daemon this reaches the connect and fails *there*, exit 2.
+    let (code, _, err) = env.run(&["logs", "--raw", "big"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(!err.contains("needs a session"), "{err}");
+
+    assert_eq!(env.run(&["daemon", "start"]).0, 0);
+    let pid = env.daemon_pid().expect("pid file");
+    let (code, out, err) = env.run(&["daemon", "stop", "--forse"]);
+    assert_eq!(code, 64, "stdout {out} stderr {err}");
+    assert!(err.contains("--forse"), "{err}");
+    assert!(
+        alive(pid),
+        "a mistyped `daemon stop` flag stopped the daemon anyway"
+    );
+    let (code, out, _) = env.run(&["daemon", "status", "--json"]);
+    assert_eq!(code, 0, "the daemon stopped answering: {out}");
+}
+
+/// **GH #178: `holdfast version` said `(build unknown)` on every build
+/// that was not the release pipeline's**, identical to the tag for a tree
+/// a hundred commits past it. A build from a git checkout now names the
+/// commit — derived here from the same place, not typed in.
+#[test]
+fn version_names_the_commit_it_was_built_from() {
+    let env = TestEnv::new("buildid");
+    let (code, out, err) = env.run(&["version"]);
+    assert_eq!(code, 0, "{err}");
+    let build = out
+        .split("(build ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .unwrap_or_else(|| panic!("no `(build …)` in {out:?}"));
+
+    // What the build script was told, if it was told anything.
+    if let Some(sha) = option_env!("HOLDFAST_BUILD_SHA").filter(|s| !s.trim().is_empty()) {
+        assert_eq!(build, sha.trim(), "{out}");
+        return;
+    }
+    let git = Command::new("git")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output();
+    let Some(sha) = git
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    else {
+        println!("skipping: no git checkout to derive the expected build from");
+        return;
+    };
+    assert!(
+        build.starts_with(&sha),
+        "`holdfast version` says build {build:?}; the checkout it was built from is at {sha}"
+    );
+}
+
+/// **GH #20: `daemon stop` returned before the daemon had exited**, so
+/// `daemon stop && rm -rf "$HOLDFAST_RUNTIME_DIR"` raced the daemon's own
+/// teardown and the directory came back — the issue's acceptance, as
+/// written: stop, remove the directory at once, and it stays gone.
+///
+/// An interactive shell in the session makes it the issue's measured case
+/// too: it ignores `SIGTERM`, so the stop spends the whole grace, and it
+/// used to spend it without a word.
+#[test]
+fn daemon_stop_returns_once_the_daemon_is_gone_and_its_directory_stays_gone() {
+    let env = TestEnv::new("stopwait");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "stubborn" }),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "ok",
+        "{started}"
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    // The shell has to be running its read loop before it is stopped: a
+    // SIGTERM that lands while bash is still starting, before it has set
+    // itself up to ignore one, kills it at once — a fast stop with nothing
+    // to wait for, and a red row that says nothing about the stop.
+    shim.call_tool(
+        "send_input",
+        json!({ "session": session_id, "data": "echo READY''_MARK" }),
+    );
+    let seen = shim.read_until(&session_id, "READY_MARK");
+    assert!(
+        seen.contains("READY_MARK"),
+        "the shell never started: {seen:?}"
+    );
+    let pid = env.daemon_pid().expect("pid file");
+    shim.kill();
+
+    // **The issue's own idiom, run by a shell**: `daemon stop && rm -rf`,
+    // with the daemon's state read in the instant between the two. The
+    // window this closes is milliseconds wide — the old stop returned as
+    // the daemon began a teardown that takes little longer — so a check
+    // made after `TestEnv::run`'s 10 ms exit poll sees the daemon gone
+    // whether or not the stop waited for it. Measured: that version of
+    // this row passed against a stop that did not wait, twice in two.
+    let script = format!(
+        "\"$0\" daemon stop || exit $?; \
+         if kill -0 {pid} 2>/dev/null; then \
+           echo \"STATE alive $(cut -d')' -f2- /proc/{pid}/stat 2>/dev/null | cut -d' ' -f2)\"; \
+         else echo 'STATE gone'; fi; \
+         rm -rf \"$HOLDFAST_RUNTIME_DIR\""
+    );
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .arg(BIN)
+        .env("HOLDFAST_RUNTIME_DIR", &env.dir)
+        .env("XDG_CONFIG_HOME", env.dir.join("xdg-config"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run sh");
+    let (code, out, err) =
+        wait_bounded(child, CLI_TIMEOUT).expect("`daemon stop && rm -rf` did not finish");
+    assert_eq!(code, 0, "stdout: {out} stderr: {err}");
+    assert!(out.contains("daemon stopped"), "{out}");
+    // A zombie has finished everything it will do to the directory.
+    assert!(
+        out.contains("STATE gone") || out.contains("STATE alive Z"),
+        "`daemon stop` returned while the daemon (pid {pid}) was still running: {out}"
+    );
+    assert!(
+        err.contains("waiting for 1 live session"),
+        "a stop that spends the whole grace must say what it is waiting for: {err}"
+    );
+
+    // Longer than everything the daemon did after answering, measured
+    // before this fix: the teardown and the 250 ms runtime shutdown.
+    std::thread::sleep(Duration::from_millis(750));
+    assert!(
+        !env.dir.exists(),
+        "the stopped daemon recreated {} after `daemon stop` returned",
+        env.dir.display()
+    );
+}
+
+/// A session that has printed more than its ring holds: `logs` prints what
+/// is left, **says** that the front is gone, and does not ask for bytes
+/// the ring no longer has (GH #232).
+///
+/// Asking from cursor 0 — what the command did before — returns the same
+/// bytes, but a cursor below the ring's tail is §9.4's `truncated_at_tail`
+/// and writes an audit row naming a reader that lost its place. A command
+/// asking for everything the buffer holds is not that reader. The shim's
+/// cursor-0 read at the end is the control: it proves the audit row is
+/// written when earned, so its absence above is not an audit log that
+/// writes nothing.
+#[test]
+fn logs_of_a_session_longer_than_its_buffer_says_the_front_is_gone() {
+    const WRAP_LAST: u64 = 200_000;
+    let env = TestEnv::new("logswrap");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "wrapped" }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    shim.call_tool(
+        "send_input",
+        json!({ "session": session_id, "data": format!("seq 1 {WRAP_LAST}; echo WRAP''_DONE") }),
+    );
+    wait_for_tail(&mut shim, &session_id, "WRAP_DONE");
+
+    let (code, out, err) = env.run(&["logs", "wrapped"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        err.contains("have left its buffer"),
+        "the ring dropped the session's front and nothing said so: {err}"
+    );
+    assert!(
+        out.contains("WRAP_DONE"),
+        "the end of the session is missing"
+    );
+    let numbers = numbered_lines(&out);
+    // The ring's oldest byte can fall mid-line, so the first number may be
+    // a fragment; everything after it is whole and consecutive.
+    let rest = &numbers[1..];
+    let first = *rest.first().expect("numbered lines");
+    assert!(first > 1, "a 1 MiB ring cannot still hold the first line");
+    assert_eq!(rest, (first..=WRAP_LAST).collect::<Vec<_>>().as_slice());
+
+    // `--tail N` says so only when its N lines reach back to where the
+    // ring begins. Both directions, because either alone is satisfied by
+    // a constant: 60,000 lines is longer than a page, so it takes the
+    // drain, and stops well short of the ring's front; 190,000 is more
+    // than the ring holds.
+    let (code, out, err) = env.run(&["logs", "wrapped", "--tail", "60000"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.lines().count(), 60_000, "stderr: {err}");
+    assert!(
+        !err.contains("have left its buffer"),
+        "the last 60000 lines are all in the ring, and the note says some are not: {err}"
+    );
+    let (code, out, err) = env.run(&["logs", "wrapped", "--tail", "190000"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.lines().count() < 190_000,
+        "the ring cannot hold 190000 lines"
+    );
+    assert!(
+        err.contains("have left its buffer"),
+        "`--tail` asked for more than the ring holds and was not told the front is gone: {err}"
+    );
+
+    let audit_path = env.dir.join("logs").join("audit.log");
+    let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    assert!(
+        !audit.contains("truncated_at_tail"),
+        "`holdfast logs` asked below the ring's tail and was audited for it:\n{audit}"
+    );
+    shim.call_tool(
+        "read_output",
+        json!({ "session": session_id, "since_cursor": 0, "max_bytes": 1024 }),
+    );
+    let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    assert!(
+        audit.contains("truncated_at_tail"),
+        "the control read below the tail was not audited, so the absence above means nothing"
+    );
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// The last number [`a_coloured_session`] prints. Chosen so the output —
+/// 37 bytes a line once the pty has made each `\n` a `\r\n` — is longer
+/// than the 1 MiB ring, which [`align_a_seam_inside_an_escape`] relies on.
+const COLOURED_LAST: u64 = 32_000;
+
+/// A session that has printed `1..=COLOURED_LAST`, every number wrapped in
+/// SGR sequences, and a marker. Nearly three bytes in four sit inside an
+/// escape sequence, so a page boundary almost always lands inside one.
+fn a_coloured_session(env: &TestEnv, name: &str) -> (Shim, String) {
+    let mut shim = Shim::start(env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": name }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    shim.call_tool(
+        "send_input",
+        json!({
+            "session": session_id,
+            "data": format!(
+                "printf '\\033[1;3;4;38;5;196;48;5;21m%06d\\033[0m\\n' $(seq 1 {COLOURED_LAST}); \
+                 echo COLOURED''_DONE"
+            ),
+        }),
+    );
+    wait_for_tail(&mut shim, &session_id, "COLOURED_DONE");
+    (shim, session_id)
+}
+
+/// `buffer.head` and `buffer.tail`, from `status`.
+fn buffer_extent(shim: &mut Shim, session: &str) -> (u64, u64) {
+    let st = shim.call_tool("status", json!({ "session": session }));
+    let buffer = &st["result"]["structuredContent"]["data"]["buffer"];
+    (
+        buffer["head"].as_u64().expect("buffer.head"),
+        buffer["tail"].as_u64().expect("buffer.tail"),
+    )
+}
+
+/// Wait until the session has stopped printing: the same head, twice, a
+/// quarter of a second apart. Bounded.
+fn await_quiet(shim: &mut Shim, session: &str) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = buffer_extent(shim, session).0;
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let now = buffer_extent(shim, session).0;
+        if now == last {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never stopped printing"
+        );
+        last = now;
+    }
+}
+
+/// Whether the drain `holdfast logs` will make of `session` as it stands —
+/// 256 KiB pages from the ring's tail, following `next_cursor` — meets a
+/// page the daemon cut short at an unfinished escape sequence **with more
+/// of the buffer behind it**. That is the page the first fix of GH #232
+/// took for the end of the buffer.
+fn a_seam_lands_inside_an_escape(shim: &mut Shim, session: &str) -> bool {
+    let (head, tail) = buffer_extent(shim, session);
+    let mut cursor = tail;
+    while cursor < head {
+        let resp = shim.call_tool(
+            "read_output",
+            json!({ "session": session, "since_cursor": cursor, "max_bytes": 262_144 }),
+        );
+        let data = &resp["result"]["structuredContent"]["data"];
+        let Some(next) = data["next_cursor"].as_u64() else {
+            return false;
+        };
+        if data["held_back"] == json!(true)
+            && data["held_back_cause"] == json!("incomplete_escape")
+            && next < head
+        {
+            return true;
+        }
+        if next <= cursor {
+            return false;
+        }
+        cursor = next;
+    }
+    false
+}
+
+/// Make the drain's page boundaries fall inside an escape sequence, and
+/// leave the session idle so they stay there.
+///
+/// **Deterministic by construction rather than by luck.** The ring is
+/// full, so its tail — where the drain starts — moves one-for-one with
+/// its head, and every page seam moves with it. A seam that happens to
+/// fall between two sequences is moved by printing a few bytes more; the
+/// loop is bounded, and a fixture that never aligns fails here, by name,
+/// rather than letting the row pass without testing anything.
+fn align_a_seam_inside_an_escape(shim: &mut Shim, session: &str) {
+    for pad in 1..=40 {
+        await_quiet(shim, session);
+        if a_seam_lands_inside_an_escape(shim, session) {
+            return;
+        }
+        shim.call_tool(
+            "send_input",
+            json!({ "session": session, "data": format!("printf '%{pad}s\\n' ''") }),
+        );
+    }
+    panic!("no page seam of the drain could be made to land inside an escape sequence");
+}
+
+/// **The first fix of GH #232 stopped at the first escape sequence a page
+/// boundary cut in half**, which is most pages of coloured output.
+///
+/// `read_output` ends a page at `since_cursor + max_bytes`, and when an
+/// escape sequence straddles that point REQ-O-008 withholds it:
+/// `held_back`, `incomplete_escape`, `next_cursor` at the sequence's
+/// introducer — with the rest of the buffer still behind it. The drain
+/// read every `held_back` as the end of the buffer, so `holdfast logs` on
+/// `grep --color=always` output stopped a third of the way in, said
+/// "read again", and stopped at the same byte every time; and `--tail N`,
+/// which drains when the N lines are longer than a page, printed the
+/// session's *oldest* lines as its tail. §4.1's recourse for this cause is
+/// "retry at `next_cursor`", and the retry makes progress.
+///
+/// Both paths, over the same buffer, after checking that the buffer does
+/// what the row is about — so a fixture that stops producing the seam
+/// fails rather than passing on a drain that never met one.
+#[test]
+fn holdfast_logs_reads_on_past_an_escape_sequence_cut_by_a_page_boundary() {
+    const N: usize = 20_000;
+    let env = TestEnv::new("logsansi");
+    let (mut shim, session_id) = a_coloured_session(&env, "coloured");
+    align_a_seam_inside_an_escape(&mut shim, &session_id);
+    let head = buffer_extent(&mut shim, &session_id).0;
+
+    let (code, out, err) = env.run(&["logs", "coloured"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("COLOURED_DONE"),
+        "the drain stopped short of the end of the buffer; stderr: {err}"
+    );
+    assert!(
+        !err.contains("Read again"),
+        "a seam inside an escape is not a holdback the reader has to retry: {err}"
+    );
+    // The ring's oldest byte can fall mid-line, so the first line may be a
+    // fragment; everything after it is whole and consecutive.
+    let numbers = numbered_lines(out.split_once('\n').map_or("", |(_, rest)| rest));
+    let first = *numbers.first().expect("numbered lines");
+    assert_eq!(
+        numbers,
+        (first..=COLOURED_LAST).collect::<Vec<_>>(),
+        "a page seam dropped or repeated a line"
+    );
+
+    // The fallback is taken on the *raw* extent of the N lines, which the
+    // stripped output does not show, so it is asked of the daemon.
+    let tail_read = shim.call_tool(
+        "read_output",
+        json!({ "session": session_id, "tail_lines": N, "max_bytes": 262_144 }),
+    );
+    assert_eq!(
+        tail_read["result"]["structuredContent"]["data"]["truncated_for_size"],
+        json!(true),
+        "{N} lines have to be longer than one page for this to test the fallback"
+    );
+    let (code, out, err) = env.run(&["logs", "coloured", "--tail", &N.to_string()]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(
+        out.lines().count(),
+        N,
+        "`--tail {N}` did not print {N} lines"
+    );
+    let numbers = numbered_lines(&out);
+    let first = *numbers.first().expect("numbered lines");
+    assert_eq!(
+        numbers,
+        (first..=COLOURED_LAST).collect::<Vec<_>>(),
+        "`--tail {N}` is not the session's last {N} lines"
+    );
+    assert!(
+        out.contains("COLOURED_DONE"),
+        "the tail's own end is missing"
+    );
+
+    assert_eq!(
+        buffer_extent(&mut shim, &session_id).0,
+        head,
+        "the session printed during the row, so the seam it aligned may have moved"
+    );
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
     shim.kill();
 }
